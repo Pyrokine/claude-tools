@@ -42,9 +42,17 @@ A comprehensive SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.
 
 ## Installation
 
+### npm (Recommended)
+
 ```bash
-git clone https://github.com/Pyrokine/mcp-ssh.git
-cd mcp-ssh
+npm install -g @pyrokine/mcp-ssh
+```
+
+### From Source
+
+```bash
+git clone https://github.com/Pyrokine/claude-mcp-tools.git
+cd claude-mcp-tools/ssh
 npm install
 npm run build
 ```

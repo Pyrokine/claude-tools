@@ -42,9 +42,17 @@
 
 ## 安装
 
+### npm（推荐）
+
 ```bash
-git clone https://github.com/Pyrokine/mcp-ssh.git
-cd mcp-ssh
+npm install -g @pyrokine/mcp-ssh
+```
+
+### 从源码安装
+
+```bash
+git clone https://github.com/Pyrokine/claude-mcp-tools.git
+cd claude-mcp-tools/ssh
 npm install
 npm run build
 ```

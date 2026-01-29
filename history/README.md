@@ -1,23 +1,40 @@
 # claude-history
 
-Claude Code 对话历史搜索工具
+English | [中文](README_zh.md)
 
-## 功能
+A conversation history search tool for Claude Code
 
-- 搜索对话历史（支持正则）
-- 获取完整消息内容
-- 获取消息上下文
-- 列出项目和会话
-- 自动提取图片
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
+[![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
-## 安装
+## Features
+
+- **Search**: Full-text search with regex support, time filtering, type filtering
+- **Retrieve**: Get full message content with chunked retrieval and image extraction
+- **Context**: Get surrounding messages for context
+- **Browse**: List projects and sessions
+- **Static Binary**: musl static linking, runs on most Linux x86_64 distributions
+
+## Installation
 
 ```bash
-cargo build --release
-cp target/release/claude-history ~/.local/bin/
+# Build (static linking, runs on most Linux x86_64 distributions)
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Install
+cp target/x86_64-unknown-linux-musl/release/claude-history ~/.local/bin/
 ```
 
-## MCP 配置
+## Configuration
+
+### Claude Code
+
+```bash
+claude mcp add claude-history -- claude-history --mcp
+```
+
+### Claude Desktop / Other Clients
 
 ```json
 {
@@ -30,26 +47,115 @@ cp target/release/claude-history ~/.local/bin/
 }
 ```
 
-## 命令
+## Available Tools (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `history_search` | Search conversation history |
+| `history_get` | Get full message content |
+| `history_context` | Get surrounding messages |
+| `history_projects` | List all projects |
+| `history_sessions` | List sessions in a project |
+
+### history_search
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pattern` | string | "" | Search pattern (empty returns all) |
+| `project` | string | current | Project ID (comma-separated) |
+| `all` | boolean | false | Search all projects |
+| `sessions` | string | - | Session IDs (comma-separated) |
+| `since` | string | - | Start time (ISO 8601 or today/week/month) |
+| `until` | string | - | End time |
+| `types` | string | assistant,user,summary | Message types |
+| `lines` | string | - | Line ranges (e.g., 100-200, !300-400) |
+| `regex` | boolean | false | Use regex |
+| `case_sensitive` | boolean | false | Case sensitive |
+| `offset` | number | 0 | Skip first N results |
+| `limit` | number | - | Max results to return |
+| `max_content` | number | 4000 | Max chars per result |
+| `max_total` | number | 40000 | Max total chars |
+
+### history_get
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `ref` | string | Required. Message ref (session_prefix:line) |
+| `range` | string | Character range (e.g., 0-100000) |
+| `output` | string | Output directory (auto-extract images) |
+| `project` | string | Project ID |
+
+### history_context
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `ref` | string | Required. Message ref |
+| `before` | number | Messages before |
+| `after` | number | Messages after |
+| `until_type` | string | Continue until this type |
+| `direction` | string | forward/backward |
+| `project` | string | Project ID |
+
+## Usage Examples
+
+### Search
 
 ```bash
-# 搜索
+# Basic search
 claude-history search "error"
+
+# Regex search
 claude-history search "error|warning" --regex
-claude-history search "" --since "2026-01-28" --limit 10
 
-# 获取完整内容
-claude-history get --ref c86bc677:1234
-claude-history get --ref c86bc677:1234 --output /tmp
+# Recent messages
+claude-history search "" --since today --limit 10
 
-# 获取上下文
-claude-history context --ref c86bc677:1234 --before 5 --after 5
-
-# 列出项目和会话
-claude-history projects
-claude-history sessions --project -home-user-xxx
+# Search specific project
+claude-history search "bug" --project -home-user-myproject
 ```
 
-## 设计文档
+### Get Full Content
 
-详见 [设计方案](/tmp/claude-history-rs-设计方案.md)
+```bash
+# Get message by ref
+claude-history get --ref c86bc677:1234
+
+# Export to directory (with images)
+claude-history get --ref c86bc677:1234 --output /tmp/export
+
+# Chunked retrieval for large content
+claude-history get --ref c86bc677:1234 --range 0-100000
+```
+
+### Get Context
+
+```bash
+# Get 5 messages before and after
+claude-history context --ref c86bc677:1234 --before 5 --after 5
+
+# Get messages until next user message
+claude-history context --ref c86bc677:1234 --until-type user --direction forward
+```
+
+### Browse
+
+```bash
+# List all projects
+claude-history projects
+
+# List sessions in a project
+claude-history sessions --project -home-user-myproject
+```
+
+## Ref Format
+
+```
+ref = session_prefix:line
+e.g., c86bc677:1234
+```
+
+The session prefix is the first 8 characters of the full session ID (e.g., `c86bc677-9f5f-4e49-8e16-5e175a059610`).
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.

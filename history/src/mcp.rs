@@ -1,13 +1,18 @@
 use crate::config::Config;
+use crate::context::{context, ContextParams};
+use crate::get::{get, GetParams};
+use crate::projects::list_projects;
 use crate::search::{search, SearchParams};
 use crate::sessions::list_sessions;
+use crate::types::Range;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
-/// JSON-RPC 请求
 #[derive(Deserialize)]
 struct JsonRpcRequest {
+    #[allow(dead_code)]
     jsonrpc: String,
     id: Option<Value>,
     method: String,
@@ -15,7 +20,6 @@ struct JsonRpcRequest {
     params: Value,
 }
 
-/// JSON-RPC 响应
 #[derive(Serialize)]
 struct JsonRpcResponse {
     jsonrpc: String,
@@ -34,219 +38,172 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
-/// MCP 工具定义
+/// MCP 工具定义 - 按设计方案
 fn get_tools() -> Vec<Value> {
     vec![
+        // history_search - 搜索对话
         json!({
-            "name": "search_conversations",
+            "name": "history_search",
             "description": "Search through Claude Code conversation history",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {
+                    "pattern": {
                         "type": "string",
-                        "description": "Search query to find relevant conversations"
+                        "description": "Search pattern (empty string returns all messages)"
                     },
                     "project": {
                         "type": "string",
-                        "description": "Optional project name to filter results"
+                        "description": "Project ID to search (comma-separated for multiple)"
                     },
-                    "timeframe": {
+                    "all": {
+                        "type": "boolean",
+                        "description": "Search all projects",
+                        "default": false
+                    },
+                    "sessions": {
                         "type": "string",
-                        "description": "Time range filter (today, week, month)"
+                        "description": "Session IDs to search (comma-separated)"
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "Start time (ISO 8601 or relative: today, week, month)"
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "End time (ISO 8601)"
+                    },
+                    "types": {
+                        "type": "string",
+                        "description": "Message types: assistant,user,summary (comma-separated)",
+                        "default": "assistant,user,summary"
+                    },
+                    "lines": {
+                        "type": "string",
+                        "description": "Line ranges: 100, 100-200, 100-, -200, !100-200"
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description": "Use regex pattern matching",
+                        "default": false
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Case sensitive search",
+                        "default": false
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Skip first N results",
+                        "default": 0
                     },
                     "limit": {
                         "type": "number",
-                        "description": "Maximum number of results (default: 10)",
-                        "default": 10
+                        "description": "Maximum results to return"
                     },
-                    "detail_level": {
-                        "type": "string",
-                        "enum": ["summary", "detailed", "raw"],
-                        "description": "Response detail: summary (default), detailed, raw",
-                        "default": "summary"
-                    }
-                },
-                "required": ["query"]
-            }
-        }),
-        json!({
-            "name": "find_file_context",
-            "description": "Find all conversations and changes related to a specific file",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "File path to search for in conversation history"
-                    },
-                    "operation_type": {
-                        "type": "string",
-                        "enum": ["read", "edit", "create", "all"],
-                        "description": "Filter by operation: read, edit, create, or all",
-                        "default": "all"
-                    },
-                    "limit": {
+                    "max_content": {
                         "type": "number",
-                        "description": "Maximum number of results (default: 15)",
-                        "default": 15
+                        "description": "Max characters per result",
+                        "default": 4000
                     },
-                    "detail_level": {
-                        "type": "string",
-                        "enum": ["summary", "detailed", "raw"],
-                        "description": "Response detail: summary (default), detailed, raw",
-                        "default": "summary"
-                    }
-                },
-                "required": ["filepath"]
-            }
-        }),
-        json!({
-            "name": "find_similar_queries",
-            "description": "Search for previous user messages containing similar keywords",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Query to find similar previous questions"
-                    },
-                    "limit": {
+                    "max_total": {
                         "type": "number",
-                        "description": "Maximum number of results (default: 8)",
-                        "default": 8
-                    },
-                    "detail_level": {
-                        "type": "string",
-                        "enum": ["summary", "detailed", "raw"],
-                        "description": "Response detail: summary (default), detailed, raw",
-                        "default": "summary"
-                    }
-                },
-                "required": ["query"]
-            }
-        }),
-        json!({
-            "name": "get_error_solutions",
-            "description": "Search assistant messages for content matching error patterns",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "error_pattern": {
-                        "type": "string",
-                        "description": "Error message or pattern to search for solutions"
-                    },
-                    "limit": {
-                        "type": "number",
-                        "description": "Maximum number of results (default: 8)",
-                        "default": 8
-                    },
-                    "detail_level": {
-                        "type": "string",
-                        "enum": ["summary", "detailed", "raw"],
-                        "description": "Response detail: summary (default), detailed, raw",
-                        "default": "summary"
-                    }
-                },
-                "required": ["error_pattern"]
-            }
-        }),
-        json!({
-            "name": "list_recent_sessions",
-            "description": "List recent conversation sessions sorted by time",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project": {
-                        "type": "string",
-                        "description": "Optional project name to filter sessions"
-                    },
-                    "limit": {
-                        "type": "number",
-                        "description": "Maximum number of sessions (default: 10)",
-                        "default": 10
+                        "description": "Max total characters",
+                        "default": 40000
                     }
                 }
             }
         }),
+        // history_get - 获取完整内容
         json!({
-            "name": "extract_compact_summary",
-            "description": "Extract recent messages from a session (filtered search, not AI summary)",
+            "name": "history_get",
+            "description": "Get full content of a message by ref",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "session_id": {
+                    "ref": {
                         "type": "string",
-                        "description": "Session ID to extract messages from"
+                        "description": "Message reference (session_prefix:line, e.g. c86bc677:1234)"
                     },
-                    "max_messages": {
-                        "type": "number",
-                        "description": "Maximum messages to return (default: 10)",
-                        "default": 10
-                    },
-                    "focus": {
+                    "range": {
                         "type": "string",
-                        "enum": ["solutions", "tools", "files", "all"],
-                        "description": "Filter by message type: solutions (assistant), tools (tool_use/result), all (user+assistant)",
-                        "default": "all"
+                        "description": "Character range for chunked retrieval (e.g. 0-100000)"
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": "Output directory path (auto-extract images)"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project ID"
                     }
                 },
-                "required": ["session_id"]
+                "required": ["ref"]
             }
         }),
+        // history_context - 获取上下文
         json!({
-            "name": "find_tool_patterns",
-            "description": "Search for tool-related messages (regex-based search, not pattern analysis)",
+            "name": "history_context",
+            "description": "Get surrounding messages for context",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tool_name": {
+                    "ref": {
                         "type": "string",
-                        "description": "Optional specific tool name to analyze"
+                        "description": "Message reference (session_prefix:line)"
                     },
-                    "pattern_type": {
-                        "type": "string",
-                        "enum": ["tools", "workflows", "solutions"],
-                        "description": "Type of patterns: tools, workflows, or solutions",
-                        "default": "tools"
-                    },
-                    "limit": {
+                    "before": {
                         "type": "number",
-                        "description": "Maximum number of patterns (default: 12)",
-                        "default": 12
+                        "description": "Number of messages before"
+                    },
+                    "after": {
+                        "type": "number",
+                        "description": "Number of messages after"
+                    },
+                    "until_type": {
+                        "type": "string",
+                        "description": "Continue until this message type"
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["forward", "backward"],
+                        "description": "Direction to search",
+                        "default": "forward"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project ID"
+                    }
+                },
+                "required": ["ref"]
+            }
+        }),
+        // history_projects - 列出项目
+        json!({
+            "name": "history_projects",
+            "description": "List all projects with conversation history",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        // history_sessions - 列出会话
+        json!({
+            "name": "history_sessions",
+            "description": "List sessions in a project",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project ID (optional, defaults to current)"
                     }
                 }
-            }
-        }),
-        json!({
-            "name": "search_plans",
-            "description": "Search Claude Code plan files for past implementation approaches, decisions, and patterns",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query for plan content"
-                    },
-                    "limit": {
-                        "type": "number",
-                        "description": "Maximum number of results (default: 10)",
-                        "default": 10
-                    },
-                    "detail_level": {
-                        "type": "string",
-                        "enum": ["summary", "detailed", "raw"],
-                        "description": "Response detail level",
-                        "default": "summary"
-                    }
-                },
-                "required": ["query"]
             }
         }),
     ]
 }
 
-/// 运行 MCP 服务器
 pub fn run_mcp_server() {
     let config = Config::from_env();
     let stdin = io::stdin();
@@ -275,21 +232,19 @@ pub fn run_mcp_server() {
                         data: None,
                     }),
                 };
-                let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap());
+                let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap_or_default());
                 let _ = stdout.flush();
                 continue;
             }
         };
 
-        // notification 没有 id，不应返回响应
         if let Some(response) = handle_request(&config, &request) {
-            let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap());
+            let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap_or_default());
             let _ = stdout.flush();
         }
     }
 }
 
-/// 处理请求，notification 返回 None
 fn handle_request(config: &Config, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     let id = request.id.clone().unwrap_or(Value::Null);
 
@@ -303,14 +258,13 @@ fn handle_request(config: &Config, request: &JsonRpcRequest) -> Option<JsonRpcRe
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "claude-historian-mcp",
-                    "version": "0.1.0"
+                    "name": "mcp-claude-history",
+                    "version": "1.0.0"
                 }
             })),
             error: None,
         }),
 
-        // notification 不返回响应
         "notifications/initialized" | "initialized" => None,
 
         "tools/list" => Some(JsonRpcResponse {
@@ -344,7 +298,7 @@ fn handle_request(config: &Config, request: &JsonRpcRequest) -> Option<JsonRpcRe
                     result: Some(json!({
                         "content": [{
                             "type": "text",
-                            "text": format!("Error: {}", e)
+                            "text": serde_json::to_string_pretty(&e).unwrap_or_else(|_| e.to_string())
                         }],
                         "isError": true
                     })),
@@ -366,238 +320,140 @@ fn handle_request(config: &Config, request: &JsonRpcRequest) -> Option<JsonRpcRe
     }
 }
 
-/// 执行工具
-fn execute_tool(config: &Config, tool_name: &str, args: Value) -> Result<Value, String> {
+fn execute_tool(config: &Config, tool_name: &str, args: Value) -> Result<Value, Value> {
     match tool_name {
-        "search_conversations" => {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let project = args.get("project").and_then(|v| v.as_str());
-            let timeframe = args.get("timeframe").and_then(|v| v.as_str());
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let detail_level = args.get("detail_level").and_then(|v| v.as_str()).unwrap_or("summary");
-
-            let (since, until) = parse_timeframe(timeframe);
-
-            let params = SearchParams {
-                pattern: query.to_string(),
-                projects: project.map(|p| vec![p.to_string()]).unwrap_or_default(),
-                all_projects: project.is_none(),
-                since,
-                until,
-                limit: Some(limit),
-                max_content: match detail_level {
-                    "raw" => 100000,
-                    "detailed" => 8000,
-                    _ => 2000,
-                },
-                ..Default::default()
-            };
-
-            match search(config, params) {
-                Ok(response) => Ok(serde_json::to_value(response).unwrap()),
-                Err(e) => Err(e.message),
-            }
-        }
-
-        "find_file_context" => {
-            let filepath = args.get("filepath").and_then(|v| v.as_str()).unwrap_or("");
-            let operation_type = args.get("operation_type").and_then(|v| v.as_str()).unwrap_or("all");
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(15) as usize;
-            let detail_level = args.get("detail_level").and_then(|v| v.as_str()).unwrap_or("summary");
-
-            // 根据操作类型构建搜索模式
-            let pattern = match operation_type {
-                "read" => format!("Read.*{}", regex::escape(filepath)),
-                "edit" => format!("Edit.*{}", regex::escape(filepath)),
-                "create" => format!("Write.*{}", regex::escape(filepath)),
-                _ => regex::escape(filepath),
-            };
-
-            let params = SearchParams {
-                pattern,
-                use_regex: true,
-                all_projects: true,
-                limit: Some(limit),
-                max_content: match detail_level {
-                    "raw" => 100000,
-                    "detailed" => 8000,
-                    _ => 2000,
-                },
-                ..Default::default()
-            };
-
-            match search(config, params) {
-                Ok(response) => Ok(serde_json::to_value(response).unwrap()),
-                Err(e) => Err(e.message),
-            }
-        }
-
-        "find_similar_queries" => {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-            let detail_level = args.get("detail_level").and_then(|v| v.as_str()).unwrap_or("summary");
-
-            let params = SearchParams {
-                pattern: query.to_string(),
-                types: vec!["user".to_string()],
-                all_projects: true,
-                limit: Some(limit),
-                max_content: match detail_level {
-                    "raw" => 100000,
-                    "detailed" => 8000,
-                    _ => 2000,
-                },
-                ..Default::default()
-            };
-
-            match search(config, params) {
-                Ok(response) => Ok(serde_json::to_value(response).unwrap()),
-                Err(e) => Err(e.message),
-            }
-        }
-
-        "get_error_solutions" => {
-            let error_pattern = args.get("error_pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-            let detail_level = args.get("detail_level").and_then(|v| v.as_str()).unwrap_or("summary");
-
-            // 搜索包含错误的 assistant 回复
-            let params = SearchParams {
-                pattern: error_pattern.to_string(),
-                types: vec!["assistant".to_string()],
-                all_projects: true,
-                limit: Some(limit),
-                max_content: match detail_level {
-                    "raw" => 100000,
-                    "detailed" => 8000,
-                    _ => 4000,
-                },
-                ..Default::default()
-            };
-
-            match search(config, params) {
-                Ok(response) => Ok(serde_json::to_value(response).unwrap()),
-                Err(e) => Err(e.message),
-            }
-        }
-
-        "list_recent_sessions" => {
-            let project = args.get("project").and_then(|v| v.as_str());
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-
-            match list_sessions(config, project) {
-                Ok(mut response) => {
-                    response.sessions.truncate(limit);
-                    Ok(serde_json::to_value(response).unwrap())
-                }
-                Err(e) => Err(e.message),
-            }
-        }
-
-        "extract_compact_summary" => {
-            let session_id = args.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-            let max_messages = args.get("max_messages").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("all");
-
-            // 搜索指定 session 的消息
-            let params = SearchParams {
-                pattern: String::new(),
-                sessions: vec![session_id.to_string()],
-                all_projects: true,
-                limit: Some(max_messages),
-                types: match focus {
-                    "solutions" => vec!["assistant".to_string()],
-                    "tools" => vec!["tool_use".to_string(), "tool_result".to_string()],
-                    _ => vec!["user".to_string(), "assistant".to_string()],
-                },
-                ..Default::default()
-            };
-
-            match search(config, params) {
-                Ok(response) => Ok(serde_json::to_value(response).unwrap()),
-                Err(e) => Err(e.message),
-            }
-        }
-
-        "find_tool_patterns" => {
-            let tool_name = args.get("tool_name").and_then(|v| v.as_str());
-            let pattern_type = args.get("pattern_type").and_then(|v| v.as_str()).unwrap_or("tools");
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(12) as usize;
-
-            let pattern = match (pattern_type, tool_name) {
-                (_, Some(name)) => name.to_string(),
-                ("workflows", _) => "workflow|pipeline|step".to_string(),
-                ("solutions", _) => "fix|solve|resolve".to_string(),
-                _ => "tool_use|tool_result".to_string(),
-            };
-
-            let params = SearchParams {
-                pattern,
-                use_regex: true,
-                all_projects: true,
-                limit: Some(limit),
-                ..Default::default()
-            };
-
-            match search(config, params) {
-                Ok(response) => Ok(serde_json::to_value(response).unwrap()),
-                Err(e) => Err(e.message),
-            }
-        }
-
-        "search_plans" => {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let detail_level = args.get("detail_level").and_then(|v| v.as_str()).unwrap_or("summary");
-
-            // 搜索包含 plan 相关内容的消息
-            // 对 query 进行正则转义，防止注入；使用括号明确优先级
-            let pattern = if query.is_empty() {
-                "plan|implementation|approach".to_string()
-            } else {
-                let escaped = regex::escape(query);
-                format!("({}.*plan)|(plan.*{})", escaped, escaped)
-            };
-
-            let params = SearchParams {
-                pattern,
-                use_regex: true,
-                all_projects: true,
-                limit: Some(limit),
-                max_content: match detail_level {
-                    "raw" => 100000,
-                    "detailed" => 8000,
-                    _ => 4000,
-                },
-                ..Default::default()
-            };
-
-            match search(config, params) {
-                Ok(response) => Ok(serde_json::to_value(response).unwrap()),
-                Err(e) => Err(e.message),
-            }
-        }
-
-        _ => Err(format!("Unknown tool: {}", tool_name)),
+        "history_search" => execute_search(config, args),
+        "history_get" => execute_get(config, args),
+        "history_context" => execute_context(config, args),
+        "history_projects" => execute_projects(config),
+        "history_sessions" => execute_sessions(config, args),
+        _ => Err(json!({
+            "error": "unknown_tool",
+            "message": format!("Unknown tool: {}", tool_name)
+        })),
     }
 }
 
-/// 解析时间范围
-fn parse_timeframe(timeframe: Option<&str>) -> (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) {
+fn execute_search(config: &Config, args: Value) -> Result<Value, Value> {
+    let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+    let project = args.get("project").and_then(|v| v.as_str());
+    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let sessions = args.get("sessions").and_then(|v| v.as_str());
+    let since = args.get("since").and_then(|v| v.as_str());
+    let until = args.get("until").and_then(|v| v.as_str());
+    let types = args.get("types").and_then(|v| v.as_str());
+    let lines = args.get("lines").and_then(|v| v.as_str());
+    let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+    let case_sensitive = args.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let max_content = args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+    let max_total = args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(40000) as usize;
+
+    let params = SearchParams {
+        pattern: pattern.to_string(),
+        projects: project.map(|p| p.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+        all_projects: all || project.is_none(),
+        sessions: sessions.map(|s| s.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+        since: parse_datetime(since),
+        until: parse_datetime(until),
+        types: types.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_else(|| vec!["assistant".to_string(), "user".to_string(), "summary".to_string()]),
+        lines: lines.map(|l| Range::parse_ranges(l)).unwrap_or_default(),
+        use_regex: regex,
+        case_sensitive,
+        offset,
+        limit,
+        max_content,
+        max_total,
+    };
+
+    match search(config, params) {
+        Ok(response) => Ok(serde_json::to_value(response).unwrap_or(Value::Null)),
+        Err(e) => Err(serde_json::to_value(e).unwrap_or(Value::Null)),
+    }
+}
+
+fn execute_get(config: &Config, args: Value) -> Result<Value, Value> {
+    let r#ref = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+    let range = args.get("range").and_then(|v| v.as_str());
+    let output = args.get("output").and_then(|v| v.as_str());
+    let project = args.get("project").and_then(|v| v.as_str());
+
+    let range = range.and_then(|r| {
+        let parts: Vec<&str> = r.split('-').collect();
+        if parts.len() == 2 {
+            let start = parts[0].parse().ok()?;
+            let end = parts[1].parse().ok()?;
+            Some((start, end))
+        } else {
+            None
+        }
+    });
+
+    let params = GetParams {
+        r#ref: r#ref.to_string(),
+        range,
+        output: output.map(PathBuf::from),
+        project: project.map(String::from),
+    };
+
+    match get(config, params) {
+        Ok(response) => Ok(serde_json::to_value(response).unwrap_or(Value::Null)),
+        Err(e) => Err(serde_json::to_value(e).unwrap_or(Value::Null)),
+    }
+}
+
+fn execute_context(config: &Config, args: Value) -> Result<Value, Value> {
+    let r#ref = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+    let before = args.get("before").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let after = args.get("after").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let until_type = args.get("until_type").and_then(|v| v.as_str());
+    let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("forward");
+    let project = args.get("project").and_then(|v| v.as_str());
+
+    let params = ContextParams {
+        r#ref: r#ref.to_string(),
+        before,
+        after,
+        until_type: until_type.map(String::from),
+        direction: direction.to_string(),
+        project: project.map(String::from),
+        max_content: 4000,
+    };
+
+    match context(config, params) {
+        Ok(response) => Ok(serde_json::to_value(response).unwrap_or(Value::Null)),
+        Err(e) => Err(serde_json::to_value(e).unwrap_or(Value::Null)),
+    }
+}
+
+fn execute_projects(config: &Config) -> Result<Value, Value> {
+    match list_projects(config) {
+        Ok(response) => Ok(serde_json::to_value(response).unwrap_or(Value::Null)),
+        Err(e) => Err(serde_json::to_value(e).unwrap_or(Value::Null)),
+    }
+}
+
+fn execute_sessions(config: &Config, args: Value) -> Result<Value, Value> {
+    let project = args.get("project").and_then(|v| v.as_str());
+
+    match list_sessions(config, project) {
+        Ok(response) => Ok(serde_json::to_value(response).unwrap_or(Value::Null)),
+        Err(e) => Err(serde_json::to_value(e).unwrap_or(Value::Null)),
+    }
+}
+
+fn parse_datetime(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s?;
     let now = chrono::Utc::now();
-    match timeframe {
-        Some("today") => {
-            let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-            (Some(chrono::DateTime::from_naive_utc_and_offset(start, chrono::Utc)), None)
+
+    match s {
+        "today" => {
+            let start = now.date_naive().and_hms_opt(0, 0, 0)?;
+            Some(chrono::DateTime::from_naive_utc_and_offset(start, chrono::Utc))
         }
-        Some("week") => {
-            let start = now - chrono::Duration::days(7);
-            (Some(start), None)
-        }
-        Some("month") => {
-            let start = now - chrono::Duration::days(30);
-            (Some(start), None)
-        }
-        _ => (None, None),
+        "week" => Some(now - chrono::Duration::days(7)),
+        "month" => Some(now - chrono::Duration::days(30)),
+        _ => chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&chrono::Utc)),
     }
 }
