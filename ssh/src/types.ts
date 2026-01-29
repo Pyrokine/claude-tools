@@ -39,6 +39,7 @@ export interface ExecOptions {
   env?: Record<string, string>;  // 额外环境变量
   cwd?: string;          // 工作目录
   pty?: boolean;         // 是否使用 PTY
+  maxOutputSize?: number; // 最大输出大小（字节），默认 10MB
   // PTY 配置
   rows?: number;
   cols?: number;
@@ -81,4 +82,52 @@ export interface PersistedSession {
   username: string;
   connectedAt: number;
   env?: Record<string, string>;
+}
+
+// PTY 会话配置
+export interface PtyOptions {
+  rows?: number;
+  cols?: number;
+  term?: string;
+  env?: Record<string, string>;
+  cwd?: string;
+  bufferSize?: number;  // 输出缓冲区大小，默认 1MB
+}
+
+// PTY 会话信息
+export interface PtySessionInfo {
+  id: string;
+  alias: string;          // SSH 连接别名
+  command: string;        // 启动命令
+  rows: number;
+  cols: number;
+  createdAt: number;
+  lastReadAt: number;
+  bufferSize: number;     // 当前缓冲区大小
+  active: boolean;
+}
+
+// 端口转发类型
+export type ForwardType = 'local' | 'remote';
+
+// 端口转发配置
+export interface PortForwardConfig {
+  type: ForwardType;
+  localHost: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+}
+
+// 端口转发信息
+export interface PortForwardInfo {
+  id: string;
+  alias: string;          // SSH 连接别名
+  type: ForwardType;
+  localHost: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+  createdAt: number;
+  active: boolean;
 }

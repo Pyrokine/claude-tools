@@ -24,7 +24,7 @@ import {
 
 import { sessionManager } from './session-manager.js';
 import * as fileOps from './file-ops.js';
-import { ExecOptions } from './types.js';
+import { ExecOptions, PtyOptions } from './types.js';
 
 // 创建 MCP Server
 const server = new Server(
@@ -284,6 +284,218 @@ const tools: Tool[] = [
       required: ['alias', 'remotePath'],
     },
   },
+  {
+    name: 'ssh_sync',
+    description: `智能文件同步（支持目录递归）。
+
+优先使用 rsync（如果本地和远程都安装了），否则回退到 SFTP。
+rsync 可实现增量传输，对大目录同步效率更高。
+
+用途：
+- 同步本地目录到远程
+- 从远程同步目录到本地
+- 支持排除特定文件/目录
+
+示例：
+- 上传目录: ssh_sync(alias="server", localPath="/local/dir", remotePath="/remote/dir", direction="upload")
+- 下载目录: ssh_sync(alias="server", localPath="/local/dir", remotePath="/remote/dir", direction="download")
+- 排除文件: ssh_sync(..., exclude=["*.log", "node_modules"])`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        alias: { type: 'string', description: '连接别名' },
+        localPath: { type: 'string', description: '本地路径' },
+        remotePath: { type: 'string', description: '远程路径' },
+        direction: {
+          type: 'string',
+          enum: ['upload', 'download'],
+          description: '同步方向：upload（本地到远程）或 download（远程到本地）',
+        },
+        delete: { type: 'boolean', description: '删除目标端多余文件（类似 rsync --delete）' },
+        dryRun: { type: 'boolean', description: '仅显示将执行的操作，不实际传输' },
+        exclude: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '排除模式列表（支持 * 和 ? 通配符）',
+        },
+        recursive: { type: 'boolean', description: '递归同步目录，默认 true' },
+      },
+      required: ['alias', 'localPath', 'remotePath', 'direction'],
+    },
+  },
+
+  // ========== PTY 会话（持久化交互式终端） ==========
+  {
+    name: 'ssh_pty_start',
+    description: `启动持久化 PTY 会话，支持 top、htop、tmux 等交互式命令。
+
+特点：
+- 输出缓冲区持续收集数据
+- 可通过 ssh_pty_read 轮询读取最新输出
+- 可通过 ssh_pty_write 发送按键/命令
+
+示例：
+- 启动 top: ssh_pty_start(alias="server", command="top")
+- 启动 tmux: ssh_pty_start(alias="server", command="tmux new -s work")`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        alias: { type: 'string', description: '连接别名' },
+        command: { type: 'string', description: '要执行的命令' },
+        rows: { type: 'number', description: '终端行数，默认 24' },
+        cols: { type: 'number', description: '终端列数，默认 80' },
+        term: { type: 'string', description: '终端类型，默认 xterm-256color' },
+        cwd: { type: 'string', description: '工作目录' },
+        env: {
+          type: 'object',
+          description: '环境变量',
+          additionalProperties: { type: 'string' },
+        },
+        bufferSize: { type: 'number', description: '输出缓冲区大小（字节），默认 1MB' },
+      },
+      required: ['alias', 'command'],
+    },
+  },
+  {
+    name: 'ssh_pty_write',
+    description: `向 PTY 写入数据（按键、命令）。
+
+常用控制序列：
+- 回车: "\\r" 或 "\\n"
+- Ctrl+C: "\\x03"
+- Ctrl+D: "\\x04"
+- Ctrl+Z: "\\x1a"
+- 上箭头: "\\x1b[A"
+- 下箭头: "\\x1b[B"
+
+示例：
+- 发送命令: ssh_pty_write(ptyId="xxx", data="ls -la\\r")
+- 退出 top: ssh_pty_write(ptyId="xxx", data="q")`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ptyId: { type: 'string', description: 'PTY 会话 ID' },
+        data: { type: 'string', description: '要写入的数据' },
+      },
+      required: ['ptyId', 'data'],
+    },
+  },
+  {
+    name: 'ssh_pty_read',
+    description: `读取 PTY 输出。
+
+两种模式：
+- screen（默认）：返回当前屏幕内容（解析后的纯文本，适合 top/btop/htop 等全屏刷新工具）
+- raw：返回原始 ANSI 流（包含转义序列，适合需要完整终端数据的场景）
+
+示例：
+- 获取 top 当前画面: ssh_pty_read(ptyId="xxx")
+- 获取原始输出: ssh_pty_read(ptyId="xxx", mode="raw")`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ptyId: { type: 'string', description: 'PTY 会话 ID' },
+        mode: { type: 'string', enum: ['screen', 'raw'], description: '输出模式：screen（当前屏幕）或 raw（原始流），默认 screen' },
+        clear: { type: 'boolean', description: '(仅 raw 模式) 读取后是否清空缓冲区，默认 true' },
+      },
+      required: ['ptyId'],
+    },
+  },
+  {
+    name: 'ssh_pty_resize',
+    description: '调整 PTY 窗口大小',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ptyId: { type: 'string', description: 'PTY 会话 ID' },
+        rows: { type: 'number', description: '新的行数' },
+        cols: { type: 'number', description: '新的列数' },
+      },
+      required: ['ptyId', 'rows', 'cols'],
+    },
+  },
+  {
+    name: 'ssh_pty_close',
+    description: '关闭 PTY 会话',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ptyId: { type: 'string', description: 'PTY 会话 ID' },
+      },
+      required: ['ptyId'],
+    },
+  },
+  {
+    name: 'ssh_pty_list',
+    description: '列出所有 PTY 会话',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+
+  // ========== 端口转发 ==========
+  {
+    name: 'ssh_forward_local',
+    description: `创建本地端口转发（类似 ssh -L）。
+
+本地监听指定端口，将连接转发到远程主机。
+
+用途：访问远程内网服务
+示例：ssh_forward_local(alias="server", localPort=8080, remoteHost="10.0.0.1", remotePort=80)
+效果：访问本地 localhost:8080 会转发到远程内网的 10.0.0.1:80`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        alias: { type: 'string', description: '连接别名' },
+        localPort: { type: 'number', description: '本地监听端口' },
+        remoteHost: { type: 'string', description: '远程目标主机' },
+        remotePort: { type: 'number', description: '远程目标端口' },
+        localHost: { type: 'string', description: '本地监听地址，默认 127.0.0.1' },
+      },
+      required: ['alias', 'localPort', 'remoteHost', 'remotePort'],
+    },
+  },
+  {
+    name: 'ssh_forward_remote',
+    description: `创建远程端口转发（类似 ssh -R）。
+
+远程监听指定端口，将连接转发到本地。
+
+用途：将本地服务暴露到远程
+示例：ssh_forward_remote(alias="server", remotePort=8080, localHost="127.0.0.1", localPort=3000)
+效果：远程访问 localhost:8080 会转发到本地的 127.0.0.1:3000`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        alias: { type: 'string', description: '连接别名' },
+        remotePort: { type: 'number', description: '远程监听端口' },
+        localHost: { type: 'string', description: '本地目标地址' },
+        localPort: { type: 'number', description: '本地目标端口' },
+        remoteHost: { type: 'string', description: '远程监听地址，默认 127.0.0.1' },
+      },
+      required: ['alias', 'remotePort', 'localHost', 'localPort'],
+    },
+  },
+  {
+    name: 'ssh_forward_close',
+    description: '关闭端口转发',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        forwardId: { type: 'string', description: '端口转发 ID' },
+      },
+      required: ['forwardId'],
+    },
+  },
+  {
+    name: 'ssh_forward_list',
+    description: '列出所有端口转发',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ];
 
 // 注册工具列表
@@ -521,6 +733,163 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args.recursive as boolean | undefined
         );
         result = { success, path: args.remotePath };
+        break;
+      }
+
+      case 'ssh_sync': {
+        const syncResult = await fileOps.syncFiles(
+          args.alias as string,
+          args.localPath as string,
+          args.remotePath as string,
+          args.direction as 'upload' | 'download',
+          {
+            delete: args.delete as boolean | undefined,
+            dryRun: args.dryRun as boolean | undefined,
+            exclude: args.exclude as string[] | undefined,
+            recursive: args.recursive as boolean | undefined,
+          }
+        );
+        result = {
+          ...syncResult,
+          direction: args.direction,
+          localPath: args.localPath,
+          remotePath: args.remotePath,
+        };
+        break;
+      }
+
+      // ========== PTY 会话 ==========
+      case 'ssh_pty_start': {
+        const ptyId = await sessionManager.ptyStart(
+          args.alias as string,
+          args.command as string,
+          {
+            rows: args.rows as number | undefined,
+            cols: args.cols as number | undefined,
+            term: args.term as string | undefined,
+            cwd: args.cwd as string | undefined,
+            env: args.env as Record<string, string> | undefined,
+            bufferSize: args.bufferSize as number | undefined,
+          }
+        );
+        result = {
+          success: true,
+          ptyId,
+          message: `PTY session started: ${args.command}`,
+        };
+        break;
+      }
+
+      case 'ssh_pty_write': {
+        const success = sessionManager.ptyWrite(
+          args.ptyId as string,
+          args.data as string
+        );
+        result = { success, ptyId: args.ptyId };
+        break;
+      }
+
+      case 'ssh_pty_read': {
+        const readResult = sessionManager.ptyRead(
+          args.ptyId as string,
+          {
+            mode: (args.mode as 'screen' | 'raw') || 'screen',
+            clear: args.clear !== false,
+          }
+        );
+        result = {
+          success: true,
+          ptyId: args.ptyId,
+          mode: args.mode || 'screen',
+          ...readResult,
+        };
+        break;
+      }
+
+      case 'ssh_pty_resize': {
+        const success = sessionManager.ptyResize(
+          args.ptyId as string,
+          args.rows as number,
+          args.cols as number
+        );
+        result = { success, ptyId: args.ptyId };
+        break;
+      }
+
+      case 'ssh_pty_close': {
+        const success = sessionManager.ptyClose(args.ptyId as string);
+        result = {
+          success,
+          message: success
+            ? `PTY session closed: ${args.ptyId}`
+            : `PTY session not found: ${args.ptyId}`,
+        };
+        break;
+      }
+
+      case 'ssh_pty_list': {
+        const ptySessions = sessionManager.ptyList();
+        result = {
+          success: true,
+          count: ptySessions.length,
+          sessions: ptySessions,
+        };
+        break;
+      }
+
+      // ========== 端口转发 ==========
+      case 'ssh_forward_local': {
+        const forwardId = await sessionManager.forwardLocal(
+          args.alias as string,
+          args.localPort as number,
+          args.remoteHost as string,
+          args.remotePort as number,
+          (args.localHost as string) || '127.0.0.1'
+        );
+        result = {
+          success: true,
+          forwardId,
+          type: 'local',
+          message: `Local forward: ${args.localHost || '127.0.0.1'}:${args.localPort} -> ${args.remoteHost}:${args.remotePort}`,
+        };
+        break;
+      }
+
+      case 'ssh_forward_remote': {
+        const forwardId = await sessionManager.forwardRemote(
+          args.alias as string,
+          args.remotePort as number,
+          args.localHost as string,
+          args.localPort as number,
+          (args.remoteHost as string) || '127.0.0.1'
+        );
+        result = {
+          success: true,
+          forwardId,
+          type: 'remote',
+          message: `Remote forward: ${args.remoteHost || '127.0.0.1'}:${args.remotePort} -> ${args.localHost}:${args.localPort}`,
+        };
+        break;
+      }
+
+      case 'ssh_forward_close': {
+        const success = sessionManager.forwardClose(args.forwardId as string);
+        result = {
+          success,
+          message: success
+            ? `Forward closed: ${args.forwardId}`
+            : `Forward not found: ${args.forwardId}`,
+        };
+        break;
+      }
+
+      case 'ssh_forward_list': {
+        const forwards = sessionManager.forwardList();
+        result = {
+          success: true,
+          count: forwards.length,
+          forwards,
+        };
         break;
       }
 

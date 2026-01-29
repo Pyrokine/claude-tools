@@ -14,7 +14,13 @@
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["mcp", "ssh", "claude", "remote", "automation"],
+  "keywords": [
+    "mcp",
+    "ssh",
+    "claude",
+    "remote",
+    "automation"
+  ],
   "author": "pyro",
   "license": "MIT",
   "repository": {
@@ -23,6 +29,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
+    "@xterm/headless": "^6.0.0",
     "ssh2": "^1.17.0"
   },
   "devDependencies": {
