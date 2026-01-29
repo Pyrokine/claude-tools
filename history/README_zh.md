@@ -8,6 +8,10 @@ Claude Code 对话历史搜索工具
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
+![Linux](https://img.shields.io/badge/Linux_x86__64-tested-success)
+![macOS](https://img.shields.io/badge/macOS-untested-yellow)
+![Windows](https://img.shields.io/badge/Windows-unsupported-red)
+
 ## 功能特性
 
 - **搜索**：全文搜索，支持正则、时间过滤、类型过滤

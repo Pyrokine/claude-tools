@@ -8,6 +8,10 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D18-green.svg)](https://nodejs.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
+![Linux](https://img.shields.io/badge/Linux-tested-success)
+![macOS](https://img.shields.io/badge/macOS-untested-yellow)
+![Windows](https://img.shields.io/badge/Windows-untested-yellow)
+
 ## 功能特性
 
 - **多种认证方式**：密码、SSH 密钥、SSH Agent
