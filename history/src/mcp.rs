@@ -533,29 +533,39 @@ fn execute_sessions(config: &Config, args: Value) -> Result<Value, Value> {
 }
 
 fn parse_datetime(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+
     let s = s?;
-    let now = chrono::Utc::now();
+    // 使用本地时区
+    let local = chrono::Local::now();
+    let local_tz = local.timezone();
 
     match s {
         "today" => {
-            let start = now.date_naive().and_hms_opt(0, 0, 0)?;
-            Some(chrono::DateTime::from_naive_utc_and_offset(start, chrono::Utc))
+            // 今天 0 点（本地时间）转 UTC
+            let start = local.date_naive().and_hms_opt(0, 0, 0)?;
+            let local_dt = local_tz.from_local_datetime(&start).single()?;
+            Some(local_dt.with_timezone(&chrono::Utc))
         }
-        "week" => Some(now - chrono::Duration::days(7)),
-        "month" => Some(now - chrono::Duration::days(30)),
+        "week" => Some(chrono::Utc::now() - chrono::Duration::days(7)),
+        "month" => Some(chrono::Utc::now() - chrono::Duration::days(30)),
         _ => {
             // 优先尝试 RFC3339（带时区）
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
                 return Some(dt.with_timezone(&chrono::Utc));
             }
-            // 尝试 ISO8601 格式（不带时区，假设 UTC）
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-                return Some(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc));
+            // 尝试 ISO8601 格式（不带时区，假设本地时间）
+            if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+                if let Some(local_dt) = local_tz.from_local_datetime(&naive_dt).single() {
+                    return Some(local_dt.with_timezone(&chrono::Utc));
+                }
             }
-            // 尝试只有日期
+            // 尝试只有日期（本地时间 0 点）
             if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                let dt = date.and_hms_opt(0, 0, 0)?;
-                return Some(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc));
+                let naive_dt = date.and_hms_opt(0, 0, 0)?;
+                if let Some(local_dt) = local_tz.from_local_datetime(&naive_dt).single() {
+                    return Some(local_dt.with_timezone(&chrono::Utc));
+                }
             }
             None
         }
