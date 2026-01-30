@@ -1,4 +1,4 @@
-# claude-history
+# mcp-claude-history
 
 [English](README.md) | 中文
 
@@ -28,9 +28,9 @@ Claude Code 对话历史搜索工具
 
 ```bash
 # 下载并安装
-curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/claude-history-linux-x86_64.tar.gz | tar xz
-chmod +x claude-history
-mv claude-history ~/.local/bin/
+curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz | tar xz
+chmod +x mcp-claude-history
+mv mcp-claude-history ~/.local/bin/
 ```
 
 ### 从源码编译
@@ -40,7 +40,7 @@ mv claude-history ~/.local/bin/
 cargo build --release --target x86_64-unknown-linux-musl
 
 # 安装
-cp target/x86_64-unknown-linux-musl/release/claude-history ~/.local/bin/
+cp target/x86_64-unknown-linux-musl/release/mcp-claude-history ~/.local/bin/
 ```
 
 ## 配置
@@ -48,7 +48,7 @@ cp target/x86_64-unknown-linux-musl/release/claude-history ~/.local/bin/
 ### Claude Code
 
 ```bash
-claude mcp add claude-history -- claude-history --mcp
+claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 ```
 
 ### Claude Desktop / 其他客户端
@@ -56,8 +56,8 @@ claude mcp add claude-history -- claude-history --mcp
 ```json
 {
   "mcpServers": {
-    "claude-history": {
-      "command": "claude-history",
+    "mcp-claude-history": {
+      "command": "mcp-claude-history",
       "args": ["--mcp"]
     }
   }
@@ -104,14 +104,19 @@ claude mcp add claude-history -- claude-history --mcp
 
 ### history_context
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `ref` | string | 必填，消息定位 |
-| `before` | number | 向前取 N 条 |
-| `after` | number | 向后取 N 条 |
-| `until_type` | string | 持续到指定类型 |
-| `direction` | string | forward/backward |
-| `project` | string | 项目 ID |
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `ref` | string | - | 必填，消息定位 |
+| `before` | number | - | 向前取 N 条（指定 `types` 时仅计数匹配类型） |
+| `after` | number | - | 向后取 N 条（指定 `types` 时仅计数匹配类型） |
+| `until_type` | string | - | 持续到指定类型 |
+| `direction` | string | forward | forward/backward |
+| `types` | string | - | 要包含的消息类型（逗号分隔） |
+| `project` | string | - | 项目 ID |
+| `max_content` | number | 4000 | 单条最大字符数 |
+| `max_total` | number | 40000 | 总最大字符数 |
+
+**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，即使其类型不在 `types` 过滤列表中。
 
 ## 使用示例
 
@@ -119,49 +124,52 @@ claude mcp add claude-history -- claude-history --mcp
 
 ```bash
 # 基础搜索
-claude-history search "error"
+mcp-claude-history search "error"
 
 # 正则搜索
-claude-history search "error|warning" --regex
+mcp-claude-history search "error|warning" --regex
 
 # 最近的消息
-claude-history search "" --since today --limit 10
+mcp-claude-history search "" --since today --limit 10
 
 # 搜索指定项目
-claude-history search "bug" --project -home-user-myproject
+mcp-claude-history search "bug" --project -home-user-myproject
 ```
 
 ### 获取完整内容
 
 ```bash
 # 通过 ref 获取消息
-claude-history get --ref c86bc677:1234
+mcp-claude-history get --ref c86bc677:1234
 
 # 导出到目录（包含图片）
-claude-history get --ref c86bc677:1234 --output /tmp/export
+mcp-claude-history get --ref c86bc677:1234 --output /tmp/export
 
 # 分块获取大内容
-claude-history get --ref c86bc677:1234 --range 0-100000
+mcp-claude-history get --ref c86bc677:1234 --range 0-100000
 ```
 
 ### 获取上下文
 
 ```bash
 # 获取前后各 5 条消息
-claude-history context --ref c86bc677:1234 --before 5 --after 5
+mcp-claude-history context --ref c86bc677:1234 --before 5 --after 5
+
+# 获取前 10 条 user 消息（按类型过滤）
+mcp-claude-history context --ref c86bc677:1234 --before 10 --types user
 
 # 获取直到下一条用户消息
-claude-history context --ref c86bc677:1234 --until-type user --direction forward
+mcp-claude-history context --ref c86bc677:1234 --until-type user --direction forward
 ```
 
 ### 浏览
 
 ```bash
 # 列出所有项目
-claude-history projects
+mcp-claude-history projects
 
 # 列出项目的会话
-claude-history sessions --project -home-user-myproject
+mcp-claude-history sessions --project -home-user-myproject
 ```
 
 ## ref 格式

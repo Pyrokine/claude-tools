@@ -1,4 +1,4 @@
-# claude-history
+# mcp-claude-history
 
 English | [中文](README_zh.md)
 
@@ -28,9 +28,9 @@ Download the latest release from [GitHub Releases](https://github.com/Pyrokine/c
 
 ```bash
 # Download and install
-curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/claude-history-linux-x86_64.tar.gz | tar xz
-chmod +x claude-history
-mv claude-history ~/.local/bin/
+curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz | tar xz
+chmod +x mcp-claude-history
+mv mcp-claude-history ~/.local/bin/
 ```
 
 ### Build from Source
@@ -40,7 +40,7 @@ mv claude-history ~/.local/bin/
 cargo build --release --target x86_64-unknown-linux-musl
 
 # Install
-cp target/x86_64-unknown-linux-musl/release/claude-history ~/.local/bin/
+cp target/x86_64-unknown-linux-musl/release/mcp-claude-history ~/.local/bin/
 ```
 
 ## Configuration
@@ -48,7 +48,7 @@ cp target/x86_64-unknown-linux-musl/release/claude-history ~/.local/bin/
 ### Claude Code
 
 ```bash
-claude mcp add claude-history -- claude-history --mcp
+claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 ```
 
 ### Claude Desktop / Other Clients
@@ -56,8 +56,8 @@ claude mcp add claude-history -- claude-history --mcp
 ```json
 {
   "mcpServers": {
-    "claude-history": {
-      "command": "claude-history",
+    "mcp-claude-history": {
+      "command": "mcp-claude-history",
       "args": ["--mcp"]
     }
   }
@@ -104,14 +104,19 @@ claude mcp add claude-history -- claude-history --mcp
 
 ### history_context
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `ref` | string | Required. Message ref |
-| `before` | number | Messages before |
-| `after` | number | Messages after |
-| `until_type` | string | Continue until this type |
-| `direction` | string | forward/backward |
-| `project` | string | Project ID |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ref` | string | - | Required. Message ref |
+| `before` | number | - | Messages before (counts only matching types if `types` specified) |
+| `after` | number | - | Messages after (counts only matching types if `types` specified) |
+| `until_type` | string | - | Continue until this type |
+| `direction` | string | forward | forward/backward |
+| `types` | string | - | Message types to include (comma-separated) |
+| `project` | string | - | Project ID |
+| `max_content` | number | 4000 | Max chars per message |
+| `max_total` | number | 40000 | Max total chars |
+
+**Note**: The anchor message (specified by `ref`) is always included in results, even if its type is not in the `types` filter.
 
 ## Usage Examples
 
@@ -119,49 +124,52 @@ claude mcp add claude-history -- claude-history --mcp
 
 ```bash
 # Basic search
-claude-history search "error"
+mcp-claude-history search "error"
 
 # Regex search
-claude-history search "error|warning" --regex
+mcp-claude-history search "error|warning" --regex
 
 # Recent messages
-claude-history search "" --since today --limit 10
+mcp-claude-history search "" --since today --limit 10
 
 # Search specific project
-claude-history search "bug" --project -home-user-myproject
+mcp-claude-history search "bug" --project -home-user-myproject
 ```
 
 ### Get Full Content
 
 ```bash
 # Get message by ref
-claude-history get --ref c86bc677:1234
+mcp-claude-history get --ref c86bc677:1234
 
 # Export to directory (with images)
-claude-history get --ref c86bc677:1234 --output /tmp/export
+mcp-claude-history get --ref c86bc677:1234 --output /tmp/export
 
 # Chunked retrieval for large content
-claude-history get --ref c86bc677:1234 --range 0-100000
+mcp-claude-history get --ref c86bc677:1234 --range 0-100000
 ```
 
 ### Get Context
 
 ```bash
 # Get 5 messages before and after
-claude-history context --ref c86bc677:1234 --before 5 --after 5
+mcp-claude-history context --ref c86bc677:1234 --before 5 --after 5
+
+# Get 10 user messages before (filter by type)
+mcp-claude-history context --ref c86bc677:1234 --before 10 --types user
 
 # Get messages until next user message
-claude-history context --ref c86bc677:1234 --until-type user --direction forward
+mcp-claude-history context --ref c86bc677:1234 --until-type user --direction forward
 ```
 
 ### Browse
 
 ```bash
 # List all projects
-claude-history projects
+mcp-claude-history projects
 
 # List sessions in a project
-claude-history sessions --project -home-user-myproject
+mcp-claude-history sessions --project -home-user-myproject
 ```
 
 ## Ref Format

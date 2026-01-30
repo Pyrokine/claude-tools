@@ -160,11 +160,11 @@ fn get_tools() -> Vec<Value> {
                     },
                     "before": {
                         "type": "number",
-                        "description": "Number of messages before"
+                        "description": "Number of messages before (counts only matching types if types specified)"
                     },
                     "after": {
                         "type": "number",
-                        "description": "Number of messages after"
+                        "description": "Number of messages after (counts only matching types if types specified)"
                     },
                     "until_type": {
                         "type": "string",
@@ -176,9 +176,23 @@ fn get_tools() -> Vec<Value> {
                         "description": "Direction to search",
                         "default": "forward"
                     },
+                    "types": {
+                        "type": "string",
+                        "description": "Message types to include: user,assistant,summary (comma-separated)"
+                    },
                     "project": {
                         "type": "string",
                         "description": "Project ID"
+                    },
+                    "max_content": {
+                        "type": "number",
+                        "description": "Max characters per message",
+                        "default": 4000
+                    },
+                    "max_total": {
+                        "type": "number",
+                        "description": "Max total characters",
+                        "default": 40000
                     }
                 },
                 "required": ["ref"]
@@ -498,7 +512,10 @@ fn execute_context(config: &Config, args: Value) -> Result<Value, Value> {
     let after = args.get("after").and_then(|v| v.as_u64()).map(|v| v as usize);
     let until_type = args.get("until_type").and_then(|v| v.as_str());
     let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("forward");
+    let types = args.get("types").and_then(|v| v.as_str());
     let project = args.get("project").and_then(|v| v.as_str());
+    let max_content = args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+    let max_total = args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(40000) as usize;
 
     let params = ContextParams {
         r#ref: r#ref.to_string(),
@@ -507,7 +524,9 @@ fn execute_context(config: &Config, args: Value) -> Result<Value, Value> {
         until_type: until_type.map(String::from),
         direction: direction.to_string(),
         project: project.map(String::from),
-        max_content: 4000,
+        types: types.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+        max_content,
+        max_total,
     };
 
     match context(config, params) {

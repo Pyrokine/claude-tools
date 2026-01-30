@@ -15,6 +15,7 @@
 ## 功能特性
 
 - **多种认证方式**：密码、SSH 密钥、SSH Agent
+- **SSH Config 支持**：读取 `~/.ssh/config`，支持 Host 多别名、`Host *` 继承、ProxyJump（`user@host:port` 格式）
 - **连接管理**：连接池复用、心跳保持、自动重连
 - **会话持久化**：会话信息保存，支持重连
 - **命令执行**：
@@ -23,6 +24,7 @@
   - `sudo` 执行
   - `su` 切换用户执行
   - 批量执行
+  - 多主机并行执行
 - **持久化 PTY 会话**：用于长时间运行的交互式命令（top、htop、tmux、vim 等）
   - 输出缓冲区，支持轮询读取
   - 发送按键和命令
@@ -56,7 +58,7 @@ npm install -g @pyrokine/mcp-ssh
 
 ```bash
 git clone https://github.com/Pyrokine/claude-mcp-tools.git
-cd claude-mcp-tools/ssh
+cd claude-mcp-tools/mcp-ssh
 npm install
 npm run build
 ```
@@ -84,16 +86,17 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 }
 ```
 
-## 可用工具（27 个）
+## 可用工具（29 个）
 
 ### 连接管理
 
 | 工具 | 描述 |
 |------|------|
-| `ssh_connect` | 建立 SSH 连接并保持心跳 |
+| `ssh_connect` | 建立 SSH 连接（支持 ~/.ssh/config） |
 | `ssh_disconnect` | 关闭连接 |
 | `ssh_list_sessions` | 列出活跃会话 |
 | `ssh_reconnect` | 重新连接断开的会话 |
+| `ssh_config_list` | 列出 ~/.ssh/config 中的 Host |
 
 ### 命令执行
 
@@ -103,6 +106,7 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_exec_as_user` | 以其他用户身份执行（通过 `su`） |
 | `ssh_exec_sudo` | 使用 `sudo` 执行 |
 | `ssh_exec_batch` | 批量执行多条命令 |
+| `ssh_exec_parallel` | 在多台主机上并行执行命令 |
 | `ssh_quick_exec` | 一次性执行：连接、执行、断开 |
 
 ### 文件操作
@@ -140,12 +144,74 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 
 ## 使用示例
 
+### 使用 SSH Config（推荐）
+
+如果已在 `~/.ssh/config` 中配置了主机：
+
+```
+# 列出可用主机
+ssh_config_list()
+
+# 使用配置的主机名连接
+ssh_connect(configHost="myserver")
+ssh_exec(alias="myserver", command="uptime")
+
+# 使用自定义配置文件路径
+ssh_connect(configHost="myserver", configPath="/custom/path/config")
+```
+
+支持的 SSH config 特性：
+- `Host` 多别名（如 `Host a b c`）
+- `Host *` 全局默认继承（仅第一个 `Host *` 块）
+- `HostName`、`User`、`Port`、`IdentityFile`
+- `ProxyJump`，支持 `user@host:port` 格式（仅第一跳）
+- 显式参数优先于 config 值（如 `ssh_connect(configHost="x", user="覆盖值")`）
+
+**不支持**（跳过）：
+- `Include` 指令
+- `Match` 块（整个块跳过直到下一个 `Host`）
+- 通配符模式（如 `Host *.example.com`）
+
+**行为说明**：
+- 多个 `Host *` 块：仅使用第一个
+- 重复的 Host 定义：`ssh_config_list` 显示全部，`ssh_connect` 使用第一个
+- ProxyJump 中的 IPv6：使用方括号格式 `[2001:db8::1]:22`
+
+### 多主机并行执行
+
+在多个已连接的主机上并行执行同一命令：
+
+```
+1. ssh_connect(configHost="server1")
+2. ssh_connect(configHost="server2")
+3. ssh_connect(configHost="server3")
+4. ssh_exec_parallel(aliases=["server1", "server2", "server3"], command="uptime")
+```
+
 ### 基础：连接和执行
 
 ```
-1. ssh_connect(host="192.168.1.100", user="root", password="xxx", alias="myserver")
-2. ssh_exec(alias="myserver", command="ls -la /home")
-3. ssh_disconnect(alias="myserver")
+ssh_connect(host="192.168.1.100", user="root", keyPath="/home/.ssh/id_rsa", alias="myserver")
+ssh_exec(alias="myserver", command="ls -la /home")
+ssh_disconnect(alias="myserver")
+```
+
+### 跳板机
+
+通过跳板机连接内网服务器：
+
+```
+ssh_connect(
+  host="10.0.0.5",
+  user="root",
+  keyPath="/home/.ssh/id_rsa",
+  alias="internal",
+  jumpHost={
+    host: "bastion.example.com",
+    user: "admin",
+    keyPath: "/home/.ssh/bastion_key"
+  }
+)
 ```
 
 ### 切换用户执行（su）
@@ -342,14 +408,6 @@ mcp-ssh/
 ├── tsconfig.json
 └── README.md
 ```
-
-## 路线图
-
-- [ ] 动态端口转发（SOCKS 代理）
-- [ ] SSH Agent 转发
-- [ ] 命令历史和审计日志
-- [ ] 多主机并行执行
-- [ ] SSH 配置文件（~/.ssh/config）自动发现
 
 ## 贡献
 

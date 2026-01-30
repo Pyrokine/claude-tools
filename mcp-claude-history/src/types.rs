@@ -97,6 +97,8 @@ pub struct OutputInfo {
 pub struct ContextResponse {
     pub anchor_ref: String,
     pub messages: Vec<ContextMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

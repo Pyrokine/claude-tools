@@ -25,6 +25,7 @@ import {
 import { sessionManager } from './session-manager.js';
 import * as fileOps from './file-ops.js';
 import { ExecOptions, PtyOptions } from './types.js';
+import { parseSSHConfig, getHostConfig, parseProxyJump, SSHConfigHost } from './ssh-config.js';
 
 // 创建 MCP Server
 const server = new Server(
@@ -46,28 +47,43 @@ const tools: Tool[] = [
     name: 'ssh_connect',
     description: `建立 SSH 连接并保持会话。支持密码、密钥认证，支持跳板机。
 
+可通过 configHost 参数使用 ~/.ssh/config 中的配置，无需重复填写连接信息。
+支持 Host 多别名、Host * 全局默认继承、ProxyJump（user@host:port 格式）。
+
 示例:
-- 密码认证: ssh_connect(host="192.168.1.1", user="root", password="xxx")
+- 使用 ssh config: ssh_connect(configHost="myserver")
 - 密钥认证: ssh_connect(host="192.168.1.1", user="root", keyPath="/home/.ssh/id_rsa")
-- 自定义别名: ssh_connect(..., alias="myserver")
-- 设置环境变量: ssh_connect(..., env={"LANG": "en_US.UTF-8"})`,
+- 跳板机: ssh_connect(host="内网IP", user="root", keyPath="...", jumpHost={host:"跳板机IP", user:"root", keyPath:"..."})`,
     inputSchema: {
       type: 'object',
       properties: {
-        host: { type: 'string', description: '服务器地址' },
-        user: { type: 'string', description: '用户名' },
-        password: { type: 'string', description: '密码（与 keyPath 二选一）' },
+        configHost: { type: 'string', description: '使用 ~/.ssh/config 中的 Host 配置（推荐）' },
+        configPath: { type: 'string', description: 'SSH 配置文件路径（默认 ~/.ssh/config）' },
+        host: { type: 'string', description: '服务器地址（使用 configHost 时可省略）' },
+        user: { type: 'string', description: '用户名（使用 configHost 时可省略）' },
+        password: { type: 'string', description: '密码' },
         keyPath: { type: 'string', description: 'SSH 私钥路径' },
-        port: { type: 'number', description: 'SSH 端口，默认 22', default: 22 },
-        alias: { type: 'string', description: '连接别名（可选，用于后续引用）' },
+        port: { type: 'number', description: 'SSH 端口，默认 22' },
+        alias: { type: 'string', description: '连接别名（可选，默认使用 configHost 或 host）' },
         env: {
           type: 'object',
-          description: '环境变量，如 {"LANG": "en_US.UTF-8"}',
+          description: '环境变量',
           additionalProperties: { type: 'string' },
         },
         keepaliveInterval: { type: 'number', description: '心跳间隔（毫秒），默认 30000' },
+        jumpHost: {
+          type: 'object',
+          description: '跳板机配置',
+          properties: {
+            host: { type: 'string', description: '跳板机地址' },
+            user: { type: 'string', description: '跳板机用户名' },
+            password: { type: 'string', description: '跳板机密码' },
+            keyPath: { type: 'string', description: '跳板机私钥路径' },
+            port: { type: 'number', description: '跳板机端口，默认 22' },
+          },
+          required: ['host', 'user'],
+        },
       },
-      required: ['host', 'user'],
     },
   },
   {
@@ -496,6 +512,44 @@ rsync 可实现增量传输，对大目录同步效率更高。
       properties: {},
     },
   },
+
+  // ========== SSH Config ==========
+  {
+    name: 'ssh_config_list',
+    description: `列出 ~/.ssh/config 中配置的所有 Host。
+
+返回每个 Host 的配置信息（别名、地址、用户、端口、密钥路径等）。`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        configPath: { type: 'string', description: 'SSH 配置文件路径（默认 ~/.ssh/config）' },
+      },
+    },
+  },
+
+  // ========== 批量执行 ==========
+  {
+    name: 'ssh_exec_parallel',
+    description: `在多个已连接的会话上并行执行同一命令。
+
+示例：
+- ssh_exec_parallel(aliases=["server1", "server2"], command="uptime")
+
+返回每个主机的执行结果。`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        aliases: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '连接别名列表',
+        },
+        command: { type: 'string', description: '要执行的命令' },
+        timeout: { type: 'number', description: '每个命令的超时（毫秒），默认 30000' },
+      },
+      required: ['aliases', 'command'],
+    },
+  },
 ];
 
 // 注册工具列表
@@ -513,20 +567,81 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       // ========== 连接管理 ==========
       case 'ssh_connect': {
+        // 解析 configHost
+        let host = args.host as string | undefined;
+        let user = args.user as string | undefined;
+        let port = args.port as number | undefined;
+        let keyPath = args.keyPath as string | undefined;
+        const configPath = args.configPath as string | undefined;
+        let jumpHostResolved: { host: string; port: number; username: string; password?: string; privateKeyPath?: string } | undefined;
+
+        if (args.configHost) {
+          const allHosts = parseSSHConfig(configPath);
+          const hostConfig = allHosts.find(h => h.host === args.configHost);
+          if (!hostConfig) {
+            throw new Error(`Host '${args.configHost}' not found in SSH config`);
+          }
+          // 显式参数优先于 config 值
+          host = host || hostConfig.hostName || hostConfig.host;
+          user = user || hostConfig.user;
+          port = port || hostConfig.port;
+          keyPath = keyPath || hostConfig.identityFile;
+
+          // 解析 ProxyJump（支持 user@host:port 格式）
+          if (hostConfig.proxyJump) {
+            const parsed = parseProxyJump(hostConfig.proxyJump);
+            if (parsed) {
+              // 先尝试在 config 中查找对应的 Host
+              const jumpHostConfig = allHosts.find(h => h.host === parsed.host);
+              if (jumpHostConfig) {
+                // 使用 config 中的配置，但 parsed 的 user/port 优先
+                jumpHostResolved = {
+                  host: jumpHostConfig.hostName || jumpHostConfig.host,
+                  port: parsed.port || jumpHostConfig.port || 22,
+                  username: parsed.user || jumpHostConfig.user || 'root',
+                  privateKeyPath: jumpHostConfig.identityFile,
+                };
+              } else {
+                // 直接使用 parsed 的值
+                jumpHostResolved = {
+                  host: parsed.host,
+                  port: parsed.port || 22,
+                  username: parsed.user || 'root',
+                };
+              }
+            }
+          }
+        }
+
+        if (!host || !user) {
+          throw new Error('host and user are required (either directly or via configHost)');
+        }
+
+        // 手动指定的 jumpHost 优先级高于 ProxyJump
+        const jumpHostArg = args.jumpHost as { host: string; user: string; password?: string; keyPath?: string; port?: number } | undefined;
+        const jumpHost = jumpHostArg ? {
+          host: jumpHostArg.host,
+          port: jumpHostArg.port || 22,
+          username: jumpHostArg.user,
+          password: jumpHostArg.password,
+          privateKeyPath: jumpHostArg.keyPath,
+        } : jumpHostResolved;
+
         const alias = await sessionManager.connect({
-          host: args.host as string,
-          port: (args.port as number) || 22,
-          username: args.user as string,
+          host,
+          port: port || 22,
+          username: user,
           password: args.password as string | undefined,
-          privateKeyPath: args.keyPath as string | undefined,
-          alias: args.alias as string | undefined,
+          privateKeyPath: keyPath,
+          alias: (args.alias as string | undefined) || (args.configHost as string | undefined),
           env: args.env as Record<string, string> | undefined,
           keepaliveInterval: args.keepaliveInterval as number | undefined,
+          jumpHost,
         });
         result = {
           success: true,
           alias,
-          message: `Connected to ${args.user}@${args.host}:${args.port || 22}`,
+          message: `Connected to ${user}@${host}:${port || 22}${jumpHost ? ' via jump host' : ''}`,
         };
         break;
       }
@@ -889,6 +1004,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           success: true,
           count: forwards.length,
           forwards,
+        };
+        break;
+      }
+
+      // ========== SSH Config ==========
+      case 'ssh_config_list': {
+        const hosts = parseSSHConfig(args.configPath as string | undefined);
+        result = {
+          success: true,
+          count: hosts.length,
+          hosts: hosts.map(h => ({
+            host: h.host,
+            hostName: h.hostName,
+            user: h.user,
+            port: h.port,
+            identityFile: h.identityFile,
+            proxyJump: h.proxyJump,
+          })),
+        };
+        break;
+      }
+
+      // ========== 批量执行 ==========
+      case 'ssh_exec_parallel': {
+        const aliases = args.aliases as string[];
+        const command = args.command as string;
+        const timeout = args.timeout as number | undefined;
+
+        const execPromises = aliases.map(async (alias) => {
+          try {
+            const execResult = await sessionManager.exec(alias, command, { timeout });
+            return {
+              alias,
+              success: execResult.success,
+              exitCode: execResult.exitCode,
+              stdout: execResult.stdout,
+              stderr: execResult.stderr,
+              duration: execResult.duration,
+            };
+          } catch (err: any) {
+            return {
+              alias,
+              success: false,
+              error: err.message,
+            };
+          }
+        });
+
+        const results = await Promise.all(execPromises);
+        result = {
+          success: results.every(r => r.success),
+          total: aliases.length,
+          results,
         };
         break;
       }

@@ -15,6 +15,7 @@ A comprehensive SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.
 ## Features
 
 - **Multiple Authentication**: Password, SSH key, SSH agent
+- **SSH Config Support**: Read `~/.ssh/config` with Host aliases, `Host *` inheritance, ProxyJump (`user@host:port`)
 - **Connection Management**: Connection pooling, keepalive, auto-reconnect
 - **Session Persistence**: Sessions info saved for reconnection
 - **Command Execution**:
@@ -23,6 +24,7 @@ A comprehensive SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.
   - `sudo` execution
   - `su` (switch user) execution - *run commands as different user*
   - Batch execution
+  - Parallel execution on multiple hosts
 - **Persistent PTY Sessions**: For long-running interactive commands (top, htop, tmux, vim, etc.)
   - Output buffering with polling read
   - Send keystrokes and commands
@@ -56,7 +58,7 @@ npm install -g @pyrokine/mcp-ssh
 
 ```bash
 git clone https://github.com/Pyrokine/claude-mcp-tools.git
-cd claude-mcp-tools/ssh
+cd claude-mcp-tools/mcp-ssh
 npm install
 npm run build
 ```
@@ -84,16 +86,17 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 }
 ```
 
-## Available Tools (27 tools)
+## Available Tools (29 tools)
 
 ### Connection Management
 
 | Tool | Description |
 |------|-------------|
-| `ssh_connect` | Establish SSH connection with keepalive |
+| `ssh_connect` | Establish SSH connection (supports ~/.ssh/config) |
 | `ssh_disconnect` | Close connection |
 | `ssh_list_sessions` | List active sessions |
 | `ssh_reconnect` | Reconnect a disconnected session |
+| `ssh_config_list` | List hosts from ~/.ssh/config |
 
 ### Command Execution
 
@@ -103,6 +106,7 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 | `ssh_exec_as_user` | Execute as different user (via `su`) |
 | `ssh_exec_sudo` | Execute with `sudo` |
 | `ssh_exec_batch` | Execute multiple commands sequentially |
+| `ssh_exec_parallel` | Execute command on multiple hosts in parallel |
 | `ssh_quick_exec` | One-shot: connect, execute, disconnect |
 
 ### File Operations
@@ -140,12 +144,74 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 
 ## Usage Examples
 
+### Using SSH Config (Recommended)
+
+If you have hosts configured in `~/.ssh/config`:
+
+```
+# List available hosts
+ssh_config_list()
+
+# Connect using config host name
+ssh_connect(configHost="myserver")
+ssh_exec(alias="myserver", command="uptime")
+
+# Use custom config file path
+ssh_connect(configHost="myserver", configPath="/custom/path/config")
+```
+
+Supported SSH config features:
+- `Host` with multiple aliases (e.g., `Host a b c`)
+- `Host *` global defaults inheritance (first `Host *` block only)
+- `HostName`, `User`, `Port`, `IdentityFile`
+- `ProxyJump` with `user@host:port` format (first hop only)
+- Explicit parameters override config values (e.g., `ssh_connect(configHost="x", user="override")`)
+
+**Not supported** (skipped):
+- `Include` directive
+- `Match` blocks (entire block skipped until next `Host`)
+- Wildcard patterns (e.g., `Host *.example.com`)
+
+**Behavior notes**:
+- Multiple `Host *` blocks: only first is used
+- Duplicate Host definitions: `ssh_config_list` shows all, `ssh_connect` uses first
+- IPv6 in ProxyJump: use bracket notation `[2001:db8::1]:22`
+
+### Parallel Execution on Multiple Hosts
+
+Execute the same command on multiple connected hosts:
+
+```
+1. ssh_connect(configHost="server1")
+2. ssh_connect(configHost="server2")
+3. ssh_connect(configHost="server3")
+4. ssh_exec_parallel(aliases=["server1", "server2", "server3"], command="uptime")
+```
+
 ### Basic: Connect and Execute
 
 ```
-1. ssh_connect(host="192.168.1.100", user="root", password="xxx", alias="myserver")
-2. ssh_exec(alias="myserver", command="ls -la /home")
-3. ssh_disconnect(alias="myserver")
+ssh_connect(host="192.168.1.100", user="root", keyPath="/home/.ssh/id_rsa", alias="myserver")
+ssh_exec(alias="myserver", command="ls -la /home")
+ssh_disconnect(alias="myserver")
+```
+
+### Jump Host (Bastion)
+
+Connect to internal server via jump host:
+
+```
+ssh_connect(
+  host="10.0.0.5",
+  user="root",
+  keyPath="/home/.ssh/id_rsa",
+  alias="internal",
+  jumpHost={
+    host: "bastion.example.com",
+    user: "admin",
+    keyPath: "/home/.ssh/bastion_key"
+  }
+)
 ```
 
 ### Switch User Execution (su)
@@ -342,14 +408,6 @@ mcp-ssh/
 ├── tsconfig.json
 └── README.md
 ```
-
-## Roadmap
-
-- [ ] Dynamic port forwarding (SOCKS proxy)
-- [ ] SSH Agent forwarding
-- [ ] Command history and audit logging
-- [ ] Multi-host parallel execution
-- [ ] SSH config file (~/.ssh/config) auto-discovery
 
 ## Contributing
 

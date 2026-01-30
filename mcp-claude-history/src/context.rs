@@ -13,7 +13,9 @@ pub struct ContextParams {
     pub until_type: Option<String>,
     pub direction: String,
     pub project: Option<String>,
+    pub types: Vec<String>,
     pub max_content: usize,
+    pub max_total: usize,
 }
 
 impl Default for ContextParams {
@@ -25,9 +27,16 @@ impl Default for ContextParams {
             until_type: None,
             direction: "forward".to_string(),
             project: None,
+            types: vec![],
             max_content: 4000,
+            max_total: 40000,
         }
     }
+}
+
+/// 检查消息类型是否匹配
+fn matches_types(msg_type: &str, types: &[String]) -> bool {
+    types.is_empty() || types.iter().any(|t| t == msg_type)
 }
 
 /// 获取上下文
@@ -84,7 +93,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
 
     // 确定上下文范围
     let (start_idx, end_idx) = if let Some(until_type) = &params.until_type {
-        // until_type 模式
+        // until_type 模式：遇到指定类型就停止
         if params.direction == "backward" {
             // 向前查找
             let mut start = anchor_idx;
@@ -107,30 +116,77 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             (anchor_idx, end)
         }
     } else {
-        // before/after 模式
+        // before/after 模式：按匹配类型计数
         let before = params.before.unwrap_or(0);
         let after = params.after.unwrap_or(0);
-        let start = anchor_idx.saturating_sub(before);
-        let end = (anchor_idx + after + 1).min(all_messages.len());
+
+        // 向前查找 before 条匹配类型的消息
+        let mut start = anchor_idx;
+        if before > 0 {
+            let mut count = 0;
+            for i in (0..anchor_idx).rev() {
+                if matches_types(&all_messages[i].1.msg_type, &params.types) {
+                    count += 1;
+                    start = i;
+                    if count >= before {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 向后查找 after 条匹配类型的消息
+        let mut end = anchor_idx + 1;
+        if after > 0 {
+            let mut count = 0;
+            for i in (anchor_idx + 1)..all_messages.len() {
+                if matches_types(&all_messages[i].1.msg_type, &params.types) {
+                    count += 1;
+                    end = i + 1;
+                    if count >= after {
+                        break;
+                    }
+                }
+            }
+        }
+
         (start, end)
     };
 
     // 构建结果
     let mut messages = Vec::new();
+    let mut total_chars = 0;
+    let mut truncated_by_total = false;
+
     for i in start_idx..end_idx {
         let (line_num, record, content) = &all_messages[i];
+
+        // 类型过滤（anchor 始终包含）
+        let is_anchor = i == anchor_idx;
+        if !is_anchor && !matches_types(&record.msg_type, &params.types) {
+            continue;
+        }
+
         let (truncated_content, _) = truncate_content(content, params.max_content);
+
+        // max_total 限制
+        if total_chars + truncated_content.len() > params.max_total {
+            truncated_by_total = true;
+            break;
+        }
+        total_chars += truncated_content.len();
 
         messages.push(ContextMessage {
             r#ref: format!("{}:{}", prefix, line_num),
             r#type: record.msg_type.clone(),
             content: truncated_content,
-            is_anchor: if i == anchor_idx { Some(true) } else { None },
+            is_anchor: if is_anchor { Some(true) } else { None },
         });
     }
 
     Ok(ContextResponse {
         anchor_ref: params.r#ref,
         messages,
+        truncated: if truncated_by_total { Some(true) } else { None },
     })
 }

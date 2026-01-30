@@ -118,11 +118,11 @@ enum Commands {
         #[arg(long)]
         r#ref: String,
 
-        /// Lines before anchor
+        /// Lines before anchor (counts only matching types if --types specified)
         #[arg(long)]
         before: Option<usize>,
 
-        /// Lines after anchor
+        /// Lines after anchor (counts only matching types if --types specified)
         #[arg(long)]
         after: Option<usize>,
 
@@ -134,6 +134,10 @@ enum Commands {
         #[arg(long, default_value = "forward")]
         direction: String,
 
+        /// Message types to include (comma separated)
+        #[arg(long)]
+        types: Option<String>,
+
         /// Project ID
         #[arg(long)]
         project: Option<String>,
@@ -141,6 +145,10 @@ enum Commands {
         /// Max chars per message
         #[arg(long, default_value = "4000")]
         max_content: usize,
+
+        /// Max total chars
+        #[arg(long, default_value = "40000")]
+        max_total: usize,
     },
 
     /// List all projects
@@ -250,8 +258,10 @@ fn main() {
             after,
             until_type,
             direction,
+            types,
             project,
             max_content,
+            max_total,
         } => {
             let params = ContextParams {
                 r#ref,
@@ -260,7 +270,9 @@ fn main() {
                 until_type,
                 direction,
                 project,
+                types: types.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
                 max_content,
+                max_total,
             };
 
             match context(&config, params) {
