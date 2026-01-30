@@ -82,8 +82,8 @@ claude mcp add claude-history -- claude-history --mcp
 | `project` | string | 当前项目 | 项目 ID（逗号分隔） |
 | `all` | boolean | false | 搜索所有项目 |
 | `sessions` | string | - | 会话 ID（逗号分隔） |
-| `since` | string | - | 起始时间（ISO 8601 或 today/week/month） |
-| `until` | string | - | 结束时间 |
+| `since` | string | - | 起始时间（ISO 8601 或 today/week/month），无时区时按本地时间解释 |
+| `until` | string | - | 结束时间，无时区时按本地时间解释 |
 | `types` | string | assistant,user,summary | 消息类型 |
 | `lines` | string | - | 行号范围（如 100-200, !300-400） |
 | `regex` | boolean | false | 使用正则 |

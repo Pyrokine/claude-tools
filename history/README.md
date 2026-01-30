@@ -82,8 +82,8 @@ claude mcp add claude-history -- claude-history --mcp
 | `project` | string | current | Project ID (comma-separated) |
 | `all` | boolean | false | Search all projects |
 | `sessions` | string | - | Session IDs (comma-separated) |
-| `since` | string | - | Start time (ISO 8601 or today/week/month) |
-| `until` | string | - | End time |
+| `since` | string | - | Start time (ISO 8601 or today/week/month). Without timezone, treated as local time |
+| `until` | string | - | End time. Without timezone, treated as local time |
 | `types` | string | assistant,user,summary | Message types |
 | `lines` | string | - | Line ranges (e.g., 100-200, !300-400) |
 | `regex` | boolean | false | Use regex |
