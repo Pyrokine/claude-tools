@@ -225,9 +225,11 @@ pub fn run_mcp_server() {
             continue;
         }
 
-        // 尝试解析为响应（来自 roots/list 请求）
+        // 尝试解析为 roots/list 响应（必须匹配我们发出的请求 ID）
         if let Ok(response) = serde_json::from_str::<Value>(&line) {
-            if response.get("result").is_some() && response.get("id").is_some() {
+            if response.get("id") == Some(&Value::String("roots-list-1".to_string()))
+                && response.get("result").is_some()
+            {
                 handle_roots_response(&response);
                 continue;
             }
