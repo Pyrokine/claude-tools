@@ -1,6 +1,6 @@
 [package]
 name = "claude-history"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Claude Code conversation history search tool"
 authors = ["pyro"]

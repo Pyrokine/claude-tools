@@ -22,6 +22,19 @@ A conversation history search tool for Claude Code
 
 ## Installation
 
+### Download Binary (Recommended)
+
+Download the latest release from [GitHub Releases](https://github.com/Pyrokine/claude-mcp-tools/releases):
+
+```bash
+# Download and install
+curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/claude-history-linux-x86_64.tar.gz | tar xz
+chmod +x claude-history
+mv claude-history ~/.local/bin/
+```
+
+### Build from Source
+
 ```bash
 # Build (static linking, runs on most Linux x86_64 distributions)
 cargo build --release --target x86_64-unknown-linux-musl

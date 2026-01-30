@@ -22,6 +22,19 @@ Claude Code 对话历史搜索工具
 
 ## 安装
 
+### 下载二进制（推荐）
+
+从 [GitHub Releases](https://github.com/Pyrokine/claude-mcp-tools/releases) 下载最新版本：
+
+```bash
+# 下载并安装
+curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/claude-history-linux-x86_64.tar.gz | tar xz
+chmod +x claude-history
+mv claude-history ~/.local/bin/
+```
+
+### 从源码编译
+
 ```bash
 # 编译（静态链接，可在大多数 Linux x86_64 发行版上运行）
 cargo build --release --target x86_64-unknown-linux-musl
