@@ -30,6 +30,12 @@
 ## 安装
 
 ```bash
+npm install -g @pyrokine/mcp-chrome
+```
+
+或从源码安装：
+
+```bash
 git clone https://github.com/Pyrokine/claude-mcp-tools.git
 cd claude-mcp-tools/mcp-chrome
 npm install

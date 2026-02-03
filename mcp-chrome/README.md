@@ -30,6 +30,12 @@ Chrome browser automation MCP Server using Chrome DevTools Protocol (CDP).
 ## Installation
 
 ```bash
+npm install -g @pyrokine/mcp-chrome
+```
+
+Or from source:
+
+```bash
 git clone https://github.com/Pyrokine/claude-mcp-tools.git
 cd claude-mcp-tools/mcp-chrome
 npm install
