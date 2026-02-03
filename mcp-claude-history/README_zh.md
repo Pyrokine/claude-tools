@@ -66,55 +66,55 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ## 可用工具（5 个）
 
-| 工具 | 描述 |
-|------|------|
-| `history_search` | 搜索对话历史 |
-| `history_get` | 获取完整消息内容 |
-| `history_context` | 获取消息上下文 |
-| `history_projects` | 列出所有项目 |
-| `history_sessions` | 列出项目的会话 |
+| 工具                 | 描述       |
+|--------------------|----------|
+| `history_search`   | 搜索对话历史   |
+| `history_get`      | 获取完整消息内容 |
+| `history_context`  | 获取消息上下文  |
+| `history_projects` | 列出所有项目   |
+| `history_sessions` | 列出项目的会话  |
 
 ### history_search
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `pattern` | string | "" | 搜索词（空字符串返回所有） |
-| `project` | string | 当前项目 | 项目 ID（逗号分隔） |
-| `all` | boolean | false | 搜索所有项目 |
-| `sessions` | string | - | 会话 ID（逗号分隔） |
-| `since` | string | - | 起始时间（ISO 8601 或 today/week/month），无时区时按本地时间解释 |
-| `until` | string | - | 结束时间，无时区时按本地时间解释 |
-| `types` | string | assistant,user,summary | 消息类型 |
-| `lines` | string | - | 行号范围（如 100-200, !300-400） |
-| `regex` | boolean | false | 使用正则 |
-| `case_sensitive` | boolean | false | 区分大小写 |
-| `offset` | number | 0 | 跳过前 N 条 |
-| `limit` | number | - | 最多返回 N 条 |
-| `max_content` | number | 4000 | 单条最大字符数 |
-| `max_total` | number | 40000 | 总最大字符数 |
+| 参数               | 类型      | 默认值                    | 说明                                            |
+|------------------|---------|------------------------|-----------------------------------------------|
+| `pattern`        | string  | ""                     | 搜索词（空字符串返回所有）                                 |
+| `project`        | string  | 当前项目                   | 项目 ID（逗号分隔）                                   |
+| `all`            | boolean | false                  | 搜索所有项目                                        |
+| `sessions`       | string  | -                      | 会话 ID（逗号分隔）                                   |
+| `since`          | string  | -                      | 起始时间（ISO 8601 或 today/week/month），无时区时按本地时间解释 |
+| `until`          | string  | -                      | 结束时间，无时区时按本地时间解释                              |
+| `types`          | string  | assistant,user,summary | 消息类型                                          |
+| `lines`          | string  | -                      | 行号范围（如 100-200, !300-400）                     |
+| `regex`          | boolean | false                  | 使用正则                                          |
+| `case_sensitive` | boolean | false                  | 区分大小写                                         |
+| `offset`         | number  | 0                      | 跳过前 N 条                                       |
+| `limit`          | number  | -                      | 最多返回 N 条                                      |
+| `max_content`    | number  | 4000                   | 单条最大字符数                                       |
+| `max_total`      | number  | 40000                  | 总最大字符数                                        |
 
 ### history_get
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `ref` | string | 必填，消息定位（session前8位:行号） |
-| `range` | string | 字符范围（如 0-100000） |
-| `output` | string | 输出目录（自动提取图片） |
-| `project` | string | 项目 ID |
+| 参数        | 类型     | 说明                     |
+|-----------|--------|------------------------|
+| `ref`     | string | 必填，消息定位（session前8位:行号） |
+| `range`   | string | 字符范围（如 0-100000）       |
+| `output`  | string | 输出目录（自动提取图片）           |
+| `project` | string | 项目 ID                  |
 
 ### history_context
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `ref` | string | - | 必填，消息定位 |
-| `before` | number | - | 向前取 N 条（指定 `types` 时仅计数匹配类型） |
-| `after` | number | - | 向后取 N 条（指定 `types` 时仅计数匹配类型） |
-| `until_type` | string | - | 持续到指定类型 |
-| `direction` | string | forward | forward/backward |
-| `types` | string | - | 要包含的消息类型（逗号分隔） |
-| `project` | string | - | 项目 ID |
-| `max_content` | number | 4000 | 单条最大字符数 |
-| `max_total` | number | 40000 | 总最大字符数 |
+| 参数            | 类型     | 默认值     | 说明                           |
+|---------------|--------|---------|------------------------------|
+| `ref`         | string | -       | 必填，消息定位                      |
+| `before`      | number | -       | 向前取 N 条（指定 `types` 时仅计数匹配类型） |
+| `after`       | number | -       | 向后取 N 条（指定 `types` 时仅计数匹配类型） |
+| `until_type`  | string | -       | 持续到指定类型                      |
+| `direction`   | string | forward | forward/backward             |
+| `types`       | string | -       | 要包含的消息类型（逗号分隔）               |
+| `project`     | string | -       | 项目 ID                        |
+| `max_content` | number | 4000    | 单条最大字符数                      |
+| `max_total`   | number | 40000   | 总最大字符数                       |
 
 **说明**：锚点消息（由 `ref` 指定）始终包含在结果中，即使其类型不在 `types` 过滤列表中。
 

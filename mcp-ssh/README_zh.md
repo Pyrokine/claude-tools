@@ -19,16 +19,16 @@
 - **连接管理**：连接池复用、心跳保持、自动重连
 - **会话持久化**：会话信息保存，支持重连
 - **命令执行**：
-  - 基础执行（带超时）
-  - PTY 模式（用于 `top`、`htop` 等交互式命令）
-  - `sudo` 执行
-  - `su` 切换用户执行
-  - 批量执行
-  - 多主机并行执行
+    - 基础执行（带超时）
+    - PTY 模式（用于 `top`、`htop` 等交互式命令）
+    - `sudo` 执行
+    - `su` 切换用户执行
+    - 批量执行
+    - 多主机并行执行
 - **持久化 PTY 会话**：用于长时间运行的交互式命令（top、htop、tmux、vim 等）
-  - 输出缓冲区，支持轮询读取
-  - 发送按键和命令
-  - 窗口大小调整
+    - 输出缓冲区，支持轮询读取
+    - 发送按键和命令
+    - 窗口大小调整
 - **文件操作**：上传、下载、读取、写入、目录列表（通过 SFTP）
 - **智能同步**：目录同步，优先使用 rsync（无 rsync 时自动回退到 SFTP）
 - **环境配置**：LANG、LC_ALL、自定义环境变量
@@ -36,15 +36,15 @@
 
 ## 兼容客户端
 
-| 客户端 | 状态 |
-|--------|------|
-| Claude Code | ✅ |
-| Claude Desktop | ✅ |
-| Cursor | ✅ |
-| Windsurf | ✅ |
-| Continue.dev | ✅ |
-| Cline | ✅ |
-| 其他 MCP 兼容客户端 | ✅ |
+| 客户端            | 状态 |
+|----------------|----|
+| Claude Code    | ✅  |
+| Claude Desktop | ✅  |
+| Cursor         | ✅  |
+| Windsurf       | ✅  |
+| Continue.dev   | ✅  |
+| Cline          | ✅  |
+| 其他 MCP 兼容客户端   | ✅  |
 
 ## 安装
 
@@ -90,57 +90,57 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 
 ### 连接管理
 
-| 工具 | 描述 |
-|------|------|
-| `ssh_connect` | 建立 SSH 连接（支持 ~/.ssh/config） |
-| `ssh_disconnect` | 关闭连接 |
-| `ssh_list_sessions` | 列出活跃会话 |
-| `ssh_reconnect` | 重新连接断开的会话 |
-| `ssh_config_list` | 列出 ~/.ssh/config 中的 Host |
+| 工具                  | 描述                          |
+|---------------------|-----------------------------|
+| `ssh_connect`       | 建立 SSH 连接（支持 ~/.ssh/config） |
+| `ssh_disconnect`    | 关闭连接                        |
+| `ssh_list_sessions` | 列出活跃会话                      |
+| `ssh_reconnect`     | 重新连接断开的会话                   |
+| `ssh_config_list`   | 列出 ~/.ssh/config 中的 Host    |
 
 ### 命令执行
 
-| 工具 | 描述 |
-|------|------|
-| `ssh_exec` | 执行命令（支持 PTY 模式） |
-| `ssh_exec_as_user` | 以其他用户身份执行（通过 `su`） |
-| `ssh_exec_sudo` | 使用 `sudo` 执行 |
-| `ssh_exec_batch` | 批量执行多条命令 |
-| `ssh_exec_parallel` | 在多台主机上并行执行命令 |
-| `ssh_quick_exec` | 一次性执行：连接、执行、断开 |
+| 工具                  | 描述                 |
+|---------------------|--------------------|
+| `ssh_exec`          | 执行命令（支持 PTY 模式）    |
+| `ssh_exec_as_user`  | 以其他用户身份执行（通过 `su`） |
+| `ssh_exec_sudo`     | 使用 `sudo` 执行       |
+| `ssh_exec_batch`    | 批量执行多条命令           |
+| `ssh_exec_parallel` | 在多台主机上并行执行命令       |
+| `ssh_quick_exec`    | 一次性执行：连接、执行、断开     |
 
 ### 文件操作
 
-| 工具 | 描述 |
-|------|------|
-| `ssh_upload` | 上传本地文件到远程 |
-| `ssh_download` | 从远程下载文件到本地 |
-| `ssh_read_file` | 读取远程文件内容 |
-| `ssh_write_file` | 写入内容到远程文件 |
-| `ssh_list_dir` | 列出远程目录内容 |
-| `ssh_file_info` | 获取文件/目录元数据 |
-| `ssh_mkdir` | 创建远程目录 |
-| `ssh_sync` | 智能同步（优先 rsync，回退 SFTP） |
+| 工具               | 描述                     |
+|------------------|------------------------|
+| `ssh_upload`     | 上传本地文件到远程              |
+| `ssh_download`   | 从远程下载文件到本地             |
+| `ssh_read_file`  | 读取远程文件内容               |
+| `ssh_write_file` | 写入内容到远程文件              |
+| `ssh_list_dir`   | 列出远程目录内容               |
+| `ssh_file_info`  | 获取文件/目录元数据             |
+| `ssh_mkdir`      | 创建远程目录                 |
+| `ssh_sync`       | 智能同步（优先 rsync，回退 SFTP） |
 
 ### PTY 会话（持久化交互式终端）
 
-| 工具 | 描述 |
-|------|------|
-| `ssh_pty_start` | 启动持久化 PTY 会话（用于 top、htop、tmux 等） |
-| `ssh_pty_write` | 向 PTY 发送数据（按键、命令） |
-| `ssh_pty_read` | 读取 PTY 输出（screen 模式：当前屏幕，raw 模式：ANSI 流） |
-| `ssh_pty_resize` | 调整 PTY 窗口大小 |
-| `ssh_pty_close` | 关闭 PTY 会话 |
-| `ssh_pty_list` | 列出所有 PTY 会话 |
+| 工具               | 描述                                      |
+|------------------|-----------------------------------------|
+| `ssh_pty_start`  | 启动持久化 PTY 会话（用于 top、htop、tmux 等）        |
+| `ssh_pty_write`  | 向 PTY 发送数据（按键、命令）                       |
+| `ssh_pty_read`   | 读取 PTY 输出（screen 模式：当前屏幕，raw 模式：ANSI 流） |
+| `ssh_pty_resize` | 调整 PTY 窗口大小                             |
+| `ssh_pty_close`  | 关闭 PTY 会话                               |
+| `ssh_pty_list`   | 列出所有 PTY 会话                             |
 
 ### 端口转发
 
-| 工具 | 描述 |
-|------|------|
-| `ssh_forward_local` | 本地端口转发（ssh -L）：访问远程服务 |
+| 工具                   | 描述                    |
+|----------------------|-----------------------|
+| `ssh_forward_local`  | 本地端口转发（ssh -L）：访问远程服务 |
 | `ssh_forward_remote` | 远程端口转发（ssh -R）：暴露本地服务 |
-| `ssh_forward_close` | 关闭端口转发 |
-| `ssh_forward_list` | 列出所有端口转发 |
+| `ssh_forward_close`  | 关闭端口转发                |
+| `ssh_forward_list`   | 列出所有端口转发              |
 
 ## 使用示例
 
@@ -161,6 +161,7 @@ ssh_connect(configHost="myserver", configPath="/custom/path/config")
 ```
 
 支持的 SSH config 特性：
+
 - `Host` 多别名（如 `Host a b c`）
 - `Host *` 全局默认继承（仅第一个 `Host *` 块）
 - `HostName`、`User`、`Port`、`IdentityFile`
@@ -168,11 +169,13 @@ ssh_connect(configHost="myserver", configPath="/custom/path/config")
 - 显式参数优先于 config 值（如 `ssh_connect(configHost="x", user="覆盖值")`）
 
 **不支持**（跳过）：
+
 - `Include` 指令
 - `Match` 块（整个块跳过直到下一个 `Host`）
 - 通配符模式（如 `Host *.example.com`）
 
 **行为说明**：
+
 - 多个 `Host *` 块：仅使用第一个
 - 重复的 Host 定义：`ssh_config_list` 显示全部，`ssh_connect` 使用第一个
 - ProxyJump 中的 IPv6：使用方括号格式 `[2001:db8::1]:22`
@@ -223,6 +226,9 @@ ssh_connect(
 2. ssh_exec_as_user(alias="server", command="whoami", targetUser="appuser")
    // 输出: appuser
 ```
+
+默认加载 shell 配置以确保环境变量可用（`su -c` 创建非交互式 shell，不会自动执行 rc 文件）。支持 bash（`.bashrc`）、zsh（`.zshrc`
+）及其他 shell（`.profile`）。如不需要可设置 `loadProfile=false`。
 
 ### 交互式命令（PTY 模式）
 
@@ -306,7 +312,8 @@ ssh_sync(..., dryRun=true)
 
 如果远程或本地没有 rsync，会自动回退到 SFTP。
 
-**注意**：rsync 模式使用 SSH 密钥/代理认证，并禁用严格主机密钥检查（`StrictHostKeyChecking=no`）以方便使用。如需主机密钥验证，请使用 SFTP 模式。
+**注意**：rsync 模式使用 SSH 密钥/代理认证，并禁用严格主机密钥检查（`StrictHostKeyChecking=no`）以方便使用。如需主机密钥验证，请使用
+SFTP 模式。
 
 ### 持久化 PTY 会话（top、tmux 等）
 
@@ -345,6 +352,7 @@ ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 ```
 
 常用控制序列：
+
 - 回车: `\r` 或 `\n`
 - Ctrl+C: `\x03`
 - Ctrl+D: `\x04`
@@ -374,25 +382,25 @@ ssh_forward_close(forwardId="fwd_1_xxx")
 
 ### 连接选项
 
-| 选项 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `host` | string | *必需* | 服务器地址 |
-| `user` | string | *必需* | 用户名 |
-| `password` | string | - | 密码认证 |
-| `keyPath` | string | - | SSH 私钥路径 |
-| `port` | number | 22 | SSH 端口 |
-| `alias` | string | 自动生成 | 连接别名，用于后续引用 |
-| `env` | object | - | 环境变量 |
-| `keepaliveInterval` | number | 30000 | 心跳间隔（毫秒） |
+| 选项                  | 类型     | 默认值   | 描述          |
+|---------------------|--------|-------|-------------|
+| `host`              | string | *必需*  | 服务器地址       |
+| `user`              | string | *必需*  | 用户名         |
+| `password`          | string | -     | 密码认证        |
+| `keyPath`           | string | -     | SSH 私钥路径    |
+| `port`              | number | 22    | SSH 端口      |
+| `alias`             | string | 自动生成  | 连接别名，用于后续引用 |
+| `env`               | object | -     | 环境变量        |
+| `keepaliveInterval` | number | 30000 | 心跳间隔（毫秒）    |
 
 ### 执行选项
 
-| 选项 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `timeout` | number | 30000 | 命令超时（毫秒） |
-| `cwd` | string | - | 工作目录 |
-| `env` | object | - | 额外环境变量 |
-| `pty` | boolean | false | 启用 PTY 模式（用于交互式命令） |
+| 选项        | 类型      | 默认值   | 描述                 |
+|-----------|---------|-------|--------------------|
+| `timeout` | number  | 30000 | 命令超时（毫秒）           |
+| `cwd`     | string  | -     | 工作目录               |
+| `env`     | object  | -     | 额外环境变量             |
+| `pty`     | boolean | false | 启用 PTY 模式（用于交互式命令） |
 
 ## 项目结构
 

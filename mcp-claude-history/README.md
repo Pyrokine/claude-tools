@@ -66,57 +66,58 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ## Available Tools (5 tools)
 
-| Tool | Description |
-|------|-------------|
-| `history_search` | Search conversation history |
-| `history_get` | Get full message content |
-| `history_context` | Get surrounding messages |
-| `history_projects` | List all projects |
-| `history_sessions` | List sessions in a project |
+| Tool               | Description                 |
+|--------------------|-----------------------------|
+| `history_search`   | Search conversation history |
+| `history_get`      | Get full message content    |
+| `history_context`  | Get surrounding messages    |
+| `history_projects` | List all projects           |
+| `history_sessions` | List sessions in a project  |
 
 ### history_search
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `pattern` | string | "" | Search pattern (empty returns all) |
-| `project` | string | current | Project ID (comma-separated) |
-| `all` | boolean | false | Search all projects |
-| `sessions` | string | - | Session IDs (comma-separated) |
-| `since` | string | - | Start time (ISO 8601 or today/week/month). Without timezone, treated as local time |
-| `until` | string | - | End time. Without timezone, treated as local time |
-| `types` | string | assistant,user,summary | Message types |
-| `lines` | string | - | Line ranges (e.g., 100-200, !300-400) |
-| `regex` | boolean | false | Use regex |
-| `case_sensitive` | boolean | false | Case sensitive |
-| `offset` | number | 0 | Skip first N results |
-| `limit` | number | - | Max results to return |
-| `max_content` | number | 4000 | Max chars per result |
-| `max_total` | number | 40000 | Max total chars |
+| Parameter        | Type    | Default                | Description                                                                        |
+|------------------|---------|------------------------|------------------------------------------------------------------------------------|
+| `pattern`        | string  | ""                     | Search pattern (empty returns all)                                                 |
+| `project`        | string  | current                | Project ID (comma-separated)                                                       |
+| `all`            | boolean | false                  | Search all projects                                                                |
+| `sessions`       | string  | -                      | Session IDs (comma-separated)                                                      |
+| `since`          | string  | -                      | Start time (ISO 8601 or today/week/month). Without timezone, treated as local time |
+| `until`          | string  | -                      | End time. Without timezone, treated as local time                                  |
+| `types`          | string  | assistant,user,summary | Message types                                                                      |
+| `lines`          | string  | -                      | Line ranges (e.g., 100-200, !300-400)                                              |
+| `regex`          | boolean | false                  | Use regex                                                                          |
+| `case_sensitive` | boolean | false                  | Case sensitive                                                                     |
+| `offset`         | number  | 0                      | Skip first N results                                                               |
+| `limit`          | number  | -                      | Max results to return                                                              |
+| `max_content`    | number  | 4000                   | Max chars per result                                                               |
+| `max_total`      | number  | 40000                  | Max total chars                                                                    |
 
 ### history_get
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `ref` | string | Required. Message ref (session_prefix:line) |
-| `range` | string | Character range (e.g., 0-100000) |
-| `output` | string | Output directory (auto-extract images) |
-| `project` | string | Project ID |
+| Parameter | Type   | Description                                 |
+|-----------|--------|---------------------------------------------|
+| `ref`     | string | Required. Message ref (session_prefix:line) |
+| `range`   | string | Character range (e.g., 0-100000)            |
+| `output`  | string | Output directory (auto-extract images)      |
+| `project` | string | Project ID                                  |
 
 ### history_context
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `ref` | string | - | Required. Message ref |
-| `before` | number | - | Messages before (counts only matching types if `types` specified) |
-| `after` | number | - | Messages after (counts only matching types if `types` specified) |
-| `until_type` | string | - | Continue until this type |
-| `direction` | string | forward | forward/backward |
-| `types` | string | - | Message types to include (comma-separated) |
-| `project` | string | - | Project ID |
-| `max_content` | number | 4000 | Max chars per message |
-| `max_total` | number | 40000 | Max total chars |
+| Parameter     | Type   | Default | Description                                                       |
+|---------------|--------|---------|-------------------------------------------------------------------|
+| `ref`         | string | -       | Required. Message ref                                             |
+| `before`      | number | -       | Messages before (counts only matching types if `types` specified) |
+| `after`       | number | -       | Messages after (counts only matching types if `types` specified)  |
+| `until_type`  | string | -       | Continue until this type                                          |
+| `direction`   | string | forward | forward/backward                                                  |
+| `types`       | string | -       | Message types to include (comma-separated)                        |
+| `project`     | string | -       | Project ID                                                        |
+| `max_content` | number | 4000    | Max chars per message                                             |
+| `max_total`   | number | 40000   | Max total chars                                                   |
 
-**Note**: The anchor message (specified by `ref`) is always included in results, even if its type is not in the `types` filter.
+**Note**: The anchor message (specified by `ref`) is always included in results, even if its type is not in the `types`
+filter.
 
 ## Usage Examples
 

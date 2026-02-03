@@ -19,16 +19,16 @@ A comprehensive SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.
 - **Connection Management**: Connection pooling, keepalive, auto-reconnect
 - **Session Persistence**: Sessions info saved for reconnection
 - **Command Execution**:
-  - Basic exec with timeout
-  - PTY mode (for interactive commands like `top`, `htop`)
-  - `sudo` execution
-  - `su` (switch user) execution - *run commands as different user*
-  - Batch execution
-  - Parallel execution on multiple hosts
+    - Basic exec with timeout
+    - PTY mode (for interactive commands like `top`, `htop`)
+    - `sudo` execution
+    - `su` (switch user) execution - *run commands as different user*
+    - Batch execution
+    - Parallel execution on multiple hosts
 - **Persistent PTY Sessions**: For long-running interactive commands (top, htop, tmux, vim, etc.)
-  - Output buffering with polling read
-  - Send keystrokes and commands
-  - Window resize support
+    - Output buffering with polling read
+    - Send keystrokes and commands
+    - Window resize support
 - **File Operations**: Upload, download, read, write, list directory (via SFTP)
 - **Smart Sync**: Directory sync with rsync (auto-fallback to SFTP if rsync unavailable)
 - **Environment Configuration**: LANG, LC_ALL, custom env vars
@@ -36,15 +36,15 @@ A comprehensive SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.
 
 ## Compatible Clients
 
-| Client | Status |
-|--------|--------|
-| Claude Code | ✅ |
-| Claude Desktop | ✅ |
-| Cursor | ✅ |
-| Windsurf | ✅ |
-| Continue.dev | ✅ |
-| Cline | ✅ |
-| Any MCP-compatible client | ✅ |
+| Client                    | Status |
+|---------------------------|--------|
+| Claude Code               | ✅      |
+| Claude Desktop            | ✅      |
+| Cursor                    | ✅      |
+| Windsurf                  | ✅      |
+| Continue.dev              | ✅      |
+| Cline                     | ✅      |
+| Any MCP-compatible client | ✅      |
 
 ## Installation
 
@@ -90,57 +90,57 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 
 ### Connection Management
 
-| Tool | Description |
-|------|-------------|
-| `ssh_connect` | Establish SSH connection (supports ~/.ssh/config) |
-| `ssh_disconnect` | Close connection |
-| `ssh_list_sessions` | List active sessions |
-| `ssh_reconnect` | Reconnect a disconnected session |
-| `ssh_config_list` | List hosts from ~/.ssh/config |
+| Tool                | Description                                       |
+|---------------------|---------------------------------------------------|
+| `ssh_connect`       | Establish SSH connection (supports ~/.ssh/config) |
+| `ssh_disconnect`    | Close connection                                  |
+| `ssh_list_sessions` | List active sessions                              |
+| `ssh_reconnect`     | Reconnect a disconnected session                  |
+| `ssh_config_list`   | List hosts from ~/.ssh/config                     |
 
 ### Command Execution
 
-| Tool | Description |
-|------|-------------|
-| `ssh_exec` | Execute command (supports PTY mode) |
-| `ssh_exec_as_user` | Execute as different user (via `su`) |
-| `ssh_exec_sudo` | Execute with `sudo` |
-| `ssh_exec_batch` | Execute multiple commands sequentially |
+| Tool                | Description                                   |
+|---------------------|-----------------------------------------------|
+| `ssh_exec`          | Execute command (supports PTY mode)           |
+| `ssh_exec_as_user`  | Execute as different user (via `su`)          |
+| `ssh_exec_sudo`     | Execute with `sudo`                           |
+| `ssh_exec_batch`    | Execute multiple commands sequentially        |
 | `ssh_exec_parallel` | Execute command on multiple hosts in parallel |
-| `ssh_quick_exec` | One-shot: connect, execute, disconnect |
+| `ssh_quick_exec`    | One-shot: connect, execute, disconnect        |
 
 ### File Operations
 
-| Tool | Description |
-|------|-------------|
-| `ssh_upload` | Upload local file to remote server |
-| `ssh_download` | Download remote file to local |
-| `ssh_read_file` | Read remote file content |
-| `ssh_write_file` | Write content to remote file |
-| `ssh_list_dir` | List remote directory contents |
-| `ssh_file_info` | Get file/directory metadata |
-| `ssh_mkdir` | Create remote directory |
-| `ssh_sync` | Smart sync with rsync (fallback to SFTP) |
+| Tool             | Description                              |
+|------------------|------------------------------------------|
+| `ssh_upload`     | Upload local file to remote server       |
+| `ssh_download`   | Download remote file to local            |
+| `ssh_read_file`  | Read remote file content                 |
+| `ssh_write_file` | Write content to remote file             |
+| `ssh_list_dir`   | List remote directory contents           |
+| `ssh_file_info`  | Get file/directory metadata              |
+| `ssh_mkdir`      | Create remote directory                  |
+| `ssh_sync`       | Smart sync with rsync (fallback to SFTP) |
 
 ### PTY Sessions (Persistent Interactive Terminal)
 
-| Tool | Description |
-|------|-------------|
-| `ssh_pty_start` | Start persistent PTY session (for top, htop, tmux, etc.) |
-| `ssh_pty_write` | Send data to PTY (keystrokes, commands) |
-| `ssh_pty_read` | Read PTY output (screen mode: current screen, raw mode: ANSI stream) |
-| `ssh_pty_resize` | Resize PTY window |
-| `ssh_pty_close` | Close PTY session |
-| `ssh_pty_list` | List all PTY sessions |
+| Tool             | Description                                                          |
+|------------------|----------------------------------------------------------------------|
+| `ssh_pty_start`  | Start persistent PTY session (for top, htop, tmux, etc.)             |
+| `ssh_pty_write`  | Send data to PTY (keystrokes, commands)                              |
+| `ssh_pty_read`   | Read PTY output (screen mode: current screen, raw mode: ANSI stream) |
+| `ssh_pty_resize` | Resize PTY window                                                    |
+| `ssh_pty_close`  | Close PTY session                                                    |
+| `ssh_pty_list`   | List all PTY sessions                                                |
 
 ### Port Forwarding
 
-| Tool | Description |
-|------|-------------|
-| `ssh_forward_local` | Local port forwarding (ssh -L): access remote services |
+| Tool                 | Description                                            |
+|----------------------|--------------------------------------------------------|
+| `ssh_forward_local`  | Local port forwarding (ssh -L): access remote services |
 | `ssh_forward_remote` | Remote port forwarding (ssh -R): expose local services |
-| `ssh_forward_close` | Close port forwarding |
-| `ssh_forward_list` | List all port forwards |
+| `ssh_forward_close`  | Close port forwarding                                  |
+| `ssh_forward_list`   | List all port forwards                                 |
 
 ## Usage Examples
 
@@ -161,6 +161,7 @@ ssh_connect(configHost="myserver", configPath="/custom/path/config")
 ```
 
 Supported SSH config features:
+
 - `Host` with multiple aliases (e.g., `Host a b c`)
 - `Host *` global defaults inheritance (first `Host *` block only)
 - `HostName`, `User`, `Port`, `IdentityFile`
@@ -168,11 +169,13 @@ Supported SSH config features:
 - Explicit parameters override config values (e.g., `ssh_connect(configHost="x", user="override")`)
 
 **Not supported** (skipped):
+
 - `Include` directive
 - `Match` blocks (entire block skipped until next `Host`)
 - Wildcard patterns (e.g., `Host *.example.com`)
 
 **Behavior notes**:
+
 - Multiple `Host *` blocks: only first is used
 - Duplicate Host definitions: `ssh_config_list` shows all, `ssh_connect` uses first
 - IPv6 in ProxyJump: use bracket notation `[2001:db8::1]:22`
@@ -223,6 +226,10 @@ Perfect for scenarios where you SSH as root but need to run commands as another 
 2. ssh_exec_as_user(alias="server", command="whoami", targetUser="appuser")
    // Output: appuser
 ```
+
+By default, shell profile is loaded to ensure environment variables are available (since `su -c` creates a
+non-interactive shell which doesn't execute rc files). Supports bash (`.bashrc`), zsh (`.zshrc`), and other shells (
+`.profile`). Disable with `loadProfile=false` if not needed.
 
 ### Interactive Commands (PTY mode)
 
@@ -306,7 +313,8 @@ ssh_sync(..., dryRun=true)
 
 If rsync is not available on remote or local, it automatically falls back to SFTP.
 
-**Note**: rsync mode uses SSH key/agent authentication and disables strict host key checking (`StrictHostKeyChecking=no`) for convenience. If you require host key verification, use SFTP mode instead.
+**Note**: rsync mode uses SSH key/agent authentication and disables strict host key checking (
+`StrictHostKeyChecking=no`) for convenience. If you require host key verification, use SFTP mode instead.
 
 ### Persistent PTY Sessions (top, tmux, etc.)
 
@@ -345,6 +353,7 @@ ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 ```
 
 Common control sequences:
+
 - Enter: `\r` or `\n`
 - Ctrl+C: `\x03`
 - Ctrl+D: `\x04`
@@ -374,25 +383,25 @@ ssh_forward_close(forwardId="fwd_1_xxx")
 
 ### Connection Options
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `host` | string | *required* | Server address |
-| `user` | string | *required* | Username |
-| `password` | string | - | Password authentication |
-| `keyPath` | string | - | Path to SSH private key |
-| `port` | number | 22 | SSH port |
-| `alias` | string | auto-generated | Connection alias for reference |
-| `env` | object | - | Environment variables |
-| `keepaliveInterval` | number | 30000 | Keepalive interval in ms |
+| Option              | Type   | Default        | Description                    |
+|---------------------|--------|----------------|--------------------------------|
+| `host`              | string | *required*     | Server address                 |
+| `user`              | string | *required*     | Username                       |
+| `password`          | string | -              | Password authentication        |
+| `keyPath`           | string | -              | Path to SSH private key        |
+| `port`              | number | 22             | SSH port                       |
+| `alias`             | string | auto-generated | Connection alias for reference |
+| `env`               | object | -              | Environment variables          |
+| `keepaliveInterval` | number | 30000          | Keepalive interval in ms       |
 
 ### Exec Options
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `timeout` | number | 30000 | Command timeout in ms |
-| `cwd` | string | - | Working directory |
-| `env` | object | - | Additional environment variables |
-| `pty` | boolean | false | Enable PTY mode for interactive commands |
+| Option    | Type    | Default | Description                              |
+|-----------|---------|---------|------------------------------------------|
+| `timeout` | number  | 30000   | Command timeout in ms                    |
+| `cwd`     | string  | -       | Working directory                        |
+| `env`     | object  | -       | Additional environment variables         |
+| `pty`     | boolean | false   | Enable PTY mode for interactive commands |
 
 ## Project Structure
 
