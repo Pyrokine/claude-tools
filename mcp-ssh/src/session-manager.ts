@@ -78,11 +78,13 @@ export class SessionManager {
     private forwardSessions: Map<string, ForwardSession> = new Map()
     private ptyIdCounter                                 = 0
     private forwardIdCounter                             = 0
-    private persistPath: string
+    private readonly persistPath: string
     private defaultKeepaliveInterval                     = 30000  // 30秒
     private defaultKeepaliveCountMax                     = 3
     private defaultTimeout                               = 30000  // 30秒
     private maxReconnectAttempts                         = 3
+    private defaultMaxOutputSize                         = 10 * 1024 * 1024  // 10MB
+    private reconnectDelay                               = 5000  // 5秒
     private defaultPtyBufferSize                         = 1024 * 1024  // 1MB
 
     constructor(persistPath?: string) {
@@ -139,12 +141,11 @@ export class SessionManager {
             const jumpSession = this.sessions.get(jumpAlias)
             if (jumpSession) {
                 // 通过跳板机建立连接
-                const stream       = await this.forwardConnection(
+                connectConfig.sock = await this.forwardConnection(
                     jumpSession.client,
                     config.host,
                     config.port || 22,
                 )
-                connectConfig.sock = stream
             }
         }
 
@@ -179,9 +180,10 @@ export class SessionManager {
                     if (session.reconnectAttempts < this.maxReconnectAttempts) {
                         session.reconnectAttempts++
                         setTimeout(() => {
-                            this.reconnect(alias).catch(() => {
+                            this.reconnect(alias).catch((err) => {
+                                console.error(`Auto-reconnect failed for ${alias}:`, err.message)
                             })
-                        }, 5000)  // 5 秒后重连
+                        }, this.reconnectDelay)
                     }
                 }
             })
@@ -201,7 +203,7 @@ export class SessionManager {
 
         try {
             session.client.end()
-        } catch {
+        } catch { /* 忽略已关闭的连接 */
         }
 
         await this.connect(session.config)
@@ -215,22 +217,13 @@ export class SessionManager {
         if (session) {
             try {
                 session.client.end()
-            } catch {
+            } catch { /* 忽略已关闭的连接 */
             }
             this.sessions.delete(alias)
             this.persistSessions()
             return true
         }
         return false
-    }
-
-    /**
-     * 断开所有连接
-     */
-    disconnectAll(): void {
-        for (const alias of this.sessions.keys()) {
-            this.disconnect(alias)
-        }
     }
 
     /**
@@ -278,32 +271,8 @@ export class SessionManager {
     ): Promise<ExecResult> {
         const session       = this.getSession(alias)
         const startTime     = Date.now()
-        const maxOutputSize = options.maxOutputSize || 10 * 1024 * 1024 // 默认 10MB
-
-        // 构建完整命令（包含环境变量）
-        let fullCommand = command
-        const env       = {...session.config.env, ...options.env}
-
-        if (Object.keys(env).length > 0) {
-            // 校验并过滤环境变量名
-            const validEnvEntries = Object.entries(env).filter(([k]) => {
-                if (!this.isValidEnvKey(k)) {
-                    // 静默忽略非法环境变量名
-                    return false
-                }
-                return true
-            })
-            if (validEnvEntries.length > 0) {
-                const envStr = validEnvEntries
-                    .map(([k, v]) => `export ${k}=${this.escapeShellArg(v)}`)
-                    .join('; ')
-                fullCommand  = `${envStr}; ${command}`
-            }
-        }
-
-        if (options.cwd) {
-            fullCommand = `cd ${this.escapeShellArg(options.cwd)} && ${fullCommand}`
-        }
+        const maxOutputSize = options.maxOutputSize || this.defaultMaxOutputSize
+        const fullCommand   = this.buildCommand(command, session, options)
 
         return new Promise((resolve, reject) => {
             const timeout                        = options.timeout || this.defaultTimeout
@@ -378,10 +347,11 @@ export class SessionManager {
 
     /**
      * 以其他用户身份执行命令
-     * @param loadProfile 是否加载用户的 shell 配置（默认 true）。
-     *   su -c 创建非交互式 shell，不会自动执行 rc 文件，
-     *   但大多数用户的环境变量设置在 rc 文件中，因此默认加载。
-     *   支持 bash(.bashrc)、zsh(.zshrc) 及其他 shell(.profile)。
+     *
+     * options.loadProfile 控制是否加载用户的 shell 配置（默认 true）。
+     * su -c 创建非交互式 shell，不会自动执行 rc 文件，
+     * 但大多数用户的环境变量设置在 rc 文件中，因此默认加载。
+     * 支持 bash(.bashrc)、zsh(.zshrc) 及其他 shell(.profile)。
      */
     async execAsUser(
         alias: string,
@@ -440,19 +410,6 @@ export class SessionManager {
     }
 
     /**
-     * 加载持久化的会话信息（仅用于显示，不自动重连）
-     */
-    loadPersistedSessions(): PersistedSession[] {
-        try {
-            if (fs.existsSync(this.persistPath)) {
-                return JSON.parse(fs.readFileSync(this.persistPath, 'utf-8'))
-            }
-        } catch {
-        }
-        return []
-    }
-
-    /**
      * 启动持久化 PTY 会话
      */
     async ptyStart(
@@ -467,21 +424,7 @@ export class SessionManager {
         const cols          = options.cols || 80
         const term          = options.term || 'xterm-256color'
         const maxBufferSize = options.bufferSize || this.defaultPtyBufferSize
-
-        // 构建完整命令
-        let fullCommand = command
-        const env       = {...session.config.env, ...options.env}
-
-        if (Object.keys(env).length > 0) {
-            const envStr = Object.entries(env)
-                                 .map(([k, v]) => `export ${k}=${this.escapeShellArg(v)}`)
-                                 .join('; ')
-            fullCommand  = `${envStr}; ${command}`
-        }
-
-        if (options.cwd) {
-            fullCommand = `cd ${this.escapeShellArg(options.cwd)} && ${fullCommand}`
-        }
+        const fullCommand   = this.buildCommand(command, session, options)
 
         return new Promise((resolve, reject) => {
             session.client.exec(
@@ -564,7 +507,8 @@ export class SessionManager {
 
     /**
      * 读取 PTY 输出
-     * @param mode 'screen' 返回当前屏幕内容，'raw' 返回原始 ANSI 流
+     *
+     * options.mode: 'screen' 返回当前屏幕内容，'raw' 返回原始 ANSI 流
      */
     ptyRead(
         ptyId: string,
@@ -629,11 +573,11 @@ export class SessionManager {
         }
         try {
             ptySession.stream.close()
-        } catch {
+        } catch { /* 忽略清理异常 */
         }
         try {
             ptySession.terminal.dispose()
-        } catch {
+        } catch { /* 忽略清理异常 */
         }
         ptySession.active = false
         this.ptySessions.delete(ptyId)
@@ -659,19 +603,6 @@ export class SessionManager {
                         })
         }
         return result
-    }
-
-    /**
-     * 关闭所有 PTY 会话
-     */
-    ptyCloseAll(): number {
-        let count = 0
-        for (const ptyId of this.ptySessions.keys()) {
-            if (this.ptyClose(ptyId)) {
-                count++
-            }
-        }
-        return count
     }
 
     /**
@@ -770,8 +701,6 @@ export class SessionManager {
         })
     }
 
-    // ========== PTY 会话管理 ==========
-
     /**
      * 关闭端口转发
      */
@@ -786,14 +715,14 @@ export class SessionManager {
         if (fwdSession.type === 'local' && fwdSession.server) {
             try {
                 fwdSession.server.close()
-            } catch {
+            } catch { /* 忽略清理异常 */
             }
         } else if (fwdSession.type === 'remote') {
             const session = this.sessions.get(fwdSession.alias)
             if (session) {
                 try {
                     session.client.unforwardIn(fwdSession.remoteHost, fwdSession.remotePort)
-                } catch {
+                } catch { /* 忽略清理异常 */
                 }
                 // 检查是否需要移除共享 dispatcher
                 this.removeTcpDispatcherIfEmpty(session, fwdSession.alias)
@@ -892,7 +821,32 @@ export class SessionManager {
         return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)
     }
 
-    // ========== 端口转发 ==========
+    /**
+     * 构建完整命令：注入环境变量 + 切换工作目录
+     */
+    private buildCommand(
+        command: string,
+        session: SSHSession,
+        options: { env?: Record<string, string>; cwd?: string },
+    ): string {
+        let fullCommand = command
+        const env       = {...session.config.env, ...options.env}
+
+        if (Object.keys(env).length > 0) {
+            const validEntries = Object.entries(env).filter(([k]) => this.isValidEnvKey(k))
+            if (validEntries.length > 0) {
+                const envStr = validEntries
+                    .map(([k, v]) => `export ${k}=${this.escapeShellArg(v)}`)
+                    .join('; ')
+                fullCommand  = `${envStr}; ${command}`
+            }
+        }
+
+        if (options.cwd) {
+            fullCommand = `cd ${this.escapeShellArg(options.cwd)} && ${fullCommand}`
+        }
+        return fullCommand
+    }
 
     /**
      * 根据用户 shell 类型生成加载配置文件的命令
@@ -965,7 +919,6 @@ export class SessionManager {
     /**
      * 确保 SSH session 有共享的 tcp connection dispatcher
      * 所有 remote forward 共用一个 dispatcher，根据 destIP/destPort 路由
-     * @param alias - session 的 map key
      */
     private ensureTcpDispatcher(session: SSHSession, alias: string): void {
         if (session.tcpDispatcher) {
@@ -999,7 +952,6 @@ export class SessionManager {
 
     /**
      * 移除 SSH session 的 tcp dispatcher（当没有 remote forward 时）
-     * @param alias - session 的 map key
      */
     private removeTcpDispatcherIfEmpty(session: SSHSession, alias: string): void {
         if (!session.tcpDispatcher) {

@@ -102,7 +102,7 @@ export function parseProxyJump(proxyJump: string): ParsedProxyJump | null {
     }
 
     const {host, port} = parseHostPort(firstJump)
-    return {user, host, port}
+    return {host, port}
 }
 
 /**
@@ -255,10 +255,3 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
     return hosts
 }
 
-/**
- * 根据 Host 名称获取配置
- */
-export function getHostConfig(hostName: string, configPath?: string): SSHConfigHost | null {
-    const hosts = parseSSHConfig(configPath)
-    return hosts.find(h => h.host === hostName) || null
-}

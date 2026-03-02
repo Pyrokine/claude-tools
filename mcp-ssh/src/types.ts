@@ -110,15 +110,6 @@ export interface PtySessionInfo {
 // 端口转发类型
 export type ForwardType = 'local' | 'remote';
 
-// 端口转发配置
-export interface PortForwardConfig {
-    type: ForwardType;
-    localHost: string;
-    localPort: number;
-    remoteHost: string;
-    remotePort: number;
-}
-
 // 端口转发信息
 export interface PortForwardInfo {
     id: string;

@@ -5,9 +5,79 @@
 import {execSync} from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
-import {Stats} from 'ssh2'
+import {SFTPWrapper, Stats} from 'ssh2'
 import {sessionManager} from './session-manager.js'
 import {FileInfo, TransferProgress} from './types.js'
+
+// 文件类型 mode 常量
+const S_IFDIR = 0o40000
+const S_IFREG = 0o100000
+const S_IFLNK = 0o120000
+
+/**
+ * sftp.stat 的 Promise 包装
+ */
+function sftpStat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
+    return new Promise((resolve, reject) => {
+        sftp.stat(remotePath, (err, stats) => {
+            if (err) {
+                reject(err)
+            } else {
+                resolve(stats)
+            }
+        })
+    })
+}
+
+/**
+ * 带进度追踪的流传输
+ */
+function pipeWithProgress(
+    readStream: NodeJS.ReadableStream,
+    writeStream: NodeJS.WritableStream,
+    sftp: SFTPWrapper,
+    totalSize: number,
+    onProgress?: (progress: TransferProgress) => void,
+): Promise<{ success: boolean; size: number }> {
+    return new Promise((resolve, reject) => {
+        let settled = false
+
+        const cleanup = (err?: Error) => {
+            if (settled) {
+                return
+            }
+            settled = true
+            sftp.end()
+            if (err) {
+                reject(err)
+            }
+        }
+
+        let transferred = 0
+
+        readStream.on('data', (chunk: Buffer) => {
+            transferred += chunk.length
+            onProgress?.({
+                             transferred,
+                             total: totalSize,
+                             percent: totalSize > 0 ? Math.round((transferred / totalSize) * 100) : 100,
+                         })
+        })
+
+        readStream.on('error', (err: Error) => cleanup(err))
+        writeStream.on('error', (err: Error) => cleanup(err))
+
+        writeStream.on('close', () => {
+            if (!settled) {
+                settled = true
+                sftp.end()
+                resolve({success: true, size: totalSize})
+            }
+        })
+
+        readStream.pipe(writeStream)
+    })
+}
 
 /**
  * 上传文件
@@ -23,51 +93,13 @@ export async function uploadFile(
     }
 
     const sftp      = await sessionManager.getSftp(alias)
-    const stats     = fs.statSync(localPath)
-    const totalSize = stats.size
+    const totalSize = fs.statSync(localPath).size
 
-    return new Promise((resolve, reject) => {
-        const readStream  = fs.createReadStream(localPath)
-        const writeStream = sftp.createWriteStream(remotePath)
-        let settled       = false
-
-        const cleanup = (err?: Error) => {
-            if (settled) {
-                return
-            }
-            settled = true
-            sftp.end()
-            if (err) {
-                reject(err)
-            }
-        }
-
-        let transferred = 0
-
-        readStream.on('data', (chunk: Buffer) => {
-            transferred += chunk.length
-            if (onProgress) {
-                onProgress({
-                               transferred,
-                               total: totalSize,
-                               percent: totalSize > 0 ? Math.round((transferred / totalSize) * 100) : 100,
-                           })
-            }
-        })
-
-        readStream.on('error', (err: Error) => cleanup(err))
-        writeStream.on('error', (err: Error) => cleanup(err))
-
-        writeStream.on('close', () => {
-            if (!settled) {
-                settled = true
-                sftp.end()
-                resolve({success: true, size: totalSize})
-            }
-        })
-
-        readStream.pipe(writeStream)
-    })
+    return pipeWithProgress(
+        fs.createReadStream(localPath),
+        sftp.createWriteStream(remotePath),
+        sftp, totalSize, onProgress,
+    )
 }
 
 /**
@@ -79,19 +111,8 @@ export async function downloadFile(
     localPath: string,
     onProgress?: (progress: TransferProgress) => void,
 ): Promise<{ success: boolean; size: number }> {
-    const sftp = await sessionManager.getSftp(alias)
-
-    // 获取远程文件大小
-    const stats     = await new Promise<Stats>((resolve, reject) => {
-        sftp.stat(remotePath, (err, stats) => {
-            if (err) {
-                reject(err)
-            } else {
-                resolve(stats)
-            }
-        })
-    })
-    const totalSize = stats.size
+    const sftp      = await sessionManager.getSftp(alias)
+    const totalSize = (await sftpStat(sftp, remotePath)).size
 
     // 确保本地目录存在
     const localDir = path.dirname(localPath)
@@ -99,48 +120,11 @@ export async function downloadFile(
         fs.mkdirSync(localDir, {recursive: true})
     }
 
-    return new Promise((resolve, reject) => {
-        const readStream  = sftp.createReadStream(remotePath)
-        const writeStream = fs.createWriteStream(localPath)
-        let settled       = false
-
-        const cleanup = (err?: Error) => {
-            if (settled) {
-                return
-            }
-            settled = true
-            sftp.end()
-            if (err) {
-                reject(err)
-            }
-        }
-
-        let transferred = 0
-
-        readStream.on('data', (chunk: Buffer) => {
-            transferred += chunk.length
-            if (onProgress) {
-                onProgress({
-                               transferred,
-                               total: totalSize,
-                               percent: totalSize > 0 ? Math.round((transferred / totalSize) * 100) : 100,
-                           })
-            }
-        })
-
-        readStream.on('error', (err: Error) => cleanup(err))
-        writeStream.on('error', (err: Error) => cleanup(err))
-
-        writeStream.on('close', () => {
-            if (!settled) {
-                settled = true
-                sftp.end()
-                resolve({success: true, size: totalSize})
-            }
-        })
-
-        readStream.pipe(writeStream)
-    })
+    return pipeWithProgress(
+        sftp.createReadStream(remotePath),
+        fs.createWriteStream(localPath),
+        sftp, totalSize, onProgress,
+    )
 }
 
 /**
@@ -151,20 +135,8 @@ export async function readFile(
     remotePath: string,
     maxBytes: number = 1024 * 1024,  // 默认最大 1MB
 ): Promise<{ content: string; size: number; truncated: boolean }> {
-    const sftp = await sessionManager.getSftp(alias)
-
-    // 获取文件大小
-    const stats = await new Promise<Stats>((resolve, reject) => {
-        sftp.stat(remotePath, (err, stats) => {
-            if (err) {
-                reject(err)
-            } else {
-                resolve(stats)
-            }
-        })
-    })
-
-    const actualSize = stats.size
+    const sftp       = await sessionManager.getSftp(alias)
+    const actualSize = (await sftpStat(sftp, remotePath)).size
     const truncated  = actualSize > maxBytes
 
     // 处理空文件
@@ -258,9 +230,9 @@ export async function listDir(
                     name: item.filename,
                     path: path.posix.join(remotePath, item.filename),
                     size: item.attrs.size,
-                    isDirectory: (item.attrs.mode & 0o40000) !== 0,
-                    isFile: (item.attrs.mode & 0o100000) !== 0,
-                    isSymlink: (item.attrs.mode & 0o120000) !== 0,
+                    isDirectory: (item.attrs.mode & S_IFDIR) !== 0,
+                    isFile: (item.attrs.mode & S_IFREG) !== 0,
+                    isSymlink: (item.attrs.mode & S_IFLNK) !== 0,
                     permissions: formatPermissions(item.attrs.mode),
                     owner: item.attrs.uid,
                     group: item.attrs.gid,
@@ -303,32 +275,15 @@ export async function getFileInfo(
                         name: path.posix.basename(remotePath),
                         path: remotePath,
                         size: stats.size,
-                        isDirectory: (stats.mode & 0o40000) !== 0,
-                        isFile: (stats.mode & 0o100000) !== 0,
-                        isSymlink: (stats.mode & 0o120000) !== 0,
+                        isDirectory: (stats.mode & S_IFDIR) !== 0,
+                        isFile: (stats.mode & S_IFREG) !== 0,
+                        isSymlink: (stats.mode & S_IFLNK) !== 0,
                         permissions: formatPermissions(stats.mode),
                         owner: stats.uid,
                         group: stats.gid,
                         mtime: new Date(stats.mtime * 1000),
                         atime: new Date(stats.atime * 1000),
                     })
-        })
-    })
-}
-
-/**
- * 检查文件是否存在
- */
-export async function fileExists(
-    alias: string,
-    remotePath: string,
-): Promise<boolean> {
-    const sftp = await sessionManager.getSftp(alias)
-
-    return new Promise((resolve) => {
-        sftp.stat(remotePath, (err) => {
-            sftp.end()
-            resolve(!err)
         })
     })
 }
@@ -350,26 +305,6 @@ export async function mkdir(
     const sftp = await sessionManager.getSftp(alias)
     return new Promise((resolve, reject) => {
         sftp.mkdir(remotePath, (err) => {
-            sftp.end()
-            if (err) {
-                reject(err)
-            } else {
-                resolve(true)
-            }
-        })
-    })
-}
-
-/**
- * 删除文件
- */
-export async function removeFile(
-    alias: string,
-    remotePath: string,
-): Promise<boolean> {
-    const sftp = await sessionManager.getSftp(alias)
-    return new Promise((resolve, reject) => {
-        sftp.unlink(remotePath, (err) => {
             sftp.end()
             if (err) {
                 reject(err)
@@ -412,23 +347,13 @@ export async function syncFiles(
         exclude?: string[];     // 排除模式
         recursive?: boolean;    // 递归同步目录
     } = {},
-): Promise<{
-    success: boolean;
-    method: 'rsync' | 'sftp';
-    filesTransferred?: number;
-    bytesTransferred?: number;
-    output?: string;
-}> {
-    // 检查远程 rsync
+): Promise<SyncResult> {
     const hasRsync = await checkRsync(alias)
 
     if (hasRsync) {
-        // 使用 rsync（通过远程端执行）
         return syncWithRsync(alias, localPath, remotePath, direction, options)
-    } else {
-        // 回退到 SFTP
-        return syncWithSftp(alias, localPath, remotePath, direction, options)
     }
+    return syncWithSftp(alias, localPath, remotePath, direction, options)
 }
 
 /**
@@ -453,13 +378,7 @@ async function syncWithRsync(
         exclude?: string[];
         recursive?: boolean;
     },
-): Promise<{
-    success: boolean;
-    method: 'rsync' | 'sftp';
-    filesTransferred?: number;
-    bytesTransferred?: number;
-    output?: string;
-}> {
+): Promise<SyncResult> {
     // 检查本地是否有 rsync
     let hasLocalRsync = false
     try {
@@ -540,6 +459,28 @@ async function syncWithRsync(
 /**
  * 使用 SFTP 同步文件
  */
+type SyncResult = {
+    success: boolean;
+    method: 'rsync' | 'sftp';
+    filesTransferred?: number;
+    bytesTransferred?: number;
+    output?: string;
+}
+
+function buildSyncResult(
+    fileCount: number,
+    totalSize: number,
+    warnings: string[],
+): SyncResult {
+    return {
+        success: true,
+        method: 'sftp',
+        filesTransferred: fileCount,
+        bytesTransferred: totalSize,
+        output: warnings.length ? `Warning: ${warnings.join('; ')}` : undefined,
+    }
+}
+
 async function syncWithSftp(
     alias: string,
     localPath: string,
@@ -551,14 +492,7 @@ async function syncWithSftp(
         exclude?: string[];
         recursive?: boolean;
     },
-): Promise<{
-    success: boolean;
-    method: 'rsync' | 'sftp';
-    filesTransferred?: number;
-    bytesTransferred?: number;
-    output?: string;
-}> {
-    // SFTP 模式不支持 delete 选项
+): Promise<SyncResult> {
     const warnings: string[] = []
     if (options.delete) {
         warnings.push('delete option is not supported in SFTP mode (requires rsync)')
@@ -574,53 +508,24 @@ async function syncWithSftp(
     }
 
     try {
-        let result: { fileCount: number; totalSize: number } | { success: boolean; size: number }
-
         if (direction === 'upload') {
-            // 检查是否是目录
             const stats = fs.statSync(localPath)
             if (stats.isDirectory() && options.recursive !== false) {
-                result = await uploadDirectory(alias, localPath, remotePath, options.exclude)
-                return {
-                    success: true,
-                    method: 'sftp',
-                    filesTransferred: result.fileCount,
-                    bytesTransferred: result.totalSize,
-                    output: warnings.length ? `Warning: ${warnings.join('; ')}` : undefined,
-                }
-            } else {
-                result = await uploadFile(alias, localPath, remotePath)
-                return {
-                    success: result.success,
-                    method: 'sftp',
-                    filesTransferred: 1,
-                    bytesTransferred: result.size,
-                    output: warnings.length ? `Warning: ${warnings.join('; ')}` : undefined,
-                }
+                const {fileCount, totalSize} = await uploadDirectory(alias, localPath, remotePath, options.exclude)
+                return buildSyncResult(fileCount, totalSize, warnings)
             }
-        } else {
-            // 下载
-            const info = await getFileInfo(alias, remotePath)
-            if (info.isDirectory && options.recursive !== false) {
-                result = await downloadDirectory(alias, remotePath, localPath, options.exclude)
-                return {
-                    success: true,
-                    method: 'sftp',
-                    filesTransferred: result.fileCount,
-                    bytesTransferred: result.totalSize,
-                    output: warnings.length ? `Warning: ${warnings.join('; ')}` : undefined,
-                }
-            } else {
-                result = await downloadFile(alias, remotePath, localPath)
-                return {
-                    success: result.success,
-                    method: 'sftp',
-                    filesTransferred: 1,
-                    bytesTransferred: result.size,
-                    output: warnings.length ? `Warning: ${warnings.join('; ')}` : undefined,
-                }
-            }
+            const {size} = await uploadFile(alias, localPath, remotePath)
+            return buildSyncResult(1, size, warnings)
         }
+
+        // download
+        const info = await getFileInfo(alias, remotePath)
+        if (info.isDirectory && options.recursive !== false) {
+            const {fileCount, totalSize} = await downloadDirectory(alias, remotePath, localPath, options.exclude)
+            return buildSyncResult(fileCount, totalSize, warnings)
+        }
+        const {size} = await downloadFile(alias, remotePath, localPath)
+        return buildSyncResult(1, size, warnings)
     } catch (err: any) {
         return {
             success: false,
@@ -725,15 +630,15 @@ function matchPattern(name: string, pattern: string): boolean {
  * 格式化权限字符串
  */
 function formatPermissions(mode: number): string {
-    const types: Record<number, string> = {
-        0o40000: 'd',
-        0o120000: 'l',
-        0o100000: '-',
-    }
+    const types: [number, string][] = [
+        [S_IFDIR, 'd'],
+        [S_IFLNK, 'l'],
+        [S_IFREG, '-'],
+    ]
 
     let type = '-'
-    for (const [mask, char] of Object.entries(types)) {
-        if ((mode & parseInt(mask)) !== 0) {
+    for (const [mask, char] of types) {
+        if ((mode & mask) !== 0) {
             type = char
             break
         }
