@@ -13,7 +13,7 @@ import {createServer, IncomingMessage, Server, ServerResponse} from 'http'
 import {WebSocket, WebSocketServer} from 'ws'
 import {DEFAULT_TIMEOUT} from '../core/types.js'
 
-const SERVER_VERSION     = '1.2.0'
+const SERVER_VERSION     = '1.3.0'
 const DEFAULT_PORT       = 19222
 const MAX_PORT           = 19299
 const REQUEST_TIMEOUT    = DEFAULT_TIMEOUT

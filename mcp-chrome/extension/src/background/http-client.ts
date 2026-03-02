@@ -9,7 +9,7 @@
  * - 心跳检测（连接存活确认）
  */
 
-const EXTENSION_VERSION    = '1.2.0'
+const EXTENSION_VERSION    = '1.3.0'
 const PORT_RANGE_START     = 19222
 const PORT_RANGE_END       = 19299
 const HEALTH_CHECK_TIMEOUT = 500
