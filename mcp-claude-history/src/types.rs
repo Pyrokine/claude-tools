@@ -6,13 +6,9 @@ use std::path::PathBuf;
 #[serde(rename_all = "camelCase")]
 pub struct MessageRecord {
     pub uuid: String,
-    #[serde(default)]
-    pub parent_uuid: Option<String>,
     #[serde(rename = "type")]
     pub msg_type: String,
     pub timestamp: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
     #[serde(default)]
     pub message: Option<serde_json::Value>,
 }

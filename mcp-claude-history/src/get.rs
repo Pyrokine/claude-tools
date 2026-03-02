@@ -23,7 +23,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     })?;
 
     // 查找 session 文件
-    let (project_id, session_id, path) = find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
+    let (_project_id, _session_id, path) = find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
 
     // 读取指定行
     let file = File::open(&path).map_err(|e| ErrorResponse {
@@ -67,7 +67,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
 
     // 如果指定了 output，写入文件
     if let Some(output_dir) = params.output {
-        return write_output(config, &output_dir, &params.r#ref, &record, &content, image_count);
+        return write_output(&output_dir, &params.r#ref, &record, &content, image_count);
     }
 
     // 如果指定了 range，返回部分内容
@@ -168,7 +168,6 @@ pub fn find_session_file(
 
 /// 写入输出文件
 fn write_output(
-    config: &Config,
     output_dir: &PathBuf,
     r#ref: &str,
     record: &MessageRecord,

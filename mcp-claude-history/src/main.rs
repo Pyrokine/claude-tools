@@ -19,6 +19,7 @@ use projects::list_projects;
 use search::{search, SearchParams};
 use sessions::list_sessions;
 use types::Range;
+use utils::parse_range;
 
 #[derive(Parser)]
 #[command(name = "claude-history")]
@@ -228,16 +229,7 @@ fn main() {
             output,
             project,
         } => {
-            let range = range.and_then(|s| {
-                let parts: Vec<&str> = s.split('-').collect();
-                if parts.len() == 2 {
-                    let start = parts[0].parse().ok()?;
-                    let end = parts[1].parse().ok()?;
-                    Some((start, end))
-                } else {
-                    None
-                }
-            });
+            let range = range.and_then(|s| parse_range(&s));
 
             let params = GetParams {
                 r#ref,

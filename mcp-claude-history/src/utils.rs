@@ -239,3 +239,15 @@ pub fn session_id_from_filename(filename: &str) -> Option<String> {
 pub fn ref_prefix(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
+
+/// 解析 "start-end" 格式的范围字符串
+pub fn parse_range(s: &str) -> Option<(usize, usize)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() == 2 {
+        let start = parts[0].parse().ok()?;
+        let end = parts[1].parse().ok()?;
+        Some((start, end))
+    } else {
+        None
+    }
+}

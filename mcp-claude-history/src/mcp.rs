@@ -5,11 +5,15 @@ use crate::projects::list_projects;
 use crate::search::{search, SearchParams};
 use crate::sessions::list_sessions;
 use crate::types::Range;
+use crate::utils::parse_range;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+
+const DEFAULT_MAX_CONTENT: usize = 4000;
+const DEFAULT_MAX_TOTAL: usize = 40000;
 
 thread_local! {
     /// 从客户端 roots 获取的当前项目 ID
@@ -234,44 +238,46 @@ pub fn run_mcp_server() {
             Ok(l) => l,
             Err(_) => continue,
         };
-
         if line.is_empty() {
             continue;
         }
+        process_line(&config, &line, &mut stdout);
+    }
+}
 
-        // 尝试解析为 roots/list 响应（必须匹配我们发出的请求 ID）
-        if let Ok(response) = serde_json::from_str::<Value>(&line) {
-            if response.get("id") == Some(&Value::String("roots-list-1".to_string()))
-                && response.get("result").is_some()
-            {
-                handle_roots_response(&response);
-                continue;
-            }
+fn process_line(config: &Config, line: &str, stdout: &mut io::Stdout) {
+    // 尝试解析为 roots/list 响应（必须匹配我们发出的请求 ID）
+    if let Ok(response) = serde_json::from_str::<Value>(line) {
+        if response.get("id") == Some(&Value::String("roots-list-1".to_string()))
+            && response.get("result").is_some()
+        {
+            handle_roots_response(&response);
+            return;
         }
+    }
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                let response = JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: {}", e),
-                        data: None,
-                    }),
-                };
-                let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap_or_default());
-                let _ = stdout.flush();
-                continue;
-            }
-        };
-
-        if let Some(response) = handle_request(&config, &request, &mut stdout) {
+    let request: JsonRpcRequest = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(e) => {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Value::Null,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32700,
+                    message: format!("Parse error: {}", e),
+                    data: None,
+                }),
+            };
             let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap_or_default());
             let _ = stdout.flush();
+            return;
         }
+    };
+
+    if let Some(response) = handle_request(config, &request, stdout) {
+        let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap_or_default());
+        let _ = stdout.flush();
     }
 }
 
@@ -421,26 +427,51 @@ fn execute_tool(config: &Config, tool_name: &str, args: Value) -> Result<Value, 
     }
 }
 
+struct SearchArgs {
+    pattern: String,
+    project: Option<String>,
+    all: bool,
+    sessions: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    types: Option<String>,
+    lines: Option<String>,
+    regex: bool,
+    case_sensitive: bool,
+    offset: usize,
+    limit: Option<usize>,
+    max_content: usize,
+    max_total: usize,
+}
+
+impl SearchArgs {
+    fn from_json(args: &Value) -> Self {
+        Self {
+            pattern: args.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            project: args.get("project").and_then(|v| v.as_str()).map(String::from),
+            all: args.get("all").and_then(|v| v.as_bool()).unwrap_or(false),
+            sessions: args.get("sessions").and_then(|v| v.as_str()).map(String::from),
+            since: args.get("since").and_then(|v| v.as_str()).map(String::from),
+            until: args.get("until").and_then(|v| v.as_str()).map(String::from),
+            types: args.get("types").and_then(|v| v.as_str()).map(String::from),
+            lines: args.get("lines").and_then(|v| v.as_str()).map(String::from),
+            regex: args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false),
+            case_sensitive: args.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
+            offset: args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            limit: args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize),
+            max_content: args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_CONTENT as u64) as usize,
+            max_total: args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_TOTAL as u64) as usize,
+        }
+    }
+}
+
 fn execute_search(config: &Config, args: Value) -> Result<Value, Value> {
-    let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let project = args.get("project").and_then(|v| v.as_str());
-    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-    let sessions = args.get("sessions").and_then(|v| v.as_str());
-    let since = args.get("since").and_then(|v| v.as_str());
-    let until = args.get("until").and_then(|v| v.as_str());
-    let types = args.get("types").and_then(|v| v.as_str());
-    let lines = args.get("lines").and_then(|v| v.as_str());
-    let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
-    let case_sensitive = args.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
-    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-    let max_content = args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
-    let max_total = args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(40000) as usize;
+    let a = SearchArgs::from_json(&args);
 
     // 优先级：指定 project > 从 roots 获取 > 搜索所有
-    let (projects, all_projects) = if let Some(p) = project {
+    let (projects, all_projects) = if let Some(p) = a.project.as_deref() {
         (p.split(',').map(|s| s.trim().to_string()).collect(), false)
-    } else if all {
+    } else if a.all {
         (vec![], true)
     } else {
         // 尝试使用从 roots 获取的当前项目
@@ -454,20 +485,20 @@ fn execute_search(config: &Config, args: Value) -> Result<Value, Value> {
     };
 
     let params = SearchParams {
-        pattern: pattern.to_string(),
+        pattern: a.pattern,
         projects,
         all_projects,
-        sessions: sessions.map(|s| s.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
-        since: parse_datetime(since),
-        until: parse_datetime(until),
-        types: types.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_else(|| vec!["assistant".to_string(), "user".to_string(), "summary".to_string()]),
-        lines: lines.map(|l| Range::parse_ranges(l)).unwrap_or_default(),
-        use_regex: regex,
-        case_sensitive,
-        offset,
-        limit,
-        max_content,
-        max_total,
+        sessions: a.sessions.as_deref().map(|s| s.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+        since: parse_datetime(a.since.as_deref()),
+        until: parse_datetime(a.until.as_deref()),
+        types: a.types.as_deref().map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_else(|| vec!["assistant".to_string(), "user".to_string(), "summary".to_string()]),
+        lines: a.lines.as_deref().map(|l| Range::parse_ranges(l)).unwrap_or_default(),
+        use_regex: a.regex,
+        case_sensitive: a.case_sensitive,
+        offset: a.offset,
+        limit: a.limit,
+        max_content: a.max_content,
+        max_total: a.max_total,
     };
 
     match search(config, params) {
@@ -476,28 +507,33 @@ fn execute_search(config: &Config, args: Value) -> Result<Value, Value> {
     }
 }
 
-fn execute_get(config: &Config, args: Value) -> Result<Value, Value> {
-    let r#ref = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-    let range = args.get("range").and_then(|v| v.as_str());
-    let output = args.get("output").and_then(|v| v.as_str());
-    let project = args.get("project").and_then(|v| v.as_str());
+struct GetArgs {
+    r#ref: String,
+    range: Option<(usize, usize)>,
+    output: Option<String>,
+    project: Option<String>,
+}
 
-    let range = range.and_then(|r| {
-        let parts: Vec<&str> = r.split('-').collect();
-        if parts.len() == 2 {
-            let start = parts[0].parse().ok()?;
-            let end = parts[1].parse().ok()?;
-            Some((start, end))
-        } else {
-            None
+impl GetArgs {
+    fn from_json(args: &Value) -> Self {
+        let range_str = args.get("range").and_then(|v| v.as_str());
+        Self {
+            r#ref: args.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            range: range_str.and_then(parse_range),
+            output: args.get("output").and_then(|v| v.as_str()).map(String::from),
+            project: args.get("project").and_then(|v| v.as_str()).map(String::from),
         }
-    });
+    }
+}
+
+fn execute_get(config: &Config, args: Value) -> Result<Value, Value> {
+    let a = GetArgs::from_json(&args);
 
     let params = GetParams {
-        r#ref: r#ref.to_string(),
-        range,
-        output: output.map(PathBuf::from),
-        project: project.map(String::from),
+        r#ref: a.r#ref,
+        range: a.range,
+        output: a.output.map(PathBuf::from),
+        project: a.project,
     };
 
     match get(config, params) {
@@ -506,27 +542,47 @@ fn execute_get(config: &Config, args: Value) -> Result<Value, Value> {
     }
 }
 
+struct ContextArgs {
+    r#ref: String,
+    before: Option<usize>,
+    after: Option<usize>,
+    until_type: Option<String>,
+    direction: String,
+    types: Option<String>,
+    project: Option<String>,
+    max_content: usize,
+    max_total: usize,
+}
+
+impl ContextArgs {
+    fn from_json(args: &Value) -> Self {
+        Self {
+            r#ref: args.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            before: args.get("before").and_then(|v| v.as_u64()).map(|v| v as usize),
+            after: args.get("after").and_then(|v| v.as_u64()).map(|v| v as usize),
+            until_type: args.get("until_type").and_then(|v| v.as_str()).map(String::from),
+            direction: args.get("direction").and_then(|v| v.as_str()).unwrap_or("forward").to_string(),
+            types: args.get("types").and_then(|v| v.as_str()).map(String::from),
+            project: args.get("project").and_then(|v| v.as_str()).map(String::from),
+            max_content: args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_CONTENT as u64) as usize,
+            max_total: args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_TOTAL as u64) as usize,
+        }
+    }
+}
+
 fn execute_context(config: &Config, args: Value) -> Result<Value, Value> {
-    let r#ref = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-    let before = args.get("before").and_then(|v| v.as_u64()).map(|v| v as usize);
-    let after = args.get("after").and_then(|v| v.as_u64()).map(|v| v as usize);
-    let until_type = args.get("until_type").and_then(|v| v.as_str());
-    let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("forward");
-    let types = args.get("types").and_then(|v| v.as_str());
-    let project = args.get("project").and_then(|v| v.as_str());
-    let max_content = args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
-    let max_total = args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(40000) as usize;
+    let a = ContextArgs::from_json(&args);
 
     let params = ContextParams {
-        r#ref: r#ref.to_string(),
-        before,
-        after,
-        until_type: until_type.map(String::from),
-        direction: direction.to_string(),
-        project: project.map(String::from),
-        types: types.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
-        max_content,
-        max_total,
+        r#ref: a.r#ref,
+        before: a.before,
+        after: a.after,
+        until_type: a.until_type,
+        direction: a.direction,
+        project: a.project,
+        types: a.types.as_deref().map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+        max_content: a.max_content,
+        max_total: a.max_total,
     };
 
     match context(config, params) {

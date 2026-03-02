@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// 搜索参数
@@ -277,7 +277,7 @@ fn collect_jsonl_files(
 fn search_file(
     project_id: &str,
     session_id: &str,
-    path: &PathBuf,
+    path: &Path,
     params: &SearchParams,
     regex: Option<&Regex>,
     pattern: Option<&SearchPattern>,
