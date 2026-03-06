@@ -136,6 +136,7 @@ Event sequence model supporting arbitrary combinations:
 | Event Type                              | Description                |
 |-----------------------------------------|----------------------------|
 | `keydown` / `keyup`                     | Key press/release          |
+| `click`                                 | Click (mousedown + mouseup)  |
 | `mousedown` / `mouseup`                 | Mouse button press/release |
 | `mousemove`                             | Mouse movement             |
 | `wheel`                                 | Mouse wheel scroll         |
@@ -153,11 +154,12 @@ an iframe (CSS selector or index). Both Extension mode only.
 | `text`       | Extract text content                              |
 | `html`       | Extract HTML source                               |
 | `attribute`  | Extract element attribute                         |
-| `screenshot` | Take screenshot                                   |
+| `screenshot` | Take screenshot (supports `target` element crop)  |
 | `state`      | Get page state (URL, title, interactive elements) |
+| `metadata`   | Extract page metadata (title, OG, JSON-LD, etc.)  |
 
-Parameters: `output` saves result to file. `tabId` targets a specific tab. `frame` targets an iframe. Both Extension
-mode only.
+Parameters: `output` saves result to file (or directory for `images=data`). `images` (`info`/`data`) extracts image
+metadata or data alongside HTML. `tabId` targets a specific tab. `frame` targets an iframe. Both Extension mode only.
 
 ### wait - Wait for Conditions
 
@@ -340,11 +342,35 @@ evaluate(script="document.title", tabId="12345")
 // Full page
 extract(type="screenshot", fullPage=true)
 
+// Element screenshot (any target type)
+extract(type="screenshot", target={ role: "button", name: "Submit" })
+
 // JPEG with quality (smaller file)
 extract(type="screenshot", format="jpeg", quality=80, output="/tmp/screenshot.jpg")
 
 // Save to file
 extract(type="screenshot", output="/tmp/screenshot.png")
+```
+
+### Extract HTML with Images
+
+```
+// Get HTML + image metadata (src, alt, dimensions)
+extract(type="html", target={ css: ".article" }, images="info")
+
+// Get HTML + image data, save to directory
+extract(type="html", images="data", output="/tmp/page")
+// Creates: /tmp/page/content.html, /tmp/page/images/*, /tmp/page/index.json
+
+// Get HTML + image data inline (max 20 images)
+extract(type="html", target={ css: ".card" }, images="data")
+```
+
+### Page Metadata
+
+```
+// Extract title, OG tags, JSON-LD, feeds, etc.
+extract(type="metadata")
 ```
 
 ### iframe Operations (Extension Mode)

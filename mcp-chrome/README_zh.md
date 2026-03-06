@@ -131,6 +131,7 @@ Extension 特有：`list` 返回 `managed` 字段（Tab 是否在 MCP Chrome 分
 | 事件类型                                    | 描述      |
 |-----------------------------------------|---------|
 | `keydown` / `keyup`                     | 按键按下/释放 |
+| `click`                                 | 点击（mousedown + mouseup） |
 | `mousedown` / `mouseup`                 | 鼠标按下/释放 |
 | `mousemove`                             | 鼠标移动    |
 | `wheel`                                 | 滚轮滚动    |
@@ -143,15 +144,17 @@ Extension 模式。
 
 ### extract - 内容提取
 
-| Type         | 描述                   |
-|--------------|----------------------|
+| Type         | 描述                    |
+|--------------|-----------------------|
 | `text`       | 提取文本内容               |
 | `html`       | 提取 HTML 源码           |
 | `attribute`  | 提取元素属性               |
-| `screenshot` | 截图                   |
+| `screenshot` | 截图（支持 `target` 元素裁剪） |
 | `state`      | 获取页面状态（URL、标题、可交互元素） |
+| `metadata`   | 提取页面元信息（标题、OG、JSON-LD 等） |
 
-参数：`output` 将结果保存到文件。`tabId` 指定目标 Tab。`frame` 指定目标 iframe。均限 Extension 模式。
+参数：`output` 将结果保存到文件（`images=data` 时为输出目录）。`images`（`info`/`data`）提取 HTML 中的图片元信息或数据。`tabId`
+指定目标 Tab。`frame` 指定目标 iframe。均限 Extension 模式。
 
 ### wait - 等待条件
 
@@ -333,11 +336,35 @@ evaluate(script="document.title", tabId="12345")
 // 全页面
 extract(type="screenshot", fullPage=true)
 
+// 元素截图（支持所有 target 类型）
+extract(type="screenshot", target={ role: "button", name: "提交" })
+
 // JPEG + quality（更小体积）
 extract(type="screenshot", format="jpeg", quality=80, output="/tmp/screenshot.jpg")
 
 // 保存到文件
 extract(type="screenshot", output="/tmp/screenshot.png")
+```
+
+### 提取 HTML 及图片
+
+```
+// 获取 HTML + 图片元信息（src、alt、尺寸）
+extract(type="html", target={ css: ".article" }, images="info")
+
+// 获取 HTML + 图片数据，保存到目录
+extract(type="html", images="data", output="/tmp/page")
+// 生成：/tmp/page/content.html, /tmp/page/images/*, /tmp/page/index.json
+
+// 获取 HTML + 图片数据（内联返回，最多 20 张）
+extract(type="html", target={ css: ".card" }, images="data")
+```
+
+### 页面元信息
+
+```
+// 提取标题、OG 标签、JSON-LD、RSS 等
+extract(type="metadata")
 ```
 
 ### iframe 操作（Extension 模式）
