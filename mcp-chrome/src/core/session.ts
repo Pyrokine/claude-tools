@@ -14,11 +14,11 @@ import {AutoWait} from './auto-wait.js'
 import {NavigationTimeoutError, SessionNotFoundError, TargetNotFoundError} from './errors.js'
 import {Locator} from './locator.js'
 import {
+    type CdpResultObject,
     type ConnectOptions,
     type ConsoleLogEntry,
     type Cookie,
     type CookieOptions,
-    type CdpResultObject,
     DEFAULT_TIMEOUT,
     extractCdpValue,
     formatCdpException,
@@ -647,7 +647,13 @@ class SessionManager {
     /**
      * 截图
      */
-    async screenshot(fullPage = false, scale?: number, format?: string, quality?: number, clip?: { x: number; y: number; width: number; height: number }): Promise<string> {
+    async screenshot(
+        fullPage = false,
+        scale?: number,
+        format?: string,
+        quality?: number,
+        clip?: { x: number; y: number; width: number; height: number },
+    ): Promise<string> {
         this.ensureSession()
 
         const captureParams: Record<string, unknown> = {format: format ?? 'png'}

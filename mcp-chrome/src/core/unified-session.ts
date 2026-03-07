@@ -605,14 +605,56 @@ class UnifiedSessionManager {
             if (this.isExtensionConnected()) {
                 return this.extensionBridge!.find(selector, text, xpath, timeout)
             }
-            throw new Error('Extension 未连接')
+            this.assertCdpFallbackAllowed()
+            return this.findViaCdp(selector, text, xpath, timeout)
         }
 
         // 非轮询上下文：允许等待重连
         if (await this.ensureExtensionConnected()) {
             return this.extensionBridge!.find(selector, text, xpath)
         }
-        throw new Error('Extension 未连接')
+        return this.findViaCdp(selector, text, xpath)
+    }
+
+    /** CDP fallback：通过 Runtime.evaluate 注入 DOM 查询逻辑 */
+    private async findViaCdp(selector?: string, text?: string, xpath?: string, timeout?: number): Promise<Array<{
+        refId: string
+        tag: string
+        text: string
+        rect: { x: number; y: number; width: number; height: number }
+    }>> {
+        return getCdpSession().evaluate<Array<{
+            refId: string; tag: string; text: string
+            rect: { x: number; y: number; width: number; height: number }
+        }>>(`function(selector, text, xpath) {
+            var elements;
+            if (xpath) {
+                elements = [];
+                var xr = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                for (var i = 0; i < xr.snapshotLength; i++) {
+                    var node = xr.snapshotItem(i);
+                    if (node instanceof Element) elements.push(node);
+                }
+            } else if (selector) {
+                elements = Array.from(document.querySelectorAll(selector));
+            } else {
+                elements = Array.from(document.querySelectorAll('*'));
+            }
+            var results = [];
+            for (var j = 0; j < elements.length; j++) {
+                var el = elements[j];
+                if (text && !(el.textContent || '').includes(text)) continue;
+                var rect = el.getBoundingClientRect();
+                results.push({
+                    refId: '',
+                    tag: el.tagName.toLowerCase(),
+                    text: (el.textContent || '').trim().substring(0, 100),
+                    rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
+                });
+                if (results.length >= 50) break;
+            }
+            return results;
+        }`, [selector ?? null, text ?? null, xpath ?? null], timeout)
     }
 
     /**
@@ -872,6 +914,15 @@ class UnifiedSessionManager {
     async withTabId<T>(tabId: string | undefined, fn: () => Promise<T>): Promise<T> {
         // Extension 未连接时不需要锁和 tab 切换（CDP 模式无 currentTabId 竞态）
         if (!this.extensionBridge?.isConnected()) {
+            if (tabId) {
+                const previousRequireExtension = this.requireExtension
+                this.requireExtension          = true
+                try {
+                    this.assertCdpFallbackAllowed()
+                } finally {
+                    this.requireExtension = previousRequireExtension
+                }
+            }
             return fn()
         }
 

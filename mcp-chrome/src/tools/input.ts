@@ -23,19 +23,23 @@ const inputEventSchema = z.object({
                                       type: z.enum([
                                                        'keydown', 'keyup', 'click', 'mousedown', 'mouseup', 'mousemove',
                                                        'wheel', 'touchstart', 'touchmove', 'touchend', 'type', 'wait',
+                                                       'select', 'replace',
                                                    ]).describe('事件类型'),
                                       key: z.string().optional().describe('按键（keydown/keyup）'),
                                       button: z.enum(['left', 'middle', 'right', 'back', 'forward'])
                                                .optional()
                                                .describe('鼠标按钮'),
                                       target: targetZodSchema.optional().describe(
-                                          '目标元素（mousemove/touchstart/touchmove 必填；click/mousedown/wheel/type 可选，用于先定位再操作）'),
+                                          '目标元素（mousemove/touchstart/touchmove 必填；click/mousedown/wheel/type 可选，用于先定位再操作；select/replace 可选，用于限定搜索范围）'),
                                       steps: z.number().optional().describe('移动步数（mousemove/touchmove）'),
                                       deltaX: z.number().optional().describe('水平滚动量'),
                                       deltaY: z.number().optional().describe('垂直滚动量'),
-                                      text: z.string().optional().describe('输入文本'),
+                                      text: z.string().optional().describe('输入文本（type）或替换文本（replace）'),
                                       delay: z.number().optional().describe('按键间隔毫秒'),
                                       ms: z.number().optional().describe('等待毫秒'),
+                                      find: z.string().optional().describe('要查找并选中的文本（select/replace）'),
+                                      nth: z.number().optional().describe(
+                                          '第 N 个匹配（select/replace，从 0 开始，默认 0 即第一个）'),
                                   })
 
 /**
@@ -67,24 +71,50 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
             return await unifiedSession.withFrame(args.frame, async () => {
 
                 // 根据连接模式选择执行方式
+                const warnings: string[] = []
                 if (mode === 'extension') {
                     // Extension 模式：使用 debugger API
                     for (const event of args.events) {
-                        await executeEventExtension(unifiedSession, event as InputEvent, humanize, args.timeout)
+                        const w = await executeEventExtension(
+                            unifiedSession,
+                            event as InputEvent,
+                            humanize,
+                            args.timeout,
+                        )
+                        if (w) {
+                            warnings.push(w)
+                        }
                     }
                 } else {
                     // CDP 模式：使用原有逻辑
                     const session = getSession()
                     for (const event of args.events) {
-                        await executeEvent(session, event as InputEvent, humanize, args.timeout)
+                        if (event.type === 'select' || event.type === 'replace') {
+                            // select/replace 通过 unifiedSession（内部自适应双模式）
+                            const w = await executeEventExtension(
+                                unifiedSession,
+                                event as InputEvent,
+                                humanize,
+                                args.timeout,
+                            )
+                            if (w) {
+                                warnings.push(w)
+                            }
+                        } else {
+                            await executeEvent(session, event as InputEvent, humanize, args.timeout)
+                        }
                     }
                 }
 
-                return formatResponse({
-                                          success: true,
-                                          eventsExecuted: args.events.length,
-                                          mode,
-                                      })
+                const result: Record<string, unknown> = {
+                    success: true,
+                    eventsExecuted: args.events.length,
+                    mode,
+                }
+                if (warnings.length > 0) {
+                    result.warnings = warnings
+                }
+                return formatResponse(result)
 
             }) // withFrame
         }) // withTabId
@@ -94,14 +124,233 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
 }
 
 /**
+ * 文本坐标定位结果
+ *
+ * DOM 文本节点返回字符坐标（用于鼠标选择）；
+ * input/textarea 返回 selectionRange 索引（用于 setSelectionRange）
+ */
+interface TextLocateResult {
+    type: 'coords'
+    startX: number;
+    startY: number;
+    endX: number;
+    endY: number
+    /** 被替换文本是否被格式化标签包裹（如 <code>、<strong>） */
+    formatted?: string
+}
+
+interface InputLocateResult {
+    type: 'input'
+    selectionStart: number;
+    selectionEnd: number
+    focusX?: number;
+    focusY?: number
+}
+
+/**
+ * 通过真实鼠标事件选中页面文本
+ *
+ * 两种策略：
+ * - DOM 文本节点：TreeWalker + Range API 获取字符坐标 → Click + Shift+Click 模拟选区
+ * - input/textarea：聚焦元素 → setSelectionRange() 直接设置选区
+ *
+ * @returns 格式化标签名（如 "code"），若被替换文本在格式化节点内
+ */
+async function selectText(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    findText: string,
+    scopeTarget?: Target,
+    nth = 0,
+    timeout?: number,
+): Promise<string | undefined> {
+    // 将 target 转为查询参数，传入注入脚本进行 DOM 查询
+    let scopeSelector: string | null = null
+    let scopeText: string | null     = null
+    let scopeXpath: string | null    = null
+    if (scopeTarget && !('x' in scopeTarget) && !('y' in scopeTarget)) {
+        const params  = targetToFindParams(scopeTarget as Target & { nth?: number })
+        scopeSelector = params.selector ?? null
+        scopeText     = params.text ?? null
+        scopeXpath    = params.xpath ?? null
+    }
+
+    // Step 1: 注入脚本定位文本
+    const result = await unifiedSession.evaluate<TextLocateResult | InputLocateResult | { type: 'notfound' } | {
+        type: 'noscope'
+    } | null>(
+        `function(findText, nth, scopeSelector, scopeText, scopeXpath) {
+        // 确定搜索根节点
+        var root = document.body;
+        if (scopeXpath) {
+            var xr = document.evaluate(scopeXpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            root = xr.singleNodeValue;
+        } else if (scopeSelector) {
+            var candidates = document.querySelectorAll(scopeSelector);
+            if (scopeText) {
+                for (var ci = 0; ci < candidates.length; ci++) {
+                    if ((candidates[ci].textContent || '').includes(scopeText)) { root = candidates[ci]; break; }
+                }
+            } else {
+                root = candidates[0];
+            }
+        } else if (scopeText) {
+            var all = document.querySelectorAll('*');
+            for (var ai = 0; ai < all.length; ai++) {
+                if ((all[ai].textContent || '').includes(scopeText)) { root = all[ai]; break; }
+            }
+        }
+        if (!root) return {type: 'noscope'};
+
+        // input/textarea：value 不在 DOM 文本节点中
+        var tag = root.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') {
+            var val = root.value || '';
+            var pos = -1;
+            for (var n = 0; n <= nth; n++) {
+                pos = val.indexOf(findText, pos + (n > 0 ? 1 : 0));
+                if (pos === -1) return {type: 'notfound'};
+            }
+            return {type: 'input', selectionStart: pos, selectionEnd: pos + findText.length};
+        }
+
+        // 在子树中查找 input/textarea
+        var inputs = root.querySelectorAll('input, textarea');
+        for (var k = 0; k < inputs.length; k++) {
+            var inp = inputs[k];
+            var v = inp.value || '';
+            var ip = -1;
+            for (var n2 = 0; n2 <= nth; n2++) {
+                ip = v.indexOf(findText, ip + (n2 > 0 ? 1 : 0));
+                if (ip === -1) break;
+            }
+            if (ip !== -1) {
+                var r = inp.getBoundingClientRect();
+                return {type: 'input', selectionStart: ip, selectionEnd: ip + findText.length,
+                    focusX: r.x + r.width / 2, focusY: r.y + r.height / 2};
+            }
+        }
+
+        // DOM 文本节点：TreeWalker 遍历
+        var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+        var textNodes = [];
+        var fullText = '';
+        var node;
+        while (node = walker.nextNode()) {
+            textNodes.push({node: node, start: fullText.length, length: node.textContent.length});
+            fullText += node.textContent;
+        }
+
+        // 查找第 nth 个匹配
+        var idx = -1;
+        for (var m = 0; m <= nth; m++) {
+            idx = fullText.indexOf(findText, idx + (m > 0 ? 1 : 0));
+            if (idx === -1) return {type: 'notfound'};
+        }
+
+        function findNodeOffset(globalOffset) {
+            for (var i = 0; i < textNodes.length; i++) {
+                var tn = textNodes[i];
+                if (globalOffset >= tn.start && globalOffset < tn.start + tn.length)
+                    return {node: tn.node, offset: globalOffset - tn.start};
+            }
+            var last = textNodes[textNodes.length - 1];
+            return {node: last.node, offset: last.length};
+        }
+
+        var range = document.createRange();
+        var s = findNodeOffset(idx);
+        range.setStart(s.node, s.offset);
+        range.setEnd(s.node, Math.min(s.offset + 1, s.node.textContent.length));
+        var sr = range.getBoundingClientRect();
+        if (!sr.width && !sr.height) return {type: 'notfound'};
+
+        var e = findNodeOffset(idx + findText.length - 1);
+        range.setStart(e.node, e.offset);
+        range.setEnd(e.node, Math.min(e.offset + 1, e.node.textContent.length));
+        var er = range.getBoundingClientRect();
+        if (!er.width && !er.height) return {type: 'notfound'};
+
+        // 检测格式化标签（<code>、<strong>、<em> 等）
+        var FORMAT_TAGS = {CODE:1, STRONG:1, EM:1, B:1, I:1, MARK:1, U:1, S:1, DEL:1, SUB:1, SUP:1};
+        var formatted = '';
+        var startNode = s.node.parentElement;
+        var endNode = e.node.parentElement;
+        if (startNode === endNode && startNode && FORMAT_TAGS[startNode.tagName]) {
+            formatted = startNode.tagName.toLowerCase();
+        }
+
+        return {
+            type: 'coords',
+            startX: sr.x + 1,
+            startY: sr.y + sr.height / 2,
+            endX: er.x + er.width - 1,
+            endY: er.y + er.height / 2,
+            formatted: formatted || undefined
+        };
+    }`, undefined, timeout, [findText, nth, scopeSelector, scopeText, scopeXpath])
+
+    if (!result || result.type === 'noscope') {
+        throw new Error(`未找到目标元素: ${JSON.stringify(scopeTarget)}`)
+    }
+    if (result.type === 'notfound') {
+        throw new Error(scopeTarget
+                        ? `目标元素内未找到文本 "${findText}"${nth > 0 ? `（第 ${nth} 个匹配）` : ''}`
+                        : `未找到文本: "${findText}"${nth > 0 ? `（第 ${nth} 个匹配）` : ''}`)
+    }
+
+    if (result.type === 'input') {
+        // input/textarea：聚焦 + setSelectionRange
+        const r = result as InputLocateResult
+        if (r.focusX !== undefined && r.focusY !== undefined) {
+            await unifiedSession.mouseMove(r.focusX, r.focusY)
+            await unifiedSession.mouseClick('left')
+        } else if (scopeTarget) {
+            const point = await getTargetPointExtension(unifiedSession, scopeTarget, timeout)
+            await unifiedSession.mouseMove(point.x, point.y)
+            await unifiedSession.mouseClick('left')
+        }
+        await unifiedSession.evaluate<void>(`function(start, end) {
+            var el = document.activeElement;
+            if (el && el.setSelectionRange) el.setSelectionRange(start, end);
+        }`, undefined, timeout, [result.selectionStart, result.selectionEnd])
+        return undefined
+    }
+
+    // DOM 文本节点：鼠标选择
+    const coords = result as TextLocateResult
+
+    // iframe 坐标修正（precise 模式需要视口绝对坐标）
+    const frameOffset = unifiedSession.getFrameOffset()
+    if (frameOffset && unifiedSession.getInputMode() !== 'stealth') {
+        coords.startX += frameOffset.x
+        coords.startY += frameOffset.y
+        coords.endX += frameOffset.x
+        coords.endY += frameOffset.y
+    }
+
+    // Step 2: 模拟鼠标选择
+    await unifiedSession.mouseMove(coords.startX, coords.startY)
+    await unifiedSession.mouseClick('left')
+
+    await unifiedSession.keyDown('Shift')
+    await unifiedSession.mouseMove(coords.endX, coords.endY)
+    await unifiedSession.mouseClick('left')
+    await unifiedSession.keyUp('Shift')
+
+    return coords.formatted
+}
+
+/**
  * Extension 模式：执行单个事件
+ *
+ * @returns 可选警告信息（如格式丢失提示）
  */
 async function executeEventExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     event: InputEvent,
     humanize: boolean,
     timeout?: number,
-): Promise<void> {
+): Promise<string | undefined> {
     switch (event.type) {
         case 'keydown': {
             if (!event.key) {
@@ -221,6 +470,70 @@ async function executeEventExtension(
                 throw new Error('wait 事件需要 ms 参数')
             }
             await new Promise(resolve => setTimeout(resolve, event.ms))
+            break
+        }
+
+        case 'select': {
+            if (!event.find) {
+                throw new Error('select 事件需要 find 参数')
+            }
+            await selectText(unifiedSession, event.find, event.target, event.nth, timeout)
+            break
+        }
+
+        case 'replace': {
+            if (!event.find) {
+                throw new Error('replace 事件需要 find 参数')
+            }
+            if (event.text === undefined) {
+                throw new Error('replace 事件需要 text 参数')
+            }
+            // Step 1: 选中文本
+            const formatted = await selectText(unifiedSession, event.find, event.target, event.nth, timeout)
+            // 等待编辑器同步选区状态
+            await new Promise(resolve => setTimeout(resolve, 50))
+
+            // Step 2: 检测可编辑性并替换
+            const replaceResult = await unifiedSession.evaluate<'ok' | 'readonly' | 'fallback'>(
+                `function(replacementText) {
+                var el = document.activeElement;
+                // input/textarea：使用 setRangeText 直接替换选区
+                if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.setRangeText) {
+                    if (el.readOnly || el.disabled) return 'readonly';
+                    el.setRangeText(replacementText, el.selectionStart, el.selectionEnd, 'end');
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    return 'ok';
+                }
+                // 检测 contenteditable
+                var sel = window.getSelection();
+                if (!sel || sel.isCollapsed) return 'readonly';
+                var anchor = sel.anchorNode;
+                var editable = anchor instanceof Element ? anchor : anchor && anchor.parentElement;
+                while (editable && !editable.isContentEditable && editable !== document.body) {
+                    editable = editable.parentElement;
+                }
+                if (!editable || !editable.isContentEditable) return 'readonly';
+                // contenteditable：beforeinput + execCommand fallback
+                var target = (anchor && anchor.parentElement) || el;
+                var ev = new InputEvent('beforeinput', {
+                    inputType: 'insertReplacementText',
+                    data: replacementText,
+                    bubbles: true, cancelable: true, composed: true
+                });
+                target.dispatchEvent(ev);
+                if (document.execCommand('insertText', false, replacementText)) return 'ok';
+                return 'fallback';
+            }`, undefined, timeout, [event.text])
+            if (replaceResult === 'readonly') {
+                throw new Error(`目标元素不可编辑，已选中文本 "${event.find}" 但无法替换`)
+            }
+            if (replaceResult === 'fallback') {
+                // Fallback: 键盘输入覆盖选区
+                await unifiedSession.typeText(event.text)
+            }
+            if (formatted) {
+                return `替换的文本原在 <${formatted}> 标签内，替换后格式可能丢失`
+            }
             break
         }
 
@@ -490,7 +803,15 @@ async function getTargetPoint(
  */
 export function registerInputTool(server: McpServer): void {
     server.registerTool('input', {
-        description: '键鼠输入：键盘、鼠标及任意组合',
+        description: `键鼠输入：键盘、鼠标及任意组合
+
+组合键需拆分为独立事件。示例（Ctrl+A 全选）：
+  events: [
+    {type: "keydown", key: "Control"},
+    {type: "keydown", key: "a"},
+    {type: "keyup", key: "a"},
+    {type: "keyup", key: "Control"}
+  ]`,
         inputSchema: inputSchema,
     }, (args) => handleInput(args))
 }

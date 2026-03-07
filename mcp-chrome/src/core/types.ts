@@ -111,7 +111,9 @@ export type InputEventType =
     | 'touchmove'
     | 'touchend'
     | 'type'
-    | 'wait';
+    | 'wait'
+    | 'select'
+    | 'replace';
 
 /**
  * 输入事件
@@ -133,6 +135,9 @@ export interface InputEvent {
     delay?: number;
     // 等待参数
     ms?: number;
+    // 查找文本参数（select/replace 事件）
+    find?: string;
+    nth?: number;
 }
 
 /**

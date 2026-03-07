@@ -181,7 +181,12 @@ export class ExtensionBridge {
         }) as { pageContent: string; viewport: { width: number; height: number }; error?: string }
     }
 
-    async screenshot(options?: { format?: string; quality?: number; fullPage?: boolean; clip?: { x: number; y: number; width: number; height: number } }): Promise<{
+    async screenshot(options?: {
+        format?: string;
+        quality?: number;
+        fullPage?: boolean;
+        clip?: { x: number; y: number; width: number; height: number }
+    }): Promise<{
         data: string;
         format: string
     }> {
@@ -287,7 +292,16 @@ export class ExtensionBridge {
 
     async getHtmlWithImages(selector?: string, outer = true): Promise<{
         html: string
-        images: Array<{ index: number; src: string; dataSrc: string; alt: string; width: number; height: number; naturalWidth: number; naturalHeight: number }>
+        images: Array<{
+            index: number;
+            src: string;
+            dataSrc: string;
+            alt: string;
+            width: number;
+            height: number;
+            naturalWidth: number;
+            naturalHeight: number
+        }>
     }> {
         return await this.httpServer.sendCommand('get_html_with_images', {
             tabId: this.currentTabId,
@@ -296,7 +310,16 @@ export class ExtensionBridge {
             outer,
         }) as {
             html: string
-            images: Array<{ index: number; src: string; dataSrc: string; alt: string; width: number; height: number; naturalWidth: number; naturalHeight: number }>
+            images: Array<{
+                index: number;
+                src: string;
+                dataSrc: string;
+                alt: string;
+                width: number;
+                height: number;
+                naturalWidth: number;
+                naturalHeight: number
+            }>
         }
     }
 
