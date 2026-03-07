@@ -80,7 +80,9 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
   "mcpServers": {
     "ssh": {
       "command": "node",
-      "args": ["/path/to/mcp-ssh/dist/index.js"]
+      "args": [
+        "/path/to/mcp-ssh/dist/index.js"
+      ]
     }
   }
 }

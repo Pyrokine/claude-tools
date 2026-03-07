@@ -80,7 +80,9 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
   "mcpServers": {
     "ssh": {
       "command": "node",
-      "args": ["/path/to/mcp-ssh/dist/index.js"]
+      "args": [
+        "/path/to/mcp-ssh/dist/index.js"
+      ]
     }
   }
 }

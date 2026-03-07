@@ -8,11 +8,11 @@
  * - 会话持久化
  */
 
-import xterm from '@xterm/headless'
 import * as fs from 'fs'
-import * as net from 'net'
 import * as path from 'path'
 import {Client, ClientChannel, ConnectConfig, SFTPWrapper} from 'ssh2'
+import {ForwardManager} from './forward-manager.js'
+import {PtyManager} from './pty-manager.js'
 import {
     ExecOptions,
     ExecResult,
@@ -24,68 +24,27 @@ import {
     SSHSessionInfo,
 } from './types.js'
 
-const Terminal = xterm.Terminal as typeof import('@xterm/headless').Terminal
-type TerminalType = import('@xterm/headless').Terminal;
-
 interface SSHSession {
     client: Client;
     config: SSHConnectionConfig;
     connectedAt: number;
     lastUsedAt: number;
     reconnectAttempts: number;
-    connected: boolean;  // 通过事件监听维护的连接状态
-    tcpDispatcher?: TcpConnectionHandler;  // remote forward 共享的 dispatcher
-}
-
-interface PtySession {
-    id: string;
-    alias: string;
-    command: string;
-    stream: ClientChannel;
-    terminal: TerminalType;   // xterm headless 终端仿真器
-    rows: number;
-    cols: number;
-    createdAt: number;
-    lastReadAt: number;
-    rawBuffer: string;        // 原始 ANSI 流
-    maxBufferSize: number;
-    active: boolean;
-}
-
-// tcp connection 事件处理函数类型
-type TcpConnectionHandler = (
-    info: { destIP: string; destPort: number; srcIP: string; srcPort: number },
-    accept: () => ClientChannel,
-    reject: () => void,
-) => void;
-
-interface ForwardSession {
-    id: string;
-    alias: string;
-    type: 'local' | 'remote';
-    localHost: string;
-    localPort: number;
-    remoteHost: string;
-    remotePort: number;
-    server?: net.Server;  // 本地转发的 TCP 服务器
-    createdAt: number;
-    active: boolean;
+    connected: boolean;      // 通过事件监听维护的连接状态
+    manualClose: boolean;    // 标记主动关闭，阻止 close 事件触发自动重连
 }
 
 export class SessionManager {
-    private sessions: Map<string, SSHSession>            = new Map()
-    private ptySessions: Map<string, PtySession>         = new Map()
-    private forwardSessions: Map<string, ForwardSession> = new Map()
-    private ptyIdCounter                                 = 0
-    private forwardIdCounter                             = 0
+    private sessions: Map<string, SSHSession> = new Map()
+    private readonly ptyManager               = new PtyManager()
+    private readonly forwardManager           = new ForwardManager()
     private readonly persistPath: string
-    private defaultKeepaliveInterval                     = 30000  // 30秒
-    private defaultKeepaliveCountMax                     = 3
-    private defaultTimeout                               = 30000  // 30秒
-    private maxReconnectAttempts                         = 3
-    private defaultMaxOutputSize                         = 10 * 1024 * 1024  // 10MB
-    private reconnectDelay                               = 5000  // 5秒
-    private defaultPtyBufferSize                         = 1024 * 1024  // 1MB
+    private defaultKeepaliveInterval          = 30000  // 30秒
+    private defaultKeepaliveCountMax          = 3
+    private defaultTimeout                    = 30000  // 30秒
+    private maxReconnectAttempts              = 3
+    private defaultMaxOutputSize              = 10 * 1024 * 1024  // 10MB
+    private reconnectDelay                    = 5000  // 5秒
 
     constructor(persistPath?: string) {
         this.persistPath = persistPath || path.join(
@@ -158,6 +117,7 @@ export class SessionManager {
                     lastUsedAt: Date.now(),
                     reconnectAttempts: 0,
                     connected: true,
+                    manualClose: false,
                 }
                 this.sessions.set(alias, session)
                 this.persistSessions()
@@ -166,24 +126,22 @@ export class SessionManager {
 
             client.on('error', (err) => {
                 const session = this.sessions.get(alias)
-                if (session) {
+                if (session && session.client === client) {
                     session.connected = false
                 }
-                reject(new Error(`SSH connection failed: ${err.message}`))
+                const target     = `${connectConfig.username}@${connectConfig.host}:${connectConfig.port}`
+                const suggestion = this.diagnoseConnectionError(err)
+                reject(new Error(`SSH connection to ${target} failed: ${err.message}${suggestion ?
+                                                                                      ` (${suggestion})` :
+                                                                                      ''}`))
             })
 
             client.on('close', () => {
                 const session = this.sessions.get(alias)
-                if (session) {
+                if (session && session.client === client) {
                     session.connected = false
-                    // 自动重连逻辑
-                    if (session.reconnectAttempts < this.maxReconnectAttempts) {
-                        session.reconnectAttempts++
-                        setTimeout(() => {
-                            this.reconnect(alias).catch((err) => {
-                                console.error(`Auto-reconnect failed for ${alias}:`, err.message)
-                            })
-                        }, this.reconnectDelay)
+                    if (!session.manualClose) {
+                        this.scheduleReconnect(alias)
                     }
                 }
             })
@@ -201,6 +159,9 @@ export class SessionManager {
             throw new Error(`Session ${alias} not found`)
         }
 
+        session.manualClose = true
+        session.connected   = false
+
         try {
             session.client.end()
         } catch { /* 忽略已关闭的连接 */
@@ -215,6 +176,10 @@ export class SessionManager {
     disconnect(alias: string): boolean {
         const session = this.sessions.get(alias)
         if (session) {
+            session.manualClose = true
+            // 清理关联的 PTY 和 forward 资源
+            this.ptyManager.closeByAlias(alias)
+            this.forwardManager.closeByAlias(alias)
             try {
                 session.client.end()
             } catch { /* 忽略已关闭的连接 */
@@ -409,206 +374,39 @@ export class SessionManager {
         })
     }
 
-    /**
-     * 启动持久化 PTY 会话
-     */
-    async ptyStart(
-        alias: string,
-        command: string,
-        options: PtyOptions = {},
-    ): Promise<string> {
-        const session = this.getSession(alias)
-        const ptyId   = this.generatePtyId()
+    // ===== PTY 委托 =====
 
-        const rows          = options.rows || 24
-        const cols          = options.cols || 80
-        const term          = options.term || 'xterm-256color'
-        const maxBufferSize = options.bufferSize || this.defaultPtyBufferSize
-        const fullCommand   = this.buildCommand(command, session, options)
-
-        return new Promise((resolve, reject) => {
-            session.client.exec(
-                fullCommand,
-                {
-                    pty: {rows, cols, term},
-                },
-                (err, stream) => {
-                    if (err) {
-                        reject(new Error(`PTY start failed: ${err.message}`))
-                        return
-                    }
-
-                    // 创建 xterm headless 终端仿真器
-                    const terminal = new Terminal({
-                                                      rows,
-                                                      cols,
-                                                      allowProposedApi: true,
-                                                  })
-
-                    const ptySession: PtySession = {
-                        id: ptyId,
-                        alias,
-                        command,
-                        stream,
-                        terminal,
-                        rows,
-                        cols,
-                        createdAt: Date.now(),
-                        lastReadAt: Date.now(),
-                        rawBuffer: '',
-                        maxBufferSize,
-                        active: true,
-                    }
-
-                    // 监听输出数据
-                    stream.on('data', (data: Buffer) => {
-                        if (!ptySession.active) {
-                            return
-                        }
-                        const chunk = data.toString('utf-8')
-                        // 写入终端仿真器（解析 ANSI 序列）
-                        terminal.write(chunk)
-                        // 同时保留原始流（用于 raw 模式）
-                        ptySession.rawBuffer += chunk
-                        if (ptySession.rawBuffer.length > maxBufferSize) {
-                            ptySession.rawBuffer = ptySession.rawBuffer.slice(-maxBufferSize)
-                        }
-                    })
-
-                    stream.on('close', () => {
-                        ptySession.active = false
-                    })
-
-                    stream.on('error', (err: Error) => {
-                        ptySession.active = false
-                        terminal.write(`\n[PTY Error: ${err.message}]`)
-                    })
-
-                    this.ptySessions.set(ptyId, ptySession)
-                    resolve(ptyId)
-                },
-            )
-        })
+    async ptyStart(alias: string, command: string, options: PtyOptions = {}): Promise<string> {
+        return this.ptyManager.start({
+                                         execPty: (a, cmd, opts) => this.execPtyStream(a, cmd, opts),
+                                     }, alias, command, options)
     }
 
-    /**
-     * 向 PTY 写入数据
-     */
     ptyWrite(ptyId: string, data: string): boolean {
-        const ptySession = this.ptySessions.get(ptyId)
-        if (!ptySession) {
-            throw new Error(`PTY session '${ptyId}' not found`)
-        }
-        if (!ptySession.active) {
-            throw new Error(`PTY session '${ptyId}' is closed`)
-        }
-        return ptySession.stream.write(data)
+        return this.ptyManager.write(ptyId, data)
     }
 
-    /**
-     * 读取 PTY 输出
-     *
-     * options.mode: 'screen' 返回当前屏幕内容，'raw' 返回原始 ANSI 流
-     */
     ptyRead(
         ptyId: string,
         options: { mode?: 'screen' | 'raw'; clear?: boolean } = {},
     ): { data: string; active: boolean; rows: number; cols: number } {
-        const ptySession = this.ptySessions.get(ptyId)
-        if (!ptySession) {
-            throw new Error(`PTY session '${ptyId}' not found`)
-        }
-
-        const mode  = options.mode || 'screen'
-        const clear = options.clear !== false
-
-        let data: string
-        if (mode === 'screen') {
-            // 返回当前屏幕内容（解析后的纯文本）
-            data = this.getScreenContent(ptySession.terminal)
-        } else {
-            // 返回原始 ANSI 流
-            data = ptySession.rawBuffer
-            if (clear) {
-                ptySession.rawBuffer = ''
-            }
-        }
-
-        ptySession.lastReadAt = Date.now()
-        return {
-            data,
-            active: ptySession.active,
-            rows: ptySession.rows,
-            cols: ptySession.cols,
-        }
+        return this.ptyManager.read(ptyId, options)
     }
 
-    /**
-     * 调整 PTY 窗口大小
-     */
     ptyResize(ptyId: string, rows: number, cols: number): boolean {
-        const ptySession = this.ptySessions.get(ptyId)
-        if (!ptySession) {
-            throw new Error(`PTY session '${ptyId}' not found`)
-        }
-        if (!ptySession.active) {
-            throw new Error(`PTY session '${ptyId}' is closed`)
-        }
-        // 调整远程 PTY 窗口
-        ptySession.stream.setWindow(rows, cols, 0, 0)
-        // 调整本地终端仿真器
-        ptySession.terminal.resize(cols, rows)
-        ptySession.rows = rows
-        ptySession.cols = cols
-        return true
+        return this.ptyManager.resize(ptyId, rows, cols)
     }
 
-    /**
-     * 关闭 PTY 会话
-     */
     ptyClose(ptyId: string): boolean {
-        const ptySession = this.ptySessions.get(ptyId)
-        if (!ptySession) {
-            return false
-        }
-        try {
-            ptySession.stream.close()
-        } catch { /* 忽略清理异常 */
-        }
-        try {
-            ptySession.terminal.dispose()
-        } catch { /* 忽略清理异常 */
-        }
-        ptySession.active = false
-        this.ptySessions.delete(ptyId)
-        return true
+        return this.ptyManager.close(ptyId)
     }
 
-    /**
-     * 列出所有 PTY 会话
-     */
     ptyList(): PtySessionInfo[] {
-        const result: PtySessionInfo[] = []
-        for (const [id, pty] of this.ptySessions) {
-            result.push({
-                            id,
-                            alias: pty.alias,
-                            command: pty.command,
-                            rows: pty.rows,
-                            cols: pty.cols,
-                            createdAt: pty.createdAt,
-                            lastReadAt: pty.lastReadAt,
-                            bufferSize: pty.rawBuffer.length,
-                            active: pty.active,
-                        })
-        }
-        return result
+        return this.ptyManager.list()
     }
 
-    /**
-     * 创建本地端口转发
-     * 本地监听 localHost:localPort，转发到远程 remoteHost:remotePort
-     */
+    // ===== Forward 委托 =====
+
     async forwardLocal(
         alias: string,
         localPort: number,
@@ -616,53 +414,12 @@ export class SessionManager {
         remotePort: number,
         localHost: string = '127.0.0.1',
     ): Promise<string> {
-        const session   = this.getSession(alias)
-        const forwardId = this.generateForwardId()
-
-        return new Promise((resolve, reject) => {
-            const server = net.createServer((socket) => {
-                session.client.forwardOut(
-                    socket.remoteAddress || '127.0.0.1',
-                    socket.remotePort || 0,
-                    remoteHost,
-                    remotePort,
-                    (err, stream) => {
-                        if (err) {
-                            socket.end()
-                            return
-                        }
-                        socket.pipe(stream).pipe(socket)
-                    },
-                )
-            })
-
-            server.on('error', (err) => {
-                reject(new Error(`Local forward failed: ${err.message}`))
-            })
-
-            server.listen(localPort, localHost, () => {
-                const fwdSession: ForwardSession = {
-                    id: forwardId,
-                    alias,
-                    type: 'local',
-                    localHost,
-                    localPort,
-                    remoteHost,
-                    remotePort,
-                    server,
-                    createdAt: Date.now(),
-                    active: true,
-                }
-                this.forwardSessions.set(forwardId, fwdSession)
-                resolve(forwardId)
-            })
-        })
+        return this.forwardManager.forwardLocal(
+            {getClient: (a) => this.getSession(a).client},
+            alias, localPort, remoteHost, remotePort, localHost,
+        )
     }
 
-    /**
-     * 创建远程端口转发
-     * 远程监听 remoteHost:remotePort，转发到本地 localHost:localPort
-     */
     async forwardRemote(
         alias: string,
         remotePort: number,
@@ -670,88 +427,48 @@ export class SessionManager {
         localPort: number,
         remoteHost: string = '127.0.0.1',
     ): Promise<string> {
-        const session   = this.getSession(alias)
-        const forwardId = this.generateForwardId()
+        return this.forwardManager.forwardRemote(
+            {getClient: (a) => this.getSession(a).client},
+            alias, remotePort, localHost, localPort, remoteHost,
+        )
+    }
 
-        return new Promise((resolve, reject) => {
-            session.client.forwardIn(remoteHost, remotePort, (err) => {
-                if (err) {
-                    reject(new Error(`Remote forward failed: ${err.message}`))
-                    return
-                }
-
-                const fwdSession: ForwardSession = {
-                    id: forwardId,
-                    alias,
-                    type: 'remote',
-                    localHost,
-                    localPort,
-                    remoteHost,
-                    remotePort,
-                    createdAt: Date.now(),
-                    active: true,
-                }
-                this.forwardSessions.set(forwardId, fwdSession)
-
-                // 确保该 session 有共享的 tcp dispatcher
-                this.ensureTcpDispatcher(session, alias)
-
-                resolve(forwardId)
-            })
+    forwardClose(forwardId: string): boolean {
+        return this.forwardManager.close(forwardId, {
+            getClient: (a) => this.getSession(a).client,
         })
     }
 
-    /**
-     * 关闭端口转发
-     */
-    forwardClose(forwardId: string): boolean {
-        const fwdSession = this.forwardSessions.get(forwardId)
-        if (!fwdSession) {
-            return false
-        }
-
-        fwdSession.active = false
-
-        if (fwdSession.type === 'local' && fwdSession.server) {
-            try {
-                fwdSession.server.close()
-            } catch { /* 忽略清理异常 */
-            }
-        } else if (fwdSession.type === 'remote') {
-            const session = this.sessions.get(fwdSession.alias)
-            if (session) {
-                try {
-                    session.client.unforwardIn(fwdSession.remoteHost, fwdSession.remotePort)
-                } catch { /* 忽略清理异常 */
-                }
-                // 检查是否需要移除共享 dispatcher
-                this.removeTcpDispatcherIfEmpty(session, fwdSession.alias)
-            }
-        }
-
-        this.forwardSessions.delete(forwardId)
-        return true
+    forwardList(): PortForwardInfo[] {
+        return this.forwardManager.list()
     }
 
     /**
-     * 列出所有端口转发
+     * 执行带 PTY 的命令，返回原始 stream（供 PtyManager 使用）
      */
-    forwardList(): PortForwardInfo[] {
-        const result: PortForwardInfo[] = []
-        for (const [id, fwd] of this.forwardSessions) {
-            result.push({
-                            id,
-                            alias: fwd.alias,
-                            type: fwd.type,
-                            localHost: fwd.localHost,
-                            localPort: fwd.localPort,
-                            remoteHost: fwd.remoteHost,
-                            remotePort: fwd.remotePort,
-                            createdAt: fwd.createdAt,
-                            active: fwd.active,
-                        })
-        }
-        return result
+    private execPtyStream(
+        alias: string,
+        command: string,
+        options: PtyOptions,
+    ): Promise<ClientChannel> {
+        const session     = this.getSession(alias)
+        const fullCommand = this.buildCommand(command, session, {env: options.env, cwd: options.cwd})
+
+        return new Promise((resolve, reject) => {
+            session.client.exec(fullCommand, {
+                pty: {
+                    rows: options.rows || 24,
+                    cols: options.cols || 80,
+                    term: options.term || 'xterm-256color',
+                },
+            }, (err, stream) => {
+                if (err) {
+                    reject(new Error(`PTY exec failed: ${err.message}`))
+                } else {
+                    resolve(stream)
+                }
+            })
+        })
     }
 
     private ensurePersistDir(): void {
@@ -798,6 +515,57 @@ export class SessionManager {
      */
     private isAlive(session: SSHSession): boolean {
         return session.connected
+    }
+
+    /**
+     * 调度自动重连（支持多次重试）
+     */
+    private scheduleReconnect(alias: string): void {
+        const session = this.sessions.get(alias)
+        if (!session || session.reconnectAttempts >= this.maxReconnectAttempts) {
+            return
+        }
+
+        session.reconnectAttempts++
+        const attempt = session.reconnectAttempts
+
+        setTimeout(async () => {
+            try {
+                await this.reconnect(alias)
+            } catch (err) {
+                console.error(
+                    `Auto-reconnect failed for ${alias} (${attempt}/${this.maxReconnectAttempts}):`,
+                    (err as Error).message,
+                )
+                // reconnect 失败后继续调度下一次尝试
+                this.scheduleReconnect(alias)
+            }
+        }, this.reconnectDelay)
+    }
+
+    /**
+     * 根据错误类型生成排查建议
+     */
+    private diagnoseConnectionError(err: Error & { code?: string }): string {
+        const msg  = err.message || ''
+        const code = err.code || ''
+
+        if (code === 'ECONNREFUSED' || msg.includes('ECONNREFUSED')) {
+            return 'check if SSH service is running on the target host'
+        }
+        if (code === 'ETIMEDOUT' || msg.includes('ETIMEDOUT') || msg.includes('Timed out')) {
+            return 'check host reachability, firewall rules, or try a jump host'
+        }
+        if (code === 'ENOTFOUND' || msg.includes('ENOTFOUND') || msg.includes('getaddrinfo')) {
+            return 'hostname cannot be resolved, check DNS or use IP address'
+        }
+        if (msg.includes('All configured authentication methods failed')) {
+            return 'check password, key path, or key permissions (chmod 600)'
+        }
+        if (msg.includes('ECONNRESET') || msg.includes('Connection reset')) {
+            return 'connection was reset by the remote host'
+        }
+        return ''
     }
 
     /**
@@ -883,92 +651,6 @@ export class SessionManager {
         }
     }
 
-    /**
-     * 生成 PTY 会话 ID
-     */
-    private generatePtyId(): string {
-        return `pty_${++this.ptyIdCounter}_${Date.now()}`
-    }
-
-    /**
-     * 从终端仿真器获取当前屏幕内容
-     */
-    private getScreenContent(terminal: TerminalType): string {
-        const buffer          = terminal.buffer.active
-        const lines: string[] = []
-        for (let i = 0; i < terminal.rows; i++) {
-            const line = buffer.getLine(i)
-            if (line) {
-                lines.push(line.translateToString(true))
-            }
-        }
-        // 移除尾部空行
-        while (lines.length > 0 && lines[lines.length - 1].trim() === '') {
-            lines.pop()
-        }
-        return lines.join('\n')
-    }
-
-    /**
-     * 生成端口转发 ID
-     */
-    private generateForwardId(): string {
-        return `fwd_${++this.forwardIdCounter}_${Date.now()}`
-    }
-
-    /**
-     * 确保 SSH session 有共享的 tcp connection dispatcher
-     * 所有 remote forward 共用一个 dispatcher，根据 destIP/destPort 路由
-     */
-    private ensureTcpDispatcher(session: SSHSession, alias: string): void {
-        if (session.tcpDispatcher) {
-            return  // 已存在
-        }
-
-        const dispatcher: TcpConnectionHandler = (info, accept, rejectConn) => {
-            // 查找匹配的 remote forward
-            for (const fwd of this.forwardSessions.values()) {
-                if (fwd.type === 'remote' &&
-                    fwd.active &&
-                    fwd.alias === alias &&
-                    fwd.remoteHost === info.destIP &&
-                    fwd.remotePort === info.destPort) {
-                    // 找到匹配的 forward，建立连接
-                    const stream = accept()
-                    const socket = net.createConnection(fwd.localPort, fwd.localHost)
-                    socket.pipe(stream).pipe(socket)
-                    socket.on('error', () => stream.close())
-                    stream.on('error', () => socket.destroy())
-                    return
-                }
-            }
-            // 没有匹配的 forward，拒绝连接
-            rejectConn()
-        }
-
-        session.tcpDispatcher = dispatcher
-        session.client.on('tcp connection', dispatcher)
-    }
-
-    /**
-     * 移除 SSH session 的 tcp dispatcher（当没有 remote forward 时）
-     */
-    private removeTcpDispatcherIfEmpty(session: SSHSession, alias: string): void {
-        if (!session.tcpDispatcher) {
-            return
-        }
-
-        // 检查是否还有该 session 的 remote forward
-        for (const fwd of this.forwardSessions.values()) {
-            if (fwd.type === 'remote' && fwd.alias === alias && fwd.active) {
-                return  // 还有活跃的 remote forward
-            }
-        }
-
-        // 没有了，移除 dispatcher
-        session.client.removeListener('tcp connection', session.tcpDispatcher)
-        session.tcpDispatcher = undefined
-    }
 }
 
 // 全局单例
