@@ -27,7 +27,7 @@ const evaluateSchema = z.object({
                                     mode: z.enum(['stealth', 'precise']).optional().describe(
                                         '执行模式。precise（默认）使用 debugger API，可绕过 CSP；stealth 使用 JS 注入，不触发调试提示但受 CSP 限制'),
                                     tabId: z.string().optional().describe(
-                                        '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下忽略此参数'),
+                                        '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
                                     frame: z.union([z.string(), z.number()]).optional().describe(
                                         'iframe 定位（可选，仅 Extension 模式）。CSS 选择器（如 "iframe#main"）或索引（如 0）。不指定则在主框架执行'),
                                 })

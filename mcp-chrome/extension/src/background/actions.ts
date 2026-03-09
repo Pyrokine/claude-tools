@@ -649,19 +649,21 @@ export class ActionHandler {
             })
 
             try {
+                const effectiveFormat = p?.format || 'png'
                 const result = await chrome.debugger.sendCommand({tabId}, 'Page.captureScreenshot', {
-                    format: p?.format || 'png',
-                    quality: p?.quality,
+                    format: effectiveFormat,
+                    ...(p?.quality !== undefined && effectiveFormat !== 'png' ? {quality: p.quality} : {}),
                 }) as { data: string }
-                return {data: result.data, format: p?.format || 'png'}
+                return {data: result.data, format: effectiveFormat}
             } finally {
                 await chrome.debugger.sendCommand({tabId}, 'Emulation.clearDeviceMetricsOverride')
             }
         }
 
+        const effectiveFormat = p?.format || 'png'
         const result = await chrome.debugger.sendCommand({tabId}, 'Page.captureScreenshot', {
-            format: p?.format || 'png',
-            quality: p?.quality,
+            format: effectiveFormat,
+            ...(p?.quality !== undefined && effectiveFormat !== 'png' ? {quality: p.quality} : {}),
             ...(p?.clip ? {clip: {...p.clip, scale: p?.scale ?? 1}} : {}),
         }) as { data: string }
 
@@ -2389,7 +2391,7 @@ function extractMetadata(): Record<string, unknown> {
     return {
         title: document.title,
         description: meta('description'),
-        canonical: document.querySelector('link[rel="canonical"]')?.getAttribute('href') || undefined,
+        canonical: (document.querySelector('link[rel="canonical"]') as HTMLLinkElement | null)?.href || undefined,
         charset: document.characterSet,
         viewport: meta('viewport'),
         og: Object.fromEntries(
@@ -2802,4 +2804,3 @@ function injectStealthScripts(): void {
 
     console.log('[MCP Stealth] Anti-detection scripts injected')
 }
-

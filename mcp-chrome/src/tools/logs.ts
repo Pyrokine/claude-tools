@@ -23,7 +23,7 @@ const logsSchema = z.object({
                                 clear: z.boolean().optional().describe('获取后清除日志'),
                                 output: z.string().optional().describe('输出文件路径。若指定，日志导出为 JSON 文件'),
                                 tabId: z.string().optional().describe(
-                                    '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下忽略此参数'),
+                                    '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
                             })
 
 /**

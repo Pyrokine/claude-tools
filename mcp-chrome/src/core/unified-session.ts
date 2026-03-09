@@ -362,22 +362,20 @@ class UnifiedSessionManager {
      * @param timeout 端到端预算（毫秒），同时作为脚本执行超时和 sendCommand 的端到端预算
      * @param args 传递给函数的参数
      */
-    async evaluate<T>(code: string, mode?: InputMode, timeout?: number, args?: unknown[]): Promise<T> {
+    async evaluate<T>(code: string, mode?: InputMode, timeout?: number, args?: unknown[], _retried?: boolean): Promise<T> {
         const effectiveMode = mode ?? this.inputMode
         const hasArgs       = args && args.length > 0
 
-        // 检测裸 return 语句，自动包裹 IIFE（仅无 args 时）
-        let expression = code
-        if (!hasArgs && /\breturn\b/.test(code) && !/^\s*([(\[]|function\b|async\b|class\b)/.test(code)) {
-            expression = `(() => { ${code} })()`
-        }
         // stealth 模式：args 只能通过字符串拼接（chrome.scripting 不支持协议级参数传递）
+        let expression = code
         if (hasArgs && effectiveMode === 'stealth') {
             const argsStr = args.map(a => JSON.stringify(a)).join(', ')
             expression    = `(${code})(${argsStr})`
         }
 
         const cdpScript = hasArgs ? code : expression
+
+        try {
 
         if (timeout !== undefined) {
             // 轮询上下文：快速失败，端到端预算受控
@@ -442,6 +440,17 @@ class UnifiedSessionManager {
             return extractCdpValue<T>(result.result)
         }
         return await this.extensionBridge!.evaluate(expression, timeout, timeout) as T
+        } catch (err) {
+            // 裸 return 语句导致语法错误时，自动包裹 IIFE 重试（仅一次）
+            if (!_retried && !hasArgs) {
+                const msg = err instanceof Error ? err.message : String(err)
+                if (/Illegal return statement|'return' not inside function|Unexpected token 'return'/.test(msg)) {
+                    const wrapped = `(() => { ${code} })()`
+                    return this.evaluate<T>(wrapped, mode, timeout, undefined, true)
+                }
+            }
+            throw err
+        }
     }
 
     /**

@@ -141,6 +141,9 @@ export class SessionManager {
                 const session = this.sessions.get(alias)
                 if (session && session.client === client) {
                     session.connected = false
+                    // 清理绑定旧 client 的 forward/PTY 资源
+                    this.forwardManager.closeByAlias(alias)
+                    this.ptyManager.closeByAlias(alias)
                     if (!session.manualClose) {
                         this.scheduleReconnect(alias)
                     }

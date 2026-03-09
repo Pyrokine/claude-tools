@@ -28,7 +28,7 @@ const waitSchema = z.object({
                                     '元素状态（element）'),
                                 ms: z.number().optional().describe('毫秒（time）'),
                                 tabId: z.string().optional().describe(
-                                    '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下忽略此参数'),
+                                    '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
                                 timeout: z.number().optional().describe('超时'),
                                 frame: z.union([z.string(), z.number()]).optional().describe(
                                     'iframe 定位（可选，仅 Extension 模式）。CSS 选择器（如 "iframe#main"）或索引（如 0）。不指定则在主框架操作'),

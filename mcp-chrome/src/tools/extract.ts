@@ -46,7 +46,7 @@ const extractSchema = z.object({
                                    type: z.enum(['text', 'html', 'attribute', 'screenshot', 'state', 'metadata'])
                                           .describe('提取类型'),
                                    target: targetZodSchema.optional().describe(
-                                       '目标元素（attribute 必填；text/html 可选，省略则提取整个页面；screenshot/state/metadata 不需要）'),
+                                       '目标元素（attribute 必填；text/html 可选，省略则提取整个页面；screenshot 可选用于元素截图；state 可选（仅 Extension）用于返回目标子树；metadata 不需要）'),
                                    attribute: z.string().optional().describe('属性名（attribute）'),
                                    images: z.enum(['info', 'data']).optional().describe(
                                        '图片提取模式（仅 html 类型有效）。info: 元信息（src/alt/尺寸）；data: 含图片数据'),
@@ -61,7 +61,7 @@ const extractSchema = z.object({
                                             .optional()
                                             .describe('输出文件路径（可选）。若指定，结果写入文件；否则返回内容。images=data 时作为输出目录路径'),
                                    tabId: z.string().optional().describe(
-                                       '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下忽略此参数'),
+                                       '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
                                    timeout: z.number().optional().describe('等待目标元素超时'),
                                    frame: z.union([z.string(), z.number()]).optional().describe(
                                        'iframe 定位（可选，仅 Extension 模式）。CSS 选择器（如 "iframe#main"）或索引（如 0）。不指定则在主框架操作'),
@@ -499,7 +499,6 @@ async function extractHtmlWithImagesCdp(
  * 策略：
  * 1. data: URL → 直接解码
  * 2. CDP Page.getResourceContent（批量） → 从浏览器缓存读取（零网络请求）
- * 3. Node.js fetch → fallback
  *
  * @param unifiedSession 会话管理器，用于 CDP 资源获取
  * @param images 图片元信息列表
@@ -545,8 +544,7 @@ async function fetchImageData(
     // 第二趟：批量 CDP 获取
     const cdpResults = await unifiedSession.getResourceContentBatch([...cdpUrlSet])
 
-    // 第三趟：组装结果，CDP 未命中的走 fetch fallback（去重：相同 URL 共享结果）
-    const fetchUrlMap = new Map<string, { mimeType: string; indices: number[] }>()
+    // 第三趟：组装结果，CDP 未命中的返回 null
     const results: ImageData[] = []
 
     for (let i = 0; i < images.length; i++) {
@@ -570,39 +568,8 @@ async function fetchImageData(
             continue
         }
 
-        // 需要 fetch fallback — 按 URL 合并
-        results.push({base64: null, mimeType}) // 占位
-        const existing = fetchUrlMap.get(effectiveSrc)
-        if (existing) {
-            existing.indices.push(i)
-        } else {
-            fetchUrlMap.set(effectiveSrc, {mimeType, indices: [i]})
-        }
-    }
-
-    // 第四趟：并发 fetch fallback（限制并发，相同 URL 只下载一次）
-    if (fetchUrlMap.size > 0) {
-        const fetchTasks = [...fetchUrlMap.entries()]
-        let idx = 0
-        const next = async (): Promise<void> => {
-            while (idx < fetchTasks.length) {
-                const [url, {mimeType, indices}] = fetchTasks[idx++]
-                try {
-                    const response = await fetch(url, {signal: AbortSignal.timeout(5000)})
-                    if (response.ok) {
-                        const buffer = Buffer.from(await response.arrayBuffer())
-                        const contentType = response.headers.get('content-type')?.split(';')[0] ?? mimeType
-                        const data: ImageData = {base64: buffer.toString('base64'), mimeType: contentType}
-                        for (const i of indices) {
-                            results[i] = data
-                        }
-                    }
-                } catch {
-                    // fetch 失败，保持 null
-                }
-            }
-        }
-        await Promise.all(Array.from({length: Math.min(6, fetchTasks.length)}, () => next()))
+        // CDP 缓存未命中，不使用 Node.js fetch（避免绕过浏览器同源策略）
+        results.push({base64: null, mimeType})
     }
 
     return results

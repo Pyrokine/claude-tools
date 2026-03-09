@@ -49,7 +49,7 @@ const inputSchema = z.object({
                                  events: z.array(inputEventSchema).describe('事件序列'),
                                  humanize: z.boolean().optional().describe('启用人类行为模拟（贝塞尔曲线移动、随机延迟）'),
                                  tabId: z.string().optional().describe(
-                                     '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下忽略此参数'),
+                                     '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
                                  timeout: z.number().optional().describe('超时毫秒'),
                                  frame: z.union([z.string(), z.number()]).optional().describe(
                                      'iframe 定位（可选，仅 Extension 模式）。CSS 选择器（如 "iframe#main"）或索引（如 0）。不指定则在主框架操作'),
@@ -302,7 +302,14 @@ async function selectText(
         // input/textarea：聚焦 + setSelectionRange
         const r = result as InputLocateResult
         if (r.focusX !== undefined && r.focusY !== undefined) {
-            await unifiedSession.mouseMove(r.focusX, r.focusY)
+            let x = r.focusX
+            let y = r.focusY
+            const frameOffset = unifiedSession.getFrameOffset()
+            if (frameOffset && unifiedSession.getInputMode() !== 'stealth') {
+                x += frameOffset.x
+                y += frameOffset.y
+            }
+            await unifiedSession.mouseMove(x, y)
             await unifiedSession.mouseClick('left')
         } else if (scopeTarget) {
             const point = await getTargetPointExtension(unifiedSession, scopeTarget, timeout)
@@ -513,14 +520,7 @@ async function executeEventExtension(
                     editable = editable.parentElement;
                 }
                 if (!editable || !editable.isContentEditable) return 'readonly';
-                // contenteditable：beforeinput + execCommand fallback
-                var target = (anchor && anchor.parentElement) || el;
-                var ev = new InputEvent('beforeinput', {
-                    inputType: 'insertReplacementText',
-                    data: replacementText,
-                    bubbles: true, cancelable: true, composed: true
-                });
-                target.dispatchEvent(ev);
+                // contenteditable：execCommand 让浏览器自行产出事件序列
                 if (document.execCommand('insertText', false, replacementText)) return 'ok';
                 return 'fallback';
             }`, undefined, timeout, [event.text])

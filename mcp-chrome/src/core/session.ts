@@ -656,8 +656,9 @@ class SessionManager {
     ): Promise<string> {
         this.ensureSession()
 
-        const captureParams: Record<string, unknown> = {format: format ?? 'png'}
-        if (quality !== undefined) {
+        const effectiveFormat = format ?? 'png'
+        const captureParams: Record<string, unknown> = {format: effectiveFormat}
+        if (quality !== undefined && effectiveFormat !== 'png') {
             captureParams.quality = quality
         }
         if (clip) {
