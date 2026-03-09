@@ -177,7 +177,7 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
                 return Err(ErrorResponse {
                     error: "project_not_found".to_string(),
                     message: format!("项目不存在: {}", project_id),
-                    available: Some(list_available_projects(config)),
+                    available: Some(config.available_projects_json()),
                 });
             }
             dirs.push((project_id.clone(), dir));
@@ -195,20 +195,8 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
     Err(ErrorResponse {
         error: "no_current_project".to_string(),
         message: "无法确定当前项目，请使用 --project 指定".to_string(),
-        available: Some(list_available_projects(config)),
+        available: Some(config.available_projects_json()),
     })
-}
-
-/// 列出可用项目
-fn list_available_projects(config: &Config) -> serde_json::Value {
-    let projects: Vec<_> = config.list_project_dirs().unwrap_or_default()
-        .into_iter()
-        .map(|(id, _)| {
-            let path = project_id_to_display_path(&id);
-            serde_json::json!({ "id": id, "path": path })
-        })
-        .collect();
-    serde_json::json!(projects)
 }
 
 /// 收集所有 jsonl 文件

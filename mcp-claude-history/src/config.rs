@@ -1,3 +1,4 @@
+use crate::utils::project_id_to_display_path;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -54,5 +55,17 @@ impl Config {
             }
         }
         Ok(dirs)
+    }
+
+    /// 列出可用项目（用于错误提示）
+    pub fn available_projects_json(&self) -> serde_json::Value {
+        let projects: Vec<_> = self.list_project_dirs().unwrap_or_default()
+            .into_iter()
+            .map(|(id, _)| {
+                let path = project_id_to_display_path(&id);
+                serde_json::json!({ "id": id, "path": path })
+            })
+            .collect();
+        serde_json::json!(projects)
     }
 }

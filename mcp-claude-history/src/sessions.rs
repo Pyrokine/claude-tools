@@ -9,10 +9,13 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
     // 确定项目
     let project_id = match project_id {
         Some(id) => id.to_string(),
-        None => config.current_project_id().ok_or_else(|| ErrorResponse {
-            error: "no_current_project".to_string(),
-            message: "无法确定当前项目，请使用 --project 指定".to_string(),
-            available: None,
+        None => config.current_project_id().ok_or_else(|| {
+            let available = config.available_projects_json();
+            ErrorResponse {
+                error: "no_current_project".to_string(),
+                message: "无法确定当前项目，请使用 --project 指定".to_string(),
+                available: if available.as_array().map(|a| a.is_empty()).unwrap_or(true) { None } else { Some(available) },
+            }
         })?,
     };
 
