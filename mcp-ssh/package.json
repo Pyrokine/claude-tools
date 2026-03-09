@@ -1,6 +1,6 @@
 {
   "name": "@pyrokine/mcp-ssh",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "A comprehensive SSH MCP Server for Claude Code",
   "type": "module",
   "main": "dist/index.js",
