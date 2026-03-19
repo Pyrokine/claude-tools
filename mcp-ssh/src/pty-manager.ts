@@ -51,7 +51,7 @@ export class PtyManager {
         const stream = await deps.execPty(alias, command, options)
 
         // 创建 xterm headless 终端仿真器
-        const terminal = new Terminal({rows, cols, allowProposedApi: true})
+        const terminal = new Terminal({ rows, cols, allowProposedApi: true })
 
         const ptySession: PtySession = {
             id: ptyId,

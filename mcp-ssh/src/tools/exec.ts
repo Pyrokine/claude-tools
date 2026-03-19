@@ -102,7 +102,7 @@ async function handleExecSudo(args: z.infer<typeof execSudoSchema>) {
             args.alias,
             args.command,
             args.sudoPassword,
-            {timeout: args.timeout},
+            { timeout: args.timeout },
         )
         return formatResult(result)
     } catch (error) {
@@ -120,7 +120,7 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
                 const execResult = await sessionManager.exec(
                     args.alias,
                     args.commands[i],
-                    {timeout: args.timeout},
+                    { timeout: args.timeout },
                 )
                 results.push({
                                  index: i,
@@ -168,7 +168,7 @@ async function handleQuickExec(args: z.infer<typeof quickExecSchema>) {
         const result = await sessionManager.exec(
             tempAlias,
             args.command,
-            {timeout: args.timeout},
+            { timeout: args.timeout },
         )
         return formatResult(result)
     } catch (error) {
@@ -182,7 +182,7 @@ async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
     try {
         const execPromises = args.aliases.map(async (alias) => {
             try {
-                const execResult = await sessionManager.exec(alias, args.command, {timeout: args.timeout})
+                const execResult = await sessionManager.exec(alias, args.command, { timeout: args.timeout })
                 return {
                     alias,
                     success: execResult.success,

@@ -49,9 +49,9 @@ export class SessionManager {
 
     constructor(persistPath?: string) {
         this.persistPath = persistPath || path.join(
-                           os.homedir(),
-                           '.ssh-mcp-pro',
-                           'sessions.json',
+            os.homedir(),
+            '.ssh-mcp-pro',
+            'sessions.json',
         )
         this.ensurePersistDir()
     }
@@ -333,7 +333,7 @@ export class SessionManager {
             throw new Error(`Invalid username: ${targetUser}`)
         }
 
-        const {loadProfile = true, ...execOpts} = options
+        const { loadProfile = true, ...execOpts } = options
 
         const wrappedCommand = loadProfile
                                ? `${this.getLoadProfileCommand()}${command}`
@@ -419,7 +419,7 @@ export class SessionManager {
         localHost: string = '127.0.0.1',
     ): Promise<string> {
         return this.forwardManager.forwardLocal(
-            {getClient: (a) => this.getSession(a).client},
+            { getClient: (a) => this.getSession(a).client },
             alias, localPort, remoteHost, remotePort, localHost,
         )
     }
@@ -432,7 +432,7 @@ export class SessionManager {
         remoteHost: string = '127.0.0.1',
     ): Promise<string> {
         return this.forwardManager.forwardRemote(
-            {getClient: (a) => this.getSession(a).client},
+            { getClient: (a) => this.getSession(a).client },
             alias, remotePort, localHost, localPort, remoteHost,
         )
     }
@@ -456,7 +456,7 @@ export class SessionManager {
         options: PtyOptions,
     ): Promise<ClientChannel> {
         const session     = this.getSession(alias)
-        const fullCommand = this.buildCommand(command, session, {env: options.env, cwd: options.cwd})
+        const fullCommand = this.buildCommand(command, session, { env: options.env, cwd: options.cwd })
 
         return new Promise((resolve, reject) => {
             session.client.exec(fullCommand, {
@@ -478,7 +478,7 @@ export class SessionManager {
     private ensurePersistDir(): void {
         const dir = path.dirname(this.persistPath)
         if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, {recursive: true})
+            fs.mkdirSync(dir, { recursive: true })
         }
     }
 
@@ -602,7 +602,7 @@ export class SessionManager {
         options: { env?: Record<string, string>; cwd?: string },
     ): string {
         let fullCommand = command
-        const env       = {...session.config.env, ...options.env}
+        const env       = { ...session.config.env, ...options.env }
 
         if (Object.keys(env).length > 0) {
             const validEntries = Object.entries(env).filter(([k]) => this.isValidEnvKey(k))

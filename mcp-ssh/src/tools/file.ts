@@ -71,7 +71,7 @@ const syncSchema = z.object({
 async function handleUpload(args: z.infer<typeof uploadSchema>) {
     try {
         const uploadResult = await fileOps.uploadFile(args.alias, args.localPath, args.remotePath)
-        return formatResult({...uploadResult, message: `Uploaded to ${args.remotePath}`})
+        return formatResult({ ...uploadResult, message: `Uploaded to ${args.remotePath}` })
     } catch (error) {
         return formatError(error)
     }
@@ -80,7 +80,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
 async function handleDownload(args: z.infer<typeof downloadSchema>) {
     try {
         const downloadResult = await fileOps.downloadFile(args.alias, args.remotePath, args.localPath)
-        return formatResult({...downloadResult, message: `Downloaded to ${args.localPath}`})
+        return formatResult({ ...downloadResult, message: `Downloaded to ${args.localPath}` })
     } catch (error) {
         return formatError(error)
     }
@@ -89,7 +89,7 @@ async function handleDownload(args: z.infer<typeof downloadSchema>) {
 async function handleReadFile(args: z.infer<typeof readFileSchema>) {
     try {
         const readResult = await fileOps.readFile(args.alias, args.remotePath, args.maxBytes)
-        return formatResult({success: true, ...readResult})
+        return formatResult({ success: true, ...readResult })
     } catch (error) {
         return formatError(error)
     }
@@ -121,7 +121,7 @@ async function handleListDir(args: z.infer<typeof listDirSchema>) {
 async function handleFileInfo(args: z.infer<typeof fileInfoSchema>) {
     try {
         const info = await fileOps.getFileInfo(args.alias, args.remotePath)
-        return formatResult({success: true, ...info})
+        return formatResult({ success: true, ...info })
     } catch (error) {
         return formatError(error)
     }
@@ -130,7 +130,7 @@ async function handleFileInfo(args: z.infer<typeof fileInfoSchema>) {
 async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
     try {
         const success = await fileOps.mkdir(args.alias, args.remotePath, args.recursive)
-        return formatResult({success, path: args.remotePath})
+        return formatResult({ success, path: args.remotePath })
     } catch (error) {
         return formatError(error)
     }

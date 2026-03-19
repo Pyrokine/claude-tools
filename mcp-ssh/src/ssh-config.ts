@@ -48,17 +48,17 @@ function parseHostPort(s: string): { host: string; port?: number } {
             if (rest.startsWith(':')) {
                 const parsedPort = parseInt(rest.slice(1), 10)
                 if (!isNaN(parsedPort)) {
-                    return {host, port: parsedPort}
+                    return { host, port: parsedPort }
                 }
             }
-            return {host}
+            return { host }
         }
     }
 
     // 检测裸 IPv6（多个冒号但无方括号）：安全失败，当作 host-only
     const colonCount = (s.match(/:/g) || []).length
     if (colonCount >= 2) {
-        return {host: s}
+        return { host: s }
     }
 
     // 普通格式: host:port 或 host
@@ -68,10 +68,10 @@ function parseHostPort(s: string): { host: string; port?: number } {
         const portStr    = s.slice(colonIndex + 1)
         const parsedPort = parseInt(portStr, 10)
         if (!isNaN(parsedPort)) {
-            return {host, port: parsedPort}
+            return { host, port: parsedPort }
         }
     }
-    return {host: s}
+    return { host: s }
 }
 
 /**
@@ -95,14 +95,14 @@ export function parseProxyJump(proxyJump: string): ParsedProxyJump | null {
     // 解析 user@... 格式
     const atIndex = firstJump.indexOf('@')
     if (atIndex !== -1) {
-        user               = firstJump.slice(0, atIndex)
-        const rest         = firstJump.slice(atIndex + 1)
-        const {host, port} = parseHostPort(rest)
-        return {user, host, port}
+        user                 = firstJump.slice(0, atIndex)
+        const rest           = firstJump.slice(atIndex + 1)
+        const { host, port } = parseHostPort(rest)
+        return { user, host, port }
     }
 
-    const {host, port} = parseHostPort(firstJump)
-    return {host, port}
+    const { host, port } = parseHostPort(firstJump)
+    return { host, port }
 }
 
 /**
@@ -187,7 +187,7 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
 
             // Host 行可能有多个别名/模式，用空格分隔
             const patterns = value.split(/\s+/).filter(p => p.length > 0)
-            currentBlock   = {patterns, config: {}}
+            currentBlock   = { patterns, config: {} }
         } else if (keyLower === 'match') {
             // Match 块开始，跳过直到下一个 Host
             inMatchBlock = true
@@ -226,7 +226,7 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
     // 第二遍：提取 Host * 的全局默认配置
     for (const block of blocks) {
         if (block.patterns.length === 1 && block.patterns[0] === '*') {
-            globalDefaults = {...block.config}
+            globalDefaults = { ...block.config }
             break
         }
     }

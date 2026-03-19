@@ -7,7 +7,7 @@
  */
 export function formatResult(data: unknown) {
     return {
-        content: [{type: 'text' as const, text: JSON.stringify(data, null, 2)}],
+        content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
     }
 }
 
@@ -17,7 +17,7 @@ export function formatResult(data: unknown) {
 export function formatError(error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
     return {
-        content: [{type: 'text' as const, text: JSON.stringify({success: false, error: message}, null, 2)}],
+        content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }, null, 2) }],
         isError: true,
     }
 }

@@ -71,7 +71,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             const allHosts   = parseSSHConfig(args.configPath)
             const hostConfig = allHosts.find(h => h.host === args.configHost)
             if (!hostConfig) {
-                return formatResult({success: false, error: `Host '${args.configHost}' not found in SSH config`})
+                return formatResult({ success: false, error: `Host '${args.configHost}' not found in SSH config` })
             }
             // 显式参数优先于 config 值
             host    = host || hostConfig.hostName || hostConfig.host
@@ -174,7 +174,7 @@ async function handleListSessions() {
 async function handleReconnect(args: z.infer<typeof reconnectSchema>) {
     try {
         await sessionManager.reconnect(args.alias)
-        return formatResult({success: true, message: `Reconnected to ${args.alias}`})
+        return formatResult({ success: true, message: `Reconnected to ${args.alias}` })
     } catch (error) {
         return formatError(error)
     }

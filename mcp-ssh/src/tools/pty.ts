@@ -77,7 +77,7 @@ async function handlePtyStart(args: z.infer<typeof ptyStartSchema>) {
 async function handlePtyWrite(args: z.infer<typeof ptyWriteSchema>) {
     try {
         const success = sessionManager.ptyWrite(args.ptyId, args.data)
-        return formatResult({success, ptyId: args.ptyId})
+        return formatResult({ success, ptyId: args.ptyId })
     } catch (error) {
         return formatError(error)
     }
@@ -106,7 +106,7 @@ async function handlePtyRead(args: z.infer<typeof ptyReadSchema>) {
 async function handlePtyResize(args: z.infer<typeof ptyResizeSchema>) {
     try {
         const success = sessionManager.ptyResize(args.ptyId, args.rows, args.cols)
-        return formatResult({success, ptyId: args.ptyId})
+        return formatResult({ success, ptyId: args.ptyId })
     } catch (error) {
         return formatError(error)
     }

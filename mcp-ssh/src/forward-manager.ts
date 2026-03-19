@@ -178,7 +178,8 @@ export class ForwardManager {
         if (state) {
             try {
                 state.client.removeListener('tcp connection', state.handler)
-            } catch { /* client 可能已关闭 */ }
+            } catch { /* client 可能已关闭 */
+            }
             this.dispatchers.delete(alias)
         }
     }
@@ -228,7 +229,7 @@ export class ForwardManager {
             rejectConn()
         }
 
-        this.dispatchers.set(alias, {handler, client})
+        this.dispatchers.set(alias, { handler, client })
         client.on('tcp connection', handler)
     }
 

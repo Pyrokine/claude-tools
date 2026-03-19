@@ -25,8 +25,8 @@ import {
 } from './tools/index.js'
 
 const server = new McpServer(
-    {name: 'ssh-mcp-pro', version: '1.1.2'},
-    {capabilities: {tools: {}}},
+    { name: 'ssh-mcp-pro', version: '1.1.2' },
+    { capabilities: { tools: {} } },
 )
 
 registerConnectionTools(server)

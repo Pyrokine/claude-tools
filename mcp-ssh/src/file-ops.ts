@@ -72,7 +72,7 @@ function pipeWithProgress(
             if (!settled) {
                 settled = true
                 sftp.end()
-                resolve({success: true, size: totalSize})
+                resolve({ success: true, size: totalSize })
             }
         })
 
@@ -118,7 +118,7 @@ export async function downloadFile(
     // 确保本地目录存在
     const localDir = path.dirname(localPath)
     if (!fs.existsSync(localDir)) {
-        fs.mkdirSync(localDir, {recursive: true})
+        fs.mkdirSync(localDir, { recursive: true })
     }
 
     return pipeWithProgress(
@@ -143,7 +143,7 @@ export async function readFile(
     // 处理空文件
     if (actualSize === 0) {
         sftp.end()
-        return {content: '', size: 0, truncated: false}
+        return { content: '', size: 0, truncated: false }
     }
 
     const readSize = Math.min(actualSize, maxBytes)
@@ -190,11 +190,11 @@ export async function writeFile(
     const flags = append ? 'a' : 'w'
 
     return new Promise((resolve, reject) => {
-        const writeStream = sftp.createWriteStream(remotePath, {flags})
+        const writeStream = sftp.createWriteStream(remotePath, { flags })
 
         writeStream.on('close', () => {
             sftp.end()
-            resolve({success: true, size: content.length})
+            resolve({ success: true, size: content.length })
         })
 
         writeStream.on('error', (err: Error) => {
@@ -384,7 +384,7 @@ async function syncWithRsync(
     let hasLocalRsync = false
     try {
         const cmd = os.platform() === 'win32' ? 'where rsync' : 'which rsync'
-        execSync(cmd, {stdio: 'pipe'})
+        execSync(cmd, { stdio: 'pipe' })
         hasLocalRsync = true
     } catch {
     }
@@ -513,20 +513,20 @@ async function syncWithSftp(
         if (direction === 'upload') {
             const stats = fs.statSync(localPath)
             if (stats.isDirectory() && options.recursive !== false) {
-                const {fileCount, totalSize} = await uploadDirectory(alias, localPath, remotePath, options.exclude)
+                const { fileCount, totalSize } = await uploadDirectory(alias, localPath, remotePath, options.exclude)
                 return buildSyncResult(fileCount, totalSize, warnings)
             }
-            const {size} = await uploadFile(alias, localPath, remotePath)
+            const { size } = await uploadFile(alias, localPath, remotePath)
             return buildSyncResult(1, size, warnings)
         }
 
         // download
         const info = await getFileInfo(alias, remotePath)
         if (info.isDirectory && options.recursive !== false) {
-            const {fileCount, totalSize} = await downloadDirectory(alias, remotePath, localPath, options.exclude)
+            const { fileCount, totalSize } = await downloadDirectory(alias, remotePath, localPath, options.exclude)
             return buildSyncResult(fileCount, totalSize, warnings)
         }
-        const {size} = await downloadFile(alias, remotePath, localPath)
+        const { size } = await downloadFile(alias, remotePath, localPath)
         return buildSyncResult(1, size, warnings)
     } catch (err: any) {
         return {
@@ -574,7 +574,7 @@ async function uploadDirectory(
         }
     }
 
-    return {fileCount, totalSize}
+    return { fileCount, totalSize }
 }
 
 /**
@@ -591,7 +591,7 @@ async function downloadDirectory(
 
     // 确保本地目录存在
     if (!fs.existsSync(localPath)) {
-        fs.mkdirSync(localPath, {recursive: true})
+        fs.mkdirSync(localPath, { recursive: true })
     }
 
     const items = await listDir(alias, remotePath, true)
@@ -614,7 +614,7 @@ async function downloadDirectory(
         }
     }
 
-    return {fileCount, totalSize}
+    return { fileCount, totalSize }
 }
 
 /**
