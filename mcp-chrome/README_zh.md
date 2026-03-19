@@ -128,31 +128,31 @@ Extension 特有：`list` 返回额外字段：`managed`（Tab 是否在 MCP Chr
 
 事件序列模型，支持任意组合：
 
-| 事件类型                                    | 描述      |
-|-----------------------------------------|---------|
-| `keydown` / `keyup`                     | 按键按下/释放 |
+| 事件类型                                    | 描述                      |
+|-----------------------------------------|-------------------------|
+| `keydown` / `keyup`                     | 按键按下/释放                 |
 | `click`                                 | 点击（mousedown + mouseup） |
-| `mousedown` / `mouseup`                 | 鼠标按下/释放 |
-| `mousemove`                             | 鼠标移动    |
-| `wheel`                                 | 滚轮滚动    |
-| `touchstart` / `touchmove` / `touchend` | 触摸事件    |
-| `type`                                  | 输入文本    |
-| `wait`                                  | 事件间暂停   |
-| `select`                                | 按内容选中文本（鼠标模拟） |
-| `replace`                               | 查找并替换文本 |
+| `mousedown` / `mouseup`                 | 鼠标按下/释放                 |
+| `mousemove`                             | 鼠标移动                    |
+| `wheel`                                 | 滚轮滚动                    |
+| `touchstart` / `touchmove` / `touchend` | 触摸事件                    |
+| `type`                                  | 输入文本                    |
+| `wait`                                  | 事件间暂停                   |
+| `select`                                | 按内容选中文本（鼠标模拟）           |
+| `replace`                               | 查找并替换文本                 |
 
 参数：`humanize` 启用贝塞尔曲线移动和随机延迟。`tabId` 指定目标 Tab。`frame` 指定目标 iframe（CSS 选择器或索引）。均限
 Extension 模式。
 
 ### extract - 内容提取
 
-| Type         | 描述                    |
-|--------------|-----------------------|
-| `text`       | 提取文本内容               |
-| `html`       | 提取 HTML 源码           |
-| `attribute`  | 提取元素属性               |
-| `screenshot` | 截图（支持 `target` 元素裁剪） |
-| `state`      | 获取页面状态（URL、标题、可交互元素） |
+| Type         | 描述                       |
+|--------------|--------------------------|
+| `text`       | 提取文本内容                   |
+| `html`       | 提取 HTML 源码               |
+| `attribute`  | 提取元素属性                   |
+| `screenshot` | 截图（支持 `target` 元素裁剪）     |
+| `state`      | 获取页面状态（URL、标题、可交互元素）     |
 | `metadata`   | 提取页面元信息（标题、OG、JSON-LD 等） |
 
 参数：`output` 将结果保存到文件（`images=data` 时为输出目录）。`images`（`info`/`data`）提取 HTML 中的图片元信息或数据。`tabId`
@@ -223,18 +223,10 @@ Extension 模式。
 
 ```typescript
 // 按可访问性（推荐 - 最稳定）
-{
-    role: "button", name
-:
-    "提交"
-}
+{ role: "button", name: "提交" }
 
 // 按文本内容
-{
-    text: "点击这里", exact
-:
-    true
-}
+{ text: "点击这里", exact: true }
 
 // 按表单 label
 {
@@ -267,20 +259,10 @@ Extension 模式。
 }
 
 // 多匹配消歧（从 0 开始）
-{
-    css: ".ant-select-input", nth
-:
-    1
-}
+{ css: ".ant-select-input", nth: 1 }
 
 // 按 CSS + 文本（按文本内容过滤）
-{
-    css: "button", text
-:
-    "提交", exact
-:
-    true
-}
+{ css: "button", text: "提交", exact: true }
 
 // 按 XPath
 {
@@ -288,11 +270,7 @@ Extension 模式。
 }
 
 // 按坐标
-{
-    x: 100, y
-:
-    200
-}
+{ x: 100, y: 200 }
 ```
 
 ## 使用示例

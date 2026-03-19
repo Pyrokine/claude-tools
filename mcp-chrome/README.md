@@ -127,25 +127,26 @@ browse(action="open", url="https://example.com")
 | `close`   | Close browser connection              |
 
 Extension-specific: `list` returns additional fields: `managed` (whether tab is in MCP Chrome group), `isActive`
-(whether it's the current operation target), `windowId`, `index`, `pinned`, `incognito`, `status` (`loading`/`complete`).
+(whether it's the current operation target), `windowId`, `index`, `pinned`, `incognito`, `status` (`loading`/
+`complete`).
 `open` auto-creates tab group (cyan color).
 
 ### input - Keyboard & Mouse Input
 
 Event sequence model supporting arbitrary combinations:
 
-| Event Type                              | Description                         |
-|-----------------------------------------|-------------------------------------|
-| `keydown` / `keyup`                     | Key press/release                   |
-| `click`                                 | Click (mousedown + mouseup)         |
-| `mousedown` / `mouseup`                 | Mouse button press/release          |
-| `mousemove`                             | Mouse movement                      |
-| `wheel`                                 | Mouse wheel scroll                  |
-| `touchstart` / `touchmove` / `touchend` | Touch events                        |
-| `type`                                  | Type text                           |
-| `wait`                                  | Pause between events                |
-| `select`                                | Select text by content (mouse sim)  |
-| `replace`                               | Find and replace text               |
+| Event Type                              | Description                        |
+|-----------------------------------------|------------------------------------|
+| `keydown` / `keyup`                     | Key press/release                  |
+| `click`                                 | Click (mousedown + mouseup)        |
+| `mousedown` / `mouseup`                 | Mouse button press/release         |
+| `mousemove`                             | Mouse movement                     |
+| `wheel`                                 | Mouse wheel scroll                 |
+| `touchstart` / `touchmove` / `touchend` | Touch events                       |
+| `type`                                  | Type text                          |
+| `wait`                                  | Pause between events               |
+| `select`                                | Select text by content (mouse sim) |
+| `replace`                               | Find and replace text              |
 
 Parameters: `humanize` enables Bézier curve movement and random delays. `tabId` targets a specific tab. `frame` targets
 an iframe (CSS selector or index). Both Extension mode only.
@@ -230,18 +231,10 @@ All tools use a unified `Target` type for element location:
 
 ```typescript
 // By accessibility (recommended - most stable)
-{
-    role: "button", name
-:
-    "Submit"
-}
+{ role: "button", name: "Submit" }
 
 // By text content
-{
-    text: "Click here", exact
-:
-    true
-}
+{ text: "Click here", exact: true }
 
 // By form label
 {
@@ -274,20 +267,10 @@ All tools use a unified `Target` type for element location:
 }
 
 // Disambiguate multiple matches (0-based)
-{
-    css: ".ant-select-input", nth
-:
-    1
-}
+{ css: ".ant-select-input", nth: 1 }
 
 // By CSS + text (filter by text content)
-{
-    css: "button", text
-:
-    "Submit", exact
-:
-    true
-}
+{ css: "button", text: "Submit", exact: true }
 
 // By XPath
 {
@@ -295,11 +278,7 @@ All tools use a unified `Target` type for element location:
 }
 
 // By coordinates
-{
-    x: 100, y
-:
-    200
-}
+{ x: 100, y: 200 }
 ```
 
 ## Usage Examples
