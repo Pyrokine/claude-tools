@@ -20,14 +20,14 @@ const REQUEST_TIMEOUT    = DEFAULT_TIMEOUT
 const HEARTBEAT_INTERVAL = 15000 // 每 15 秒发送一次 ping，下次 ping 前检查 pong
 
 export interface HttpServerOptions {
-    port?: number
-    autoPort?: boolean
+    port?: number;
+    autoPort?: boolean;
 }
 
 interface MessageHandler {
-    resolve: (value: unknown) => void
-    reject: (error: Error) => void
-    timeout: NodeJS.Timeout
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
 }
 
 export class ExtensionHttpServer extends EventEmitter {
@@ -90,7 +90,7 @@ export class ExtensionHttpServer extends EventEmitter {
 
         return new Promise((resolve, reject) => {
             const messageId = this.generateId()
-            const message   = {id: messageId, action, params}
+            const message   = { id: messageId, action, params }
 
             const timeout = setTimeout(() => {
                 this.messageHandlers.delete(messageId)
@@ -100,7 +100,7 @@ export class ExtensionHttpServer extends EventEmitter {
                 reject(new Error(`Request timeout for action: ${action} (${detail})`))
             }, remaining)
 
-            this.messageHandlers.set(messageId, {resolve, reject, timeout})
+            this.messageHandlers.set(messageId, { resolve, reject, timeout })
 
             try {
                 this.clientSocket!.send(JSON.stringify(message))
@@ -168,7 +168,7 @@ export class ExtensionHttpServer extends EventEmitter {
      * 绑定成功后初始化 WebSocket Server
      */
     private setupWebSocket(): void {
-        this.wss = new WebSocketServer({server: this.server!})
+        this.wss = new WebSocketServer({ server: this.server! })
 
         this.wss.on('connection', (ws, req) => {
             // Origin 校验：拒绝非 Extension 来源（如网页 JS 的跨域 WebSocket）。
@@ -239,7 +239,7 @@ export class ExtensionHttpServer extends EventEmitter {
         const origin = req.headers.origin
         if (origin && !origin.startsWith('chrome-extension://')) {
             res.writeHead(403)
-            res.end(JSON.stringify({error: 'Forbidden: only Chrome Extension origin allowed'}))
+            res.end(JSON.stringify({ error: 'Forbidden: only Chrome Extension origin allowed' }))
             return
         }
 
@@ -258,7 +258,7 @@ export class ExtensionHttpServer extends EventEmitter {
 
         if (url === '/api/health') {
             res.writeHead(200)
-            res.end(JSON.stringify({status: 'ok', port: this.port}))
+            res.end(JSON.stringify({ status: 'ok', port: this.port }))
             return
         }
 
@@ -274,7 +274,7 @@ export class ExtensionHttpServer extends EventEmitter {
         }
 
         res.writeHead(404)
-        res.end(JSON.stringify({error: 'Not found'}))
+        res.end(JSON.stringify({ error: 'Not found' }))
     }
 
     private handleMessage(data: string): void {
@@ -349,7 +349,7 @@ export class ExtensionHttpServer extends EventEmitter {
             // 发送新的 ping
             this.pongReceived = false
             try {
-                this.clientSocket.send(JSON.stringify({type: 'ping'}))
+                this.clientSocket.send(JSON.stringify({ type: 'ping' }))
             } catch {
                 console.error('[HTTP] Failed to send heartbeat ping')
             }

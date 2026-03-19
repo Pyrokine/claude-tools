@@ -130,21 +130,21 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
  * input/textarea 返回 selectionRange 索引（用于 setSelectionRange）
  */
 interface TextLocateResult {
-    type: 'coords'
+    type: 'coords';
     startX: number;
     startY: number;
     endX: number;
-    endY: number
+    endY: number;
     /** 被替换文本是否被格式化标签包裹（如 <code>、<strong>） */
-    formatted?: string
+    formatted?: string;
 }
 
 interface InputLocateResult {
-    type: 'input'
+    type: 'input';
     selectionStart: number;
-    selectionEnd: number
+    selectionEnd: number;
     focusX?: number;
-    focusY?: number
+    focusY?: number;
 }
 
 /**
@@ -230,12 +230,15 @@ async function selectText(
             }
         }
 
-        // DOM 文本节点：TreeWalker 遍历
+        // DOM 文本节点：TreeWalker 遍历（限制规模防止大 DOM 阻塞）
+        var MAX_TEXT_NODES = 10000;
+        var MAX_TEXT_LENGTH = 500000;
         var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
         var textNodes = [];
         var fullText = '';
         var node;
         while (node = walker.nextNode()) {
+            if (textNodes.length >= MAX_TEXT_NODES || fullText.length >= MAX_TEXT_LENGTH) break;
             textNodes.push({node: node, start: fullText.length, length: node.textContent.length});
             fullText += node.textContent;
         }
@@ -302,8 +305,8 @@ async function selectText(
         // input/textarea：聚焦 + setSelectionRange
         const r = result as InputLocateResult
         if (r.focusX !== undefined && r.focusY !== undefined) {
-            let x = r.focusX
-            let y = r.focusY
+            let x             = r.focusX
+            let y             = r.focusY
             const frameOffset = unifiedSession.getFrameOffset()
             if (frameOffset && unifiedSession.getInputMode() !== 'stealth') {
                 x += frameOffset.x
@@ -496,9 +499,29 @@ async function executeEventExtension(
                 throw new Error('replace 事件需要 text 参数')
             }
             // Step 1: 选中文本
-            const formatted = await selectText(unifiedSession, event.find, event.target, event.nth, timeout)
-            // 等待编辑器同步选区状态
-            await new Promise(resolve => setTimeout(resolve, 50))
+            const formatted        = await selectText(unifiedSession, event.find, event.target, event.nth, timeout)
+            // 轮询等待选区同步（最多 500ms）
+            let selectionConfirmed = false
+            for (let i = 0; i < 25; i++) {
+                const hasSelection = await unifiedSession.evaluate<boolean>(
+                    `(function() {
+                        var el = document.activeElement;
+                        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+                            return el.selectionStart !== el.selectionEnd;
+                        }
+                        var sel = window.getSelection();
+                        return sel && !sel.isCollapsed;
+                    })()`,
+                )
+                if (hasSelection) {
+                    selectionConfirmed = true
+                    break
+                }
+                await new Promise(resolve => setTimeout(resolve, 20))
+            }
+            if (!selectionConfirmed) {
+                throw new Error(`选区同步失败：文本 "${event.find}" 已定位但未能建立选区，无法执行替换`)
+            }
 
             // Step 2: 检测可编辑性并替换
             const replaceResult = await unifiedSession.evaluate<'ok' | 'readonly' | 'fallback'>(
@@ -565,13 +588,13 @@ async function getTargetPointExtension(
     if ('x' in target && 'y' in target) {
         if (frameOffset && !isStealth) {
             // precise: 转为视口绝对坐标
-            return {x: target.x + frameOffset.x, y: target.y + frameOffset.y}
+            return { x: target.x + frameOffset.x, y: target.y + frameOffset.y }
         }
-        return {x: target.x, y: target.y}
+        return { x: target.x, y: target.y }
     }
 
-    const {selector, text, xpath, nth: nthParam} = targetToFindParams(target as Target & { nth?: number })
-    const elements                               = await unifiedSession.find(selector, text, xpath, timeout)
+    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
+    const elements                                 = await unifiedSession.find(selector, text, xpath, timeout)
     if (elements.length === 0) {
         throw new Error(`未找到目标元素: ${JSON.stringify(target)}`)
     }
@@ -589,7 +612,7 @@ async function getTargetPointExtension(
     // 元素定位：find() 返回视口绝对坐标
     if (frameOffset && isStealth) {
         // stealth: 转回 iframe 相对坐标
-        return {x: point.x - frameOffset.x, y: point.y - frameOffset.y}
+        return { x: point.x - frameOffset.x, y: point.y - frameOffset.y }
     }
     return point
 }
@@ -778,16 +801,16 @@ async function getTargetPoint(
 ): Promise<{ x: number; y: number }> {
     // 如果是坐标，直接返回
     if ('x' in target && 'y' in target) {
-        return {x: target.x, y: target.y}
+        return { x: target.x, y: target.y }
     }
 
     // 使用 Locator 定位元素
-    const locator = session.createLocator(target, {timeout})
+    const locator = session.createLocator(target, { timeout })
     const nodeId  = await locator.find()
 
     // 根据操作类型执行自动等待
     if (waitType !== 'none') {
-        const autoWait = session.createAutoWait({timeout})
+        const autoWait = session.createAutoWait({ timeout })
         if (waitType === 'click') {
             await autoWait.waitForClickable(nodeId)
         } else if (waitType === 'input') {

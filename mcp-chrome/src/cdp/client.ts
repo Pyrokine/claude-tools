@@ -113,7 +113,7 @@ export class CDPClient extends EventEmitter {
         }
 
         const id                               = this.nextId++
-        const message: Record<string, unknown> = {id, method}
+        const message: Record<string, unknown> = { id, method }
 
         if (params !== undefined) {
             message.params = params
@@ -326,7 +326,7 @@ async function cdpHttpFetch<T>(host: string, port: number, path: string, timeout
 
     let response: Response
     try {
-        response = await fetch(url, {signal: controller.signal})
+        response = await fetch(url, { signal: controller.signal })
     } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
             throw new TimeoutError(`连接超时: ${host}:${port} (${timeout}ms)`)

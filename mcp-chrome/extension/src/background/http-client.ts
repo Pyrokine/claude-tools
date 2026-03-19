@@ -17,8 +17,8 @@ const MAX_RECONNECT_DELAY  = 30000
 const HEARTBEAT_TIMEOUT    = 20000
 
 interface ServerConnection {
-    ws: WebSocket
-    heartbeatTimer: ReturnType<typeof setTimeout> | null
+    ws: WebSocket;
+    heartbeatTimer: ReturnType<typeof setTimeout> | null;
 }
 
 type MessageHandler = (message: { id: string; action: string; params: unknown }, port: number) => void
@@ -46,7 +46,7 @@ export class HttpClient {
      */
     async connect(): Promise<{ connected: number; ports: number[] }> {
         if (this.connecting) {
-            return {connected: this.connections.size, ports: this.getConnectedPorts()}
+            return { connected: this.connections.size, ports: this.getConnectedPorts() }
         }
 
         this.stopReconnect()
@@ -65,7 +65,7 @@ export class HttpClient {
             if (healthyPorts.length === 0 && this.connections.size === 0) {
                 this.statusHandler?.('disconnected', 0)
                 this.scheduleReconnect()
-                return {connected: 0, ports: []}
+                return { connected: 0, ports: [] }
             }
 
             // 连接所有尚未连接的健康端口
@@ -86,7 +86,7 @@ export class HttpClient {
                 this.scheduleReconnect()
             }
 
-            return {connected: ports.length, ports}
+            return { connected: ports.length, ports }
         } finally {
             this.connecting = false
         }
@@ -124,7 +124,7 @@ export class HttpClient {
             return
         }
 
-        conn.ws.send(JSON.stringify({id, success, data, error}))
+        conn.ws.send(JSON.stringify({ id, success, data, error }))
     }
 
     private async connectToPort(port: number): Promise<boolean> {
@@ -156,7 +156,7 @@ export class HttpClient {
                     this.resetHeartbeat(port)
 
                     // 版本握手
-                    ws.send(JSON.stringify({type: 'hello', version: EXTENSION_VERSION}))
+                    ws.send(JSON.stringify({ type: 'hello', version: EXTENSION_VERSION }))
 
                     console.log(`[HTTP] Connected to MCP Server at port ${port} (total: ${this.connections.size})`)
                     this.statusHandler?.('connected', this.connections.size)
@@ -259,7 +259,7 @@ export class HttpClient {
             // 心跳：收到 ping 说明连接存活，重置心跳计时器
             if (message.type === 'ping') {
                 const conn = this.connections.get(port)
-                conn?.ws.send(JSON.stringify({type: 'pong'}))
+                conn?.ws.send(JSON.stringify({ type: 'pong' }))
                 this.resetHeartbeat(port)
                 return
             }

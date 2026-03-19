@@ -44,14 +44,25 @@ import type {
 import {setMcpTabGroupId} from './index'
 
 interface ActionContext {
-    mcpTabGroupId: number | null
+    mcpTabGroupId: number | null;
 }
 
 type ActionFunction = (params: unknown, context: ActionContext) => Promise<unknown>
 
+class DebuggerBlockedError extends Error {
+    constructor(tabId: number) {
+        super(`Debugger blocked on tab ${tabId} (another debugger attached). Close other DevTools extensions (React DevTools, etc.) to enable full functionality.`)
+        this.name = 'DebuggerBlockedError'
+    }
+}
+
 export class ActionHandler {
     private actions: Map<string, ActionFunction>                                                       = new Map()
     private attachedTabs: Set<number>                                                                  = new Set()
+    /** debugger 被其他扩展占用的 tab（如 React DevTools） */
+    private debuggerBlocked: Set<number>                                                               = new Set()
+    /** debugger 占用时的重试节流：tabId -> 下一次允许 attach 的时间戳（ms） */
+    private debuggerBlockedRetryAfter: Map<number, number>                                             = new Map()
     private consoleMessages: Map<number, ConsoleMessage[]>                                             = new Map()
     private networkRequests: Map<number, NetworkRequest[]>                                             = new Map()
     /** 按 tabId 隔离的待匹配请求（不同 tab 的 requestId 可能重复） */
@@ -59,7 +70,8 @@ export class ActionHandler {
         url: string;
         method: string;
         type: string;
-        timestamp: number
+        timestamp: number;
+        _monotonic: number
     }>>                                                                                                = new Map()
     /** 按 tabId 缓存的执行上下文（由 Runtime.executionContextCreated 事件填充） */
     private executionContexts: Map<number, Array<{ id: number; frameId: string; isDefault: boolean }>> = new Map()
@@ -76,6 +88,25 @@ export class ActionHandler {
             throw new Error(`Unknown action: ${action}`)
         }
         return handler(params, context)
+    }
+
+    // ==================== URL 安全检查 ====================
+
+    /** chrome.scripting.executeScript 无法在受限 URL 上执行 */
+    private isRestrictedUrl(url: string | undefined): boolean {
+        if (!url) {
+            return true
+        }
+        return url === 'about:blank' || url.startsWith('about:')
+               || url.startsWith('chrome://') || url.startsWith('chrome-extension://')
+    }
+
+    /** 检查 tab 是否可执行脚本，不可时抛清晰错误 */
+    private async assertScriptable(tabId: number): Promise<void> {
+        const tab = await chrome.tabs.get(tabId)
+        if (this.isRestrictedUrl(tab.url)) {
+            throw new Error(`Cannot execute on restricted URL "${tab.url}". Navigate to an http/https page first.`)
+        }
     }
 
     // ==================== Debugger 监听器 ====================
@@ -164,6 +195,8 @@ export class ActionHandler {
         chrome.debugger.onDetach.addListener((source, reason) => {
             if (source.tabId) {
                 this.attachedTabs.delete(source.tabId)
+                this.debuggerBlocked.delete(source.tabId)
+                this.debuggerBlockedRetryAfter.delete(source.tabId)
                 this.consoleMessages.delete(source.tabId)
                 this.networkRequests.delete(source.tabId)
                 this.pendingRequests.delete(source.tabId)
@@ -191,7 +224,7 @@ export class ActionHandler {
                     source: 'console-api',
                     level: p.type,
                     text: p.args.map(arg => arg.value ?? arg.description ?? '').join(' '),
-                    timestamp: p.timestamp,
+                    timestamp: Math.round(p.timestamp),  // Runtime.Timestamp 已是 epoch 毫秒
                 }
 
                 if (p.stackTrace?.callFrames?.[0]) {
@@ -224,7 +257,7 @@ export class ActionHandler {
                     source: 'javascript',
                     level: 'error',
                     text: p.exceptionDetails.exception?.description || p.exceptionDetails.text,
-                    timestamp: p.timestamp,
+                    timestamp: Math.round(p.timestamp),  // Runtime.Timestamp 已是 epoch 毫秒
                     url: p.exceptionDetails.url,
                     lineNumber: p.exceptionDetails.lineNumber,
                 }
@@ -244,6 +277,7 @@ export class ActionHandler {
                     request: { url: string; method: string }
                     type: string
                     timestamp: number
+                    wallTime: number
                 }
                 let tabPending = this.pendingRequests.get(source.tabId)
                 if (!tabPending) {
@@ -254,7 +288,8 @@ export class ActionHandler {
                     url: p.request.url,
                     method: p.request.method,
                     type: p.type,
-                    timestamp: p.timestamp,
+                    timestamp: Math.round(p.wallTime * 1000),  // wallTime 是 epoch 秒 → epoch 毫秒
+                    _monotonic: p.timestamp,  // 保留 MonotonicTime 用于 duration 计算
                 })
             }
 
@@ -268,11 +303,12 @@ export class ActionHandler {
                 const tabPending = this.pendingRequests.get(source.tabId)
                 const pending    = tabPending?.get(p.requestId)
                 if (pending) {
-                    const requests = this.networkRequests.get(source.tabId) || []
+                    const { _monotonic, ...requestData } = pending
+                    const requests                       = this.networkRequests.get(source.tabId) || []
                     requests.push({
-                                      ...pending,
+                                      ...requestData,
                                       status: p.response.status,
-                                      duration: (p.timestamp - pending.timestamp) * 1000,
+                                      duration: Math.round((p.timestamp - _monotonic) * 1000),
                                   })
                     if (requests.length > 1000) {
                         requests.shift()
@@ -294,7 +330,11 @@ export class ActionHandler {
                 const ctx = p.context
                 if (ctx.auxData?.frameId) {
                     const contexts = this.executionContexts.get(source.tabId) || []
-                    contexts.push({id: ctx.id, frameId: ctx.auxData.frameId, isDefault: ctx.auxData.isDefault ?? false})
+                    contexts.push({
+                                      id: ctx.id,
+                                      frameId: ctx.auxData.frameId,
+                                      isDefault: ctx.auxData.isDefault ?? false,
+                                  })
                     this.executionContexts.set(source.tabId, contexts)
                 }
             }
@@ -374,7 +414,7 @@ export class ActionHandler {
             let groupId: number | null = p?.groupId ?? context.mcpTabGroupId
             if (groupId !== null && groupId !== undefined) {
                 try {
-                    await chrome.tabs.group({tabIds: [tab.id], groupId})
+                    await chrome.tabs.group({ tabIds: [tab.id], groupId })
                     actualGroupId = groupId
                 } catch {
                     // 分组可能已被删除，重新创建
@@ -382,8 +422,8 @@ export class ActionHandler {
                 }
             }
             if (groupId === null || groupId === undefined) {
-                const newGroupId = await chrome.tabs.group({tabIds: [tab.id]})
-                await chrome.tabGroups.update(newGroupId, {title: 'MCP Chrome', color: 'cyan'})
+                const newGroupId = await chrome.tabs.group({ tabIds: [tab.id] })
+                await chrome.tabGroups.update(newGroupId, { title: 'MCP Chrome', color: 'cyan' })
                 setMcpTabGroupId(newGroupId)
                 actualGroupId = newGroupId
             }
@@ -416,7 +456,7 @@ export class ActionHandler {
         }
 
         await chrome.tabs.remove(p.tabId)
-        return {success: true}
+        return { success: true }
     }
 
     // ==================== 导航操作 ====================
@@ -427,11 +467,11 @@ export class ActionHandler {
             throw new Error('tabId is required')
         }
 
-        const tab = await chrome.tabs.update(p.tabId, {active: true})
+        const tab = await chrome.tabs.update(p.tabId, { active: true })
 
         // 聚焦窗口
         if (tab.windowId) {
-            await chrome.windows.update(tab.windowId, {focused: true})
+            await chrome.windows.update(tab.windowId, { focused: true })
         }
 
         return {
@@ -456,7 +496,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p.tabId)
-        await chrome.tabs.update(tabId, {url: p.url})
+        await chrome.tabs.update(tabId, { url: p.url })
 
         if (p.waitUntil) {
             await this.waitForNavigation(tabId, p.waitUntil, p.timeout)
@@ -496,7 +536,7 @@ export class ActionHandler {
         }
 
         const tab = await chrome.tabs.get(tabId)
-        return {url: tab.url || '', title: tab.title || '', navigated}
+        return { url: tab.url || '', title: tab.title || '', navigated }
     }
 
     private async goForward(params: unknown): Promise<{ url: string; title: string; navigated: boolean }> {
@@ -517,7 +557,7 @@ export class ActionHandler {
         }
 
         const tab = await chrome.tabs.get(tabId)
-        return {url: tab.url || '', title: tab.title || '', navigated}
+        return { url: tab.url || '', title: tab.title || '', navigated }
     }
 
     /**
@@ -588,19 +628,20 @@ export class ActionHandler {
         const p     = params as ReloadParams | undefined
         const tabId = await this.getTargetTabId(p?.tabId)
 
-        await chrome.tabs.reload(tabId, {bypassCache: p?.ignoreCache ?? false})
+        await chrome.tabs.reload(tabId, { bypassCache: p?.ignoreCache ?? false })
 
         if (p?.waitUntil) {
             await this.waitForNavigation(tabId, p.waitUntil, p.timeout)
         }
 
         const tab = await chrome.tabs.get(tabId)
-        return {url: tab.url || '', title: tab.title || ''}
+        return { url: tab.url || '', title: tab.title || '' }
     }
 
     private async readPage(params: unknown): Promise<ReadPageResult> {
         const p     = params as ReadPageParams | undefined
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -632,45 +673,64 @@ export class ActionHandler {
         const p     = params as ScreenshotParams | undefined
         const tabId = await this.getTargetTabId(p?.tabId)
 
-        // 使用 debugger API 截图（不需要 tab 在前台）
-        await this.ensureDebuggerAttached(tabId)
+        try {
+            // 使用 debugger API 截图（不需要 tab 在前台）
+            await this.ensureDebuggerAttached(tabId)
+        } catch (err) {
+            if (err instanceof DebuggerBlockedError) {
+                return this.screenshotFallback(tabId, p)
+            }
+            throw err
+        }
 
         if (p?.fullPage) {
             // 获取页面完整尺寸
-            const {result: sizeResult} = await chrome.debugger.sendCommand({tabId}, 'Runtime.evaluate', {
+            const { result: sizeResult } = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
                 expression: 'JSON.stringify({width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight})',
                 returnByValue: true,
             }) as { result: { value: string } }
-            const {width, height}      = JSON.parse(sizeResult.value)
+            const { width, height }      = JSON.parse(sizeResult.value)
 
             // 临时设置视口为页面完整尺寸
-            await chrome.debugger.sendCommand({tabId}, 'Emulation.setDeviceMetricsOverride', {
+            await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
                 width, height, deviceScaleFactor: p?.scale ?? 1, mobile: false,
             })
 
             try {
                 const effectiveFormat = p?.format || 'png'
-                const result = await chrome.debugger.sendCommand({tabId}, 'Page.captureScreenshot', {
+                const result          = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
                     format: effectiveFormat,
-                    ...(p?.quality !== undefined && effectiveFormat !== 'png' ? {quality: p.quality} : {}),
+                    ...(p?.quality !== undefined && effectiveFormat !== 'png' ? { quality: p.quality } : {}),
                 }) as { data: string }
-                return {data: result.data, format: effectiveFormat}
+                return { data: result.data, format: effectiveFormat }
             } finally {
-                await chrome.debugger.sendCommand({tabId}, 'Emulation.clearDeviceMetricsOverride')
+                await chrome.debugger.sendCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride')
             }
         }
 
         const effectiveFormat = p?.format || 'png'
-        const result = await chrome.debugger.sendCommand({tabId}, 'Page.captureScreenshot', {
+        const result          = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
             format: effectiveFormat,
-            ...(p?.quality !== undefined && effectiveFormat !== 'png' ? {quality: p.quality} : {}),
-            ...(p?.clip ? {clip: {...p.clip, scale: p?.scale ?? 1}} : {}),
+            ...(p?.quality !== undefined && effectiveFormat !== 'png' ? { quality: p.quality } : {}),
+            ...(p?.clip ? { clip: { ...p.clip, scale: p?.scale ?? 1 } } : {}),
         }) as { data: string }
 
         return {
             data: result.data,
             format: p?.format || 'png',
         }
+    }
+
+    /** debugger 被占用时通过 captureVisibleTab 截图（仅可视区域） */
+    private async screenshotFallback(tabId: number, p?: ScreenshotParams): Promise<ScreenshotResult> {
+        const tab     = await chrome.tabs.get(tabId)
+        const format  = p?.format === 'jpeg' ? 'jpeg' : 'png'
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+            format,
+            quality: p?.quality,
+        })
+        const data    = dataUrl.split(',')[1]
+        return { data, format }
     }
 
     private async click(params: unknown): Promise<{ success: boolean }> {
@@ -680,6 +740,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -706,6 +767,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -725,6 +787,7 @@ export class ActionHandler {
     private async scroll(params: unknown): Promise<{ success: boolean; scrollX: number; scrollY: number }> {
         const p     = params as ScrollParams | undefined
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -748,6 +811,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -759,6 +823,7 @@ export class ActionHandler {
                                                                  },
                                                                  func: executeCode,
                                                                  args: [p.code],
+                                                                 world: 'MAIN',  // 在页面上下文中执行，绕过 CSP
                                                              })
 
         return results[0].result as { success: boolean; result?: string; error?: string }
@@ -769,8 +834,14 @@ export class ActionHandler {
         const tabId   = await this.getTargetTabId(p?.tabId)
         const frameId = (p as { frameId?: number })?.frameId ?? 0
 
+        // 受限 URL 返回空数组（而非抛异常，避免 auto-wait 轮询时大量错误）
+        const tab = await chrome.tabs.get(tabId)
+        if (this.isRestrictedUrl(tab.url)) {
+            return []
+        }
+
         const results = await chrome.scripting.executeScript({
-                                                                 target: {tabId, frameIds: [frameId]},
+                                                                 target: { tabId, frameIds: [frameId] },
                                                                  func: findElements,
                                                                  args: [
                                                                      p?.selector ?? null,
@@ -803,30 +874,52 @@ export class ActionHandler {
     // ==================== 页面内容提取 ====================
 
     /**
-     * 获取 iframe 在主页面中的偏移量
+     * 获取 iframe 在主页面中的偏移量（支持嵌套 iframe）
      *
-     * 通过 frameId 反查 iframe URL，在主框架中定位 iframe 元素获取位置。
-     * 当多个 iframe 共享同一 URL 时，优先按同 URL 的出现顺序匹配，避免取到第一个错误 iframe。
+     * 通过 frameId 反查 iframe URL，在其父框架中定位 iframe 元素获取位置。
+     * 对于嵌套 iframe，递归累加各层偏移。
+     * 当多个 iframe 共享同一 URL 时，优先按同 URL 的出现顺序匹配。
      * clientLeft/clientTop 补偿 iframe 的 border，确保坐标指向内容区域起点。
      */
     private async getFrameOffset(tabId: number, frameId: number): Promise<{ x: number; y: number } | null> {
-        const allFrames = await chrome.webNavigation.getAllFrames({tabId})
+        const allFrames = await chrome.webNavigation.getAllFrames({ tabId })
         if (!allFrames) {
             return null
         }
 
-        const childFrames = allFrames.filter(f => f.parentFrameId === 0 && f.frameId !== 0)
-        const frameIndex  = childFrames.findIndex(f => f.frameId === frameId)
-        if (frameIndex < 0) {
+        const targetFrame = allFrames.find(f => f.frameId === frameId)
+        if (!targetFrame || targetFrame.parentFrameId === -1) {
             return null
         }
 
-        const targetFrame   = childFrames[frameIndex]
-        const sameUrlFrames = childFrames.filter(f => f.url === targetFrame.url)
+        // 受限 URL 无法执行脚本获取偏移
+        const tab = await chrome.tabs.get(tabId)
+        if (this.isRestrictedUrl(tab.url)) {
+            return null
+        }
+
+        // 递归获取父 frame 的偏移（嵌套 iframe 时需要累加）
+        let parentOffset = { x: 0, y: 0 }
+        if (targetFrame.parentFrameId !== 0) {
+            const po = await this.getFrameOffset(tabId, targetFrame.parentFrameId)
+            if (po) {
+                parentOffset = po
+            }
+        }
+
+        // 在父框架中找到同级 iframe，按 URL 和索引匹配目标
+        const siblingFrames = allFrames.filter(
+            f => f.parentFrameId === targetFrame.parentFrameId && f.frameId !== targetFrame.parentFrameId,
+        )
+        const frameIndex    = siblingFrames.findIndex(f => f.frameId === frameId)
+        const sameUrlFrames = siblingFrames.filter(f => f.url === targetFrame.url)
         const sameUrlIndex  = sameUrlFrames.findIndex(f => f.frameId === frameId)
 
         const results = await chrome.scripting.executeScript({
-                                                                 target: {tabId, frameIds: [0]},
+                                                                 target: {
+                                                                     tabId,
+                                                                     frameIds: [targetFrame.parentFrameId],
+                                                                 },
                                                                  func: (
                                                                      frameUrl: string,
                                                                      frameIndex: number,
@@ -869,12 +962,21 @@ export class ActionHandler {
                                                                  args: [targetFrame.url, frameIndex, sameUrlIndex],
                                                              })
 
-        return results[0]?.result as { x: number; y: number } | null
+        const localOffset = results[0]?.result as { x: number; y: number } | null
+        if (!localOffset) {
+            return null
+        }
+
+        return {
+            x: parentOffset.x + localOffset.x,
+            y: parentOffset.y + localOffset.y,
+        }
     }
 
     private async getText(params: unknown): Promise<{ text: string }> {
         const p     = params as { tabId?: number; selector?: string }
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -894,6 +996,7 @@ export class ActionHandler {
     private async getHtml(params: unknown): Promise<{ html: string }> {
         const p     = params as { tabId?: number; selector?: string; outer?: boolean }
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -925,6 +1028,7 @@ export class ActionHandler {
     }> {
         const p     = params as { tabId?: number; selector?: string; outer?: boolean }
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -962,6 +1066,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -985,6 +1090,7 @@ export class ActionHandler {
     private async getMetadata(params: unknown): Promise<Record<string, unknown>> {
         const p     = params as { tabId?: number }
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -1045,7 +1151,7 @@ export class ActionHandler {
                                      expirationDate: p.expirationDate,
                                  })
 
-        return {success: true}
+        return { success: true }
     }
 
     private async cookiesDelete(params: unknown): Promise<{ success: boolean }> {
@@ -1059,7 +1165,7 @@ export class ActionHandler {
                                         name: p.name,
                                     })
 
-        return {success: true}
+        return { success: true }
     }
 
     // ==================== Tab Groups ====================
@@ -1085,14 +1191,14 @@ export class ActionHandler {
             const domain   = cookie.domain.startsWith('.') ? cookie.domain.slice(1) : cookie.domain
             const url      = `${protocol}//${domain}${cookie.path}`
             try {
-                await chrome.cookies.remove({url, name: cookie.name})
+                await chrome.cookies.remove({ url, name: cookie.name })
                 count++
             } catch {
                 // 忽略删除失败的 cookie
             }
         }
 
-        return {success: true, count}
+        return { success: true, count }
     }
 
     private async tabGroupCreate(params: unknown): Promise<{ groupId: number; title: string; color: string }> {
@@ -1101,13 +1207,13 @@ export class ActionHandler {
             throw new Error('At least one tabId is required')
         }
 
-        const groupId = await chrome.tabs.group({tabIds: p.tabIds})
+        const groupId = await chrome.tabs.group({ tabIds: p.tabIds })
         const title   = p.title || 'MCP Chrome'
         const color   = p.color || 'cyan'
 
-        await chrome.tabGroups.update(groupId, {title, color})
+        await chrome.tabGroups.update(groupId, { title, color })
 
-        return {groupId, title, color}
+        return { groupId, title, color }
     }
 
     // ==================== Debugger (CDP) 操作 ====================
@@ -1123,16 +1229,16 @@ export class ActionHandler {
             throw new Error('No tab group available')
         }
 
-        await chrome.tabs.group({tabIds: [p.tabId], groupId})
+        await chrome.tabs.group({ tabIds: [p.tabId], groupId })
 
-        return {success: true, groupId}
+        return { success: true, groupId }
     }
 
     private async debuggerAttach(params: unknown): Promise<{ success: boolean; tabId: number }> {
         const p     = params as DebuggerAttachParams | undefined
         const tabId = await this.getTargetTabId(p?.tabId)
         await this.ensureDebuggerAttached(tabId)
-        return {success: true, tabId}
+        return { success: true, tabId }
     }
 
     private async debuggerDetach(params: unknown): Promise<{ success: boolean }> {
@@ -1140,16 +1246,16 @@ export class ActionHandler {
         const tabId = await this.getTargetTabId(p?.tabId)
 
         if (!this.attachedTabs.has(tabId)) {
-            return {success: true}
+            return { success: true }
         }
 
-        await chrome.debugger.detach({tabId})
+        await chrome.debugger.detach({ tabId })
         this.attachedTabs.delete(tabId)
         this.consoleMessages.delete(tabId)
         this.networkRequests.delete(tabId)
         this.pendingRequests.delete(tabId)
 
-        return {success: true}
+        return { success: true }
     }
 
     // ==================== 输入事件（通过 CDP）====================
@@ -1163,7 +1269,7 @@ export class ActionHandler {
         const tabId = await this.getTargetTabId(p.tabId)
         await this.ensureDebuggerAttached(tabId)
 
-        return await chrome.debugger.sendCommand({tabId}, p.method, p.params)
+        return await chrome.debugger.sendCommand({ tabId }, p.method, p.params)
     }
 
     private async inputKey(params: unknown): Promise<{ success: boolean }> {
@@ -1198,9 +1304,9 @@ export class ActionHandler {
             cdpParams.modifiers = p.modifiers
         }
 
-        await chrome.debugger.sendCommand({tabId}, 'Input.dispatchKeyEvent', cdpParams)
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', cdpParams)
 
-        return {success: true}
+        return { success: true }
     }
 
     private async inputMouse(params: unknown): Promise<{ success: boolean }> {
@@ -1234,9 +1340,9 @@ export class ActionHandler {
             cdpParams.modifiers = p.modifiers
         }
 
-        await chrome.debugger.sendCommand({tabId}, 'Input.dispatchMouseEvent', cdpParams)
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', cdpParams)
 
-        return {success: true}
+        return { success: true }
     }
 
     private async inputTouch(params: unknown): Promise<{ success: boolean }> {
@@ -1257,9 +1363,9 @@ export class ActionHandler {
             cdpParams.modifiers = p.modifiers
         }
 
-        await chrome.debugger.sendCommand({tabId}, 'Input.dispatchTouchEvent', cdpParams)
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchTouchEvent', cdpParams)
 
-        return {success: true}
+        return { success: true }
     }
 
     // ==================== 控制台日志 ====================
@@ -1277,7 +1383,7 @@ export class ActionHandler {
 
         for (const char of p.text) {
             // 发送 char 事件
-            await chrome.debugger.sendCommand({tabId}, 'Input.dispatchKeyEvent', {
+            await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
                 type: 'char',
                 text: char,
             })
@@ -1287,23 +1393,62 @@ export class ActionHandler {
             }
         }
 
-        return {success: true}
+        return { success: true }
     }
 
     private async consoleEnable(params: unknown): Promise<{ success: boolean }> {
         const p     = params as { tabId?: number }
         const tabId = await this.getTargetTabId(p?.tabId)
-        await this.ensureDebuggerAttached(tabId)
 
-        // 启用 Runtime 域以接收控制台消息
-        await chrome.debugger.sendCommand({tabId}, 'Runtime.enable', {})
+        try {
+            await this.ensureDebuggerAttached(tabId)
+            // 启用 Runtime 域以接收控制台消息
+            await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {})
+        } catch (err) {
+            if (err instanceof DebuggerBlockedError) {
+                // Fallback: 通过 scripting 注入 console 拦截器
+                await this.assertScriptable(tabId)
+                await chrome.scripting.executeScript({
+                                                         target: { tabId, frameIds: [0] },
+                                                         func: () => {
+                                                             if ((window as any).__mcpConsoleHooked) {
+                                                                 return
+
+                                                             }
+                                                             (window as any).__mcpConsoleHooked   = true
+                                                             const logs: any[]                    = ((window as any).__mcpConsoleLogs =
+                                                                 [])
+                                                             const orig: Record<string, Function> = {}
+                                                             for (const level of
+                                                                 ['log', 'warn', 'error', 'info', 'debug'] as const) {
+                                                                 orig[level]              = (console as any)[level]
+                                                                 ;(console as any)[level] = (...args: any[]) => {
+                                                                     logs.push({
+                                                                                   source: 'console-api',
+                                                                                   level,
+                                                                                   text: args.map(String).join(' '),
+                                                                                   timestamp: Date.now(),
+                                                                               })
+                                                                     if (logs.length > 1000) {
+                                                                         logs.shift()
+                                                                     }
+                                                                     orig[level].apply(console, args)
+                                                                 }
+                                                             }
+                                                         },
+                                                         world: 'MAIN',
+                                                     })
+            } else {
+                throw err
+            }
+        }
 
         // 初始化消息存储
         if (!this.consoleMessages.has(tabId)) {
             this.consoleMessages.set(tabId, [])
         }
 
-        return {success: true}
+        return { success: true }
     }
 
     private async consoleGet(params: unknown): Promise<{ messages: ConsoleMessage[] }> {
@@ -1312,23 +1457,82 @@ export class ActionHandler {
 
         let messages = this.consoleMessages.get(tabId) || []
 
-        // 按级别过滤
-        if (p?.level) {
-            messages = messages.filter(m => m.level === p.level)
+        // Fallback: 从注入的 console hook 读取日志
+        if (messages.length === 0 && this.debuggerBlocked.has(tabId)) {
+            try {
+                const tab = await chrome.tabs.get(tabId)
+                if (!this.isRestrictedUrl(tab.url)) {
+                    const results  = await chrome.scripting.executeScript({
+                                                                              target: { tabId, frameIds: [0] },
+                                                                              func: () => (window as any).__mcpConsoleLogs ||
+                                                                                  [],
+                                                                              world: 'MAIN',
+                                                                          })
+                    const injected = results[0]?.result as ConsoleMessage[] ?? []
+                    if (injected.length > 0) {
+                        messages = injected
+                    }
+                }
+            } catch { /* 忽略 fallback 失败 */
+            }
         }
 
-        // 按正则过滤
+        // 按级别过滤（warning/warn 统一匹配）
+        if (p?.level) {
+            const target = p.level
+            messages     = messages.filter(m =>
+                                               m.level === target
+                                               || (target === 'warning' && m.level === 'warn')
+                                               || (target === 'warn' && m.level === 'warning'),
+            )
+        }
+
+        // 按正则过滤（检测灾难性模式 + 限制输入长度，防止 ReDoS 阻塞后台线程）
         if (p?.pattern) {
-            const regex = new RegExp(p.pattern, 'i')
-            messages    = messages.filter(m => regex.test(m.text))
+            // 检测典型灾难性回溯模式：嵌套量词 (x+)+、(x*)*、(x+)*、(x{n,})+  等
+            const hasCatastrophicPattern = /(\+|\*|\{[^}]*\})\)(\+|\*|\{)/.test(p.pattern)
+            if (!hasCatastrophicPattern) {
+                try {
+                    const regex        = new RegExp(p.pattern, 'i')
+                    const MAX_TEST_LEN = 50000  // 单条消息最多测试 50KB
+                    messages           = messages.filter(m => {
+                        const text = m.text.length > MAX_TEST_LEN ? m.text.slice(0, MAX_TEST_LEN) : m.text
+                        return regex.test(text)
+                    })
+                } catch {
+                    // 正则无效时退化为字符串包含匹配
+                    const pat = p.pattern.toLowerCase()
+                    messages  = messages.filter(m => m.text.toLowerCase().includes(pat))
+                }
+            } else {
+                // 灾难性模式退化为字符串包含匹配
+                const pat = p.pattern.toLowerCase()
+                messages  = messages.filter(m => m.text.toLowerCase().includes(pat))
+            }
         }
 
         // 清除已读消息
         if (p?.clear) {
             this.consoleMessages.set(tabId, [])
+            // 同时清除 fallback 日志
+            if (this.debuggerBlocked.has(tabId)) {
+                try {
+                    const tab = await chrome.tabs.get(tabId)
+                    if (!this.isRestrictedUrl(tab.url)) {
+                        await chrome.scripting.executeScript({
+                                                                 target: { tabId, frameIds: [0] },
+                                                                 func: () => {
+                                                                     (window as any).__mcpConsoleLogs = []
+                                                                 },
+                                                                 world: 'MAIN',
+                                                             })
+                    }
+                } catch { /* 忽略 */
+                }
+            }
         }
 
-        return {messages}
+        return { messages }
     }
 
     // ==================== 网络日志 ====================
@@ -1339,22 +1543,29 @@ export class ActionHandler {
 
         this.consoleMessages.set(tabId, [])
 
-        return {success: true}
+        return { success: true }
     }
 
     private async networkEnable(params: unknown): Promise<{ success: boolean }> {
         const p     = params as { tabId?: number }
         const tabId = await this.getTargetTabId(p?.tabId)
-        await this.ensureDebuggerAttached(tabId)
 
-        // 启用 Network 域以接收网络事件
-        await chrome.debugger.sendCommand({tabId}, 'Network.enable', {})
+        try {
+            await this.ensureDebuggerAttached(tabId)
+            // 启用 Network 域以接收网络事件
+            await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
+        } catch (err) {
+            if (!(err instanceof DebuggerBlockedError)) {
+                throw err
+            }
+            // Debugger 被占用，networkGet 将通过 performance API fallback
+        }
 
         if (!this.networkRequests.has(tabId)) {
             this.networkRequests.set(tabId, [])
         }
 
-        return {success: true}
+        return { success: true }
     }
 
     private async networkGet(params: unknown): Promise<{ requests: NetworkRequest[] }> {
@@ -1363,17 +1574,54 @@ export class ActionHandler {
 
         let requests = this.networkRequests.get(tabId) || []
 
-        // 按 URL 模式过滤
+        // Fallback: debugger 不可用时通过 performance API 获取
+        if (requests.length === 0 && this.debuggerBlocked.has(tabId)) {
+            try {
+                const tab = await chrome.tabs.get(tabId)
+                if (!this.isRestrictedUrl(tab.url)) {
+                    const results = await chrome.scripting.executeScript({
+                                                                             target: { tabId, frameIds: [0] },
+                                                                             func: () => {
+                                                                                 const entries = performance.getEntriesByType(
+                                                                                     'resource') as PerformanceResourceTiming[]
+                                                                                 return entries.map(e => ({
+                                                                                     url: e.name,
+                                                                                     method: '',
+                                                                                     type: e.initiatorType,
+                                                                                     status: 0,
+                                                                                     timestamp: Math.round(e.startTime +
+                                                                                                           performance.timeOrigin),
+                                                                                     duration: Math.round(e.duration),
+                                                                                 }))
+                                                                             },
+                                                                             world: 'MAIN',
+                                                                         })
+                    requests      = results[0]?.result as NetworkRequest[] ?? []
+                }
+            } catch { /* 忽略 fallback 失败 */
+            }
+        }
+
+        // 按 URL 通配符过滤（* 匹配任意字符，? 匹配单个字符）
         if (p?.urlPattern) {
-            const regex = new RegExp(p.urlPattern.replace(/\*/g, '.*'), 'i')
-            requests    = requests.filter(r => regex.test(r.url))
+            try {
+                // 转义正则元字符，仅保留 * 和 ? 的通配语义
+                const escaped = p.urlPattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+                const pattern = escaped.replace(/\*/g, '.*').replace(/\?/g, '.')
+                const regex   = new RegExp(pattern, 'i')
+                requests      = requests.filter(r => regex.test(r.url))
+            } catch {
+                // 构造失败时退化为字符串包含匹配
+                const pat = p.urlPattern.toLowerCase()
+                requests  = requests.filter(r => r.url.toLowerCase().includes(pat))
+            }
         }
 
         if (p?.clear) {
             this.networkRequests.set(tabId, [])
         }
 
-        return {requests}
+        return { requests }
     }
 
     // ==================== Debugger 辅助方法 ====================
@@ -1384,7 +1632,7 @@ export class ActionHandler {
 
         this.networkRequests.set(tabId, [])
 
-        return {success: true}
+        return { success: true }
     }
 
     /**
@@ -1405,13 +1653,30 @@ export class ActionHandler {
             return
         }
 
-        const attachPromise = chrome.debugger.attach({tabId}, '1.3').then(() => {
+        if (this.debuggerBlocked.has(tabId)) {
+            const retryAfter = this.debuggerBlockedRetryAfter.get(tabId) ?? 0
+            if (Date.now() < retryAfter) {
+                throw new DebuggerBlockedError(tabId)
+            }
+        }
+
+        const attachPromise = chrome.debugger.attach({ tabId }, '1.3').then(() => {
             this.attachedTabs.add(tabId)
+            this.debuggerBlocked.delete(tabId)
+            this.debuggerBlockedRetryAfter.delete(tabId)
         })
 
         this.pendingAttach.set(tabId, attachPromise)
         try {
             await attachPromise
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            if (msg.includes('Another debugger') || msg.includes('already attached')) {
+                this.debuggerBlocked.add(tabId)
+                this.debuggerBlockedRetryAfter.set(tabId, Date.now() + 2000)
+                throw new DebuggerBlockedError(tabId)
+            }
+            throw err
         } finally {
             this.pendingAttach.delete(tabId)
         }
@@ -1426,6 +1691,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -1449,6 +1715,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -1472,6 +1739,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -1495,6 +1763,7 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         const results = await chrome.scripting.executeScript({
                                                                  target: {
@@ -1514,14 +1783,18 @@ export class ActionHandler {
     private async stealthInject(params: unknown): Promise<{ success: boolean }> {
         const p     = params as { tabId?: number }
         const tabId = await this.getTargetTabId(p?.tabId)
+        await this.assertScriptable(tabId)
 
         await chrome.scripting.executeScript({
-                                                 target: {tabId, frameIds: [(p as { frameId?: number })?.frameId ?? 0]},
+                                                 target: {
+                                                     tabId,
+                                                     frameIds: [(p as { frameId?: number })?.frameId ?? 0],
+                                                 },
                                                  func: injectStealthScripts,
                                                  world: 'MAIN',  // 注入到主世界，覆盖原生属性
                                              })
 
-        return {success: true}
+        return { success: true }
     }
 
     // ==================== iframe 穿透 ====================
@@ -1541,22 +1814,25 @@ export class ActionHandler {
         }
 
         const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
 
         // 获取所有 frames
-        const allFrames = await chrome.webNavigation.getAllFrames({tabId})
+        const allFrames = await chrome.webNavigation.getAllFrames({ tabId })
         if (!allFrames) {
             throw new Error('Failed to get frames')
         }
 
-        // 主框架的直接子 iframe
-        const childFrames = allFrames.filter(f => f.parentFrameId === 0 && f.frameId !== 0)
-        if (childFrames.length === 0) {
+        // 所有非主框架的 iframe（包括嵌套），用于 URL 匹配
+        const allChildFrames = allFrames.filter(f => f.frameId !== 0)
+        if (allChildFrames.length === 0) {
             throw new Error('No iframes found in page')
         }
+        // 主框架的直接子 iframe，用于 DOM 索引匹配（与 querySelectorAll 语义一致）
+        const directChildFrames = allFrames.filter(f => f.parentFrameId === 0 && f.frameId !== 0)
 
         // 在主框架中查找目标 iframe 的信息
         const results = await chrome.scripting.executeScript({
-                                                                 target: {tabId, frameIds: [0]},
+                                                                 target: { tabId, frameIds: [0] },
                                                                  func: (frame: string | number) => {
                                                                      const iframes                        = Array.from(
                                                                          document.querySelectorAll('iframe, frame')) as HTMLIFrameElement[]
@@ -1599,7 +1875,7 @@ export class ActionHandler {
                                                                          }
                                                                      }
 
-                                                                     return {src: absoluteSrc, index}
+                                                                     return { src: absoluteSrc, index }
                                                                  },
                                                                  args: [p.frame],
                                                              })
@@ -1610,26 +1886,26 @@ export class ActionHandler {
             throw new Error(`iframe not found: ${desc}`)
         }
 
-        // 策略 1: URL 精确匹配
+        // 策略 1: URL 精确匹配（在所有 frame 中搜索，支持嵌套 iframe）
         let matchedFrameId: number | undefined
         if (info.src) {
-            const urlMatches = childFrames.filter(f => f.url === info.src)
+            const urlMatches = allChildFrames.filter(f => f.url === info.src)
             if (urlMatches.length === 1) {
                 matchedFrameId = urlMatches[0].frameId
             }
         }
 
-        // 策略 2: 按 DOM 索引匹配
-        if (matchedFrameId === undefined && info.index >= 0 && info.index < childFrames.length) {
-            matchedFrameId = childFrames[info.index].frameId
+        // 策略 2: 按 DOM 索引匹配（仅在直接子 frame 中匹配，与主框架 querySelectorAll 语义一致）
+        if (matchedFrameId === undefined && info.index >= 0 && info.index < directChildFrames.length) {
+            matchedFrameId = directChildFrames[info.index].frameId
         }
 
         if (matchedFrameId === undefined) {
-            throw new Error(`Cannot resolve iframe to frameId. src: "${info.src}", childFrames: ${childFrames.length}`)
+            throw new Error(`Cannot resolve iframe to frameId. src: "${info.src}", directChildren: ${directChildFrames.length}, allFrames: ${allChildFrames.length}`)
         }
 
         const offset = await this.getFrameOffset(tabId, matchedFrameId)
-        return {frameId: matchedFrameId, offset}
+        return { frameId: matchedFrameId, offset }
     }
 
     /**
@@ -1641,7 +1917,7 @@ export class ActionHandler {
         const p     = params as { tabId?: number }
         const tabId = await this.getTargetTabId(p?.tabId)
 
-        const frames = await chrome.webNavigation.getAllFrames({tabId})
+        const frames = await chrome.webNavigation.getAllFrames({ tabId })
         if (!frames) {
             throw new Error('Failed to get frames')
         }
@@ -1681,7 +1957,7 @@ export class ActionHandler {
         await this.ensureDebuggerAttached(tabId)
 
         // 获取 Extension frameId 对应的 URL
-        const extFrames = await chrome.webNavigation.getAllFrames({tabId})
+        const extFrames = await chrome.webNavigation.getAllFrames({ tabId })
         if (!extFrames) {
             throw new Error('Failed to enumerate frames')
         }
@@ -1691,7 +1967,7 @@ export class ActionHandler {
         }
 
         // 获取 CDP frame tree，通过 URL 匹配找到 CDP frameId
-        const treeResult  = await chrome.debugger.sendCommand({tabId}, 'Page.getFrameTree') as {
+        const treeResult  = await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree') as {
             frameTree: { frame: { id: string; url: string }; childFrames?: Array<unknown> }
         }
         const cdpFrameIds = this.findCdpFrameIds(treeResult.frameTree, targetFrame.url)
@@ -1712,14 +1988,22 @@ export class ActionHandler {
         // 后续调用复用缓存（由 onEvent 持久监听保持一致性）
         let contexts = this.executionContexts.get(tabId) || []
         if (contexts.length === 0) {
-            await chrome.debugger.sendCommand({tabId}, 'Runtime.enable')
-            // 等待事件到达
-            await new Promise(resolve => setTimeout(resolve, 100))
-            contexts = this.executionContexts.get(tabId) || []
+            await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
         }
 
-        // 查找目标 frame 的主世界上下文
-        const targetCtx = contexts.find(c => c.frameId === cdpFrameId && c.isDefault)
+        // 轮询等待目标 frame 的主世界上下文（无论 contexts 是否已有其他 frame 的条目）
+        let targetCtx = contexts.find(c => c.frameId === cdpFrameId && c.isDefault)
+        if (!targetCtx) {
+            for (let i = 0; i < 20; i++) {
+                await new Promise(resolve => setTimeout(resolve, 100))
+                contexts  = this.executionContexts.get(tabId) || []
+                targetCtx = contexts.find(c => c.frameId === cdpFrameId && c.isDefault)
+                if (targetCtx) {
+                    break
+                }
+            }
+        }
+
         if (!targetCtx) {
             throw new Error(`No execution context for frame (CDP: ${cdpFrameId}, contexts: ${contexts.length})`)
         }
@@ -1735,7 +2019,7 @@ export class ActionHandler {
             evalParams.timeout = p.timeout
         }
 
-        return await chrome.debugger.sendCommand({tabId}, 'Runtime.evaluate', evalParams)
+        return await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', evalParams)
     }
 
     /** 在 CDP frame tree 中递归收集所有匹配 URL 的 frameId */
@@ -1766,7 +2050,7 @@ export class ActionHandler {
             return tabId
         }
 
-        const [activeTab] = await chrome.tabs.query({active: true, currentWindow: true})
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
         if (!activeTab?.id) {
             throw new Error('No active tab found')
         }
@@ -2172,7 +2456,7 @@ function generateAccessibilityTree(
             return {
                 error: `Element with ref_id '${refId}' not found`,
                 pageContent: '',
-                viewport: {width: window.innerWidth, height: window.innerHeight},
+                viewport: { width: window.innerWidth, height: window.innerHeight },
             }
         }
         const element = ref.deref()
@@ -2180,7 +2464,7 @@ function generateAccessibilityTree(
             return {
                 error: `Element with ref_id '${refId}' no longer exists`,
                 pageContent: '',
-                viewport: {width: window.innerWidth, height: window.innerHeight},
+                viewport: { width: window.innerWidth, height: window.innerHeight },
             }
         }
         traverse(element, 0, true)
@@ -2201,13 +2485,13 @@ function generateAccessibilityTree(
         return {
             error: `Output exceeds ${maxLength} character limit (${content.length} characters)`,
             pageContent: '',
-            viewport: {width: window.innerWidth, height: window.innerHeight},
+            viewport: { width: window.innerWidth, height: window.innerHeight },
         }
     }
 
     return {
         pageContent: content,
-        viewport: {width: window.innerWidth, height: window.innerHeight},
+        viewport: { width: window.innerWidth, height: window.innerHeight },
     }
 }
 
@@ -2217,23 +2501,23 @@ function performClick(refId: string): { success: boolean; error?: string } {
     const ref = win.__mcpElementMap?.[refId]
 
     if (!ref) {
-        return {success: false, error: `Element ${refId} not found`}
+        return { success: false, error: `Element ${refId} not found` }
     }
 
     const element = ref.deref()
     if (!element) {
-        return {success: false, error: `Element ${refId} no longer exists`}
+        return { success: false, error: `Element ${refId} no longer exists` }
     }
 
     // 滚动到元素位置
-    element.scrollIntoView({behavior: 'smooth', block: 'center'})
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' })
 
     // 高效点击：直接调用 click()
     const el = element as HTMLElement
     el.focus()
     el.click()
 
-    return {success: true}
+    return { success: true }
 }
 
 // 输入操作（高效模式）
@@ -2242,12 +2526,12 @@ function performType(refId: string, text: string, clear: boolean): { success: bo
     const ref = win.__mcpElementMap?.[refId]
 
     if (!ref) {
-        return {success: false, error: `Element ${refId} not found`}
+        return { success: false, error: `Element ${refId} not found` }
     }
 
     const element = ref.deref()
     if (!element) {
-        return {success: false, error: `Element ${refId} no longer exists`}
+        return { success: false, error: `Element ${refId} no longer exists` }
     }
 
     const el = element as HTMLInputElement | HTMLTextAreaElement
@@ -2256,18 +2540,18 @@ function performType(refId: string, text: string, clear: boolean): { success: bo
     // 高效输入：直接设置 value
     if ('value' in el) {
         el.value = clear ? text : el.value + text
-        el.dispatchEvent(new Event('input', {bubbles: true}))
-        el.dispatchEvent(new Event('change', {bubbles: true}))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+        el.dispatchEvent(new Event('change', { bubbles: true }))
     } else if ((element as HTMLElement).contentEditable === 'true') {
         if (clear) {
             element.textContent = text
         } else {
             element.textContent = (element.textContent || '') + text
         }
-        element.dispatchEvent(new Event('input', {bubbles: true}))
+        element.dispatchEvent(new Event('input', { bubbles: true }))
     }
 
-    return {success: true}
+    return { success: true }
 }
 
 // 滚动操作
@@ -2282,12 +2566,12 @@ function performScroll(x: number, y: number, refId: string | null): {
         const ref = win.__mcpElementMap?.[refId]
 
         if (!ref) {
-            return {success: false, error: `Element ${refId} not found`, scrollX: 0, scrollY: 0}
+            return { success: false, error: `Element ${refId} not found`, scrollX: 0, scrollY: 0 }
         }
 
         const element = ref.deref()
         if (!element) {
-            return {success: false, error: `Element ${refId} no longer exists`, scrollX: 0, scrollY: 0}
+            return { success: false, error: `Element ${refId} no longer exists`, scrollX: 0, scrollY: 0 }
         }
 
         element.scrollBy(x, y)
@@ -2295,7 +2579,7 @@ function performScroll(x: number, y: number, refId: string | null): {
         window.scrollBy(x, y)
     }
 
-    return {success: true, scrollX: window.scrollX, scrollY: window.scrollY}
+    return { success: true, scrollX: window.scrollX, scrollY: window.scrollY }
 }
 
 // 代码执行
@@ -2304,7 +2588,7 @@ function executeCode(code: string): { success: boolean; result?: string; error?:
         // 使用 Function 构造函数替代 eval，更容易处理返回值
         const fn     = new Function(`return (${code})`)
         const result = fn()
-        return {success: true, result: JSON.stringify(result)}
+        return { success: true, result: JSON.stringify(result) }
     } catch (error) {
         const errorMsg = error instanceof Error ? error.message : 'Unknown error'
         // 检测 CSP 相关错误
@@ -2314,7 +2598,7 @@ function executeCode(code: string): { success: boolean; result?: string; error?:
                 error: `CSP 限制：此页面禁止动态代码执行。建议使用 extract 工具获取页面内容，或使用 CDP 模式。原始错误: ${errorMsg}`,
             }
         }
-        return {success: false, error: errorMsg}
+        return { success: false, error: errorMsg }
     }
 }
 
@@ -2322,9 +2606,9 @@ function executeCode(code: string): { success: boolean; result?: string; error?:
 function extractText(selector: string | null): { text: string } {
     if (selector) {
         const element = document.querySelector(selector)
-        return {text: element?.textContent || ''}
+        return { text: element?.textContent || '' }
     }
-    return {text: document.body.innerText}
+    return { text: document.body.innerText }
 }
 
 // 提取 HTML
@@ -2332,11 +2616,11 @@ function extractHtml(selector: string | null, outer: boolean): { html: string } 
     if (selector) {
         const element = document.querySelector(selector)
         if (!element) {
-            return {html: ''}
+            return { html: '' }
         }
-        return {html: outer ? element.outerHTML : element.innerHTML}
+        return { html: outer ? element.outerHTML : element.innerHTML }
     }
-    return {html: document.documentElement.outerHTML}
+    return { html: document.documentElement.outerHTML }
 }
 
 // 提取 HTML + 图片元信息
@@ -2355,7 +2639,7 @@ function extractHtmlWithImages(selector: string | null, outer: boolean): {
 } {
     const root = selector ? document.querySelector(selector) : document.documentElement
     if (!root) {
-        return {html: '', images: []}
+        return { html: '', images: [] }
     }
 
     const html = selector
@@ -2371,7 +2655,17 @@ function extractHtmlWithImages(selector: string | null, outer: boolean): {
     const images = imgList.map((img, index) => ({
         index,
         src: img.src,                       // 绝对 URL（浏览器已解析）
-        dataSrc: (() => { const raw = img.dataset.src || img.dataset.lazySrc || img.dataset.original || ''; if (!raw) return ''; try { return new URL(raw, location.href).href } catch { return raw } })(),  // 懒加载 URL（解析为绝对路径）
+        dataSrc: (() => {
+            const raw = img.dataset.src || img.dataset.lazySrc || img.dataset.original || ''
+            if (!raw) {
+                return ''
+            }
+            try {
+                return new URL(raw, location.href).href
+            } catch {
+                return raw
+            }
+        })(),  // 懒加载 URL（解析为绝对路径）
         alt: img.alt,
         width: img.width,                   // 渲染宽度
         height: img.height,                 // 渲染高度
@@ -2379,7 +2673,7 @@ function extractHtmlWithImages(selector: string | null, outer: boolean): {
         naturalHeight: img.naturalHeight,   // 原始高度
     }))
 
-    return {html, images}
+    return { html, images }
 }
 
 // 提取页面元信息
@@ -2439,7 +2733,7 @@ function extractAttribute(selector: string | null, refId: string | null, attribu
     }
 
     if (!element) {
-        return {value: null}
+        return { value: null }
     }
 
     // 特定属性使用 property 方式获取（运行时实际值，而非 HTML 初始值）
@@ -2448,12 +2742,12 @@ function extractAttribute(selector: string | null, refId: string | null, attribu
         const el        = element as HTMLInputElement
         const propValue = el[attribute as keyof HTMLInputElement]
         if (typeof propValue === 'boolean') {
-            return {value: propValue ? 'true' : 'false'}
+            return { value: propValue ? 'true' : 'false' }
         }
-        return {value: propValue != null ? String(propValue) : null}
+        return { value: propValue != null ? String(propValue) : null }
     }
 
-    return {value: element.getAttribute(attribute)}
+    return { value: element.getAttribute(attribute) }
 }
 
 // 元素查找（支持 CSS 选择器、XPath、文本）
@@ -2534,7 +2828,7 @@ function findElements(
                          refId,
                          tag: element.tagName.toLowerCase(),
                          text: (element.textContent || '').trim().substring(0, 100),
-                         rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
                      })
 
         if (results.length >= 50) {
@@ -2558,7 +2852,7 @@ function findElements(
 function simulateMouseClick(x: number, y: number, button: string): { success: boolean } {
     const element = document.elementFromPoint(x, y)
     if (!element) {
-        return {success: false}
+        return { success: false }
     }
 
     const buttonCode   = button === 'right' ? 2 : button === 'middle' ? 1 : 0
@@ -2575,7 +2869,7 @@ function simulateMouseClick(x: number, y: number, button: string): { success: bo
     }
 
     element.dispatchEvent(new MouseEvent('mouseover', eventOptions))
-    element.dispatchEvent(new MouseEvent('mouseenter', {...eventOptions, bubbles: false}))
+    element.dispatchEvent(new MouseEvent('mouseenter', { ...eventOptions, bubbles: false }))
     element.dispatchEvent(new MouseEvent('mousemove', eventOptions))
     element.dispatchEvent(new MouseEvent('mousedown', eventOptions))
 
@@ -2587,7 +2881,7 @@ function simulateMouseClick(x: number, y: number, button: string): { success: bo
     element.dispatchEvent(new MouseEvent('mouseup', eventOptions))
     element.dispatchEvent(new MouseEvent('click', eventOptions))
 
-    return {success: true}
+    return { success: true }
 }
 
 // 模拟键盘输入
@@ -2595,7 +2889,7 @@ function simulateKeyboardType(text: string, _delay: number): { success: boolean;
     const activeElement = document.activeElement as HTMLElement | null
 
     if (!activeElement) {
-        return {success: false, error: 'No active element'}
+        return { success: false, error: 'No active element' }
     }
 
     // 检查是否是可输入元素
@@ -2604,7 +2898,7 @@ function simulateKeyboardType(text: string, _delay: number): { success: boolean;
                         activeElement.isContentEditable
 
     if (!isInputable) {
-        return {success: false, error: `Active element is not inputable: ${activeElement.tagName}`}
+        return { success: false, error: `Active element is not inputable: ${activeElement.tagName}` }
     }
 
     for (const char of text) {
@@ -2641,9 +2935,9 @@ function simulateKeyboardType(text: string, _delay: number): { success: boolean;
         activeElement.dispatchEvent(new KeyboardEvent('keyup', keyEventOptions))
     }
 
-    activeElement.dispatchEvent(new Event('change', {bubbles: true}))
+    activeElement.dispatchEvent(new Event('change', { bubbles: true }))
 
-    return {success: true}
+    return { success: true }
 }
 
 // 模拟单个按键事件
@@ -2672,7 +2966,7 @@ function simulateKeyEvent(key: string, type: string, modifiers: string[]): { suc
         activeElement.dispatchEvent(new KeyboardEvent('keyup', keyEventOptions))
     }
 
-    return {success: true}
+    return { success: true }
 }
 
 // 模拟鼠标事件
@@ -2704,7 +2998,7 @@ function simulateMouseEvent(type: string, x: number, y: number, button: string):
         element.dispatchEvent(new MouseEvent('click', eventOptions))
     }
 
-    return {success: true}
+    return { success: true }
 }
 
 // 注入反检测脚本
@@ -2719,9 +3013,9 @@ function injectStealthScripts(): void {
     Object.defineProperty(navigator, 'plugins', {
         get: () => {
             const plugins     = [
-                {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
-                {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
-                {name: 'Native Client', filename: 'internal-nacl-plugin'},
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin' },
             ]
             // 反检测需要使用已废弃的 PluginArray/Plugin API，通过 globalThis 间接访问避免 TS6385
             const pluginArray = Object.create((globalThis as unknown as Record<string, {
@@ -2732,14 +3026,14 @@ function injectStealthScripts(): void {
                     prototype: object
                 }>).Plugin.prototype)
                 Object.defineProperties(plugin, {
-                    name: {value: p.name},
-                    filename: {value: p.filename},
-                    description: {value: ''},
-                    length: {value: 0},
+                    name: { value: p.name },
+                    filename: { value: p.filename },
+                    description: { value: '' },
+                    length: { value: 0 },
                 })
                 pluginArray[i] = plugin
             })
-            Object.defineProperty(pluginArray, 'length', {value: plugins.length})
+            Object.defineProperty(pluginArray, 'length', { value: plugins.length })
             return pluginArray
         },
         configurable: true,
@@ -2756,7 +3050,7 @@ function injectStealthScripts(): void {
     if (originalChrome) {
         Object.defineProperty(window, 'chrome', {
             get: () => {
-                const chrome = {...originalChrome as object}
+                const chrome = { ...originalChrome as object }
                 delete (chrome as { runtime?: unknown }).runtime
                 return chrome
             },
@@ -2784,7 +3078,7 @@ function injectStealthScripts(): void {
         const originalQuery         = navigator.permissions.query.bind(navigator.permissions)
         navigator.permissions.query = async (descriptor: PermissionDescriptor) => {
             if (descriptor.name === 'notifications') {
-                return {state: 'prompt', onchange: null} as PermissionStatus
+                return { state: 'prompt', onchange: null } as PermissionStatus
             }
             return originalQuery(descriptor)
         }
@@ -2792,7 +3086,7 @@ function injectStealthScripts(): void {
 
     // 覆盖 WebGL 渲染器信息
     const originalGetParameter                   = WebGLRenderingContext.prototype.getParameter
-    WebGLRenderingContext.prototype.getParameter = function (parameter: number) {
+    WebGLRenderingContext.prototype.getParameter = function(parameter: number) {
         if (parameter === 37445) {  // UNMASKED_VENDOR_WEBGL
             return 'Google Inc. (NVIDIA)'
         }

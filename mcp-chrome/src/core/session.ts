@@ -65,7 +65,8 @@ class SessionManager {
         url: string;
         method: string;
         type: string;
-        timestamp: number
+        timestamp: number;
+        _monotonic: number
     }>()
 
     // 监听器安装标志（防止重复安装）
@@ -184,7 +185,7 @@ class SessionManager {
      */
     async connect(options: ConnectOptions): Promise<TargetInfo> {
         return this.withLock(async () => {
-            const {host = '127.0.0.1', port, timeout = DEFAULT_TIMEOUT, stealth = 'safe'} = options
+            const { host = '127.0.0.1', port, timeout = DEFAULT_TIMEOUT, stealth = 'safe' } = options
 
             // 关闭现有会话
             this.resetState()
@@ -227,7 +228,7 @@ class SessionManager {
         this.ensureConnected()
 
         // 从 CDP 获取 targets
-        const {targetInfos} = (await this.cdp!.send('Target.getTargets')) as {
+        const { targetInfos } = (await this.cdp!.send('Target.getTargets')) as {
             targetInfos: Array<{
                 targetId: string;
                 type: string;
@@ -263,10 +264,10 @@ class SessionManager {
         return this.withLock(async () => {
             this.ensureSession()
 
-            const {wait = 'load', timeout = DEFAULT_TIMEOUT} = options
+            const { wait = 'load', timeout = DEFAULT_TIMEOUT } = options
 
             // 导航（传 timeout 防止 CDP 默认 30s 截断用户预算）
-            const {errorText} = (await this.send('Page.navigate', {url}, timeout)) as {
+            const { errorText } = (await this.send('Page.navigate', { url }, timeout)) as {
                 errorText?: string;
             }
 
@@ -325,13 +326,13 @@ class SessionManager {
             }
 
             const onRequestStart = (params: unknown) => {
-                const {requestId} = params as { requestId: string }
+                const { requestId } = params as { requestId: string }
                 localPendingRequests.add(requestId)
                 checkIdle()
             }
 
             const onRequestEnd = (params: unknown) => {
-                const {requestId} = params as { requestId: string }
+                const { requestId } = params as { requestId: string }
                 localPendingRequests.delete(requestId)
                 checkIdle()
             }
@@ -388,13 +389,13 @@ class SessionManager {
     async goBack(timeout = DEFAULT_TIMEOUT): Promise<{ navigated: boolean }> {
         return this.withLock(async () => {
             this.ensureSession()
-            const {currentIndex, entries} = await this.send<{
+            const { currentIndex, entries } = await this.send<{
                 currentIndex: number
                 entries: Array<{ id: number; url: string; title: string }>
             }>('Page.getNavigationHistory', undefined, timeout)
 
             if (currentIndex <= 0) {
-                return {navigated: false}
+                return { navigated: false }
             }
 
             // 跨文档导航触发 loadEventFired，同文档导航（hash/pushState）触发 navigatedWithinDocument
@@ -406,10 +407,10 @@ class SessionManager {
             // 其 timer reject 不会成为 unhandled rejection（Node 20 默认会退出进程）
             waitPromise.catch(() => {
             })
-            await this.send('Page.navigateToHistoryEntry', {entryId: entries[currentIndex - 1].id}, timeout)
+            await this.send('Page.navigateToHistoryEntry', { entryId: entries[currentIndex - 1].id }, timeout)
             await waitPromise
             await this.updateState()
-            return {navigated: true}
+            return { navigated: true }
         })
     }
 
@@ -419,13 +420,13 @@ class SessionManager {
     async goForward(timeout = DEFAULT_TIMEOUT): Promise<{ navigated: boolean }> {
         return this.withLock(async () => {
             this.ensureSession()
-            const {currentIndex, entries} = await this.send<{
+            const { currentIndex, entries } = await this.send<{
                 currentIndex: number
                 entries: Array<{ id: number; url: string; title: string }>
             }>('Page.getNavigationHistory', undefined, timeout)
 
             if (currentIndex >= entries.length - 1) {
-                return {navigated: false}
+                return { navigated: false }
             }
 
             // 跨文档导航触发 loadEventFired，同文档导航（hash/pushState）触发 navigatedWithinDocument
@@ -435,10 +436,10 @@ class SessionManager {
             )
             waitPromise.catch(() => {
             })
-            await this.send('Page.navigateToHistoryEntry', {entryId: entries[currentIndex + 1].id}, timeout)
+            await this.send('Page.navigateToHistoryEntry', { entryId: entries[currentIndex + 1].id }, timeout)
             await waitPromise
             await this.updateState()
-            return {navigated: true}
+            return { navigated: true }
         })
     }
 
@@ -449,7 +450,7 @@ class SessionManager {
         return this.withLock(async () => {
             this.ensureSession()
 
-            const {ignoreCache = false, timeout = DEFAULT_TIMEOUT} = options
+            const { ignoreCache = false, timeout = DEFAULT_TIMEOUT } = options
 
             const waitPromise = this.cdp!.waitForEvent(
                 'Page.loadEventFired',
@@ -459,7 +460,7 @@ class SessionManager {
             waitPromise.catch(() => {
             })
 
-            await this.send('Page.reload', {ignoreCache}, timeout)
+            await this.send('Page.reload', { ignoreCache }, timeout)
 
             await waitPromise
             await this.updateState()
@@ -504,7 +505,7 @@ class SessionManager {
             y,
             modifiers: this.modifiers,
         })
-        this.behaviorSimulator.setCurrentPosition({x, y})
+        this.behaviorSimulator.setCurrentPosition({ x, y })
     }
 
     /**
@@ -618,7 +619,7 @@ class SessionManager {
         this.ensureSession()
         await this.send('Input.dispatchTouchEvent', {
             type: 'touchStart',
-            touchPoints: [{x, y}],
+            touchPoints: [{ x, y }],
         })
     }
 
@@ -629,7 +630,7 @@ class SessionManager {
         this.ensureSession()
         await this.send('Input.dispatchTouchEvent', {
             type: 'touchMove',
-            touchPoints: [{x, y}],
+            touchPoints: [{ x, y }],
         })
     }
 
@@ -656,24 +657,24 @@ class SessionManager {
     ): Promise<string> {
         this.ensureSession()
 
-        const effectiveFormat = format ?? 'png'
-        const captureParams: Record<string, unknown> = {format: effectiveFormat}
+        const effectiveFormat                        = format ?? 'png'
+        const captureParams: Record<string, unknown> = { format: effectiveFormat }
         if (quality !== undefined && effectiveFormat !== 'png') {
             captureParams.quality = quality
         }
         if (clip) {
-            captureParams.clip = {...clip, scale: scale ?? 1}
+            captureParams.clip = { ...clip, scale: scale ?? 1 }
         }
 
         if (fullPage) {
             // 获取页面完整高度
-            const {result} = (await this.send('Runtime.evaluate', {
+            const { result } = (await this.send('Runtime.evaluate', {
                 expression:
                     'JSON.stringify({ width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight })',
                 returnByValue: true,
             })) as { result: { value: string } }
 
-            const {width, height} = JSON.parse(result.value)
+            const { width, height } = JSON.parse(result.value)
 
             // 设置视口
             await this.send('Emulation.setDeviceMetricsOverride', {
@@ -684,14 +685,14 @@ class SessionManager {
             })
 
             try {
-                const {data} = (await this.send('Page.captureScreenshot', captureParams)) as { data: string }
+                const { data } = (await this.send('Page.captureScreenshot', captureParams)) as { data: string }
                 return data
             } finally {
                 await this.send('Emulation.clearDeviceMetricsOverride')
             }
         }
 
-        const {data} = (await this.send('Page.captureScreenshot', captureParams)) as { data: string }
+        const { data } = (await this.send('Page.captureScreenshot', captureParams)) as { data: string }
         return data
     }
 
@@ -702,7 +703,7 @@ class SessionManager {
         this.ensureSession()
 
         // 获取基本信息
-        const {result} = (await this.send('Runtime.evaluate', {
+        const { result } = (await this.send('Runtime.evaluate', {
             expression: `JSON.stringify({
         url: location.href,
         title: document.title,
@@ -718,7 +719,7 @@ class SessionManager {
 
         // 获取可交互元素
         await this.send('Accessibility.enable')
-        const {nodes} = (await this.send('Accessibility.getFullAXTree')) as {
+        const { nodes } = (await this.send('Accessibility.getFullAXTree')) as {
             nodes: Array<{
                 role: { value: string };
                 name?: { value: string };
@@ -768,8 +769,8 @@ class SessionManager {
      */
     async getCookies(urls?: string[]): Promise<Cookie[]> {
         this.ensureSession()
-        const params    = urls?.length ? {urls} : {}
-        const {cookies} = (await this.send('Network.getCookies', params)) as {
+        const params      = urls?.length ? { urls } : {}
+        const { cookies } = (await this.send('Network.getCookies', params)) as {
             cookies: Cookie[];
         }
         return cookies
@@ -802,7 +803,7 @@ class SessionManager {
     async deleteCookie(name: string, url?: string): Promise<void> {
         this.ensureSession()
         const effectiveUrl = url ?? this.state?.url ?? 'http://localhost'
-        await this.send('Network.deleteCookies', {name, url: effectiveUrl})
+        await this.send('Network.deleteCookies', { name, url: effectiveUrl })
     }
 
     /**
@@ -819,7 +820,12 @@ class SessionManager {
     getConsoleLogs(level?: string, limit = 100): ConsoleLogEntry[] {
         let logs = this.consoleLogs
         if (level && level !== 'all') {
-            logs = logs.filter((l) => l.level === level)
+            // warning/warn 统一匹配（CDP 用 warning，其他源可能用 warn）
+            logs = logs.filter((l) =>
+                                   l.level === level
+                                   || (level === 'warning' && l.level === 'warn')
+                                   || (level === 'warn' && l.level === 'warning'),
+            )
         }
         return logs.slice(-limit)
     }
@@ -830,8 +836,17 @@ class SessionManager {
     getNetworkRequests(urlPattern?: string, limit = 100): NetworkRequestEntry[] {
         let requests = this.networkRequests
         if (urlPattern) {
-            const regex = new RegExp(urlPattern.replace(/\*/g, '.*'))
-            requests    = requests.filter((r) => regex.test(r.url))
+            try {
+                // 转义正则元字符，仅保留 * 和 ? 的通配语义
+                const escaped = urlPattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+                const pattern = escaped.replace(/\*/g, '.*').replace(/\?/g, '.')
+                const regex   = new RegExp(pattern, 'i')
+                requests      = requests.filter((r) => regex.test(r.url))
+            } catch {
+                // 构造失败时退化为字符串包含匹配
+                const pat = urlPattern.toLowerCase()
+                requests  = requests.filter((r) => r.url.toLowerCase().includes(pat))
+            }
         }
         return requests.slice(-limit)
     }
@@ -857,7 +872,7 @@ class SessionManager {
 
         // 有参数时使用 callFunctionOn：避免大 payload 字符串拼接，参数通过协议结构化传递
         if (args && args.length > 0) {
-            const {result: globalResult} = (await this.send('Runtime.evaluate', {
+            const { result: globalResult } = (await this.send('Runtime.evaluate', {
                 expression: 'globalThis',
                 returnByValue: false,
             })) as { result: { objectId: string } }
@@ -866,14 +881,14 @@ class SessionManager {
                 const callParams: Record<string, unknown> = {
                     functionDeclaration: script,
                     objectId: globalResult.objectId,
-                    arguments: args.map(a => ({value: a})),
+                    arguments: args.map(a => ({ value: a })),
                     returnByValue: true,
                     awaitPromise: true,
                 }
                 if (timeout !== undefined) {
                     callParams.timeout = timeout
                 }
-                const {result, exceptionDetails} = (await this.send(
+                const { result, exceptionDetails } = (await this.send(
                     'Runtime.callFunctionOn',
                     callParams,
                     sendTimeout,
@@ -886,7 +901,7 @@ class SessionManager {
                 }
                 return extractCdpValue<T>(result)
             } finally {
-                this.send('Runtime.releaseObject', {objectId: globalResult.objectId}).catch(() => {
+                this.send('Runtime.releaseObject', { objectId: globalResult.objectId }).catch(() => {
                 })
             }
         }
@@ -899,7 +914,7 @@ class SessionManager {
         if (timeout !== undefined) {
             evalParams.timeout = timeout
         }
-        const {result, exceptionDetails} = (await this.send('Runtime.evaluate', evalParams, sendTimeout)) as {
+        const { result, exceptionDetails } = (await this.send('Runtime.evaluate', evalParams, sendTimeout)) as {
             result: CdpResultObject<T>
             exceptionDetails?: { text: string; exception?: { description?: string } }
         }
@@ -929,7 +944,7 @@ class SessionManager {
      */
     async setUserAgent(userAgent: string): Promise<void> {
         this.ensureSession()
-        await this.send('Emulation.setUserAgentOverride', {userAgent})
+        await this.send('Emulation.setUserAgentOverride', { userAgent })
     }
 
     /**
@@ -967,7 +982,7 @@ class SessionManager {
     async activateTarget(targetId: string): Promise<void> {
         this.ensureConnected()
         // Target 域命令是 browser-level，不携带 sessionId
-        await this.cdp!.send('Target.activateTarget', {targetId})
+        await this.cdp!.send('Target.activateTarget', { targetId })
     }
 
     /**
@@ -982,7 +997,7 @@ class SessionManager {
                 throw new TargetNotFoundError('unknown')
             }
 
-            await this.cdp!.send('Target.closeTarget', {targetId: id})
+            await this.cdp!.send('Target.closeTarget', { targetId: id })
 
             // 如果关闭的是当前页面，清除会话状态
             if (id === this.currentTargetId) {
@@ -1071,7 +1086,7 @@ class SessionManager {
         }
 
         // 附加到目标
-        const {sessionId} = (await this.cdp!.send('Target.attachToTarget', {
+        const { sessionId } = (await this.cdp!.send('Target.attachToTarget', {
             targetId,
             flatten: true,
         })) as { sessionId: string }
@@ -1089,7 +1104,7 @@ class SessionManager {
     private async newPageInternal(): Promise<TargetInfo> {
         this.ensureConnected()
 
-        const {targetId} = (await this.cdp!.send('Target.createTarget', {
+        const { targetId } = (await this.cdp!.send('Target.createTarget', {
             url: 'about:blank',
         })) as { targetId: string }
 
@@ -1122,7 +1137,7 @@ class SessionManager {
 
         this.clearLogs()
         this.modifiers = 0
-        this.behaviorSimulator.setCurrentPosition({x: 0, y: 0})
+        this.behaviorSimulator.setCurrentPosition({ x: 0, y: 0 })
         this.sessionId          = null
         this.currentTargetId    = null
         this.state              = null
@@ -1166,7 +1181,7 @@ class SessionManager {
 
             const cleanup = () => {
                 clearTimeout(timer)
-                for (const {event, listener} of listeners) {
+                for (const { event, listener } of listeners) {
                     cdp.offEvent(event, listener)
                 }
                 cdp.removeListener('disconnected', onDisconnected)
@@ -1188,7 +1203,7 @@ class SessionManager {
                     cleanup()
                     resolve()
                 }
-                listeners.push({event, listener})
+                listeners.push({ event, listener })
                 cdp.onEvent(event, listener)
             }
         })
@@ -1246,7 +1261,7 @@ class SessionManager {
             this.consoleLogs.push({
                                       level: p.type,
                                       text: p.args.map((a) => a.value ?? a.description ?? '').join(' '),
-                                      timestamp: p.timestamp,
+                                      timestamp: Math.round(p.timestamp),  // Runtime.Timestamp 已是 epoch 毫秒
                                       url: p.stackTrace?.callFrames[0]?.url,
                                       lineNumber: p.stackTrace?.callFrames[0]?.lineNumber,
                                   })
@@ -1263,12 +1278,14 @@ class SessionManager {
                 request: { url: string; method: string };
                 type: string;
                 timestamp: number;
+                wallTime: number;
             }
             this.requestMap.set(p.requestId, {
                 url: p.request.url,
                 method: p.request.method,
                 type: p.type,
-                timestamp: p.timestamp,
+                timestamp: Math.round(p.wallTime * 1000),  // wallTime 是 epoch 秒 → epoch 毫秒
+                _monotonic: p.timestamp,  // MonotonicTime 用于 duration 计算
             })
         })
 
@@ -1280,10 +1297,11 @@ class SessionManager {
             }
             const request = this.requestMap.get(p.requestId)
             if (request) {
+                const { _monotonic, ...requestData } = request
                 this.networkRequests.push({
-                                              ...request,
+                                              ...requestData,
                                               status: p.response.status,
-                                              duration: (p.timestamp - request.timestamp) * 1000,
+                                              duration: Math.round((p.timestamp - _monotonic) * 1000),
                                           })
                 // 环形缓冲区：超出上限时移除最旧的条目
                 if (this.networkRequests.length > SessionManager.MAX_LOG_ENTRIES) {
@@ -1309,8 +1327,8 @@ class SessionManager {
             returnByValue: true,
         })) as { result: { value: string } }
 
-        const {url, title} = JSON.parse(result.result.value)
-        this.state         = {
+        const { url, title } = JSON.parse(result.result.value)
+        this.state           = {
             url,
             title,
             targetId: this.currentTargetId!,
@@ -1351,27 +1369,27 @@ function getKeyDefinition(key: string): {
         { key: string; code: string; keyCode: number; text?: string }
     > = {
         // 修饰键
-        Control: {key: 'Control', code: 'ControlLeft', keyCode: 17},
-        Shift: {key: 'Shift', code: 'ShiftLeft', keyCode: 16},
-        Alt: {key: 'Alt', code: 'AltLeft', keyCode: 18},
-        Meta: {key: 'Meta', code: 'MetaLeft', keyCode: 91},
+        Control: { key: 'Control', code: 'ControlLeft', keyCode: 17 },
+        Shift: { key: 'Shift', code: 'ShiftLeft', keyCode: 16 },
+        Alt: { key: 'Alt', code: 'AltLeft', keyCode: 18 },
+        Meta: { key: 'Meta', code: 'MetaLeft', keyCode: 91 },
         // 功能键
-        Enter: {key: 'Enter', code: 'Enter', keyCode: 13, text: '\r'},
-        Tab: {key: 'Tab', code: 'Tab', keyCode: 9},
-        Backspace: {key: 'Backspace', code: 'Backspace', keyCode: 8},
-        Delete: {key: 'Delete', code: 'Delete', keyCode: 46},
-        Escape: {key: 'Escape', code: 'Escape', keyCode: 27},
-        Space: {key: ' ', code: 'Space', keyCode: 32, text: ' '},
+        Enter: { key: 'Enter', code: 'Enter', keyCode: 13, text: '\r' },
+        Tab: { key: 'Tab', code: 'Tab', keyCode: 9 },
+        Backspace: { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+        Delete: { key: 'Delete', code: 'Delete', keyCode: 46 },
+        Escape: { key: 'Escape', code: 'Escape', keyCode: 27 },
+        Space: { key: ' ', code: 'Space', keyCode: 32, text: ' ' },
         // 方向键
-        ArrowUp: {key: 'ArrowUp', code: 'ArrowUp', keyCode: 38},
-        ArrowDown: {key: 'ArrowDown', code: 'ArrowDown', keyCode: 40},
-        ArrowLeft: {key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37},
-        ArrowRight: {key: 'ArrowRight', code: 'ArrowRight', keyCode: 39},
+        ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+        ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+        ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+        ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
         // 其他常用键
-        Home: {key: 'Home', code: 'Home', keyCode: 36},
-        End: {key: 'End', code: 'End', keyCode: 35},
-        PageUp: {key: 'PageUp', code: 'PageUp', keyCode: 33},
-        PageDown: {key: 'PageDown', code: 'PageDown', keyCode: 34},
+        Home: { key: 'Home', code: 'Home', keyCode: 36 },
+        End: { key: 'End', code: 'End', keyCode: 35 },
+        PageUp: { key: 'PageUp', code: 'PageUp', keyCode: 33 },
+        PageDown: { key: 'PageDown', code: 'PageDown', keyCode: 34 },
     }
 
     // 如果是已知按键，返回定义
@@ -1400,7 +1418,7 @@ function getKeyDefinition(key: string): {
     }
 
     // 未知按键
-    return {key, code: key, keyCode: 0}
+    return { key, code: key, keyCode: 0 }
 }
 
 /**

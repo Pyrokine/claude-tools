@@ -261,7 +261,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                           navigated: result.navigated,
                                           url: state?.url,
                                           title: state?.title,
-                                          ...(result.navigated ? {} : {note: '无后退历史'}),
+                                          ...(result.navigated ? {} : { note: '无后退历史' }),
                                       })
             }
 
@@ -275,7 +275,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                           navigated: result.navigated,
                                           url: state?.url,
                                           title: state?.title,
-                                          ...(result.navigated ? {} : {note: '无前进历史'}),
+                                          ...(result.navigated ? {} : { note: '无前进历史' }),
                                       })
             }
 

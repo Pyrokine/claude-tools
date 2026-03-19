@@ -10,8 +10,8 @@ export {}
 // 初始化元素映射
 declare global {
     interface Window {
-        __mcpElementMap?: Record<string, WeakRef<Element>>
-        __mcpRefCounter?: number
+        __mcpElementMap?: Record<string, WeakRef<Element>>;
+        __mcpRefCounter?: number;
     }
 }
 

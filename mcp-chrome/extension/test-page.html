@@ -166,98 +166,98 @@
 
 <script>
     // 输入监听
-    document.getElementById('text-input').addEventListener('input', function (e) {
-        document.getElementById('input-result').textContent = '输入内容: ' + e.target.value;
-        console.log('[MCP-TEST] Input changed:', e.target.value);
-    });
+    document.getElementById('text-input').addEventListener('input', function(e) {
+        document.getElementById('input-result').textContent = '输入内容: ' + e.target.value
+        console.log('[MCP-TEST] Input changed:', e.target.value)
+    })
 
     // 键盘事件
-    const keyDisplay = document.getElementById('key-display');
+    const keyDisplay = document.getElementById('key-display')
     const keyLog = document.getElementById('key-log');
 
     ['keydown', 'keyup', 'keypress'].forEach(eventType => {
-        keyDisplay.addEventListener(eventType, function (e) {
-            const info = `${eventType}: key="${e.key}" code="${e.code}" ctrl=${e.ctrlKey} shift=${e.shiftKey} alt=${e.altKey} meta=${e.metaKey}`;
-            keyDisplay.textContent = e.key || e.code;
-            keyLog.innerHTML = info + '<br>' + keyLog.innerHTML;
-            console.log('[MCP-TEST]', info);
+        keyDisplay.addEventListener(eventType, function(e) {
+            const info = `${eventType}: key="${e.key}" code="${e.code}" ctrl=${e.ctrlKey} shift=${e.shiftKey} alt=${e.altKey} meta=${e.metaKey}`
+            keyDisplay.textContent = e.key || e.code
+            keyLog.innerHTML = info + '<br>' + keyLog.innerHTML
+            console.log('[MCP-TEST]', info)
             if (eventType === 'keydown') {
-                e.preventDefault();
+                e.preventDefault()
             }
-        });
-    });
+        })
+    })
 
     // 鼠标事件
-    const mouseLog = document.getElementById('mouse-log');
+    const mouseLog = document.getElementById('mouse-log')
 
-    document.getElementById('click-test').addEventListener('click', function (e) {
-        const info = `click: button=${e.button} x=${e.clientX} y=${e.clientY}`;
-        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML;
-        console.log('[MCP-TEST]', info);
-    });
+    document.getElementById('click-test').addEventListener('click', function(e) {
+        const info = `click: button=${e.button} x=${e.clientX} y=${e.clientY}`
+        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML
+        console.log('[MCP-TEST]', info)
+    })
 
-    document.getElementById('dblclick-test').addEventListener('dblclick', function (e) {
-        const info = `dblclick: x=${e.clientX} y=${e.clientY}`;
-        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML;
-        console.log('[MCP-TEST]', info);
-    });
+    document.getElementById('dblclick-test').addEventListener('dblclick', function(e) {
+        const info = `dblclick: x=${e.clientX} y=${e.clientY}`
+        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML
+        console.log('[MCP-TEST]', info)
+    })
 
-    document.getElementById('contextmenu-test').addEventListener('contextmenu', function (e) {
-        e.preventDefault();
-        const info = `contextmenu (right-click): x=${e.clientX} y=${e.clientY}`;
-        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML;
-        console.log('[MCP-TEST]', info);
-    });
+    document.getElementById('contextmenu-test').addEventListener('contextmenu', function(e) {
+        e.preventDefault()
+        const info = `contextmenu (right-click): x=${e.clientX} y=${e.clientY}`
+        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML
+        console.log('[MCP-TEST]', info)
+    })
 
     // 拖拽事件
-    const dragSource = document.getElementById('drag-source');
-    const dropTarget = document.getElementById('drop-target');
-    const dragLog = document.getElementById('drag-log');
+    const dragSource = document.getElementById('drag-source')
+    const dropTarget = document.getElementById('drop-target')
+    const dragLog = document.getElementById('drag-log')
 
-    dragSource.addEventListener('dragstart', function (e) {
-        dragLog.innerHTML = 'dragstart<br>' + dragLog.innerHTML;
-        console.log('[MCP-TEST] dragstart');
-        e.dataTransfer.setData('text/plain', 'dragged');
-    });
+    dragSource.addEventListener('dragstart', function(e) {
+        dragLog.innerHTML = 'dragstart<br>' + dragLog.innerHTML
+        console.log('[MCP-TEST] dragstart')
+        e.dataTransfer.setData('text/plain', 'dragged')
+    })
 
-    dropTarget.addEventListener('dragover', function (e) {
-        e.preventDefault();
-        dropTarget.style.background = '#c8e6c9';
-    });
+    dropTarget.addEventListener('dragover', function(e) {
+        e.preventDefault()
+        dropTarget.style.background = '#c8e6c9'
+    })
 
-    dropTarget.addEventListener('dragleave', function () {
-        dropTarget.style.background = '#f0f0f0';
-    });
+    dropTarget.addEventListener('dragleave', function() {
+        dropTarget.style.background = '#f0f0f0'
+    })
 
-    dropTarget.addEventListener('drop', function (e) {
-        e.preventDefault();
-        dropTarget.style.background = '#4CAF50';
-        dropTarget.textContent = '已放置!';
-        dragLog.innerHTML = 'drop - 成功!<br>' + dragLog.innerHTML;
-        console.log('[MCP-TEST] drop - success');
-    });
+    dropTarget.addEventListener('drop', function(e) {
+        e.preventDefault()
+        dropTarget.style.background = '#4CAF50'
+        dropTarget.textContent = '已放置!'
+        dragLog.innerHTML = 'drop - 成功!<br>' + dragLog.innerHTML
+        console.log('[MCP-TEST] drop - success')
+    })
 
     // 滚动事件
-    const scrollContainer = document.getElementById('scroll-container');
-    const scrollLog = document.getElementById('scroll-log');
+    const scrollContainer = document.getElementById('scroll-container')
+    const scrollLog = document.getElementById('scroll-log')
 
-    scrollContainer.addEventListener('scroll', function () {
-        const info = `scroll: scrollTop=${scrollContainer.scrollTop}`;
-        scrollLog.innerHTML = info;
-        console.log('[MCP-TEST]', info);
-    });
+    scrollContainer.addEventListener('scroll', function() {
+        const info = `scroll: scrollTop=${scrollContainer.scrollTop}`
+        scrollLog.innerHTML = info
+        console.log('[MCP-TEST]', info)
+    })
 
     // 自定义日志
     function logCustom() {
-        const timestamp = new Date().toISOString();
+        const timestamp = new Date().toISOString()
         console.log('[MCP-TEST] Custom log at', timestamp, {
             test: true,
-            nested: {value: 42},
-        });
+            nested: { value: 42 },
+        })
     }
 
     // 页面加载完成
-    console.log('[MCP-TEST] Test page loaded successfully');
+    console.log('[MCP-TEST] Test page loaded successfully')
 </script>
 </body>
 </html>

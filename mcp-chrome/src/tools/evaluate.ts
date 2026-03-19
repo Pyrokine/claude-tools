@@ -62,7 +62,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                                           })
                 }
 
-                const serialized = JSON.stringify({success: true, result: normalizedResult}, null, 2)
+                const serialized = JSON.stringify({ success: true, result: normalizedResult }, null, 2)
                 // 检测结果大小，超过 100KB 自动保存到文件
                 if (serialized.length > 100_000) {
                     const suffix      = typeof result === 'string' ? 'txt' : 'json'
@@ -78,7 +78,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                                           })
                 }
 
-                return formatResponse({success: true, result: normalizedResult})
+                return formatResponse({ success: true, result: normalizedResult })
             })
         }) // withTabId
     } catch (error) {

@@ -46,11 +46,11 @@ export class AutoWait {
     async waitForEnabled(nodeId: number): Promise<void> {
         await withRetry(
             async () => {
-                const {object} = (await this.send('DOM.resolveNode', {nodeId})) as {
+                const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
                     object: { objectId: string };
                 }
 
-                const {result} = (await this.send('Runtime.callFunctionOn', {
+                const { result } = (await this.send('Runtime.callFunctionOn', {
                     objectId: object.objectId,
                     functionDeclaration: `function() {
             if (!(this instanceof HTMLElement)) return true;
@@ -65,7 +65,7 @@ export class AutoWait {
                     throw new Error('元素处于禁用状态')
                 }
             },
-            {timeout: this.remaining()},
+            { timeout: this.remaining() },
         )
     }
 
@@ -78,11 +78,11 @@ export class AutoWait {
     async waitForStableBoundingBox(nodeId: number): Promise<void> {
         await withRetry(
             async () => {
-                const {object} = (await this.send('DOM.resolveNode', {nodeId})) as {
+                const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
                     object: { objectId: string };
                 }
 
-                const {result} = (await this.send('Runtime.callFunctionOn', {
+                const { result } = (await this.send('Runtime.callFunctionOn', {
                     objectId: object.objectId,
                     functionDeclaration: `function() {
             return new Promise((resolve) => {
@@ -106,7 +106,7 @@ export class AutoWait {
                     throw new Error('元素位置不稳定')
                 }
             },
-            {timeout: this.remaining()},
+            { timeout: this.remaining() },
         )
     }
 
@@ -117,12 +117,12 @@ export class AutoWait {
      * 如果元素不在视口内，自动滚动到视口中
      */
     async ensureInViewport(nodeId: number): Promise<void> {
-        const {object} = (await this.send('DOM.resolveNode', {nodeId})) as {
+        const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
             object: { objectId: string };
         }
 
         // 检查是否在视口内
-        const {result: isInViewport} = (await this.send('Runtime.callFunctionOn', {
+        const { result: isInViewport } = (await this.send('Runtime.callFunctionOn', {
             objectId: object.objectId,
             functionDeclaration: `function() {
         const rect = this.getBoundingClientRect();
@@ -155,11 +155,11 @@ export class AutoWait {
     async waitForVisible(nodeId: number): Promise<void> {
         await withRetry(
             async () => {
-                const {object} = (await this.send('DOM.resolveNode', {nodeId})) as {
+                const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
                     object: { objectId: string };
                 }
 
-                const {result} = (await this.send('Runtime.callFunctionOn', {
+                const { result } = (await this.send('Runtime.callFunctionOn', {
                     objectId: object.objectId,
                     functionDeclaration: `function() {
             const style = window.getComputedStyle(this);
@@ -175,7 +175,7 @@ export class AutoWait {
                     throw new Error('元素不可见')
                 }
             },
-            {timeout: this.remaining()},
+            { timeout: this.remaining() },
         )
     }
 

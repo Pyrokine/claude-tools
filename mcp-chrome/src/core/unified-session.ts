@@ -15,21 +15,21 @@ export type ConnectionMode = 'extension' | 'cdp' | 'none'
 export type InputMode = 'stealth' | 'precise'  // stealth=JS模拟, precise=debugger API
 
 interface UnifiedSessionState {
-    url: string
-    title: string
+    url: string;
+    title: string;
 }
 
 class UnifiedSessionManager {
     private static instance: UnifiedSessionManager
-    private static readonly CONNECTION_COOLDOWN            = 30000 // 连接失败后 30 秒内不重试
-    private extensionBridge: ExtensionBridge | null        = null
-    private inputMode: InputMode                           = 'precise'  // 默认使用 precise 模式，可绕过 CSP 限制
-    private currentMousePosition: { x: number; y: number } = {x: 0, y: 0}  // 跟踪鼠标位置
+    private static readonly CONNECTION_COOLDOWN                 = 30000 // 连接失败后 30 秒内不重试
+    private extensionBridge: ExtensionBridge | null             = null
+    private inputMode: InputMode                                = 'precise'  // 默认使用 precise 模式，可绕过 CSP 限制
+    private currentMousePosition: { x: number; y: number }      = { x: 0, y: 0 }  // 跟踪鼠标位置
     /** 当前按下的修饰键位掩码 */
-    private modifiers                                      = 0
-    private lastConnectionFailure                          = 0
-    private tabSwitchLock: Promise<void>                   = Promise.resolve()  // 串行化 tab 切换，防止并发竞态
-    private requireExtension                               = false  // 指定 tabId 或 frame 时为 true，禁止 CDP 回退
+    private modifiers                                           = 0
+    private lastConnectionFailure                               = 0
+    private tabSwitchLock: Promise<void>                        = Promise.resolve()  // 串行化 tab 切换，防止并发竞态
+    private requireExtension                                    = false  // 指定 tabId 或 frame 时为 true，禁止 CDP 回退
     private currentFrameOffset: { x: number; y: number } | null = null  // iframe 在主页面的偏移量（withFrame 期间有效）
 
     private constructor() {
@@ -92,7 +92,7 @@ class UnifiedSessionManager {
      * 获取当前鼠标位置
      */
     getMousePosition(): { x: number; y: number } {
-        return {...this.currentMousePosition}
+        return { ...this.currentMousePosition }
     }
 
     /**
@@ -226,7 +226,7 @@ class UnifiedSessionManager {
         if (await this.ensureExtensionConnected(timeout)) {
             return this.withTabLock(async () => {
                 const result = await this.extensionBridge!.goBack(timeout)
-                return {navigated: result.navigated}
+                return { navigated: result.navigated }
             })
         }
         return getCdpSession().goBack(timeout)
@@ -239,7 +239,7 @@ class UnifiedSessionManager {
         if (await this.ensureExtensionConnected(timeout)) {
             return this.withTabLock(async () => {
                 const result = await this.extensionBridge!.goForward(timeout)
-                return {navigated: result.navigated}
+                return { navigated: result.navigated }
             })
         }
         return getCdpSession().goForward(timeout)
@@ -305,7 +305,13 @@ class UnifiedSessionManager {
             return result.data
         }
 
-        return getCdpSession().screenshot(options?.fullPage, options?.scale, options?.format, options?.quality, options?.clip)
+        return getCdpSession().screenshot(
+            options?.fullPage,
+            options?.scale,
+            options?.format,
+            options?.quality,
+            options?.clip,
+        )
     }
 
     /**
@@ -361,8 +367,15 @@ class UnifiedSessionManager {
      * @param mode 执行模式（stealth/precise）
      * @param timeout 端到端预算（毫秒），同时作为脚本执行超时和 sendCommand 的端到端预算
      * @param args 传递给函数的参数
+     * @param _retried 内部重试标记，外部不应传入
      */
-    async evaluate<T>(code: string, mode?: InputMode, timeout?: number, args?: unknown[], _retried?: boolean): Promise<T> {
+    async evaluate<T>(
+        code: string,
+        mode?: InputMode,
+        timeout?: number,
+        args?: unknown[],
+        _retried?: boolean,
+    ): Promise<T> {
         const effectiveMode = mode ?? this.inputMode
         const hasArgs       = args && args.length > 0
 
@@ -377,73 +390,86 @@ class UnifiedSessionManager {
 
         try {
 
-        if (timeout !== undefined) {
-            // 轮询上下文：快速失败，端到端预算受控
-            if (!this.isExtensionConnected()) {
-                this.assertCdpFallbackAllowed()
-                return getCdpSession().evaluate<T>(cdpScript, args, timeout)
-            }
-        } else {
-            // 非轮询上下文：允许等待重连；连接失败时回退 CDP
-            if (!(await this.ensureExtensionConnected())) {
-                return getCdpSession().evaluate<T>(cdpScript, args, timeout)
-            }
-        }
-
-        // Extension 路径
-        const currentFrameId = this.extensionBridge!.getCurrentFrameId()
-        if (effectiveMode === 'precise') {
-            // precise + args + 主 frame：使用 callFunctionOn 避免大 payload 字符串拼接
-            if (hasArgs && currentFrameId === 0) {
-                return this.callFunctionOn<T>(code, args, timeout)
-            }
-
-            if (currentFrameId !== 0) {
-                // iframe：args 仍用字符串拼接（evaluateInFrame 使用 expression 字符串）
-                let iframeExpression = expression
-                if (hasArgs) {
-                    const argsStr    = args.map(a => JSON.stringify(a)).join(', ')
-                    iframeExpression = `(${code})(${argsStr})`
+            if (timeout !== undefined) {
+                // 轮询上下文：快速失败，端到端预算受控
+                if (!this.isExtensionConnected()) {
+                    this.assertCdpFallbackAllowed()
+                    return getCdpSession().evaluate<T>(cdpScript, args, timeout)
                 }
-                const result = await this.extensionBridge!.evaluateInFrame(
-                    currentFrameId,
-                    iframeExpression,
+            } else {
+                // 非轮询上下文：允许等待重连；连接失败时回退 CDP
+                if (!(await this.ensureExtensionConnected())) {
+                    return getCdpSession().evaluate<T>(cdpScript, args, timeout)
+                }
+            }
+
+            // Extension 路径
+            const currentFrameId = this.extensionBridge!.getCurrentFrameId()
+            if (effectiveMode === 'precise') {
+                // precise + args + 主 frame：使用 callFunctionOn 避免大 payload 字符串拼接
+                if (hasArgs && currentFrameId === 0) {
+                    return this.callFunctionOn<T>(code, args, timeout)
+                }
+
+                if (currentFrameId !== 0) {
+                    // iframe：args 仍用字符串拼接（evaluateInFrame 使用 expression 字符串）
+                    let iframeExpression = expression
+                    if (hasArgs) {
+                        const argsStr    = args.map(a => JSON.stringify(a)).join(', ')
+                        iframeExpression = `(${code})(${argsStr})`
+                    }
+                    const result = await this.extensionBridge!.evaluateInFrame(
+                        currentFrameId,
+                        iframeExpression,
+                        timeout,
+                    ) as {
+                        result?: CdpResultObject<T>
+                        exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+                    }
+                    return this.checkCdpResult<T>(result)
+                }
+
+                // 主 frame，无 args：直接 Runtime.evaluate
+                const params: Record<string, unknown> = {
+                    expression,
+                    returnByValue: true,
+                    awaitPromise: true,
+                }
+                if (timeout !== undefined) {
+                    params.timeout = timeout
+                }
+                // timeout 即端到端预算，直接作为 RPC 超时（不额外加 margin）
+                const result = await this.extensionBridge!.debuggerSend(
+                    'Runtime.evaluate',
+                    params,
+                    undefined,
                     timeout,
                 ) as {
                     result?: CdpResultObject<T>
                     exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
                 }
-                if (result.exceptionDetails) {
-                    throw new Error(formatCdpException(result.exceptionDetails))
-                }
-                return extractCdpValue<T>(result.result)
-            }
 
-            // 主 frame，无 args：直接 Runtime.evaluate
-            const params: Record<string, unknown> = {
-                expression,
-                returnByValue: true,
-                awaitPromise: true,
+                return this.checkCdpResult<T>(result)
             }
-            if (timeout !== undefined) {
-                params.timeout = timeout
-            }
-            // timeout 即端到端预算，直接作为 RPC 超时（不额外加 margin）
-            const result = await this.extensionBridge!.debuggerSend('Runtime.evaluate', params, undefined, timeout) as {
-                result?: CdpResultObject<T>
-                exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
-            }
-
-            if (result.exceptionDetails) {
-                throw new Error(formatCdpException(result.exceptionDetails))
-            }
-            return extractCdpValue<T>(result.result)
-        }
-        return await this.extensionBridge!.evaluate(expression, timeout, timeout) as T
+            return await this.extensionBridge!.evaluate(expression, timeout, timeout) as T
         } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            // Extension 断连时等待重连后重试一次
+            if (!_retried &&
+                (msg.includes('Extension disconnected') ||
+                 msg.includes('Connection replaced') ||
+                 msg.includes('not connected'))) {
+                await new Promise(r => setTimeout(r, 2000))
+                if (this.isExtensionConnected()) {
+                    return this.evaluate<T>(code, mode, timeout, args, true)
+                }
+                // Extension 重连失败，尝试 CDP fallback
+                if (!this.requireExtension) {
+                    return getCdpSession().evaluate<T>(cdpScript, args, timeout)
+                }
+            }
             // 裸 return 语句导致语法错误时，自动包裹 IIFE 重试（仅一次）
             if (!_retried && !hasArgs) {
-                const msg = err instanceof Error ? err.message : String(err)
                 if (/Illegal return statement|'return' not inside function|Unexpected token 'return'/.test(msg)) {
                     const wrapped = `(() => { ${code} })()`
                     return this.evaluate<T>(wrapped, mode, timeout, undefined, true)
@@ -493,7 +519,16 @@ class UnifiedSessionManager {
      */
     async getHtmlWithImages(selector?: string, outer = true): Promise<{
         html: string
-        images: Array<{ index: number; src: string; dataSrc: string; alt: string; width: number; height: number; naturalWidth: number; naturalHeight: number }>
+        images: Array<{
+            index: number;
+            src: string;
+            dataSrc: string;
+            alt: string;
+            width: number;
+            height: number;
+            naturalWidth: number;
+            naturalHeight: number
+        }>
     }> {
         if (await this.ensureExtensionConnected()) {
             return this.extensionBridge!.getHtmlWithImages(selector, outer)
@@ -503,7 +538,16 @@ class UnifiedSessionManager {
         const selectorArg = JSON.stringify(selector ?? null)
         return getCdpSession().evaluate<{
             html: string
-            images: Array<{ index: number; src: string; dataSrc: string; alt: string; width: number; height: number; naturalWidth: number; naturalHeight: number }>
+            images: Array<{
+                index: number;
+                src: string;
+                dataSrc: string;
+                alt: string;
+                width: number;
+                height: number;
+                naturalWidth: number;
+                naturalHeight: number
+            }>
         }>(`(function() {
             var root = ${selectorArg} ? document.querySelector(${selectorArg}) : document.documentElement;
             if (!root) return {html: '', images: []};
@@ -568,7 +612,10 @@ class UnifiedSessionManager {
      * 只调用一次 Page.enable + Page.getFrameTree，然后逐个获取资源。
      * 并发限制避免 CDP 连接拥塞。
      */
-    async getResourceContentBatch(urls: string[], concurrency = 6): Promise<Map<string, { content: string; base64Encoded: boolean }>> {
+    async getResourceContentBatch(urls: string[], concurrency = 6): Promise<Map<string, {
+        content: string;
+        base64Encoded: boolean
+    }>> {
         const results = new Map<string, { content: string; base64Encoded: boolean }>()
         if (urls.length === 0) {
             return results
@@ -579,15 +626,15 @@ class UnifiedSessionManager {
             const frameTree = await this.sendCdpCommand('Page.getFrameTree') as {
                 frameTree: { frame: { id: string } }
             }
-            const frameId = frameTree.frameTree.frame.id
+            const frameId   = frameTree.frameTree.frame.id
 
             // 并发控制
-            let idx = 0
+            let idx    = 0
             const next = async (): Promise<void> => {
                 while (idx < urls.length) {
                     const url = urls[idx++]
                     try {
-                        const result = await this.sendCdpCommand('Page.getResourceContent', {frameId, url}) as {
+                        const result = await this.sendCdpCommand('Page.getResourceContent', { frameId, url }) as {
                             content: string
                             base64Encoded: boolean
                         }
@@ -597,7 +644,7 @@ class UnifiedSessionManager {
                     }
                 }
             }
-            await Promise.all(Array.from({length: Math.min(concurrency, urls.length)}, () => next()))
+            await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, () => next()))
         } catch {
             // Page.enable 或 getFrameTree 失败，返回空结果
         }
@@ -634,50 +681,12 @@ class UnifiedSessionManager {
 
         // 非轮询上下文：允许等待重连
         if (await this.ensureExtensionConnected()) {
-            return this.extensionBridge!.find(selector, text, xpath)
+            return this.withExtensionRetry(
+                () => this.extensionBridge!.find(selector, text, xpath),
+                () => this.findViaCdp(selector, text, xpath),
+            )
         }
         return this.findViaCdp(selector, text, xpath)
-    }
-
-    /** CDP fallback：通过 Runtime.evaluate 注入 DOM 查询逻辑 */
-    private async findViaCdp(selector?: string, text?: string, xpath?: string, timeout?: number): Promise<Array<{
-        refId: string
-        tag: string
-        text: string
-        rect: { x: number; y: number; width: number; height: number }
-    }>> {
-        return getCdpSession().evaluate<Array<{
-            refId: string; tag: string; text: string
-            rect: { x: number; y: number; width: number; height: number }
-        }>>(`function(selector, text, xpath) {
-            var elements;
-            if (xpath) {
-                elements = [];
-                var xr = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                for (var i = 0; i < xr.snapshotLength; i++) {
-                    var node = xr.snapshotItem(i);
-                    if (node instanceof Element) elements.push(node);
-                }
-            } else if (selector) {
-                elements = Array.from(document.querySelectorAll(selector));
-            } else {
-                elements = Array.from(document.querySelectorAll('*'));
-            }
-            var results = [];
-            for (var j = 0; j < elements.length; j++) {
-                var el = elements[j];
-                if (text && !(el.textContent || '').includes(text)) continue;
-                var rect = el.getBoundingClientRect();
-                results.push({
-                    refId: '',
-                    tag: el.tagName.toLowerCase(),
-                    text: (el.textContent || '').trim().substring(0, 100),
-                    rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
-                });
-                if (results.length >= 50) break;
-            }
-            return results;
-        }`, [selector ?? null, text ?? null, xpath ?? null], timeout)
     }
 
     /**
@@ -841,11 +850,11 @@ class UnifiedSessionManager {
                 await getCdpSession().deleteCookie(cookie.name, deleteUrl)
                 count++
             }
-            return {count}
+            return { count }
         }
 
         await getCdpSession().clearCookies()
-        return {count: -1}
+        return { count: -1 }
     }
 
     /**
@@ -988,7 +997,7 @@ class UnifiedSessionManager {
             throw new Error('iframe 穿透需要 Extension 模式')
         }
 
-        const {frameId, offset}        = await this.extensionBridge!.resolveFrame(frame)
+        const { frameId, offset }      = await this.extensionBridge!.resolveFrame(frame)
         const previousFrameId          = this.extensionBridge!.getCurrentFrameId()
         const previousFrameOffset      = this.currentFrameOffset
         const previousRequireExtension = this.requireExtension
@@ -1013,7 +1022,7 @@ class UnifiedSessionManager {
         }
 
         const cdpState = getCdpSession().getState()
-        return cdpState ? {url: cdpState.url, title: cdpState.title} : null
+        return cdpState ? { url: cdpState.url, title: cdpState.title } : null
     }
 
     /**
@@ -1039,7 +1048,7 @@ class UnifiedSessionManager {
             if (this.inputMode === 'stealth') {
                 await this.extensionBridge!.stealthKey(key, 'down', this.getModifierNames())
             } else {
-                await this.extensionBridge!.inputKey('keyDown', {key, code: key, modifiers: this.modifiers})
+                await this.extensionBridge!.inputKey('keyDown', { key, code: key, modifiers: this.modifiers })
             }
             return
         }
@@ -1054,7 +1063,7 @@ class UnifiedSessionManager {
             if (this.inputMode === 'stealth') {
                 await this.extensionBridge!.stealthKey(key, 'up', this.getModifierNames())
             } else {
-                await this.extensionBridge!.inputKey('keyUp', {key, code: key, modifiers: this.modifiers})
+                await this.extensionBridge!.inputKey('keyUp', { key, code: key, modifiers: this.modifiers })
             }
             if (MODIFIER_KEYS[key]) {
                 this.modifiers &= ~MODIFIER_KEYS[key]
@@ -1086,12 +1095,12 @@ class UnifiedSessionManager {
      * 鼠标移动
      */
     async mouseMove(x: number, y: number): Promise<void> {
-        this.currentMousePosition = {x, y}  // 更新位置
+        this.currentMousePosition = { x, y }  // 更新位置
         if (await this.ensureExtensionConnected()) {
             if (this.inputMode === 'stealth') {
                 await this.extensionBridge!.stealthMouse('mousemove', x, y)
             } else {
-                await this.extensionBridge!.inputMouse('mouseMoved', x, y, {modifiers: this.modifiers})
+                await this.extensionBridge!.inputMouse('mouseMoved', x, y, { modifiers: this.modifiers })
             }
             return
         }
@@ -1103,7 +1112,7 @@ class UnifiedSessionManager {
      */
     async mouseDown(button: 'left' | 'middle' | 'right' | 'back' | 'forward' = 'left'): Promise<void> {
         const effectiveButton = (button === 'back' || button === 'forward') ? 'left' : button
-        const {x, y}          = this.currentMousePosition  // 使用当前位置
+        const { x, y }        = this.currentMousePosition  // 使用当前位置
 
         if (await this.ensureExtensionConnected()) {
             if (this.inputMode === 'stealth') {
@@ -1130,7 +1139,7 @@ class UnifiedSessionManager {
      */
     async mouseUp(button: 'left' | 'middle' | 'right' | 'back' | 'forward' = 'left'): Promise<void> {
         const effectiveButton = (button === 'back' || button === 'forward') ? 'left' : button
-        const {x, y}          = this.currentMousePosition  // 使用当前位置
+        const { x, y }        = this.currentMousePosition  // 使用当前位置
 
         if (await this.ensureExtensionConnected()) {
             if (this.inputMode === 'stealth') {
@@ -1140,7 +1149,7 @@ class UnifiedSessionManager {
                     'mouseReleased',
                     x,
                     y,
-                    {button: effectiveButton, clickCount: 1, modifiers: this.modifiers},
+                    { button: effectiveButton, clickCount: 1, modifiers: this.modifiers },
                 )
             }
             return
@@ -1157,7 +1166,7 @@ class UnifiedSessionManager {
     async mouseClick(button: 'left' | 'middle' | 'right' | 'back' | 'forward' = 'left'): Promise<void> {
         if (this.inputMode === 'stealth' && await this.ensureExtensionConnected()) {
             const effectiveButton = (button === 'back' || button === 'forward') ? 'left' : button
-            const {x, y}         = this.currentMousePosition
+            const { x, y }        = this.currentMousePosition
             await this.extensionBridge!.stealthClick(x, y, effectiveButton)
             return
         }
@@ -1165,17 +1174,13 @@ class UnifiedSessionManager {
         await this.mouseUp(button)
     }
 
-    // ==================== 键鼠输入 ====================
-    // stealth 模式：使用 JS 事件模拟，不触发调试提示，推荐用于反检测场景
-    // precise 模式：使用 debugger API，精确但会显示"扩展程序正在调试此浏览器"
-
     /**
      * 鼠标滚轮
      */
     async mouseWheel(deltaX: number, deltaY: number): Promise<void> {
         if (await this.ensureExtensionConnected()) {
-            const {x, y} = this.currentMousePosition
-            await this.extensionBridge!.inputMouse('mouseWheel', x, y, {deltaX, deltaY, modifiers: this.modifiers})
+            const { x, y } = this.currentMousePosition
+            await this.extensionBridge!.inputMouse('mouseWheel', x, y, { deltaX, deltaY, modifiers: this.modifiers })
             return
         }
         await getCdpSession().mouseWheel(deltaX, deltaY)
@@ -1192,12 +1197,16 @@ class UnifiedSessionManager {
         throw new Error('CDP 模式下 stealth 脚本在 connect/launch 时通过 stealth 参数自动注入，不支持后续手动注入')
     }
 
+    // ==================== 键鼠输入 ====================
+    // stealth 模式：使用 JS 事件模拟，不触发调试提示，推荐用于反检测场景
+    // precise 模式：使用 debugger API，精确但会显示"扩展程序正在调试此浏览器"
+
     /**
      * 触摸开始
      */
     async touchStart(x: number, y: number): Promise<void> {
         if (await this.ensureExtensionConnected()) {
-            await this.extensionBridge!.inputTouch('touchStart', [{x, y, id: 0}])
+            await this.extensionBridge!.inputTouch('touchStart', [{ x, y, id: 0 }])
             return
         }
         await getCdpSession().touchStart(x, y)
@@ -1208,7 +1217,7 @@ class UnifiedSessionManager {
      */
     async touchMove(x: number, y: number): Promise<void> {
         if (await this.ensureExtensionConnected()) {
-            await this.extensionBridge!.inputTouch('touchMove', [{x, y, id: 0}])
+            await this.extensionBridge!.inputTouch('touchMove', [{ x, y, id: 0 }])
             return
         }
         await getCdpSession().touchMove(x, y)
@@ -1308,6 +1317,78 @@ class UnifiedSessionManager {
         return getCdpSession().send(method, params)
     }
 
+    /**
+     * Extension 操作断连自动重试
+     *
+     * 操作失败且错误为断连类型时，等待 2 秒让 Extension 重连后重试一次。
+     * 若重连失败且提供了 cdpFallback，则降级到 CDP 模式。
+     */
+    private async withExtensionRetry<T>(
+        operation: () => Promise<T>,
+        cdpFallback?: () => Promise<T>,
+    ): Promise<T> {
+        try {
+            return await operation()
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            if (msg.includes('Extension disconnected') ||
+                msg.includes('Connection replaced') ||
+                msg.includes('not connected')) {
+                // 等待 Extension 重连
+                await new Promise(r => setTimeout(r, 2000))
+                if (this.isExtensionConnected()) {
+                    return operation()
+                }
+                if (cdpFallback) {
+                    this.assertCdpFallbackAllowed()
+                    return cdpFallback()
+                }
+            }
+            throw err
+        }
+    }
+
+    /** CDP fallback：通过 Runtime.evaluate 注入 DOM 查询逻辑 */
+    private async findViaCdp(selector?: string, text?: string, xpath?: string, timeout?: number): Promise<Array<{
+        refId: string
+        tag: string
+        text: string
+        rect: { x: number; y: number; width: number; height: number }
+    }>> {
+        return getCdpSession().evaluate<Array<{
+            refId: string; tag: string; text: string
+            rect: { x: number; y: number; width: number; height: number }
+        }>>(`function(selector, text, xpath) {
+            var elements;
+            if (xpath) {
+                elements = [];
+                var xr = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                for (var i = 0; i < xr.snapshotLength; i++) {
+                    var node = xr.snapshotItem(i);
+                    if (node instanceof Element) elements.push(node);
+                }
+            } else if (selector) {
+                elements = Array.from(document.querySelectorAll(selector));
+            } else {
+                elements = Array.from(document.querySelectorAll('*'));
+            }
+            var results = [];
+            for (var j = 0; j < elements.length; j++) {
+                var el = elements[j];
+                if (text && !(el.textContent || '').includes(text)) continue;
+                var rect = el.getBoundingClientRect();
+                results.push({
+                    refId: '',
+                    tag: el.tagName.toLowerCase(),
+                    text: (el.textContent || '').trim().substring(0, 100),
+                    rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
+                });
+                if (results.length >= 50) break;
+            }
+            return results;
+        }`, [selector ?? null, text ?? null, xpath ?? null], timeout)
+    }
+
     /** 获取当前修饰键名称数组（stealth 模式用） */
     private getModifierNames(): string[] {
         const names: string[] = []
@@ -1327,6 +1408,19 @@ class UnifiedSessionManager {
     }
 
     // ==================== 控制台日志 ====================
+
+    /**
+     * 校验 CDP 执行结果，有异常则抛出
+     */
+    private checkCdpResult<T>(result: {
+        result?: CdpResultObject<T>
+        exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+    }): T {
+        if (result.exceptionDetails) {
+            throw new Error(formatCdpException(result.exceptionDetails))
+        }
+        return extractCdpValue<T>(result.result)
+    }
 
     /**
      * 检查 CDP 回退是否允许
@@ -1406,7 +1500,7 @@ class UnifiedSessionManager {
             const params: Record<string, unknown> = {
                 functionDeclaration: code,
                 objectId: globalResult.result.objectId,
-                arguments: args.map(a => ({value: a})),
+                arguments: args.map(a => ({ value: a })),
                 returnByValue: true,
                 awaitPromise: true,
             }
@@ -1422,10 +1516,7 @@ class UnifiedSessionManager {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
             }
-            if (result.exceptionDetails) {
-                throw new Error(formatCdpException(result.exceptionDetails))
-            }
-            return extractCdpValue<T>(result.result)
+            return this.checkCdpResult<T>(result)
         } finally {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', {
                 objectId: globalResult.result.objectId,

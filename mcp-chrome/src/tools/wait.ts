@@ -281,11 +281,11 @@ async function waitForElementExtension(
     state: ElementState,
     timeout: number,
 ): Promise<void> {
-    const startTime                              = Date.now()
-    const retryDelay                             = POLL_INTERVAL
-    const {selector, text, xpath, nth: nthParam} = targetToFindParams(target as Target & { nth?: number })
-    const nth                                    = nthParam ?? 0
-    let lastError: Error | null                  = null
+    const startTime                                = Date.now()
+    const retryDelay                               = POLL_INTERVAL
+    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
+    const nth                                      = nthParam ?? 0
+    let lastError: Error | null                    = null
 
     while (true) {
         const elapsed = Date.now() - startTime
@@ -368,7 +368,7 @@ async function waitForElement(
     while (Date.now() - startTime < timeout) {
         try {
             const remaining = timeout - (Date.now() - startTime)
-            const locator   = session.createLocator(target, {timeout: remaining})
+            const locator   = session.createLocator(target, { timeout: remaining })
 
             switch (state) {
                 case 'attached':

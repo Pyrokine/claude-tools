@@ -72,7 +72,7 @@ export class ConnectionRefusedError extends BrowserError {
   google-chrome --remote-debugging-port=${port}
 
 或者使用 browse(action="launch") 让 mcp-chrome 自动启动浏览器。`
-        this.context    = {host, port}
+        this.context    = { host, port }
     }
 }
 
@@ -112,7 +112,7 @@ export class TargetNotFoundError extends BrowserError {
 
     constructor(targetId: string) {
         super(`页面不存在: ${targetId}`)
-        this.context = {targetId}
+        this.context = { targetId }
     }
 }
 
@@ -129,7 +129,7 @@ export class ElementNotFoundError extends BrowserError {
         super(`元素未找到: ${JSON.stringify(target)}`)
         this.suggestion = `请检查 target 是否正确，或增加 timeout（当前: ${timeout}ms）`
         this.logs       = logs
-        this.context    = {target, timeout}
+        this.context    = { target, timeout }
         if (url) {
             this.context.url = url
         }
@@ -165,7 +165,7 @@ export class NavigationTimeoutError extends BrowserError {
 
     constructor(url: string, timeout: number) {
         super(`导航超时: ${url} (${timeout}ms)`)
-        this.context = {url, timeout}
+        this.context = { url, timeout }
     }
 }
 
@@ -308,6 +308,6 @@ export function formatResponse(data: unknown): {
     content: Array<{ type: 'text'; text: string }>;
 } {
     return {
-        content: [{type: 'text', text: JSON.stringify(data, null, 2)}],
+        content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
     }
 }

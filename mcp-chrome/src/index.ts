@@ -32,8 +32,8 @@ import {
  */
 function createServer(): McpServer {
     const server = new McpServer(
-        {name: 'mcp-chrome', version: '1.3.0'},
-        {capabilities: {tools: {}}},
+        { name: 'mcp-chrome', version: '1.3.0' },
+        { capabilities: { tools: {} } },
     )
 
     registerBrowseTool(server)

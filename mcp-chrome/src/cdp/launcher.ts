@@ -86,7 +86,7 @@ export class BrowserLauncher {
         }
 
         // 构建启动参数
-        const args = this.buildArgs({port, incognito, headless, userDataDir})
+        const args = this.buildArgs({ port, incognito, headless, userDataDir })
 
         // 启动进程
         this.process = spawn(chromePath, args, {
@@ -157,7 +157,7 @@ export class BrowserLauncher {
         const userDataDir = options.userDataDir ?? DEFAULT_PROFILE_DIR
         // 确保目录存在
         if (!existsSync(userDataDir)) {
-            mkdirSync(userDataDir, {recursive: true})
+            mkdirSync(userDataDir, { recursive: true })
         }
         args.push(`--user-data-dir=${userDataDir}`)
 

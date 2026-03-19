@@ -145,7 +145,7 @@ export class Locator {
             throw new Error('坐标定位不支持 find()，请使用 getClickablePoint()')
         }
 
-        return withRetry(() => this.findInternal(), {timeout: this.remaining()})
+        return withRetry(() => this.findInternal(), { timeout: this.remaining() })
     }
 
     /**
@@ -153,7 +153,7 @@ export class Locator {
      */
     async getClickablePoint(): Promise<Point> {
         if (isCoordinateTarget(this.target)) {
-            return {x: this.target.x, y: this.target.y}
+            return { x: this.target.x, y: this.target.y }
         }
 
         const nodeId = await this.find()
@@ -170,7 +170,7 @@ export class Locator {
      */
     async getBoundingBox(): Promise<Box> {
         if (isCoordinateTarget(this.target)) {
-            return {x: this.target.x, y: this.target.y, width: 0, height: 0}
+            return { x: this.target.x, y: this.target.y, width: 0, height: 0 }
         }
 
         const nodeId = await this.find()
@@ -187,7 +187,7 @@ export class Locator {
         const nodeId = await this.find()
 
         // 将 nodeId 转换为 RemoteObjectId
-        const {object} = (await this.send('DOM.resolveNode', {
+        const { object } = (await this.send('DOM.resolveNode', {
             nodeId,
         })) as { object: { objectId: string } }
 
@@ -196,7 +196,7 @@ export class Locator {
         }
 
         // 在元素上执行函数
-        const {result, exceptionDetails} = (await this.send('Runtime.callFunctionOn', {
+        const { result, exceptionDetails } = (await this.send('Runtime.callFunctionOn', {
             objectId: object.objectId,
             functionDeclaration: fn,
             returnByValue: true,
@@ -255,14 +255,14 @@ export class Locator {
      * 通过可访问性树定位
      */
     private async findByAccessibility(): Promise<NodeId> {
-        const {role, name} = this.target as { role: string; name?: string }
+        const { role, name } = this.target as { role: string; name?: string }
         this.log(`使用可访问性树定位: role=${role}, name=${name ?? '(any)'}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
 
         // 启用可访问性
         await this.send('Accessibility.enable')
 
         // 获取整个可访问性树
-        const {nodes} = (await this.send('Accessibility.getFullAXTree')) as {
+        const { nodes } = (await this.send('Accessibility.getFullAXTree')) as {
             nodes: Array<{
                 nodeId: string;
                 role: { value: string };
@@ -289,7 +289,7 @@ export class Locator {
                                                                                `（第 ${this.nth} 个）` :
                                                                                ''}`)
                 // 将 backendDOMNodeId 转换为 nodeId
-                const {nodeIds} = (await this.send('DOM.pushNodesByBackendIdsToFrontend', {
+                const { nodeIds } = (await this.send('DOM.pushNodesByBackendIdsToFrontend', {
                     backendNodeIds: [node.backendDOMNodeId],
                 })) as { nodeIds: number[] }
                 if (nodeIds.length > 0 && nodeIds[0] !== 0) {
@@ -305,7 +305,7 @@ export class Locator {
      * 通过文本内容定位
      */
     private async findByText(): Promise<NodeId> {
-        const {text, exact = false} = this.target as {
+        const { text, exact = false } = this.target as {
             text: string;
             exact?: boolean;
         }
@@ -325,7 +325,7 @@ export class Locator {
      * 通过 label 定位
      */
     private async findByLabel(): Promise<NodeId> {
-        const {label, exact = false} = this.target as {
+        const { label, exact = false } = this.target as {
             label: string;
             exact?: boolean;
         }
@@ -335,7 +335,7 @@ export class Locator {
         const escapedLabel = escapeJSString(label)
 
         // 使用 Runtime.evaluate 执行复杂查询
-        const {result} = (await this.send('Runtime.evaluate', {
+        const { result } = (await this.send('Runtime.evaluate', {
             expression: `
         (function() {
           const targetLabel = "${escapedLabel}";
@@ -398,7 +398,7 @@ export class Locator {
      * 通过 placeholder 定位
      */
     private async findByPlaceholder(): Promise<NodeId> {
-        const {placeholder, exact = false} = this.target as {
+        const { placeholder, exact = false } = this.target as {
             placeholder: string;
             exact?: boolean;
         }
@@ -418,7 +418,7 @@ export class Locator {
      * 通过 title 属性定位
      */
     private async findByTitle(): Promise<NodeId> {
-        const {title, exact = false} = this.target as {
+        const { title, exact = false } = this.target as {
             title: string;
             exact?: boolean;
         }
@@ -434,7 +434,7 @@ export class Locator {
      * 通过 alt 属性定位
      */
     private async findByAlt(): Promise<NodeId> {
-        const {alt, exact = false} = this.target as {
+        const { alt, exact = false } = this.target as {
             alt: string;
             exact?: boolean;
         }
@@ -450,7 +450,7 @@ export class Locator {
      * 通过 data-testid 定位
      */
     private async findByTestId(): Promise<NodeId> {
-        const {testId} = this.target as { testId: string }
+        const { testId } = this.target as { testId: string }
         this.log(`使用 data-testid 定位: testId=${testId}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
 
         const escaped = escapeCSSAttributeValue(testId)
@@ -461,7 +461,7 @@ export class Locator {
      * 通过 CSS 选择器定位
      */
     private async findByCSS(): Promise<NodeId> {
-        const {css} = this.target as { css: string }
+        const { css } = this.target as { css: string }
         this.log(`使用 CSS 选择器定位: css=${css}`)
 
         return this.findByCSSInternal(css)
@@ -471,7 +471,7 @@ export class Locator {
      * 通过 CSS + 文本组合定位
      */
     private async findByCSSAndText(): Promise<NodeId> {
-        const {css, text, exact = false} = this.target as { css: string; text: string; exact?: boolean }
+        const { css, text, exact = false } = this.target as { css: string; text: string; exact?: boolean }
         this.log(`使用 CSS+text 组合定位: css=${css}, text=${text}, exact=${exact}${this.nth > 0 ?
                                                                                     `, nth=${this.nth}` :
                                                                                     ''}`)
@@ -479,7 +479,7 @@ export class Locator {
         const escapedCSS  = escapeJSString(css)
         const escapedText = escapeJSString(text)
 
-        const {result} = (await this.send('Runtime.evaluate', {
+        const { result } = (await this.send('Runtime.evaluate', {
             expression: `
         (function() {
           const elements = document.querySelectorAll("${escapedCSS}");
@@ -511,7 +511,7 @@ export class Locator {
      * 通过 XPath 定位
      */
     private async findByXPath(): Promise<NodeId> {
-        const {xpath} = this.target as { xpath: string }
+        const { xpath } = this.target as { xpath: string }
         this.log(`使用 XPath 定位: xpath=${xpath}`)
 
         return this.findByXPathInternal(xpath)
@@ -522,13 +522,13 @@ export class Locator {
      */
     private async findByCSSInternal(css: string): Promise<NodeId> {
         // 确保 DOM 已启用
-        const {root} = (await this.send('DOM.getDocument')) as {
+        const { root } = (await this.send('DOM.getDocument')) as {
             root: { nodeId: number };
         }
 
         if (this.nth > 0) {
             // nth > 0：用 querySelectorAll 取第 nth 个
-            const {nodeIds} = (await this.send('DOM.querySelectorAll', {
+            const { nodeIds } = (await this.send('DOM.querySelectorAll', {
                 nodeId: root.nodeId,
                 selector: css,
             })) as { nodeIds: number[] }
@@ -542,7 +542,7 @@ export class Locator {
             return nodeIds[this.nth]
         }
 
-        const {nodeId} = (await this.send('DOM.querySelector', {
+        const { nodeId } = (await this.send('DOM.querySelector', {
             nodeId: root.nodeId,
             selector: css,
         })) as { nodeId: number }
@@ -564,7 +564,7 @@ export class Locator {
 
         if (this.nth > 0) {
             // nth > 0：用 ORDERED_NODE_SNAPSHOT_TYPE 取第 nth 个
-            const {result} = (await this.send('Runtime.evaluate', {
+            const { result } = (await this.send('Runtime.evaluate', {
                 expression: `(function() { var r = document.evaluate('${escapedXPath}', document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); return r.snapshotLength > ${this.nth} ? r.snapshotItem(${this.nth}) : null })()`,
                 returnByValue: false,
             })) as { result: { objectId?: string; subtype?: string } }
@@ -578,7 +578,7 @@ export class Locator {
         }
 
         // 使用 Runtime.evaluate 执行 XPath
-        const {result} = (await this.send('Runtime.evaluate', {
+        const { result } = (await this.send('Runtime.evaluate', {
             expression: `document.evaluate('${escapedXPath}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`,
             returnByValue: false,
         })) as { result: { objectId?: string } }
@@ -598,7 +598,7 @@ export class Locator {
         // DOM.requestNode 需要 DOM 树已初始化（通过 DOM.getDocument）
         await this.send('DOM.getDocument')
 
-        const {nodeId} = (await this.send('DOM.requestNode', {
+        const { nodeId } = (await this.send('DOM.requestNode', {
             objectId,
         })) as { nodeId: number }
 
@@ -614,7 +614,7 @@ export class Locator {
      * 获取元素边界框
      */
     private async getBoxModel(nodeId: NodeId): Promise<Box> {
-        const {model} = (await this.send('DOM.getBoxModel', {nodeId})) as {
+        const { model } = (await this.send('DOM.getBoxModel', { nodeId })) as {
             model: { content: number[] };
         }
 

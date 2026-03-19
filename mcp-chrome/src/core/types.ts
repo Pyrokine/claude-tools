@@ -18,17 +18,17 @@ export const MODIFIER_KEYS: Record<string, number> = {
 
 /** CDP Runtime.evaluate / callFunctionOn 响应中的异常详情 */
 export interface CdpExceptionDetails {
-    text: string
-    exception?: { className?: string; description?: string }
+    text: string;
+    exception?: { className?: string; description?: string };
 }
 
 /** CDP Runtime.evaluate / callFunctionOn 响应中的结果对象 */
 export interface CdpResultObject<T = unknown> {
-    type: string
-    subtype?: string
-    className?: string
-    description?: string
-    value?: T
+    type: string;
+    subtype?: string;
+    className?: string;
+    description?: string;
+    value?: T;
 }
 
 /** 从 CDP exceptionDetails 提取有用的错误信息（含完整堆栈） */

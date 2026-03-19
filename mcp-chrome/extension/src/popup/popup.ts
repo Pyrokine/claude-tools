@@ -10,7 +10,7 @@ const disconnectBtn   = document.getElementById('disconnectBtn') as HTMLButtonEl
 // 获取状态
 async function updateStatus() {
     try {
-        const response = await chrome.runtime.sendMessage({type: 'GET_STATUS'})
+        const response = await chrome.runtime.sendMessage({ type: 'GET_STATUS' })
 
         if (response.connected) {
             const ports: number[]     = response.ports ?? []
@@ -45,7 +45,7 @@ connectBtn.addEventListener('click', async () => {
     statusText.textContent = '连接中...'
 
     try {
-        const response = await chrome.runtime.sendMessage({type: 'CONNECT'})
+        const response = await chrome.runtime.sendMessage({ type: 'CONNECT' })
 
         if (response.connected > 0) {
             await updateStatus()
@@ -63,7 +63,7 @@ connectBtn.addEventListener('click', async () => {
 // 断开
 disconnectBtn.addEventListener('click', async () => {
     try {
-        await chrome.runtime.sendMessage({type: 'DISCONNECT'})
+        await chrome.runtime.sendMessage({ type: 'DISCONNECT' })
         await updateStatus()
     } catch (error) {
         console.error('Disconnect failed:', error)

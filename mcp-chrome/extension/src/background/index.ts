@@ -22,10 +22,10 @@ let mcpTabGroupId: number | null = null
 // ==================== WebSocket 消息处理 ====================
 
 httpClient.onMessage(async (message, port) => {
-    const {id, action, params} = message
+    const { id, action, params } = message
 
     try {
-        const result = await actionHandler.execute(action, params, {mcpTabGroupId})
+        const result = await actionHandler.execute(action, params, { mcpTabGroupId })
         httpClient.sendResponse(id, true, result, undefined, port)
     } catch (error) {
         console.error(`[MCP] Error executing ${action}:`, error)
@@ -52,7 +52,7 @@ async function handleInternalMessage(message: InternalMessage): Promise<unknown>
 
         case 'DISCONNECT':
             httpClient.disconnect()
-            return {success: true}
+            return { success: true }
 
         case 'GET_STATUS':
             return {
@@ -61,7 +61,7 @@ async function handleInternalMessage(message: InternalMessage): Promise<unknown>
             }
 
         default:
-            return {error: 'Unknown message type'}
+            return { error: 'Unknown message type' }
     }
 }
 
@@ -85,8 +85,8 @@ function updateBadge(status: ConnectionStatus, count = 0) {
         badge = ''
     }
 
-    void chrome.action.setBadgeBackgroundColor({color: colors[status]})
-    void chrome.action.setBadgeText({text: badge})
+    void chrome.action.setBadgeBackgroundColor({ color: colors[status] })
+    void chrome.action.setBadgeText({ text: badge })
 }
 
 function broadcastStatus(status: ConnectionStatus, count: number) {
@@ -113,7 +113,7 @@ chrome.tabs.onRemoved.addListener(async (_tabId) => {
     }
 
     try {
-        const tabs = await chrome.tabs.query({groupId: mcpTabGroupId})
+        const tabs = await chrome.tabs.query({ groupId: mcpTabGroupId })
         if (tabs.length === 0) {
             mcpTabGroupId = null
         }
@@ -143,7 +143,7 @@ const KEEPALIVE_ALARM = 'mcp-keepalive'
 
 // chrome.alarms 最小周期为 1 分钟（Chrome 强制限制）
 // WebSocket 心跳（15s ping）已能保持 Service Worker 存活，alarm 仅作断线重连备份
-void chrome.alarms.create(KEEPALIVE_ALARM, {periodInMinutes: 1})
+void chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 })
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === KEEPALIVE_ALARM) {

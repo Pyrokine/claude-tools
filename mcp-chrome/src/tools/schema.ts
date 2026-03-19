@@ -54,9 +54,9 @@ const targetObjectSchema = z.intersection(
                              alt: z.string().describe('alt 属性值'),
                              exact: z.boolean().optional().describe('是否精确匹配（默认 false）'),
                          }),
-                z.object({testId: z.string().describe('data-testid 值')}),
-                z.object({css: z.string().describe('CSS 选择器')}),
-                z.object({xpath: z.string().describe('XPath 表达式')}),
+                z.object({ testId: z.string().describe('data-testid 值') }),
+                z.object({ css: z.string().describe('CSS 选择器') }),
+                z.object({ xpath: z.string().describe('XPath 表达式') }),
                 z.object({
                              x: z.number().describe('X 坐标（像素）'),
                              y: z.number().describe('Y 坐标（像素）'),
@@ -304,6 +304,6 @@ export function targetToFindParams(target: Target & { nth?: number }): {
         selector = `[data-testid="${escapeAttrValue(target.testId)}"]`
     }
 
-    return {selector, text, xpath, nth: (target as { nth?: number }).nth}
+    return { selector, text, xpath, nth: (target as { nth?: number }).nth }
 }
 

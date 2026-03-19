@@ -107,20 +107,20 @@ export function getMouseMoveDelay(): number {
  * 行为模拟器
  */
 export class BehaviorSimulator {
-    private currentPosition: Point = {x: 0, y: 0}
+    private currentPosition: Point = { x: 0, y: 0 }
 
     /**
      * 获取当前鼠标位置
      */
     getCurrentPosition(): Point {
-        return {...this.currentPosition}
+        return { ...this.currentPosition }
     }
 
     /**
      * 更新当前鼠标位置
      */
     setCurrentPosition(point: Point): void {
-        this.currentPosition = {...point}
+        this.currentPosition = { ...point }
     }
 
 }

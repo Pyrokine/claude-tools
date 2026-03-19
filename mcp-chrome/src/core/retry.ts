@@ -34,10 +34,10 @@ export async function withRetry<T>(
     fn: () => Promise<T>,
     options: RetryOptions = {},
 ): Promise<T> {
-    const {timeout = DEFAULT_TIMEOUT, retryDelay = DEFAULT_RETRY_DELAY} = options
-    const deadline                                                      = Date.now() + timeout
-    let lastError: Error | null                                         = null
-    let attempts                                                        = 0
+    const { timeout = DEFAULT_TIMEOUT, retryDelay = DEFAULT_RETRY_DELAY } = options
+    const deadline                                                        = Date.now() + timeout
+    let lastError: Error | null                                           = null
+    let attempts                                                          = 0
 
     while (Date.now() < deadline) {
         attempts++

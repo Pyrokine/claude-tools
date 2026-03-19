@@ -20,20 +20,20 @@ import {targetToFindParams, targetZodSchema} from './schema.js'
 
 /** 图片元信息 */
 interface ImageInfo {
-    index: number
-    src: string
-    dataSrc: string
-    alt: string
-    width: number
-    height: number
-    naturalWidth: number
-    naturalHeight: number
+    index: number;
+    src: string;
+    dataSrc: string;
+    alt: string;
+    width: number;
+    height: number;
+    naturalWidth: number;
+    naturalHeight: number;
 }
 
 /** 图片数据（base64） */
 interface ImageData {
-    base64: string | null
-    mimeType: string
+    base64: string | null;
+    mimeType: string;
 }
 
 /** 无 output 时附录返回的最大图片数 */
@@ -189,8 +189,15 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                         let clip: { x: number; y: number; width: number; height: number } | undefined
                         if (args.target) {
                             if (useExtension) {
-                                const {selector, text, xpath, nth: nthParam} = targetToFindParams(args.target as Target & { nth?: number })
-                                const nth = nthParam ?? 0
+                                const {
+                                          selector,
+                                          text,
+                                          xpath,
+                                          nth: nthParam,
+                                      }     = targetToFindParams(args.target as Target & {
+                                    nth?: number
+                                })
+                                const nth   = nthParam ?? 0
                                 const found = await unifiedSession.find(selector, text, xpath)
                                 if (found.length > nth) {
                                     const rect = found[nth].rect
@@ -200,9 +207,21 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                                     }
                                 }
                             } else {
-                                const {selector, text, xpath, nth: nthParam} = targetToFindParams(args.target as Target & { nth?: number })
-                                const nth = nthParam ?? 0
-                                const rect = await session.evaluate<{ x: number; y: number; width: number; height: number } | null>(
+                                const {
+                                          selector,
+                                          text,
+                                          xpath,
+                                          nth: nthParam,
+                                      }    = targetToFindParams(args.target as Target & {
+                                    nth?: number
+                                })
+                                const nth  = nthParam ?? 0
+                                const rect = await session.evaluate<{
+                                                                        x: number;
+                                                                        y: number;
+                                                                        width: number;
+                                                                        height: number
+                                                                    } | null>(
                                     `function(selector, text, xpath, nth) {
                                         function toRect(el) {
                                             var r = el.getBoundingClientRect();
@@ -266,7 +285,9 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                         }
 
                         const base64 = await unifiedSession.screenshot({
-                                                                           fullPage: clip ? false : (args.fullPage ?? false),
+                                                                           fullPage: clip ?
+                                                                                     false :
+                                                                                     (args.fullPage ?? false),
                                                                            scale: args.scale,
                                                                            format: args.format,
                                                                            quality: args.quality,
@@ -297,15 +318,22 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                         // 有 target 时获取子树的无障碍状态
                         let refId: string | undefined
                         if (args.target && useExtension) {
-                            const {selector, text, xpath, nth: nthParam} = targetToFindParams(args.target as Target & { nth?: number })
-                            const nth = nthParam ?? 0
+                            const {
+                                      selector,
+                                      text,
+                                      xpath,
+                                      nth: nthParam,
+                                  }        = targetToFindParams(args.target as Target & {
+                                nth?: number
+                            })
+                            const nth      = nthParam ?? 0
                             const elements = await unifiedSession.find(selector, text, xpath)
                             if (elements.length > 0 && nth < elements.length) {
                                 refId = elements[nth].refId
                             }
                         }
 
-                        const state = await unifiedSession.readPage(refId ? {refId} : undefined)
+                        const state = await unifiedSession.readPage(refId ? { refId } : undefined)
                         if (args.output) {
                             await writeOutputFile(args.output, JSON.stringify(state, null, 2), 'utf-8')
                             return formatResponse({
@@ -366,7 +394,7 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
 
 /** 写入文件前自动创建父目录 */
 async function writeOutputFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<void> {
-    await mkdir(dirname(path), {recursive: true})
+    await mkdir(dirname(path), { recursive: true })
     await writeFile(path, data, encoding)
 }
 
@@ -382,10 +410,10 @@ async function handleHtmlWithImages(
     content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>;
     isError?: boolean;
 }> {
-    const {selector, nth: nthParam} = args.target
-                                      ? targetToFindParams(args.target as Target & { nth?: number })
-                                      : {selector: undefined, nth: undefined}
-    const nth = nthParam ?? 0
+    const { selector, nth: nthParam } = args.target
+                                        ? targetToFindParams(args.target as Target & { nth?: number })
+                                        : { selector: undefined, nth: undefined }
+    const nth                         = nthParam ?? 0
 
     let result: { html: string; images: ImageInfo[] }
 
@@ -417,7 +445,7 @@ async function handleHtmlWithImages(
 
     if (args.images === 'info') {
         // info 模式：HTML + 图片元信息
-        const payload = {type: 'html' as const, content: result.html, images: result.images}
+        const payload = { type: 'html' as const, content: result.html, images: result.images }
         if (args.output) {
             await writeOutputFile(args.output, JSON.stringify(payload, null, 2), 'utf-8')
             return formatResponse({
@@ -466,7 +494,7 @@ async function extractHtmlWithImagesCdp(
     timeout?: number,
 ): Promise<{ html: string; images: ImageInfo[] }> {
     if (selector) {
-        const locator = session.createLocator({css: selector}, timeout !== undefined ? {timeout} : undefined)
+        const locator = session.createLocator({ css: selector }, timeout !== undefined ? { timeout } : undefined)
         return locator.evaluateOn<{ html: string; images: ImageInfo[] }>(`function() {
             var html = this.outerHTML;
             var imgList = [];
@@ -513,24 +541,26 @@ async function fetchImageData(
 
     // 第一趟：解析 data: URL + 收集需要 CDP 获取的 URL（去重）
     const preResolved: (ImageData | null)[] = []
-    const cdpUrlSet = new Set<string>()
+    const cdpUrlSet                         = new Set<string>()
     for (let i = 0; i < images.length; i++) {
-        const img = images[i]
+        const img          = images[i]
         const effectiveSrc = img.src || img.dataSrc
 
         if (i >= effectiveLimit || !effectiveSrc) {
-            preResolved.push({base64: null, mimeType: 'image/png'})
+            preResolved.push({ base64: null, mimeType: 'image/png' })
             continue
         }
 
         if (effectiveSrc.startsWith('data:')) {
             const match = effectiveSrc.match(/^data:([^;]+);base64,(.+)$/)
-            preResolved.push(match ? {base64: match[2], mimeType: match[1]} : {base64: null, mimeType: 'image/png'})
+            preResolved.push(match ?
+                                 { base64: match[2], mimeType: match[1] } :
+                                 { base64: null, mimeType: 'image/png' })
             continue
         }
 
         if (!effectiveSrc.startsWith('http')) {
-            preResolved.push({base64: null, mimeType: guessMimeType(effectiveSrc)})
+            preResolved.push({ base64: null, mimeType: guessMimeType(effectiveSrc) })
             continue
         }
 
@@ -553,23 +583,23 @@ async function fetchImageData(
             continue
         }
 
-        const img = images[i]
+        const img          = images[i]
         const effectiveSrc = img.src || img.dataSrc
-        const mimeType = guessMimeType(effectiveSrc)
+        const mimeType     = guessMimeType(effectiveSrc)
 
         // 尝试 CDP 缓存
         if (img.src && cdpResults.has(img.src)) {
             const resource = cdpResults.get(img.src)!
             if (resource.base64Encoded) {
-                results.push({base64: resource.content, mimeType})
+                results.push({ base64: resource.content, mimeType })
             } else {
-                results.push({base64: Buffer.from(resource.content).toString('base64'), mimeType})
+                results.push({ base64: Buffer.from(resource.content).toString('base64'), mimeType })
             }
             continue
         }
 
         // CDP 缓存未命中，不使用 Node.js fetch（避免绕过浏览器同源策略）
-        results.push({base64: null, mimeType})
+        results.push({ base64: null, mimeType })
     }
 
     return results
@@ -593,7 +623,7 @@ async function writeImageDirectory(
     imageDataList: ImageData[],
 ): Promise<void> {
     const imagesDir = join(outputDir, 'images')
-    await mkdir(imagesDir, {recursive: true})
+    await mkdir(imagesDir, { recursive: true })
 
     // 写入 HTML
     await writeFile(join(outputDir, 'content.html'), html, 'utf-8')
@@ -602,13 +632,13 @@ async function writeImageDirectory(
     const indexEntries: Array<{
         index: number; src: string; alt: string
         width: number; height: number; file: string | null
-    }> = []
+    }>                 = []
     const writtenFiles = new Map<string, string>() // src → file path
 
     for (let i = 0; i < images.length; i++) {
-        const img  = images[i]
-        const data = imageDataList[i]
-        const src  = img.src || img.dataSrc
+        const img               = images[i]
+        const data              = imageDataList[i]
+        const src               = img.src || img.dataSrc
         let file: string | null = null
 
         if (data.base64) {
@@ -627,20 +657,20 @@ async function writeImageDirectory(
         }
 
         indexEntries.push({
-            index: img.index,
-            src: img.src || img.dataSrc,
-            alt: img.alt,
-            width: img.width,
-            height: img.height,
-            file,
-        })
+                              index: img.index,
+                              src: img.src || img.dataSrc,
+                              alt: img.alt,
+                              width: img.width,
+                              height: img.height,
+                              file,
+                          })
     }
 
     // 写入索引
     await writeFile(join(outputDir, 'index.json'), JSON.stringify({
-        html: 'content.html',
-        images: indexEntries,
-    }, null, 2), 'utf-8')
+                                                                      html: 'content.html',
+                                                                      images: indexEntries,
+                                                                  }, null, 2), 'utf-8')
 }
 
 /**
@@ -664,49 +694,49 @@ function buildImageAppendixResponse(
 
     // 主体 JSON
     content.push({
-        type: 'text',
-        text: JSON.stringify({
-                                 success: true,
-                                 type: 'html',
-                                 content: html,
-                                 imageCount: images.length,
-                             }),
-    })
+                     type: 'text',
+                     text: JSON.stringify({
+                                              success: true,
+                                              type: 'html',
+                                              content: html,
+                                              imageCount: images.length,
+                                          }),
+                 })
 
     if (images.length === 0) {
-        return {content}
+        return { content }
     }
 
-    content.push({type: 'text', text: '\n--- Images ---'})
+    content.push({ type: 'text', text: '\n--- Images ---' })
 
     /** Claude API 支持的 image block 格式 */
     const SUPPORTED_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 
     const limit = Math.min(images.length, MAX_APPENDIX_IMAGES)
     for (let i = 0; i < images.length; i++) {
-        const img  = images[i]
-        const data = imageDataList[i]
+        const img          = images[i]
+        const data         = imageDataList[i]
         const effectiveSrc = img.src || img.dataSrc
 
         // 图片标注
         const sizeStr = img.naturalWidth ? `${img.naturalWidth}×${img.naturalHeight}` : `${img.width}×${img.height}`
         const altStr  = img.alt ? `  alt="${img.alt}"` : ''
-        content.push({type: 'text', text: `\n[${img.index}] ${effectiveSrc}${altStr}  ${sizeStr}`})
+        content.push({ type: 'text', text: `\n[${img.index}] ${effectiveSrc}${altStr}  ${sizeStr}` })
 
         // 在限制内且有数据时附带图片（SVG 等不支持的格式跳过 image block）
         if (i < limit && data.base64 && SUPPORTED_IMAGE_MIMES.has(data.mimeType)) {
-            content.push({type: 'image', data: data.base64, mimeType: data.mimeType})
+            content.push({ type: 'image', data: data.base64, mimeType: data.mimeType })
         }
     }
 
     if (images.length > MAX_APPENDIX_IMAGES) {
         content.push({
-            type: 'text',
-            text: `\n（共 ${images.length} 张图片，仅前 ${MAX_APPENDIX_IMAGES} 张附带数据。使用 output 参数导出全部图片）`,
-        })
+                         type: 'text',
+                         text: `\n（共 ${images.length} 张图片，仅前 ${MAX_APPENDIX_IMAGES} 张附带数据。使用 output 参数导出全部图片）`,
+                     })
     }
 
-    return {content}
+    return { content }
 }
 
 // ==================== MIME / 文件名工具 ====================
@@ -763,7 +793,7 @@ async function extractText(
     timeout?: number,
 ): Promise<string> {
     if (target) {
-        const locator = session.createLocator(target, timeout !== undefined ? {timeout} : undefined)
+        const locator = session.createLocator(target, timeout !== undefined ? { timeout } : undefined)
         const text    = await locator.evaluateOn<string>(`function() {
       return this.textContent ?? '';
     }`)
@@ -782,7 +812,7 @@ async function extractHTML(
     timeout?: number,
 ): Promise<string> {
     if (target) {
-        const locator = session.createLocator(target, timeout !== undefined ? {timeout} : undefined)
+        const locator = session.createLocator(target, timeout !== undefined ? { timeout } : undefined)
         return await locator.evaluateOn<string>(`function() {
       return this.outerHTML;
     }`)
@@ -800,7 +830,7 @@ async function extractAttribute(
     attribute: string,
     timeout?: number,
 ): Promise<string | null> {
-    const locator = session.createLocator(target, timeout !== undefined ? {timeout} : undefined)
+    const locator = session.createLocator(target, timeout !== undefined ? { timeout } : undefined)
     // 使用 JSON.stringify 安全转义属性名，防止 JS 注入
     return locator.evaluateOn<string | null>(`function() {
     return this.getAttribute(${JSON.stringify(attribute)});
@@ -818,8 +848,8 @@ async function extractTextExtension(
     if (!target) {
         return unifiedSession.getText()
     }
-    const {selector, text, xpath, nth: nthParam} = targetToFindParams(target as Target & { nth?: number })
-    const nth = nthParam ?? 0
+    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
+    const nth                                      = nthParam ?? 0
 
     if (selector) {
         if (nth > 0) {
@@ -859,9 +889,9 @@ async function extractHtmlExtension(
     if (!target) {
         return unifiedSession.getHtml(undefined, outer)
     }
-    const {selector, text, xpath, nth: nthParam} = targetToFindParams(target as Target & { nth?: number })
-    const nth = nthParam ?? 0
-    const prop = outer ? 'outerHTML' : 'innerHTML'
+    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
+    const nth                                      = nthParam ?? 0
+    const prop                                     = outer ? 'outerHTML' : 'innerHTML'
 
     if (selector) {
         if (nth > 0) {
@@ -896,7 +926,7 @@ async function extractAttributeExtension(
     target: Target,
     attribute: string,
 ): Promise<string | null> {
-    const {selector, text, xpath, nth: nthParam} = targetToFindParams(target as Target & { nth?: number })
+    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
 
     // xpath/text 定位需要先 find 得到 refId，再获取属性
     if (xpath || text) {
@@ -936,11 +966,11 @@ async function waitForTargetExtension(
     target: Target,
     timeout: number,
 ): Promise<void> {
-    const startTime                              = Date.now()
-    const retryDelay                             = 100
-    const {selector, text, xpath, nth: nthParam} = targetToFindParams(target as Target & { nth?: number })
-    const nth                                    = nthParam ?? 0
-    let lastError: Error | null                  = null
+    const startTime                                = Date.now()
+    const retryDelay                               = 100
+    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
+    const nth                                      = nthParam ?? 0
+    let lastError: Error | null                    = null
 
     while (true) {
         const elapsed = Date.now() - startTime

@@ -13,13 +13,13 @@ const RPC_MARGIN        = 5000
 const NAV_SIGNAL_WINDOW = 5000
 
 interface SimplePageState {
-    url: string
-    title: string
+    url: string;
+    title: string;
 }
 
 export interface ExtensionBridgeOptions {
-    port?: number
-    timeout?: number
+    port?: number;
+    timeout?: number;
 }
 
 export class ExtensionBridge {
@@ -37,6 +37,16 @@ export class ExtensionBridge {
 
     async start(): Promise<void> {
         await this.httpServer.start()
+
+        // Extension 重连后自动恢复 attach 状态
+        this.httpServer.on('connected', () => {
+            if (this.currentTabId !== null) {
+                const tabId = this.currentTabId
+                this.httpServer.sendCommand('debugger_attach', { tabId }).catch(() => {
+                    // tab 可能已关闭，忽略恢复失败
+                })
+            }
+        })
     }
 
     async stop(): Promise<void> {
@@ -106,7 +116,7 @@ export class ExtensionBridge {
     }
 
     async closeTab(tabId: number): Promise<void> {
-        await this.httpServer.sendCommand('tabs_close', {tabId})
+        await this.httpServer.sendCommand('tabs_close', { tabId })
         if (this.currentTabId === tabId) {
             this.currentTabId = null
             this.state        = null
@@ -114,7 +124,7 @@ export class ExtensionBridge {
     }
 
     async activateTab(tabId: number): Promise<void> {
-        const result      = await this.httpServer.sendCommand('tabs_activate', {tabId})
+        const result      = await this.httpServer.sendCommand('tabs_activate', { tabId })
         const tab         = result as { id: number; url: string; title: string }
         this.currentTabId = tab.id
         this.updateState(tab.url, tab.title)
@@ -383,7 +393,7 @@ export class ExtensionBridge {
     }
 
     async deleteCookie(url: string, name: string): Promise<void> {
-        await this.httpServer.sendCommand('cookies_delete', {url, name})
+        await this.httpServer.sendCommand('cookies_delete', { url, name })
     }
 
     async clearCookies(filter?: { url?: string; domain?: string }): Promise<{ count: number }> {
@@ -635,7 +645,6 @@ export class ExtensionBridge {
     }
 
     private updateState(url: string, title: string): void {
-        this.state = {url, title}
+        this.state = { url, title }
     }
 }
-
