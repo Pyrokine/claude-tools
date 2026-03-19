@@ -65,6 +65,10 @@ enum Commands {
         #[arg(long, default_value = "assistant,user,summary")]
         types: String,
 
+        /// Message subtypes filter (comma separated: human, tool_result, meta, text, tool_use, thinking, empty, summary, system)
+        #[arg(long)]
+        subtypes: Option<String>,
+
         /// Line ranges (e.g., "1-100,200-300,!150-160")
         #[arg(long)]
         lines: Option<String>,
@@ -192,6 +196,7 @@ fn main() {
             since,
             until,
             types,
+            subtypes,
             lines,
             regex,
             case_sensitive,
@@ -208,6 +213,7 @@ fn main() {
                 since: since.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
                 until: until.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
                 types: types.split(',').map(|s| s.trim().to_string()).collect(),
+                subtypes: subtypes.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
                 lines: lines.map(|s| Range::parse_ranges(&s)).unwrap_or_default(),
                 use_regex: regex,
                 case_sensitive,
@@ -215,6 +221,7 @@ fn main() {
                 limit,
                 max_content,
                 max_total,
+                subagents: false,
             };
 
             match search(&config, params) {

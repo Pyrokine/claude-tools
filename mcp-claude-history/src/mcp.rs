@@ -88,6 +88,10 @@ fn get_tools() -> Vec<Value> {
                         "description": "Message types: assistant,user,summary (comma-separated)",
                         "default": "assistant,user,summary"
                     },
+                    "subtypes": {
+                        "type": "string",
+                        "description": "Message subtypes filter (comma-separated). user subtypes: human, tool_result, meta; assistant subtypes: text, tool_use, thinking, empty; summary subtype: summary; system subtype: system",
+                    },
                     "lines": {
                         "type": "string",
                         "description": "Line ranges: 100, 100-200, 100-, -200, !100-200"
@@ -120,6 +124,11 @@ fn get_tools() -> Vec<Value> {
                         "type": "number",
                         "description": "Max total characters",
                         "default": 40000
+                    },
+                    "subagents": {
+                        "type": "boolean",
+                        "description": "Include agent sub-sessions in search (default: false, main sessions only)",
+                        "default": false
                     }
                 }
             }
@@ -325,7 +334,7 @@ fn path_to_project_id(path: &str) -> Option<String> {
         return None;
     }
     // Claude Code 的转换规则：/、\、:、_ 都变成 -
-    let id = path.replace('\\', "-").replace('/', "-").replace(':', "-").replace('_', "-");
+    let id = path.replace(['\\', '/', ':', '_'], "-");
     if id.starts_with('-') {
         Some(id)
     } else {
@@ -448,6 +457,7 @@ struct SearchArgs {
     since: Option<String>,
     until: Option<String>,
     types: Option<String>,
+    subtypes: Option<String>,
     lines: Option<String>,
     regex: bool,
     case_sensitive: bool,
@@ -455,6 +465,7 @@ struct SearchArgs {
     limit: Option<usize>,
     max_content: usize,
     max_total: usize,
+    subagents: bool,
 }
 
 impl SearchArgs {
@@ -467,6 +478,7 @@ impl SearchArgs {
             since: args.get("since").and_then(|v| v.as_str()).map(String::from),
             until: args.get("until").and_then(|v| v.as_str()).map(String::from),
             types: args.get("types").and_then(|v| v.as_str()).map(String::from),
+            subtypes: args.get("subtypes").and_then(|v| v.as_str()).map(String::from),
             lines: args.get("lines").and_then(|v| v.as_str()).map(String::from),
             regex: args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false),
             case_sensitive: args.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -474,6 +486,7 @@ impl SearchArgs {
             limit: args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize),
             max_content: args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_CONTENT as u64) as usize,
             max_total: args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_TOTAL as u64) as usize,
+            subagents: args.get("subagents").and_then(|v| v.as_bool()).unwrap_or(false),
         }
     }
 }
@@ -505,13 +518,15 @@ fn execute_search(config: &Config, args: Value) -> Result<Value, Value> {
         since: parse_datetime(a.since.as_deref()),
         until: parse_datetime(a.until.as_deref()),
         types: a.types.as_deref().map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_else(|| vec!["assistant".to_string(), "user".to_string(), "summary".to_string()]),
-        lines: a.lines.as_deref().map(|l| Range::parse_ranges(l)).unwrap_or_default(),
+        subtypes: a.subtypes.as_deref().map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+        lines: a.lines.as_deref().map(Range::parse_ranges).unwrap_or_default(),
         use_regex: a.regex,
         case_sensitive: a.case_sensitive,
         offset: a.offset,
         limit: a.limit,
         max_content: a.max_content,
         max_total: a.max_total,
+        subagents: a.subagents,
     };
 
     match search(config, params) {
@@ -612,9 +627,11 @@ fn execute_projects(config: &Config) -> Result<Value, Value> {
 }
 
 fn execute_sessions(config: &Config, args: Value) -> Result<Value, Value> {
-    let project = args.get("project").and_then(|v| v.as_str());
+    // 优先级：指定 project > 从 roots 获取 > CWD 推断
+    let project = args.get("project").and_then(|v| v.as_str()).map(|s| s.to_string())
+        .or_else(|| CLIENT_PROJECT.with(|p| p.borrow().clone()));
 
-    match list_sessions(config, project) {
+    match list_sessions(config, project.as_deref()) {
         Ok(response) => Ok(serde_json::to_value(response).unwrap_or(Value::Null)),
         Err(e) => Err(serde_json::to_value(e).unwrap_or(Value::Null)),
     }

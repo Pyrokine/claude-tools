@@ -60,10 +60,11 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     })?;
 
     // 提取内容和图片
+    let (effective_type, _) = classify_message(&record);
     let content = replace_images_with_placeholders(&record);
     let images = extract_images(&record);
     let image_count = images.len();
-    let content_size = content.len();
+    let content_size = content.chars().count();
 
     // 如果指定了 output，写入文件
     if let Some(output_dir) = params.output {
@@ -72,20 +73,21 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
 
     // 如果指定了 range，返回部分内容
     if let Some((start, end)) = params.range {
-        let end = end.min(content.len());
+        let content_len = content.chars().count();
+        let end = end.min(content_len);
         let start = start.min(end);
         let partial_content = content.chars().skip(start).take(end - start).collect();
         return Ok(GetResponse::Success {
             r#ref: params.r#ref,
-            r#type: record.msg_type,
+            r#type: effective_type.to_string(),
             content: partial_content,
             content_size,
             image_count,
         });
     }
 
-    // 检查内容大小
-    const MAX_DIRECT_SIZE: usize = 100_000; // 100KB
+    // 检查内容大小（字符数）
+    const MAX_DIRECT_SIZE: usize = 100_000;
     if content_size > MAX_DIRECT_SIZE {
         return Ok(GetResponse::TooLarge {
             error: "content_too_large".to_string(),
@@ -100,7 +102,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
 
     Ok(GetResponse::Success {
         r#ref: params.r#ref,
-        r#type: record.msg_type,
+        r#type: effective_type.to_string(),
         content,
         content_size,
         image_count,
@@ -229,7 +231,7 @@ fn write_output(
             content: content_path,
             images: image_paths,
         },
-        content_size: content.len(),
+        content_size: content.chars().count(),
         image_count,
     })
 }

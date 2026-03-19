@@ -17,6 +17,7 @@ pub struct SearchParams {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
     pub types: Vec<String>,
+    pub subtypes: Vec<String>,
     pub lines: Vec<Range>,
     pub use_regex: bool,
     pub case_sensitive: bool,
@@ -24,6 +25,8 @@ pub struct SearchParams {
     pub limit: Option<usize>,
     pub max_content: usize,
     pub max_total: usize,
+    /// 是否包含 agent 子会话（默认 false）
+    pub subagents: bool,
 }
 
 impl Default for SearchParams {
@@ -36,6 +39,7 @@ impl Default for SearchParams {
             since: None,
             until: None,
             types: vec!["assistant".to_string(), "user".to_string(), "summary".to_string()],
+            subtypes: Vec::new(),
             lines: Vec::new(),
             use_regex: false,
             case_sensitive: false,
@@ -43,6 +47,7 @@ impl Default for SearchParams {
             limit: None,
             max_content: 4000,
             max_total: 40000,
+            subagents: false,
         }
     }
 }
@@ -55,7 +60,7 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
     let project_dirs = get_project_dirs(config, &params)?;
 
     // 收集所有 jsonl 文件
-    let files = collect_jsonl_files(&project_dirs, &params.sessions);
+    let files = collect_jsonl_files(&project_dirs, &params.sessions, params.subagents);
 
     // 编译正则（如果需要）
     let regex = if params.use_regex && !params.pattern.is_empty() {
@@ -76,7 +81,7 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
 
     // 解析搜索模式
     let search_pattern = if !params.use_regex && !params.pattern.is_empty() {
-        Some(parse_search_pattern(&params.pattern))
+        Some(parse_search_pattern(&params.pattern, params.case_sensitive))
     } else {
         None
     };
@@ -120,21 +125,23 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
         .collect();
 
     // 应用 max_total 限制
+    // 每条结果的 JSON 元数据（ref、session、uuid、timestamp、project 等）约 300 字符
+    const METADATA_OVERHEAD: usize = 300;
     let mut final_results = Vec::new();
     let mut total_chars = 0;
 
     for mut result in results {
-        // 截断单条内容
-        let (content, truncated) = truncate_content(&result.content, params.max_content);
+        // 截断单条内容（围绕匹配位置居中）
+        let (content, truncated) = truncate_around_match(&result.content, result.match_pos, params.max_content);
         result.content = content;
         result.truncated = truncated || result.truncated;
 
-        let result_chars = result.content.len();
-        if total_chars + result_chars > params.max_total && !final_results.is_empty() {
+        let result_size = result.content.chars().count() + METADATA_OVERHEAD;
+        if total_chars + result_size > params.max_total && !final_results.is_empty() {
             break;
         }
 
-        total_chars += result_chars;
+        total_chars += result_size;
         final_results.push(result);
     }
 
@@ -199,10 +206,20 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
     })
 }
 
+/// 检查 session 是否匹配过滤条件
+fn session_matches_filter(session_id: &str, sessions: &[String]) -> bool {
+    if sessions.is_empty() {
+        return true;
+    }
+    let prefix = ref_prefix(session_id);
+    sessions.iter().any(|s| s == session_id || s == &prefix)
+}
+
 /// 收集所有 jsonl 文件
 fn collect_jsonl_files(
     project_dirs: &[(String, PathBuf)],
     sessions: &[String],
+    include_subagents: bool,
 ) -> Vec<(String, String, PathBuf)> {
     let mut files = Vec::new();
 
@@ -212,20 +229,19 @@ fn collect_jsonl_files(
                 let path = entry.path();
                 if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
                     if let Some(session_id) = session_id_from_filename(&entry.file_name().to_string_lossy()) {
-                        // 过滤 sessions
-                        if !sessions.is_empty() {
-                            let prefix = ref_prefix(&session_id);
-                            if !sessions.iter().any(|s| s == &session_id || s == &prefix) {
-                                continue;
-                            }
+                        if session_matches_filter(&session_id, sessions) {
+                            files.push((project_id.clone(), session_id, path));
                         }
-                        files.push((project_id.clone(), session_id, path));
                     }
                 }
             }
         }
 
-        // 也搜索 subagents 目录
+        if !include_subagents {
+            continue;
+        }
+
+        // subagents 目录
         let subagents_pattern = dir.join("*/subagents");
         if let Ok(entries) = glob::glob(&subagents_pattern.to_string_lossy()) {
             for subdir in entries.flatten() {
@@ -236,14 +252,9 @@ fn collect_jsonl_files(
                             let filename = entry.file_name().to_string_lossy().to_string();
                             if filename.starts_with("agent-") {
                                 let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
-                                // 过滤 sessions
-                                if !sessions.is_empty() {
-                                    let prefix = ref_prefix(&session_id);
-                                    if !sessions.iter().any(|s| s == &session_id || s == &prefix) {
-                                        continue;
-                                    }
+                                if session_matches_filter(&session_id, sessions) {
+                                    files.push((project_id.clone(), session_id, path));
                                 }
-                                files.push((project_id.clone(), session_id, path));
                             }
                         }
                     }
@@ -295,8 +306,16 @@ fn search_file(
             Err(_) => continue,
         };
 
-        // 类型过滤
-        if !params.types.iter().any(|t| t == &record.msg_type) {
+        // 类型分类
+        let (effective_type, subtype) = classify_message(&record);
+
+        // 类型过滤（使用分类后的 effective_type）
+        if !params.types.iter().any(|t| t == effective_type) {
+            continue;
+        }
+
+        // 子类型过滤
+        if !params.subtypes.is_empty() && !params.subtypes.iter().any(|s| s == subtype) {
             continue;
         }
 
@@ -309,14 +328,18 @@ fn search_file(
         let content = replace_images_with_placeholders(&record);
 
         // 内容匹配
-        let matches = if params.pattern.is_empty() {
-            true
+        let (matches, match_pos) = if params.pattern.is_empty() {
+            (true, None)
         } else if let Some(regex) = regex {
-            matches_regex(&content, regex)
+            if let Some(m) = regex.find(&content) {
+                (true, Some(content[..m.start()].chars().count()))
+            } else {
+                (false, None)
+            }
         } else if let Some(pattern) = pattern {
             matches_pattern(&content, pattern, params.case_sensitive)
         } else {
-            true
+            (true, None)
         };
 
         if !matches {
@@ -326,14 +349,15 @@ fn search_file(
         // 提取图片信息
         let images = extract_images(&record);
         let image_count = images.len();
-        let content_size = content.len();
+        let content_size = content.chars().count();
 
         results.push(SearchResult {
             r#ref: format!("{}:{}", prefix, line_num),
             session: session_id.to_string(),
             line: line_num,
             uuid: record.uuid,
-            r#type: record.msg_type,
+            r#type: effective_type.to_string(),
+            subtype: subtype.to_string(),
             timestamp: record.timestamp,
             content,
             content_size,
@@ -341,6 +365,7 @@ fn search_file(
             image_count,
             images,
             project: project_id.to_string(),
+            match_pos,
         });
     }
 

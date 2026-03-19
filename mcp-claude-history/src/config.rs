@@ -23,14 +23,9 @@ impl Config {
     /// 获取当前项目 ID（从 CWD 推断）
     pub fn current_project_id(&self) -> Option<String> {
         let cwd = env::current_dir().ok()?;
-        let cwd_str = cwd.to_string_lossy()
-            .replace('\\', "-")
-            .replace('/', "-")
-            .replace(':', "-");
-        // On Linux, paths start with / which becomes -, so the ID naturally starts with -
-        // On Windows, paths start with a drive letter (e.g. D:), so no leading - is added
-        // Claude Code uses the same conversion, so just use the result directly
-        let project_id = cwd_str;
+        // Claude Code 的转换规则：/、\、:、_ 都变成 -
+        let project_id = cwd.to_string_lossy()
+            .replace(['\\', '/', ':', '_'], "-");
 
         // 检查该项目目录是否存在
         if self.projects_dir.join(&project_id).exists() {

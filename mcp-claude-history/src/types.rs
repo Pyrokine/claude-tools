@@ -11,6 +11,12 @@ pub struct MessageRecord {
     pub timestamp: String,
     #[serde(default)]
     pub message: Option<serde_json::Value>,
+    /// 上下文压缩产生的摘要消息（raw type 为 user，但逻辑类型应为 summary）
+    #[serde(default)]
+    pub is_compact_summary: bool,
+    /// CLI 命令产生的 meta 消息
+    #[serde(default)]
+    pub is_meta: bool,
 }
 
 /// 搜索结果中的单条消息
@@ -21,6 +27,7 @@ pub struct SearchResult {
     pub line: usize,
     pub uuid: String,
     pub r#type: String,
+    pub subtype: String,
     pub timestamp: String,
     pub content: String,
     pub content_size: usize,
@@ -29,6 +36,9 @@ pub struct SearchResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageInfo>,
     pub project: String,
+    /// 匹配位置（字符偏移），用于截断时居中显示上下文
+    #[serde(skip)]
+    pub match_pos: Option<usize>,
 }
 
 /// 图片信息
@@ -101,6 +111,7 @@ pub struct ContextResponse {
 pub struct ContextMessage {
     pub r#ref: String,
     pub r#type: String,
+    pub subtype: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_anchor: Option<bool>,
@@ -130,6 +141,8 @@ pub struct SessionInfo {
     pub start_time: String,
     pub end_time: String,
     pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 /// 会话列表响应

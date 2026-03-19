@@ -34,9 +34,17 @@ impl Default for ContextParams {
     }
 }
 
+/// 消息 + 分类信息
+struct ClassifiedMessage {
+    line_num: usize,
+    effective_type: &'static str,
+    subtype: &'static str,
+    content: String,
+}
+
 /// 检查消息类型是否匹配
-fn matches_types(msg_type: &str, types: &[String]) -> bool {
-    types.is_empty() || types.iter().any(|t| t == msg_type)
+fn matches_types(effective_type: &str, types: &[String]) -> bool {
+    types.is_empty() || types.iter().any(|t| t == effective_type)
 }
 
 /// 获取上下文
@@ -61,8 +69,8 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     let reader = BufReader::new(file);
     let prefix = ref_prefix(&session_id);
 
-    // 收集所有消息
-    let mut all_messages: Vec<(usize, MessageRecord, String)> = Vec::new();
+    // 收集所有消息（带分类信息）
+    let mut all_messages: Vec<ClassifiedMessage> = Vec::new();
     let mut anchor_idx = None;
 
     for (line_num, line) in reader.lines().enumerate() {
@@ -77,8 +85,14 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             Err(_) => continue,
         };
 
+        let (effective_type, subtype) = classify_message(&record);
         let content = replace_images_with_placeholders(&record);
-        all_messages.push((line_num, record, content));
+        all_messages.push(ClassifiedMessage {
+            line_num,
+            effective_type,
+            subtype,
+            content,
+        });
 
         if line_num == parsed_ref.line {
             anchor_idx = Some(all_messages.len() - 1);
@@ -95,20 +109,18 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     let (start_idx, end_idx) = if let Some(until_type) = &params.until_type {
         // until_type 模式：遇到指定类型就停止
         if params.direction == "backward" {
-            // 向前查找
             let mut start = anchor_idx;
             for i in (0..anchor_idx).rev() {
-                if all_messages[i].1.msg_type == *until_type {
+                if all_messages[i].effective_type == until_type.as_str() {
                     start = i;
                     break;
                 }
             }
             (start, anchor_idx + 1)
         } else {
-            // 向后查找
             let mut end = anchor_idx + 1;
-            for i in (anchor_idx + 1)..all_messages.len() {
-                if all_messages[i].1.msg_type == *until_type {
+            for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
+                if msg.effective_type == until_type.as_str() {
                     end = i + 1;
                     break;
                 }
@@ -120,12 +132,11 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         let before = params.before.unwrap_or(0);
         let after = params.after.unwrap_or(0);
 
-        // 向前查找 before 条匹配类型的消息
         let mut start = anchor_idx;
         if before > 0 {
             let mut count = 0;
             for i in (0..anchor_idx).rev() {
-                if matches_types(&all_messages[i].1.msg_type, &params.types) {
+                if matches_types(all_messages[i].effective_type, &params.types) {
                     count += 1;
                     start = i;
                     if count >= before {
@@ -135,12 +146,11 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             }
         }
 
-        // 向后查找 after 条匹配类型的消息
         let mut end = anchor_idx + 1;
         if after > 0 {
             let mut count = 0;
-            for i in (anchor_idx + 1)..all_messages.len() {
-                if matches_types(&all_messages[i].1.msg_type, &params.types) {
+            for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
+                if matches_types(msg.effective_type, &params.types) {
                     count += 1;
                     end = i + 1;
                     if count >= after {
@@ -158,27 +168,25 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     let mut total_chars = 0;
     let mut truncated_by_total = false;
 
-    for i in start_idx..end_idx {
-        let (line_num, record, content) = &all_messages[i];
-
-        // 类型过滤（anchor 始终包含）
+    for (i, msg) in all_messages.iter().enumerate().take(end_idx).skip(start_idx) {
         let is_anchor = i == anchor_idx;
-        if !is_anchor && !matches_types(&record.msg_type, &params.types) {
+        if !is_anchor && !matches_types(msg.effective_type, &params.types) {
             continue;
         }
 
-        let (truncated_content, _) = truncate_content(content, params.max_content);
+        let (truncated_content, _) = truncate_content(&msg.content, params.max_content);
+        let truncated_len = truncated_content.chars().count();
 
-        // max_total 限制
-        if total_chars + truncated_content.len() > params.max_total {
+        if total_chars + truncated_len > params.max_total {
             truncated_by_total = true;
             break;
         }
-        total_chars += truncated_content.len();
+        total_chars += truncated_len;
 
         messages.push(ContextMessage {
-            r#ref: format!("{}:{}", prefix, line_num),
-            r#type: record.msg_type.clone(),
+            r#ref: format!("{}:{}", prefix, msg.line_num),
+            r#type: msg.effective_type.to_string(),
+            subtype: msg.subtype.to_string(),
             content: truncated_content,
             is_anchor: if is_anchor { Some(true) } else { None },
         });

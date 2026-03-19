@@ -51,8 +51,8 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
         let meta = entry.metadata().ok();
         let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
-        // 统计行数并获取时间范围
-        let (line_count, start_time, end_time) = get_session_stats(&path);
+        // 统计行数并获取时间范围和主题
+        let (line_count, start_time, end_time, topic) = get_session_stats(&path);
 
         sessions.push(SessionInfo {
             id: session_id.clone(),
@@ -61,6 +61,7 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
             start_time,
             end_time,
             size_bytes,
+            topic,
         });
     }
 
@@ -74,16 +75,17 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
 }
 
 /// 获取会话统计信息
-fn get_session_stats(path: &std::path::Path) -> (usize, String, String) {
+fn get_session_stats(path: &std::path::Path) -> (usize, String, String, Option<String>) {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return (0, String::new(), String::new()),
+        Err(_) => return (0, String::new(), String::new(), None),
     };
 
     let reader = BufReader::new(file);
     let mut line_count = 0;
     let mut start_time = String::new();
     let mut end_time = String::new();
+    let mut topic: Option<String> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -97,9 +99,45 @@ fn get_session_stats(path: &std::path::Path) -> (usize, String, String) {
             if start_time.is_empty() {
                 start_time = record.timestamp.clone();
             }
-            end_time = record.timestamp;
+            end_time = record.timestamp.clone();
+
+            // 提取首条 user 消息作为 topic（跳过 summary 和 meta）
+            if topic.is_none() && record.msg_type == "user"
+                && !record.is_compact_summary && !record.is_meta
+            {
+                if let Some(text) = extract_topic_text(&record) {
+                    if !text.is_empty() {
+                        let preview: String = text.chars().take(100).collect();
+                        topic = Some(if text.chars().count() > 100 {
+                            format!("{}...", preview)
+                        } else {
+                            preview
+                        });
+                    }
+                }
+            }
         }
     }
 
-    (line_count, start_time, end_time)
+    (line_count, start_time, end_time, topic)
+}
+
+/// 从消息记录中提取文本内容（用于生成会话主题）
+fn extract_topic_text(record: &MessageRecord) -> Option<String> {
+    let message = record.message.as_ref()?;
+    let content = message.get("content")?;
+
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+
+    if let Some(arr) = content.as_array() {
+        for item in arr {
+            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+
+    None
 }
