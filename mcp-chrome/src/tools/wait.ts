@@ -26,7 +26,9 @@ const waitSchema = z.object({
                                     '目标元素（for=element 时必填；navigation/time/idle 不需要）'),
                                 state: z.enum(['visible', 'hidden', 'attached', 'detached']).optional().describe(
                                     '元素状态（element）'),
-                                ms: z.number().optional().describe('毫秒（time）'),
+                                ms: z.number()
+                                     .optional()
+                                     .describe('毫秒（time：等待时长；idle：DOM mutation 静默期，默认 500ms）'),
                                 tabId: z.string().optional().describe(
                                     '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
                                 timeout: z.number().optional().describe('超时'),
@@ -190,10 +192,13 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
 
                     case 'idle': {
                         if (mode === 'extension') {
-                            // Extension 模式：等待 document.readyState === 'complete' + 额外网络静默期
+                            // Extension 模式：readyState complete + DOM mutation 静默检测
                             const idleStart                 = Date.now()
+                            const quietPeriod               = args.ms ?? 500
                             let idleCompleted               = false
                             let idleLastError: Error | null = null
+
+                            // Phase 1: 等待 readyState === 'complete'
                             while (Date.now() - idleStart < timeout) {
                                 if (!unifiedSession.isExtensionConnected()) {
                                     idleLastError = new Error('Extension 未连接')
@@ -207,7 +212,6 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                         undefined,
                                         remaining,
                                     )
-                                    // evaluate 带 timeout 时，Extension 断连会静默回退 CDP，返回错误 tab 的数据
                                     if (!unifiedSession.isExtensionConnected()) {
                                         idleLastError = new Error('Extension 在 evaluate 期间断开')
                                         await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
@@ -223,17 +227,68 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
                             }
                             if (!idleCompleted) {
-                                const msg = `等待网络空闲超时 (${timeout}ms)`
+                                const msg = `等待页面加载超时 (${timeout}ms)`
                                 throw new TimeoutError(idleLastError ? `${msg}: ${idleLastError.message}` : msg)
                             }
-                            // 额外等待确保网络请求结束，受 timeout 约束
-                            const idleRemaining = timeout - (Date.now() - idleStart)
-                            if (idleRemaining > 0) {
-                                await new Promise(resolve => setTimeout(resolve, Math.min(500, idleRemaining)))
+
+                            // Phase 2: DOM mutation 静默检测
+                            // 注入 MutationObserver，等待 quietPeriod 毫秒内无 DOM 变更
+                            const mutationRemaining = timeout - (Date.now() - idleStart)
+                            if (mutationRemaining > quietPeriod) {
+                                try {
+                                    const domStable = await unifiedSession.evaluate<boolean>(
+                                        `(function(quietMs, timeoutMs) {
+                                            return new Promise(function(resolve) {
+                                                var startTime = Date.now();
+                                                var lastMutation = Date.now();
+                                                var observer = new MutationObserver(function() {
+                                                    lastMutation = Date.now();
+                                                });
+                                                observer.observe(document.body, {
+                                                    childList: true,
+                                                    subtree: true,
+                                                    characterData: true
+                                                });
+                                                var check = function() {
+                                                    var elapsed = Date.now() - lastMutation;
+                                                    if (elapsed >= quietMs) {
+                                                        observer.disconnect();
+                                                        resolve(true);
+                                                    } else if (Date.now() - startTime + quietMs > timeoutMs) {
+                                                        observer.disconnect();
+                                                        resolve(false);
+                                                    } else {
+                                                        setTimeout(check, Math.min(100, quietMs - elapsed));
+                                                    }
+                                                };
+                                                setTimeout(check, quietMs);
+                                            });
+                                        })`,
+                                        undefined,
+                                        mutationRemaining,
+                                        [quietPeriod, mutationRemaining],
+                                    )
+                                    return formatResponse({
+                                                              success: true,
+                                                              waited: 'idle',
+                                                              domStable,
+                                                              mode,
+                                                          })
+                                } catch {
+                                    // evaluate 超时或断连——降级返回 domStable: false（readyState 已 complete）
+                                    return formatResponse({
+                                                              success: true,
+                                                              waited: 'idle',
+                                                              domStable: false,
+                                                              mode,
+                                                          })
+                                }
                             }
+
                             return formatResponse({
                                                       success: true,
                                                       waited: 'idle',
+                                                      domStable: false,
                                                       mode,
                                                   })
                         }

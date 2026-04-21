@@ -6,9 +6,9 @@
 
 import type {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js'
 import {randomUUID} from 'crypto'
-import {writeFile} from 'fs/promises'
+import {readFile, writeFile} from 'fs/promises'
 import {tmpdir} from 'os'
-import {join} from 'path'
+import {join, resolve, sep} from 'path'
 import {z} from 'zod'
 import {formatErrorResponse, formatResponse, getUnifiedSession} from '../core/index.js'
 
@@ -16,7 +16,9 @@ import {formatErrorResponse, formatResponse, getUnifiedSession} from '../core/in
  * evaluate 参数 schema
  */
 const evaluateSchema = z.object({
-                                    script: z.string().describe('JavaScript 代码'),
+                                    script: z.string().optional().describe('JavaScript 代码（与 scriptFile 二选一）'),
+                                    scriptFile: z.string().optional().describe(
+                                        '从文件读取 JavaScript 代码（与 script 二选一），指定后忽略 script 参数，路径限制在当前工作目录内'),
                                     args: z.array(z.unknown()).optional().describe(
                                         '传递给脚本的参数。使用时 script 必须是函数表达式，如 "(x, y) => x + y"，参数通过 IIFE 调用传入'),
                                     output: z.string()
@@ -42,10 +44,25 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
     try {
         const unifiedSession = getUnifiedSession()
 
+        // scriptFile: 从文件读取脚本内容（限制在 cwd 内，防止路径穿越）
+        let script = args.script
+        if (args.scriptFile) {
+            const cwd      = process.cwd()
+            const safePath = resolve(cwd, args.scriptFile)
+            // 用尾部分隔符确保是路径边界，防止前缀同名目录绕过（如 ../cwd-evil/x.js）
+            if (!safePath.startsWith(cwd + sep) && safePath !== cwd) {
+                throw new Error(`scriptFile 路径超出工作目录范围: ${args.scriptFile}`)
+            }
+            script = await readFile(safePath, 'utf-8')
+        }
+        if (!script) {
+            throw new Error('script 或 scriptFile 必须提供其一')
+        }
+
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
                 const result           = await unifiedSession.evaluate(
-                    args.script,
+                    script,
                     args.mode,
                     args.timeout,
                     args.args as unknown[],

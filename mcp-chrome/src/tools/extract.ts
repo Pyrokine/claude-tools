@@ -62,6 +62,8 @@ const extractSchema = z.object({
                                             .describe('输出文件路径（可选）。若指定，结果写入文件；否则返回内容。images=data 时作为输出目录路径'),
                                    tabId: z.string().optional().describe(
                                        '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
+                                   depth: z.number().optional().describe(
+                                       'DOM 遍历深度限制（state），默认 15，减小可降低返回数据量'),
                                    timeout: z.number().optional().describe('等待目标元素超时'),
                                    frame: z.union([z.string(), z.number()]).optional().describe(
                                        'iframe 定位（可选，仅 Extension 模式）。CSS 选择器（如 "iframe#main"）或索引（如 0）。不指定则在主框架操作'),
@@ -333,7 +335,17 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                             }
                         }
 
-                        const state = await unifiedSession.readPage(refId ? { refId } : undefined)
+                        const readPageOptions: { refId?: string; depth?: number } = {}
+                        if (refId) {
+                            readPageOptions.refId = refId
+                        }
+                        if (args.depth !== undefined) {
+                            readPageOptions.depth = args.depth
+                        }
+
+                        const state = await unifiedSession.readPage(
+                            Object.keys(readPageOptions).length > 0 ? readPageOptions : undefined,
+                        )
                         if (args.output) {
                             await writeOutputFile(args.output, JSON.stringify(state, null, 2), 'utf-8')
                             return formatResponse({
@@ -831,6 +843,23 @@ async function extractAttribute(
     timeout?: number,
 ): Promise<string | null> {
     const locator = session.createLocator(target, timeout !== undefined ? { timeout } : undefined)
+
+    // computed style: computed:color → getComputedStyle(el).color
+    if (attribute.startsWith('computed:')) {
+        const prop = attribute.slice('computed:'.length)
+        if (prop === '*') {
+            return locator.evaluateOn<string>(`function() {
+        var cs = window.getComputedStyle(this);
+        var obj = {};
+        for (var i = 0; i < cs.length; i++) { obj[cs[i]] = cs.getPropertyValue(cs[i]); }
+        return JSON.stringify(obj);
+      }`)
+        }
+        return locator.evaluateOn<string | null>(`function() {
+      return window.getComputedStyle(this).getPropertyValue(${JSON.stringify(prop)});
+    }`)
+    }
+
     // 使用 JSON.stringify 安全转义属性名，防止 JS 注入
     return locator.evaluateOn<string | null>(`function() {
     return this.getAttribute(${JSON.stringify(attribute)});
@@ -928,6 +957,12 @@ async function extractAttributeExtension(
 ): Promise<string | null> {
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
 
+    // computed style: computed:color → getComputedStyle(el)
+    if (attribute.startsWith('computed:')) {
+        const prop = attribute.slice('computed:'.length)
+        return extractComputedStyleExtension(unifiedSession, selector, text, xpath, nthParam ?? 0, prop)
+    }
+
     // xpath/text 定位需要先 find 得到 refId，再获取属性
     if (xpath || text) {
         const elements = await unifiedSession.find(selector, text, xpath)
@@ -953,6 +988,27 @@ async function extractAttributeExtension(
     }
 
     return null
+}
+
+/**
+ * Extension 模式：提取 computed style
+ */
+async function extractComputedStyleExtension(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    selector: string | undefined,
+    text: string | undefined,
+    xpath: string | undefined,
+    nth: number,
+    prop: string,
+): Promise<string | null> {
+    const elements = await unifiedSession.find(selector, text, xpath)
+    if (elements.length === 0 || nth >= elements.length) {
+        return null
+    }
+    const refId = elements[nth].refId
+
+    // 通过 Extension ISOLATED 世界执行（访问 __mcpElementMap），避免 MAIN 世界找不到 refId
+    return unifiedSession.getComputedStyle(refId, prop)
 }
 
 /**
@@ -1012,7 +1068,7 @@ async function waitForTargetExtension(
  */
 export function registerExtractTool(server: McpServer): void {
     server.registerTool('extract', {
-        description: '提取页面内容：文本、HTML（可附带图片）、属性、截图、状态、页面元信息',
+        description: `提取页面内容：文本、HTML（可附带图片）、属性、截图、状态、页面元信息`,
         inputSchema: extractSchema,
     }, (args) => handleExtract(args))
 }

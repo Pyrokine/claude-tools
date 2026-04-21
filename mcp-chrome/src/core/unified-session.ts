@@ -328,6 +328,58 @@ class UnifiedSessionManager {
     }
 
     /**
+     * 带 actionability 检查的点击（Extension 模式）
+     *
+     * 返回结构化结果，让调用方知道操作是否真正生效
+     */
+    async actionableClick(refId: string, force?: boolean): Promise<{
+        success: boolean;
+        error?: string;
+        reason?: string;
+        coveringElement?: string;
+    }> {
+        if (await this.ensureExtensionConnected()) {
+            return this.extensionBridge!.actionableClick(refId, force)
+        }
+        throw new Error('actionableClick 仅支持 Extension 模式')
+    }
+
+    /**
+     * 检查元素可操作性（Extension 模式）
+     */
+    async checkActionability(refId: string): Promise<{
+        actionable: boolean;
+        reason?: string;
+        coveringElement?: string;
+        rect?: { x: number; y: number; width: number; height: number };
+    }> {
+        if (await this.ensureExtensionConnected()) {
+            return this.extensionBridge!.checkActionability(refId)
+        }
+        throw new Error('checkActionability 仅支持 Extension 模式')
+    }
+
+    /**
+     * dispatch 模式输入（ISOLATED 世界，兼容 React/Vue 受控组件）
+     */
+    async dispatchInput(refId: string, text: string): Promise<{ success: boolean; error?: string }> {
+        if (await this.ensureExtensionConnected()) {
+            return this.extensionBridge!.dispatchInput(refId, text)
+        }
+        throw new Error('dispatchInput 仅支持 Extension 模式')
+    }
+
+    /**
+     * 获取元素 computed style（ISOLATED 世界）
+     */
+    async getComputedStyle(refId: string, prop: string): Promise<string | null> {
+        if (await this.ensureExtensionConnected()) {
+            return this.extensionBridge!.getComputedStyle(refId, prop)
+        }
+        throw new Error('getComputedStyle 仅支持 Extension 模式')
+    }
+
+    /**
      * 输入文本
      */
     async type(refId: string, text: string, clear = false): Promise<void> {

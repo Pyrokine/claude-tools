@@ -230,6 +230,56 @@ export class ExtensionBridge {
         }
     }
 
+    async actionableClick(refId: string, force?: boolean): Promise<{
+        success: boolean;
+        error?: string;
+        reason?: string;
+        coveringElement?: string;
+    }> {
+        return await this.httpServer.sendCommand('actionable_click', {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId || undefined,
+            refId,
+            force: force ?? false,
+        }) as { success: boolean; error?: string; reason?: string; coveringElement?: string }
+    }
+
+    async checkActionability(refId: string): Promise<{
+        actionable: boolean;
+        reason?: string;
+        coveringElement?: string;
+        rect?: { x: number; y: number; width: number; height: number };
+    }> {
+        return await this.httpServer.sendCommand('check_actionability', {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId || undefined,
+            refId,
+        }) as {
+            actionable: boolean;
+            reason?: string;
+            coveringElement?: string;
+            rect?: { x: number; y: number; width: number; height: number }
+        }
+    }
+
+    async dispatchInput(refId: string, text: string): Promise<{ success: boolean; error?: string }> {
+        return await this.httpServer.sendCommand('dispatch_input', {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId || undefined,
+            refId,
+            text,
+        }) as { success: boolean; error?: string }
+    }
+
+    async getComputedStyle(refId: string, prop: string): Promise<string | null> {
+        return await this.httpServer.sendCommand('get_computed_style', {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId || undefined,
+            refId,
+            prop,
+        }) as string | null
+    }
+
     async type(refId: string, text: string, clear = false): Promise<void> {
         const result = await this.httpServer.sendCommand('type', {
             tabId: this.currentTabId,

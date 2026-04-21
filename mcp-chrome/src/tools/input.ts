@@ -40,6 +40,10 @@ const inputEventSchema = z.object({
                                       find: z.string().optional().describe('要查找并选中的文本（select/replace）'),
                                       nth: z.number().optional().describe(
                                           '第 N 个匹配（select/replace，从 0 开始，默认 0 即第一个）'),
+                                      dispatch: z.boolean().optional().describe(
+                                          '使用 dispatch 模式输入（type），直接设置 value 并触发 input/change 事件，兼容 React/Vue 等框架的受控组件，默认 false 使用键盘事件'),
+                                      force: z.boolean().optional().describe(
+                                          '强制执行（click），跳过可操作性检查（可见性、遮挡检测等），直接在目标元素上触发事件，用于已知需要绕过检查的场景'),
                                   })
 
 /**
@@ -380,6 +384,33 @@ async function executeEventExtension(
 
         case 'click': {
             if (event.target) {
+                // 坐标型 target：不过 actionableClick，但仍需 getTargetPointExtension 做 iframe offset 修正
+                if ('x' in event.target && 'y' in event.target) {
+                    const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+                    await unifiedSession.mouseMove(point.x, point.y)
+                    await unifiedSession.mouseClick(event.button ?? 'left')
+                    break
+                }
+                // 优先使用 actionable click（带可操作性检查、自动滚动、遮挡检测）
+                const { selector, text: searchText, xpath, nth: nthParam } = targetToFindParams(
+                    event.target as Target & { nth?: number },
+                )
+                const elements                                             = await unifiedSession.find(
+                    selector,
+                    searchText,
+                    xpath,
+                    timeout,
+                )
+                const nth                                                  = nthParam ?? 0
+                if (elements.length > 0 && nth < elements.length) {
+                    const refId  = elements[nth].refId
+                    const result = await unifiedSession.actionableClick(refId, event.force)
+                    if (!result.success) {
+                        throw new Error(result.error || 'Click failed')
+                    }
+                    break
+                }
+                // fallback: 找不到 refId 时用坐标方式
                 const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
                 await unifiedSession.mouseMove(point.x, point.y)
             }
@@ -456,6 +487,40 @@ async function executeEventExtension(
                 throw new Error('type 事件需要 text 参数')
             }
 
+            // dispatch 模式：直接设置 value + 触发事件（兼容 React/Vue 受控组件）
+            if (event.dispatch) {
+                // 定位目标元素
+                if (!event.target) {
+                    throw new Error('dispatch 模式需要 target 参数定位输入元素')
+                }
+                if ('x' in event.target && 'y' in event.target) {
+                    throw new Error('dispatch 模式不支持坐标型 target，请使用 CSS 选择器、role 或文本定位')
+                }
+                const { selector, text: searchText, xpath, nth: nthParam } = targetToFindParams(
+                    event.target as Target & { nth?: number },
+                )
+                const elements                                             = await unifiedSession.find(
+                    selector,
+                    searchText,
+                    xpath,
+                    timeout,
+                )
+                const nth                                                  = nthParam ?? 0
+                if (elements.length === 0 || nth >= elements.length) {
+                    throw new Error('目标元素未找到')
+                }
+                const refId = elements[nth].refId
+
+                // 通过 Extension ISOLATED 世界执行 dispatch（访问 __mcpElementMap）
+                // 参考 Playwright fill()：nativeInputValueSetter + dispatchEvent
+                const result = await unifiedSession.dispatchInput(refId, event.text)
+                if (!result.success) {
+                    throw new Error(result.error || 'dispatch 输入失败')
+                }
+                break
+            }
+
+            // 默认模式：键盘事件
             // 如果有 target，先点击目标（聚焦）
             if (event.target) {
                 const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
@@ -721,6 +786,9 @@ async function executeEvent(
             if (!event.text) {
                 throw new Error('type 事件需要 text 参数')
             }
+            if (event.dispatch) {
+                throw new Error('dispatch 模式需要 Extension 连接，当前为 CDP 模式')
+            }
             // 如果有 target，先点击目标（聚焦），使用 input 等待类型
             if (event.target) {
                 await moveToTarget(session, event.target, humanize, timeout, undefined, 'input')
@@ -827,6 +895,11 @@ async function getTargetPoint(
 export function registerInputTool(server: McpServer): void {
     server.registerTool('input', {
         description: `键鼠输入：键盘、鼠标及任意组合
+
+推荐操作顺序：
+1. 先用 extract type=state 或 type=html 了解页面结构
+2. 用 CSS 选择器 + nth 精确定位元素（避免坐标点击）
+3. 再 input click/type 操作目标元素
 
 组合键需拆分为独立事件。示例（Ctrl+A 全选）：
   events: [

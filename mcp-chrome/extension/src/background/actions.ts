@@ -130,6 +130,10 @@ export class ActionHandler {
 
         // DOM 操作
         this.actions.set('click', this.click.bind(this))
+        this.actions.set('actionable_click', this.actionableClick.bind(this))
+        this.actions.set('check_actionability', this.checkActionabilityAction.bind(this))
+        this.actions.set('dispatch_input', this.dispatchInputAction.bind(this))
+        this.actions.set('get_computed_style', this.getComputedStyleAction.bind(this))
         this.actions.set('type', this.type.bind(this))
         this.actions.set('scroll', this.scroll.bind(this))
         this.actions.set('evaluate', this.evaluate.bind(this))
@@ -755,6 +759,133 @@ export class ActionHandler {
                                                              })
 
         return results[0].result as { success: boolean }
+    }
+
+    private async actionableClick(params: unknown): Promise<{
+        success: boolean;
+        error?: string;
+        reason?: string;
+        coveringElement?: string;
+    }> {
+        const p = params as ClickParams & { force?: boolean }
+        if (!p?.refId) {
+            throw new Error('refId is required')
+        }
+
+        const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
+
+        // 渐进退避重试（参考 Playwright dom.ts:300）
+        const delays                                                                                           = [
+            0,
+            20,
+            100,
+            100,
+            500,
+        ]
+        let lastResult: { success: boolean; error?: string; reason?: string; coveringElement?: string } | null = null
+        for (let attempt = 0; attempt <= delays.length; attempt++) {
+            if (attempt > 0) {
+                await new Promise(resolve => setTimeout(resolve, delays[attempt - 1]))
+            }
+
+            const results = await chrome.scripting.executeScript({
+                                                                     target: {
+                                                                         tabId,
+                                                                         frameIds: [
+                                                                             (p as { frameId?: number })?.frameId ??
+                                                                             0,
+                                                                         ],
+                                                                     },
+                                                                     func: performActionableClick,
+                                                                     args: [p.refId, p.force ?? false],
+                                                                 })
+
+            lastResult = results[0].result as {
+                success: boolean;
+                error?: string;
+                reason?: string;
+                coveringElement?: string;
+            }
+
+            if (lastResult.success) {
+                return lastResult
+            }
+
+            // 不可恢复的错误：不重试
+            if (lastResult.reason === 'not-connected' ||
+                lastResult.reason === 'not-enabled' ||
+                lastResult.reason === 'pointer-events-none') {
+                return lastResult
+            }
+
+            // 可恢复的错误（covered / not-in-viewport / not-visible）：继续重试
+        }
+
+        // 所有重试耗尽，直接使用最后一次结果（避免额外 IPC 调用）
+        return {
+            success: false,
+            error: lastResult?.reason === 'covered'
+                   ? `Element is covered by ${lastResult.coveringElement} after ${delays.length} retries`
+                   : `Element not actionable: ${lastResult?.reason} after ${delays.length} retries`,
+            reason: lastResult?.reason,
+            coveringElement: lastResult?.coveringElement,
+        }
+    }
+
+    private async checkActionabilityAction(params: unknown): Promise<ActionabilityResult> {
+        const p = params as { refId: string; tabId?: string; frameId?: number }
+        if (!p?.refId) {
+            throw new Error('refId is required')
+        }
+
+        const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
+
+        const results = await chrome.scripting.executeScript({
+                                                                 target: {
+                                                                     tabId,
+                                                                     frameIds: [p.frameId ?? 0],
+                                                                 },
+                                                                 func: checkActionability,
+                                                                 args: [p.refId],
+                                                             })
+
+        return results[0].result as ActionabilityResult
+    }
+
+    private async dispatchInputAction(params: unknown): Promise<{ success: boolean; error?: string }> {
+        const p = params as { refId: string; text: string; tabId?: string; frameId?: number }
+        if (!p?.refId) {
+            throw new Error('refId is required')
+        }
+
+        const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
+
+        const results = await chrome.scripting.executeScript({
+                                                                 target: { tabId, frameIds: [p.frameId ?? 0] },
+                                                                 func: dispatchInputToElement,
+                                                                 args: [p.refId, p.text ?? ''],
+                                                             })
+        return results[0].result as { success: boolean; error?: string }
+    }
+
+    private async getComputedStyleAction(params: unknown): Promise<string | null> {
+        const p = params as { refId: string; prop: string; tabId?: string; frameId?: number }
+        if (!p?.refId) {
+            throw new Error('refId is required')
+        }
+
+        const tabId = await this.getTargetTabId(p.tabId)
+        await this.assertScriptable(tabId)
+
+        const results = await chrome.scripting.executeScript({
+                                                                 target: { tabId, frameIds: [p.frameId ?? 0] },
+                                                                 func: getComputedStyleFromElement,
+                                                                 args: [p.refId, p.prop ?? ''],
+                                                             })
+        return results[0].result as string | null
     }
 
     private async type(params: unknown): Promise<{ success: boolean }> {
@@ -3097,4 +3228,295 @@ function injectStealthScripts(): void {
     }
 
     console.log('[MCP Stealth] Anti-detection scripts injected')
+}
+
+// ==================== Actionability 检查 ====================
+// 参考 Playwright 的 actionability 模型，在交互前验证元素可操作性
+
+interface ActionabilityResult {
+    actionable: boolean
+    reason?: 'not-connected' | 'not-visible' | 'not-enabled' |
+             'covered' | 'pointer-events-none' | 'not-in-viewport'
+    coveringElement?: string
+    rect?: { x: number; y: number; width: number; height: number }
+}
+
+/**
+ * 检查元素可操作性（注入到页面执行）
+ *
+ * 检查顺序（参考 Playwright injectedScript.ts:640-657）：
+ * 1. Connected — 元素仍在 DOM 中
+ * 2. Visible — 非零尺寸 + visibility !== hidden + opacity > 0（含父链）
+ * 3. Enabled — 无 disabled + 无 aria-disabled
+ * 4. Pointer-events — 非 pointer-events:none
+ * 5. In viewport — getBoundingClientRect 在视口范围内（自动滚动后重检）
+ * 6. Not covered — elementFromPoint(center) === 目标元素或其后代
+ */
+function checkActionability(refId: string): ActionabilityResult {
+    const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+    const ref = win.__mcpElementMap?.[refId]
+    if (!ref) {
+        return { actionable: false, reason: 'not-connected' }
+    }
+    const element = ref.deref()
+    if (!element || !element.isConnected) {
+        return { actionable: false, reason: 'not-connected' }
+    }
+
+    // 1. Visible check（参考 Playwright domUtils.ts:87-134）
+    const style = window.getComputedStyle(element)
+
+    // display:none（自身或父链）
+    // checkVisibility() 检查 content-visibility 和 display:none 整条链
+    if (typeof element.checkVisibility === 'function') {
+        if (!element.checkVisibility()) {
+            return { actionable: false, reason: 'not-visible' }
+        }
+    }
+
+    // visibility:hidden
+    if (style.visibility !== 'visible') {
+        return { actionable: false, reason: 'not-visible' }
+    }
+
+    // opacity:0（含父链，通过 checkVisibility 已部分覆盖，再显式检查自身）
+    if (parseFloat(style.opacity) === 0) {
+        return { actionable: false, reason: 'not-visible' }
+    }
+
+    // 非零尺寸（display:contents 例外，递归检查子元素）
+    const rect = element.getBoundingClientRect()
+    if (style.display !== 'contents' && (rect.width === 0 || rect.height === 0)) {
+        return { actionable: false, reason: 'not-visible' }
+    }
+
+    // 2. Enabled check（参考 Playwright roleUtils.ts + Selenium dom.js:84）
+    const htmlEl = element as HTMLElement
+    if ('disabled' in htmlEl && (htmlEl as HTMLButtonElement).disabled) {
+        return { actionable: false, reason: 'not-enabled' }
+    }
+    // aria-disabled（包括祖先链）
+    let ancestor: Element | null = element
+    while (ancestor) {
+        if (ancestor.getAttribute('aria-disabled') === 'true') {
+            return { actionable: false, reason: 'not-enabled' }
+        }
+        ancestor = ancestor.parentElement
+    }
+
+    // 3. Pointer-events check（参考 Selenium atoms/dom.js）
+    if (style.pointerEvents === 'none') {
+        return { actionable: false, reason: 'pointer-events-none' }
+    }
+
+    // 4. In viewport check
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+        return {
+            actionable: false,
+            reason: 'not-in-viewport',
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        }
+    }
+
+    // 5. Covered check（参考 Playwright injectedScript.ts:955-1034）
+    const cx    = rect.x + rect.width / 2
+    const cy    = rect.y + rect.height / 2
+    const hitEl = document.elementFromPoint(cx, cy)
+    if (hitEl) {
+        // 检查 hitEl 是否是目标元素或其后代
+        if (hitEl !== element && !element.contains(hitEl)) {
+            // hitEl 不在目标元素子树中——被遮挡
+            // 再检查 hitEl 是否是目标元素的祖先（某些透明容器场景）
+            if (!hitEl.contains(element)) {
+                const tag  = hitEl.tagName.toLowerCase()
+                const cls  = hitEl.className ? `.${String(hitEl.className).split(/\s+/).slice(0, 2).join('.')}` : ''
+                const id   = hitEl.id ? `#${hitEl.id}` : ''
+                const desc = `<${tag}${id}${cls}>`
+                return {
+                    actionable: false,
+                    reason: 'covered',
+                    coveringElement: desc,
+                    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                }
+            }
+        }
+    }
+
+    return {
+        actionable: true,
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    }
+}
+
+/**
+ * 滚动元素到视口内（4 种对齐轮换，参考 Playwright dom.ts:360-429）
+ *
+ * 轮换策略避免 sticky header 遮挡：
+ * 1. block:'center' — 默认居中
+ * 2. block:'end' — 底部对齐（避开顶部 sticky）
+ * 3. block:'start' — 顶部对齐（避开底部 sticky）
+ * 4. block:'nearest' — 最小滚动
+ */
+function scrollIntoViewWithRetry(refId: string): ActionabilityResult {
+    const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+    const ref = win.__mcpElementMap?.[refId]
+    if (!ref) {
+        return { actionable: false, reason: 'not-connected' }
+    }
+    const element = ref.deref()
+    if (!element || !element.isConnected) {
+        return { actionable: false, reason: 'not-connected' }
+    }
+
+    const alignments: ScrollIntoViewOptions[] = [
+        { block: 'center', inline: 'center', behavior: 'instant' },
+        { block: 'end', inline: 'end', behavior: 'instant' },
+        { block: 'start', inline: 'start', behavior: 'instant' },
+        { block: 'nearest', inline: 'nearest', behavior: 'instant' },
+    ]
+
+    for (const alignment of alignments) {
+        element.scrollIntoView(alignment)
+        // 检查是否在视口内且未被遮挡
+        const rect = element.getBoundingClientRect()
+        const vw   = window.innerWidth
+        const vh   = window.innerHeight
+        if (rect.top >= 0 && rect.bottom <= vh && rect.left >= 0 && rect.right <= vw) {
+            // 在视口内，检查遮挡
+            const cx    = rect.x + rect.width / 2
+            const cy    = rect.y + rect.height / 2
+            const hitEl = document.elementFromPoint(cx, cy)
+            if (hitEl && (hitEl === element || element.contains(hitEl))) {
+                return {
+                    actionable: true,
+                    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                }
+            }
+        }
+    }
+
+    // 所有对齐方式都试过了，仍然被遮挡或不在视口
+    return checkActionability(refId)
+}
+
+/**
+ * 带 actionability 检查的点击（注入到页面执行）
+ *
+ * 流程：
+ * 1. 检查可操作性
+ * 2. 不在视口 → 滚动（4 种对齐轮换）
+ * 3. 重新检查可操作性（滚动后坐标变化）
+ * 4. 验证 hit target
+ * 5. 执行点击
+ */
+function performActionableClick(refId: string, force: boolean): {
+    success: boolean;
+    error?: string;
+    reason?: string;
+    coveringElement?: string;
+} {
+    // force 模式：跳过所有检查，直接点击
+    if (force) {
+        const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+        const ref = win.__mcpElementMap?.[refId]
+        if (!ref) {
+            return { success: false, error: `Element ${refId} not found` }
+        }
+        const element = ref.deref()
+        if (!element) {
+            return { success: false, error: `Element ${refId} no longer exists` }
+        }
+        const el = element as HTMLElement
+        el.focus()
+        el.click()
+        return { success: true }
+    }
+
+    // 正常模式：actionability 检查
+    let result = checkActionability(refId)
+
+    // 不在视口 → 自动滚动
+    if (!result.actionable && result.reason === 'not-in-viewport') {
+        result = scrollIntoViewWithRetry(refId)
+    }
+
+    if (!result.actionable) {
+        const msg = result.reason === 'covered'
+                    ? `Element is covered by ${result.coveringElement}`
+                    : `Element is not actionable: ${result.reason}`
+        return {
+            success: false,
+            error: msg,
+            reason: result.reason,
+            coveringElement: result.coveringElement,
+        }
+    }
+
+    // 通过检查，执行点击
+    const win     = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+    const ref     = win.__mcpElementMap?.[refId]
+    const element = ref?.deref()
+    if (!element) {
+        return { success: false, error: `Element ${refId} no longer exists` }
+    }
+
+    const el = element as HTMLElement
+    el.focus()
+    el.click()
+
+    return { success: true }
+}
+
+// ==================== dispatch 输入（ISOLATED 世界，可访问 __mcpElementMap）====================
+
+/**
+ * 通过 nativeInputValueSetter 直接设置 value 并触发 input/change 事件
+ * 兼容 React/Vue 等框架的受控组件（参考 Playwright fill()）
+ */
+function dispatchInputToElement(refId: string, val: string): { success: boolean; error?: string } {
+    const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+    const ref = win.__mcpElementMap?.[refId]
+    const el  = ref?.deref() as HTMLInputElement | HTMLTextAreaElement | undefined
+    if (!el) {
+        return { success: false, error: `Element ${refId} not found` }
+    }
+    el.focus()
+    const proto  = Object.getPrototypeOf(el)
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')
+                   ?? Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+                   ?? Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+    if (setter?.set) {
+        setter.set.call(el, val)
+    } else {
+        el.value = val
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+    return { success: true }
+}
+
+// ==================== computed style 提取（ISOLATED 世界，可访问 __mcpElementMap）====================
+
+/**
+ * 获取元素的 computed style
+ * prop = '*' 返回全部属性 JSON；否则返回指定属性值
+ */
+function getComputedStyleFromElement(refId: string, prop: string): string | null {
+    const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+    const ref = win.__mcpElementMap?.[refId]
+    const el  = ref?.deref()
+    if (!el) {
+        return null
+    }
+    const cs = window.getComputedStyle(el)
+    if (prop === '*') {
+        const obj: Record<string, string> = {}
+        for (let i = 0; i < cs.length; i++) {
+            obj[cs[i]] = cs.getPropertyValue(cs[i])
+        }
+        return JSON.stringify(obj)
+    }
+    return cs.getPropertyValue(prop)
 }

@@ -28,8 +28,15 @@ httpClient.onMessage(async (message, port) => {
         const result = await actionHandler.execute(action, params, { mcpTabGroupId })
         httpClient.sendResponse(id, true, result, undefined, port)
     } catch (error) {
-        console.error(`[MCP] Error executing ${action}:`, error)
-        httpClient.sendResponse(id, false, null, error instanceof Error ? error.message : 'Unknown error', port)
+        const msg        = error instanceof Error ? error.message : 'Unknown error'
+        // 预期的操作错误（tab 关闭、超时等）用 warn，不污染 Extension 错误面板
+        const isExpected = msg.includes('不存在') || msg.includes('not found') || msg.includes('timeout')
+        if (isExpected) {
+            console.warn(`[MCP] ${action}: ${msg}`)
+        } else {
+            console.error(`[MCP] Error executing ${action}:`, error)
+        }
+        httpClient.sendResponse(id, false, null, msg, port)
     }
 })
 

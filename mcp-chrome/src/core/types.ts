@@ -138,6 +138,10 @@ export interface InputEvent {
     // 查找文本参数（select/replace 事件）
     find?: string;
     nth?: number;
+    // dispatch 模式（type 事件）
+    dispatch?: boolean;
+    // 强制执行（click 事件）
+    force?: boolean;
 }
 
 /**

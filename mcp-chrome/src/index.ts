@@ -32,7 +32,7 @@ import {
  */
 function createServer(): McpServer {
     const server = new McpServer(
-        { name: 'mcp-chrome', version: '1.3.0' },
+        { name: 'mcp-chrome', version: '1.7.0' },
         { capabilities: { tools: {} } },
     )
 
@@ -65,11 +65,23 @@ async function cleanup(): Promise<void> {
  */
 async function main(): Promise<void> {
     // 全局错误兜底：防止未捕获的异常/rejection 杀死进程
-    process.on('uncaughtException', (error) => {
-        console.error('[MCP] Uncaught exception:', error)
+    // 检测 EPIPE：父进程（Claude Code）退出后 stdio 断开，写日志会持续 EPIPE 形成死循环
+    process.on('uncaughtException', (error: NodeJS.ErrnoException) => {
+        if (error.code === 'EPIPE' || error.code === 'ERR_STREAM_DESTROYED') {
+            process.exit(0)
+        }
+        try {
+            console.error('[MCP] Uncaught exception:', error)
+        } catch {
+            process.exit(1)
+        }
     })
     process.on('unhandledRejection', (reason) => {
-        console.error('[MCP] Unhandled rejection:', reason)
+        try {
+            console.error('[MCP] Unhandled rejection:', reason)
+        } catch {
+            process.exit(1)
+        }
     })
 
     // 启动 Extension HTTP/WebSocket 服务器
@@ -79,6 +91,16 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport()
 
     await server.connect(transport)
+
+    // 父进程退出时 stdin 关闭，主动退出防止成为孤儿进程
+    process.stdin.on('end', async () => {
+        await cleanup()
+        process.exit(0)
+    })
+
+    // stdout/stderr 写入失败（EPIPE）时直接退出
+    process.stdout.on('error', () => process.exit(0))
+    process.stderr.on('error', () => process.exit(0))
 
     // 优雅退出
     process.on('SIGINT', async () => {
