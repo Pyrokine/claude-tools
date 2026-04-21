@@ -15,7 +15,8 @@ import {formatError, formatResult} from './utils.js'
 const execSchema = z.object({
                                 alias: z.string().describe('连接别名'),
                                 command: z.string().describe('要执行的命令'),
-                                timeout: z.number().optional().describe('超时（毫秒），默认 30000'),
+                                timeout: z.number().optional().describe(
+                                    '超时（毫秒），默认 30000。长时间命令可设更大值如 600000（10 分钟），或用 ssh_pty_start 替代'),
                                 cwd: z.string().optional().describe('工作目录（可选）'),
                                 env: z.record(z.string()).optional().describe('额外环境变量'),
                                 pty: z.boolean().optional().describe('是否使用 PTY 模式（用于 top 等交互式命令）'),
@@ -26,7 +27,8 @@ const execAsUserSchema = z.object({
                                       command: z.string().describe('要执行的命令'),
                                       targetUser: z.string().describe('目标用户名'),
                                       timeout: z.number().optional().describe('超时（毫秒）'),
-                                      loadProfile: z.boolean().optional().describe('是否加载 .bashrc（默认 true）'),
+                                      loadProfile: z.boolean().optional().describe(
+                                          '是否加载目标用户的 shell 配置（默认 true）。profile 加载慢导致超时时设为 false'),
                                   })
 
 const execSudoSchema = z.object({
@@ -226,7 +228,7 @@ export function registerExecTools(server: McpServer): void {
 
 适用场景: SSH 以 root 登录，但需要以其他用户（如 caros）执行命令。
 
-默认加载目标用户的 shell 配置以获取环境变量（su -c 创建非交互式 shell，不会自动执行 rc 文件）。
+默认加载目标用户的 shell 配置以获取环境变量。如果 profile 加载耗时过长导致超时，设 loadProfile=false 跳过。
 支持 bash(.bashrc)、zsh(.zshrc) 及其他 shell(.profile)。
 
 示例: ssh_exec_as_user(alias="server", command="whoami", targetUser="caros")`,
@@ -239,7 +241,9 @@ export function registerExecTools(server: McpServer): void {
     }, (args) => handleExecSudo(args))
 
     server.registerTool('ssh_exec_batch', {
-        description: '批量执行多条命令',
+        description: `批量执行多条命令。每条命令在独立 SSH channel 中执行，环境变量不共享。
+
+如需命令间共享环境（如 export 变量），用分号拼接为单条命令通过 ssh_exec 执行。`,
         inputSchema: execBatchSchema,
     }, (args) => handleExecBatch(args))
 

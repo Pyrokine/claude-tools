@@ -25,7 +25,7 @@ import {
 } from './tools/index.js'
 
 const server = new McpServer(
-    { name: 'ssh-mcp-pro', version: '1.1.2' },
+    { name: 'ssh-mcp-pro', version: '1.2.2' },
     { capabilities: { tools: {} } },
 )
 
@@ -36,6 +36,21 @@ registerPtyTools(server)
 registerForwardTools(server)
 
 async function main() {
+    // 防止父进程退出后成为孤儿进程持续占用 CPU
+    process.on('uncaughtException', (error: NodeJS.ErrnoException) => {
+        if (error.code === 'EPIPE' || error.code === 'ERR_STREAM_DESTROYED') {
+            process.exit(0)
+        }
+        try {
+            console.error('[MCP] Uncaught exception:', error)
+        } catch {
+            process.exit(1)
+        }
+    })
+    process.stdin.on('end', () => process.exit(0))
+    process.stdout.on('error', () => process.exit(0))
+    process.stderr.on('error', () => process.exit(0))
+
     const transport = new StdioServerTransport()
     await server.connect(transport)
     console.error('SSH MCP Pro server started')
