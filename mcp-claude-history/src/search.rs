@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
 use rayon::prelude::*;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -24,6 +24,8 @@ pub struct SearchParams {
     pub offset: usize,
     pub limit: Option<usize>,
     pub max_content: usize,
+    /// tool_result 子类型的最大内容长度（独立控制，默认 500）
+    pub max_content_tool_result: usize,
     pub max_total: usize,
     /// 是否包含 agent 子会话（默认 false）
     pub subagents: bool,
@@ -46,6 +48,7 @@ impl Default for SearchParams {
             offset: 0,
             limit: None,
             max_content: 4000,
+            max_content_tool_result: 500,
             max_total: 40000,
             subagents: false,
         }
@@ -64,8 +67,10 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
 
     // 编译正则（如果需要）
     let regex = if params.use_regex && !params.pattern.is_empty() {
-        let flags = if params.case_sensitive { "" } else { "(?i)" };
-        match Regex::new(&format!("{}{}", flags, params.pattern)) {
+        match RegexBuilder::new(&params.pattern)
+            .case_insensitive(!params.case_sensitive)
+            .build()
+        {
             Ok(r) => Some(r),
             Err(e) => {
                 return Err(ErrorResponse {
@@ -112,10 +117,14 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
         all_results.extend(results);
     }
 
-    let total_matches = all_results.len();
-
     // 按时间排序
     all_results.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    // UUID 去重：跨会话去重（延续会话镜像场景），保留最早出现的一条
+    let mut seen_uuids = std::collections::HashSet::new();
+    all_results.retain(|r| seen_uuids.insert(r.uuid.clone()));
+
+    let total_matches = all_results.len();
 
     // 应用 offset 和 limit
     let results: Vec<SearchResult> = all_results
@@ -131,8 +140,13 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
     let mut total_chars = 0;
 
     for mut result in results {
-        // 截断单条内容（围绕匹配位置居中）
-        let (content, truncated) = truncate_around_match(&result.content, result.match_pos, params.max_content);
+        // tool_result 默认使用更小的截断限制（除非用户显式设置了 max_content）
+        let effective_max = if result.subtype == "tool_result" {
+            params.max_content_tool_result
+        } else {
+            params.max_content
+        };
+        let (content, truncated) = truncate_around_match(&result.content, result.match_pos, effective_max);
         result.content = content;
         result.truncated = truncated || result.truncated;
 

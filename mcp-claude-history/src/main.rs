@@ -220,6 +220,7 @@ fn main() {
                 offset,
                 limit,
                 max_content,
+                max_content_tool_result: 500,
                 max_total,
                 subagents: false,
             };
@@ -272,6 +273,9 @@ fn main() {
                 types: types.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
                 max_content,
                 max_total,
+                pattern: None,
+                regex: false,
+                case_sensitive: false,
             };
 
             match context(&config, params) {

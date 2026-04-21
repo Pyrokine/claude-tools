@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::get::find_session_file;
 use crate::types::*;
 use crate::utils::*;
+use regex::{Regex, RegexBuilder};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
@@ -16,6 +17,10 @@ pub struct ContextParams {
     pub types: Vec<String>,
     pub max_content: usize,
     pub max_total: usize,
+    /// 内容过滤 pattern（before/after 只计数匹配的消息）
+    pub pattern: Option<String>,
+    pub regex: bool,
+    pub case_sensitive: bool,
 }
 
 impl Default for ContextParams {
@@ -30,6 +35,9 @@ impl Default for ContextParams {
             types: vec![],
             max_content: 4000,
             max_total: 40000,
+            pattern: None,
+            regex: false,
+            case_sensitive: false,
         }
     }
 }
@@ -47,8 +55,53 @@ fn matches_types(effective_type: &str, types: &[String]) -> bool {
     types.is_empty() || types.iter().any(|t| t == effective_type)
 }
 
+/// 检查消息内容是否匹配 pattern
+fn matches_pattern(content: &str, pattern: &Option<Regex>, plain_pattern: &Option<String>, case_sensitive: bool) -> bool {
+    if let Some(re) = pattern {
+        return re.is_match(content);
+    }
+    if let Some(p) = plain_pattern {
+        if case_sensitive {
+            return content.contains(p.as_str());
+        }
+        // plain_pattern 在 case-insensitive 时已预先 to_lowercase，直接比较
+        return content.to_lowercase().contains(p.as_str());
+    }
+    true // 无 pattern 时匹配所有
+}
+
 /// 获取上下文
 pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse, ErrorResponse> {
+    // 编译 pattern
+    let compiled_regex: Option<Regex> = if let Some(ref pat) = params.pattern {
+        if params.regex {
+            match RegexBuilder::new(pat)
+                .case_insensitive(!params.case_sensitive)
+                .build()
+            {
+                Ok(r) => Some(r),
+                Err(e) => return Err(ErrorResponse {
+                    error: "invalid_regex".to_string(),
+                    message: format!("无效的正则表达式: {}", e),
+                    available: None,
+                }),
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // case-insensitive 时预先 to_lowercase，避免每次调用 matches_pattern 时重复分配
+    let plain_pattern: Option<String> = if params.pattern.is_some() && !params.regex {
+        if params.case_sensitive {
+            params.pattern.clone()
+        } else {
+            params.pattern.as_ref().map(|p| p.to_lowercase())
+        }
+    } else {
+        None
+    };
     // 解析 ref
     let parsed_ref = ParsedRef::parse(&params.r#ref).ok_or_else(|| ErrorResponse {
         error: "ref_invalid".to_string(),
@@ -136,7 +189,9 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         if before > 0 {
             let mut count = 0;
             for i in (0..anchor_idx).rev() {
-                if matches_types(all_messages[i].effective_type, &params.types) {
+                if matches_types(all_messages[i].effective_type, &params.types)
+                    && matches_pattern(&all_messages[i].content, &compiled_regex, &plain_pattern, params.case_sensitive)
+                {
                     count += 1;
                     start = i;
                     if count >= before {
@@ -150,7 +205,9 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         if after > 0 {
             let mut count = 0;
             for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
-                if matches_types(msg.effective_type, &params.types) {
+                if matches_types(msg.effective_type, &params.types)
+                    && matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive)
+                {
                     count += 1;
                     end = i + 1;
                     if count >= after {
@@ -171,6 +228,12 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     for (i, msg) in all_messages.iter().enumerate().take(end_idx).skip(start_idx) {
         let is_anchor = i == anchor_idx;
         if !is_anchor && !matches_types(msg.effective_type, &params.types) {
+            continue;
+        }
+        // pattern 过滤（anchor 消息始终保留）
+        if !is_anchor && (compiled_regex.is_some() || plain_pattern.is_some())
+            && !matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive)
+        {
             continue;
         }
 

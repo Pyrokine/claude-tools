@@ -127,15 +127,49 @@ pub fn find_session_file(
         }
         vec![(pid.to_string(), dir)]
     } else if let Some(pid) = config.current_project_id() {
+        // 优先搜当前项目
         vec![(pid.clone(), config.project_dir(&pid))]
     } else {
         config.list_project_dirs().unwrap_or_default()
     };
 
     // 在项目中查找匹配的 session
+    if let Some(result) = search_session_in_dirs(&project_dirs, session_prefix) {
+        return Ok(result);
+    }
+
+    // 当前项目未找到时，fallback 到搜索所有项目
+    // （search 返回的 ref 可能来自其他项目，用户未必传 project 参数）
+    if project_id.is_none() {
+        if let Ok(all_dirs) = config.list_project_dirs() {
+            // 排除已搜过的当前项目，避免重复扫描
+            let remaining: Vec<_> = all_dirs
+                .into_iter()
+                .filter(|(id, _)| !project_dirs.iter().any(|(pid, _)| pid == id))
+                .collect();
+            if !remaining.is_empty() {
+                if let Some(result) = search_session_in_dirs(&remaining, session_prefix) {
+                    return Ok(result);
+                }
+            }
+        }
+    }
+
+    Err(ErrorResponse {
+        error: "session_not_found".to_string(),
+        message: format!("找不到 session: {}", session_prefix),
+        available: None,
+    })
+}
+
+/// 在指定的项目目录列表中搜索匹配 session prefix 的文件
+fn search_session_in_dirs(
+    project_dirs: &[(String, PathBuf)],
+    session_prefix: &str,
+) -> Option<(String, String, PathBuf)> {
     for (project_id, dir) in project_dirs {
         // 搜索主目录的 .jsonl 文件
-        if let Ok(entries) = fs::read_dir(&dir) {
+        if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
@@ -145,7 +179,7 @@ pub fn find_session_file(
                 let filename = entry.file_name().to_string_lossy().to_string();
                 if let Some(session_id) = session_id_from_filename(&filename) {
                     if ref_prefix(&session_id) == session_prefix {
-                        return Ok((project_id, session_id, path));
+                        return Some((project_id.clone(), session_id, path));
                     }
                 }
             }
@@ -165,7 +199,7 @@ pub fn find_session_file(
                         if filename.starts_with("agent-") {
                             let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
                             if ref_prefix(&session_id) == session_prefix {
-                                return Ok((project_id, session_id, path));
+                                return Some((project_id.clone(), session_id, path));
                             }
                         }
                     }
@@ -174,11 +208,7 @@ pub fn find_session_file(
         }
     }
 
-    Err(ErrorResponse {
-        error: "session_not_found".to_string(),
-        message: format!("找不到 session: {}", session_prefix),
-        available: None,
-    })
+    None
 }
 
 /// 写入输出文件

@@ -117,7 +117,7 @@ fn get_tools() -> Vec<Value> {
                     },
                     "max_content": {
                         "type": "number",
-                        "description": "Max characters per result",
+                        "description": "Max characters per result (default 4000; tool_result defaults to 500 unless explicitly set)",
                         "default": 4000
                     },
                     "max_total": {
@@ -206,6 +206,20 @@ fn get_tools() -> Vec<Value> {
                         "type": "number",
                         "description": "Max total characters",
                         "default": 40000
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Filter pattern for content (before/after only count matching messages)"
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description": "Use regex for pattern matching",
+                        "default": false
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Case sensitive pattern matching",
+                        "default": false
                     }
                 },
                 "required": ["ref"]
@@ -464,6 +478,7 @@ struct SearchArgs {
     offset: usize,
     limit: Option<usize>,
     max_content: usize,
+    max_content_tool_result: usize,
     max_total: usize,
     subagents: bool,
 }
@@ -484,7 +499,15 @@ impl SearchArgs {
             case_sensitive: args.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
             offset: args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             limit: args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize),
-            max_content: args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_CONTENT as u64) as usize,
+            max_content: {
+                let explicit = args.get("max_content").and_then(|v| v.as_u64());
+                explicit.unwrap_or(DEFAULT_MAX_CONTENT as u64) as usize
+            },
+            max_content_tool_result: {
+                // 用户显式传入 max_content 时对所有类型生效；未传则 tool_result 默认 500
+                let explicit = args.get("max_content").and_then(|v| v.as_u64());
+                explicit.unwrap_or(500) as usize
+            },
             max_total: args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_TOTAL as u64) as usize,
             subagents: args.get("subagents").and_then(|v| v.as_bool()).unwrap_or(false),
         }
@@ -525,6 +548,7 @@ fn execute_search(config: &Config, args: Value) -> Result<Value, Value> {
         offset: a.offset,
         limit: a.limit,
         max_content: a.max_content,
+        max_content_tool_result: a.max_content_tool_result,
         max_total: a.max_total,
         subagents: a.subagents,
     };
@@ -580,6 +604,9 @@ struct ContextArgs {
     project: Option<String>,
     max_content: usize,
     max_total: usize,
+    pattern: Option<String>,
+    regex: bool,
+    case_sensitive: bool,
 }
 
 impl ContextArgs {
@@ -594,6 +621,9 @@ impl ContextArgs {
             project: args.get("project").and_then(|v| v.as_str()).map(String::from),
             max_content: args.get("max_content").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_CONTENT as u64) as usize,
             max_total: args.get("max_total").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_TOTAL as u64) as usize,
+            pattern: args.get("pattern").and_then(|v| v.as_str()).map(String::from),
+            regex: args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false),
+            case_sensitive: args.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
         }
     }
 }
@@ -611,6 +641,9 @@ fn execute_context(config: &Config, args: Value) -> Result<Value, Value> {
         types: a.types.as_deref().map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
         max_content: a.max_content,
         max_total: a.max_total,
+        pattern: a.pattern,
+        regex: a.regex,
+        case_sensitive: a.case_sensitive,
     };
 
     match context(config, params) {
