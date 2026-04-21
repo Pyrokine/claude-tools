@@ -43,8 +43,8 @@ npm install -g @pyrokine/mcp-chrome
 Or from source:
 
 ```bash
-git clone https://github.com/Pyrokine/claude-mcp-tools.git
-cd claude-mcp-tools/mcp-chrome
+git clone https://github.com/Pyrokine/claude-tools.git
+cd claude-tools/mcp-chrome
 npm install
 npm run build
 ```
@@ -135,21 +135,25 @@ Extension-specific: `list` returns additional fields: `managed` (whether tab is 
 
 Event sequence model supporting arbitrary combinations:
 
-| Event Type                              | Description                        |
-|-----------------------------------------|------------------------------------|
-| `keydown` / `keyup`                     | Key press/release                  |
-| `click`                                 | Click (mousedown + mouseup)        |
-| `mousedown` / `mouseup`                 | Mouse button press/release         |
-| `mousemove`                             | Mouse movement                     |
-| `wheel`                                 | Mouse wheel scroll                 |
-| `touchstart` / `touchmove` / `touchend` | Touch events                       |
-| `type`                                  | Type text                          |
-| `wait`                                  | Pause between events               |
-| `select`                                | Select text by content (mouse sim) |
-| `replace`                               | Find and replace text              |
+| Event Type                              | Description                                                                  |
+|-----------------------------------------|------------------------------------------------------------------------------|
+| `keydown` / `keyup`                     | Key press/release                                                            |
+| `click`                                 | Click with actionability checks (visible, enabled, not-covered, auto-scroll) |
+| `mousedown` / `mouseup`                 | Mouse button press/release                                                   |
+| `mousemove`                             | Mouse movement                                                               |
+| `wheel`                                 | Mouse wheel scroll                                                           |
+| `touchstart` / `touchmove` / `touchend` | Touch events                                                                 |
+| `type`                                  | Type text                                                                    |
+| `wait`                                  | Pause between events                                                         |
+| `select`                                | Select text by content (mouse sim)                                           |
+| `replace`                               | Find and replace text                                                        |
 
 Parameters: `humanize` enables Bézier curve movement and random delays. `tabId` targets a specific tab. `frame` targets
 an iframe (CSS selector or index). Both Extension mode only.
+
+**`click`-specific**: `force: true` skips actionability checks (useful for testing or hidden elements).
+**`type`-specific**: `dispatch: true` sets `.value` directly and fires `input`/`change` events — use for React/Vue
+controlled inputs where keyboard events don't update state. Requires a non-coordinate `target`. Extension mode only.
 
 ### extract - Content Extraction
 
@@ -165,6 +169,12 @@ an iframe (CSS selector or index). Both Extension mode only.
 Parameters: `output` saves result to file (or directory for `images=data`). `images` (`info`/`data`) extracts image
 metadata or data alongside HTML. `tabId` targets a specific tab. `frame` targets an iframe. Both Extension mode only.
 
+**`attribute` special prefix**: `computed:<property>` returns the computed CSS style value (e.g. `computed:color`,
+`computed:font-size`). Use `computed:*` to return all computed style properties as JSON (returns 300+ properties — use
+`output` to save to file).
+
+**`state`-specific**: `depth` controls DOM traversal depth (default 15). Reduce to limit response size on large pages.
+
 ### wait - Wait for Conditions
 
 | For          | Description                                         |
@@ -172,23 +182,31 @@ metadata or data alongside HTML. `tabId` targets a specific tab. `frame` targets
 | `element`    | Wait for element (visible/hidden/attached/detached) |
 | `navigation` | Wait for navigation complete                        |
 | `time`       | Fixed delay                                         |
-| `idle`       | Wait for network idle                               |
+| `idle`       | Wait for page load + DOM mutation quiet period      |
 
 Parameters: `tabId` targets a specific tab. `frame` targets an iframe. Both Extension mode only.
+
+**`idle`-specific**: After `readyState === 'complete'`, injects a `MutationObserver` and waits for a quiet period with
+no DOM changes. The `ms` parameter controls the quiet period duration (default 500ms). Returns `domStable: true` when
+the DOM settled, `domStable: false` if still mutating when the budget ran out.
 
 ### evaluate - JavaScript Execution
 
 Execute JavaScript in page context.
 
-| Parameter | Description                                                               |
-|-----------|---------------------------------------------------------------------------|
-| `script`  | JavaScript code (required). Bare `return` statements auto-wrapped in IIFE |
-| `args`    | Arguments passed to script (script must be a function expression)         |
-| `mode`    | `precise` (default, debugger API) or `stealth` (JS injection)             |
-| `output`  | Save result to file (strings written as raw text, others as JSON)         |
-| `tabId`   | Target a specific tab (Extension mode)                                    |
-| `frame`   | Target an iframe by CSS selector or index (Extension mode)                |
-| `timeout` | End-to-end budget (ms)                                                    |
+| Parameter    | Description                                                                |
+|--------------|----------------------------------------------------------------------------|
+| `script`     | JavaScript code. Bare `return` statements auto-wrapped in IIFE             |
+| `scriptFile` | Read script from a local file (alternative to `script`, restricted to cwd) |
+| `args`       | Arguments passed to script (script must be a function expression)          |
+| `mode`       | `precise` (default, debugger API) or `stealth` (JS injection)              |
+| `output`     | Save result to file (strings written as raw text, others as JSON)          |
+| `tabId`      | Target a specific tab (Extension mode)                                     |
+| `frame`      | Target an iframe by CSS selector or index (Extension mode)                 |
+| `timeout`    | End-to-end budget (ms)                                                     |
+
+`script` and `scriptFile` are mutually exclusive; at least one must be provided. `scriptFile` paths are restricted to
+the current working directory (no `../` traversal).
 
 Results >100KB are auto-saved to `/tmp/` with a structured hint returned.
 

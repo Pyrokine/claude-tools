@@ -57,8 +57,8 @@ npm install -g @pyrokine/mcp-ssh
 ### From Source
 
 ```bash
-git clone https://github.com/Pyrokine/claude-mcp-tools.git
-cd claude-mcp-tools/mcp-ssh
+git clone https://github.com/Pyrokine/claude-tools.git
+cd claude-tools/mcp-ssh
 npm install
 npm run build
 ```

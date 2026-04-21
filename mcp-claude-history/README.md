@@ -24,11 +24,11 @@ A conversation history search tool for Claude Code
 
 ### Download Binary (Recommended)
 
-Download the latest release from [GitHub Releases](https://github.com/Pyrokine/claude-mcp-tools/releases):
+Download the latest release from [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases):
 
 ```bash
 # Download and install
-curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz | tar xz
+curl -L https://github.com/Pyrokine/claude-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz | tar xz
 chmod +x mcp-claude-history
 mv mcp-claude-history ~/.local/bin/
 ```
@@ -106,20 +106,23 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ### history_context
 
-| Parameter     | Type   | Default | Description                                                       |
-|---------------|--------|---------|-------------------------------------------------------------------|
-| `ref`         | string | -       | Required. Message ref                                             |
-| `before`      | number | -       | Messages before (counts only matching types if `types` specified) |
-| `after`       | number | -       | Messages after (counts only matching types if `types` specified)  |
-| `until_type`  | string | -       | Continue until this type                                          |
-| `direction`   | string | forward | forward/backward                                                  |
-| `types`       | string | -       | Message types to include (comma-separated)                        |
-| `project`     | string | -       | Project ID                                                        |
-| `max_content` | number | 4000    | Max chars per message                                             |
-| `max_total`   | number | 40000   | Max total chars                                                   |
+| Parameter        | Type    | Default | Description                                                           |
+|------------------|---------|---------|-----------------------------------------------------------------------|
+| `ref`            | string  | -       | Required. Message ref                                                 |
+| `before`         | number  | -       | Messages before (counts only messages matching `types` AND `pattern`) |
+| `after`          | number  | -       | Messages after (counts only messages matching `types` AND `pattern`)  |
+| `until_type`     | string  | -       | Continue until this type                                              |
+| `direction`      | string  | forward | forward/backward                                                      |
+| `types`          | string  | -       | Message types to include (comma-separated)                            |
+| `project`        | string  | -       | Project ID                                                            |
+| `max_content`    | number  | 4000    | Max chars per message                                                 |
+| `max_total`      | number  | 40000   | Max total chars                                                       |
+| `pattern`        | string  | -       | Filter pattern: only count/include messages matching this pattern     |
+| `regex`          | boolean | false   | Use regex for pattern matching                                        |
+| `case_sensitive` | boolean | false   | Case-sensitive pattern matching                                       |
 
-**Note**: The anchor message (specified by `ref`) is always included in results, even if its type is not in the `types`
-filter.
+**Note**: The anchor message (specified by `ref`) is always included regardless of `types` or `pattern` filters. When
+`pattern` is set, `before`/`after` counts only messages that match the pattern.
 
 ## Usage Examples
 

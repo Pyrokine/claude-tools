@@ -1,20 +1,22 @@
-# claude-mcp-tools
+# claude-tools
 
 MCP tools for Claude Code / Claude Code MCP 工具集
 
 ## Tools / 工具列表
 
-| Tool                                       | Language   | Description                                        |
+| Tool                                       | Type       | Description                                        |
 |--------------------------------------------|------------|----------------------------------------------------|
-| [mcp-ssh](./mcp-ssh)                       | TypeScript | SSH connection, command execution, file operations |
-| [mcp-chrome](./mcp-chrome)                 | TypeScript | Chrome browser automation (Extension + CDP)        |
-| [mcp-claude-history](./mcp-claude-history) | Rust       | Conversation history search                        |
+| [mcp-ssh](./mcp-ssh)                       | MCP Server | SSH connection, command execution, file operations |
+| [mcp-chrome](./mcp-chrome)                 | MCP Server | Chrome browser automation (Extension + CDP)        |
+| [mcp-claude-history](./mcp-claude-history) | MCP Server | Conversation history search                        |
+| [skill-elenchus](./skill-elenchus)         | Skill      | Multi-agent adversarial code review                |
 
-| 工具                                         | 语言         | 功能                             |
+| 工具                                         | 类型         | 功能                             |
 |--------------------------------------------|------------|--------------------------------|
-| [mcp-ssh](./mcp-ssh)                       | TypeScript | SSH 远程连接、命令执行、文件操作             |
-| [mcp-chrome](./mcp-chrome)                 | TypeScript | Chrome 浏览器自动化（Extension + CDP） |
-| [mcp-claude-history](./mcp-claude-history) | Rust       | 对话历史搜索                         |
+| [mcp-ssh](./mcp-ssh)                       | MCP Server | SSH 远程连接、命令执行、文件操作             |
+| [mcp-chrome](./mcp-chrome)                 | MCP Server | Chrome 浏览器自动化（Extension + CDP） |
+| [mcp-claude-history](./mcp-claude-history) | MCP Server | 对话历史搜索                         |
+| [skill-elenchus](./skill-elenchus)         | Skill      | 辩证分析方法论（评审 + 深度思辨）             |
 
 ## Installation / 安装
 

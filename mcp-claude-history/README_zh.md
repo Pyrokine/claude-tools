@@ -24,11 +24,11 @@ Claude Code 对话历史搜索工具
 
 ### 下载二进制（推荐）
 
-从 [GitHub Releases](https://github.com/Pyrokine/claude-mcp-tools/releases) 下载最新版本：
+从 [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases) 下载最新版本：
 
 ```bash
 # 下载并安装
-curl -L https://github.com/Pyrokine/claude-mcp-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz | tar xz
+curl -L https://github.com/Pyrokine/claude-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz | tar xz
 chmod +x mcp-claude-history
 mv mcp-claude-history ~/.local/bin/
 ```
@@ -106,19 +106,23 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ### history_context
 
-| 参数            | 类型     | 默认值     | 说明                           |
-|---------------|--------|---------|------------------------------|
-| `ref`         | string | -       | 必填，消息定位                      |
-| `before`      | number | -       | 向前取 N 条（指定 `types` 时仅计数匹配类型） |
-| `after`       | number | -       | 向后取 N 条（指定 `types` 时仅计数匹配类型） |
-| `until_type`  | string | -       | 持续到指定类型                      |
-| `direction`   | string | forward | forward/backward             |
-| `types`       | string | -       | 要包含的消息类型（逗号分隔）               |
-| `project`     | string | -       | 项目 ID                        |
-| `max_content` | number | 4000    | 单条最大字符数                      |
-| `max_total`   | number | 40000   | 总最大字符数                       |
+| 参数               | 类型      | 默认值     | 说明                                       |
+|------------------|---------|---------|------------------------------------------|
+| `ref`            | string  | -       | 必填，消息定位                                  |
+| `before`         | number  | -       | 向前取 N 条（仅计数同时匹配 `types` 和 `pattern` 的消息） |
+| `after`          | number  | -       | 向后取 N 条（仅计数同时匹配 `types` 和 `pattern` 的消息） |
+| `until_type`     | string  | -       | 持续到指定类型                                  |
+| `direction`      | string  | forward | forward/backward                         |
+| `types`          | string  | -       | 要包含的消息类型（逗号分隔）                           |
+| `project`        | string  | -       | 项目 ID                                    |
+| `max_content`    | number  | 4000    | 单条最大字符数                                  |
+| `max_total`      | number  | 40000   | 总最大字符数                                   |
+| `pattern`        | string  | -       | 内容过滤 pattern，仅计数/返回匹配该 pattern 的消息       |
+| `regex`          | boolean | false   | 是否使用正则匹配                                 |
+| `case_sensitive` | boolean | false   | 是否区分大小写                                  |
 
-**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，即使其类型不在 `types` 过滤列表中。
+**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，不受 `types` 和 `pattern` 过滤影响。设置 `pattern` 后，`before`/`after`
+的计数仅统计匹配该 pattern 的消息。
 
 ## 使用示例
 

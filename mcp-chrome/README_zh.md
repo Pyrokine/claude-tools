@@ -41,8 +41,8 @@ npm install -g @pyrokine/mcp-chrome
 或从源码安装：
 
 ```bash
-git clone https://github.com/Pyrokine/claude-mcp-tools.git
-cd claude-mcp-tools/mcp-chrome
+git clone https://github.com/Pyrokine/claude-tools.git
+cd claude-tools/mcp-chrome
 npm install
 npm run build
 ```
@@ -128,21 +128,25 @@ Extension 特有：`list` 返回额外字段：`managed`（Tab 是否在 MCP Chr
 
 事件序列模型，支持任意组合：
 
-| 事件类型                                    | 描述                      |
-|-----------------------------------------|-------------------------|
-| `keydown` / `keyup`                     | 按键按下/释放                 |
-| `click`                                 | 点击（mousedown + mouseup） |
-| `mousedown` / `mouseup`                 | 鼠标按下/释放                 |
-| `mousemove`                             | 鼠标移动                    |
-| `wheel`                                 | 滚轮滚动                    |
-| `touchstart` / `touchmove` / `touchend` | 触摸事件                    |
-| `type`                                  | 输入文本                    |
-| `wait`                                  | 事件间暂停                   |
-| `select`                                | 按内容选中文本（鼠标模拟）           |
-| `replace`                               | 查找并替换文本                 |
+| 事件类型                                    | 描述                             |
+|-----------------------------------------|--------------------------------|
+| `keydown` / `keyup`                     | 按键按下/释放                        |
+| `click`                                 | 点击（含可操作性检查：可见性、是否启用、遮挡检测、自动滚动） |
+| `mousedown` / `mouseup`                 | 鼠标按下/释放                        |
+| `mousemove`                             | 鼠标移动                           |
+| `wheel`                                 | 滚轮滚动                           |
+| `touchstart` / `touchmove` / `touchend` | 触摸事件                           |
+| `type`                                  | 输入文本                           |
+| `wait`                                  | 事件间暂停                          |
+| `select`                                | 按内容选中文本（鼠标模拟）                  |
+| `replace`                               | 查找并替换文本                        |
 
 参数：`humanize` 启用贝塞尔曲线移动和随机延迟。`tabId` 指定目标 Tab。`frame` 指定目标 iframe（CSS 选择器或索引）。均限
 Extension 模式。
+
+**`click` 专属参数**：`force: true` 跳过可操作性检查（适用于测试隐藏元素等场景）。  
+**`type` 专属参数**：`dispatch: true` 直接设置 `.value` 并触发 `input`/`change` 事件，兼容 React/Vue
+等框架的受控组件（键盘事件无法触发状态更新时使用）。需要非坐标型 `target`，仅限 Extension 模式。
 
 ### extract - 内容提取
 
@@ -158,6 +162,11 @@ Extension 模式。
 参数：`output` 将结果保存到文件（`images=data` 时为输出目录）。`images`（`info`/`data`）提取 HTML 中的图片元信息或数据。`tabId`
 指定目标 Tab。`frame` 指定目标 iframe。均限 Extension 模式。
 
+**`attribute` 特殊前缀**：`computed:<属性名>` 返回 computed CSS 样式值（如 `computed:color`、`computed:font-size`）。
+`computed:*` 返回全部计算样式（300+ 属性，建议配合 `output` 写文件）。
+
+**`state` 专属参数**：`depth` 控制 DOM 遍历深度（默认 15），减小可降低大页面的返回数据量。
+
 ### wait - 等待条件
 
 | For          | 描述                                     |
@@ -165,23 +174,29 @@ Extension 模式。
 | `element`    | 等待元素（visible/hidden/attached/detached） |
 | `navigation` | 等待导航完成                                 |
 | `time`       | 固定延迟                                   |
-| `idle`       | 等待网络空闲                                 |
+| `idle`       | 等待页面加载完成 + DOM mutation 静默期            |
 
 参数：`tabId` 指定目标 Tab。`frame` 指定目标 iframe。均限 Extension 模式。
+
+**`idle` 说明**：`readyState === 'complete'` 后注入 `MutationObserver`，等待 `ms` 毫秒内无 DOM 变更（默认 500ms）。返回
+`domStable: true` 表示 DOM 已稳定，`domStable: false` 表示预算用完时 DOM 仍在变化。
 
 ### evaluate - JavaScript 执行
 
 在页面上下文执行 JavaScript。
 
-| 参数        | 描述                                           |
-|-----------|----------------------------------------------|
-| `script`  | JavaScript 代码（必需）。裸 `return` 语句自动包裹 IIFE     |
-| `args`    | 传递给脚本的参数（script 须为函数表达式）                     |
-| `mode`    | `precise`（默认，debugger API）或 `stealth`（JS 注入） |
-| `output`  | 将结果保存到文件（字符串写入原始文本，其他类型 JSON 序列化）            |
-| `tabId`   | 指定目标 Tab（Extension 模式）                       |
-| `frame`   | 指定目标 iframe（CSS 选择器或索引，Extension 模式）         |
-| `timeout` | 端到端超时预算（毫秒）                                  |
+| 参数           | 描述                                           |
+|--------------|----------------------------------------------|
+| `script`     | JavaScript 代码，裸 `return` 语句自动包裹 IIFE         |
+| `scriptFile` | 从本地文件读取脚本（与 `script` 二选一，路径限制在当前工作目录内）       |
+| `args`       | 传递给脚本的参数（script 须为函数表达式）                     |
+| `mode`       | `precise`（默认，debugger API）或 `stealth`（JS 注入） |
+| `output`     | 将结果保存到文件（字符串写入原始文本，其他类型 JSON 序列化）            |
+| `tabId`      | 指定目标 Tab（Extension 模式）                       |
+| `frame`      | 指定目标 iframe（CSS 选择器或索引，Extension 模式）         |
+| `timeout`    | 端到端超时预算（毫秒）                                  |
+
+`script` 和 `scriptFile` 至少提供一个，互斥使用。`scriptFile` 路径限制在当前工作目录内（不允许 `../` 穿越）。
 
 结果超过 100KB 时自动落盘到 `/tmp/`，返回文件路径和大小。
 
