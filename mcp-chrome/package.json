@@ -1,6 +1,6 @@
 {
   "name": "@pyrokine/mcp-chrome",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Chrome browser automation MCP Server using Chrome DevTools Protocol",
   "main": "dist/index.js",
   "type": "module",
