@@ -343,7 +343,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
  */
 export function registerBrowseTool(server: McpServer): void {
     server.registerTool('browse', {
-        description: '浏览器管理与导航：启动、连接、列出页面、打开 URL、导航',
+        description: `浏览器管理与导航：启动、连接、列出页面、打开 URL、导航`,
         inputSchema: browseSchema,
     }, (args) => handleBrowse(args))
 }
