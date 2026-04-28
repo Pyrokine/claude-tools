@@ -14,7 +14,7 @@ A comprehensive SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.
 
 ## Features
 
-- **Multiple Authentication**: Password, SSH key, SSH agent
+- **Multiple Authentication**: Password, SSH key
 - **SSH Config Support**: Read `~/.ssh/config` with Host aliases, `Host *` inheritance, ProxyJump (`user@host:port`)
 - **Connection Management**: Connection pooling, keepalive, auto-reconnect
 - **Session Persistence**: Sessions info saved for reconnection
@@ -315,8 +315,8 @@ ssh_sync(..., dryRun=true)
 
 If rsync is not available on remote or local, it automatically falls back to SFTP.
 
-**Note**: rsync mode uses SSH key/agent authentication and disables strict host key checking (
-`StrictHostKeyChecking=no`) for convenience. If you require host key verification, use SFTP mode instead.
+**Note**: rsync mode uses SSH key/agent authentication and sets `StrictHostKeyChecking=accept-new`.
+If you require strict host key verification and management, use SFTP mode instead.
 
 ### Persistent PTY Sessions (top, tmux, etc.)
 
@@ -404,6 +404,56 @@ ssh_forward_close(forwardId="fwd_1_xxx")
 | `cwd`     | string  | -       | Working directory                        |
 | `env`     | object  | -       | Additional environment variables         |
 | `pty`     | boolean | false   | Enable PTY mode for interactive commands |
+
+## Security
+
+### Path Whitelist for Key/Config Files
+
+`keyPath` (private key) and `configPath` (SSH config) must reside under one of the following directories:
+
+- `~/.ssh/` — user SSH directory
+- `/etc/ssh/` — system-wide SSH directory
+
+To allow additional directories, set the `SSH_MCP_ALLOWED_KEY_DIRS` environment variable, separated by `:` on
+Linux/macOS or `;` on Windows:
+
+```bash
+export SSH_MCP_ALLOWED_KEY_DIRS=/opt/secrets:/var/lib/keys
+```
+
+Files outside the whitelist are rejected with `Invalid private key path: ...` or `Invalid config path: ...`.
+
+### Optional File-Ops Path Whitelist
+
+`ssh_upload`, `ssh_download`, `ssh_sync` accept arbitrary local paths by default. To restrict them to specific
+directories (recommended for shared environments), set `SSH_MCP_FILE_OPS_ALLOW_DIRS` (paths separated by Node's
+`path.delimiter` — `:` on POSIX, `;` on Windows):
+
+```bash
+export SSH_MCP_FILE_OPS_ALLOW_DIRS=/tmp:/home/me/work
+```
+
+When set, any local path outside the whitelist is rejected. Symlinks are resolved via `realpath` to prevent escape.
+When unset, no restriction is applied (preserves flexibility).
+
+### File Size Limits
+
+- Private key files: max 64 KB
+- SSH config files: max 1 MB
+
+Files exceeding these limits are rejected before being read.
+
+### Symlink Handling in `ssh_sync`
+
+`ssh_sync(direction="upload", ...)` handles local symlinks differently depending on the underlying transport:
+
+| `followSymlinks`  | SFTP path                                                  | rsync path                                                                  |
+|-------------------|------------------------------------------------------------|-----------------------------------------------------------------------------|
+| `false` (default) | Skipped, returned in `skippedSymlinks`, printed as warning | Copied as-is (rsync default: preserves the symlink without dereferencing)   |
+| `true`            | Followed: link target contents are uploaded                | Followed via rsync `-L` / `--copy-links`: link target contents are uploaded |
+
+Both default modes are safe (neither uploads link target contents). The divergence is whether the destination keeps the
+symlink: SFTP omits it entirely, rsync preserves it as a symlink.
 
 ## Project Structure
 

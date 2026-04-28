@@ -14,7 +14,7 @@
 
 ## 功能特性
 
-- **多种认证方式**：密码、SSH 密钥、SSH Agent
+- **多种认证方式**：密码、SSH 密钥
 - **SSH Config 支持**：读取 `~/.ssh/config`，支持 Host 多别名、`Host *` 继承、ProxyJump（`user@host:port` 格式）
 - **连接管理**：连接池复用、心跳保持、自动重连
 - **会话持久化**：会话信息保存，支持重连
@@ -229,8 +229,8 @@ ssh_connect(
    // 输出: appuser
 ```
 
-默认加载 shell 配置以确保环境变量可用（`su -c` 创建非交互式 shell，不会自动执行 rc 文件）。支持 bash（`.bashrc`）、zsh（`.zshrc`
-）及其他 shell（`.profile`）。如不需要可设置 `loadProfile=false`。
+默认加载 shell 配置以确保环境变量可用（`su -c` 创建非交互式 shell，不会自动执行 rc 文件），支持 bash（`.bashrc`）、zsh（`.zshrc`
+）及其他 shell（`.profile`），如不需要可设置 `loadProfile=false`
 
 ### 交互式命令（PTY 模式）
 
@@ -312,10 +312,10 @@ ssh_sync(
 ssh_sync(..., dryRun=true)
 ```
 
-如果远程或本地没有 rsync，会自动回退到 SFTP。
+如果远程或本地没有 rsync，会自动回退到 SFTP
 
-**注意**：rsync 模式使用 SSH 密钥/代理认证，并禁用严格主机密钥检查（`StrictHostKeyChecking=no`）以方便使用。如需主机密钥验证，请使用
-SFTP 模式。
+**注意**：rsync 模式使用 SSH 密钥/代理认证，并设置 `StrictHostKeyChecking=accept-new`（首次连接会自动接受主机密钥），
+如需严格的主机密钥验证与管理，请使用 SFTP 模式
 
 ### 持久化 PTY 会话（top、tmux 等）
 
@@ -404,6 +404,52 @@ ssh_forward_close(forwardId="fwd_1_xxx")
 | `env`     | object  | -     | 额外环境变量             |
 | `pty`     | boolean | false | 启用 PTY 模式（用于交互式命令） |
 
+## 安全
+
+### 私钥/配置文件路径白名单
+
+`keyPath`（私钥）和 `configPath`（SSH 配置文件）必须位于以下目录之一：
+
+- `~/.ssh/` — 用户 SSH 目录
+- `/etc/ssh/` — 系统 SSH 目录
+
+如需扩展白名单，设置环境变量 `SSH_MCP_ALLOWED_KEY_DIRS`，Linux/macOS 用 `:` 分隔，Windows 用 `;` 分隔：
+
+```bash
+export SSH_MCP_ALLOWED_KEY_DIRS=/opt/secrets:/var/lib/keys
+```
+
+白名单外的文件会被拒绝，错误信息为 `Invalid private key path: ...` 或 `Invalid config path: ...`
+
+### 可选：文件操作路径白名单
+
+`ssh_upload`、`ssh_download`、`ssh_sync` 默认接受任意本地路径，如需在共享环境下限定到指定目录（推荐），
+设置 `SSH_MCP_FILE_OPS_ALLOW_DIRS`（路径分隔符跟随 Node `path.delimiter`：POSIX 用 `:`，Windows 用 `;`）：
+
+```bash
+export SSH_MCP_FILE_OPS_ALLOW_DIRS=/tmp:/home/me/work
+```
+
+设置后，白名单外的本地路径会被拒绝，symlink 会通过 `realpath` 解析以防逃逸；未设置时不做限制（保留灵活性）
+
+### 文件大小上限
+
+- 私钥文件：最大 64 KB
+- SSH 配置文件：最大 1 MB
+
+超过上限的文件在读取前即被拒绝
+
+### `ssh_sync` 的 symlink 处理
+
+`ssh_sync(direction="upload", ...)` 对本地 symlink 的处理因底层传输方式而异：
+
+| `followSymlinks` | SFTP 路径                                | rsync 路径                                   |
+|------------------|----------------------------------------|--------------------------------------------|
+| `false`（默认）      | 跳过，写入 `skippedSymlinks` 字段，warning 中提示 | 按 symlink 本身复制（rsync 默认：保留链接，不上传目标内容）      |
+| `true`           | 跟随：上传链接目标内容                            | 通过 rsync `-L` / `--copy-links` 跟随：上传链接目标内容 |
+
+两个默认模式都安全（都不会上传链接目标内容），差异仅在于目标端是否保留 symlink：SFTP 完全跳过不传，rsync 保留为 symlink
+
 ## 项目结构
 
 ```
@@ -421,11 +467,11 @@ mcp-ssh/
 
 ## 贡献
 
-欢迎贡献！请随时提交 Pull Request。
+欢迎贡献！请随时提交 Pull Request
 
 ## 许可证
 
-MIT 许可证 - 详见 [LICENSE](LICENSE)。
+MIT 许可证 - 详见 [LICENSE](LICENSE)
 
 ## 相关项目
 
