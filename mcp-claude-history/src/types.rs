@@ -56,6 +56,10 @@ pub struct SearchStats {
     pub total_matches: usize,
     pub returned_count: usize,
     pub time_ms: u64,
+    /// 是否触发了全局命中硬上限截断（GLOBAL_RESULT_CAP）；
+    /// 客户端看到 has_more=false + truncated_global=true 应理解为"翻完但被截，需缩小搜索"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_global: Option<bool>,
 }
 
 /// 搜索响应
@@ -176,7 +180,10 @@ impl ParsedRef {
         }
         let session_prefix = parts[0].to_string();
         let line = parts[1].parse().ok()?;
-        Some(Self { session_prefix, line })
+        Some(Self {
+            session_prefix,
+            line,
+        })
     }
 }
 
@@ -213,11 +220,27 @@ impl Range {
 
             if part.contains('-') {
                 let parts: Vec<&str> = part.splitn(2, '-').collect();
-                let start = if parts[0].is_empty() { None } else { parts[0].parse().ok() };
-                let end = if parts.len() < 2 || parts[1].is_empty() { None } else { parts[1].parse().ok() };
-                ranges.push(Range { start, end, exclude });
+                let start = if parts[0].is_empty() {
+                    None
+                } else {
+                    parts[0].parse().ok()
+                };
+                let end = if parts.len() < 2 || parts[1].is_empty() {
+                    None
+                } else {
+                    parts[1].parse().ok()
+                };
+                ranges.push(Range {
+                    start,
+                    end,
+                    exclude,
+                });
             } else if let Ok(n) = part.parse::<usize>() {
-                ranges.push(Range { start: Some(n), end: Some(n), exclude });
+                ranges.push(Range {
+                    start: Some(n),
+                    end: Some(n),
+                    exclude,
+                });
             }
         }
         ranges

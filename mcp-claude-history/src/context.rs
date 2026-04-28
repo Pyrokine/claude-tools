@@ -56,7 +56,12 @@ fn matches_types(effective_type: &str, types: &[String]) -> bool {
 }
 
 /// 检查消息内容是否匹配 pattern
-fn matches_pattern(content: &str, pattern: &Option<Regex>, plain_pattern: &Option<String>, case_sensitive: bool) -> bool {
+fn matches_pattern(
+    content: &str,
+    pattern: &Option<Regex>,
+    plain_pattern: &Option<String>,
+    case_sensitive: bool,
+) -> bool {
     if let Some(re) = pattern {
         return re.is_match(content);
     }
@@ -80,11 +85,13 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
                 .build()
             {
                 Ok(r) => Some(r),
-                Err(e) => return Err(ErrorResponse {
-                    error: "invalid_regex".to_string(),
-                    message: format!("无效的正则表达式: {}", e),
-                    available: None,
-                }),
+                Err(e) => {
+                    return Err(ErrorResponse {
+                        error: "invalid_regex".to_string(),
+                        message: format!("无效的正则表达式: {}", e),
+                        available: None,
+                    })
+                }
             }
         } else {
             None
@@ -110,7 +117,11 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     })?;
 
     // 查找 session 文件
-    let (_project_id, session_id, path) = find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
+    let (_project_id, session_id, path) = find_session_file(
+        config,
+        &parsed_ref.session_prefix,
+        params.project.as_deref(),
+    )?;
 
     // 读取文件
     let file = File::open(&path).map_err(|e| ErrorResponse {
@@ -189,9 +200,14 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         if before > 0 {
             let mut count = 0;
             for i in (0..anchor_idx).rev() {
-                if matches_types(all_messages[i].effective_type, &params.types)
-                    && matches_pattern(&all_messages[i].content, &compiled_regex, &plain_pattern, params.case_sensitive)
-                {
+                let type_ok = matches_types(all_messages[i].effective_type, &params.types);
+                let pattern_ok = matches_pattern(
+                    &all_messages[i].content,
+                    &compiled_regex,
+                    &plain_pattern,
+                    params.case_sensitive,
+                );
+                if type_ok && pattern_ok {
                     count += 1;
                     start = i;
                     if count >= before {
@@ -205,9 +221,14 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         if after > 0 {
             let mut count = 0;
             for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
-                if matches_types(msg.effective_type, &params.types)
-                    && matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive)
-                {
+                let type_ok = matches_types(msg.effective_type, &params.types);
+                let pattern_ok = matches_pattern(
+                    &msg.content,
+                    &compiled_regex,
+                    &plain_pattern,
+                    params.case_sensitive,
+                );
+                if type_ok && pattern_ok {
                     count += 1;
                     end = i + 1;
                     if count >= after {
@@ -225,15 +246,26 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     let mut total_chars = 0;
     let mut truncated_by_total = false;
 
-    for (i, msg) in all_messages.iter().enumerate().take(end_idx).skip(start_idx) {
+    for (i, msg) in all_messages
+        .iter()
+        .enumerate()
+        .take(end_idx)
+        .skip(start_idx)
+    {
         let is_anchor = i == anchor_idx;
         if !is_anchor && !matches_types(msg.effective_type, &params.types) {
             continue;
         }
         // pattern 过滤（anchor 消息始终保留）
-        if !is_anchor && (compiled_regex.is_some() || plain_pattern.is_some())
-            && !matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive)
-        {
+        let has_pattern_filter = compiled_regex.is_some() || plain_pattern.is_some();
+        let pattern_ok = !has_pattern_filter
+            || matches_pattern(
+            &msg.content,
+            &compiled_regex,
+            &plain_pattern,
+            params.case_sensitive,
+        );
+        if !is_anchor && !pattern_ok {
             continue;
         }
 

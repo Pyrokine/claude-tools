@@ -40,7 +40,11 @@ impl Default for SearchParams {
             sessions: Vec::new(),
             since: None,
             until: None,
-            types: vec!["assistant".to_string(), "user".to_string(), "summary".to_string()],
+            types: vec![
+                "assistant".to_string(),
+                "user".to_string(),
+                "summary".to_string(),
+            ],
             subtypes: Vec::new(),
             lines: Vec::new(),
             use_regex: false,
@@ -55,6 +59,17 @@ impl Default for SearchParams {
     }
 }
 
+/// 单文件命中上限（避免单一巨型 jsonl 把内存吃满）
+/// 上限 = clamp((offset + limit) * 2, 1_000, GLOBAL_RESULT_CAP)
+/// 不让 offset 把单文件 cap 拉到无限，否则并行 search_file 会先 OOM 再被全局截断
+fn per_file_cap(params: &SearchParams) -> usize {
+    let target = params.offset.saturating_add(params.limit.unwrap_or(10_000));
+    target.saturating_mul(2).clamp(1_000, GLOBAL_RESULT_CAP)
+}
+
+/// 全局命中硬上限（防止 OOM；超过即截断 + 在响应里标 truncated）
+const GLOBAL_RESULT_CAP: usize = 50_000;
+
 /// 执行搜索
 pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, ErrorResponse> {
     let start = Instant::now();
@@ -66,6 +81,8 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
     let files = collect_jsonl_files(&project_dirs, &params.sessions, params.subagents);
 
     // 编译正则（如果需要）
+    // 注：Rust 的 `regex` crate 基于 NFA，无回溯，最坏 O(n*m)，因此不需要 ReDoS 启发式检测
+    // （与 mcp-chrome extension 的 JS 路径不同，JS RegExp 是回溯实现）
     let regex = if params.use_regex && !params.pattern.is_empty() {
         match RegexBuilder::new(&params.pattern)
             .case_insensitive(!params.case_sensitive)
@@ -91,6 +108,9 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
         None
     };
 
+    // 单文件早停阈值（防止单文件命中过多直接拖垮内存）
+    let file_cap = per_file_cap(&params);
+
     // 并行搜索所有文件
     let file_results: Vec<_> = files
         .par_iter()
@@ -102,6 +122,7 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
                 &params,
                 regex.as_ref(),
                 search_pattern.as_ref(),
+                file_cap,
             )
         })
         .collect();
@@ -117,12 +138,19 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
         all_results.extend(results);
     }
 
+    // 全局硬截断：超过 GLOBAL_RESULT_CAP 直接砍掉，避免后续 sort/dedup 处理超大 Vec
+    let truncated_global = all_results.len() > GLOBAL_RESULT_CAP;
+    if truncated_global {
+        all_results.truncate(GLOBAL_RESULT_CAP);
+    }
+
     // 按时间排序
     all_results.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
     // UUID 去重：跨会话去重（延续会话镜像场景），保留最早出现的一条
     let mut seen_uuids = std::collections::HashSet::new();
-    all_results.retain(|r| seen_uuids.insert(r.uuid.clone()));
+    // 空 UUID（uuid: ""）跳过去重，避免将多条无 uuid 消息合并为一条
+    all_results.retain(|r| r.uuid.is_empty() || seen_uuids.insert(r.uuid.clone()));
 
     let total_matches = all_results.len();
 
@@ -146,7 +174,8 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
         } else {
             params.max_content
         };
-        let (content, truncated) = truncate_around_match(&result.content, result.match_pos, effective_max);
+        let (content, truncated) =
+            truncate_around_match(&result.content, result.match_pos, effective_max);
         result.content = content;
         result.truncated = truncated || result.truncated;
 
@@ -162,6 +191,8 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
     let returned_count = final_results.len();
     // 使用 saturating_sub 防止下溢
     let remaining = total_matches.saturating_sub(params.offset);
+    // has_more 仅表示"还有可继续翻的页"；truncated_global 通过 stats 单独告知客户端"被截"
+    // 不能让 has_more = ... || truncated_global，否则到底后客户端拿 has_more=true + next_offset 不动，分页死循环
     let has_more = returned_count < remaining;
     let next_offset = params.offset + returned_count;
 
@@ -172,6 +203,7 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
             total_matches,
             returned_count,
             time_ms: start.elapsed().as_millis() as u64,
+            truncated_global: truncated_global.then_some(true),
         },
         results: final_results,
         has_more,
@@ -180,7 +212,10 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
 }
 
 /// 获取要搜索的项目目录
-fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(String, PathBuf)>, ErrorResponse> {
+fn get_project_dirs(
+    config: &Config,
+    params: &SearchParams,
+) -> Result<Vec<(String, PathBuf)>, ErrorResponse> {
     if params.all_projects {
         return config.list_project_dirs().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
@@ -193,7 +228,7 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
         // 搜索指定项目
         let mut dirs = Vec::new();
         for project_id in &params.projects {
-            let dir = config.project_dir(project_id);
+            let dir = config.project_dir(project_id)?;
             if !dir.exists() {
                 return Err(ErrorResponse {
                     error: "project_not_found".to_string(),
@@ -208,8 +243,10 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
 
     // 默认：当前项目
     if let Some(project_id) = config.current_project_id() {
-        let dir = config.project_dir(&project_id);
-        return Ok(vec![(project_id, dir)]);
+        // current_project_id 由 cwd 转码生成,理论上合规;若失败则继续向下报 no_current_project
+        if let Ok(dir) = config.project_dir(&project_id) {
+            return Ok(vec![(project_id, dir)]);
+        }
     }
 
     // 找不到当前项目，返回错误
@@ -242,7 +279,9 @@ fn collect_jsonl_files(
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    if let Some(session_id) = session_id_from_filename(&entry.file_name().to_string_lossy()) {
+                    if let Some(session_id) =
+                        session_id_from_filename(&entry.file_name().to_string_lossy())
+                    {
                         if session_matches_filter(&session_id, sessions) {
                             files.push((project_id.clone(), session_id, path));
                         }
@@ -265,7 +304,10 @@ fn collect_jsonl_files(
                         if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
                             let filename = entry.file_name().to_string_lossy().to_string();
                             if filename.starts_with("agent-") {
-                                let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
+                                let session_id = filename
+                                    .strip_suffix(".jsonl")
+                                    .unwrap_or(&filename)
+                                    .to_string();
                                 if session_matches_filter(&session_id, sessions) {
                                     files.push((project_id.clone(), session_id, path));
                                 }
@@ -288,6 +330,7 @@ fn search_file(
     params: &SearchParams,
     regex: Option<&Regex>,
     pattern: Option<&SearchPattern>,
+    max_per_file: usize,
 ) -> (usize, Vec<SearchResult>) {
     let mut results = Vec::new();
     let mut lines_scanned = 0;
@@ -334,12 +377,16 @@ fn search_file(
         }
 
         // 时间过滤
-        if !time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref()) {
+        if !time_in_range(
+            &record.timestamp,
+            params.since.as_ref(),
+            params.until.as_ref(),
+        ) {
             continue;
         }
 
-        // 提取内容（图片替换为占位符）
-        let content = replace_images_with_placeholders(&record);
+        // 一次遍历同时提取文本内容和图片列表
+        let (content, images) = extract_and_replace_images(&record);
 
         // 内容匹配
         let (matches, match_pos) = if params.pattern.is_empty() {
@@ -360,8 +407,7 @@ fn search_file(
             continue;
         }
 
-        // 提取图片信息
-        let images = extract_images(&record);
+        // 图片信息已在 extract_and_replace_images 中一并提取
         let image_count = images.len();
         let content_size = content.chars().count();
 
@@ -381,7 +427,105 @@ fn search_file(
             project: project_id.to_string(),
             match_pos,
         });
+
+        // 单文件早停（避免一个巨型 jsonl 把内存吃满）
+        if results.len() >= max_per_file {
+            break;
+        }
     }
 
     (lines_scanned, results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_jsonl(dir: &Path, name: &str, lines: usize) -> PathBuf {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..lines {
+            // 构造最小可被 classify_message 识别为 "user" 类型的 jsonl 行
+            // 时间戳带毫秒偏移以保证 sort 顺序
+            writeln!(
+                f,
+                r#"{{"uuid":"u-{i:08}","type":"user","timestamp":"2026-04-26T10:00:{:02}.{:03}Z","message":{{"role":"user","content":"hit-{i}"}}}}"#,
+                i % 60,
+                i % 1000,
+            )
+                .unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn test_per_file_cap_default() {
+        let p = SearchParams::default();
+        // limit None → unwrap_or(10000); offset 0; cap = max(20000, 1000) = 20000
+        assert_eq!(per_file_cap(&p), 20_000);
+    }
+
+    #[test]
+    fn test_per_file_cap_with_limit() {
+        let mut p = SearchParams::default();
+        p.offset = 100;
+        p.limit = Some(50);
+        // (100 + 50) * 2 = 300，下限 1000 → 1000
+        assert_eq!(per_file_cap(&p), 1_000);
+
+        p.offset = 0;
+        p.limit = Some(5_000);
+        // 5000 * 2 = 10000
+        assert_eq!(per_file_cap(&p), 10_000);
+    }
+
+    #[test]
+    fn test_search_file_early_stop_at_cap() {
+        let tmp = std::env::temp_dir().join(format!("mcp-search-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = write_jsonl(&tmp, "session-aaa.jsonl", 200);
+
+        let mut p = SearchParams::default();
+        p.types = vec!["user".to_string()]; // 默认含 user，但显式收紧避免被其他默认类型干扰
+        p.pattern = String::new(); // 全部命中
+
+        let cap = 50;
+        let (lines_scanned, results) =
+            search_file("proj", "session-aaa", &path, &p, None, None, cap);
+        assert!(
+            results.len() <= cap,
+            "results.len()={} should be <= cap={}",
+            results.len(),
+            cap
+        );
+        assert_eq!(results.len(), cap, "should hit exactly cap");
+        // lines_scanned 在 break 前已 +1，所以 ≤ cap 行（每行命中即 push 后才检查 break）
+        assert!(
+            lines_scanned <= cap + 1 && lines_scanned >= cap,
+            "lines_scanned={} should be near cap={}",
+            lines_scanned,
+            cap
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_search_file_no_break_when_under_cap() {
+        let tmp = std::env::temp_dir().join(format!("mcp-search-test2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = write_jsonl(&tmp, "session-bbb.jsonl", 30);
+
+        let mut p = SearchParams::default();
+        p.types = vec!["user".to_string()];
+        p.pattern = String::new();
+
+        let (lines_scanned, results) =
+            search_file("proj", "session-bbb", &path, &p, None, None, 1000);
+        assert_eq!(results.len(), 30, "all 30 should be returned");
+        assert_eq!(lines_scanned, 30);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }
