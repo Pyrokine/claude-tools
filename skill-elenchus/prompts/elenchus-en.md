@@ -115,7 +115,10 @@ When the problem involves software engineering, augment each phase:
 Continue...
 ```
 
-## Engine Mode
+## Round Limit
+
+Maximum **15 rounds** (including engine mode invocations). At the limit, output the best current synthesis and stop,
+noting "Round limit reached."
 
 When invoked internally by other flows (e.g. design proposal pre-analysis):
 

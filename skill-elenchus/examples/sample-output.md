@@ -1,6 +1,6 @@
 # Sample Review Output
 
-This is an example of what `/review` produces for a TypeScript project.
+This is an example of what `/elenchus` produces for a TypeScript project.
 
 ---
 
@@ -21,19 +21,21 @@ Date: 2025-03-27 14:30:00
 │ Total    │    11 │
 └──────────┴───────┘
 
-┌─────────────────────────┬───────┐
-│ Verdict                 │ Count │
-├─────────────────────────┼───────┤
-│ CONFIRMED (unanimous)   │     6 │
-│ CONFIRMED (majority)    │     2 │
-│ SUSTAINED (after dispute│     1 │
-│ DEEPENED                │     1 │
-│ OVERTURNED              │     1 │
-└─────────────────────────┴───────┘
+┌───────────────────────────────┬───────┐
+│ Verdict                       │ Count │
+├───────────────────────────────┼───────┤
+│ CONFIRMED (unanimous)         │     6 │
+│ CONFIRMED (majority)          │     2 │
+│ SUSTAINED (after arbitration) │     1 │
+│ DEEPENED                      │     1 │
+│ OVERTURNED                    │     1 │
+│ UNRESOLVED                    │     0 │
+└───────────────────────────────┴───────┘
 
 --- CRITICAL ---
 
 [FINDING]
+id: E1-001
 file: src/core/session.ts
 line: 142
 severity: CRITICAL
@@ -48,6 +50,7 @@ suggestion: Remove the `* 1000`: `timestamp: Math.round(p.timestamp),`
 --- HIGH ---
 
 [FINDING]
+id: E2-001
 file: extension/src/background/actions.ts
 line: 287-295
 severity: HIGH
@@ -62,29 +65,27 @@ suggestion: Detect nested quantifier patterns before constructing RegExp; limit 
 [... more findings ...]
 
 MEDIUM: 5 findings | LOW: 2 findings
-Full report: /tmp/skill-review/mcp-chrome/runs/20250327_143000/review-report.md
+Full report: /tmp/skill-elenchus/mcp-chrome/runs/20250327_143000/report.md
 ```
 
 ## Output Directory Structure
 
 ```
-/tmp/skill-review/mcp-chrome/runs/20250327_143000/
-├── diff-stat.txt          # git diff --stat snapshot
-├── diff-content.txt       # full diff
+/tmp/skill-elenchus/mcp-chrome/runs/20250327_143000/
 ├── expert-logic.md        # Expert 1 raw findings
 ├── expert-security.md     # Expert 2 raw findings
 ├── expert-design.md       # Expert 3 raw findings
 ├── expert-perf.md         # Expert 4 raw findings
 ├── expert-convention.md   # Expert 5 raw findings
-├── cross-review.md        # Cross-examination results
+├── cross-1.md ... cross-5.md  # Cross-examination results (one per examiner)
 ├── disputes.md            # Dispute resolution records
-└── review-report.md       # Final aggregated report
+└── report.md              # Final aggregated report
 ```
 
 ## Dispute Example
 
 ```markdown
-# Dispute: expert-logic finding at src/tools/input.ts:89
+# Dispute: E1-002 — src/tools/input.ts:89
 
 ## Original Finding (Expert 1 — Logic)
 setTimeout with delay > 2^31-1 ms silently fires immediately in Node.js.

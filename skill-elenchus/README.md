@@ -91,7 +91,7 @@ Each run creates a timestamped directory:
 ├── expert-design.md
 ├── expert-perf.md
 ├── expert-convention.md
-├── cross-review.md        # Cross-examination results
+├── cross-1.md ... cross-5.md  # Cross-examination results (one per examiner)
 ├── disputes.md            # Dispute resolution records
 └── report.md              # Final aggregated report
 ```

@@ -1,8 +1,8 @@
 # skill-elenchus
 
-面向 Claude Code 的辩证分析方法论。多视角质疑、交叉对质、第一性原理还原。一个工具，一套哲学——自然适配代码评审、深度思辨、设计分析。
+面向 Claude Code 的辩证分析方法论，多视角质疑、交叉对质、第一性原理还原，一个工具，一套哲学——自然适配代码评审、深度思辨、设计分析
 
-命名来自 **Elenchus**（ἔλεγχος）——苏格拉底的质疑反驳法。
+命名来自 **Elenchus**（ἔλεγχος）——苏格拉底的质疑反驳法
 
 ## 核心理念
 
@@ -52,7 +52,7 @@ cp -r skill-elenchus/ ~/.claude/skills/elenchus/
 
 ### 切换英文版
 
-默认入口 `SKILL.md` 为中文版。切换英文版：
+默认入口 `SKILL.md` 为中文版，切换英文版：
 
 ```bash
 cd ~/.claude/skills/elenchus
@@ -76,7 +76,7 @@ mv SKILL-en.md SKILL.md
 /elenchus 多角度评估下这个缓存架构方案
 ```
 
-不需要选择模式——工具理解你的意图并自动适配。
+不需要选择模式——工具理解你的意图并自动适配
 
 ## 输出
 
@@ -89,7 +89,7 @@ mv SKILL-en.md SKILL.md
 ├── expert-design.md
 ├── expert-perf.md
 ├── expert-convention.md
-├── cross-review.md        # 交叉质疑结果
+├── cross-1.md ... cross-5.md  # 交叉质疑结果（每个质疑者独立文件）
 ├── disputes.md            # 争议对质记录
 └── report.md              # 最终综合报告
 ```
