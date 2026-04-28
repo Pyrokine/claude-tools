@@ -121,8 +121,8 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `regex`          | boolean | false   | 是否使用正则匹配                                 |
 | `case_sensitive` | boolean | false   | 是否区分大小写                                  |
 
-**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，不受 `types` 和 `pattern` 过滤影响。设置 `pattern` 后，`before`/`after`
-的计数仅统计匹配该 pattern 的消息。
+**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，不受 `types` 和 `pattern` 过滤影响；设置 `pattern` 后，`before`/`after`
+的计数仅统计匹配该 pattern 的消息
 
 ## 使用示例
 
@@ -185,8 +185,8 @@ ref = session前8位:行号
 例如：c86bc677:1234
 ```
 
-session 前 8 位取自完整的 session ID（如 `c86bc677-9f5f-4e49-8e16-5e175a059610`）。
+session 前 8 位取自完整的 session ID（如 `c86bc677-9f5f-4e49-8e16-5e175a059610`）
 
 ## 许可证
 
-MIT 许可证 - 详见 [LICENSE](LICENSE)。
+MIT 许可证 - 详见 [LICENSE](LICENSE)
