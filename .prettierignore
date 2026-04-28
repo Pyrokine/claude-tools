@@ -1,0 +1,6 @@
+node_modules/
+dist/
+extension/dist/
+coverage/
+*.min.css
+package-lock.json
