@@ -75,7 +75,9 @@ claude mcp add chrome -- node /path/to/mcp-chrome/dist/index.js
   "mcpServers": {
     "chrome": {
       "command": "node",
-      "args": ["/path/to/mcp-chrome/dist/index.js"]
+      "args": [
+        "/path/to/mcp-chrome/dist/index.js"
+      ]
     }
   }
 }
@@ -135,18 +137,26 @@ Extension-specific: `list` returns additional fields: `managed` (whether tab is 
 
 Event sequence model supporting arbitrary combinations:
 
-| Event Type                              | Description                                                                  |
-|-----------------------------------------|------------------------------------------------------------------------------|
-| `keydown` / `keyup`                     | Key press/release                                                            |
-| `click`                                 | Click with actionability checks (visible, enabled, not-covered, auto-scroll) |
-| `mousedown` / `mouseup`                 | Mouse button press/release                                                   |
-| `mousemove`                             | Mouse movement                                                               |
-| `wheel`                                 | Mouse wheel scroll                                                           |
-| `touchstart` / `touchmove` / `touchend` | Touch events                                                                 |
-| `type`                                  | Type text                                                                    |
-| `wait`                                  | Pause between events                                                         |
-| `select`                                | Select text by content (mouse sim)                                           |
-| `replace`                               | Find and replace text                                                        |
+| Event Type                              | Description                                                                       |
+|-----------------------------------------|-----------------------------------------------------------------------------------|
+| `keydown` / `keyup`                     | Key press/release                                                                 |
+| `click`                                 | Click with actionability checks (visible, enabled, not-covered, auto-scroll)      |
+| `mousedown` / `mouseup`                 | Mouse button press/release                                                        |
+| `mousemove`                             | Mouse movement                                                                    |
+| `wheel`                                 | Mouse wheel scroll                                                                |
+| `touchstart` / `touchmove` / `touchend` | Touch events                                                                      |
+| `type`                                  | Type text (with optional `delay`, `dispatch` for React/Vue)                       |
+| `wait`                                  | Pause between events                                                              |
+| `select`                                | Select text by content (mouse sim)                                                |
+| `replace`                               | Find and replace text                                                             |
+| `drag`                                  | HTML5 drag-and-drop (DragEvent in MAIN world, with `target` source + `to` target) |
+
+Special-case parameters:
+
+- `keydown` accepts `commands` (e.g. `["selectAll"]`, `["copy"]`, `["paste"]`, `["cut"]`, `["undo"]`, `["redo"]`) to
+  trigger native browser editing commands. `commands` is precise-mode only — stealth mode will throw because the
+  CDP commands API has no JS-event equivalent.
+- `keydown` on a key already held emits `rawKeyDown` with `autoRepeat: true` (Puppeteer-compatible long-press).
 
 Parameters: `humanize` enables Bézier curve movement and random delays. `tabId` targets a specific tab. `frame` targets
 an iframe (CSS selector or index). Both Extension mode only.
@@ -174,6 +184,8 @@ metadata or data alongside HTML. `tabId` targets a specific tab. `frame` targets
 `output` to save to file).
 
 **`state`-specific**: `depth` controls DOM traversal depth (default 15). Reduce to limit response size on large pages.
+`mode` selects the underlying source — `accessibility` (default, derived from the a11y tree) or `domsnapshot` (raw CDP
+`DOMSnapshot.captureSnapshot`, CDP-only; returns a flat node array with computed styles for advanced post-processing).
 
 ### wait - Wait for Conditions
 
@@ -212,17 +224,23 @@ Results >100KB are auto-saved to `/tmp/` with a structured hint returned.
 
 ### manage - Page & Environment Management
 
-| Action       | Description                                              |
-|--------------|----------------------------------------------------------|
-| `newPage`    | Create new page/tab                                      |
-| `closePage`  | Close page                                               |
-| `clearCache` | Clear cache/cookies/storage                              |
-| `viewport`   | Set viewport size                                        |
-| `userAgent`  | Set User-Agent                                           |
-| `emulate`    | Device emulation (iPhone, iPad, etc.)                    |
-| `inputMode`  | Query or set input mode (`precise` / `stealth`)          |
-| `stealth`    | Inject anti-detection scripts                            |
-| `cdp`        | Send raw CDP command (advanced, e.g. `Runtime.evaluate`) |
+| Action       | Description                                               |
+|--------------|-----------------------------------------------------------|
+| `newPage`    | Create new page/tab                                       |
+| `closePage`  | Close page                                                |
+| `clearCache` | Clear cache/storage (use `cookies` tool to clear cookies) |
+| `viewport`   | Set viewport size                                         |
+| `userAgent`  | Set User-Agent                                            |
+| `emulate`    | Device emulation (iPhone, iPad, etc.)                     |
+| `inputMode`  | Query or set input mode (`precise` / `stealth`)           |
+| `stealth`    | Inject anti-detection scripts                             |
+| `cdp`        | Send raw CDP command (advanced, e.g. `Runtime.evaluate`)  |
+
+**Stealth mode levels** (CDP launch parameter, set via `browse action=launch stealth=...`):
+
+- `off` — no anti-detection (clean mode for tests/CI)
+- `safe` (default) — minimal patches (remove `navigator.webdriver`, clean CDP traces)
+- `aggressive` — adds a few WebGL/plugin/language fingerprint patches (does NOT equal full masking)
 
 ### logs - Browser Logs
 
@@ -236,12 +254,15 @@ for logs.
 
 ### cookies - Cookie Management
 
-| Action   | Description       |
-|----------|-------------------|
-| `get`    | Get cookies       |
-| `set`    | Set cookie        |
-| `delete` | Delete cookie     |
-| `clear`  | Clear all cookies |
+| Action   | Description                                                   |
+|----------|---------------------------------------------------------------|
+| `get`    | Get cookies                                                   |
+| `set`    | Set cookie                                                    |
+| `delete` | Delete cookie                                                 |
+| `clear`  | Delete cookies by filter (`name`/`domain`/`url`, ≥1 required) |
+
+**Note**: `clear` requires at least one of `name`, `domain`, or `url` to filter — calling without any filter is rejected
+to avoid wiping the user's login cookies.
 
 ## Target: Unified Element Locator
 
@@ -445,12 +466,15 @@ mcp-chrome/
 │   │   └── schema.ts         # Shared JSON Schema (Target oneOf)
 │   ├── core/                 # Core abstractions
 │   │   ├── unified-session.ts # Dual-mode session (Extension + CDP)
+│   │   ├── browser-driver.ts # IBrowserDriver abstraction
 │   │   ├── session.ts        # CDP session management
 │   │   ├── locator.ts        # Element locator (deadline-based timeout)
 │   │   ├── auto-wait.ts      # Auto-wait mechanism
 │   │   ├── retry.ts          # Retry logic
 │   │   ├── types.ts          # Type definitions
-│   │   └── errors.ts         # Error types
+│   │   ├── utils.ts          # Shared helpers
+│   │   ├── errors.ts         # Error types
+│   │   └── index.ts          # Module entry
 │   ├── extension/            # Extension bridge
 │   │   ├── bridge.ts         # High-level Extension API
 │   │   └── http-server.ts    # HTTP + WebSocket server
@@ -475,12 +499,28 @@ mcp-chrome/
 
 ## Security Notes
 
+- **Trust boundary**: This server has no application-layer authentication — it relies on `127.0.0.1` binding plus
+  same-UID trust, matching the model used by Playwright, Puppeteer, and chrome-launcher. Do NOT run on multi-user
+  systems, CI runners, or containers with `--net=host` where untrusted code can reach `127.0.0.1:19222-19299`. WebSocket
+  upgrades require a `chrome-extension://` Origin header, which blocks browser pages and curl, but does not stop a
+  malicious local process running as the same user.
 - Extension mode: shares your browser sessions — only use on trusted machines
 - CDP mode: provides full browser control via DevTools Protocol
 - Default ports bind to 127.0.0.1 only (localhost)
 - The `evaluate` tool can execute arbitrary JavaScript
 - The `manage cdp` action can send arbitrary CDP commands
 - Network logs may contain sensitive information
+
+### Anti-detection (stealth) — what it actually does
+
+The `stealth` mode (`safe` / `aggressive`) only patches a small set of fingerprinting surfaces:
+
+- **Covers**: `navigator.webdriver`, `cdc_*` properties, User-Agent string, a few WebGL vendor/renderer values, Chrome
+  runtime properties
+- **Does NOT cover**: Canvas fingerprinting, AudioContext fingerprinting, Font enumeration, TLS-level fingerprints (
+  JA3/JA4), CDP attach banner ("Chrome is being controlled by automated software"), Extension presence detection
+- **Warning**: Do NOT rely on this to bypass commercial anti-bot services (Cloudflare Turnstile, Akamai, DataDome,
+  PerimeterX). Real bot detection happens at multiple layers we cannot patch from inside the page
 
 ## Known Limitations
 
