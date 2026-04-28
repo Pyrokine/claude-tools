@@ -11,27 +11,47 @@
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+import { validateConfigFile } from './security.js'
+import { expandTilde } from './tools/utils.js'
 
 export interface SSHConfigHost {
-    host: string;           // Host 别名
-    hostName?: string;      // 实际地址
-    user?: string;          // 用户名
-    port?: number;          // 端口
-    identityFile?: string;  // 私钥路径
-    proxyJump?: string;     // 跳板机（原始字符串，可能是 user@host:port 格式）
+    host: string // Host 别名
+    hostName?: string // 实际地址
+    user?: string // 用户名
+    port?: number // 端口
+    identityFile?: string // 私钥路径
+    proxyJump?: string // 跳板机（原始字符串，可能是 user@host:port 格式）
 }
 
 /** ProxyJump 解析结果 */
 export interface ParsedProxyJump {
-    user?: string;
-    host: string;
-    port?: number;
+    user?: string
+    host: string
+    port?: number
 }
 
 /** 内部使用的配置块 */
 interface ConfigBlock {
-    patterns: string[];     // Host 行的所有模式/别名
-    config: Omit<SSHConfigHost, 'host'>;
+    patterns: string[] // Host 行的所有模式/别名
+    config: Omit<SSHConfigHost, 'host'>
+}
+
+// hostname 仅允许字母、数字、`.`、`:`(IPv6)、`-`、`_`,拒绝空格、引号、反斜杠、`-o` 注入字符
+const HOSTNAME_ALLOWED = /^[a-zA-Z0-9.:_-]+$/
+function validateHostName(value: string, hostBlock: string): void {
+    if (!HOSTNAME_ALLOWED.test(value)) {
+        throw new Error(
+            `ssh-config: Host "${hostBlock}" 的 HostName "${value}" 含非法字符（仅允许字母、数字、.、:、-、_）`
+        )
+    }
+}
+
+// SSH 用户名仅允许字母、数字、`.`、`-`、`_`,拒绝 `-o` 等注入
+const USERNAME_ALLOWED = /^[a-zA-Z0-9._-]+$/
+function validateUserName(value: string, hostBlock: string): void {
+    if (!USERNAME_ALLOWED.test(value)) {
+        throw new Error(`ssh-config: Host "${hostBlock}" 的 User "${value}" 含非法字符（仅允许字母、数字、.、-、_）`)
+    }
 }
 
 /**
@@ -43,7 +63,7 @@ function parseHostPort(s: string): { host: string; port?: number } {
     if (s.startsWith('[')) {
         const closeBracket = s.indexOf(']')
         if (closeBracket !== -1) {
-            const host = s.slice(1, closeBracket)  // 去掉方括号
+            const host = s.slice(1, closeBracket) // 去掉方括号
             const rest = s.slice(closeBracket + 1)
             if (rest.startsWith(':')) {
                 const parsedPort = parseInt(rest.slice(1), 10)
@@ -64,8 +84,8 @@ function parseHostPort(s: string): { host: string; port?: number } {
     // 普通格式: host:port 或 host
     const colonIndex = s.lastIndexOf(':')
     if (colonIndex !== -1) {
-        const host       = s.slice(0, colonIndex)
-        const portStr    = s.slice(colonIndex + 1)
+        const host = s.slice(0, colonIndex)
+        const portStr = s.slice(colonIndex + 1)
         const parsedPort = parseInt(portStr, 10)
         if (!isNaN(parsedPort)) {
             return { host, port: parsedPort }
@@ -95,8 +115,8 @@ export function parseProxyJump(proxyJump: string): ParsedProxyJump | null {
     // 解析 user@... 格式
     const atIndex = firstJump.indexOf('@')
     if (atIndex !== -1) {
-        user                 = firstJump.slice(0, atIndex)
-        const rest           = firstJump.slice(atIndex + 1)
+        user = firstJump.slice(0, atIndex)
+        const rest = firstJump.slice(atIndex + 1)
         const { host, port } = parseHostPort(rest)
         return { user, host, port }
     }
@@ -106,27 +126,17 @@ export function parseProxyJump(proxyJump: string): ParsedProxyJump | null {
 }
 
 /**
- * 展开 ~ 路径
- */
-function expandTilde(filePath: string): string {
-    if (filePath.startsWith('~')) {
-        return path.join(os.homedir(), filePath.slice(1))
-    }
-    return filePath
-}
-
-/**
  * 剥离行尾注释
  * "value # comment" -> "value"
  */
 function stripInlineComment(value: string): string {
     // 查找不在引号内的 #
-    let inQuote   = false
+    let inQuote = false
     let quoteChar = ''
     for (let i = 0; i < value.length; i++) {
         const ch = value[i]
-        if (!inQuote && (ch === '"' || ch === '\'')) {
-            inQuote   = true
+        if (!inQuote && (ch === '"' || ch === "'")) {
+            inQuote = true
             quoteChar = ch
         } else if (inQuote && ch === quoteChar) {
             inQuote = false
@@ -143,20 +153,23 @@ function stripInlineComment(value: string): string {
  * 跳过 Match 块（避免条件配置被误应用）
  */
 export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
-    const filePath = configPath || path.join(os.homedir(), '.ssh', 'config')
+    const filePath = configPath ? expandTilde(configPath) : path.join(os.homedir(), '.ssh', 'config')
 
     if (!fs.existsSync(filePath)) {
         return []
     }
 
+    // 路径白名单 + 大小上限校验，避免任意大文件被读取
+    validateConfigFile(filePath)
+
     const content = fs.readFileSync(filePath, 'utf-8')
-    const lines   = content.split('\n')
+    const lines = content.split('\n')
 
     // 第一遍：收集所有配置块
-    const blocks: ConfigBlock[]                     = []
-    let currentBlock: ConfigBlock | null            = null
+    const blocks: ConfigBlock[] = []
+    let currentBlock: ConfigBlock | null = null
     let globalDefaults: Omit<SSHConfigHost, 'host'> = {}
-    let inMatchBlock                                = false  // 跳过 Match 块
+    let inMatchBlock = false // 跳过 Match 块
 
     for (const line of lines) {
         const trimmed = line.trim()
@@ -167,14 +180,14 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
         }
 
         // 解析 key value（支持 = 和空格分隔）
-        const match = trimmed.match(/^(\S+)\s*[=\s]\s*(.+)$/)
+        const match = trimmed.match(/^(?<key>\S+)\s*[=\s]\s*(?<rawValue>.+)$/)
         if (!match) {
             continue
         }
 
-        const [, key, rawValue] = match
-        const keyLower          = key.toLowerCase()
-        const value             = stripInlineComment(rawValue)
+        const { key, rawValue } = match.groups as { key: string; rawValue: string }
+        const keyLower = key.toLowerCase()
+        const value = stripInlineComment(rawValue)
 
         if (keyLower === 'host') {
             // Host 块开始，结束 Match 块
@@ -186,8 +199,8 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
             }
 
             // Host 行可能有多个别名/模式，用空格分隔
-            const patterns = value.split(/\s+/).filter(p => p.length > 0)
-            currentBlock   = { patterns, config: {} }
+            const patterns = value.split(/\s+/).filter((p) => p.length > 0)
+            currentBlock = { patterns, config: {} }
         } else if (keyLower === 'match') {
             // Match 块开始，跳过直到下一个 Host
             inMatchBlock = true
@@ -200,9 +213,11 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
             // 解析配置项（不在 Match 块内）
             switch (keyLower) {
                 case 'hostname':
+                    validateHostName(value, currentBlock.patterns.join(','))
                     currentBlock.config.hostName = value
                     break
                 case 'user':
+                    validateUserName(value, currentBlock.patterns.join(','))
                     currentBlock.config.user = value
                     break
                 case 'port':
@@ -254,4 +269,3 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
 
     return hosts
 }
-

@@ -5,47 +5,57 @@
  */
 
 import xterm from '@xterm/headless'
-import type {ClientChannel} from 'ssh2'
-import type {PtyOptions, PtySessionInfo} from './types.js'
+import type { ClientChannel } from 'ssh2'
+import type { PtyOptions, PtySessionInfo } from './types.js'
 
 const Terminal = xterm.Terminal as typeof import('@xterm/headless').Terminal
-type TerminalType = import('@xterm/headless').Terminal;
+type TerminalType = import('@xterm/headless').Terminal
 
 /** PTY 创建所需的外部依赖 */
 export interface PtyDependencies {
     /** 通过 alias 获取 SSH client 并执行命令 */
-    execPty(alias: string, command: string, options: PtyOptions): Promise<ClientChannel>;
+    execPty(alias: string, command: string, options: PtyOptions): Promise<ClientChannel>
 }
 
 interface PtySession {
-    id: string;
-    alias: string;
-    command: string;
-    stream: ClientChannel;
-    terminal: TerminalType;
-    rows: number;
-    cols: number;
-    createdAt: number;
-    lastReadAt: number;
-    rawBuffer: string;
-    maxBufferSize: number;
-    active: boolean;
+    id: string
+    alias: string
+    command: string
+    stream: ClientChannel
+    terminal: TerminalType
+    rows: number
+    cols: number
+    createdAt: number
+    lastReadAt: number
+    rawBuffer: string
+    maxBufferSize: number
+    active: boolean
 }
 
 export class PtyManager {
     private sessions: Map<string, PtySession> = new Map()
-    private idCounter                         = 0
-    private readonly defaultBufferSize        = 1024 * 1024  // 1MB
+    private idCounter = 0
+    private readonly defaultBufferSize = 1024 * 1024 // 1MB
+    // 默认 idle timeout 1 小时,超时未读的 pty 自动回收
+    private readonly idleTimeoutMs = Number(process.env.SSH_MCP_PTY_IDLE_TIMEOUT_MS) || 3600_000
+    private idleSweeper: NodeJS.Timeout | null = null
 
-    async start(
-        deps: PtyDependencies,
-        alias: string,
-        command: string,
-        options: PtyOptions = {},
-    ): Promise<string> {
-        const ptyId         = this.generateId()
-        const rows          = options.rows || 24
-        const cols          = options.cols || 80
+    constructor() {
+        this.startIdleSweeper()
+    }
+
+    /** 用于测试或停服时手动停止 idle sweeper */
+    stopIdleSweeper(): void {
+        if (this.idleSweeper) {
+            clearInterval(this.idleSweeper)
+            this.idleSweeper = null
+        }
+    }
+
+    async start(deps: PtyDependencies, alias: string, command: string, options: PtyOptions = {}): Promise<string> {
+        const ptyId = this.generateId()
+        const rows = options.rows || 24
+        const cols = options.cols || 80
         const maxBufferSize = options.bufferSize || this.defaultBufferSize
 
         const stream = await deps.execPty(alias, command, options)
@@ -106,11 +116,11 @@ export class PtyManager {
 
     read(
         ptyId: string,
-        options: { mode?: 'screen' | 'raw'; clear?: boolean } = {},
+        options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}
     ): { data: string; active: boolean; rows: number; cols: number } {
         const session = this.getSession(ptyId)
-        const mode    = options.mode || 'screen'
-        const clear   = options.clear !== false
+        const mode = options.mode || 'screen'
+        const clear = options.clear !== false
 
         let data: string
         if (mode === 'screen') {
@@ -176,18 +186,46 @@ export class PtyManager {
         const result: PtySessionInfo[] = []
         for (const [id, pty] of this.sessions) {
             result.push({
-                            id,
-                            alias: pty.alias,
-                            command: pty.command,
-                            rows: pty.rows,
-                            cols: pty.cols,
-                            createdAt: pty.createdAt,
-                            lastReadAt: pty.lastReadAt,
-                            bufferSize: pty.rawBuffer.length,
-                            active: pty.active,
-                        })
+                id,
+                alias: pty.alias,
+                command: pty.command,
+                rows: pty.rows,
+                cols: pty.cols,
+                createdAt: pty.createdAt,
+                lastReadAt: pty.lastReadAt,
+                bufferSize: pty.rawBuffer.length,
+                active: pty.active,
+            })
         }
         return result
+    }
+
+    private startIdleSweeper(): void {
+        if (this.idleSweeper) {
+            return
+        }
+        // 每 5 分钟扫一次,关闭超过 idleTimeout 未读的 pty
+        this.idleSweeper = setInterval(() => this.sweepIdle(), 5 * 60_000)
+        if (typeof this.idleSweeper.unref === 'function') {
+            this.idleSweeper.unref()
+        }
+    }
+
+    private sweepIdle(): void {
+        const now = Date.now()
+        for (const [id, session] of this.sessions) {
+            if (!session.active) {
+                continue
+            }
+            if (now - session.lastReadAt > this.idleTimeoutMs) {
+                console.warn(
+                    `[mcp-ssh] PTY ${id} (alias=${session.alias}, command=${session.command}) idle ${Math.round(
+                        (now - session.lastReadAt) / 1000
+                    )}s > ${Math.round(this.idleTimeoutMs / 1000)}s, auto-closing`
+                )
+                this.close(id)
+            }
+        }
     }
 
     private getSession(ptyId: string): PtySession {
@@ -204,9 +242,11 @@ export class PtyManager {
 
     /** 从终端仿真器获取当前屏幕内容 */
     private getScreenContent(terminal: TerminalType): string {
-        const buffer          = terminal.buffer.active
+        const buffer = terminal.buffer.active
+        const start = buffer.viewportY
+        const end = start + terminal.rows
         const lines: string[] = []
-        for (let i = 0; i < terminal.rows; i++) {
+        for (let i = start; i < end; i++) {
             const line = buffer.getLine(i)
             if (line) {
                 lines.push(line.translateToString(true))
