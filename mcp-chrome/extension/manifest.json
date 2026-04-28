@@ -1,49 +1,36 @@
 {
-  "manifest_version": 3,
-  "name": "MCP Chrome",
-  "version": "1.4.0",
-  "description": "Browser automation for Claude Code via MCP protocol",
-  "permissions": [
-    "alarms",
-    "tabs",
-    "activeTab",
-    "scripting",
-    "webNavigation",
-    "tabGroups",
-    "cookies",
-    "debugger"
-  ],
-  "host_permissions": [
-    "<all_urls>"
-  ],
-  "background": {
-    "service_worker": "src/background/index.ts",
-    "type": "module"
-  },
-  "action": {
-    "default_title": "MCP Chrome",
-    "default_popup": "src/popup/popup.html",
-    "default_icon": {
-      "16": "public/icons/icon16.png",
-      "48": "public/icons/icon48.png",
-      "128": "public/icons/icon128.png"
-    }
-  },
-  "icons": {
-    "16": "public/icons/icon16.png",
-    "48": "public/icons/icon48.png",
-    "128": "public/icons/icon128.png"
-  },
-  "content_scripts": [
-    {
-      "matches": [
-        "<all_urls>"
-      ],
-      "js": [
-        "src/content/index.ts"
-      ],
-      "run_at": "document_idle",
-      "all_frames": true
-    }
-  ]
+    "manifest_version": 3,
+    "name": "MCP Chrome",
+    "version": "2.0.0",
+    "description": "Browser automation for Claude Code via MCP protocol",
+    "permissions": ["alarms", "tabs", "activeTab", "scripting", "webNavigation", "tabGroups", "cookies", "debugger"],
+    "host_permissions": ["<all_urls>"],
+    "background": {
+        "service_worker": "src/background/index.ts",
+        "type": "module"
+    },
+    "action": {
+        "default_title": "MCP Chrome",
+        "default_popup": "src/popup/popup.html",
+        "default_icon": {
+            "16": "public/icons/icon16.png",
+            "48": "public/icons/icon48.png",
+            "128": "public/icons/icon128.png"
+        }
+    },
+    "icons": {
+        "16": "public/icons/icon16.png",
+        "48": "public/icons/icon48.png",
+        "128": "public/icons/icon128.png"
+    },
+    "content_scripts": [
+        {
+            "matches": ["<all_urls>"],
+            "js": ["src/content/content.ts"],
+            "run_at": "document_idle",
+            "all_frames": true,
+            "match_about_blank": true,
+            "match_origin_as_fallback": true
+        }
+    ]
 }

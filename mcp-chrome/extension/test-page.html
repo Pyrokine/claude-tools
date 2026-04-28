@@ -77,6 +77,32 @@
             font-family: monospace;
             min-height: 50px;
         }
+
+        /* 区域 12 遮挡层样式 */
+        .overlay-wrap {
+            position: relative;
+            width: 300px;
+            height: 80px;
+        }
+
+        .overlay-wrap button {
+            position: absolute;
+            left: 0;
+            top: 20px;
+            width: 200px;
+            height: 40px;
+        }
+
+        .overlay-wrap .overlay {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 250px;
+            height: 80px;
+            background: rgba(255, 0, 0, 0.3);
+            z-index: 10;
+            pointer-events: auto;
+        }
     </style>
 </head>
 <body>
@@ -89,9 +115,9 @@
     <button class='btn-class'>Class 定位按钮</button>
     <button data-testid='test-button'>TestId 定位按钮</button>
     <button aria-label='accessible-button' role='button'>ARIA 按钮</button>
-    <input id='input-placeholder' placeholder='placeholder 输入框' type='text'>
-    <input id='input-title' title='title 输入框' type='text'>
-    <a href='#link-test'>文本链接测试</a>
+    <input aria-label='placeholder 输入框' id='input-placeholder' placeholder='placeholder 输入框' type='text'>
+    <input aria-label='title 输入框' id='input-title' title='title 输入框' type='text'>
+    <a href='#link-test' id='link-test'>文本链接测试</a>
 </div>
 
 <!-- 输入测试 -->
@@ -99,6 +125,7 @@
     <h2>2. 输入测试</h2>
     <label for='text-input'>文本输入:</label>
     <input id='text-input' placeholder='在这里输入' type='text'>
+    <label for='textarea'>多行文本:</label>
     <textarea id='textarea' placeholder='多行文本'></textarea>
     <div id='input-result'></div>
 </div>
@@ -141,6 +168,14 @@
             <p id='scroll-bottom' style='margin-top: 200px;'>滚动内容底部</p>
         </div>
     </div>
+    <div id='scroll-container-x'
+         style='width: 200px; overflow-x: scroll; border: 1px solid #ccc; white-space: nowrap; margin-top: 8px;'>
+        <div style='display: inline-block; width: 800px; padding: 10px;'>
+            <span id='scroll-x-left'>横向左</span>
+            <span id='scroll-x-middle' style='margin-left: 300px;'>横向中</span>
+            <span id='scroll-x-right' style='margin-left: 300px;'>横向右</span>
+        </div>
+    </div>
     <div class='log-area' id='scroll-log'></div>
 </div>
 
@@ -159,27 +194,112 @@
     <img alt='测试图片'
          data-custom='custom-value'
          id='test-image'
-         src="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect fill='%2300f' width='100' height='100'/></svg>"
+         src=''
          title='图片标题'>
     <a href='https://example.com' id='test-link' rel='noopener' target='_blank'>测试链接</a>
 </div>
 
+<!-- 文本编辑测试（select/replace 事件） -->
+<div class='section'>
+    <h2>9. 文本编辑测试（select/replace）</h2>
+    <label for='edit-input'>input:</label>
+    <input aria-label='edit input'
+           id='edit-input'
+           style='width: 300px;'
+           type='text'
+           value='The quick brown fox jumps'>
+    <label for='edit-textarea'>textarea:</label>
+    <textarea aria-label='edit textarea'
+              id='edit-textarea'
+              style='width: 300px; height: 60px;'>Hello world, this is a sample.</textarea>
+    <div aria-label='editable region' contenteditable='true' id='edit-contenteditable'
+         style='width: 300px; min-height: 40px; padding: 8px; border: 1px solid #999;'>
+        Editable content here for select/replace
+    </div>
+</div>
+
+<!-- iframe 跨框架测试 -->
+<div class='section'>
+    <h2>10. iframe 跨框架测试</h2>
+    <iframe id='test-frame' srcdoc='
+        <html><body style="font-family: sans-serif; padding: 10px;">
+        <h3>Inner Frame</h3>
+        <button id="frame-btn" onclick="this.textContent=`Clicked`">Frame Button</button>
+        <input id="frame-input" placeholder="frame input" style="margin-top: 8px;">
+        <div id="frame-result"></div>
+        <script>
+          document.getElementById("frame-input").addEventListener("input", function(e) {
+            document.getElementById("frame-result").textContent = "Frame input: " + e.target.value;
+          });
+        &#x3c;/script>
+        </body></html>
+    ' style='width: 400px; height: 180px; border: 1px solid #999;'></iframe>
+    <iframe id='real-src-frame' src='iframe-content.html'
+            style='width: 400px; height: 250px; border: 1px solid #999; margin-top: 8px;'></iframe>
+</div>
+
+<!-- wait 各类型测试 -->
+<div class='section'>
+    <h2>11. wait 各类型测试</h2>
+    <button id='show-later-btn'>5 秒后显示元素</button>
+    <div id='show-later-target' style='display: none; padding: 10px; background: #4CAF50; color: white;'>
+        延迟出现的元素
+    </div>
+    <button id='hashnav-btn'>触发 hashchange 导航</button>
+    <div class='log-area' id='hashnav-log' style='min-height: 30px;'>当前 hash:</div>
+    <button id='burst-mutation-btn'>触发 1 秒连续 DOM mutation</button>
+    <div id='burst-mutation-target' style='min-height: 30px;'>初始内容</div>
+</div>
+
+<!-- force click / 遮挡检测 + 组合键测试 -->
+<div class='section'>
+    <h2>12. force click / 遮挡检测 + 组合键编辑</h2>
+    <div class='overlay-wrap'>
+        <button id='covered-btn' onclick='document.getElementById("covered-result").textContent = "Covered clicked!"'>
+            被遮挡按钮
+        </button>
+        <div class='overlay' id='blocker'>红色遮挡层（z-index=10）</div>
+    </div>
+    <div class='log-area' id='covered-result' style='min-height: 20px;'></div>
+    <label for='combo-input'>组合键测试输入框:</label>
+    <input id='combo-input' style='width: 250px;' type='text' value='select-all-then-delete'>
+</div>
+
 <script>
+    /**
+     * 在日志容器头部插入一行文本
+     * @param {HTMLElement} el - 日志容器元素
+     * @param {string} text - 要前置的文本
+     */
+    function prependLog(el, text) {
+        el.prepend(document.createElement('br'));
+        el.prepend(document.createTextNode(text));
+    }
+
+    // 测试图片的 data URI（避免 HTML 属性行超长）
+    document.getElementById('test-image').src =
+        'data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'100\' height=\'100\'>' +
+        '<rect fill=\'%2300f\' width=\'100\' height=\'100\'/></svg>';
+
     // 输入监听
-    document.getElementById('text-input').addEventListener('input', function(e) {
-        document.getElementById('input-result').textContent = '输入内容: ' + e.target.value;
-        console.log('[MCP-TEST] Input changed:', e.target.value);
+    document.getElementById('text-input').addEventListener('input', function(/** @type {InputEvent} */ e) {
+        /** @type {HTMLInputElement} */
+        const target = e.target;
+        document.getElementById('input-result').textContent = '输入内容: ' + target.value;
+        console.log('[MCP-TEST] Input changed:', target.value);
     });
 
     // 键盘事件
     const keyDisplay = document.getElementById('key-display');
-    const keyLog = document.getElementById('key-log');
+    const keyLog = document.getElementById('key-log')
 
-    ['keydown', 'keyup', 'keypress'].forEach(eventType => {
-        keyDisplay.addEventListener(eventType, function(e) {
-            const info = `${eventType}: key="${e.key}" code="${e.code}" ctrl=${e.ctrlKey} shift=${e.shiftKey} alt=${e.altKey} meta=${e.metaKey}`;
-            keyDisplay.textContent = e.key || e.code;
-            keyLog.innerHTML = info + '<br>' + keyLog.innerHTML;
+    ;['keydown', 'keyup', 'keypress'].forEach(eventType => {
+        keyDisplay.addEventListener(eventType, function(/** @type {KeyboardEvent} */ e) {
+            const { key, code, ctrlKey, shiftKey, altKey, metaKey } = e;
+            const modifiers = `ctrl=${ctrlKey} shift=${shiftKey} alt=${altKey} meta=${metaKey}`;
+            const info = `${eventType}: key="${key}" code="${code}" ${modifiers}`;
+            keyDisplay.textContent = key || code;
+            prependLog(keyLog, info);
             console.log('[MCP-TEST]', info);
             if (eventType === 'keydown') {
                 e.preventDefault();
@@ -190,22 +310,22 @@
     // 鼠标事件
     const mouseLog = document.getElementById('mouse-log');
 
-    document.getElementById('click-test').addEventListener('click', function(e) {
+    document.getElementById('click-test').addEventListener('click', function(/** @type {MouseEvent} */ e) {
         const info = `click: button=${e.button} x=${e.clientX} y=${e.clientY}`;
-        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML;
+        prependLog(mouseLog, info);
         console.log('[MCP-TEST]', info);
     });
 
-    document.getElementById('dblclick-test').addEventListener('dblclick', function(e) {
+    document.getElementById('dblclick-test').addEventListener('dblclick', function(/** @type {MouseEvent} */ e) {
         const info = `dblclick: x=${e.clientX} y=${e.clientY}`;
-        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML;
+        prependLog(mouseLog, info);
         console.log('[MCP-TEST]', info);
     });
 
-    document.getElementById('contextmenu-test').addEventListener('contextmenu', function(e) {
+    document.getElementById('contextmenu-test').addEventListener('contextmenu', function(/** @type {MouseEvent} */ e) {
         e.preventDefault();
         const info = `contextmenu (right-click): x=${e.clientX} y=${e.clientY}`;
-        mouseLog.innerHTML = info + '<br>' + mouseLog.innerHTML;
+        prependLog(mouseLog, info);
         console.log('[MCP-TEST]', info);
     });
 
@@ -214,8 +334,8 @@
     const dropTarget = document.getElementById('drop-target');
     const dragLog = document.getElementById('drag-log');
 
-    dragSource.addEventListener('dragstart', function(e) {
-        dragLog.innerHTML = 'dragstart<br>' + dragLog.innerHTML;
+    dragSource.addEventListener('dragstart', function(/** @type {DragEvent} */ e) {
+        prependLog(dragLog, 'dragstart');
         console.log('[MCP-TEST] dragstart');
         e.dataTransfer.setData('text/plain', 'dragged');
     });
@@ -233,7 +353,7 @@
         e.preventDefault();
         dropTarget.style.background = '#4CAF50';
         dropTarget.textContent = '已放置!';
-        dragLog.innerHTML = 'drop - 成功!<br>' + dragLog.innerHTML;
+        prependLog(dragLog, 'drop - 成功!');
         console.log('[MCP-TEST] drop - success');
     });
 
@@ -243,7 +363,7 @@
 
     scrollContainer.addEventListener('scroll', function() {
         const info = `scroll: scrollTop=${scrollContainer.scrollTop}`;
-        scrollLog.innerHTML = info;
+        scrollLog.textContent = info;
         console.log('[MCP-TEST]', info);
     });
 
@@ -255,6 +375,40 @@
             nested: { value: 42 },
         });
     }
+
+    // 区域 11: wait 各类型
+    document.getElementById('show-later-btn').addEventListener('click', function() {
+        setTimeout(function() {
+            document.getElementById('show-later-target').style.display = 'block';
+            console.log('[MCP-TEST] show-later-target is now visible');
+        }, 5000);
+    });
+
+    document.getElementById('hashnav-btn').addEventListener('click', function() {
+        location.hash = 'nav-' + Date.now();
+    });
+
+    window.addEventListener('hashchange', function() {
+        document.getElementById('hashnav-log').textContent = '当前 hash: ' + location.hash;
+        console.log('[MCP-TEST] hashchange:', location.hash);
+    });
+
+    document.getElementById('burst-mutation-btn').addEventListener('click', function() {
+        const target = document.getElementById('burst-mutation-target');
+        const start = Date.now();
+        const interval = setInterval(function() {
+            target.textContent =
+                'mutation at ' +
+                (
+                    Date.now() - start
+                ) +
+                'ms';
+            if (Date.now() - start >= 1000) {
+                clearInterval(interval);
+                target.textContent += ' (idle)';
+            }
+        }, 50);
+    });
 
     // 页面加载完成
     console.log('[MCP-TEST] Test page loaded successfully');

@@ -7,17 +7,16 @@
  * 3. Tab/TabGroup 管理
  */
 
-import type {InternalMessage} from '../types'
-import {ActionHandler} from './actions'
-import {HttpClient} from './http-client'
+import type { InternalMessage } from '../types'
+import { isExpectedOperationError } from '../types/expected-errors'
+import { ActionHandler } from './actions'
+import { HttpClient } from './http-client'
+import { getMcpTabGroupId, getMcpWindowId, setMcpTabGroupId, setMcpWindowId } from './tab-state'
 
 // ==================== 全局状态 ====================
 
-const httpClient    = new HttpClient()
+const httpClient = new HttpClient()
 const actionHandler = new ActionHandler()
-
-// MCP 管理的 Tab Group ID
-let mcpTabGroupId: number | null = null
 
 // ==================== WebSocket 消息处理 ====================
 
@@ -25,14 +24,21 @@ httpClient.onMessage(async (message, port) => {
     const { id, action, params } = message
 
     try {
-        const result = await actionHandler.execute(action, params, { mcpTabGroupId })
+        const result = await actionHandler.execute(action, params, {
+            mcpTabGroupId: getMcpTabGroupId(),
+            mcpWindowId: getMcpWindowId(),
+        })
         httpClient.sendResponse(id, true, result, undefined, port)
     } catch (error) {
-        const msg        = error instanceof Error ? error.message : 'Unknown error'
-        // 预期的操作错误（tab 关闭、超时等）用 warn，不污染 Extension 错误面板
-        const isExpected = msg.includes('不存在') || msg.includes('not found') || msg.includes('timeout')
-        if (isExpected) {
-            console.warn(`[MCP] ${action}: ${msg}`)
+        const rawMsg = error instanceof Error ? error.message : 'Unknown error'
+        // 错误信息脱敏：剥离 chrome-extension://<id>/ 路径,避免向 server 泄露扩展内部路径
+        const msg = rawMsg.replace(
+            /chrome-extension:\/\/[a-z0-9]{32}\/[^\s)"']*/g,
+            'chrome-extension://<redacted>/<redacted>'
+        )
+        // 预期的操作错误用 warn，不污染 Extension 错误面板
+        if (isExpectedOperationError(error)) {
+            console.warn(`[MCP] ${action}: ${rawMsg}`)
         } else {
             console.error(`[MCP] Error executing ${action}:`, error)
         }
@@ -97,47 +103,56 @@ function updateBadge(status: ConnectionStatus, count = 0) {
 }
 
 function broadcastStatus(status: ConnectionStatus, count: number) {
-    chrome.runtime.sendMessage({
-                                   type: 'STATUS_UPDATE',
-                                   status,
-                                   count,
-                               }).catch(() => {
-        // Popup 可能未打开
-    })
+    chrome.runtime
+        .sendMessage({
+            type: 'STATUS_UPDATE',
+            status,
+            count,
+        })
+        .catch(() => {
+            // Popup 可能未打开
+        })
 }
 
 // ==================== Tab Group 管理 ====================
 
-// 导出供 ActionHandler 使用
-export function setMcpTabGroupId(groupId: number | null) {
-    mcpTabGroupId = groupId
-}
+// MCP 专属窗口被关闭时重置（避免后续 newPage 再尝试复用已关闭的 windowId）
+chrome.windows.onRemoved.addListener((windowId) => {
+    if (windowId === getMcpWindowId()) {
+        setMcpWindowId(null)
+    }
+})
 
-// Tab 关闭时检查 TabGroup 是否为空
-chrome.tabs.onRemoved.addListener(async (_tabId) => {
-    if (mcpTabGroupId === null) {
+// Tab 关闭时检查 TabGroup 是否为空，并清理 per-tab 状态
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+    // 清理 ActionHandler 中的 per-tab 内存（防止长时间运行后内存泄漏）
+    actionHandler.cleanupTab(tabId)
+
+    const groupId = getMcpTabGroupId()
+    if (groupId === null) {
         return
     }
 
     try {
-        const tabs = await chrome.tabs.query({ groupId: mcpTabGroupId })
+        const tabs = await chrome.tabs.query({ groupId })
         if (tabs.length === 0) {
-            mcpTabGroupId = null
+            setMcpTabGroupId(null)
         }
     } catch {
-        mcpTabGroupId = null
+        setMcpTabGroupId(null)
     }
 })
 
 // 感知用户拖动 tab 到 MCP Chrome 分组
 // Chrome 88+ 的 onUpdated 事件会在 tab 的 groupId 变化时触发
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (mcpTabGroupId === null) {
+    const groupId = getMcpTabGroupId()
+    if (groupId === null) {
         return
     }
     // changeInfo 包含 groupId（Chrome 88+），TypeScript 类型可能未声明
     const info = changeInfo as chrome.tabs.TabChangeInfo & { groupId?: number }
-    if (info.groupId === mcpTabGroupId) {
+    if (info.groupId === groupId) {
         console.log(`[MCP] Tab ${tabId} joined MCP Chrome group`)
     }
 })

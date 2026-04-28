@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <title>Iframe Content</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            padding: 10px;
+            margin: 0;
+        }
+
+        .spacer {
+            height: 600px;
+            background: linear-gradient(#f0f0f0, #fff);
+        }
+
+        button {
+            padding: 6px 12px;
+            margin: 4px;
+        }
+
+        #overlay-cover {
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.01);
+            z-index: 9999;
+            pointer-events: auto;
+            display: none;
+        }
+
+        #overlay-cover.on {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+<h3>Real-src iframe content</h3>
+<button id='top-btn'>Top Button (in viewport)</button>
+<button id='toggle-overlay' onclick="document.getElementById('overlay-cover').classList.toggle('on')">Toggle overlay
+</button>
+<div class='spacer'>scroll spacer</div>
+<button id='bottom-btn'>Bottom Button (off-viewport)</button>
+<div id='overlay-cover' title='overlay-cover'></div>
+<div id='log' style='margin-top: 8px; font-family: monospace; font-size: 12px;'></div>
+</body>
+</html>

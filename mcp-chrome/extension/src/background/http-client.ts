@@ -9,29 +9,28 @@
  * - 心跳检测（连接存活确认）
  */
 
-const EXTENSION_VERSION    = '1.3.0'
-const PORT_RANGE_START     = 19222
-const PORT_RANGE_END       = 19299
+const PORT_RANGE_START = 19222
+const PORT_RANGE_END = 19299
 const HEALTH_CHECK_TIMEOUT = 500
-const MAX_RECONNECT_DELAY  = 30000
-const HEARTBEAT_TIMEOUT    = 20000
+const MAX_RECONNECT_DELAY = 30000
+const HEARTBEAT_TIMEOUT = 20000
 
 interface ServerConnection {
-    ws: WebSocket;
-    heartbeatTimer: ReturnType<typeof setTimeout> | null;
+    ws: WebSocket
+    heartbeatTimer: ReturnType<typeof setTimeout> | null
 }
 
 type MessageHandler = (message: { id: string; action: string; params: unknown }, port: number) => void
 type StatusHandler = (status: 'connected' | 'disconnected' | 'connecting', connectedCount: number) => void
 
 export class HttpClient {
-    private connections                                          = new Map<number, ServerConnection>()
-    private messageHandler: MessageHandler | null                = null
-    private statusHandler: StatusHandler | null                  = null
+    private connections = new Map<number, ServerConnection>()
+    private messageHandler: MessageHandler | null = null
+    private statusHandler: StatusHandler | null = null
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-    private reconnectAttempts                                    = 0
-    private shouldReconnect                                      = true
-    private connecting                                           = false
+    private reconnectAttempts = 0
+    private shouldReconnect = true
+    private connecting = false
 
     onMessage(handler: MessageHandler): void {
         this.messageHandler = handler
@@ -50,7 +49,7 @@ export class HttpClient {
         }
 
         this.stopReconnect()
-        this.connecting      = true
+        this.connecting = true
         this.shouldReconnect = true
 
         const wasConnected = this.connections.size > 0
@@ -69,12 +68,10 @@ export class HttpClient {
             }
 
             // 连接所有尚未连接的健康端口
-            const newPorts = healthyPorts.filter(p => !this.connections.has(p))
-            const results  = await Promise.allSettled(
-                newPorts.map(port => this.connectToPort(port)),
-            )
+            const newPorts = healthyPorts.filter((p) => !this.connections.has(p))
+            const results = await Promise.allSettled(newPorts.map((port) => this.connectToPort(port)))
 
-            const successCount = results.filter(r => r.status === 'fulfilled' && r.value).length
+            const successCount = results.filter((r) => r.status === 'fulfilled' && r.value).length
 
             if (successCount > 0) {
                 this.reconnectAttempts = 0
@@ -135,18 +132,23 @@ export class HttpClient {
 
         return new Promise((resolve) => {
             try {
-                const url = `ws://127.0.0.1:${port}`
-                const ws  = new WebSocket(url)
+                const url = `ws://127.0.0.1:${port}/`
+                const ws = new WebSocket(url)
+                let resolved = false
 
                 const connectionTimeout = setTimeout(() => {
                     if (ws.readyState !== WebSocket.OPEN) {
                         ws.close()
-                        resolve(false)
+                        if (!resolved) {
+                            resolved = true
+                            resolve(false)
+                        }
                     }
                 }, 5000)
 
                 ws.onopen = () => {
                     clearTimeout(connectionTimeout)
+                    resolved = true
 
                     const conn: ServerConnection = {
                         ws,
@@ -156,7 +158,7 @@ export class HttpClient {
                     this.resetHeartbeat(port)
 
                     // 版本握手
-                    ws.send(JSON.stringify({ type: 'hello', version: EXTENSION_VERSION }))
+                    ws.send(JSON.stringify({ type: 'hello', version: chrome.runtime.getManifest().version }))
 
                     console.log(`[HTTP] Connected to MCP Server at port ${port} (total: ${this.connections.size})`)
                     this.statusHandler?.('connected', this.connections.size)
@@ -176,7 +178,13 @@ export class HttpClient {
                 ws.onerror = (error) => {
                     clearTimeout(connectionTimeout)
                     console.error(`[HTTP] WebSocket error for port ${port}:`, error)
-                    resolve(false)
+                    if (resolved) {
+                        // onopen 已触发后再 onerror：连接进入异常状态，清理资源
+                        this.removeConnection(port)
+                    } else {
+                        resolved = true
+                        resolve(false)
+                    }
                 }
             } catch {
                 resolve(false)
@@ -208,27 +216,29 @@ export class HttpClient {
 
     /**
      * 扫描端口范围，返回所有健康的 Server 端口
+     *
+     * 完整扫描整段范围，保证多 CC 并存时新启动的 server 能被发现
      */
     private async discoverServers(): Promise<number[]> {
         const healthyPorts: number[] = []
-
-        // 并发检查所有端口（每个 500ms 超时，总体很快）
         const checks = []
         for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
             checks.push(
-                this.checkPort(port).then(ok => {
+                this.checkPort(port).then((ok) => {
                     if (ok) {
                         healthyPorts.push(port)
                     }
-                }),
+                })
             )
         }
         await Promise.all(checks)
 
         if (healthyPorts.length > 0) {
-            console.log(`[HTTP] Found ${healthyPorts.length} MCP Server(s) at ports: ${healthyPorts.sort((a, b) => a -
-                                                                                                                   b)
-                                                                                                   .join(', ')}`)
+            console.log(
+                `[HTTP] Found ${healthyPorts.length} MCP Server(s) at ports: ${healthyPorts
+                    .sort((a, b) => a - b)
+                    .join(', ')}`
+            )
         } else {
             console.log('[HTTP] No MCP Server found in port range')
         }
@@ -239,7 +249,7 @@ export class HttpClient {
     private async checkPort(port: number): Promise<boolean> {
         try {
             const controller = new AbortController()
-            const timeoutId  = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT)
+            const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT)
 
             const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
                 signal: controller.signal,
@@ -307,7 +317,7 @@ export class HttpClient {
             return
         }
 
-        this.reconnectAttempts++
+        this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, 1000)
         const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts - 1), MAX_RECONNECT_DELAY)
 
         console.log(`[HTTP] Scheduling reconnect in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts})`)

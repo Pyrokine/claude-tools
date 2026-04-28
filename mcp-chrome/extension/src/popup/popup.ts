@@ -3,9 +3,9 @@
  */
 
 const statusIndicator = document.getElementById('statusIndicator')!
-const statusText      = document.getElementById('statusText')!
-const connectBtn      = document.getElementById('connectBtn') as HTMLButtonElement
-const disconnectBtn   = document.getElementById('disconnectBtn') as HTMLButtonElement
+const statusText = document.getElementById('statusText')!
+const connectBtn = document.getElementById('connectBtn') as HTMLButtonElement
+const disconnectBtn = document.getElementById('disconnectBtn') as HTMLButtonElement
 
 // 获取状态
 async function updateStatus() {
@@ -13,7 +13,7 @@ async function updateStatus() {
         const response = await chrome.runtime.sendMessage({ type: 'GET_STATUS' })
 
         if (response.connected) {
-            const ports: number[]     = response.ports ?? []
+            const ports: number[] = response.ports ?? []
             statusIndicator.className = 'status-indicator connected'
 
             if (ports.length > 1) {
@@ -24,24 +24,24 @@ async function updateStatus() {
                 statusText.textContent = '已连接'
             }
 
-            connectBtn.disabled    = true
+            connectBtn.disabled = true
             disconnectBtn.disabled = false
         } else {
             statusIndicator.className = 'status-indicator disconnected'
-            statusText.textContent    = '未连接'
-            connectBtn.disabled       = false
-            disconnectBtn.disabled    = true
+            statusText.textContent = '未连接'
+            connectBtn.disabled = false
+            disconnectBtn.disabled = true
         }
     } catch (error) {
         console.error('Failed to get status:', error)
         statusIndicator.className = 'status-indicator disconnected'
-        statusText.textContent    = '未连接'
+        statusText.textContent = '未连接'
     }
 }
 
 // 连接
 connectBtn.addEventListener('click', async () => {
-    connectBtn.disabled    = true
+    connectBtn.disabled = true
     statusText.textContent = '连接中...'
 
     try {
@@ -51,12 +51,12 @@ connectBtn.addEventListener('click', async () => {
             await updateStatus()
         } else {
             statusText.textContent = '未找到 MCP Server'
-            connectBtn.disabled    = false
+            connectBtn.disabled = false
         }
     } catch (error) {
         console.error('Connect failed:', error)
         statusText.textContent = '连接失败'
-        connectBtn.disabled    = false
+        connectBtn.disabled = false
     }
 })
 
