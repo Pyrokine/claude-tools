@@ -12,10 +12,11 @@
  * - 事件序列模型（支持任意键鼠组合）
  */
 
-import {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js'
-import {StdioServerTransport} from '@modelcontextprotocol/sdk/server/stdio.js'
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { readFileSync } from 'node:fs'
 
-import {getUnifiedSession} from './core/index.js'
+import { getUnifiedSession } from './core/index.js'
 import {
     registerBrowseTool,
     registerCookiesTool,
@@ -27,14 +28,13 @@ import {
     registerWaitTool,
 } from './tools/index.js'
 
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as { version: string }
+
 /**
  * 创建 MCP Server
  */
 function createServer(): McpServer {
-    const server = new McpServer(
-        { name: 'mcp-chrome', version: '1.7.0' },
-        { capabilities: { tools: {} } },
-    )
+    const server = new McpServer({ name: 'mcp-chrome', version: pkg.version }, { capabilities: { tools: {} } })
 
     registerBrowseTool(server)
     registerInputTool(server)
@@ -87,7 +87,7 @@ async function main(): Promise<void> {
     // 启动 Extension HTTP/WebSocket 服务器
     await getUnifiedSession().startExtensionServer()
 
-    const server    = createServer()
+    const server = createServer()
     const transport = new StdioServerTransport()
 
     await server.connect(transport)

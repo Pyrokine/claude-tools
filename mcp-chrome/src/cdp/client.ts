@@ -5,34 +5,34 @@
  * 参考 Puppeteer 的实现原理，但更轻量
  */
 
-import {EventEmitter} from 'events'
+import { EventEmitter } from 'events'
 import WebSocket from 'ws'
-import {CDPError, ConnectionRefusedError, TimeoutError} from '../core/errors.js'
-import {DEFAULT_TIMEOUT} from '../core/types.js'
+import { CDPError, ConnectionRefusedError, TimeoutError } from '../core/errors.js'
+import { DEFAULT_TIMEOUT } from '../core/types.js'
 
 /**
  * CDP 消息回调
  */
 interface PendingCallback {
-    resolve: (result: unknown) => void;
-    reject: (error: Error) => void;
-    method: string;
+    resolve: (result: unknown) => void
+    reject: (error: Error) => void
+    method: string
 }
 
 /**
  * waitForEvent 活跃等待者
  */
 interface EventWaiter {
-    event: string;
-    listener: CDPEventListener;
-    timer: NodeJS.Timeout;
-    reject: (error: Error) => void;
+    event: string
+    listener: CDPEventListener
+    timer: NodeJS.Timeout
+    reject: (error: Error) => void
 }
 
 /**
  * CDP 事件监听器
  */
-type CDPEventListener = (params: unknown) => void;
+type CDPEventListener = (params: unknown) => void
 
 /**
  * CDP 客户端
@@ -40,11 +40,11 @@ type CDPEventListener = (params: unknown) => void;
 export class CDPClient extends EventEmitter {
     /** 默认命令超时 */
     private static readonly DEFAULT_COMMAND_TIMEOUT = DEFAULT_TIMEOUT
-    private ws: WebSocket | null                    = null
-    private callbacks                               = new Map<number, PendingCallback>()
-    private nextId                                  = 1
-    private eventListeners                          = new Map<string, Set<CDPEventListener>>()
-    private activeEventWaiters                      = new Set<EventWaiter>()
+    private ws: WebSocket | null = null
+    private callbacks = new Map<number, PendingCallback>()
+    private nextId = 1
+    private eventListeners = new Map<string, Set<CDPEventListener>>()
+    private activeEventWaiters = new Set<EventWaiter>()
 
     get isConnected(): boolean {
         return this.ws !== null && this.ws.readyState === WebSocket.OPEN
@@ -61,12 +61,12 @@ export class CDPClient extends EventEmitter {
 
             try {
                 this.ws = new WebSocket(endpoint)
-            } catch (error) {
+            } catch {
                 clearTimeout(timer)
                 // 解析 host 和 port
-                const match = endpoint.match(/ws:\/\/([^:]+):(\d+)/)
+                const match = endpoint.match(/ws:\/\/(?<host>[^:]+):(?<port>\d+)/)
                 if (match) {
-                    reject(new ConnectionRefusedError(match[1], parseInt(match[2], 10)))
+                    reject(new ConnectionRefusedError(match.groups!.host, parseInt(match.groups!.port, 10)))
                 } else {
                     reject(new CDPError(`无法连接到 ${endpoint}`))
                 }
@@ -81,9 +81,9 @@ export class CDPClient extends EventEmitter {
             this.ws.on('error', (error: Error) => {
                 clearTimeout(timer)
                 // 解析 host 和 port
-                const match = endpoint.match(/ws:\/\/([^:]+):(\d+)/)
+                const match = endpoint.match(/ws:\/\/(?<host>[^:]+):(?<port>\d+)/)
                 if (match && error.message.includes('ECONNREFUSED')) {
-                    reject(new ConnectionRefusedError(match[1], parseInt(match[2], 10)))
+                    reject(new ConnectionRefusedError(match.groups!.host, parseInt(match.groups!.port, 10)))
                 } else {
                     reject(new CDPError(error.message))
                 }
@@ -106,13 +106,13 @@ export class CDPClient extends EventEmitter {
         method: string,
         params?: object,
         sessionId?: string,
-        timeout: number = CDPClient.DEFAULT_COMMAND_TIMEOUT,
+        timeout: number = CDPClient.DEFAULT_COMMAND_TIMEOUT
     ): Promise<T> {
         if (!this.isConnected) {
             throw new CDPError('CDP 客户端未连接')
         }
 
-        const id                               = this.nextId++
+        const id = this.nextId++
         const message: Record<string, unknown> = { id, method }
 
         if (params !== undefined) {
@@ -145,9 +145,11 @@ export class CDPClient extends EventEmitter {
             } catch (err) {
                 clearTimeout(timeoutId)
                 this.callbacks.delete(id)
-                reject(new CDPError(`Failed to send CDP command ${method}: ${err instanceof Error ?
-                                                                             err.message :
-                                                                             'Unknown error'}`))
+                reject(
+                    new CDPError(
+                        `Failed to send CDP command ${method}: ${err instanceof Error ? err.message : 'Unknown error'}`
+                    )
+                )
             }
         })
     }
@@ -175,12 +177,12 @@ export class CDPClient extends EventEmitter {
     /**
      * 等待特定事件
      *
-     * close()/handleClose() 会立即 reject 所有活跃的等待者，不必等 timer 超时。
+     * close()/handleClose() 会立即 reject 所有活跃的等待者，不必等 timer 超时
      */
     waitForEvent<T = unknown>(
         event: string,
         predicate?: (params: T) => boolean,
-        timeout = DEFAULT_TIMEOUT,
+        timeout = DEFAULT_TIMEOUT
     ): Promise<T> {
         return new Promise((resolve, reject) => {
             const listener: CDPEventListener = (params) => {
@@ -215,7 +217,7 @@ export class CDPClient extends EventEmitter {
      * 关闭连接
      *
      * 立即 reject 所有 pending callbacks 和 waitForEvent，
-     * 然后发出 'disconnected' 信号供外部等待者（如 waitForAnyEvent）清理。
+     * 然后发出 'disconnected' 信号供外部等待者（如 waitForAnyEvent）清理
      */
     close(): void {
         this.rejectAllPending('连接主动关闭')
@@ -234,11 +236,11 @@ export class CDPClient extends EventEmitter {
      */
     private handleMessage(data: WebSocket.Data): void {
         let message: {
-            id?: number;
-            method?: string;
-            params?: unknown;
-            result?: unknown;
-            error?: { message: string; code?: number };
+            id?: number
+            method?: string
+            params?: unknown
+            result?: unknown
+            error?: { message: string; code?: number }
         }
 
         try {
@@ -254,9 +256,7 @@ export class CDPClient extends EventEmitter {
             if (callback) {
                 this.callbacks.delete(message.id)
                 if (message.error) {
-                    callback.reject(
-                        new CDPError(`${callback.method}: ${message.error.message}`),
-                    )
+                    callback.reject(new CDPError(`${callback.method}: ${message.error.message}`))
                 } else {
                     callback.resolve(message.result)
                 }
@@ -320,9 +320,9 @@ const DEFAULT_HTTP_TIMEOUT = 10000
  */
 async function cdpHttpFetch<T>(host: string, port: number, path: string, timeout: number): Promise<T> {
     // noinspection HttpUrlsUsage — CDP 调试协议只支持 HTTP
-    const url        = `http://${host}:${port}${path}`
+    const url = `http://${host}:${port}${path}`
     const controller = new AbortController()
-    const timeoutId  = setTimeout(() => controller.abort(), timeout)
+    const timeoutId = setTimeout(() => controller.abort(), timeout)
 
     let response: Response
     try {
@@ -348,7 +348,7 @@ async function cdpHttpFetch<T>(host: string, port: number, path: string, timeout
 export async function getBrowserWSEndpoint(
     host: string,
     port: number,
-    timeout: number = DEFAULT_HTTP_TIMEOUT,
+    timeout: number = DEFAULT_HTTP_TIMEOUT
 ): Promise<string> {
     const data = await cdpHttpFetch<{ webSocketDebuggerUrl: string }>(host, port, '/json/version', timeout)
     return data.webSocketDebuggerUrl
@@ -360,7 +360,7 @@ export async function getBrowserWSEndpoint(
 export async function getTargets(
     host: string,
     port: number,
-    timeout: number = DEFAULT_HTTP_TIMEOUT,
+    timeout: number = DEFAULT_HTTP_TIMEOUT
 ): Promise<Array<{ id: string; type: string; url: string; title: string; webSocketDebuggerUrl: string }>> {
     return cdpHttpFetch(host, port, '/json/list', timeout)
 }

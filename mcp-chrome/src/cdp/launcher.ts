@@ -4,12 +4,12 @@
  * 负责启动 Chrome 浏览器进程并获取 CDP 端点
  */
 
-import {ChildProcess, spawn} from 'child_process'
-import {existsSync, mkdirSync} from 'fs'
-import {homedir, platform} from 'os'
-import {join} from 'path'
-import {BrowserNotFoundError, TimeoutError} from '../core/errors.js'
-import {DEFAULT_TIMEOUT, type LaunchOptions} from '../core/types.js'
+import { ChildProcess, spawn } from 'child_process'
+import { existsSync, mkdirSync } from 'fs'
+import { homedir, platform } from 'os'
+import { join } from 'path'
+import { BrowserNotFoundError, TimeoutError } from '../core/errors.js'
+import { DEFAULT_TIMEOUT, type LaunchOptions } from '../core/types.js'
 
 /**
  * 默认 profile 目录（固定路径，保留 cookies 和登录状态）
@@ -34,9 +34,7 @@ const CHROME_PATHS: Record<string, string[]> = {
     win32: [
         'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
         'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-        ...(process.env.LOCALAPPDATA
-            ? [`${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`]
-            : []),
+        ...(process.env.LOCALAPPDATA ? [`${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`] : []),
     ],
 }
 
@@ -60,7 +58,7 @@ export function findChrome(): string | null {
  */
 export class BrowserLauncher {
     private process: ChildProcess | null = null
-    private _port: number                = 0
+    private _port: number = 0
 
     get port(): number {
         return this._port
@@ -71,18 +69,45 @@ export class BrowserLauncher {
      */
     async launch(options: LaunchOptions = {}): Promise<string> {
         const {
-                  executablePath,
-                  port      = 0,
-                  incognito = false,
-                  headless  = false,
-                  userDataDir,
-                  timeout   = DEFAULT_TIMEOUT,
-              } = options
+            executablePath,
+            port = 0,
+            incognito = false,
+            headless = false,
+            userDataDir,
+            timeout = DEFAULT_TIMEOUT,
+        } = options
 
         // 查找 Chrome
         const chromePath = executablePath ?? findChrome()
         if (!chromePath) {
             throw new BrowserNotFoundError()
+        }
+
+        // executablePath 校验：用户显式提供的路径必须存在且不在系统敏感目录
+        if (executablePath) {
+            if (!existsSync(executablePath)) {
+                throw new Error(`executablePath 不存在: ${executablePath}`)
+            }
+            const lowered = executablePath.toLowerCase()
+            const suspicious = ['/etc/', '/dev/', '/proc/', '/sys/', '/boot/']
+            if (suspicious.some((p) => lowered.includes(p))) {
+                console.warn(
+                    `[launcher] 警告: executablePath 包含敏感系统目录前缀（${executablePath}），请确认路径正确`
+                )
+            }
+        }
+
+        // userDataDir 校验：警告非常用位置（避免误指向系统目录）
+        if (userDataDir) {
+            const lowered = userDataDir.toLowerCase()
+            const home = homedir().toLowerCase()
+            const tmp = ['/tmp/', '/var/tmp/']
+            const isSafe = lowered.startsWith(home) || tmp.some((p) => lowered.startsWith(p))
+            if (!isSafe) {
+                console.warn(
+                    `[launcher] 警告: userDataDir 不在常见位置（${userDataDir}），建议使用 ~/.mcp-chrome/ 或 /tmp/ 下的目录`
+                )
+            }
         }
 
         // 构建启动参数
@@ -112,13 +137,15 @@ export class BrowserLauncher {
      * 构建启动参数
      */
     private buildArgs(options: {
-        port: number;
-        incognito: boolean;
-        headless: boolean;
-        userDataDir?: string;
+        port: number
+        incognito: boolean
+        headless: boolean
+        userDataDir?: string
     }): string[] {
         const args = [
             `--remote-debugging-port=${options.port}`,
+            // 显式绑定到 loopback,防止 Chrome 在某些平台/版本默认监听全网卡造成端口暴露
+            '--remote-debugging-address=127.0.0.1',
             '--no-first-run',
             '--no-default-browser-check',
             '--disable-background-networking',
@@ -155,9 +182,9 @@ export class BrowserLauncher {
         // 必须指定 user-data-dir，否则会复用已运行的 Chrome 实例导致启动失败
         // 默认使用固定目录 ~/.mcp-chrome/profile，保留 cookies 和登录状态
         const userDataDir = options.userDataDir ?? DEFAULT_PROFILE_DIR
-        // 确保目录存在
+        // 确保目录存在（mode 0o700 限制仅创建者可读）
         if (!existsSync(userDataDir)) {
-            mkdirSync(userDataDir, { recursive: true })
+            mkdirSync(userDataDir, { recursive: true, mode: 0o700 })
         }
         args.push(`--user-data-dir=${userDataDir}`)
 
@@ -182,37 +209,46 @@ export class BrowserLauncher {
             }, timeout)
 
             let stderr = ''
+            const stderrStream = this.process.stderr
 
-            this.process.stderr?.on('data', (data: Buffer) => {
+            const onStderr = (data: Buffer) => {
                 stderr += data.toString()
 
                 // 解析 DevTools listening on ws://...
-                const match = stderr.match(/DevTools listening on (ws:\/\/\S+)/)
+                const match = stderr.match(/DevTools listening on (?<url>ws:\/\/\S+)/)
                 if (match) {
                     clearTimeout(timer)
                     // 解析端口
-                    const portMatch = match[1].match(/:(\d+)\//)
+                    const portMatch = match.groups!.url.match(/:(?<port>\d+)\//)
                     if (portMatch) {
-                        this._port = parseInt(portMatch[1], 10)
+                        this._port = parseInt(portMatch.groups!.port, 10)
                     }
-                    resolve(match[1])
+                    // 端点已拿到，移除 listener 避免后续 stderr 持续累积内存
+                    stderrStream?.removeListener('data', onStderr)
+                    resolve(match.groups!.url)
                 }
-            })
+            }
+
+            stderrStream?.on('data', onStderr)
 
             this.process.on('error', (error: Error) => {
                 clearTimeout(timer)
+                stderrStream?.removeListener('data', onStderr)
                 reject(error)
             })
 
             this.process.on('exit', (code) => {
                 clearTimeout(timer)
+                stderrStream?.removeListener('data', onStderr)
                 if (code === 0) {
                     // Chrome 退出码 0：通常是把请求委托给了已运行的实例后自行退出，
                     // 此时没有 DevTools 端点可连接
-                    reject(new Error(
-                        '浏览器进程已退出（code 0），可能已有相同 profile 的 Chrome 实例在运行。\n'
-                        + '请关闭已运行的 Chrome 或指定不同的 userDataDir',
-                    ))
+                    reject(
+                        new Error(
+                            '浏览器进程已退出（code 0），可能已有相同 profile 的 Chrome 实例在运行\n' +
+                                '请关闭已运行的 Chrome 或指定不同的 userDataDir'
+                        )
+                    )
                 } else if (code !== null) {
                     reject(new Error(`浏览器进程退出，代码: ${code}\n${stderr}`))
                 }

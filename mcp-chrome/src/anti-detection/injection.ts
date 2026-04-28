@@ -6,25 +6,19 @@
  * - 清理 CDP 痕迹
  * - 模拟真实浏览器指纹
  *
+ * 覆盖范围：navigator.webdriver、cdc_*、UA、若干 WebGL vendor/renderer、Chrome runtime
+ * 不覆盖：Canvas/Audio/Font 指纹、TLS 层指纹、CDP attach 横幅、扩展存在性探测
+ * 警告：禁止依赖此能力绕过商业 anti-bot 服务
+ *
  * 模式：
- * - safe: 最小改动（移除 webdriver、清理 CDP 痕迹）
- * - aggressive: 完整伪装（插件、WebGL、语言等）
+ * - safe: 基础修补（移除 webdriver、清理 CDP 痕迹、UA 标识修正）
+ * - aggressive: 在 safe 基础上追加 plugins、languages、chrome、permissions、WebGL 修补
  */
 
-type StealthMode = 'safe' | 'aggressive';
+type StealthMode = 'safe' | 'aggressive'
 
-/**
- * 获取反检测注入脚本
- */
-export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
-    const safeScript = `
-(function() {
-  'use strict';
-
-  // 如果已经注入过，跳过
-  if (window.__mcp_chrome_injected__) return;
-  window.__mcp_chrome_injected__ = true;
-
+// 公共 body：三块基础修补，base 与 full 共享
+const COMMON_BODY = `
   // ============================================
   // 1. 移除 navigator.webdriver
   // ============================================
@@ -73,53 +67,12 @@ export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
   } catch {
     // 静默处理
   }
-})();
 `
 
-    const aggressiveScript = `
-(function() {
-  'use strict';
-
-  // 如果已经注入过，跳过
-  if (window.__mcp_chrome_injected__) return;
-  window.__mcp_chrome_injected__ = true;
-
+// aggressive 追加 body：plugins / languages / chrome / permissions / WebGL
+const AGGRESSIVE_EXTRA_BODY = `
   // ============================================
-  // 1. 移除 navigator.webdriver
-  // ============================================
-  try {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-      configurable: true,
-    });
-
-    // 删除 webdriver 检测相关属性
-    delete navigator.__proto__.webdriver;
-  } catch {
-    // 静默处理，避免污染站点控制台
-  }
-
-  // ============================================
-  // 2. 清理 CDP 痕迹
-  // ============================================
-  try {
-    // 清理 window.cdc_* 变量（Chrome DevTools 特征）
-    const cdcKeys = Object.keys(window).filter(key => key.startsWith('cdc_'));
-    for (const key of cdcKeys) {
-      delete window[key];
-    }
-
-    // 清理 document.cdc_* 变量
-    const docCdcKeys = Object.keys(document).filter(key => key.startsWith('cdc_'));
-    for (const key of docCdcKeys) {
-      delete document[key];
-    }
-  } catch {
-    // 静默处理
-  }
-
-  // ============================================
-  // 3. 模拟真实插件列表
+  // 4. 模拟真实插件列表
   // ============================================
   try {
     Object.defineProperty(navigator, 'plugins', {
@@ -168,7 +121,7 @@ export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
   }
 
   // ============================================
-  // 4. 模拟真实语言设置
+  // 5. 模拟真实语言设置
   // ============================================
   try {
     Object.defineProperty(navigator, 'languages', {
@@ -180,7 +133,7 @@ export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
   }
 
   // ============================================
-  // 5. 修复 Chrome 特有属性
+  // 6. 修复 Chrome 特有属性
   // ============================================
   try {
     // chrome.runtime 检测
@@ -204,7 +157,7 @@ export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
   }
 
   // ============================================
-  // 6. 修复 Permissions API
+  // 7. 修复 Permissions API
   // ============================================
   try {
     const originalQuery = window.navigator.permissions?.query;
@@ -216,22 +169,6 @@ export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
         }
         return originalQuery.call(navigator.permissions, parameters);
       };
-    }
-  } catch {
-    // 静默处理
-  }
-
-  // ============================================
-  // 7. 隐藏自动化检测特征
-  // ============================================
-  try {
-    // 修改 navigator.userAgent 中的 Headless 标识
-    const originalUserAgent = navigator.userAgent;
-    if (originalUserAgent.includes('HeadlessChrome')) {
-      Object.defineProperty(navigator, 'userAgent', {
-        get: () => originalUserAgent.replace('HeadlessChrome', 'Chrome'),
-        configurable: true,
-      });
     }
   } catch {
     // 静默处理
@@ -267,8 +204,26 @@ export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
   } catch {
     // 静默处理
   }
-})();
 `
 
-    return mode === 'aggressive' ? aggressiveScript : safeScript
+function wrapStealthBody(body: string): string {
+    return `
+(function() {
+  'use strict';
+
+  // 如果已经注入过，跳过
+  if (window.__mcp_chrome_injected__) return;
+  window.__mcp_chrome_injected__ = true;
+${body}})();
+`
+}
+
+const baseStealthScript = wrapStealthBody(COMMON_BODY)
+const fullStealthScript = wrapStealthBody(COMMON_BODY + AGGRESSIVE_EXTRA_BODY)
+
+/**
+ * 获取反检测注入脚本
+ */
+export function getAntiDetectionScript(mode: StealthMode = 'safe'): string {
+    return mode === 'aggressive' ? fullStealthScript : baseStealthScript
 }

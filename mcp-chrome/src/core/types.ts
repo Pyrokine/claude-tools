@@ -11,24 +11,27 @@ export const DEFAULT_TIMEOUT = 30000
 
 /** 修饰键位掩码（CDP Input.dispatchKeyEvent/MouseEvent 的 modifiers 字段） */
 export const MODIFIER_KEYS: Record<string, number> = {
-    Alt: 1, Control: 2, Meta: 4, Shift: 8,
+    Alt: 1,
+    Control: 2,
+    Meta: 4,
+    Shift: 8,
 }
 
 // ==================== CDP Runtime 响应类型 ====================
 
 /** CDP Runtime.evaluate / callFunctionOn 响应中的异常详情 */
 export interface CdpExceptionDetails {
-    text: string;
-    exception?: { className?: string; description?: string };
+    text: string
+    exception?: { className?: string; description?: string }
 }
 
 /** CDP Runtime.evaluate / callFunctionOn 响应中的结果对象 */
 export interface CdpResultObject<T = unknown> {
-    type: string;
-    subtype?: string;
-    className?: string;
-    description?: string;
-    value?: T;
+    type: string
+    subtype?: string
+    className?: string
+    description?: string
+    value?: T
 }
 
 /** 从 CDP exceptionDetails 提取有用的错误信息（含完整堆栈） */
@@ -40,10 +43,10 @@ export function formatCdpException(details: CdpExceptionDetails): string {
 export function extractCdpValue<T>(result?: CdpResultObject<T>): T {
     if (!result || (result.value === undefined && result.type !== 'undefined')) {
         const typeName = result?.className ?? result?.subtype ?? result?.type ?? 'unknown'
-        const preview  = result?.description ? ` (${result.description.substring(0, 200)})` : ''
+        const preview = result?.description ? ` (${result.description.substring(0, 200)})` : ''
         throw new Error(
-            `返回值类型 ${typeName}${preview} 无法序列化。` +
-            '请在脚本中用 JSON.stringify() 包装返回值，或将需要的属性提取为简单类型',
+            `返回值类型 ${typeName}${preview} 无法序列化，` +
+                '请在脚本中用 JSON.stringify() 包装返回值，或将需要的属性提取为简单类型'
         )
     }
     return result.value as T
@@ -58,7 +61,7 @@ export function extractCdpValue<T>(result?: CdpResultObject<T>): T {
  * - 坐标定位
  */
 export type Target =
-// 语义化定位（推荐，参考 Playwright）
+    // 语义化定位（推荐，参考 Playwright）
     | { role: string; name?: string } // 可访问性树：getByRole
     | { text: string; exact?: boolean } // 文本内容：getByText
     | { label: string; exact?: boolean } // 关联 label：getByLabel
@@ -71,30 +74,30 @@ export type Target =
     | { css: string; text: string; exact?: boolean } // CSS + 文本组合
     | { xpath: string } // XPath
     // 坐标定位
-    | { x: number; y: number }; // 绝对坐标
+    | { x: number; y: number } // 绝对坐标
 
 /**
  * 坐标点
  */
 export interface Point {
-    x: number;
-    y: number;
+    x: number
+    y: number
 }
 
 /**
  * 矩形区域
  */
 export interface Box {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
+    x: number
+    y: number
+    width: number
+    height: number
 }
 
 /**
  * 鼠标按钮类型（参考 Puppeteer，支持 5 种）
  */
-export type MouseButton = 'left' | 'middle' | 'right' | 'back' | 'forward';
+export type MouseButton = 'left' | 'middle' | 'right' | 'back' | 'forward'
 
 /**
  * 输入事件类型
@@ -113,188 +116,196 @@ export type InputEventType =
     | 'type'
     | 'wait'
     | 'select'
-    | 'replace';
+    | 'replace'
+    | 'drag'
 
 /**
  * 输入事件
  */
 export interface InputEvent {
-    type: InputEventType;
+    type: InputEventType
     // 键盘参数
-    key?: string;
+    key?: string
+    commands?: string[]
     // 鼠标参数
-    button?: MouseButton;
-    target?: Target;
+    button?: MouseButton
+    clickCount?: number
+    target?: Target
+    // 拖拽目标（drag 事件）
+    to?: Target
     // 移动参数
-    steps?: number;
+    steps?: number
     // 滚轮参数
-    deltaX?: number;
-    deltaY?: number;
+    deltaX?: number
+    deltaY?: number
     // 输入文本参数
-    text?: string;
-    delay?: number;
+    text?: string
+    delay?: number
     // 等待参数
-    ms?: number;
+    ms?: number
     // 查找文本参数（select/replace 事件）
-    find?: string;
-    nth?: number;
+    find?: string
+    nth?: number
     // dispatch 模式（type 事件）
-    dispatch?: boolean;
+    dispatch?: boolean
     // 强制执行（click 事件）
-    force?: boolean;
+    force?: boolean
 }
 
 /**
  * 页面加载等待条件
  */
-export type WaitUntil = 'load' | 'domcontentloaded' | 'networkidle';
+export type WaitUntil = 'load' | 'domcontentloaded' | 'networkidle'
 
 /**
  * 元素状态
  */
-export type ElementState = 'visible' | 'hidden' | 'attached' | 'detached';
+export type ElementState = 'visible' | 'hidden' | 'attached' | 'detached'
 
 /**
  * 缓存类型
+ *
+ * 不含 'cookies'：cookies 清除统一走 cookies action=clear（强制要求 name/domain/url 过滤）
  */
-export type CacheType = 'all' | 'cookies' | 'storage' | 'cache';
+export type CacheType = 'all' | 'storage' | 'cache'
 
 /**
  * Cookie SameSite 属性
  */
-export type SameSite = 'Strict' | 'Lax' | 'None';
+export type SameSite = 'Strict' | 'Lax' | 'None'
 
 /**
  * Cookie 选项
  */
 export interface CookieOptions {
-    domain?: string;
-    path?: string;
-    expires?: number;
-    httpOnly?: boolean;
-    secure?: boolean;
-    sameSite?: SameSite;
+    domain?: string
+    path?: string
+    expires?: number
+    httpOnly?: boolean
+    secure?: boolean
+    sameSite?: SameSite
 }
 
 /**
  * Cookie 数据
  */
 export interface Cookie {
-    name: string;
-    value: string;
-    domain: string;
-    path: string;
-    expires: number;
-    size: number;
-    httpOnly: boolean;
-    secure: boolean;
-    session: boolean;
-    sameSite?: SameSite;
+    name: string
+    value: string
+    domain: string
+    path: string
+    expires: number
+    size: number
+    httpOnly: boolean
+    secure: boolean
+    session: boolean
+    sameSite?: SameSite
 }
 
 /**
  * 页面状态
  */
 export interface PageState {
-    url: string;
-    title: string;
+    url: string
+    title: string
     viewport: {
-        width: number;
-        height: number;
-    };
+        width: number
+        height: number
+    }
     // 只返回可交互元素，不是完整 DOM
     elements: Array<{
-        role: string;
-        name: string;
-        description?: string;
-        disabled?: boolean;
-        checked?: boolean;
-        value?: string;
-    }>;
+        role: string
+        name: string
+        description?: string
+        disabled?: boolean
+        checked?: boolean
+        value?: string
+    }>
 }
 
 /**
  * 控制台日志条目
  */
 export interface ConsoleLogEntry {
-    level: string;
-    text: string;
-    timestamp: number;
-    url?: string;
-    lineNumber?: number;
+    source?: string
+    level: string
+    text: string
+    timestamp: number
+    url?: string
+    lineNumber?: number
 }
 
 /**
  * 网络请求条目
  */
 export interface NetworkRequestEntry {
-    url: string;
-    method: string;
-    status?: number;
-    type: string;
-    timestamp: number;
-    duration?: number;
-    size?: number;
+    url: string
+    method: string
+    status?: number
+    type: string
+    timestamp: number
+    duration?: number
+    size?: number
 }
 
 /**
  * Target 信息（浏览器页面/tab）
  */
 export interface TargetInfo {
-    targetId: string;
-    type: string;
-    url: string;
-    title: string;
+    targetId: string
+    type: string
+    url: string
+    title: string
     /** 是否复用了已运行的浏览器（launch 时如果连接到已有浏览器则为 true） */
-    reused?: boolean;
+    reused?: boolean
 }
 
 /**
  * 反检测模式
  * - off: 关闭反检测（纯净模式，适合测试/CI）
  * - safe: 安全模式（最小改动，默认）
- * - aggressive: 激进模式（完整伪装，可能有副作用）
+ * - aggressive: 激进模式（增加少量 WebGL/插件/语言指纹修补,不等于完整伪装）
  */
-export type StealthMode = 'off' | 'safe' | 'aggressive';
+export type StealthMode = 'off' | 'safe' | 'aggressive'
 
 /**
  * 启动选项
  */
 export interface LaunchOptions {
-    executablePath?: string;
-    port?: number;
-    incognito?: boolean;
-    headless?: boolean;
-    userDataDir?: string;
-    timeout?: number;
+    executablePath?: string
+    port?: number
+    incognito?: boolean
+    headless?: boolean
+    userDataDir?: string
+    timeout?: number
     /** 反检测模式，默认 'safe' */
-    stealth?: StealthMode;
+    stealth?: StealthMode
 }
 
 /**
  * 连接选项
  */
 export interface ConnectOptions {
-    host?: string;
-    port: number;
-    timeout?: number;
+    host?: string
+    port: number
+    timeout?: number
     /** 反检测模式，默认 'safe' */
-    stealth?: StealthMode;
+    stealth?: StealthMode
 }
 
 /**
  * 设备描述符
  */
 export interface DeviceDescriptor {
-    name: string;
+    name: string
     viewport: {
-        width: number;
-        height: number;
-        deviceScaleFactor: number;
-        isMobile: boolean;
-        hasTouch: boolean;
-    };
-    userAgent: string;
+        width: number
+        height: number
+        deviceScaleFactor: number
+        isMobile: boolean
+        hasTouch: boolean
+    }
+    userAgent: string
 }
 
 /**
@@ -311,7 +322,8 @@ export const devices: Record<string, DeviceDescriptor> = {
             hasTouch: true,
         },
         userAgent:
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) ' +
+            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
     },
     'iPhone 14': {
         name: 'iPhone 14',
@@ -323,7 +335,8 @@ export const devices: Record<string, DeviceDescriptor> = {
             hasTouch: true,
         },
         userAgent:
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) ' +
+            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
     },
     'iPad Pro': {
         name: 'iPad Pro',
@@ -335,7 +348,8 @@ export const devices: Record<string, DeviceDescriptor> = {
             hasTouch: true,
         },
         userAgent:
-            'Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X) ' +
+            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
     },
     'Pixel 5': {
         name: 'Pixel 5',
@@ -347,52 +361,39 @@ export const devices: Record<string, DeviceDescriptor> = {
             hasTouch: true,
         },
         userAgent:
-            'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+            'Mozilla/5.0 (Linux; Android 11; Pixel 5) ' +
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
     },
 }
 
 /**
  * 判断 Target 类型的工具函数
  */
-export function isRoleTarget(
-    target: Target,
-): target is { role: string; name?: string } {
+export function isRoleTarget(target: Target): target is { role: string; name?: string } {
     return 'role' in target
 }
 
-export function isTextTarget(
-    target: Target,
-): target is { text: string; exact?: boolean } {
+export function isTextTarget(target: Target): target is { text: string; exact?: boolean } {
     return 'text' in target && !('css' in target)
 }
 
-export function isLabelTarget(
-    target: Target,
-): target is { label: string; exact?: boolean } {
+export function isLabelTarget(target: Target): target is { label: string; exact?: boolean } {
     return 'label' in target
 }
 
-export function isPlaceholderTarget(
-    target: Target,
-): target is { placeholder: string; exact?: boolean } {
+export function isPlaceholderTarget(target: Target): target is { placeholder: string; exact?: boolean } {
     return 'placeholder' in target
 }
 
-export function isTitleTarget(
-    target: Target,
-): target is { title: string; exact?: boolean } {
+export function isTitleTarget(target: Target): target is { title: string; exact?: boolean } {
     return 'title' in target
 }
 
-export function isAltTarget(
-    target: Target,
-): target is { alt: string; exact?: boolean } {
+export function isAltTarget(target: Target): target is { alt: string; exact?: boolean } {
     return 'alt' in target
 }
 
-export function isTestIdTarget(
-    target: Target,
-): target is { testId: string } {
+export function isTestIdTarget(target: Target): target is { testId: string } {
     return 'testId' in target
 }
 
@@ -408,8 +409,6 @@ export function isXPathTarget(target: Target): target is { xpath: string } {
     return 'xpath' in target
 }
 
-export function isCoordinateTarget(
-    target: Target,
-): target is { x: number; y: number } {
+export function isCoordinateTarget(target: Target): target is { x: number; y: number } {
     return 'x' in target && 'y' in target
 }

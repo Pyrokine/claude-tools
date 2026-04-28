@@ -8,37 +8,42 @@
  * - 心跳检测：定期 ping 检测 Extension 存活
  */
 
-import {EventEmitter} from 'events'
-import {createServer, IncomingMessage, Server, ServerResponse} from 'http'
-import {WebSocket, WebSocketServer} from 'ws'
-import {DEFAULT_TIMEOUT} from '../core/types.js'
+import { EventEmitter } from 'events'
+import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
+import { readFileSync } from 'node:fs'
+import { WebSocket, WebSocketServer } from 'ws'
+import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
+import { ExtensionDisconnectedError } from '../core/extension-errors.js'
+import { DEFAULT_TIMEOUT } from '../core/types.js'
 
-const SERVER_VERSION     = '1.3.0'
-const DEFAULT_PORT       = 19222
-const MAX_PORT           = 19299
-const REQUEST_TIMEOUT    = DEFAULT_TIMEOUT
+const SERVER_VERSION = (
+    JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as { version: string }
+).version
+const DEFAULT_PORT = 19222
+const MAX_PORT = 19299
+const REQUEST_TIMEOUT = DEFAULT_TIMEOUT
 const HEARTBEAT_INTERVAL = 15000 // 每 15 秒发送一次 ping，下次 ping 前检查 pong
 
 export interface HttpServerOptions {
-    port?: number;
-    autoPort?: boolean;
+    port?: number
+    autoPort?: boolean
 }
 
 interface MessageHandler {
-    resolve: (value: unknown) => void;
-    reject: (error: Error) => void;
-    timeout: NodeJS.Timeout;
+    resolve: (value: unknown) => void
+    reject: (error: Error) => void
+    timeout: NodeJS.Timeout
 }
 
 export class ExtensionHttpServer extends EventEmitter {
-    private server: Server | null                    = null
-    private wss: WebSocketServer | null              = null
-    private clientSocket: WebSocket | null           = null
-    private port                                     = 0
-    private messageHandlers                          = new Map<string, MessageHandler>()
-    private extensionVersion: string | null          = null
+    private server: Server | null = null
+    private wss: WebSocketServer | null = null
+    private clientSocket: WebSocket | null = null
+    private port = 0
+    private messageHandlers = new Map<string, MessageHandler>()
+    private extensionVersion: string | null = null
     private heartbeatInterval: NodeJS.Timeout | null = null
-    private pongReceived                             = false
+    private pongReceived = false
 
     constructor(private options: HttpServerOptions = {}) {
         super()
@@ -57,9 +62,9 @@ export class ExtensionHttpServer extends EventEmitter {
      * 发送命令到 Extension
      * @param action 操作名称
      * @param params 操作参数
-     * @param requestTimeout 端到端预算（毫秒），包含连接等待和请求超时。
-     *                       不传则使用 REQUEST_TIMEOUT (30s)。
-     *                       ≤0 直接失败。
+     * @param requestTimeout 端到端预算（毫秒），包含连接等待和请求超时，
+     *                       不传则使用 REQUEST_TIMEOUT (30s)，
+     *                       ≤0 直接失败
      */
     async sendCommand(action: string, params: unknown = {}, requestTimeout?: number): Promise<unknown> {
         const budget = requestTimeout ?? REQUEST_TIMEOUT
@@ -72,31 +77,32 @@ export class ExtensionHttpServer extends EventEmitter {
 
         if (!this.isConnected()) {
             const connectStart = Date.now()
-            const connected    = await this.waitForConnection(budget)
-            connectWait        = Date.now() - connectStart
+            const connected = await this.waitForConnection(budget)
+            connectWait = Date.now() - connectStart
             if (!connected) {
-                throw new Error('Extension 未连接。请确保 Chrome 已打开并安装了 MCP Chrome Extension。')
+                throw new Error('Extension 未连接，请确保 Chrome 已打开并安装了 MCP Chrome Extension')
             }
         }
 
         // 端到端预算：函数入口至今的总耗时从预算中扣除
         const remaining = budget - (Date.now() - startTime)
         if (remaining <= 0) {
-            const detail = connectWait > 0
-                           ? `budget ${budget}ms, connection wait ${connectWait}ms`
-                           : `budget ${budget}ms`
+            const detail =
+                connectWait > 0 ? `budget ${budget}ms, connection wait ${connectWait}ms` : `budget ${budget}ms`
             throw new Error(`Request timeout for action: ${action} (${detail})`)
         }
 
         return new Promise((resolve, reject) => {
             const messageId = this.generateId()
-            const message   = { id: messageId, action, params }
+            const message = { id: messageId, action, params }
 
             const timeout = setTimeout(() => {
                 this.messageHandlers.delete(messageId)
-                const detail = connectWait > 0
-                               ? `budget ${budget}ms, connection wait ${connectWait}ms`
-                               : `${budget}ms`
+                // 明确剩余预算 = 总预算 - 连接等待,提示当前等待是 ws 响应阶段
+                const detail =
+                    connectWait > 0
+                        ? `remaining ${remaining}ms after connection wait ${connectWait}ms (total budget ${budget}ms)`
+                        : `${remaining}ms`
                 reject(new Error(`Request timeout for action: ${action} (${detail})`))
             }, remaining)
 
@@ -107,9 +113,11 @@ export class ExtensionHttpServer extends EventEmitter {
             } catch (err) {
                 clearTimeout(timeout)
                 this.messageHandlers.delete(messageId)
-                reject(new Error(`Failed to send command ${action}: ${err instanceof Error ?
-                                                                      err.message :
-                                                                      'Unknown error'}`))
+                reject(
+                    new Error(
+                        `Failed to send command ${action}: ${err instanceof Error ? err.message : 'Unknown error'}`
+                    )
+                )
             }
         })
     }
@@ -155,7 +163,7 @@ export class ExtensionHttpServer extends EventEmitter {
         this.clientSocket?.close()
         this.wss?.close()
 
-        return new Promise(resolve => {
+        return new Promise((resolve) => {
             if (this.server) {
                 this.server.close(() => resolve())
             } else {
@@ -168,19 +176,27 @@ export class ExtensionHttpServer extends EventEmitter {
      * 绑定成功后初始化 WebSocket Server
      */
     private setupWebSocket(): void {
-        this.wss = new WebSocketServer({ server: this.server! })
+        // 用 noServer 模式手动处理 upgrade,以便在握手前校验 Origin
+        this.wss = new WebSocketServer({ noServer: true })
 
-        this.wss.on('connection', (ws, req) => {
-            // Origin 校验：拒绝非 Extension 来源（如网页 JS 的跨域 WebSocket）。
-            // 无 Origin 的连接（如 Extension Service Worker、curl 等本地工具）放行，
-            // 安全性由 listen 绑定 127.0.0.1 保证（仅本机进程可达）。
+        this.server!.on('upgrade', (req, socket, head) => {
             const origin = req.headers.origin
-            if (origin && !origin.startsWith('chrome-extension://')) {
-                console.error(`[HTTP] Rejected WebSocket connection from origin: ${origin}`)
-                ws.close(4003, 'Forbidden origin')
+
+            // Origin 严校验：必须是 chrome-extension:// 来源（拒绝无 Origin 的连接,
+            // 因为合规的 Extension Service Worker 在握手时会带 Origin 头）
+            if (!origin || !origin.startsWith('chrome-extension://')) {
+                console.error(`[HTTP] Rejected WebSocket upgrade: invalid origin "${origin ?? '<none>'}"`)
+                socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
+                socket.destroy()
                 return
             }
 
+            this.wss!.handleUpgrade(req, socket, head, (ws) => {
+                this.wss!.emit('connection', ws, req)
+            })
+        })
+
+        this.wss.on('connection', (ws) => {
             console.error('[HTTP] Extension connected')
 
             // 只允许一个客户端连接，关闭旧的
@@ -201,7 +217,7 @@ export class ExtensionHttpServer extends EventEmitter {
             ws.on('close', () => {
                 console.error('[HTTP] Extension disconnected')
                 if (this.clientSocket === ws) {
-                    this.clientSocket     = null
+                    this.clientSocket = null
                     this.extensionVersion = null
                     this.stopHeartbeat()
                     // 立即 reject 所有 pending 请求，而非等待个别超时
@@ -256,20 +272,22 @@ export class ExtensionHttpServer extends EventEmitter {
 
         const url = req.url ?? '/'
 
-        if (url === '/api/health') {
+        if (url.startsWith('/api/health')) {
             res.writeHead(200)
             res.end(JSON.stringify({ status: 'ok', port: this.port }))
             return
         }
 
-        if (url === '/api/info') {
+        if (url.startsWith('/api/info')) {
             res.writeHead(200)
-            res.end(JSON.stringify({
-                                       serverVersion: SERVER_VERSION,
-                                       extensionVersion: this.extensionVersion,
-                                       port: this.port,
-                                       connected: this.isConnected(),
-                                   }))
+            res.end(
+                JSON.stringify({
+                    serverVersion: SERVER_VERSION,
+                    extensionVersion: this.extensionVersion,
+                    port: this.port,
+                    connected: this.isConnected(),
+                })
+            )
             return
         }
 
@@ -280,11 +298,11 @@ export class ExtensionHttpServer extends EventEmitter {
     private handleMessage(data: string): void {
         try {
             const message = JSON.parse(data) as {
-                id?: string;
-                success?: boolean;
-                data?: unknown;
-                error?: string;
-                type?: string;
+                id?: string
+                success?: boolean
+                data?: unknown
+                error?: string
+                type?: string
                 version?: string
             }
 
@@ -297,10 +315,13 @@ export class ExtensionHttpServer extends EventEmitter {
             // 版本握手
             if (message.type === 'hello') {
                 this.extensionVersion = message.version ?? null
-                const serverMajor     = SERVER_VERSION.split('.')[0]
-                const extMajor        = (message.version ?? '0').split('.')[0]
+                const [serverMajor] = SERVER_VERSION.split('.').map(Number)
+                const [extMajor] = (message.version ?? '0.0').split('.').map(Number)
                 if (serverMajor !== extMajor) {
-                    console.error(`[HTTP] ⚠ Version mismatch: Server ${SERVER_VERSION}, Extension ${message.version}. Please update both to the same major version.`)
+                    console.error(
+                        `[HTTP] ⚠ Version mismatch: Server ${SERVER_VERSION}, Extension ${message.version}, ` +
+                            'major version differs — please update to a compatible version,'
+                    )
                 } else {
                     console.error(`[HTTP] Extension version: ${message.version}`)
                 }
@@ -316,7 +337,8 @@ export class ExtensionHttpServer extends EventEmitter {
                 if (message.success) {
                     handler.resolve(message.data)
                 } else {
-                    handler.reject(new Error(message.error ?? 'Unknown error'))
+                    // 对 Extension 上报的错误信息再做一层服务端脱敏（剥离主机绝对路径残留）
+                    handler.reject(new Error(sanitizeErrorMessage(message.error ?? 'Unknown error')))
                 }
             }
         } catch (error) {
@@ -327,7 +349,7 @@ export class ExtensionHttpServer extends EventEmitter {
     /**
      * 启动心跳：定期发送 ping，检测 pong 响应
      * 如果 Extension 的 Service Worker 被 Chrome 杀死，TCP 连接可能不会立即关闭，
-     * 心跳机制能及时检测到这种"半死"连接并清理。
+     * 心跳机制能及时检测到这种"半死"连接并清理
      */
     private startHeartbeat(): void {
         this.stopHeartbeat()
@@ -365,16 +387,23 @@ export class ExtensionHttpServer extends EventEmitter {
 
     /**
      * 立即 reject 所有 pending 请求并清理
+     *
+     * Extension 断开类原因抛 typed Error,便于上层 instanceof 判断而无需字符串匹配
      */
     private rejectPendingHandlers(reason: string): void {
+        const isDisconnect =
+            reason.includes('Extension disconnected') ||
+            reason.includes('Connection replaced') ||
+            reason.includes('Server stopped')
         for (const [, handler] of this.messageHandlers) {
             clearTimeout(handler.timeout)
-            handler.reject(new Error(reason))
+            const err = isDisconnect ? new ExtensionDisconnectedError(reason) : new Error(reason)
+            handler.reject(err)
         }
         this.messageHandlers.clear()
     }
 
     private generateId(): string {
-        return Date.now().toString(36) + Math.random().toString(36).substring(2)
+        return crypto.randomUUID()
     }
 }

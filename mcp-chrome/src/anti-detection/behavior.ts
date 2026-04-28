@@ -9,7 +9,7 @@
  * 注意：这些是可选功能，需要显式启用（humanize: true）
  */
 
-import type {Point} from '../core/types.js'
+import type { Point } from '../core/types.js'
 
 /**
  * 随机延迟
@@ -27,15 +27,9 @@ export function randomDelay(min: number, max: number): Promise<void> {
  * @param steps 步数（默认根据距离计算）
  * @returns 路径点数组
  */
-export function generateBezierPath(
-    from: Point,
-    to: Point,
-    steps?: number,
-): Point[] {
+export function generateBezierPath(from: Point, to: Point, steps?: number): Point[] {
     // 计算距离
-    const distance = Math.sqrt(
-        Math.pow(to.x - from.x, 2) + Math.pow(to.y - from.y, 2),
-    )
+    const distance = Math.sqrt(Math.pow(to.x - from.x, 2) + Math.pow(to.y - from.y, 2))
 
     // 根据距离计算步数，距离越远步数越多
     const numSteps = steps ?? Math.max(20, Math.floor(distance / 10))
@@ -64,16 +58,10 @@ export function generateBezierPath(
 /**
  * 计算三次贝塞尔曲线上的点
  */
-function bezierPoint(
-    p0: Point,
-    p1: Point,
-    p2: Point,
-    p3: Point,
-    t: number,
-): Point {
-    const u   = 1 - t
-    const tt  = t * t
-    const uu  = u * u
+function bezierPoint(p0: Point, p1: Point, p2: Point, p3: Point, t: number): Point {
+    const u = 1 - t
+    const tt = t * t
+    const uu = u * u
     const uuu = uu * u
     const ttt = tt * t
 
@@ -122,5 +110,4 @@ export class BehaviorSimulator {
     setCurrentPosition(point: Point): void {
         this.currentPosition = { ...point }
     }
-
 }

@@ -13,63 +13,67 @@
  * - cdp: 发送任意 CDP 命令（高级）
  */
 
-import type {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js'
-import {z} from 'zod'
-import {devices, formatErrorResponse, formatResponse, getSession, getUnifiedSession} from '../core/index.js'
-import type {CacheType} from '../core/types.js'
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { z } from 'zod'
+import { devices, formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
+import type { CacheType } from '../core/types.js'
 
 /**
  * manage 参数 schema
  */
 const manageSchema = z.object({
-                                  action: z.enum([
-                                                     'newPage', 'closePage', 'clearCache', 'viewport',
-                                                     'userAgent', 'emulate', 'inputMode', 'stealth', 'cdp',
-                                                 ]).describe('管理操作'),
-                                  inputMode: z.enum(['stealth', 'precise']).optional().describe(
-                                      '输入模式（inputMode）。precise=debugger API（默认，可绕过 CSP 但显示调试提示）；stealth=JS 事件模拟（不触发调试提示但受 CSP 限制，适用于反检测场景）'),
-                                  cdpMethod: z.string().optional().describe(
-                                      'CDP 方法名（cdp），如 Runtime.evaluate、Page.captureScreenshot'),
-                                  cdpParams: z.record(z.unknown()).optional().describe('CDP 方法参数（cdp）'),
-                                  targetId: z.string().optional().describe('目标页面 ID（closePage）'),
-                                  cacheType: z.enum(['all', 'cookies', 'storage', 'cache']).optional().describe(
-                                      '清除类型（clearCache）'),
-                                  width: z.number().optional().describe('视口宽度（viewport）'),
-                                  height: z.number().optional().describe('视口高度（viewport）'),
-                                  userAgent: z.string().optional().describe('User-Agent 字符串（userAgent）'),
-                                  device: z.string().optional().describe('设备名称（emulate），如 iPhone 13, iPad Pro'),
-                              })
+    action: z
+        .enum(['newPage', 'closePage', 'clearCache', 'viewport', 'userAgent', 'emulate', 'inputMode', 'stealth', 'cdp'])
+        .describe('管理操作'),
+    inputMode: z
+        .enum(['stealth', 'precise'])
+        .optional()
+        .describe(
+            '输入模式（inputMode），precise=debugger API（默认，可绕过 CSP 但显示调试提示）；stealth=JS 事件模拟（不触发调试提示但受 CSP 限制，适用于反检测场景）'
+        ),
+    cdpMethod: z.string().optional().describe('CDP 方法名（cdp），如 Runtime.evaluate、Page.captureScreenshot'),
+    cdpParams: z.record(z.unknown()).optional().describe('CDP 方法参数（cdp）'),
+    targetId: z.string().optional().describe('目标页面 ID（closePage）'),
+    cacheType: z
+        .enum(['all', 'storage', 'cache'])
+        .optional()
+        .describe('清除类型（clearCache）；不再支持 cookies，请使用 cookies action=clear（强制 name/domain/url 过滤）'),
+    width: z.number().optional().describe('视口宽度（viewport）'),
+    height: z.number().optional().describe('视口高度（viewport）'),
+    userAgent: z.string().optional().describe('User-Agent 字符串（userAgent）'),
+    device: z.string().optional().describe('设备名称（emulate），如 iPhone 13, iPad Pro'),
+})
 
 /**
  * manage 工具处理器
  */
 async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
-    content: Array<{ type: 'text'; text: string }>;
-    isError?: boolean;
+    content: Array<{ type: 'text'; text: string }>
+    isError?: boolean
 }> {
     try {
         const unifiedSession = getUnifiedSession()
-        const mode           = unifiedSession.getMode()
+        const mode = unifiedSession.getMode()
 
         switch (args.action) {
             case 'newPage': {
                 const target = await unifiedSession.newPage()
                 return formatResponse({
-                                          success: true,
-                                          action: 'newPage',
-                                          target,
-                                          mode,
-                                      })
+                    success: true,
+                    action: 'newPage',
+                    target,
+                    mode,
+                })
             }
 
             case 'closePage': {
                 await unifiedSession.closePage(args.targetId)
                 return formatResponse({
-                                          success: true,
-                                          action: 'closePage',
-                                          targetId: args.targetId ?? 'current',
-                                          mode,
-                                      })
+                    success: true,
+                    action: 'closePage',
+                    targetId: args.targetId ?? 'current',
+                    mode,
+                })
             }
 
             case 'clearCache': {
@@ -77,30 +81,26 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                     const cacheType = (args.cacheType ?? 'all') as CacheType
 
                     if (mode === 'extension') {
-                        // Extension 模式：只支持 cookies 清除
-                        if (cacheType === 'all' || cacheType === 'cookies') {
-                            await unifiedSession.clearCookies()
-                        }
-                        if (cacheType === 'storage' || cacheType === 'cache') {
-                            return formatResponse({
-                                                      success: true,
-                                                      action: 'clearCache',
-                                                      cacheType,
-                                                      mode,
-                                                      warning: 'Extension 模式仅支持清除 cookies，storage 和 cache 需要 CDP 模式',
-                                                  })
-                        }
-                    } else {
-                        const session = getSession()
-                        await session.clearCache(cacheType)
+                        // Extension 模式不支持清 storage/cache（需要 CDP）；cookies 清除统一走 cookies 工具（强制过滤）
+                        return formatResponse({
+                            success: true,
+                            action: 'clearCache',
+                            cacheType,
+                            mode,
+                            warning:
+                                'Extension 模式不支持 clearCache，如需清除 cookies 请使用 cookies action=clear（必须带 name/domain/url 过滤），如需清除 storage/cache 请切换到 CDP 模式',
+                        })
                     }
 
+                    const session = getSession()
+                    await session.clearCache(cacheType)
+
                     return formatResponse({
-                                              success: true,
-                                              action: 'clearCache',
-                                              cacheType,
-                                              mode,
-                                          })
+                        success: true,
+                        action: 'clearCache',
+                        cacheType,
+                        mode,
+                    })
                 })
             }
 
@@ -112,11 +112,11 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                                 {
                                     type: 'text',
                                     text: JSON.stringify({
-                                                             error: {
-                                                                 code: 'INVALID_ARGUMENT',
-                                                                 message: '设置视口需要 width 和 height 参数',
-                                                             },
-                                                         }),
+                                        error: {
+                                            code: 'INVALID_ARGUMENT',
+                                            message: '设置视口需要 width 和 height 参数',
+                                        },
+                                    }),
                                 },
                             ],
                             isError: true,
@@ -139,12 +139,12 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                     await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))')
 
                     return formatResponse({
-                                              success: true,
-                                              action: 'viewport',
-                                              width: args.width,
-                                              height: args.height,
-                                              mode,
-                                          })
+                        success: true,
+                        action: 'viewport',
+                        width: args.width,
+                        height: args.height,
+                        mode,
+                    })
                 })
             }
 
@@ -156,11 +156,11 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                                 {
                                     type: 'text',
                                     text: JSON.stringify({
-                                                             error: {
-                                                                 code: 'INVALID_ARGUMENT',
-                                                                 message: '设置 User-Agent 需要 userAgent 参数',
-                                                             },
-                                                         }),
+                                        error: {
+                                            code: 'INVALID_ARGUMENT',
+                                            message: '设置 User-Agent 需要 userAgent 参数',
+                                        },
+                                    }),
                                 },
                             ],
                             isError: true,
@@ -178,11 +178,11 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                     }
 
                     return formatResponse({
-                                              success: true,
-                                              action: 'userAgent',
-                                              userAgent: args.userAgent,
-                                              mode,
-                                          })
+                        success: true,
+                        action: 'userAgent',
+                        userAgent: args.userAgent,
+                        mode,
+                    })
                 })
             }
 
@@ -190,24 +190,24 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                 if (!args.inputMode) {
                     // 返回当前模式
                     return formatResponse({
-                                              success: true,
-                                              action: 'inputMode',
-                                              currentMode: unifiedSession.getInputMode(),
-                                              availableModes: ['stealth', 'precise'],
-                                              description: {
-                                                  stealth: 'JS 事件模拟，不触发调试提示，但受 CSP 限制（evaluate 可能失败）',
-                                                  precise: 'debugger API，可绕过 CSP，但显示"扩展程序正在调试此浏览器"',
-                                              },
-                                          })
+                        success: true,
+                        action: 'inputMode',
+                        currentMode: unifiedSession.getInputMode(),
+                        availableModes: ['stealth', 'precise'],
+                        description: {
+                            stealth: 'JS 事件模拟，不触发调试提示，但受 CSP 限制（evaluate 可能失败）',
+                            precise: 'debugger API，可绕过 CSP，但显示"扩展程序正在调试此浏览器"',
+                        },
+                    })
                 }
 
                 unifiedSession.setInputMode(args.inputMode)
                 return formatResponse({
-                                          success: true,
-                                          action: 'inputMode',
-                                          inputMode: args.inputMode,
-                                          mode,
-                                      })
+                    success: true,
+                    action: 'inputMode',
+                    inputMode: args.inputMode,
+                    mode,
+                })
             }
 
             case 'emulate': {
@@ -215,10 +215,10 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                     if (!args.device) {
                         // 列出可用设备
                         return formatResponse({
-                                                  success: true,
-                                                  action: 'emulate',
-                                                  availableDevices: Object.keys(devices),
-                                              })
+                            success: true,
+                            action: 'emulate',
+                            availableDevices: Object.keys(devices),
+                        })
                     }
 
                     const device = devices[args.device]
@@ -228,13 +228,12 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                                 {
                                     type: 'text',
                                     text: JSON.stringify({
-                                                             error: {
-                                                                 code: 'INVALID_ARGUMENT',
-                                                                 message: `未知设备: ${args.device}`,
-                                                                 suggestion: `可用设备: ${Object.keys(devices)
-                                                                                                .join(', ')}`,
-                                                             },
-                                                         }),
+                                        error: {
+                                            code: 'INVALID_ARGUMENT',
+                                            message: `未知设备: ${args.device}`,
+                                            suggestion: `可用设备: ${Object.keys(devices).join(', ')}`,
+                                        },
+                                    }),
                                 },
                             ],
                             isError: true,
@@ -261,12 +260,12 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                     await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))')
 
                     return formatResponse({
-                                              success: true,
-                                              action: 'emulate',
-                                              device: args.device,
-                                              viewport: device.viewport,
-                                              mode,
-                                          })
+                        success: true,
+                        action: 'emulate',
+                        device: args.device,
+                        viewport: device.viewport,
+                        mode,
+                    })
                 })
             }
 
@@ -274,11 +273,11 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                 return await unifiedSession.withTabId(undefined, async () => {
                     await unifiedSession.injectStealth()
                     return formatResponse({
-                                              success: true,
-                                              action: 'stealth',
-                                              mode,
-                                              note: '已注入反检测脚本',
-                                          })
+                        success: true,
+                        action: 'stealth',
+                        mode,
+                        note: '已注入反检测脚本',
+                    })
                 })
             }
 
@@ -290,12 +289,13 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                                 {
                                     type: 'text',
                                     text: JSON.stringify({
-                                                             error: {
-                                                                 code: 'INVALID_ARGUMENT',
-                                                                 message: '缺少 cdpMethod 参数',
-                                                                 suggestion: '请指定 CDP 方法名，如 Runtime.evaluate、Page.captureScreenshot',
-                                                             },
-                                                         }),
+                                        error: {
+                                            code: 'INVALID_ARGUMENT',
+                                            message: '缺少 cdpMethod 参数',
+                                            suggestion:
+                                                '请指定 CDP 方法名，如 Runtime.evaluate、Page.captureScreenshot',
+                                        },
+                                    }),
                                 },
                             ],
                             isError: true,
@@ -305,30 +305,33 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                     try {
                         const result = await unifiedSession.sendCdpCommand(args.cdpMethod, args.cdpParams)
                         return formatResponse({
-                                                  success: true,
-                                                  action: 'cdp',
-                                                  method: args.cdpMethod,
-                                                  result,
-                                                  mode,
-                                              })
+                            success: true,
+                            action: 'cdp',
+                            method: args.cdpMethod,
+                            result,
+                            mode,
+                        })
                     } catch (error) {
                         const errorMessage = error instanceof Error ? error.message : String(error)
                         // Extension 模式下某些 CDP 域不支持
-                        if (mode ===
-                            'extension' &&
-                            (errorMessage.includes('not supported') || errorMessage.includes('not found'))) {
+                        if (
+                            mode === 'extension' &&
+                            (errorMessage.includes('not supported') || errorMessage.includes('not found'))
+                        ) {
                             const domain = args.cdpMethod.split('.')[0]
                             return {
                                 content: [
                                     {
                                         type: 'text',
                                         text: JSON.stringify({
-                                                                 error: {
-                                                                     code: 'CDP_DOMAIN_NOT_SUPPORTED',
-                                                                     message: `Extension 模式不支持 ${domain} 域`,
-                                                                     suggestion: 'Extension 模式可用域：Page、Runtime、Emulation、DOM、Input、Network。如需完整 CDP 支持，请使用 CDP 模式（browse action="launch"）',
-                                                                 },
-                                                             }),
+                                            error: {
+                                                code: 'CDP_DOMAIN_NOT_SUPPORTED',
+                                                message: `Extension 模式不支持 ${domain} 域`,
+                                                suggestion:
+                                                    'Extension 模式可用域：Page、Runtime、Emulation、DOM、Input、Network，' +
+                                                    '如需完整 CDP 支持，请使用 CDP 模式（browse action="launch"）',
+                                            },
+                                        }),
                                     },
                                 ],
                                 isError: true,
@@ -345,11 +348,11 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
                         {
                             type: 'text',
                             text: JSON.stringify({
-                                                     error: {
-                                                         code: 'INVALID_ARGUMENT',
-                                                         message: `未知操作: ${args.action}`,
-                                                     },
-                                                 }),
+                                error: {
+                                    code: 'INVALID_ARGUMENT',
+                                    message: `未知操作: ${args.action}`,
+                                },
+                            }),
                         },
                     ],
                     isError: true,
@@ -364,8 +367,12 @@ async function handleManage(args: z.infer<typeof manageSchema>): Promise<{
  * 注册 manage 工具
  */
 export function registerManageTool(server: McpServer): void {
-    server.registerTool('manage', {
-        description: '页面与环境管理：新建页面、关闭页面、缓存、视口、UA、设备模拟',
-        inputSchema: manageSchema,
-    }, (args) => handleManage(args))
+    server.registerTool(
+        'manage',
+        {
+            description: '页面与环境管理：新建页面、关闭页面、缓存、视口、UA、设备模拟',
+            inputSchema: manageSchema,
+        },
+        (args) => handleManage(args)
+    )
 }

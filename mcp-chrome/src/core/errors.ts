@@ -8,13 +8,13 @@
  * - 参考《代码整洁之道》§7.4：给出异常发生的环境说明
  */
 
-import type {Target} from './types.js'
+import type { Target } from './types.js'
 
 /**
  * 错误上下文
  */
 export interface ErrorContext {
-    [key: string]: unknown;
+    [key: string]: unknown
 }
 
 /**
@@ -37,11 +37,11 @@ export abstract class BrowserError extends Error {
     toJSON(): object {
         const result: {
             error: {
-                code: string;
-                message: string;
-                suggestion: string;
-                context?: ErrorContext;
-            };
+                code: string
+                message: string
+                suggestion: string
+                context?: ErrorContext
+            }
         } = {
             error: {
                 code: this.code,
@@ -71,8 +71,8 @@ export class ConnectionRefusedError extends BrowserError {
         this.suggestion = `请确保浏览器已启动并开放了调试端口：
   google-chrome --remote-debugging-port=${port}
 
-或者使用 browse(action="launch") 让 mcp-chrome 自动启动浏览器。`
-        this.context    = { host, port }
+或者使用 browse(action="launch") 让 mcp-chrome 自动启动浏览器`
+        this.context = { host, port }
     }
 }
 
@@ -80,8 +80,8 @@ export class ConnectionRefusedError extends BrowserError {
  * 浏览器未找到错误
  */
 export class BrowserNotFoundError extends BrowserError {
-    readonly code       = 'BROWSER_NOT_FOUND'
-    readonly suggestion = `未找到 Chrome 浏览器。请指定 executablePath 参数：
+    readonly code = 'BROWSER_NOT_FOUND'
+    readonly suggestion = `未找到 Chrome 浏览器，请指定 executablePath 参数：
   browse(action="launch", executablePath="/path/to/chrome")`
 
     constructor() {
@@ -93,9 +93,8 @@ export class BrowserNotFoundError extends BrowserError {
  * 会话不存在错误
  */
 export class SessionNotFoundError extends BrowserError {
-    readonly code       = 'SESSION_NOT_FOUND'
-    readonly suggestion =
-                 '请先使用 browse(action="launch") 或 browse(action="connect") 连接浏览器'
+    readonly code = 'SESSION_NOT_FOUND'
+    readonly suggestion = '请先使用 browse(action="launch") 或 browse(action="connect") 连接浏览器'
 
     constructor() {
         super('浏览器会话不存在')
@@ -106,7 +105,7 @@ export class SessionNotFoundError extends BrowserError {
  * 页面/Target 不存在错误
  */
 export class TargetNotFoundError extends BrowserError {
-    readonly code       = 'TARGET_NOT_FOUND'
+    readonly code = 'TARGET_NOT_FOUND'
     readonly suggestion = '请使用 browse(action="list") 查看可用页面'
     override readonly context: ErrorContext
 
@@ -128,8 +127,8 @@ export class ElementNotFoundError extends BrowserError {
     constructor(target: Target, timeout: number, logs: string[] = [], url?: string) {
         super(`元素未找到: ${JSON.stringify(target)}`)
         this.suggestion = `请检查 target 是否正确，或增加 timeout（当前: ${timeout}ms）`
-        this.logs       = logs
-        this.context    = { target, timeout }
+        this.logs = logs
+        this.context = { target, timeout }
         if (url) {
             this.context.url = url
         }
@@ -138,10 +137,11 @@ export class ElementNotFoundError extends BrowserError {
     override toJSON(): object {
         // 日志去重并限制输出数量，避免重复日志刷屏
         const uniqueLogs = [...new Set(this.logs)]
-        const maxLogs    = 10
-        const logsOutput = uniqueLogs.length > maxLogs
-                           ? [...uniqueLogs.slice(0, maxLogs), `... 共 ${uniqueLogs.length} 条（已省略）`]
-                           : uniqueLogs
+        const maxLogs = 10
+        const logsOutput =
+            uniqueLogs.length > maxLogs
+                ? [...uniqueLogs.slice(0, maxLogs), `... 共 ${uniqueLogs.length} 条（已省略）`]
+                : uniqueLogs
 
         return {
             error: {
@@ -159,7 +159,7 @@ export class ElementNotFoundError extends BrowserError {
  * 导航超时错误
  */
 export class NavigationTimeoutError extends BrowserError {
-    readonly code       = 'NAVIGATION_TIMEOUT'
+    readonly code = 'NAVIGATION_TIMEOUT'
     readonly suggestion = '请检查网络连接，或增加超时时间'
     override readonly context: ErrorContext
 
@@ -170,10 +170,24 @@ export class NavigationTimeoutError extends BrowserError {
 }
 
 /**
+ * 导航网络错误（DNS 解析失败、连接拒绝等）
+ */
+export class NavigationError extends BrowserError {
+    readonly code = 'NAVIGATION_ERROR'
+    readonly suggestion = '请检查 URL 是否正确，以及网络连接是否正常'
+    override readonly context: ErrorContext
+
+    constructor(url: string, errorText: string) {
+        super(`导航失败: ${url} (${errorText})`)
+        this.context = { url, errorText }
+    }
+}
+
+/**
  * 操作超时错误
  */
 export class TimeoutError extends BrowserError {
-    readonly code       = 'TIMEOUT'
+    readonly code = 'TIMEOUT'
     readonly suggestion = '请增加超时时间，或检查操作条件是否能满足'
 
     constructor(message: string) {
@@ -185,7 +199,7 @@ export class TimeoutError extends BrowserError {
  * CDP 协议错误
  */
 export class CDPError extends BrowserError {
-    readonly code       = 'CDP_ERROR'
+    readonly code = 'CDP_ERROR'
     readonly suggestion = '这是一个 CDP 协议错误，请检查操作是否正确'
 
     constructor(message: string) {
@@ -197,9 +211,9 @@ export class CDPError extends BrowserError {
  * ZodError issue 类型
  */
 interface ZodIssue {
-    path: (string | number)[];
-    message: string;
-    code?: string;
+    path: (string | number)[]
+    message: string
+    code?: string
 }
 
 /**
@@ -220,7 +234,7 @@ function isZodError(error: unknown): error is Error & { issues: ZodIssue[] } {
  * 检测错误是否可能由 tab 不在前台导致
  */
 function detectVisibilityHint(errorMessage: string): string | null {
-    const msg      = errorMessage.toLowerCase()
+    const msg = errorMessage.toLowerCase()
     const keywords = [
         'hidden',
         'visible',
@@ -231,8 +245,8 @@ function detectVisibilityHint(errorMessage: string): string | null {
         'not active',
         'capturevisibletab',
     ]
-    if (keywords.some(kw => msg.includes(kw))) {
-        return '此操作可能需要 tab 在前台。请使用 browse(action="attach", targetId="<id>", activate=true) 激活目标 tab'
+    if (keywords.some((kw) => msg.includes(kw))) {
+        return '此操作可能需要 tab 在前台，请使用 browse(action="attach", targetId="<id>", activate=true) 激活目标 tab'
     }
     return null
 }
@@ -243,8 +257,8 @@ function detectVisibilityHint(errorMessage: string): string | null {
  * 自动检测 visibility 相关错误并添加 hint
  */
 export function formatErrorResponse(error: unknown): {
-    content: Array<{ type: 'text'; text: string }>;
-    isError: boolean;
+    content: Array<{ type: 'text'; text: string }>
+    isError: boolean
 } {
     // 处理 ZodError
     if (isZodError(error)) {
@@ -266,7 +280,7 @@ export function formatErrorResponse(error: unknown): {
                             },
                         },
                         null,
-                        2,
+                        2
                     ),
                 },
             ],
@@ -275,7 +289,7 @@ export function formatErrorResponse(error: unknown): {
     }
 
     // 处理 BrowserError（带 toJSON 方法）
-    const err       = error as Error & { toJSON?: () => object }
+    const err = error as Error & { toJSON?: () => object }
     const errorJson = err.toJSON?.() ?? {
         error: {
             code: 'UNKNOWN_ERROR',
@@ -285,9 +299,9 @@ export function formatErrorResponse(error: unknown): {
 
     // 检测 visibility 相关错误，添加 hint
     const errorMessage = err.message ?? String(error)
-    const hint         = detectVisibilityHint(errorMessage)
+    const hint = detectVisibilityHint(errorMessage)
     if (hint) {
-        (errorJson as Record<string, unknown>).hint = hint
+        ;(errorJson as Record<string, unknown>).hint = hint
     }
 
     return {
@@ -305,7 +319,7 @@ export function formatErrorResponse(error: unknown): {
  * 格式化成功响应为 MCP 工具响应
  */
 export function formatResponse(data: unknown): {
-    content: Array<{ type: 'text'; text: string }>;
+    content: Array<{ type: 'text'; text: string }>
 } {
     return {
         content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],

@@ -3,10 +3,11 @@
  *
  * 封装与 mcp-chrome 的 JSON-RPC 通信
  */
+/* eslint-env node */
 
-import {spawn} from 'child_process';
-import {dirname, resolve} from 'path';
-import {fileURLToPath} from 'url';
+import { spawn } from 'child_process';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -17,7 +18,7 @@ export class McpClient {
     constructor() {
         this.process = null;
         this.requestId = 0;
-        this.pending = new Map();  // id -> {resolve, reject}
+        this.pending = new Map(); // id -> {resolve, reject}
         this.buffer = '';
     }
 
@@ -53,7 +54,7 @@ export class McpClient {
         });
 
         // 等待进程启动
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 1000));
     }
 
     /**
@@ -70,7 +71,7 @@ export class McpClient {
         this.notify('notifications/initialized', {});
 
         // 等待 Extension 连接
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise((resolve) => setTimeout(resolve, 2000));
 
         return result;
     }
@@ -91,11 +92,11 @@ export class McpClient {
             this.pending.set(id, { resolve, reject });
 
             const message = JSON.stringify({
-                                               jsonrpc: '2.0',
-                                               id,
-                                               method,
-                                               params,
-                                           });
+                jsonrpc: '2.0',
+                id,
+                method,
+                params,
+            });
 
             this._send(message);
 
@@ -114,10 +115,10 @@ export class McpClient {
      */
     notify(method, params) {
         const message = JSON.stringify({
-                                           jsonrpc: '2.0',
-                                           method,
-                                           params,
-                                       });
+            jsonrpc: '2.0',
+            method,
+            params,
+        });
         this._send(message);
     }
 
@@ -147,20 +148,20 @@ export class McpClient {
             }
 
             const header = this.buffer.slice(0, headerEnd);
-            const match = header.match(/Content-Length:\s*(\d+)/i);
+            const match = header.match(/Content-Length:\s*(?<len>\d+)/i);
             if (!match) {
                 // 无效头，跳过
                 this.buffer = this.buffer.slice(headerEnd + 4);
                 continue;
             }
 
-            const contentLength = parseInt(match[1]);
+            const contentLength = parseInt(match.groups.len);
             const bodyStart = headerEnd + 4;
             const bodyEnd = bodyStart + contentLength;
 
             if (this.buffer.length < bodyEnd) {
                 break;
-            }  // 数据不完整
+            } // 数据不完整
 
             const body = this.buffer.slice(bodyStart, bodyEnd);
             this.buffer = this.buffer.slice(bodyEnd);
@@ -234,14 +235,10 @@ export class TestReporter {
     }
 
     summary() {
-        const elapsed = (
-            (
-                Date.now() - this.startTime
-            ) / 1000
-        ).toFixed(1);
-        const pass = this.results.filter(r => r.status === 'PASS').length;
-        const fail = this.results.filter(r => r.status === 'FAIL').length;
-        const skip = this.results.filter(r => r.status === 'SKIP').length;
+        const elapsed = ((Date.now() - this.startTime) / 1000).toFixed(1);
+        const pass = this.results.filter((r) => r.status === 'PASS').length;
+        const fail = this.results.filter((r) => r.status === 'FAIL').length;
+        const skip = this.results.filter((r) => r.status === 'SKIP').length;
         const total = this.results.length;
 
         console.log('\n' + '='.repeat(50));
@@ -250,7 +247,7 @@ export class TestReporter {
 
         if (fail > 0) {
             console.log('\nFailed tests:');
-            for (const r of this.results.filter(r => r.status === 'FAIL')) {
+            for (const r of this.results.filter((r) => r.status === 'FAIL')) {
                 console.log(`  - ${r.name}: ${r.error}`);
             }
         }

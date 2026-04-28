@@ -8,11 +8,11 @@
  * - idle: 等待网络空闲
  */
 
-import type {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js'
-import {z} from 'zod'
-import {formatErrorResponse, formatResponse, getSession, getUnifiedSession, TimeoutError} from '../core/index.js'
-import {DEFAULT_TIMEOUT, type ElementState, type Target} from '../core/types.js'
-import {targetToFindParams, targetZodSchema} from './schema.js'
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { z } from 'zod'
+import { formatErrorResponse, formatResponse, getSession, getUnifiedSession, TimeoutError } from '../core/index.js'
+import { DEFAULT_TIMEOUT, type ElementState, type Target } from '../core/types.js'
+import { targetToFindParams, targetZodSchema } from './schema.js'
 
 /** 轮询间隔（毫秒） */
 const POLL_INTERVAL = 100
@@ -21,36 +21,39 @@ const POLL_INTERVAL = 100
  * wait 参数 schema
  */
 const waitSchema = z.object({
-                                for: z.enum(['element', 'navigation', 'time', 'idle']).describe('等待类型'),
-                                target: targetZodSchema.optional().describe(
-                                    '目标元素（for=element 时必填；navigation/time/idle 不需要）'),
-                                state: z.enum(['visible', 'hidden', 'attached', 'detached']).optional().describe(
-                                    '元素状态（element）'),
-                                ms: z.number()
-                                     .optional()
-                                     .describe('毫秒（time：等待时长；idle：DOM mutation 静默期，默认 500ms）'),
-                                tabId: z.string().optional().describe(
-                                    '目标 Tab ID（可选，仅 Extension 模式）。不指定则使用当前 attach 的 tab。可操作非当前 attach 的 tab。CDP 模式下不支持此参数'),
-                                timeout: z.number().optional().describe('超时'),
-                                frame: z.union([z.string(), z.number()]).optional().describe(
-                                    'iframe 定位（可选，仅 Extension 模式）。CSS 选择器（如 "iframe#main"）或索引（如 0）。不指定则在主框架操作'),
-                            })
+    for: z.enum(['element', 'navigation', 'time', 'idle']).describe('等待类型'),
+    target: targetZodSchema.optional().describe('目标元素（for=element 时必填；navigation/time/idle 不需要）'),
+    state: z.enum(['visible', 'hidden', 'attached', 'detached']).optional().describe('元素状态（element）'),
+    ms: z.number().optional().describe('毫秒（time：等待时长；idle：DOM mutation 静默期，默认 500ms）'),
+    tabId: z
+        .string()
+        .optional()
+        .describe(
+            '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
+        ),
+    timeout: z.number().optional().describe('超时'),
+    frame: z
+        .union([z.string(), z.number()])
+        .optional()
+        .describe(
+            'iframe 定位（可选，仅 Extension 模式），CSS 选择器（如 "iframe#main"）或索引（如 0），不指定则在主框架操作'
+        ),
+})
 
 /**
  * wait 工具处理器
  */
 async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
-    content: Array<{ type: 'text'; text: string }>;
-    isError?: boolean;
+    content: Array<{ type: 'text'; text: string }>
+    isError?: boolean
 }> {
     try {
         const unifiedSession = getUnifiedSession()
-        const mode           = unifiedSession.getMode()
-        const timeout        = args.timeout ?? DEFAULT_TIMEOUT
+        const mode = unifiedSession.getMode()
+        const timeout = args.timeout ?? DEFAULT_TIMEOUT
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
-
                 switch (args.for) {
                     case 'element': {
                         if (!args.target) {
@@ -59,11 +62,11 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                     {
                                         type: 'text',
                                         text: JSON.stringify({
-                                                                 error: {
-                                                                     code: 'INVALID_ARGUMENT',
-                                                                     message: '等待元素需要 target 参数',
-                                                                 },
-                                                             }),
+                                            error: {
+                                                code: 'INVALID_ARGUMENT',
+                                                message: '等待元素需要 target 参数',
+                                            },
+                                        }),
                                     },
                                 ],
                                 isError: true,
@@ -79,36 +82,36 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                         }
 
                         return formatResponse({
-                                                  success: true,
-                                                  waited: 'element',
-                                                  state,
-                                                  mode,
-                                              })
+                            success: true,
+                            waited: 'element',
+                            state,
+                            mode,
+                        })
                     }
 
                     case 'navigation': {
                         if (mode === 'extension') {
                             // Extension 模式：轮询 document.readyState 等待页面加载完成
-                            const navStart                 = Date.now()
-                            let navCompleted               = false
+                            const navStart = Date.now()
+                            let navCompleted = false
                             let navLastError: Error | null = null
                             while (Date.now() - navStart < timeout) {
                                 if (!unifiedSession.isExtensionConnected()) {
                                     navLastError = new Error('Extension 未连接')
-                                    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
+                                    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                                     continue
                                 }
                                 try {
-                                    const remaining  = timeout - (Date.now() - navStart)
+                                    const remaining = timeout - (Date.now() - navStart)
                                     const readyState = await unifiedSession.evaluate<string>(
                                         'document.readyState',
                                         undefined,
-                                        remaining,
+                                        remaining
                                     )
                                     // evaluate 带 timeout 时，Extension 断连会静默回退 CDP，返回错误 tab 的数据
                                     if (!unifiedSession.isExtensionConnected()) {
                                         navLastError = new Error('Extension 在 evaluate 期间断开')
-                                        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
+                                        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                                         continue
                                     }
                                     if (readyState === 'complete') {
@@ -119,24 +122,26 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                     // 页面正在导航中，evaluate 可能失败
                                     navLastError = err instanceof Error ? err : new Error(String(err))
                                 }
-                                await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
+                                await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                             }
                             if (!navCompleted) {
                                 const msg = `等待导航完成超时 (${timeout}ms)`
                                 throw new TimeoutError(navLastError ? `${msg}: ${navLastError.message}` : msg)
                             }
                             // 从实际 tab 中查询 URL/title，而非依赖全局缓存状态（支持 tabId 参数）
-                            const navRemaining          = timeout - (Date.now() - navStart)
-                            let navUrl: string | null   = null
+                            const navRemaining = timeout - (Date.now() - navStart)
+                            let navUrl: string | null = null
                             let navTitle: string | null = null
                             if (navRemaining > 0) {
                                 try {
                                     const pageInfo = await unifiedSession.evaluate<{ url: string; title: string }>(
-                                        '({url: location.href, title: document.title})', undefined, navRemaining,
+                                        '({url: location.href, title: document.title})',
+                                        undefined,
+                                        navRemaining
                                     )
                                     // CDP 回退的数据来自错误 tab，丢弃
                                     if (unifiedSession.isExtensionConnected()) {
-                                        navUrl   = pageInfo.url
+                                        navUrl = pageInfo.url
                                         navTitle = pageInfo.title
                                     }
                                 } catch {
@@ -144,12 +149,12 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 }
                             }
                             return formatResponse({
-                                                      success: true,
-                                                      waited: 'navigation',
-                                                      url: navUrl,
-                                                      title: navTitle,
-                                                      mode,
-                                                  })
+                                success: true,
+                                waited: 'navigation',
+                                url: navUrl,
+                                title: navTitle,
+                                mode,
+                            })
                         }
 
                         // CDP 模式
@@ -157,12 +162,12 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                         await waitForNavigation(session, timeout)
                         const sessionState = session.getState()
                         return formatResponse({
-                                                  success: true,
-                                                  waited: 'navigation',
-                                                  url: sessionState?.url,
-                                                  title: sessionState?.title,
-                                                  mode,
-                                              })
+                            success: true,
+                            waited: 'navigation',
+                            url: sessionState?.url,
+                            title: sessionState?.title,
+                            mode,
+                        })
                     }
 
                     case 'time': {
@@ -172,11 +177,11 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                     {
                                         type: 'text',
                                         text: JSON.stringify({
-                                                                 error: {
-                                                                     code: 'INVALID_ARGUMENT',
-                                                                     message: '等待时间需要 ms 参数',
-                                                                 },
-                                                             }),
+                                            error: {
+                                                code: 'INVALID_ARGUMENT',
+                                                message: '等待时间需要 ms 参数',
+                                            },
+                                        }),
                                     },
                                 ],
                                 isError: true,
@@ -184,37 +189,37 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                         }
                         await new Promise((resolve) => setTimeout(resolve, args.ms))
                         return formatResponse({
-                                                  success: true,
-                                                  waited: 'time',
-                                                  ms: args.ms,
-                                              })
+                            success: true,
+                            waited: 'time',
+                            ms: args.ms,
+                        })
                     }
 
                     case 'idle': {
                         if (mode === 'extension') {
                             // Extension 模式：readyState complete + DOM mutation 静默检测
-                            const idleStart                 = Date.now()
-                            const quietPeriod               = args.ms ?? 500
-                            let idleCompleted               = false
+                            const idleStart = Date.now()
+                            const quietPeriod = args.ms ?? 500
+                            let idleCompleted = false
                             let idleLastError: Error | null = null
 
                             // Phase 1: 等待 readyState === 'complete'
                             while (Date.now() - idleStart < timeout) {
                                 if (!unifiedSession.isExtensionConnected()) {
                                     idleLastError = new Error('Extension 未连接')
-                                    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
+                                    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                                     continue
                                 }
                                 try {
-                                    const remaining  = timeout - (Date.now() - idleStart)
+                                    const remaining = timeout - (Date.now() - idleStart)
                                     const readyState = await unifiedSession.evaluate<string>(
                                         'document.readyState',
                                         undefined,
-                                        remaining,
+                                        remaining
                                     )
                                     if (!unifiedSession.isExtensionConnected()) {
                                         idleLastError = new Error('Extension 在 evaluate 期间断开')
-                                        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
+                                        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                                         continue
                                     }
                                     if (readyState === 'complete') {
@@ -224,7 +229,7 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 } catch (err) {
                                     idleLastError = err instanceof Error ? err : new Error(String(err))
                                 }
-                                await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))
+                                await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                             }
                             if (!idleCompleted) {
                                 const msg = `等待页面加载超时 (${timeout}ms)`
@@ -266,41 +271,41 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                         })`,
                                         undefined,
                                         mutationRemaining,
-                                        [quietPeriod, mutationRemaining],
+                                        [quietPeriod, mutationRemaining]
                                     )
                                     return formatResponse({
-                                                              success: true,
-                                                              waited: 'idle',
-                                                              domStable,
-                                                              mode,
-                                                          })
+                                        success: true,
+                                        waited: 'idle',
+                                        domStable,
+                                        mode,
+                                    })
                                 } catch {
                                     // evaluate 超时或断连——降级返回 domStable: false（readyState 已 complete）
                                     return formatResponse({
-                                                              success: true,
-                                                              waited: 'idle',
-                                                              domStable: false,
-                                                              mode,
-                                                          })
+                                        success: true,
+                                        waited: 'idle',
+                                        domStable: false,
+                                        mode,
+                                    })
                                 }
                             }
 
                             return formatResponse({
-                                                      success: true,
-                                                      waited: 'idle',
-                                                      domStable: false,
-                                                      mode,
-                                                  })
+                                success: true,
+                                waited: 'idle',
+                                domStable: false,
+                                mode,
+                            })
                         }
 
                         // CDP 模式
                         const session = getSession()
                         await waitForNetworkIdle(session, timeout)
                         return formatResponse({
-                                                  success: true,
-                                                  waited: 'idle',
-                                                  mode,
-                                              })
+                            success: true,
+                            waited: 'idle',
+                            mode,
+                        })
                     }
 
                     default:
@@ -309,17 +314,16 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 {
                                     type: 'text',
                                     text: JSON.stringify({
-                                                             error: {
-                                                                 code: 'INVALID_ARGUMENT',
-                                                                 message: `未知等待类型: ${args.for}`,
-                                                             },
-                                                         }),
+                                        error: {
+                                            code: 'INVALID_ARGUMENT',
+                                            message: `未知等待类型: ${args.for}`,
+                                        },
+                                    }),
                                 },
                             ],
                             isError: true,
                         }
                 }
-
             }) // withFrame
         }) // withTabId
     } catch (error) {
@@ -334,13 +338,13 @@ async function waitForElementExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
     state: ElementState,
-    timeout: number,
+    timeout: number
 ): Promise<void> {
-    const startTime                                = Date.now()
-    const retryDelay                               = POLL_INTERVAL
+    const startTime = Date.now()
+    const retryDelay = POLL_INTERVAL
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
-    const nth                                      = nthParam ?? 0
-    let lastError: Error | null                    = null
+    const nth = nthParam ?? 0
+    let lastError: Error | null = null
 
     while (true) {
         const elapsed = Date.now() - startTime
@@ -352,14 +356,14 @@ async function waitForElementExtension(
         // 未连接时跳过 find()，避免阻塞超出用户 timeout
         if (!unifiedSession.isExtensionConnected()) {
             lastError = new Error('Extension 未连接')
-            await new Promise(resolve => setTimeout(resolve, retryDelay))
+            await new Promise((resolve) => setTimeout(resolve, retryDelay))
             continue
         }
 
         try {
             const remaining = timeout - elapsed
-            const elements  = await unifiedSession.find(selector, text, xpath, remaining)
-            const found     = elements.length > nth
+            const elements = await unifiedSession.find(selector, text, xpath, remaining)
+            const found = elements.length > nth
 
             switch (state) {
                 case 'attached':
@@ -392,19 +396,20 @@ async function waitForElementExtension(
                 }
             }
         } catch (err) {
-            // find() 在元素不存在时返回空数组（不抛异常），此处异常是真正的错误。
+            // find() 在元素不存在时返回空数组（不抛异常），此处异常是真正的错误
             // 暂时性错误（RPC 超时、发送失败、连接断开）可重试，其他确定性错误立即抛出
-            if (err instanceof
-                Error &&
-                /Request timeout|Failed to send|disconnect|未连接|stopped|replaced/i.test(err.message)) {
+            if (
+                err instanceof Error &&
+                /Request timeout|Failed to send|disconnect|未连接|stopped|replaced/i.test(err.message)
+            ) {
                 lastError = err
-                await new Promise(resolve => setTimeout(resolve, retryDelay))
+                await new Promise((resolve) => setTimeout(resolve, retryDelay))
                 continue
             }
             throw err
         }
 
-        await new Promise(resolve => setTimeout(resolve, retryDelay))
+        await new Promise((resolve) => setTimeout(resolve, retryDelay))
     }
 }
 
@@ -415,15 +420,15 @@ async function waitForElement(
     session: ReturnType<typeof getSession>,
     target: Target,
     state: ElementState,
-    timeout: number,
+    timeout: number
 ): Promise<void> {
-    const startTime  = Date.now()
+    const startTime = Date.now()
     const retryDelay = POLL_INTERVAL
 
     while (Date.now() - startTime < timeout) {
         try {
             const remaining = timeout - (Date.now() - startTime)
-            const locator   = session.createLocator(target, { timeout: remaining })
+            const locator = session.createLocator(target, { timeout: remaining })
 
             switch (state) {
                 case 'attached':
@@ -473,28 +478,20 @@ async function waitForElement(
         await new Promise((resolve) => setTimeout(resolve, retryDelay))
     }
 
-    throw new TimeoutError(
-        `等待元素 ${JSON.stringify(target)} 状态 ${state} 超时 (${timeout}ms)`,
-    )
+    throw new TimeoutError(`等待元素 ${JSON.stringify(target)} 状态 ${state} 超时 (${timeout}ms)`)
 }
 
 /**
  * 等待导航完成（复用 session 的事件驱动实现）
  */
-async function waitForNavigation(
-    session: ReturnType<typeof getSession>,
-    timeout: number,
-): Promise<void> {
+async function waitForNavigation(session: ReturnType<typeof getSession>, timeout: number): Promise<void> {
     await session.waitForNavigation(timeout)
 }
 
 /**
  * 等待网络空闲（复用 session 的事件驱动实现）
  */
-async function waitForNetworkIdle(
-    session: ReturnType<typeof getSession>,
-    timeout: number,
-): Promise<void> {
+async function waitForNetworkIdle(session: ReturnType<typeof getSession>, timeout: number): Promise<void> {
     await session.waitForNetworkIdle(timeout)
 }
 
@@ -502,8 +499,12 @@ async function waitForNetworkIdle(
  * 注册 wait 工具
  */
 export function registerWaitTool(server: McpServer): void {
-    server.registerTool('wait', {
-        description: '等待条件：元素、导航、时间',
-        inputSchema: waitSchema,
-    }, (args) => handleWait(args))
+    server.registerTool(
+        'wait',
+        {
+            description: '等待条件：元素、导航、时间',
+            inputSchema: waitSchema,
+        },
+        (args) => handleWait(args)
+    )
 }

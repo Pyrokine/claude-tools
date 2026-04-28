@@ -13,9 +13,9 @@
  * - 以对象取代基本类型：Target 对象而非字符串
  */
 
-import type {CDPClient} from '../cdp/client.js'
-import {ElementNotFoundError} from './errors.js'
-import {withRetry} from './retry.js'
+import type { CDPClient } from '../cdp/client.js'
+import { ElementNotFoundError } from './errors.js'
+import { withRetry } from './retry.js'
 import {
     type Box,
     DEFAULT_TIMEOUT,
@@ -33,61 +33,28 @@ import {
     type Point,
     type Target,
 } from './types.js'
+import { escapeXPathString } from './utils.js'
 
 /**
  * CDP DOM 节点 ID
  */
-type NodeId = number;
+type NodeId = number
 
 /**
  * CDP Remote Object ID
  */
-type RemoteObjectId = string;
+type RemoteObjectId = string
 
 /**
  * Locator 选项
  */
 export interface LocatorOptions {
     /** 超时时间（毫秒），默认 30000 */
-    timeout?: number;
+    timeout?: number
     /** 第 N 个匹配元素（从 0 开始，默认 0 即第一个） */
-    nth?: number;
+    nth?: number
     /** 获取当前 URL 的回调（用于错误上下文） */
-    getUrl?: () => string | undefined;
-}
-
-/**
- * 转义 XPath 字符串中的引号
- * XPath 1.0 没有转义机制，需要用 concat() 拼接单双引号
- *
- * 例如: "It's a \"test\"" => concat('It', "'", 's a "test"')
- */
-function escapeXPathString(str: string): string {
-    if (!str.includes('\'')) {
-        return `'${str}'`
-    }
-    if (!str.includes('"')) {
-        return `"${str}"`
-    }
-    // 同时包含单双引号，使用 concat() 拼接
-    // 策略：遇到单引号用双引号包裹，其他部分用单引号包裹
-    const parts: string[] = []
-    let current           = ''
-    for (const char of str) {
-        if (char === '\'') {
-            if (current) {
-                parts.push(`'${current}'`)
-                current = ''
-            }
-            parts.push(`"'"`)
-        } else {
-            current += char
-        }
-    }
-    if (current) {
-        parts.push(`'${current}'`)
-    }
-    return `concat(${parts.join(', ')})`
+    getUrl?: () => string | undefined
 }
 
 /**
@@ -96,7 +63,7 @@ function escapeXPathString(str: string): string {
 function escapeJSString(str: string): string {
     return str
         .replace(/\\/g, '\\\\')
-        .replace(/'/g, '\\\'')
+        .replace(/'/g, "\\'")
         .replace(/"/g, '\\"')
         .replace(/\n/g, '\\n')
         .replace(/\r/g, '\\r')
@@ -125,12 +92,12 @@ export class Locator {
         private cdp: CDPClient,
         private target: Target,
         private sessionId?: string,
-        options: LocatorOptions = {},
+        options: LocatorOptions = {}
     ) {
-        this.timeout  = options.timeout ?? DEFAULT_TIMEOUT
+        this.timeout = options.timeout ?? DEFAULT_TIMEOUT
         this.deadline = Date.now() + this.timeout
-        this.nth      = options.nth ?? 0
-        this.getUrl   = options.getUrl
+        this.nth = options.nth ?? 0
+        this.getUrl = options.getUrl
     }
 
     /**
@@ -157,7 +124,7 @@ export class Locator {
         }
 
         const nodeId = await this.find()
-        const box    = await this.getBoxModel(nodeId)
+        const box = await this.getBoxModel(nodeId)
 
         return {
             x: box.x + box.width / 2,
@@ -201,8 +168,8 @@ export class Locator {
             functionDeclaration: fn,
             returnByValue: true,
         })) as {
-            result: { value: T };
-            exceptionDetails?: { text: string };
+            result: { value: T }
+            exceptionDetails?: { text: string }
         }
 
         if (exceptionDetails) {
@@ -261,33 +228,31 @@ export class Locator {
         // 启用可访问性
         await this.send('Accessibility.enable')
 
-        // 获取整个可访问性树
-        const { nodes } = (await this.send('Accessibility.getFullAXTree')) as {
+        // queryAXTree 比 getFullAXTree 更高效：仅返回匹配 role/name 的节点
+        const queryParams: Record<string, unknown> = { role }
+        if (name !== undefined) {
+            queryParams.accessibleName = name
+        }
+        const { nodes } = (await this.send('Accessibility.queryAXTree', queryParams)) as {
             nodes: Array<{
-                nodeId: string;
-                role: { value: string };
-                name?: { value: string };
-                backendDOMNodeId?: number;
-            }>;
+                nodeId: string
+                role: { value: string }
+                name?: { value: string }
+                backendDOMNodeId?: number
+            }>
         }
 
-        // 查找匹配的节点，跳过前 nth 个
+        // 对所有匹配节点计数（含无 backendDOMNodeId 的节点），确保 nth 语义正确
         let matchCount = 0
         for (const node of nodes) {
-            if (node.role?.value?.toLowerCase() !== role.toLowerCase()) {
-                continue
-            }
-            if (name !== undefined && node.name?.value !== name) {
+            if (matchCount < this.nth) {
+                ++matchCount
                 continue
             }
             if (node.backendDOMNodeId) {
-                if (matchCount < this.nth) {
-                    ++matchCount
-                    continue
-                }
-                this.log(`找到元素: backendDOMNodeId=${node.backendDOMNodeId}${this.nth > 0 ?
-                                                                               `（第 ${this.nth} 个）` :
-                                                                               ''}`)
+                this.log(
+                    `找到元素: backendDOMNodeId=${node.backendDOMNodeId}${this.nth > 0 ? `（第 ${this.nth} 个）` : ''}`
+                )
                 // 将 backendDOMNodeId 转换为 nodeId
                 const { nodeIds } = (await this.send('DOM.pushNodesByBackendIdsToFrontend', {
                     backendNodeIds: [node.backendDOMNodeId],
@@ -306,17 +271,15 @@ export class Locator {
      */
     private async findByText(): Promise<NodeId> {
         const { text, exact = false } = this.target as {
-            text: string;
-            exact?: boolean;
+            text: string
+            exact?: boolean
         }
         this.log(`使用文本内容定位: text=${text}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
 
         // 使用 XPath 查找包含文本的元素（正确转义引号）
         // 用 . 而非 text()：text() 只匹配直接子文本节点，. 匹配完整 textContent
         const escapedText = escapeXPathString(text)
-        const xpath       = exact
-                            ? `//*[normalize-space(.)=${escapedText}]`
-                            : `//*[contains(.,${escapedText})]`
+        const xpath = exact ? `//*[normalize-space(.)=${escapedText}]` : `//*[contains(.,${escapedText})]`
 
         return this.findByXPathInternal(xpath)
     }
@@ -326,8 +289,8 @@ export class Locator {
      */
     private async findByLabel(): Promise<NodeId> {
         const { label, exact = false } = this.target as {
-            label: string;
-            exact?: boolean;
+            label: string
+            exact?: boolean
         }
         this.log(`使用 label 定位: label=${label}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
 
@@ -399,17 +362,17 @@ export class Locator {
      */
     private async findByPlaceholder(): Promise<NodeId> {
         const { placeholder, exact = false } = this.target as {
-            placeholder: string;
-            exact?: boolean;
+            placeholder: string
+            exact?: boolean
         }
-        this.log(`使用 placeholder 定位: placeholder=${placeholder}, exact=${exact}${this.nth > 0 ?
-                                                                                     `, nth=${this.nth}` :
-                                                                                     ''}`)
+        this.log(
+            `使用 placeholder 定位: placeholder=${placeholder}, exact=${exact}${
+                this.nth > 0 ? `, nth=${this.nth}` : ''
+            }`
+        )
 
         const escaped = escapeCSSAttributeValue(placeholder)
-        const css     = exact
-                        ? `[placeholder="${escaped}"]`
-                        : `[placeholder*="${escaped}"]`
+        const css = exact ? `[placeholder="${escaped}"]` : `[placeholder*="${escaped}"]`
 
         return this.findByCSSInternal(css)
     }
@@ -419,13 +382,13 @@ export class Locator {
      */
     private async findByTitle(): Promise<NodeId> {
         const { title, exact = false } = this.target as {
-            title: string;
-            exact?: boolean;
+            title: string
+            exact?: boolean
         }
         this.log(`使用 title 属性定位: title=${title}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
 
         const escaped = escapeCSSAttributeValue(title)
-        const css     = exact ? `[title="${escaped}"]` : `[title*="${escaped}"]`
+        const css = exact ? `[title="${escaped}"]` : `[title*="${escaped}"]`
 
         return this.findByCSSInternal(css)
     }
@@ -435,13 +398,13 @@ export class Locator {
      */
     private async findByAlt(): Promise<NodeId> {
         const { alt, exact = false } = this.target as {
-            alt: string;
-            exact?: boolean;
+            alt: string
+            exact?: boolean
         }
         this.log(`使用 alt 属性定位: alt=${alt}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
 
         const escaped = escapeCSSAttributeValue(alt)
-        const css     = exact ? `[alt="${escaped}"]` : `[alt*="${escaped}"]`
+        const css = exact ? `[alt="${escaped}"]` : `[alt*="${escaped}"]`
 
         return this.findByCSSInternal(css)
     }
@@ -472,11 +435,11 @@ export class Locator {
      */
     private async findByCSSAndText(): Promise<NodeId> {
         const { css, text, exact = false } = this.target as { css: string; text: string; exact?: boolean }
-        this.log(`使用 CSS+text 组合定位: css=${css}, text=${text}, exact=${exact}${this.nth > 0 ?
-                                                                                    `, nth=${this.nth}` :
-                                                                                    ''}`)
+        this.log(
+            `使用 CSS+text 组合定位: css=${css}, text=${text}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`
+        )
 
-        const escapedCSS  = escapeJSString(css)
+        const escapedCSS = escapeJSString(css)
         const escapedText = escapeJSString(text)
 
         const { result } = (await this.send('Runtime.evaluate', {
@@ -523,7 +486,7 @@ export class Locator {
     private async findByCSSInternal(css: string): Promise<NodeId> {
         // 确保 DOM 已启用
         const { root } = (await this.send('DOM.getDocument')) as {
-            root: { nodeId: number };
+            root: { nodeId: number }
         }
 
         if (this.nth > 0) {
@@ -564,8 +527,12 @@ export class Locator {
 
         if (this.nth > 0) {
             // nth > 0：用 ORDERED_NODE_SNAPSHOT_TYPE 取第 nth 个
+            const nthExpr =
+                `(function() { var r = document.evaluate('${escapedXPath}', document, null, ` +
+                `XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); ` +
+                `return r.snapshotLength > ${this.nth} ? r.snapshotItem(${this.nth}) : null })()`
             const { result } = (await this.send('Runtime.evaluate', {
-                expression: `(function() { var r = document.evaluate('${escapedXPath}', document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); return r.snapshotLength > ${this.nth} ? r.snapshotItem(${this.nth}) : null })()`,
+                expression: nthExpr,
                 returnByValue: false,
             })) as { result: { objectId?: string; subtype?: string } }
 
@@ -578,8 +545,11 @@ export class Locator {
         }
 
         // 使用 Runtime.evaluate 执行 XPath
+        const xpathExpr =
+            `document.evaluate('${escapedXPath}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)` +
+            `.singleNodeValue`
         const { result } = (await this.send('Runtime.evaluate', {
-            expression: `document.evaluate('${escapedXPath}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`,
+            expression: xpathExpr,
             returnByValue: false,
         })) as { result: { objectId?: string } }
 
@@ -615,7 +585,7 @@ export class Locator {
      */
     private async getBoxModel(nodeId: NodeId): Promise<Box> {
         const { model } = (await this.send('DOM.getBoxModel', { nodeId })) as {
-            model: { content: number[] };
+            model: { content: number[] }
         }
 
         // content 是 [x1,y1, x2,y2, x3,y3, x4,y4] 格式的四个角坐标
@@ -632,8 +602,8 @@ export class Locator {
     /**
      * 发送 CDP 命令
      *
-     * 使用 deadline 剩余时间而非静态 timeout，确保单个 CDP 命令不会超出整体预算。
-     * withRetry() 在重试间隙检查 deadline，此处保证单命令在当前 tick 内也受预算约束。
+     * 使用 deadline 剩余时间而非静态 timeout，确保单个 CDP 命令不会超出整体预算，
+     * withRetry() 在重试间隙检查 deadline，此处保证单命令在当前 tick 内也受预算约束
      */
     private send<T>(method: string, params?: object): Promise<T> {
         return this.cdp.send(method, params, this.sessionId, this.remaining())
@@ -653,4 +623,3 @@ export class Locator {
         this.logs.push(message)
     }
 }
-

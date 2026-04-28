@@ -9,8 +9,9 @@
  *
  * 测试站点：demoqa.com
  */
+/* eslint-env node */
 
-import {McpClient, parseToolResult, TestReporter} from './helpers.js';
+import { McpClient, parseToolResult, TestReporter } from './helpers.js';
 
 const TEST_URL = 'https://demoqa.com/text-box';
 const reporter = new TestReporter();
@@ -49,10 +50,9 @@ async function run() {
 
     // 1.2 open (creates a new tab and navigates)
     try {
-        const result = parseToolResult(await client.callTool(
-            'browse',
-            { action: 'open', url: TEST_URL, wait: 'load' },
-        ));
+        const result = parseToolResult(
+            await client.callTool('browse', { action: 'open', url: TEST_URL, wait: 'load' })
+        );
         if (result?.success) {
             reporter.pass('browse open');
         } else {
@@ -65,12 +65,13 @@ async function run() {
     // 找到刚打开的 tab
     try {
         const listResult = parseToolResult(await client.callTool('browse', { action: 'list' }));
-        const demoTab = listResult?.targets?.find(t => t.url?.includes('demoqa.com'));
+        const demoTab = listResult?.targets?.find((t) => t.url?.includes('demoqa.com'));
         if (demoTab) {
             testTabId = demoTab.targetId;
             console.log(`  [info] Test tab: ${testTabId}`);
         }
-    } catch { /* ignore */
+    } catch {
+        /* ignore */
     }
 
     // 1.3 attach（后台模式）
@@ -89,7 +90,8 @@ async function run() {
         // 1.4 attach（前台）
         try {
             const result = parseToolResult(
-                await client.callTool('browse', { action: 'attach', targetId: testTabId, activate: true }));
+                await client.callTool('browse', { action: 'attach', targetId: testTabId, activate: true })
+            );
             if (result?.success && result.activated === true) {
                 reporter.pass('browse attach (activate)');
             } else {
@@ -160,14 +162,16 @@ async function run() {
     // 3.1 type（在 #userName 输入框输入）
     try {
         // 先找到输入框并点击
-        const result = parseToolResult(await client.callTool('input', {
-            events: [
-                { type: 'mousemove', target: { css: '#userName' } },
-                { type: 'mousedown', button: 'left' },
-                { type: 'mouseup', button: 'left' },
-                { type: 'type', text: 'Test User' },
-            ],
-        }));
+        const result = parseToolResult(
+            await client.callTool('input', {
+                events: [
+                    { type: 'mousemove', target: { css: '#userName' } },
+                    { type: 'mousedown', button: 'left' },
+                    { type: 'mouseup', button: 'left' },
+                    { type: 'type', text: 'Test User' },
+                ],
+            })
+        );
         if (result?.success) {
             reporter.pass('input type');
         } else {
@@ -179,9 +183,11 @@ async function run() {
 
     // 3.2 wheel（滚动页面）
     try {
-        const result = parseToolResult(await client.callTool('input', {
-            events: [{ type: 'wheel', deltaY: 300 }],
-        }));
+        const result = parseToolResult(
+            await client.callTool('input', {
+                events: [{ type: 'wheel', deltaY: 300 }],
+            })
+        );
         if (result?.success) {
             reporter.pass('input wheel');
         } else {
@@ -193,12 +199,14 @@ async function run() {
 
     // 3.3 keydown/keyup
     try {
-        const result = parseToolResult(await client.callTool('input', {
-            events: [
-                { type: 'keydown', key: 'Tab' },
-                { type: 'keyup', key: 'Tab' },
-            ],
-        }));
+        const result = parseToolResult(
+            await client.callTool('input', {
+                events: [
+                    { type: 'keydown', key: 'Tab' },
+                    { type: 'keyup', key: 'Tab' },
+                ],
+            })
+        );
         if (result?.success) {
             reporter.pass('input keydown/keyup');
         } else {
@@ -210,9 +218,11 @@ async function run() {
 
     // 3.4 select（选中页面文本）
     try {
-        const result = parseToolResult(await client.callTool('input', {
-            events: [{ type: 'select', find: 'Full Name' }],
-        }));
+        const result = parseToolResult(
+            await client.callTool('input', {
+                events: [{ type: 'select', find: 'Full Name' }],
+            })
+        );
         if (result?.success) {
             reporter.pass('input select');
         } else {
@@ -232,9 +242,11 @@ async function run() {
             ],
         });
         // 查找并替换
-        const result = parseToolResult(await client.callTool('input', {
-            events: [{ type: 'replace', find: 'World', text: 'MCP', target: { css: '#userName' } }],
-        }));
+        const result = parseToolResult(
+            await client.callTool('input', {
+                events: [{ type: 'replace', find: 'World', text: 'MCP', target: { css: '#userName' } }],
+            })
+        );
         if (result?.success) {
             reporter.pass('input replace');
         } else {
@@ -250,10 +262,12 @@ async function run() {
 
     // 4.1 precise 模式
     try {
-        const result = parseToolResult(await client.callTool('evaluate', {
-            script: 'document.title',
-            mode: 'precise',
-        }));
+        const result = parseToolResult(
+            await client.callTool('evaluate', {
+                script: 'document.title',
+                mode: 'precise',
+            })
+        );
         if (result?.success && result.result) {
             reporter.pass('evaluate precise');
         } else {
@@ -265,10 +279,12 @@ async function run() {
 
     // 4.2 stealth 模式（demoqa 不太可能有 CSP）
     try {
-        const result = parseToolResult(await client.callTool('evaluate', {
-            script: '1 + 1',
-            mode: 'stealth',
-        }));
+        const result = parseToolResult(
+            await client.callTool('evaluate', {
+                script: '1 + 1',
+                mode: 'stealth',
+            })
+        );
         if (result?.success) {
             reporter.pass('evaluate stealth');
         } else {
@@ -335,10 +351,12 @@ async function run() {
 
     // 7.1 get
     try {
-        const result = parseToolResult(await client.callTool('cookies', {
-            action: 'get',
-            url: 'https://demoqa.com',
-        }));
+        const result = parseToolResult(
+            await client.callTool('cookies', {
+                action: 'get',
+                url: 'https://demoqa.com',
+            })
+        );
         if (result?.success) {
             reporter.pass('cookies get');
         } else {
@@ -350,12 +368,14 @@ async function run() {
 
     // 7.2 set
     try {
-        const result = parseToolResult(await client.callTool('cookies', {
-            action: 'set',
-            name: 'mcp_test',
-            value: 'test_value',
-            url: 'https://demoqa.com',
-        }));
+        const result = parseToolResult(
+            await client.callTool('cookies', {
+                action: 'set',
+                name: 'mcp_test',
+                value: 'test_value',
+                url: 'https://demoqa.com',
+            })
+        );
         if (result?.success) {
             reporter.pass('cookies set');
         } else {
@@ -367,11 +387,13 @@ async function run() {
 
     // 7.3 delete
     try {
-        const result = parseToolResult(await client.callTool('cookies', {
-            action: 'delete',
-            name: 'mcp_test',
-            url: 'https://demoqa.com',
-        }));
+        const result = parseToolResult(
+            await client.callTool('cookies', {
+                action: 'delete',
+                name: 'mcp_test',
+                url: 'https://demoqa.com',
+            })
+        );
         if (result?.success) {
             reporter.pass('cookies delete');
         } else {
@@ -415,11 +437,13 @@ async function run() {
 
     // 9.1 打开第二个 tab
     try {
-        const result = parseToolResult(await client.callTool('browse', {
-            action: 'open',
-            url: 'https://demoqa.com/buttons',
-            wait: 'load',
-        }));
+        const result = parseToolResult(
+            await client.callTool('browse', {
+                action: 'open',
+                url: 'https://demoqa.com/buttons',
+                wait: 'load',
+            })
+        );
         if (result?.success) {
             reporter.pass('multi-tab: open second tab');
         } else {
@@ -428,7 +452,7 @@ async function run() {
 
         // 获取第二个 tab ID
         const listResult = parseToolResult(await client.callTool('browse', { action: 'list' }));
-        const buttonsTab = listResult?.targets?.find(t => t.url?.includes('buttons'));
+        const buttonsTab = listResult?.targets?.find((t) => t.url?.includes('buttons'));
         if (buttonsTab) {
             testTabId2 = buttonsTab.targetId;
             console.log(`  [info] Second tab: ${testTabId2}`);
@@ -455,7 +479,8 @@ async function run() {
                 reporter.fail(
                     'multi-tab: extract text from different tabs',
                     `Tab1 has "Text Box": ${content1.includes('Text Box')}, Tab2 has "Button": ${content2.includes(
-                        'Button')}`,
+                        'Button'
+                    )}`
                 );
             }
         } catch (e) {
@@ -468,7 +493,7 @@ async function run() {
     // 9.3 检查 managed 字段
     try {
         const listResult = parseToolResult(await client.callTool('browse', { action: 'list' }));
-        const managedTabs = listResult?.targets?.filter(t => t.managed === true);
+        const managedTabs = listResult?.targets?.filter((t) => t.managed === true);
         if (managedTabs?.length > 0) {
             reporter.pass(`multi-tab: managed field (${managedTabs.length} managed tabs)`);
         } else {

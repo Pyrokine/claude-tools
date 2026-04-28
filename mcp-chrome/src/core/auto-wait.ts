@@ -6,19 +6,19 @@
  * - waitForStableBoundingBox: 等待位置稳定
  * - ensureInViewport: 确保元素在视口内
  *
- * 核心思想：操作前自动检查元素状态，失败则重试，而非立即报错。
+ * 核心思想：操作前自动检查元素状态，失败则重试，而非立即报错
  */
 
-import type {CDPClient} from '../cdp/client.js'
-import {withRetry} from './retry.js'
-import {DEFAULT_TIMEOUT} from './types.js'
+import type { CDPClient } from '../cdp/client.js'
+import { withRetry } from './retry.js'
+import { DEFAULT_TIMEOUT } from './types.js'
 
 /**
  * AutoWait 选项
  */
 export interface AutoWaitOptions {
     /** 超时时间（毫秒），默认 30000 */
-    timeout?: number;
+    timeout?: number
 }
 
 /**
@@ -31,9 +31,9 @@ export class AutoWait {
     constructor(
         private cdp: CDPClient,
         private sessionId: string,
-        options: AutoWaitOptions = {},
+        options: AutoWaitOptions = {}
     ) {
-        this.timeout  = options.timeout ?? DEFAULT_TIMEOUT
+        this.timeout = options.timeout ?? DEFAULT_TIMEOUT
         this.deadline = Date.now() + this.timeout
     }
 
@@ -47,7 +47,7 @@ export class AutoWait {
         await withRetry(
             async () => {
                 const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
-                    object: { objectId: string };
+                    object: { objectId: string }
                 }
 
                 const { result } = (await this.send('Runtime.callFunctionOn', {
@@ -65,7 +65,7 @@ export class AutoWait {
                     throw new Error('元素处于禁用状态')
                 }
             },
-            { timeout: this.remaining() },
+            { timeout: this.remaining() }
         )
     }
 
@@ -79,7 +79,7 @@ export class AutoWait {
         await withRetry(
             async () => {
                 const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
-                    object: { objectId: string };
+                    object: { objectId: string }
                 }
 
                 const { result } = (await this.send('Runtime.callFunctionOn', {
@@ -106,7 +106,7 @@ export class AutoWait {
                     throw new Error('元素位置不稳定')
                 }
             },
-            { timeout: this.remaining() },
+            { timeout: this.remaining() }
         )
     }
 
@@ -118,7 +118,7 @@ export class AutoWait {
      */
     async ensureInViewport(nodeId: number): Promise<void> {
         const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
-            object: { objectId: string };
+            object: { objectId: string }
         }
 
         // 检查是否在视口内
@@ -156,7 +156,7 @@ export class AutoWait {
         await withRetry(
             async () => {
                 const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
-                    object: { objectId: string };
+                    object: { objectId: string }
                 }
 
                 const { result } = (await this.send('Runtime.callFunctionOn', {
@@ -175,7 +175,7 @@ export class AutoWait {
                     throw new Error('元素不可见')
                 }
             },
-            { timeout: this.remaining() },
+            { timeout: this.remaining() }
         )
     }
 
@@ -205,7 +205,7 @@ export class AutoWait {
     /**
      * 发送 CDP 命令
      *
-     * 使用 deadline 剩余时间，确保单命令不超出整体预算。
+     * 使用 deadline 剩余时间，确保单命令不超出整体预算
      */
     private send<T>(method: string, params?: object): Promise<T> {
         return this.cdp.send(method, params, this.sessionId, this.remaining())
@@ -218,4 +218,3 @@ export class AutoWait {
         return Math.max(1, this.deadline - Date.now())
     }
 }
-
