@@ -146,11 +146,11 @@ enum Commands {
         #[arg(long)]
         r#ref: String,
 
-        /// Lines before anchor (counts only matching types if --types specified)
+        /// Lines before anchor (counts only messages matching both --types and --pattern)
         #[arg(long)]
         before: Option<usize>,
 
-        /// Lines after anchor (counts only matching types if --types specified)
+        /// Lines after anchor (counts only messages matching both --types and --pattern)
         #[arg(long)]
         after: Option<usize>,
 
@@ -165,6 +165,18 @@ enum Commands {
         /// Message types to include (comma separated)
         #[arg(long)]
         types: Option<String>,
+
+        /// Filter pattern for counting and returned messages
+        #[arg(long)]
+        pattern: Option<String>,
+
+        /// Use regex for pattern matching
+        #[arg(long)]
+        regex: bool,
+
+        /// Case-sensitive pattern matching
+        #[arg(long)]
+        case_sensitive: bool,
 
         /// Project ID
         #[arg(long)]
@@ -278,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
             until_type,
             direction,
             types,
+            pattern,
+            regex,
+            case_sensitive,
             project,
             max_content,
             max_total,
@@ -294,9 +309,9 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default(),
                 max_content,
                 max_total,
-                pattern: None,
-                regex: false,
-                case_sensitive: false,
+                pattern,
+                regex,
+                case_sensitive,
             };
 
             serialize_result(context(&config, params))
@@ -304,7 +319,9 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Projects => serialize_result(list_projects(&config)),
 
-        Commands::Sessions { project } => serialize_result(list_sessions(&config, project.as_deref())),
+        Commands::Sessions { project } => {
+            serialize_result(list_sessions(&config, project.as_deref()))
+        }
     };
 
     match result {

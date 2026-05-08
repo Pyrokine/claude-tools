@@ -82,6 +82,12 @@ pub struct ContextToolParams {
     #[serde(default)]
     pub types: Option<String>,
     #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub regex: Option<bool>,
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
     pub max_content: Option<usize>,
@@ -208,9 +214,9 @@ impl McpHistoryService {
             types,
             max_content: p.max_content.unwrap_or(4000),
             max_total: p.max_total.unwrap_or(40000),
-            pattern: None,
-            regex: false,
-            case_sensitive: false,
+            pattern: p.pattern,
+            regex: p.regex.unwrap_or(false),
+            case_sensitive: p.case_sensitive.unwrap_or(false),
         };
         let result = tokio::task::spawn_blocking(move || context(&cfg, params))
             .await

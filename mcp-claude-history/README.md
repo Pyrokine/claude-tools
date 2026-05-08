@@ -28,7 +28,9 @@ Download the latest release from [GitHub Releases](https://github.com/Pyrokine/c
 
 ```bash
 # Download and install
-curl -L https://github.com/Pyrokine/claude-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz | tar xz
+curl -L \
+  https://github.com/Pyrokine/claude-tools/releases/latest/download/mcp-claude-history-linux-x86_64.tar.gz \
+  | tar xz
 chmod +x mcp-claude-history
 mv mcp-claude-history ~/.local/bin/
 ```
@@ -78,22 +80,22 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ### history_search
 
-| Parameter        | Type    | Default                | Description                                                                        |
-|------------------|---------|------------------------|------------------------------------------------------------------------------------|
-| `pattern`        | string  | ""                     | Search pattern (empty returns all)                                                 |
-| `project`        | string  | current                | Project ID (comma-separated)                                                       |
-| `all`            | boolean | false                  | Search all projects                                                                |
-| `sessions`       | string  | -                      | Session IDs (comma-separated)                                                      |
-| `since`          | string  | -                      | Start time (ISO 8601 or today/week/month). Without timezone, treated as local time |
-| `until`          | string  | -                      | End time. Without timezone, treated as local time                                  |
-| `types`          | string  | assistant,user,summary | Message types                                                                      |
-| `lines`          | string  | -                      | Line ranges (e.g., 100-200, !300-400)                                              |
-| `regex`          | boolean | false                  | Use regex                                                                          |
-| `case_sensitive` | boolean | false                  | Case sensitive                                                                     |
-| `offset`         | number  | 0                      | Skip first N results                                                               |
-| `limit`          | number  | -                      | Max results to return                                                              |
-| `max_content`    | number  | 4000                   | Max chars per result                                                               |
-| `max_total`      | number  | 40000                  | Max total chars                                                                    |
+| Parameter        | Type    | Default                | Description                                            |
+|------------------|---------|------------------------|--------------------------------------------------------|
+| `pattern`        | string  | ""                     | Search pattern (empty returns all)                     |
+| `project`        | string  | current                | Project ID (comma-separated)                           |
+| `all`            | boolean | false                  | Search all projects                                    |
+| `sessions`       | string  | -                      | Session IDs (comma-separated)                          |
+| `since`          | string  | -                      | Start time in RFC 3339 / ISO 8601 format with timezone |
+| `until`          | string  | -                      | End time in RFC 3339 / ISO 8601 format with timezone   |
+| `types`          | string  | assistant,user,summary | Message types                                          |
+| `lines`          | string  | -                      | Line ranges (e.g., 100-200, !300-400)                  |
+| `regex`          | boolean | false                  | Use regex                                              |
+| `case_sensitive` | boolean | false                  | Case sensitive                                         |
+| `offset`         | number  | 0                      | Skip first N results                                   |
+| `limit`          | number  | -                      | Max results to return                                  |
+| `max_content`    | number  | 4000                   | Max chars per result                                   |
+| `max_total`      | number  | 40000                  | Max total chars                                        |
 
 ### history_get
 
@@ -136,7 +138,7 @@ mcp-claude-history search "error"
 mcp-claude-history search "error|warning" --regex
 
 # Recent messages
-mcp-claude-history search "" --since today --limit 10
+mcp-claude-history search "" --since 2026-04-29T00:00:00Z --limit 10
 
 # Search specific project
 mcp-claude-history search "bug" --project -home-user-myproject
@@ -148,8 +150,8 @@ mcp-claude-history search "bug" --project -home-user-myproject
 # Get message by ref
 mcp-claude-history get --ref c86bc677:1234
 
-# Export to directory (with images)
-mcp-claude-history get --ref c86bc677:1234 --output /tmp/export
+# Export to directory under the current working directory (with images)
+mcp-claude-history get --ref c86bc677:1234 --output ./export
 
 # Chunked retrieval for large content
 mcp-claude-history get --ref c86bc677:1234 --range 0-100000
@@ -166,6 +168,9 @@ mcp-claude-history context --ref c86bc677:1234 --before 10 --types user
 
 # Get messages until next user message
 mcp-claude-history context --ref c86bc677:1234 --until-type user --direction forward
+
+# Get only messages matching a pattern around the anchor
+mcp-claude-history context --ref c86bc677:1234 --before 5 --after 5 --pattern error --case-sensitive
 ```
 
 ### Browse
