@@ -47,6 +47,7 @@ interface DispatcherState {
 export class ForwardManager {
     private sessions: Map<string, ForwardSession> = new Map()
     private dispatchers: Map<string, DispatcherState> = new Map() // alias → dispatcher
+    private dependencies: ForwardDependencies | null = null
     private idCounter = 0
     // 默认 idle timeout 1 小时,长时间无连接活动的 forward 自动关闭
     private readonly idleTimeoutMs = Number(process.env.SSH_MCP_FORWARD_IDLE_TIMEOUT_MS) || 3600_000
@@ -54,14 +55,6 @@ export class ForwardManager {
 
     constructor() {
         this.startIdleSweeper()
-    }
-
-    /** 用于测试或停服时手动停止 idle sweeper */
-    stopIdleSweeper(): void {
-        if (this.idleSweeper) {
-            clearInterval(this.idleSweeper)
-            this.idleSweeper = null
-        }
     }
 
     async forwardLocal(
@@ -72,6 +65,7 @@ export class ForwardManager {
         remotePort: number,
         localHost: string = '127.0.0.1'
     ): Promise<{ forwardId: string; localPort: number }> {
+        this.dependencies = deps
         const client = deps.getClient(alias)
         const forwardId = this.generateId()
 
@@ -142,6 +136,7 @@ export class ForwardManager {
         localPort: number,
         remoteHost: string = '127.0.0.1'
     ): Promise<string> {
+        this.dependencies = deps
         const client = deps.getClient(alias)
         const forwardId = this.generateId()
 
@@ -267,7 +262,7 @@ export class ForwardManager {
                         (now - fwd.lastActivityAt) / 1000
                     )}s with 0 connections > ${Math.round(this.idleTimeoutMs / 1000)}s, auto-closing`
                 )
-                this.close(id)
+                this.close(id, this.dependencies ?? undefined)
             }
         }
     }

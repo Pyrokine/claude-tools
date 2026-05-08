@@ -31,7 +31,6 @@ export interface SSHSessionInfo {
     connected: boolean
     connectedAt: number
     lastUsedAt: number
-    env?: Record<string, string>
 }
 
 export interface ExecOptions {
@@ -39,7 +38,8 @@ export interface ExecOptions {
     env?: Record<string, string> // 额外环境变量
     cwd?: string // 工作目录
     pty?: boolean // 是否使用 PTY
-    maxOutputSize?: number // 最大输出长度（UTF-16 char length，与 String.prototype.length 一致；ASCII 时近似 10MB 字节，含多字节字符时实际字节数会更大），默认 10*1024*1024
+    maxOutputSize?: number // 最大输出长度（UTF-16 char length）
+    // 与 String.prototype.length 一致；ASCII 时近似 10MB 字节，含多字节字符时实际字节数会更大，默认 10*1024*1024
     // PTY 配置
     rows?: number
     cols?: number
@@ -81,7 +81,6 @@ export interface PersistedSession {
     port: number
     username: string
     connectedAt: number
-    env?: Record<string, string>
 }
 
 // PTY 会话配置

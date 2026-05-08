@@ -165,7 +165,6 @@ export class SessionManager {
                 connected: this.isAlive(session),
                 connectedAt: session.connectedAt,
                 lastUsedAt: session.lastUsedAt,
-                env: session.config.env,
             })
         }
         return result
@@ -761,14 +760,13 @@ export class SessionManager {
     private persistSessions(): void {
         const data: PersistedSession[] = []
         for (const [alias, session] of this.sessions) {
-            // 不保存敏感信息（密码、密钥）
+            // 不保存敏感信息（密码、密钥、环境变量）
             data.push({
                 alias,
                 host: session.config.host,
                 port: session.config.port || 22,
                 username: session.config.username,
                 connectedAt: session.connectedAt,
-                env: session.config.env,
             })
         }
         fs.promises

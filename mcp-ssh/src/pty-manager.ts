@@ -44,14 +44,6 @@ export class PtyManager {
         this.startIdleSweeper()
     }
 
-    /** 用于测试或停服时手动停止 idle sweeper */
-    stopIdleSweeper(): void {
-        if (this.idleSweeper) {
-            clearInterval(this.idleSweeper)
-            this.idleSweeper = null
-        }
-    }
-
     async start(deps: PtyDependencies, alias: string, command: string, options: PtyOptions = {}): Promise<string> {
         const ptyId = this.generateId()
         const rows = options.rows || 24
@@ -95,6 +87,12 @@ export class PtyManager {
 
         stream.on('close', () => {
             ptySession.active = false
+            this.sessions.delete(ptyId)
+            try {
+                terminal.dispose()
+            } catch (e) {
+                console.warn(`PTY ${ptyId} terminal dispose failed:`, (e as Error).message)
+            }
         })
 
         stream.on('error', (err: Error) => {
