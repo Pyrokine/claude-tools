@@ -137,7 +137,8 @@ const AGGRESSIVE_EXTRA_BODY = `
   // ============================================
   try {
     // chrome.runtime 检测
-    if (window.chrome === undefined) {
+    const chromeDescriptor = Object.getOwnPropertyDescriptor(window, 'chrome');
+    if (window.chrome === undefined && (!chromeDescriptor || chromeDescriptor.configurable)) {
       Object.defineProperty(window, 'chrome', {
         value: {
           runtime: {},

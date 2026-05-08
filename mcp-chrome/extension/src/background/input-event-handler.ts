@@ -193,12 +193,38 @@ export class InputEventHandler {
                     return { success: false, error: `Unknown touch event type: ${type}` }
                 }
 
-                const firstPoint = touchPoints[0]
-                const target = firstPoint
-                    ? (document.elementFromPoint(firstPoint.x, firstPoint.y) ?? document.documentElement)
-                    : document.documentElement
+                const stateKey = '__mcpLastTouchState'
+                const page = window as Window & {
+                    __mcpLastTouchState?: {
+                        target: EventTarget & { dispatchEvent: (evt: Event) => boolean }
+                        touchPoints: Array<{
+                            x: number
+                            y: number
+                            id?: number
+                            radiusX?: number
+                            radiusY?: number
+                            force?: number
+                            rotationAngle?: number
+                        }>
+                    }
+                }
+                const storedState = page.__mcpLastTouchState
+                const isEnding = type === 'touchEnd' || type === 'touchCancel'
+                const effectivePoints = touchPoints.length > 0 ? touchPoints : (storedState?.touchPoints ?? [])
+                if (effectivePoints.length < 1) {
+                    return {
+                        success: false,
+                        error: `${eventType} 需要先有 touchstart/touchmove，或显式提供 touchPoints`,
+                    }
+                }
 
-                const touches = touchPoints.map(
+                const firstPoint = effectivePoints[0]
+                const target =
+                    storedState?.target ??
+                    ((document.elementFromPoint(firstPoint.x, firstPoint.y) ??
+                        document.documentElement) as EventTarget & { dispatchEvent: (evt: Event) => boolean })
+
+                const touches = effectivePoints.map(
                     (pt, i) =>
                         new Touch({
                             identifier: pt.id ?? i,
@@ -214,8 +240,6 @@ export class InputEventHandler {
                         })
                 )
 
-                // touchend/cancel 时 touches 和 targetTouches 应为空（该触点已结束），changedTouches 是结束的触点
-                const isEnding = type === 'touchEnd' || type === 'touchCancel'
                 const evt = new TouchEvent(eventType, {
                     bubbles: true,
                     cancelable: true,
@@ -225,6 +249,12 @@ export class InputEventHandler {
                     changedTouches: touches,
                 })
                 target.dispatchEvent(evt)
+
+                if (isEnding) {
+                    delete page[stateKey]
+                } else {
+                    page[stateKey] = { target, touchPoints: effectivePoints }
+                }
                 return { success: true }
             },
             args: [p.type, p.touchPoints],

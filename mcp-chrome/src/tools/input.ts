@@ -44,8 +44,9 @@ const inputEventSchema = z.object({
         .array(z.string())
         .optional()
         .describe(
-            '浏览器编辑命令（keydown 专用），如 ["selectAll"]、["copy"]、["paste"]、["cut"]、["undo"]、["redo"]，触发原生编辑命令，优先于纯键盘事件，用于跨平台快捷键场景，需要 inputMode=precise（stealth 模式无法触发 Chrome 原生编辑命令，会报错）'
-        ),
+            '浏览器编辑命令（keydown 专用），如 ["selectAll"]、["copy"]、["paste"]、["cut"]、["undo"]、["redo"]，触发原生编辑命令，优先于纯键盘事件'
+        )
+        .describe('用于跨平台快捷键场景，需要 inputMode=precise'),
     button: z.enum(['left', 'middle', 'right', 'back', 'forward']).optional().describe('鼠标按钮'),
     clickCount: z
         .number()
@@ -56,7 +57,7 @@ const inputEventSchema = z.object({
     target: targetZodSchema
         .optional()
         .describe(
-            '目标元素（mousemove/touchstart/touchmove 必填；click/mousedown/wheel/type/drag 可选，用于先定位再操作；select/replace 可选，用于限定搜索范围；drag 时为拖拽源）'
+            '目标元素（mousemove/touchstart/touchmove 必填；click/mousedown/wheel/type/drag 可选；select/replace 可选；drag 时为拖拽源）'
         ),
     to: targetZodSchema.optional().describe('拖拽目标元素（drag 事件必填）'),
     steps: z.number().optional().describe('移动步数（mousemove/touchmove）'),
@@ -456,6 +457,12 @@ async function executeEventExtension(
     validateEvent(event)
     switch (event.type) {
         case 'keydown': {
+            if (event.commands && event.commands.length > 0 && event.target) {
+                const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+                await unifiedSession.mouseMove(point.x, point.y)
+                await unifiedSession.mouseDown('left')
+                await unifiedSession.mouseUp('left')
+            }
             await unifiedSession.keyDown(event.key!, event.commands)
             break
         }
@@ -500,7 +507,11 @@ async function executeEventExtension(
                 // refId 透传：stealth 模式下嵌套 iframe overlay 场景绕过 elementFromPoint
                 const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
                 await unifiedSession.mouseMove(point.x, point.y)
-                await unifiedSession.mouseClick(button, clickCount, point.refId)
+                await unifiedSession.mouseClick(
+                    button,
+                    clickCount,
+                    typeof point.refId === 'string' ? point.refId : undefined
+                )
                 break
             }
             await unifiedSession.mouseClick(button, clickCount)
@@ -629,7 +640,9 @@ async function executeEventExtension(
                 await unifiedSession.mouseClick('left')
             } else {
                 const hasActiveFocus = await unifiedSession.evaluate<boolean>(
-                    '!!document.activeElement && document.activeElement !== document.body && document.activeElement !== document.documentElement'
+                    '!!document.activeElement && ' +
+                        'document.activeElement !== document.body && ' +
+                        'document.activeElement !== document.documentElement'
                 )
                 if (!hasActiveFocus) {
                     throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')
@@ -1004,7 +1017,9 @@ async function executeEvent(
                 await session.mouseUp('left')
             } else {
                 const hasActiveFocus = await session.evaluate<boolean>(
-                    '!!document.activeElement && document.activeElement !== document.body && document.activeElement !== document.documentElement'
+                    '!!document.activeElement && ' +
+                        'document.activeElement !== document.body && ' +
+                        'document.activeElement !== document.documentElement'
                 )
                 if (!hasActiveFocus) {
                     throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')

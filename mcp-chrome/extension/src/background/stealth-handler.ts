@@ -20,11 +20,16 @@ export class StealthHandler {
         const tabId = await getTargetTabId(p.tabId)
         await assertScriptable(tabId)
 
+        const args: [number, number, string, number?, string?] =
+            typeof p.refId === 'string'
+                ? [p.x, p.y, p.button || 'left', p.clickCount ?? 1, p.refId]
+                : [p.x, p.y, p.button || 'left', p.clickCount ?? 1]
+
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
             func: simulateMouseClick,
-            args: [p.x, p.y, p.button || 'left', p.clickCount ?? 1, p.refId],
+            args,
         })
 
         return results[0].result as { success: boolean }

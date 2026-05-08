@@ -1101,7 +1101,8 @@ export function injectStealthScripts(): void {
 
     // 覆盖 chrome.runtime（隐藏扩展存在）
     const originalChrome = (window as unknown as { chrome?: unknown }).chrome
-    if (originalChrome) {
+    const chromeDescriptor = Object.getOwnPropertyDescriptor(window, 'chrome')
+    if (originalChrome && chromeDescriptor?.configurable) {
         Object.defineProperty(window, 'chrome', {
             get: () => {
                 const chrome = { ...(originalChrome as object) }
@@ -1275,57 +1276,6 @@ export function checkActionability(refId: string): ActionabilityResult {
         actionable: true,
         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
     }
-}
-
-/**
- * 滚动元素到视口内（4 种对齐轮换，参考 Playwright dom.ts:360-429）
- *
- * 轮换策略避免 sticky header 遮挡：
- * 1. block:'center' — 默认居中
- * 2. block:'end' — 底部对齐（避开顶部 sticky）
- * 3. block:'start' — 顶部对齐（避开底部 sticky）
- * 4. block:'nearest' — 最小滚动
- */
-export function scrollIntoViewWithRetry(refId: string): ActionabilityResult {
-    const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
-    const ref = win.__mcpElementMap?.[refId]
-    if (!ref) {
-        return { actionable: false, reason: 'not-connected' }
-    }
-    const element = ref.deref()
-    if (!element || !element.isConnected) {
-        return { actionable: false, reason: 'not-connected' }
-    }
-
-    const alignments: ScrollIntoViewOptions[] = [
-        { block: 'center', inline: 'center', behavior: 'instant' },
-        { block: 'end', inline: 'end', behavior: 'instant' },
-        { block: 'start', inline: 'start', behavior: 'instant' },
-        { block: 'nearest', inline: 'nearest', behavior: 'instant' },
-    ]
-
-    for (const alignment of alignments) {
-        element.scrollIntoView(alignment)
-        // 检查是否在视口内且未被遮挡
-        const rect = element.getBoundingClientRect()
-        const vw = window.innerWidth
-        const vh = window.innerHeight
-        if (rect.top >= 0 && rect.bottom <= vh && rect.left >= 0 && rect.right <= vw) {
-            // 在视口内，检查遮挡
-            const cx = rect.x + rect.width / 2
-            const cy = rect.y + rect.height / 2
-            const hitEl = document.elementFromPoint(cx, cy)
-            if (hitEl && (hitEl === element || element.contains(hitEl))) {
-                return {
-                    actionable: true,
-                    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-                }
-            }
-        }
-    }
-
-    // 所有对齐方式都试过了，仍然被遮挡或不在视口
-    return checkActionability(refId)
 }
 
 /**

@@ -513,11 +513,12 @@ class SessionManager implements IBrowserDriver {
             modifiers: this.modifiers,
             ...keyDefinition,
         }
+        if (commands && commands.length > 0) {
+            delete params.text
+            params.commands = commands
+        }
         if (options?.autoRepeat) {
             params.autoRepeat = true
-        }
-        if (commands && commands.length > 0) {
-            params.commands = commands
         }
         await this.send('Input.dispatchKeyEvent', params)
     }
@@ -528,21 +529,13 @@ class SessionManager implements IBrowserDriver {
     async keyUp(key: string): Promise<void> {
         this.ensureSession()
         const keyDefinition = getKeyDefinition(key)
+        const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers & ~MODIFIER_KEYS[key] : this.modifiers
         await this.send('Input.dispatchKeyEvent', {
             type: 'keyUp',
-            modifiers: this.modifiers,
+            modifiers: nextModifiers,
             ...keyDefinition,
         })
-        if (MODIFIER_KEYS[key]) {
-            this.modifiers &= ~MODIFIER_KEYS[key]
-        }
-    }
-
-    /**
-     * 同步外部修饰键状态（供 UnifiedSessionManager 在 CDP 回退路径使用，确保两路 modifiers 一致）
-     */
-    setModifiers(value: number): void {
-        this.modifiers = value
+        this.modifiers = nextModifiers
     }
 
     /**
@@ -882,7 +875,10 @@ class SessionManager implements IBrowserDriver {
                 // text-only：用 TreeWalker 仅遍历可能含目标文本的节点,避免 querySelectorAll('*') 的全树扫描和强制 layout
                 elements = [];
                 var lowerText = text;
-                var walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ELEMENT, {
+                var walker = document.createTreeWalker(
+                    document.body || document.documentElement,
+                    NodeFilter.SHOW_ELEMENT,
+                    {
                     acceptNode: function (n) {
                         var t = n.textContent || '';
                         if (!t.includes(lowerText)) return NodeFilter.FILTER_SKIP;

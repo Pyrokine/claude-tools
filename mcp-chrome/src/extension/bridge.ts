@@ -194,8 +194,7 @@ export class ExtensionBridge implements IBrowserDriver {
 
     /** IBrowserDriver 接口：选择操作目标 tab（不切换前台，只设置当前 currentTabId） */
     async selectPage(targetId: string): Promise<void> {
-        const tabId = this.parseTargetId(targetId)
-        this.currentTabId = tabId
+        this.currentTabId = this.parseTargetId(targetId)
     }
 
     /** IBrowserDriver 接口：获取当前操作目标 ID（chrome tab id 的字符串形式） */
@@ -210,17 +209,22 @@ export class ExtensionBridge implements IBrowserDriver {
 
     async navigate(url: string, options?: { wait?: string; timeout?: number }): Promise<void> {
         const rpcTimeout = options?.timeout !== undefined ? options.timeout + RPC_MARGIN : undefined
-        const result = await this.httpServer.sendCommand(
-            'navigate',
-            {
-                tabId: this.currentTabId,
-                url,
-                waitUntil: options?.wait ?? 'load',
-                timeout: options?.timeout,
-            },
-            rpcTimeout
-        )
-        const tab = result as { url: string; title: string }
+        const params: {
+            tabId?: number
+            url: string
+            waitUntil: string
+            timeout?: number
+        } = {
+            url,
+            waitUntil: options?.wait ?? 'load',
+            timeout: options?.timeout,
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        const result = await this.httpServer.sendCommand('navigate', params, rpcTimeout)
+        const tab = result as { id: number; url: string; title: string }
+        this.currentTabId = tab.id
         this.updateState(tab.url, tab.title)
     }
 
@@ -231,15 +235,18 @@ export class ExtensionBridge implements IBrowserDriver {
         // 调用方传 timeout 时：timeout 即导航超时 + 信号窗口 + 传输余量
         const rpcTimeout =
             timeout !== undefined ? timeout + NAV_SIGNAL_WINDOW + RPC_MARGIN : 30000 + NAV_SIGNAL_WINDOW + RPC_MARGIN
-        const result = (await this.httpServer.sendCommand(
-            'go_back',
-            {
-                tabId: this.currentTabId,
-                waitUntil: 'load',
-                timeout,
-            },
-            rpcTimeout
-        )) as { url: string; title: string; navigated: boolean }
+        const params: { tabId?: number; waitUntil: string; timeout?: number } = {
+            waitUntil: 'load',
+            timeout,
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        const result = (await this.httpServer.sendCommand('go_back', params, rpcTimeout)) as {
+            url: string
+            title: string
+            navigated: boolean
+        }
         this.updateState(result.url, result.title)
         return result
     }
@@ -249,31 +256,38 @@ export class ExtensionBridge implements IBrowserDriver {
         // 调用方传 timeout 时：timeout 即导航超时 + 信号窗口 + 传输余量
         const rpcTimeout =
             timeout !== undefined ? timeout + NAV_SIGNAL_WINDOW + RPC_MARGIN : 30000 + NAV_SIGNAL_WINDOW + RPC_MARGIN
-        const result = (await this.httpServer.sendCommand(
-            'go_forward',
-            {
-                tabId: this.currentTabId,
-                waitUntil: 'load',
-                timeout,
-            },
-            rpcTimeout
-        )) as { url: string; title: string; navigated: boolean }
+        const params: { tabId?: number; waitUntil: string; timeout?: number } = {
+            waitUntil: 'load',
+            timeout,
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        const result = (await this.httpServer.sendCommand('go_forward', params, rpcTimeout)) as {
+            url: string
+            title: string
+            navigated: boolean
+        }
         this.updateState(result.url, result.title)
         return result
     }
 
     async reload(ignoreCache = false, waitUntil?: string, timeout?: number): Promise<void> {
         const rpcTimeout = timeout !== undefined ? timeout + RPC_MARGIN : undefined
-        const result = await this.httpServer.sendCommand(
-            'reload',
-            {
-                tabId: this.currentTabId,
-                ignoreCache,
-                waitUntil: waitUntil ?? 'load',
-                timeout,
-            },
-            rpcTimeout
-        )
+        const params: {
+            tabId?: number
+            ignoreCache: boolean
+            waitUntil: string
+            timeout?: number
+        } = {
+            ignoreCache,
+            waitUntil: waitUntil ?? 'load',
+            timeout,
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        const result = await this.httpServer.sendCommand('reload', params, rpcTimeout)
         const tab = result as { url: string; title: string }
         this.updateState(tab.url, tab.title)
     }
@@ -774,54 +788,109 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     async stealthType(text: string, delay = 0): Promise<void> {
-        await this.httpServer.sendCommand('stealth_type', {
-            tabId: this.currentTabId,
-            frameId: this.currentFrameId || undefined,
+        const params: {
+            tabId?: number
+            frameId?: number
+            text: string
+            delay: number
+        } = {
             text,
             delay,
-        })
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        if (this.currentFrameId !== null) {
+            params.frameId = this.currentFrameId
+        }
+        await this.httpServer.sendCommand('stealth_type', params)
     }
 
     // ==================== Stealth 模式（JS 事件模拟，无 debugger）====================
 
     async stealthKey(key: string, type: 'down' | 'up' | 'press' = 'press', modifiers: string[] = []): Promise<void> {
-        await this.httpServer.sendCommand('stealth_key', {
-            tabId: this.currentTabId,
-            frameId: this.currentFrameId || undefined,
+        const params: {
+            tabId?: number
+            frameId?: number
+            key: string
+            type: 'down' | 'up' | 'press'
+            modifiers: string[]
+        } = {
             key,
             type,
             modifiers,
-        })
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        if (this.currentFrameId !== null) {
+            params.frameId = this.currentFrameId
+        }
+        await this.httpServer.sendCommand('stealth_key', params)
     }
 
     async stealthClick(x: number, y: number, button = 'left', clickCount = 1, refId?: string): Promise<void> {
-        await this.httpServer.sendCommand('stealth_click', {
-            tabId: this.currentTabId,
-            frameId: this.currentFrameId || undefined,
+        const params: {
+            tabId?: number
+            frameId?: number
+            x: number
+            y: number
+            button: string
+            clickCount: number
+            refId?: string
+        } = {
             x,
             y,
             button,
             clickCount,
-            refId,
-        })
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        if (this.currentFrameId !== null) {
+            params.frameId = this.currentFrameId
+        }
+        if (typeof refId === 'string') {
+            params.refId = refId
+        }
+        await this.httpServer.sendCommand('stealth_click', params)
     }
 
     async stealthMouse(type: string, x: number, y: number, button = 'left'): Promise<void> {
-        await this.httpServer.sendCommand('stealth_mouse', {
-            tabId: this.currentTabId,
-            frameId: this.currentFrameId || undefined,
+        const params: {
+            tabId?: number
+            frameId?: number
+            type: string
+            x: number
+            y: number
+            button: string
+        } = {
             type,
             x,
             y,
             button,
-        })
+        }
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        if (this.currentFrameId !== null) {
+            params.frameId = this.currentFrameId
+        }
+        await this.httpServer.sendCommand('stealth_mouse', params)
     }
 
     async stealthInject(): Promise<void> {
-        await this.httpServer.sendCommand('stealth_inject', {
-            tabId: this.currentTabId,
-            frameId: this.currentFrameId || undefined,
-        })
+        const params: {
+            tabId?: number
+            frameId?: number
+        } = {}
+        if (this.currentTabId !== null) {
+            params.tabId = this.currentTabId
+        }
+        if (this.currentFrameId !== null) {
+            params.frameId = this.currentFrameId
+        }
+        await this.httpServer.sendCommand('stealth_inject', params)
     }
 
     getState(): SimplePageState | null {
@@ -829,14 +898,6 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     // ==================== 状态管理 ====================
-
-    getCurrentTabId(): number | null {
-        return this.currentTabId
-    }
-
-    setCurrentTabId(tabId: number | null): void {
-        this.currentTabId = tabId
-    }
 
     getCurrentFrameId(): number {
         return this.currentFrameId

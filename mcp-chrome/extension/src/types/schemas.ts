@@ -121,6 +121,8 @@ export const ScreenshotSchema = z
     .partial()
     .optional()
 
+export type ScreenshotInput = z.infer<typeof ScreenshotSchema>
+
 // ==================== DOM ops ====================
 
 export const ClickSchema = z.object({
@@ -326,12 +328,12 @@ export const InputMouseSchema = z.object({
     modifiers: z.number().optional(),
 })
 
-export const InputTouchSchema = z.object({
-    tabId: tabIdOpt,
-    frameId: frameIdOpt,
-    type: z.enum(['touchStart', 'touchMove', 'touchEnd', 'touchCancel']),
-    touchPoints: z
-        .array(
+export const InputTouchSchema = z
+    .object({
+        tabId: tabIdOpt,
+        frameId: frameIdOpt,
+        type: z.enum(['touchStart', 'touchMove', 'touchEnd', 'touchCancel']),
+        touchPoints: z.array(
             z.object({
                 x: z.number(),
                 y: z.number(),
@@ -341,10 +343,22 @@ export const InputTouchSchema = z.object({
                 id: z.number().optional(),
                 rotationAngle: z.number().optional(),
             })
-        )
-        .min(1),
-    modifiers: z.number().optional(),
-})
+        ),
+        modifiers: z.number().optional(),
+    })
+    .superRefine((value, ctx) => {
+        if ((value.type === 'touchStart' || value.type === 'touchMove') && value.touchPoints.length < 1) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.too_small,
+                minimum: 1,
+                type: 'array',
+                inclusive: true,
+                exact: false,
+                path: ['touchPoints'],
+                message: 'Array must contain at least 1 element(s)',
+            })
+        }
+    })
 
 export const InputTypeSchema = z.object({
     tabId: tabIdOpt,
@@ -439,68 +453,3 @@ export const EvaluateInFrameSchema = z.object({
     expression: z.string().min(1),
     timeout: z.number().nonnegative().optional(),
 })
-
-// ==================== 类型导出 ====================
-
-export type TabsListInput = z.infer<typeof TabsListSchema>
-export type TabsCreateInput = z.infer<typeof TabsCreateSchema>
-export type TabsCloseInput = z.infer<typeof TabsCloseSchema>
-export type TabsActivateInput = z.infer<typeof TabsActivateSchema>
-export type TabGroupCreateInput = z.infer<typeof TabGroupCreateSchema>
-export type TabGroupAddInput = z.infer<typeof TabGroupAddSchema>
-
-export type NavigateInput = z.infer<typeof NavigateSchema>
-export type GoBackInput = z.infer<typeof GoBackSchema>
-export type GoForwardInput = z.infer<typeof GoForwardSchema>
-export type ReloadInput = z.infer<typeof ReloadSchema>
-
-export type ReadPageInput = z.infer<typeof ReadPageSchema>
-export type ScreenshotInput = z.infer<typeof ScreenshotSchema>
-
-export type ClickInput = z.infer<typeof ClickSchema>
-export type ActionableClickInput = z.infer<typeof ActionableClickSchema>
-export type CheckActionabilityInput = z.infer<typeof CheckActionabilitySchema>
-export type DispatchInputInput = z.infer<typeof DispatchInputSchema>
-export type DragAndDropInput = z.infer<typeof DragAndDropSchema>
-export type GetComputedStyleInput = z.infer<typeof GetComputedStyleSchema>
-export type TypeInput = z.infer<typeof TypeSchema>
-export type ScrollInput = z.infer<typeof ScrollSchema>
-export type EvaluateInput = z.infer<typeof EvaluateSchema>
-export type FindInput = z.infer<typeof FindSchema>
-
-export type GetTextInput = z.infer<typeof GetTextSchema>
-export type GetHtmlInput = z.infer<typeof GetHtmlSchema>
-export type GetHtmlWithImagesInput = z.infer<typeof GetHtmlWithImagesSchema>
-export type GetAttributeInput = z.infer<typeof GetAttributeSchema>
-export type GetMetadataInput = z.infer<typeof GetMetadataSchema>
-
-export type CookiesGetInput = z.infer<typeof CookiesGetSchema>
-export type CookiesSetInput = z.infer<typeof CookiesSetSchema>
-export type CookiesDeleteInput = z.infer<typeof CookiesDeleteSchema>
-export type CookiesClearInput = z.infer<typeof CookiesClearSchema>
-
-export type DebuggerAttachInput = z.infer<typeof DebuggerAttachSchema>
-export type DebuggerDetachInput = z.infer<typeof DebuggerDetachSchema>
-export type DebuggerSendInput = z.infer<typeof DebuggerSendSchema>
-
-export type InputKeyInput = z.infer<typeof InputKeySchema>
-export type InputMouseInput = z.infer<typeof InputMouseSchema>
-export type InputTouchInput = z.infer<typeof InputTouchSchema>
-export type InputTypeInput = z.infer<typeof InputTypeSchema>
-
-export type ConsoleEnableInput = z.infer<typeof ConsoleEnableSchema>
-export type ConsoleGetInput = z.infer<typeof ConsoleGetSchema>
-export type ConsoleClearInput = z.infer<typeof ConsoleClearSchema>
-export type NetworkEnableInput = z.infer<typeof NetworkEnableSchema>
-export type NetworkGetInput = z.infer<typeof NetworkGetSchema>
-export type NetworkClearInput = z.infer<typeof NetworkClearSchema>
-
-export type StealthClickInput = z.infer<typeof StealthClickSchema>
-export type StealthTypeInput = z.infer<typeof StealthTypeSchema>
-export type StealthKeyInput = z.infer<typeof StealthKeySchema>
-export type StealthMouseInput = z.infer<typeof StealthMouseSchema>
-export type StealthInjectInput = z.infer<typeof StealthInjectSchema>
-
-export type ResolveFrameInput = z.infer<typeof ResolveFrameSchema>
-export type GetAllFramesInput = z.infer<typeof GetAllFramesSchema>
-export type EvaluateInFrameInput = z.infer<typeof EvaluateInFrameSchema>

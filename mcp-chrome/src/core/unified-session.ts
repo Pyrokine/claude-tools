@@ -759,7 +759,7 @@ class UnifiedSessionManager {
         // 预检查：stealth + commands 必然抛错，要在任何状态变更前抛出，避免 modifiers 污染
         if (isExt && this.inputMode === 'stealth' && commands && commands.length > 0) {
             throw new Error(
-                'commands 参数不支持 stealth 输入模式（stealth 通过 JS 合成事件，无法触发 Chrome 原生编辑命令），请先调用 manage action=inputMode inputMode=precise 切换后重试'
+                'commands 参数不支持 stealth 输入模式，请先调用 manage action=inputMode inputMode=precise 切换后重试'
             )
         }
 
@@ -780,7 +780,7 @@ class UnifiedSessionManager {
         await driver.inputKey(isRepeat ? 'rawKeyDown' : 'keyDown', {
             key: def.key,
             code: def.code,
-            text: def.text,
+            ...(commands && commands.length > 0 ? {} : { text: def.text }),
             windowsVirtualKeyCode: def.keyCode,
             modifiers: this.modifiers,
             commands,
@@ -794,21 +794,20 @@ class UnifiedSessionManager {
     async keyUp(key: string): Promise<void> {
         const driver = await this.getDriver()
         const isExt = this.isExtensionConnected()
+        const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers & ~MODIFIER_KEYS[key] : this.modifiers
 
         if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthKey(key, 'up', this.getModifierNames())
+            await driver.stealthKey(key, 'up', this.getModifierNames(nextModifiers))
         } else {
             const def = getKeyDefinition(key)
             await driver.inputKey('keyUp', {
                 key: def.key,
                 code: def.code,
                 windowsVirtualKeyCode: def.keyCode,
-                modifiers: this.modifiers,
+                modifiers: nextModifiers,
             })
         }
-        if (MODIFIER_KEYS[key]) {
-            this.modifiers &= ~MODIFIER_KEYS[key]
-        }
+        this.modifiers = nextModifiers
         this.pressedKeys.delete(key)
     }
 
@@ -1070,18 +1069,18 @@ class UnifiedSessionManager {
     }
 
     /** 获取当前修饰键名称数组（stealth 模式用） */
-    private getModifierNames(): string[] {
+    private getModifierNames(mask = this.modifiers): string[] {
         const names: string[] = []
-        if (this.modifiers & MODIFIER_KEYS.Alt) {
+        if (mask & MODIFIER_KEYS.Alt) {
             names.push('alt')
         }
-        if (this.modifiers & MODIFIER_KEYS.Control) {
+        if (mask & MODIFIER_KEYS.Control) {
             names.push('ctrl')
         }
-        if (this.modifiers & MODIFIER_KEYS.Meta) {
+        if (mask & MODIFIER_KEYS.Meta) {
             names.push('meta')
         }
-        if (this.modifiers & MODIFIER_KEYS.Shift) {
+        if (mask & MODIFIER_KEYS.Shift) {
             names.push('shift')
         }
         return names
@@ -1240,17 +1239,6 @@ class UnifiedSessionManager {
     }
 
     // ==================== Debugger 直接访问 ====================
-
-    /**
-     * 解析 tab ID 字符串为数字，校验 NaN
-     */
-    private parseTabId(id: string): number {
-        const tabId = parseInt(id, 10)
-        if (isNaN(tabId)) {
-            throw new Error(`无效的 Tab ID: ${id}`)
-        }
-        return tabId
-    }
 }
 
 /**

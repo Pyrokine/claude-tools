@@ -329,9 +329,9 @@ export interface IExtensionDriverExtras {
     /** Extension 模式特有：是否已连接 */
     isConnected(): boolean
     /** Extension 模式特有：当前 tabId（chrome tab 数字 ID） */
-    getCurrentTabIdNumber?(): number | null
+    getCurrentTabId?(): number | null
     /** Extension 模式特有：直接设置 tabId（绕过 attach） */
-    setCurrentTabIdNumber?(tabId: number | null): void
+    setCurrentTabId?(tabId: number | null): void
 }
 
 // ==================== 通用错误 ====================
