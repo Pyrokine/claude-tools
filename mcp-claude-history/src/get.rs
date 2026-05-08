@@ -1,10 +1,25 @@
 use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
-use std::fs::{self, File, Permissions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, mode: u32, target: &str) -> Result<(), ErrorResponse> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法设置{}权限: {}", target, e),
+        available: None,
+    })
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _mode: u32, _target: &str) -> Result<(), ErrorResponse> {
+    Ok(())
+}
 
 /// Get 参数
 pub struct GetParams {
@@ -256,13 +271,7 @@ fn write_output(
         available: None,
     })?;
     if was_new {
-        fs::set_permissions(output_dir, Permissions::from_mode(0o700)).map_err(|e| {
-            ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("无法设置目录权限: {}", e),
-                available: None,
-            }
-        })?;
+        set_private_permissions(output_dir, 0o700, "目录")?;
     }
 
     let safe_ref = r#ref.replace(':', "_");
@@ -274,13 +283,7 @@ fn write_output(
         message: format!("无法创建文件: {}", e),
         available: None,
     })?;
-    fs::set_permissions(&content_path, Permissions::from_mode(0o600)).map_err(|e| {
-        ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("无法设置文件权限: {}", e),
-            available: None,
-        }
-    })?;
+    set_private_permissions(&content_path, 0o600, "文件")?;
     file.write_all(content.as_bytes())
         .map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
@@ -300,7 +303,7 @@ fn write_output(
                     if let Err(e) = img_file.write_all(&data) {
                         image_warnings.push(format!("图片 {} 写入失败: {}", img.index, e));
                     } else {
-                        let _ = fs::set_permissions(&img_path, Permissions::from_mode(0o600));
+                        let _ = set_private_permissions(&img_path, 0o600, "图片文件");
                         image_paths.push(img_path);
                     }
                 }
