@@ -9,7 +9,6 @@ mod types;
 mod utils;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 use config::Config;
 use context::{context, ContextParams};
@@ -131,9 +130,9 @@ enum Commands {
         #[arg(long)]
         range: Option<String>,
 
-        /// Output directory (auto extract images)
+        /// Output directory (relative path defaults to controlled temp dir, use cwd: prefix to persist in repo)
         #[arg(long)]
-        output: Option<PathBuf>,
+        output: Option<String>,
 
         /// Project ID
         #[arg(long)]

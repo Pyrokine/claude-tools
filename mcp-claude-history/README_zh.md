@@ -103,7 +103,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 |-----------|--------|------------------------|
 | `ref`     | string | 必填，消息定位（session前8位:行号） |
 | `range`   | string | 字符范围（如 0-100000）       |
-| `output`  | string | 输出目录（自动提取图片）           |
+| `output`  | string | 输出目录（自动提取图片，相对路径默认走受控临时目录，写入仓库请显式写 `cwd:`） |
 | `project` | string | 项目 ID                  |
 
 ### history_context
@@ -150,8 +150,11 @@ mcp-claude-history search "bug" --project -home-user-myproject
 # 通过 ref 获取消息
 mcp-claude-history get --ref c86bc677:1234
 
-# 导出到当前工作目录下的目录（包含图片）
-mcp-claude-history get --ref c86bc677:1234 --output ./export
+# 导出到受控临时目录（包含图片）
+mcp-claude-history get --ref c86bc677:1234 --output tmp:export
+
+# 明确持久化到当前工作目录
+mcp-claude-history get --ref c86bc677:1234 --output cwd:export
 
 # 分块获取大内容
 mcp-claude-history get --ref c86bc677:1234 --range 0-100000

@@ -1,11 +1,15 @@
 use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+
+const TMP_PATH_PREFIX: &str = "tmp:";
+const CWD_PATH_PREFIX: &str = "cwd:";
 
 #[cfg(unix)]
 fn set_private_permissions(path: &Path, mode: u32, target: &str) -> Result<(), ErrorResponse> {
@@ -25,7 +29,7 @@ fn set_private_permissions(_path: &Path, _mode: u32, _target: &str) -> Result<()
 pub struct GetParams {
     pub r#ref: String,
     pub range: Option<(usize, usize)>,
-    pub output: Option<PathBuf>,
+    pub output: Option<String>,
     pub project: Option<String>,
 }
 
@@ -88,7 +92,8 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
 
     // 如果指定了 output，写入文件
     if let Some(output_dir) = params.output {
-        return write_output(&output_dir, &params.r#ref, &record, &content, image_count);
+        let resolved_output = resolve_output_dir(&output_dir)?;
+        return write_output(&resolved_output, &params.r#ref, &record, &content, image_count);
     }
 
     // 如果指定了 range，返回部分内容
@@ -260,8 +265,6 @@ fn write_output(
     content: &str,
     image_count: usize,
 ) -> Result<GetResponse, ErrorResponse> {
-    // 路径校验：output_dir 必须在 cwd 内（避免 chmod-anywhere）
-    validate_output_dir(output_dir)?;
 
     // 仅当目录是新建时才 chmod 0o700，避免 chmod 用户已有目录
     let was_new = !output_dir.exists();
@@ -328,59 +331,145 @@ fn write_output(
     })
 }
 
-/// 校验 output_dir 必须在 cwd 内（避免 chmod-anywhere/写文件到用户家目录）
-fn validate_output_dir(output_dir: &Path) -> Result<(), ErrorResponse> {
-    let cwd = std::env::current_dir().map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法获取当前工作目录: {}", e),
-        available: None,
-    })?;
-
-    // 不允许 `..` 组件（避免 ../../etc 之类的逃出）
-    if output_dir
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
+    let trimmed = raw_output.trim();
+    if trimmed.is_empty() {
         return Err(ErrorResponse {
             error: "invalid_output_dir".to_string(),
-            message: "输出目录路径不允许包含 `..` 组件".to_string(),
+            message: "输出目录不能为空".to_string(),
             available: None,
         });
     }
 
-    let absolute = if output_dir.is_absolute() {
-        output_dir.to_path_buf()
-    } else {
-        cwd.join(output_dir)
-    };
-
-    // canonicalize 解析 symlink 与 `..`，防止通过 symlink 逃出 cwd
-    // 如果路径还不存在，则向上找到第一个存在的祖先 canonicalize 后再拼接剩余路径
-    let canonical_cwd = fs::canonicalize(&cwd).map_err(|e| ErrorResponse {
+    let cwd_root = fs::canonicalize(env::current_dir().map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法获取当前工作目录: {}", e),
+        available: None,
+    })?)
+    .map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("canonicalize cwd 失败: {}", e),
         available: None,
     })?;
 
-    let canonical_target = canonicalize_or_ancestor(&absolute).map_err(|e| ErrorResponse {
+    let temp_root = controlled_temp_root()?;
+
+    if let Some(relative) = trimmed.strip_prefix(CWD_PATH_PREFIX) {
+        return resolve_relative_output_dir(relative, &cwd_root, "cwd:");
+    }
+    if let Some(relative) = trimmed.strip_prefix(TMP_PATH_PREFIX) {
+        return resolve_relative_output_dir(relative, &temp_root, "tmp:");
+    }
+
+    let raw_path = PathBuf::from(trimmed);
+    if raw_path.is_absolute() {
+        return resolve_absolute_output_dir(&raw_path, &cwd_root, &temp_root);
+    }
+
+    resolve_relative_output_dir(trimmed, &temp_root, TMP_PATH_PREFIX)
+}
+
+fn controlled_temp_root() -> Result<PathBuf, ErrorResponse> {
+    let root = env::temp_dir().join("claude-tools").join("mcp-claude-history");
+    fs::create_dir_all(&root).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法创建临时目录: {}", e),
+        available: None,
+    })?;
+    set_private_permissions(&root, 0o700, "临时目录")?;
+    fs::canonicalize(&root).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("canonicalize 临时目录失败: {}", e),
+        available: None,
+    })
+}
+
+fn resolve_relative_output_dir(
+    relative: &str,
+    root: &Path,
+    prefix: &str,
+) -> Result<PathBuf, ErrorResponse> {
+    if relative.is_empty() {
+        return Err(ErrorResponse {
+            error: "invalid_output_dir".to_string(),
+            message: format!("{} 后面必须跟相对路径", prefix),
+            available: None,
+        });
+    }
+
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute() {
+        return Err(ErrorResponse {
+            error: "invalid_output_dir".to_string(),
+            message: format!("{} 只接受相对路径", prefix),
+            available: None,
+        });
+    }
+    if relative_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(ErrorResponse {
+            error: "invalid_output_dir".to_string(),
+            message: format!("{} 路径不允许包含 `..` 组件", prefix),
+            available: None,
+        });
+    }
+
+    let candidate = root.join(relative_path);
+    let canonical_target = canonicalize_or_ancestor(&candidate).map_err(|e| ErrorResponse {
         error: "invalid_output_dir".to_string(),
         message: format!("canonicalize 输出路径失败: {}", e),
         available: None,
     })?;
 
-    if !canonical_target.starts_with(&canonical_cwd) {
-        return Err(ErrorResponse {
-            error: "invalid_output_dir".to_string(),
-            message: format!(
-                "输出目录必须在当前工作目录内: cwd={}, output={}",
-                canonical_cwd.display(),
-                canonical_target.display()
-            ),
-            available: None,
-        });
+    assert_within_allowed_root(&canonical_target, root)?;
+    Ok(candidate)
+}
+
+fn resolve_absolute_output_dir(
+    absolute: &Path,
+    cwd_root: &Path,
+    temp_root: &Path,
+) -> Result<PathBuf, ErrorResponse> {
+    let canonical_target = canonicalize_or_ancestor(absolute).map_err(|e| ErrorResponse {
+        error: "invalid_output_dir".to_string(),
+        message: format!("canonicalize 输出路径失败: {}", e),
+        available: None,
+    })?;
+
+    if is_within_root(&canonical_target, cwd_root) || is_within_root(&canonical_target, temp_root) {
+        return Ok(absolute.to_path_buf());
     }
 
-    Ok(())
+    Err(ErrorResponse {
+        error: "invalid_output_dir".to_string(),
+        message: format!(
+            "输出目录超出允许范围: {}，仅允许当前工作目录或受控临时目录",
+            canonical_target.display()
+        ),
+        available: None,
+    })
+}
+
+fn assert_within_allowed_root(path: &Path, root: &Path) -> Result<(), ErrorResponse> {
+    if is_within_root(path, root) {
+        return Ok(());
+    }
+
+    Err(ErrorResponse {
+        error: "invalid_output_dir".to_string(),
+        message: format!(
+            "输出目录超出允许范围: {}，允许根目录为 {}",
+            path.display(),
+            root.display()
+        ),
+        available: None,
+    })
+}
+
+fn is_within_root(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 /// 对路径做 canonicalize；若路径不存在则向上找到第一个存在的祖先 canonicalize 后再拼接剩余部分

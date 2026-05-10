@@ -9,7 +9,6 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
-use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::context::{context, ContextParams};
@@ -188,7 +187,7 @@ impl McpHistoryService {
         let params = GetParams {
             r#ref: p.r#ref,
             range: p.range.as_deref().and_then(parse_range),
-            output: p.output.map(PathBuf::from),
+            output: p.output,
             project: p.project,
         };
         let result = tokio::task::spawn_blocking(move || get(&cfg, params))

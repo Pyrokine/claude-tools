@@ -6,7 +6,7 @@
 
 - 本地 `~/.claude/projects/` 下至少有 1 个 project，且其 sessions/ 目录下至少 2 个 jsonl 文件
 - jsonl 中至少含 user 与 assistant 消息，部分消息含中文，部分含 markdown 代码块
-- 测试用临时输出目录：`/tmp/mcp-history-test/`
+- 测试用临时输出目录：`tmp:mcp-history-test/`
 
 **记号约定**：
 
@@ -141,10 +141,10 @@
 
 **步骤**：
 
-1. `history_get(ref="<ref>", output="/tmp/mcp-history-test/out.json")` → 应成功
-2. `history_get(ref="<ref>", output="/etc/x.json")` → 应被拒绝（在 cwd 外）
-3. cwd 内建 symlink `mcp-history-test/escape -> /etc`，再 `output="mcp-history-test/escape/x.json"` → 应被拒绝（canonicalize
-   后在 cwd 外）
+1. `history_get(ref="<ref>", output="tmp:mcp-history-test/out.json")` → 应成功
+2. `history_get(ref="<ref>", output="/etc/x.json")` → 应被拒绝（不在允许根目录内）
+3. cwd 内建 symlink `mcp-history-test/escape -> /etc`，再 `output="cwd:mcp-history-test/escape/x.json"` → 应被拒绝（canonicalize
+   后越界）
 
 **预期**：1 通过；2、3 被拒绝；canonicalize 防止 symlink escape
 

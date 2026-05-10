@@ -103,7 +103,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 |-----------|--------|---------------------------------------------|
 | `ref`     | string | Required. Message ref (session_prefix:line) |
 | `range`   | string | Character range (e.g., 0-100000)            |
-| `output`  | string | Output directory (auto-extract images)      |
+| `output`  | string | Output directory (auto-extract images, relative paths default to controlled temp dir, use `cwd:` to persist in repo) |
 | `project` | string | Project ID                                  |
 
 ### history_context
@@ -150,8 +150,11 @@ mcp-claude-history search "bug" --project -home-user-myproject
 # Get message by ref
 mcp-claude-history get --ref c86bc677:1234
 
-# Export to directory under the current working directory (with images)
-mcp-claude-history get --ref c86bc677:1234 --output ./export
+# Export to controlled temp dir (with images)
+mcp-claude-history get --ref c86bc677:1234 --output tmp:export
+
+# Persist under the current working directory
+mcp-claude-history get --ref c86bc677:1234 --output cwd:export
 
 # Chunked retrieval for large content
 mcp-claude-history get --ref c86bc677:1234 --range 0-100000
