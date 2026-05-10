@@ -10,9 +10,16 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { writeFile } from 'fs/promises'
-import { resolve, sep } from 'path'
 import { z } from 'zod'
-import { formatErrorResponse, formatResponse, getUnifiedSession } from '../core/index.js'
+import {
+    CWD_PATH_PREFIX,
+    TMP_PATH_PREFIX,
+    ensureParentDir,
+    formatErrorResponse,
+    formatResponse,
+    getUnifiedSession,
+    resolveScopedOutputPath,
+} from '../core/index.js'
 
 /**
  * cookies 参数 schema
@@ -29,7 +36,10 @@ const cookiesSchema = z.object({
     httpOnly: z.boolean().optional().describe('httpOnly 属性（set）'),
     sameSite: z.enum(['Strict', 'Lax', 'None']).optional().describe('SameSite 属性（set）'),
     expirationDate: z.number().optional().describe('过期时间戳（set）'),
-    output: z.string().optional().describe('输出文件路径（get），若指定 cookies 导出为 JSON 文件'),
+    output: z
+        .string()
+        .optional()
+        .describe(`输出文件路径（get），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}`),
 })
 
 /**
@@ -85,16 +95,13 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                 }>
 
                 if (args.output) {
-                    const cwd = process.cwd()
-                    const safeOutput = resolve(cwd, args.output)
-                    if (!safeOutput.startsWith(cwd + sep) && safeOutput !== cwd) {
-                        return formatErrorResponse(new Error(`output 路径超出工作目录范围: ${args.output}`))
-                    }
-                    await writeFile(safeOutput, JSON.stringify(cookies, null, 2), 'utf-8')
+                    const outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
+                    await ensureParentDir(outputPath)
+                    await writeFile(outputPath, JSON.stringify(cookies, null, 2), 'utf-8')
                     return formatResponse({
                         success: true,
                         action: 'get',
-                        output: safeOutput,
+                        output: outputPath,
                         count: cookies.length,
                     })
                 }

@@ -5,12 +5,18 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { randomUUID } from 'crypto'
 import { readFile, writeFile } from 'fs/promises'
-import { tmpdir } from 'os'
-import { join, resolve, sep } from 'path'
 import { z } from 'zod'
-import { formatErrorResponse, formatResponse, getUnifiedSession } from '../core/index.js'
+import {
+    CWD_PATH_PREFIX,
+    TMP_PATH_PREFIX,
+    ensureParentDir,
+    formatErrorResponse,
+    formatResponse,
+    getUnifiedSession,
+    resolveScopedInputPath,
+    resolveScopedOutputPath,
+} from '../core/index.js'
 
 /**
  * evaluate 参数 schema
@@ -20,7 +26,9 @@ const evaluateSchema = z.object({
     scriptFile: z
         .string()
         .optional()
-        .describe('从文件读取 JavaScript 代码（与 script 二选一），指定后忽略 script 参数，路径限制在当前工作目录内'),
+        .describe(
+            `从文件读取 JavaScript 代码（与 script 二选一），相对路径默认从 ${TMP_PATH_PREFIX} 解析，仓库内文件请显式写 ${CWD_PATH_PREFIX}`
+        ),
     args: z
         .array(z.unknown())
         .optional()
@@ -28,7 +36,9 @@ const evaluateSchema = z.object({
     output: z
         .string()
         .optional()
-        .describe('输出文件路径（可选），若指定字符串结果直接写入原始文本，其他类型序列化为 JSON'),
+        .describe(
+            `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，字符串结果直接写原始文本，其他类型写 JSON`
+        ),
     timeout: z
         .number()
         .optional()
@@ -62,23 +72,20 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
 }> {
     // 输入校验：在 try 外提前返回，避免 throw-catch-in-place
     let script = args.script
-    const cwd = process.cwd()
+    let outputPath: string | undefined
     if (args.scriptFile) {
-        const safePath = resolve(cwd, args.scriptFile)
-        // 用尾部分隔符确保是路径边界，防止前缀同名目录绕过（如 ../cwd-evil/x.js）
-        if (!safePath.startsWith(cwd + sep) && safePath !== cwd) {
-            return formatErrorResponse(new Error(`scriptFile 路径超出工作目录范围: ${args.scriptFile}`))
-        }
         try {
-            script = await readFile(safePath, 'utf-8')
+            const resolvedScriptFile = await resolveScopedInputPath(args.scriptFile, 'mcp-chrome')
+            script = await readFile(resolvedScriptFile.absolutePath, 'utf-8')
         } catch (error) {
             return formatErrorResponse(error)
         }
     }
     if (args.output) {
-        const safeOutput = resolve(cwd, args.output)
-        if (!safeOutput.startsWith(cwd + sep) && safeOutput !== cwd) {
-            return formatErrorResponse(new Error(`output 路径超出工作目录范围: ${args.output}`))
+        try {
+            outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
+        } catch (error) {
+            return formatErrorResponse(error)
         }
     }
     if (!script) {
@@ -93,30 +100,33 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                 const result = await unifiedSession.evaluate(script, args.mode, args.timeout, args.args as unknown[])
                 const normalizedResult = result === undefined ? null : result
 
-                if (args.output) {
-                    const safeOutput = resolve(cwd, args.output)
+                if (outputPath) {
                     // string 类型直接写入原始文本，其他类型 JSON 序列化
                     const content = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                    await writeFile(safeOutput, content, 'utf-8')
+                    await ensureParentDir(outputPath)
+                    await writeFile(outputPath, content, 'utf-8')
                     return formatResponse({
                         success: true,
-                        output: safeOutput,
+                        output: outputPath,
                     })
                 }
 
                 const serialized = JSON.stringify({ success: true, result: normalizedResult }, null, 2)
-                // 检测结果大小，超过 100KB 自动保存到文件
+                // 检测结果大小，超过 100KB 自动保存到受控临时目录
                 if (serialized.length > 100_000) {
                     const suffix = typeof result === 'string' ? 'txt' : 'json'
-                    const tmpPath = join(tmpdir(), `mcp-chrome-eval-${randomUUID()}.${suffix}`)
+                    const autoSavedPath = (
+                        await resolveScopedOutputPath(`${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`, 'mcp-chrome')
+                    ).absolutePath
                     const fileContent = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                    await writeFile(tmpPath, fileContent, 'utf-8')
+                    await ensureParentDir(autoSavedPath)
+                    await writeFile(autoSavedPath, fileContent, 'utf-8')
                     return formatResponse({
                         success: true,
                         autoSaved: true,
-                        path: tmpPath,
+                        path: autoSavedPath,
                         size: fileContent.length,
-                        hint: '结果过大已自动保存到文件，请使用 Read 工具读取',
+                        hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
                     })
                 }
 

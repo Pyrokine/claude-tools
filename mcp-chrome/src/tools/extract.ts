@@ -12,9 +12,18 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { mkdir, writeFile } from 'fs/promises'
-import { basename, dirname, extname, join, resolve, sep } from 'path'
+import { basename, extname, join } from 'path'
 import { z } from 'zod'
-import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
+import {
+    CWD_PATH_PREFIX,
+    TMP_PATH_PREFIX,
+    ensureParentDir,
+    formatErrorResponse,
+    formatResponse,
+    getSession,
+    getUnifiedSession,
+    resolveScopedOutputPath,
+} from '../core/index.js'
 import type { Target } from '../core/types.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
 
@@ -72,7 +81,9 @@ const extractSchema = z.object({
     output: z
         .string()
         .optional()
-        .describe('输出文件路径（可选），若指定结果写入文件，否则返回内容，images=data 时作为输出目录路径'),
+        .describe(
+            `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，images=data 时作为输出目录路径`
+        ),
     tabId: z
         .string()
         .optional()
@@ -121,11 +132,11 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                             ? await extractTextExtension(unifiedSession, args.target)
                             : await extractText(session, args.target, args.timeout)
                         if (args.output) {
-                            await writeOutputFile(args.output, text, 'utf-8')
+                            const outputPath = await writeOutputFile(args.output, text, 'utf-8')
                             return formatResponse({
                                 success: true,
                                 type: 'text',
-                                output: args.output,
+                                output: outputPath,
                                 size: text.length,
                             })
                         }
@@ -147,11 +158,11 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                             ? await extractHtmlExtension(unifiedSession, args.target)
                             : await extractHTML(session, args.target, args.timeout)
                         if (args.output) {
-                            await writeOutputFile(args.output, html, 'utf-8')
+                            const outputPath = await writeOutputFile(args.output, html, 'utf-8')
                             return formatResponse({
                                 success: true,
                                 type: 'html',
-                                output: args.output,
+                                output: outputPath,
                                 size: html.length,
                             })
                         }
@@ -220,11 +231,11 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                         })
                         if (args.output) {
                             // 写入文件
-                            await writeOutputFile(args.output, Buffer.from(base64, 'base64'))
+                            const outputPath = await writeOutputFile(args.output, Buffer.from(base64, 'base64'))
                             return formatResponse({
                                 success: true,
                                 type: 'screenshot',
-                                output: args.output,
+                                output: outputPath,
                             })
                         }
                         // 返回 base64 图片
@@ -265,12 +276,16 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                                 includeDOMRects: true,
                             })
                             if (args.output) {
-                                await writeOutputFile(args.output, JSON.stringify(snapshot, null, 2), 'utf-8')
+                                const outputPath = await writeOutputFile(
+                                    args.output,
+                                    JSON.stringify(snapshot, null, 2),
+                                    'utf-8'
+                                )
                                 return formatResponse({
                                     success: true,
                                     type: 'state',
                                     mode: 'domsnapshot',
-                                    output: args.output,
+                                    output: outputPath,
                                 })
                             }
                             return formatResponse({
@@ -314,11 +329,11 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                             Object.keys(readPageOptions).length > 0 ? readPageOptions : undefined
                         )
                         if (args.output) {
-                            await writeOutputFile(args.output, JSON.stringify(state, null, 2), 'utf-8')
+                            const outputPath = await writeOutputFile(args.output, JSON.stringify(state, null, 2), 'utf-8')
                             return formatResponse({
                                 success: true,
                                 type: 'state',
-                                output: args.output,
+                                output: outputPath,
                             })
                         }
                         return formatResponse({
@@ -331,11 +346,11 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                     case 'metadata': {
                         const metadata = await unifiedSession.getMetadata()
                         if (args.output) {
-                            await writeOutputFile(args.output, JSON.stringify(metadata, null, 2), 'utf-8')
+                            const outputPath = await writeOutputFile(args.output, JSON.stringify(metadata, null, 2), 'utf-8')
                             return formatResponse({
                                 success: true,
                                 type: 'metadata',
-                                output: args.output,
+                                output: outputPath,
                             })
                         }
                         return formatResponse({
@@ -370,15 +385,12 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
 
 // ==================== HTML + 图片提取 ====================
 
-/** 写入文件前自动创建父目录（验证路径在 cwd 范围内）*/
-async function writeOutputFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<void> {
-    const cwd = process.cwd()
-    const safePath = resolve(cwd, path)
-    if (!safePath.startsWith(cwd + sep) && safePath !== cwd) {
-        throw new Error(`output 路径超出工作目录范围: ${path}`)
-    }
-    await mkdir(dirname(safePath), { recursive: true })
-    await writeFile(safePath, data, encoding)
+/** 写入文件前自动创建父目录，并收敛到受控范围 */
+async function writeOutputFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<string> {
+    const resolvedPath = await resolveScopedOutputPath(path, 'mcp-chrome')
+    await ensureParentDir(resolvedPath.absolutePath)
+    await writeFile(resolvedPath.absolutePath, data, encoding)
+    return resolvedPath.absolutePath
 }
 
 /**
@@ -436,11 +448,11 @@ async function handleHtmlWithImages(
         // info 模式：HTML + 图片元信息
         const payload = { type: 'html' as const, content: result.html, images: result.images }
         if (args.output) {
-            await writeOutputFile(args.output, JSON.stringify(payload, null, 2), 'utf-8')
+            const outputPath = await writeOutputFile(args.output, JSON.stringify(payload, null, 2), 'utf-8')
             return formatResponse({
                 success: true,
                 type: 'html',
-                output: args.output,
+                output: outputPath,
                 imageCount: result.images.length,
             })
         }
@@ -459,19 +471,15 @@ async function handleHtmlWithImages(
     )
 
     if (args.output) {
-        const cwd2 = process.cwd()
-        const safeOutputDir = resolve(cwd2, args.output)
-        if (!safeOutputDir.startsWith(cwd2 + sep) && safeOutputDir !== cwd2) {
-            return formatErrorResponse(new Error(`output 路径超出工作目录范围: ${args.output}`))
-        }
+        const outputDir = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
         // 写入目录
-        await writeImageDirectory(safeOutputDir, result.html, result.images, imageDataList)
+        await writeImageDirectory(outputDir, result.html, result.images, imageDataList)
         return formatResponse({
             success: true,
             type: 'html',
-            output: safeOutputDir,
+            output: outputDir,
             imageCount: result.images.length,
-            index: join(safeOutputDir, 'index.json'),
+            index: join(outputDir, 'index.json'),
         })
     }
 

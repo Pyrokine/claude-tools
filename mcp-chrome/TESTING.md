@@ -318,18 +318,16 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### evaluate-precise-08-scriptFile
 
-- 前置：`echo "42" > ./test-output/mcp-eval.js`
-- 操作：`evaluate { scriptFile: "./test-output/mcp-eval.js" }`
+- 前置：在受控临时目录准备 `mcp-eval.js`
+- 操作：`evaluate { scriptFile: "tmp:mcp-eval.js" }`
 - 断言：`result === 42`
 - 载体：任意
-- 清理：`rm ./test-output/mcp-eval.js`
 
 ### evaluate-precise-09-output
 
-- 操作：`evaluate { script: "'hello world'", output: "./test-output/mcp-eval-out.txt" }`
+- 操作：`evaluate { script: "'hello world'", output: "tmp:mcp-eval-out.txt" }`
 - 断言：文件存在，内容为 `hello world`（不带引号）
 - 载体：任意
-- 清理：`rm ./test-output/mcp-eval-out.txt`
 
 ### evaluate-stealth-01
 
@@ -1054,12 +1052,12 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：抛错，消息含 "cannot be scripted" 或类似
 - 载体：chrome:// 页面
 
-### err-output-outside-cwd-01
+### err-output-outside-allowed-roots-01
 
 - 操作：`evaluate { script:"'x'", output:"/etc/passwd" }`
-- 断言：抛错，消息含 "cwd" 或 "outside"
+- 断言：抛错，消息含允许范围或 outside
 
-### err-scriptFile-outside-cwd-01
+### err-scriptFile-outside-allowed-roots-01
 
 - 操作：`evaluate { scriptFile:"/etc/passwd" }`
 - 断言：抛错，路径越界拒绝

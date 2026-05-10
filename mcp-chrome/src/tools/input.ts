@@ -204,6 +204,35 @@ interface InputLocateResult {
  * 如果 target 是选择器类型，先通过 actionableClick 聚焦
  * select/replace 事件用，保证选区建立前 activeElement 就是目标
  */
+async function focusTargetForCommands(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    target: Target,
+    timeout?: number
+): Promise<void> {
+    if ('x' in target || 'y' in target) {
+        return
+    }
+    const params = targetToFindParams(target as Target & { nth?: number })
+    const els = await unifiedSession.find(params.selector, params.text, params.xpath, timeout)
+    const nth0 = params.nth ?? 0
+    if (els.length <= nth0) {
+        return
+    }
+    await unifiedSession.evaluate(
+        `(() => {
+            const ref = window.__mcpElementMap?.[${JSON.stringify(els[nth0].refId)}]
+            const el = ref?.deref()
+            if (!(el instanceof HTMLElement)) {
+                throw new Error('命令聚焦目标不存在')
+            }
+            el.focus()
+            return document.activeElement === el
+        })()`,
+        undefined,
+        timeout
+    )
+}
+
 async function focusTargetIfNeeded(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target | undefined,
@@ -457,11 +486,13 @@ async function executeEventExtension(
     validateEvent(event)
     switch (event.type) {
         case 'keydown': {
+            if (unifiedSession.getInputMode() === 'stealth' && event.commands && event.commands.length > 0) {
+                throw new Error(
+                    'commands 参数不支持 stealth 输入模式，请先调用 manage action=inputMode inputMode=precise 切换后重试'
+                )
+            }
             if (event.commands && event.commands.length > 0 && event.target) {
-                const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-                await unifiedSession.mouseMove(point.x, point.y)
-                await unifiedSession.mouseDown('left')
-                await unifiedSession.mouseUp('left')
+                await focusTargetForCommands(unifiedSession, event.target, timeout)
             }
             await unifiedSession.keyDown(event.key!, event.commands)
             break

@@ -208,19 +208,15 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     async navigate(url: string, options?: { wait?: string; timeout?: number }): Promise<void> {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
         const rpcTimeout = options?.timeout !== undefined ? options.timeout + RPC_MARGIN : undefined
-        const params: {
-            tabId?: number
-            url: string
-            waitUntil: string
-            timeout?: number
-        } = {
+        const params = {
+            tabId: this.currentTabId,
             url,
             waitUntil: options?.wait ?? 'load',
             timeout: options?.timeout,
-        }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
         }
         const result = await this.httpServer.sendCommand('navigate', params, rpcTimeout)
         const tab = result as { id: number; url: string; title: string }
@@ -231,16 +227,17 @@ export class ExtensionBridge implements IBrowserDriver {
     // ==================== 导航操作 ====================
 
     async goBack(timeout?: number): Promise<{ url: string; title: string; navigated: boolean }> {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
         // 默认：NAV_SIGNAL_WINDOW + 导航等待（默认 30s）+ RPC_MARGIN = 40s
         // 调用方传 timeout 时：timeout 即导航超时 + 信号窗口 + 传输余量
         const rpcTimeout =
             timeout !== undefined ? timeout + NAV_SIGNAL_WINDOW + RPC_MARGIN : 30000 + NAV_SIGNAL_WINDOW + RPC_MARGIN
-        const params: { tabId?: number; waitUntil: string; timeout?: number } = {
+        const params = {
+            tabId: this.currentTabId,
             waitUntil: 'load',
             timeout,
-        }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
         }
         const result = (await this.httpServer.sendCommand('go_back', params, rpcTimeout)) as {
             url: string
@@ -252,16 +249,17 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     async goForward(timeout?: number): Promise<{ url: string; title: string; navigated: boolean }> {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
         // 默认：NAV_SIGNAL_WINDOW + 导航等待（默认 30s）+ RPC_MARGIN = 40s
         // 调用方传 timeout 时：timeout 即导航超时 + 信号窗口 + 传输余量
         const rpcTimeout =
             timeout !== undefined ? timeout + NAV_SIGNAL_WINDOW + RPC_MARGIN : 30000 + NAV_SIGNAL_WINDOW + RPC_MARGIN
-        const params: { tabId?: number; waitUntil: string; timeout?: number } = {
+        const params = {
+            tabId: this.currentTabId,
             waitUntil: 'load',
             timeout,
-        }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
         }
         const result = (await this.httpServer.sendCommand('go_forward', params, rpcTimeout)) as {
             url: string
@@ -273,19 +271,15 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     async reload(ignoreCache = false, waitUntil?: string, timeout?: number): Promise<void> {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
         const rpcTimeout = timeout !== undefined ? timeout + RPC_MARGIN : undefined
-        const params: {
-            tabId?: number
-            ignoreCache: boolean
-            waitUntil: string
-            timeout?: number
-        } = {
+        const params = {
+            tabId: this.currentTabId,
             ignoreCache,
             waitUntil: waitUntil ?? 'load',
             timeout,
-        }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
         }
         const result = await this.httpServer.sendCommand('reload', params, rpcTimeout)
         const tab = result as { url: string; title: string }
@@ -788,20 +782,14 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     async stealthType(text: string, delay = 0): Promise<void> {
-        const params: {
-            tabId?: number
-            frameId?: number
-            text: string
-            delay: number
-        } = {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
+        const params = {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId !== null ? this.currentFrameId : undefined,
             text,
             delay,
-        }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
-        }
-        if (this.currentFrameId !== null) {
-            params.frameId = this.currentFrameId
         }
         await this.httpServer.sendCommand('stealth_type', params)
     }
@@ -809,29 +797,25 @@ export class ExtensionBridge implements IBrowserDriver {
     // ==================== Stealth 模式（JS 事件模拟，无 debugger）====================
 
     async stealthKey(key: string, type: 'down' | 'up' | 'press' = 'press', modifiers: string[] = []): Promise<void> {
-        const params: {
-            tabId?: number
-            frameId?: number
-            key: string
-            type: 'down' | 'up' | 'press'
-            modifiers: string[]
-        } = {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
+        const params = {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId !== null ? this.currentFrameId : undefined,
             key,
             type,
             modifiers,
-        }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
-        }
-        if (this.currentFrameId !== null) {
-            params.frameId = this.currentFrameId
         }
         await this.httpServer.sendCommand('stealth_key', params)
     }
 
     async stealthClick(x: number, y: number, button = 'left', clickCount = 1, refId?: string): Promise<void> {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
         const params: {
-            tabId?: number
+            tabId: number
             frameId?: number
             x: number
             y: number
@@ -839,16 +823,12 @@ export class ExtensionBridge implements IBrowserDriver {
             clickCount: number
             refId?: string
         } = {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId !== null ? this.currentFrameId : undefined,
             x,
             y,
             button,
             clickCount,
-        }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
-        }
-        if (this.currentFrameId !== null) {
-            params.frameId = this.currentFrameId
         }
         if (typeof refId === 'string') {
             params.refId = refId
@@ -857,38 +837,27 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     async stealthMouse(type: string, x: number, y: number, button = 'left'): Promise<void> {
-        const params: {
-            tabId?: number
-            frameId?: number
-            type: string
-            x: number
-            y: number
-            button: string
-        } = {
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+        }
+        const params = {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId !== null ? this.currentFrameId : undefined,
             type,
             x,
             y,
             button,
         }
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
-        }
-        if (this.currentFrameId !== null) {
-            params.frameId = this.currentFrameId
-        }
         await this.httpServer.sendCommand('stealth_mouse', params)
     }
 
     async stealthInject(): Promise<void> {
-        const params: {
-            tabId?: number
-            frameId?: number
-        } = {}
-        if (this.currentTabId !== null) {
-            params.tabId = this.currentTabId
+        if (this.currentTabId === null) {
+            throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
         }
-        if (this.currentFrameId !== null) {
-            params.frameId = this.currentFrameId
+        const params = {
+            tabId: this.currentTabId,
+            frameId: this.currentFrameId !== null ? this.currentFrameId : undefined,
         }
         await this.httpServer.sendCommand('stealth_inject', params)
     }

@@ -222,27 +222,40 @@ export class LogEventHandler {
 
         let requests = this.logManager.getNetwork(tabId)
 
-        // Fallback: debugger 不可用时通过 performance API 获取
-        if (requests.length === 0 && this.debuggerManager.isBlocked(tabId)) {
+        if (requests.length === 0) {
             try {
                 const tab = await chrome.tabs.get(tabId)
                 if (!isRestrictedUrl(tab.url)) {
                     const results = await chrome.scripting.executeScript({
                         target: { tabId, frameIds: [0] },
                         func: () => {
-                            const entries = performance.getEntriesByType('resource') as PerformanceResourceTiming[]
-                            return entries.map((e) => ({
-                                url: e.name,
-                                method: '',
-                                type: e.initiatorType,
-                                status: 0,
-                                timestamp: Math.round(e.startTime + performance.timeOrigin),
-                                duration: Math.round(e.duration),
-                            }))
+                            const resources = performance.getEntriesByType('resource') as PerformanceResourceTiming[]
+                            const navigation = performance.getEntriesByType(
+                                'navigation'
+                            ) as PerformanceNavigationTiming[]
+                            return [
+                                ...navigation.map((e) => ({
+                                    url: e.name,
+                                    method: 'GET',
+                                    type: 'Document',
+                                    status: 0,
+                                    timestamp: Math.round(performance.timeOrigin),
+                                    duration: Math.round(e.duration),
+                                })),
+                                ...resources.map((e) => ({
+                                    url: e.name,
+                                    method: '',
+                                    type: e.initiatorType,
+                                    status: 0,
+                                    timestamp: Math.round(e.startTime + performance.timeOrigin),
+                                    duration: Math.round(e.duration),
+                                })),
+                            ]
                         },
                         world: 'MAIN',
                     })
                     requests = (results[0]?.result as NetworkRequest[]) ?? []
+                    this.logManager.setNetwork(tabId, requests)
                 }
             } catch (e) {
                 console.warn('[logs] network fallback (executeScript) failed:', e)

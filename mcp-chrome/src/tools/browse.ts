@@ -229,10 +229,15 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         isError: true,
                     }
                 }
-                await unifiedSession.navigate(args.url, {
-                    wait: args.wait as WaitUntil,
-                    timeout: args.timeout ?? DEFAULT_TIMEOUT,
-                })
+                const currentState = unifiedSession.getState()
+                if (currentState === null) {
+                    await unifiedSession.newPage(args.url)
+                } else {
+                    await unifiedSession.navigate(args.url, {
+                        wait: args.wait as WaitUntil,
+                        timeout: args.timeout ?? DEFAULT_TIMEOUT,
+                    })
+                }
                 const state = unifiedSession.getState()
                 return formatResponse({
                     success: true,

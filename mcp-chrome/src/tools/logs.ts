@@ -8,9 +8,17 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { writeFile } from 'fs/promises'
-import { resolve, sep } from 'path'
 import { z } from 'zod'
-import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
+import {
+    CWD_PATH_PREFIX,
+    TMP_PATH_PREFIX,
+    ensureParentDir,
+    formatErrorResponse,
+    formatResponse,
+    getSession,
+    getUnifiedSession,
+    resolveScopedOutputPath,
+} from '../core/index.js'
 
 /**
  * logs 参数 schema
@@ -21,7 +29,10 @@ const logsSchema = z.object({
     urlPattern: z.string().optional().describe('URL 模式过滤（network），支持通配符'),
     limit: z.number().optional().describe('最大返回条数'),
     clear: z.boolean().optional().describe('获取后清除日志'),
-    output: z.string().optional().describe('输出文件路径，若指定日志导出为 JSON 文件'),
+    output: z
+        .string()
+        .optional()
+        .describe(`输出文件路径，相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}`),
     tabId: z
         .string()
         .optional()
@@ -73,16 +84,13 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     }
 
                     if (args.output) {
-                        const cwd = process.cwd()
-                        const safeOutput = resolve(cwd, args.output)
-                        if (!safeOutput.startsWith(cwd + sep) && safeOutput !== cwd) {
-                            return formatErrorResponse(new Error(`output 路径超出工作目录范围: ${args.output}`))
-                        }
-                        await writeFile(safeOutput, JSON.stringify(logs, null, 2), 'utf-8')
+                        const outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
+                        await ensureParentDir(outputPath)
+                        await writeFile(outputPath, JSON.stringify(logs, null, 2), 'utf-8')
                         return formatResponse({
                             success: true,
                             type: 'console',
-                            output: safeOutput,
+                            output: outputPath,
                             count: logs.length,
                             mode,
                         })
@@ -125,16 +133,13 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     }
 
                     if (args.output) {
-                        const cwd = process.cwd()
-                        const safeOutput = resolve(cwd, args.output)
-                        if (!safeOutput.startsWith(cwd + sep) && safeOutput !== cwd) {
-                            return formatErrorResponse(new Error(`output 路径超出工作目录范围: ${args.output}`))
-                        }
-                        await writeFile(safeOutput, JSON.stringify(requests, null, 2), 'utf-8')
+                        const outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
+                        await ensureParentDir(outputPath)
+                        await writeFile(outputPath, JSON.stringify(requests, null, 2), 'utf-8')
                         return formatResponse({
                             success: true,
                             type: 'network',
-                            output: safeOutput,
+                            output: outputPath,
                             count: requests.length,
                             mode,
                         })

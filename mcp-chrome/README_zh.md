@@ -199,17 +199,17 @@ computed style 的扁平节点数组，便于二次处理），
 | 参数           | 描述                                           |
 |--------------|----------------------------------------------|
 | `script`     | JavaScript 代码，裸 `return` 语句自动包裹 IIFE         |
-| `scriptFile` | 从本地文件读取脚本（与 `script` 二选一，路径限制在当前工作目录内）       |
+| `scriptFile` | 从本地文件读取脚本（与 `script` 二选一，相对路径默认走受控临时目录，仓库内文件请显式写 `cwd:`） |
 | `args`       | 传递给脚本的参数（script 须为函数表达式）                     |
 | `mode`       | `precise`（默认，debugger API）或 `stealth`（JS 注入） |
-| `output`     | 将结果保存到文件（字符串写入原始文本，其他类型 JSON 序列化）            |
+| `output`     | 将结果保存到文件（相对路径默认走受控临时目录，写入仓库请显式写 `cwd:`，字符串写原始文本，其他类型写 JSON） |
 | `tabId`      | 指定目标 Tab（Extension 模式）                       |
 | `frame`      | 指定目标 iframe（CSS 选择器或索引，Extension 模式）         |
 | `timeout`    | 端到端超时预算（毫秒）                                  |
 
-`script` 和 `scriptFile` 至少提供一个，互斥使用，`scriptFile` 路径限制在当前工作目录内（不允许 `../` 穿越），
+`script` 和 `scriptFile` 至少提供一个，互斥使用。相对 `scriptFile` 和 `output` 路径默认写到 `mcp-chrome` 管理的系统临时目录。需要把文件留在当前工作目录时，用 `cwd:relative/path` 显式指定。相对路径会拒绝 `..`，Windows 下也会拒绝 `:`，避免落到 NTFS alternate data stream，
 
-结果超过 100KB 时自动落盘到 `/tmp/`，返回文件路径和大小，
+结果超过 100KB 时自动落盘到受控的系统临时目录，返回文件路径和大小，
 
 ### manage - 页面与环境管理
 
@@ -354,10 +354,10 @@ extract(type="screenshot", fullPage=true)
 extract(type="screenshot", target={ role: "button", name: "提交" })
 
 // JPEG + quality（更小体积）
-extract(type="screenshot", format="jpeg", quality=80, output="/tmp/screenshot.jpg")
+extract(type="screenshot", format="jpeg", quality=80, output="tmp:screenshot.jpg")
 
 // 保存到文件
-extract(type="screenshot", output="/tmp/screenshot.png")
+extract(type="screenshot", output="tmp:screenshot.png")
 ```
 
 ### 提取 HTML 及图片
@@ -367,8 +367,8 @@ extract(type="screenshot", output="/tmp/screenshot.png")
 extract(type="html", target={ css: ".article" }, images="info")
 
 // 获取 HTML + 图片数据，保存到目录
-extract(type="html", images="data", output="/tmp/page")
-// 生成：/tmp/page/content.html, /tmp/page/images/*, /tmp/page/index.json
+extract(type="html", images="data", output="tmp:page")
+// 生成：<系统临时目录>/claude-tools/mcp-chrome/page/content.html, images/*, index.json
 
 // 获取 HTML + 图片数据（内联返回，最多 20 张）
 extract(type="html", target={ css: ".card" }, images="data")

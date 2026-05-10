@@ -209,9 +209,18 @@ export class InputEventHandler {
                     }
                 }
                 const storedState = page.__mcpLastTouchState
+                const isStarting = type === 'touchStart'
                 const isEnding = type === 'touchEnd' || type === 'touchCancel'
-                const effectivePoints = touchPoints.length > 0 ? touchPoints : (storedState?.touchPoints ?? [])
+                const effectivePoints = isStarting
+                    ? touchPoints
+                    : touchPoints.length > 0
+                      ? touchPoints
+                      : (storedState?.touchPoints ?? [])
                 if (effectivePoints.length < 1) {
+                    if (isEnding) {
+                        delete page[stateKey]
+                        return { success: true }
+                    }
                     return {
                         success: false,
                         error: `${eventType} 需要先有 touchstart/touchmove，或显式提供 touchPoints`,
@@ -220,9 +229,10 @@ export class InputEventHandler {
 
                 const firstPoint = effectivePoints[0]
                 const target =
-                    storedState?.target ??
-                    ((document.elementFromPoint(firstPoint.x, firstPoint.y) ??
-                        document.documentElement) as EventTarget & { dispatchEvent: (evt: Event) => boolean })
+                    isStarting || !storedState?.target
+                        ? ((document.elementFromPoint(firstPoint.x, firstPoint.y) ??
+                              document.documentElement) as EventTarget & { dispatchEvent: (evt: Event) => boolean })
+                        : storedState.target
 
                 const touches = effectivePoints.map(
                     (pt, i) =>

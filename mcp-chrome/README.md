@@ -209,18 +209,20 @@ Execute JavaScript in page context.
 | Parameter    | Description                                                                |
 |--------------|----------------------------------------------------------------------------|
 | `script`     | JavaScript code. Bare `return` statements auto-wrapped in IIFE             |
-| `scriptFile` | Read script from a local file (alternative to `script`, restricted to cwd) |
+| `scriptFile` | Read script from a local file (alternative to `script`, relative paths default to controlled temp dir, use `cwd:` for repo files) |
 | `args`       | Arguments passed to script (script must be a function expression)          |
 | `mode`       | `precise` (default, debugger API) or `stealth` (JS injection)              |
-| `output`     | Save result to file (strings written as raw text, others as JSON)          |
+| `output`     | Save result to file (relative paths default to controlled temp dir, use `cwd:` to persist in repo) |
 | `tabId`      | Target a specific tab (Extension mode)                                     |
 | `frame`      | Target an iframe by CSS selector or index (Extension mode)                 |
 | `timeout`    | End-to-end budget (ms)                                                     |
 
-`script` and `scriptFile` are mutually exclusive; at least one must be provided. `scriptFile` paths are restricted to
-the current working directory (no `../` traversal).
+`script` and `scriptFile` are mutually exclusive; at least one must be provided. Relative `scriptFile` and `output`
+paths default to the OS temp directory managed by `mcp-chrome`. Use `cwd:relative/path` when the file must live in the
+current working directory. Relative paths reject `..`, and on Windows they also reject `:` to avoid NTFS alternate data
+streams.
 
-Results >100KB are auto-saved to `/tmp/` with a structured hint returned.
+Results >100KB are auto-saved to the controlled OS temp directory with a structured hint returned.
 
 ### manage - Page & Environment Management
 
@@ -367,10 +369,10 @@ extract(type="screenshot", fullPage=true)
 extract(type="screenshot", target={ role: "button", name: "Submit" })
 
 // JPEG with quality (smaller file)
-extract(type="screenshot", format="jpeg", quality=80, output="/tmp/screenshot.jpg")
+extract(type="screenshot", format="jpeg", quality=80, output="tmp:screenshot.jpg")
 
 // Save to file
-extract(type="screenshot", output="/tmp/screenshot.png")
+extract(type="screenshot", output="tmp:screenshot.png")
 ```
 
 ### Extract HTML with Images
@@ -380,8 +382,8 @@ extract(type="screenshot", output="/tmp/screenshot.png")
 extract(type="html", target={ css: ".article" }, images="info")
 
 // Get HTML + image data, save to directory
-extract(type="html", images="data", output="/tmp/page")
-// Creates: /tmp/page/content.html, /tmp/page/images/*, /tmp/page/index.json
+extract(type="html", images="data", output="tmp:page")
+// Creates: <system-temp>/claude-tools/mcp-chrome/page/content.html, images/*, index.json
 
 // Get HTML + image data inline (max 20 images)
 extract(type="html", target={ css: ".card" }, images="data")
