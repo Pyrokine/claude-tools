@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "MCP Chrome",
-    "version": "2.0.1",
+    "version": "2.0.2",
     "description": "Browser automation for Claude Code via MCP protocol",
     "permissions": ["alarms", "tabs", "activeTab", "scripting", "webNavigation", "tabGroups", "cookies", "debugger"],
     "host_permissions": ["<all_urls>"],
