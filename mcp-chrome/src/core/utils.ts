@@ -105,7 +105,9 @@ async function resolveRelativeScopedPath(
         throw new Error(prefix ? `${prefix} 路径不允许包含 .. 组件` : '相对路径不允许包含 .. 组件')
     }
     if (process.platform === 'win32' && relativePath.includes(':')) {
-        throw new Error(prefix ? `${prefix} 路径在 Windows 上不允许包含 : 字符` : '相对路径在 Windows 上不允许包含 : 字符')
+        throw new Error(
+            prefix ? `${prefix} 路径在 Windows 上不允许包含 : 字符` : '相对路径在 Windows 上不允许包含 : 字符'
+        )
     }
 
     const candidate = resolve(root, relativePath)

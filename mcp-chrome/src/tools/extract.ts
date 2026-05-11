@@ -16,13 +16,13 @@ import { basename, extname, join } from 'path'
 import { z } from 'zod'
 import {
     CWD_PATH_PREFIX,
-    TMP_PATH_PREFIX,
     ensureParentDir,
     formatErrorResponse,
     formatResponse,
     getSession,
     getUnifiedSession,
     resolveScopedOutputPath,
+    TMP_PATH_PREFIX,
 } from '../core/index.js'
 import type { Target } from '../core/types.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
@@ -329,7 +329,11 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                             Object.keys(readPageOptions).length > 0 ? readPageOptions : undefined
                         )
                         if (args.output) {
-                            const outputPath = await writeOutputFile(args.output, JSON.stringify(state, null, 2), 'utf-8')
+                            const outputPath = await writeOutputFile(
+                                args.output,
+                                JSON.stringify(state, null, 2),
+                                'utf-8'
+                            )
                             return formatResponse({
                                 success: true,
                                 type: 'state',
@@ -346,7 +350,11 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                     case 'metadata': {
                         const metadata = await unifiedSession.getMetadata()
                         if (args.output) {
-                            const outputPath = await writeOutputFile(args.output, JSON.stringify(metadata, null, 2), 'utf-8')
+                            const outputPath = await writeOutputFile(
+                                args.output,
+                                JSON.stringify(metadata, null, 2),
+                                'utf-8'
+                            )
                             return formatResponse({
                                 success: true,
                                 type: 'metadata',

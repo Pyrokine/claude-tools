@@ -9,13 +9,13 @@ import { readFile, writeFile } from 'fs/promises'
 import { z } from 'zod'
 import {
     CWD_PATH_PREFIX,
-    TMP_PATH_PREFIX,
     ensureParentDir,
     formatErrorResponse,
     formatResponse,
     getUnifiedSession,
     resolveScopedInputPath,
     resolveScopedOutputPath,
+    TMP_PATH_PREFIX,
 } from '../core/index.js'
 
 /**
@@ -116,7 +116,10 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                 if (serialized.length > 100_000) {
                     const suffix = typeof result === 'string' ? 'txt' : 'json'
                     const autoSavedPath = (
-                        await resolveScopedOutputPath(`${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`, 'mcp-chrome')
+                        await resolveScopedOutputPath(
+                            `${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`,
+                            'mcp-chrome'
+                        )
                     ).absolutePath
                     const fileContent = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
                     await ensureParentDir(autoSavedPath)

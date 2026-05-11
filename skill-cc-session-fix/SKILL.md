@@ -1,6 +1,6 @@
 ---
 name: cc-session-fix
-description: 修复 Claude Code session jsonl 问题 — /resume 失败、resume 后上下文错位、jsonl 过大、resume cancelled，诊断 uuid 链、compact_boundary、resume leaf 选择,安全截断并补 custom-title，当用户说 resume 失败、resume 恢复错位、jsonl 太大、resume 卡住时使用
+description: 修复 Claude Code session jsonl 问题 — /resume 失败、resume 后上下文错位、jsonl 过大、resume cancelled、/compact 报 Invalid signature in thinking block，诊断 uuid 链、compact_boundary、resume leaf 选择，安全截断并补 custom-title，当用户说 resume 失败、resume 恢复错位、jsonl 太大、resume 卡住、compact 失败、thinking block 签名错误时使用
 argument-hint: "[session-id or path]"
 ---
 
@@ -37,6 +37,40 @@ scripts/truncate.py <target> --line <N> --new-session --title "..."
 3. **session 列表里消失** — 可能是 [Issue #25920](https://github.com/anthropics/claude-code/issues/25920) 首条 user >
    15KB 触发 head-read bug，truncate 会自动补 custom-title 绕过
 4. **文件太大打开慢** — 截断到最近 1 万行以内(经验上限,更多会再触发 /compact)
+5. **/compact 报 `Invalid signature in thinking block`** — 用 CPA 等代理将 GPT 接入 CC 后切回 Claude，GPT 返回的
+   thinking block 里 `signature` 字段为空字符串，Claude API 校验失败。修复：扫描 jsonl 删除所有 `signature == ""` 的
+   thinking block，其余内容保留。
+
+   ```python
+   # 快速修复脚本（先备份）
+   import json
+   path = 'your-session.jsonl'
+   out = path + '.fixed'
+   removed = 0
+   with open(path) as fin, open(out, 'w') as fout:
+       for line in fin:
+           s = line.strip()
+           if not s:
+               fout.write(line); continue
+           try:
+               obj = json.loads(s)
+               content = obj.get('message', {}).get('content', [])
+               if isinstance(content, list):
+                   new_c = [b for b in content
+                            if not (isinstance(b, dict)
+                                    and b.get('type') == 'thinking'
+                                    and not b.get('signature', ''))]
+                   if len(new_c) != len(content):
+                       removed += len(content) - len(new_c)
+                       obj['message']['content'] = new_c
+                       fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+                       continue
+           except Exception as e:
+               print(f'warn: line parse error: {e}', flush=True)
+           fout.write(line)
+   print(f'removed {removed} empty-signature thinking blocks')
+   # 验证后 mv out → path
+   ```
 
 ## 细节参考
 

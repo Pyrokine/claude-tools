@@ -206,16 +206,16 @@ the DOM settled, `domStable: false` if still mutating when the budget ran out.
 
 Execute JavaScript in page context.
 
-| Parameter    | Description                                                                |
-|--------------|----------------------------------------------------------------------------|
-| `script`     | JavaScript code. Bare `return` statements auto-wrapped in IIFE             |
+| Parameter    | Description                                                                                                                       |
+|--------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `script`     | JavaScript code. Bare `return` statements auto-wrapped in IIFE                                                                    |
 | `scriptFile` | Read script from a local file (alternative to `script`, relative paths default to controlled temp dir, use `cwd:` for repo files) |
-| `args`       | Arguments passed to script (script must be a function expression)          |
-| `mode`       | `precise` (default, debugger API) or `stealth` (JS injection)              |
-| `output`     | Save result to file (relative paths default to controlled temp dir, use `cwd:` to persist in repo) |
-| `tabId`      | Target a specific tab (Extension mode)                                     |
-| `frame`      | Target an iframe by CSS selector or index (Extension mode)                 |
-| `timeout`    | End-to-end budget (ms)                                                     |
+| `args`       | Arguments passed to script (script must be a function expression)                                                                 |
+| `mode`       | `precise` (default, debugger API) or `stealth` (JS injection)                                                                     |
+| `output`     | Save result to file (relative paths default to controlled temp dir, use `cwd:` to persist in repo)                                |
+| `tabId`      | Target a specific tab (Extension mode)                                                                                            |
+| `frame`      | Target an iframe by CSS selector or index (Extension mode)                                                                        |
+| `timeout`    | End-to-end budget (ms)                                                                                                            |
 
 `script` and `scriptFile` are mutually exclusive; at least one must be provided. Relative `scriptFile` and `output`
 paths default to the OS temp directory managed by `mcp-chrome`. Use `cwd:relative/path` when the file must live in the
