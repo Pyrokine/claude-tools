@@ -143,7 +143,8 @@
 
 1. `history_get(ref="<ref>", output="tmp:mcp-history-test/out.json")` → 应成功
 2. `history_get(ref="<ref>", output="/etc/x.json")` → 应被拒绝（不在允许根目录内）
-3. cwd 内建 symlink `mcp-history-test/escape -> /etc`，再 `output="cwd:mcp-history-test/escape/x.json"` → 应被拒绝（canonicalize
+3. cwd 内建 symlink `mcp-history-test/escape -> /etc`，再 `output="cwd:mcp-history-test/escape/x.json"` →
+   应被拒绝（canonicalize
    后越界）
 
 **预期**：1 通过；2、3 被拒绝；canonicalize 防止 symlink escape

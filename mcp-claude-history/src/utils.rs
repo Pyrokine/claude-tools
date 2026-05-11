@@ -23,9 +23,10 @@ pub fn classify_message(record: &MessageRecord) -> (&'static str, &'static str) 
                         return ("user", "human");
                     }
                     if let Some(arr) = content.as_array() {
-                        if arr.iter().any(|item| {
-                            item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        }) {
+                        if arr
+                            .iter()
+                            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                        {
                             return ("user", "tool_result");
                         }
                     }
@@ -48,22 +49,21 @@ pub fn classify_message(record: &MessageRecord) -> (&'static str, &'static str) 
                     if let Some(arr) = content.as_array() {
                         let has_text = arr.iter().any(|item| {
                             item.get("type").and_then(|t| t.as_str()) == Some("text")
-                                && item
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .is_some_and(|s| !s.is_empty())
+                                && item.get("text").and_then(|t| t.as_str()).is_some_and(|s| !s.is_empty())
                         });
                         if has_text {
                             return ("assistant", "text");
                         }
-                        if arr.iter().any(|item| {
-                            item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                        }) {
+                        if arr
+                            .iter()
+                            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                        {
                             return ("assistant", "tool_use");
                         }
-                        if arr.iter().any(|item| {
-                            item.get("type").and_then(|t| t.as_str()) == Some("thinking")
-                        }) {
+                        if arr
+                            .iter()
+                            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+                        {
                             return ("assistant", "thinking");
                         }
                     }
@@ -121,10 +121,7 @@ pub fn extract_image_data(record: &MessageRecord, index: usize) -> Option<(Strin
 
     let source = item.get("source")?;
     let data = source.get("data").and_then(|d| d.as_str())?;
-    let media_type = source
-        .get("media_type")
-        .and_then(|m| m.as_str())
-        .unwrap_or("image/png");
+    let media_type = source.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/png");
 
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).ok()?;
 
@@ -191,10 +188,7 @@ pub fn replace_images_with_placeholders(record: &MessageRecord) -> String {
                 }
             }
             "tool_use" => {
-                let name = item
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("unknown");
+                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                 let input = item.get("input").map(|i| i.to_string()).unwrap_or_default();
                 let input_preview: String = input.chars().take(200).collect();
                 result.push(format!("[TOOL_USE:{}({})]", name, input_preview));
@@ -246,10 +240,7 @@ pub fn extract_and_replace_images(record: &MessageRecord) -> (String, Vec<ImageI
                 }
             }
             "tool_use" => {
-                let name = item
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("unknown");
+                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                 let input = item.get("input").map(|i| i.to_string()).unwrap_or_default();
                 let input_preview: String = input.chars().take(200).collect();
                 text_parts.push(format!("[TOOL_USE:{}({})]", name, input_preview));
@@ -293,11 +284,7 @@ pub fn truncate_content(content: &str, max_len: usize) -> (String, bool) {
 ///
 /// 匹配位置居中展示，前后各保留 max_len/2 的上下文
 /// 无匹配位置信息时退化为从头截断
-pub fn truncate_around_match(
-    content: &str,
-    match_pos: Option<usize>,
-    max_len: usize,
-) -> (String, bool) {
+pub fn truncate_around_match(content: &str, match_pos: Option<usize>, max_len: usize) -> (String, bool) {
     // 用 chars().count() 单次扫描算字符数，避免预分配 Vec<usize>
     // （预分配在 100KB+ 内容上会消耗 ~800KB+ 临时内存）
     let char_count = content.chars().count();
@@ -308,10 +295,7 @@ pub fn truncate_around_match(
 
     let Some(pos) = match_pos else {
         // 从头截断：用 nth 直接定位第 max_len 个字符的 byte 偏移
-        return (
-            content[..nth_byte_or_end(content, max_len)].to_string(),
-            true,
-        );
+        return (content[..nth_byte_or_end(content, max_len)].to_string(), true);
     };
 
     let half = max_len / 2;
@@ -368,11 +352,7 @@ pub fn parse_search_pattern(pattern: &str, case_sensitive: bool) -> SearchPatter
                 must_not.push(normalize(word));
             }
         } else if word.contains('|') {
-            let or_words: Vec<String> = word
-                .split('|')
-                .filter(|w| !w.is_empty())
-                .map(normalize)
-                .collect();
+            let or_words: Vec<String> = word.split('|').filter(|w| !w.is_empty()).map(normalize).collect();
             if !or_words.is_empty() {
                 any_of.push(or_words);
             }
@@ -389,11 +369,7 @@ pub fn parse_search_pattern(pattern: &str, case_sensitive: bool) -> SearchPatter
 }
 
 /// 检查内容是否匹配搜索模式
-pub fn matches_pattern(
-    content: &str,
-    pattern: &SearchPattern,
-    case_sensitive: bool,
-) -> (bool, Option<usize>) {
+pub fn matches_pattern(content: &str, pattern: &SearchPattern, case_sensitive: bool) -> (bool, Option<usize>) {
     if case_sensitive {
         // must_have（AND）
         for word in &pattern.must_have {

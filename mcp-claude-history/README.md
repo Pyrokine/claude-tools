@@ -99,12 +99,12 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ### history_get
 
-| Parameter | Type   | Description                                 |
-|-----------|--------|---------------------------------------------|
-| `ref`     | string | Required. Message ref (session_prefix:line) |
-| `range`   | string | Character range (e.g., 0-100000)            |
+| Parameter | Type   | Description                                                                                                          |
+|-----------|--------|----------------------------------------------------------------------------------------------------------------------|
+| `ref`     | string | Required. Message ref (session_prefix:line)                                                                          |
+| `range`   | string | Character range (e.g., 0-100000)                                                                                     |
 | `output`  | string | Output directory (auto-extract images, relative paths default to controlled temp dir, use `cwd:` to persist in repo) |
-| `project` | string | Project ID                                  |
+| `project` | string | Project ID                                                                                                           |
 
 ### history_context
 

@@ -4,9 +4,10 @@
 //! tokio::task::spawn_blocking 包装，避免阻塞 rmcp 异步运行时
 
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::*,
-    schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters}, model::*, schemars,
+    tool,
+    tool_handler,
+    tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 
@@ -136,22 +137,14 @@ impl McpHistoryService {
 #[tool_router]
 impl McpHistoryService {
     #[tool(description = "Search through Claude Code conversation history")]
-    async fn history_search(
-        &self,
-        Parameters(p): Parameters<SearchToolParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn history_search(&self, Parameters(p): Parameters<SearchToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
 
         let projects: Vec<String> = p.project.as_deref().map(comma_split).unwrap_or_default();
         let sessions: Vec<String> = p.sessions.as_deref().map(comma_split).unwrap_or_default();
-        let types: Vec<String> =
-            comma_split(p.types.as_deref().unwrap_or("assistant,user,summary"));
+        let types: Vec<String> = comma_split(p.types.as_deref().unwrap_or("assistant,user,summary"));
         let subtypes: Vec<String> = p.subtypes.as_deref().map(comma_split).unwrap_or_default();
-        let lines: Vec<Range> = p
-            .lines
-            .as_deref()
-            .map(Range::parse_ranges)
-            .unwrap_or_default();
+        let lines: Vec<Range> = p.lines.as_deref().map(Range::parse_ranges).unwrap_or_default();
 
         let params = SearchParams {
             pattern: p.pattern.unwrap_or_default(),
@@ -179,10 +172,7 @@ impl McpHistoryService {
     }
 
     #[tool(description = "Get full content of a message by ref")]
-    async fn history_get(
-        &self,
-        Parameters(p): Parameters<GetToolParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn history_get(&self, Parameters(p): Parameters<GetToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let params = GetParams {
             r#ref: p.r#ref,
@@ -197,10 +187,7 @@ impl McpHistoryService {
     }
 
     #[tool(description = "Get surrounding messages for context")]
-    async fn history_context(
-        &self,
-        Parameters(p): Parameters<ContextToolParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn history_context(&self, Parameters(p): Parameters<ContextToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let types: Vec<String> = p.types.as_deref().map(comma_split).unwrap_or_default();
         let params = ContextParams {
@@ -224,10 +211,7 @@ impl McpHistoryService {
     }
 
     #[tool(description = "List all projects with conversation history")]
-    async fn history_projects(
-        &self,
-        _: Parameters<ProjectsToolParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn history_projects(&self, _: Parameters<ProjectsToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let result = tokio::task::spawn_blocking(move || list_projects(&cfg))
             .await
@@ -252,28 +236,16 @@ impl McpHistoryService {
 #[tool_handler]
 impl ServerHandler for McpHistoryService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "mcp-claude-history".to_string(),
-                title: None,
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
-                "MCP server for searching Claude Code conversation history".to_string(),
-            ),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::new("mcp-claude-history", env!("CARGO_PKG_VERSION")))
+            .with_instructions("MCP server for searching Claude Code conversation history")
     }
 }
 
 /// rmcp 路径启动入口（替代 mcp.rs 的 run_mcp_server）
 pub async fn run_mcp_server_rmcp() -> anyhow::Result<()> {
-    let service = McpHistoryService::new()
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let service = McpHistoryService::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

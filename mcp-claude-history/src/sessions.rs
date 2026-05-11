@@ -5,10 +5,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 
 /// 列出项目的会话
-pub fn list_sessions(
-    config: &Config,
-    project_id: Option<&str>,
-) -> Result<SessionsResponse, ErrorResponse> {
+pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<SessionsResponse, ErrorResponse> {
     // 确定项目
     let project_id = match project_id {
         Some(id) => id.to_string(),
@@ -109,11 +106,7 @@ fn get_session_stats(path: &std::path::Path) -> (usize, String, String, Option<S
             end_time = record.timestamp.clone();
 
             // 提取首条 user 消息作为 topic（跳过 summary 和 meta）
-            if topic.is_none()
-                && record.msg_type == "user"
-                && !record.is_compact_summary
-                && !record.is_meta
-            {
+            if topic.is_none() && record.msg_type == "user" && !record.is_compact_summary && !record.is_meta {
                 if let Some(text) = extract_topic_text(&record) {
                     if !text.is_empty() {
                         let preview: String = text.chars().take(100).collect();

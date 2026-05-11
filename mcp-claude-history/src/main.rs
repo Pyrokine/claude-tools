@@ -25,9 +25,7 @@ use utils::parse_range;
 ///   - 成功 → Ok(json)
 ///   - 业务错误 → Err(json)
 ///   - 序列化失败（本地不可能,T/E 都 derive Serialize）→ Err(serde 错误描述)
-fn serialize_result<T: serde::Serialize, E: serde::Serialize>(
-    result: Result<T, E>,
-) -> Result<String, String> {
+fn serialize_result<T: serde::Serialize, E: serde::Serialize>(result: Result<T, E>) -> Result<String, String> {
     match result {
         Ok(v) => serde_json::to_string_pretty(&v).map_err(|e| e.to_string()),
         Err(e) => match serde_json::to_string_pretty(&e) {
@@ -318,9 +316,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Projects => serialize_result(list_projects(&config)),
 
-        Commands::Sessions { project } => {
-            serialize_result(list_sessions(&config, project.as_deref()))
-        }
+        Commands::Sessions { project } => serialize_result(list_sessions(&config, project.as_deref())),
     };
 
     match result {

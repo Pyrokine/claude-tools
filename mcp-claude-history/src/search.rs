@@ -40,11 +40,7 @@ impl Default for SearchParams {
             sessions: Vec::new(),
             since: None,
             until: None,
-            types: vec![
-                "assistant".to_string(),
-                "user".to_string(),
-                "summary".to_string(),
-            ],
+            types: vec!["assistant".to_string(), "user".to_string(), "summary".to_string()],
             subtypes: Vec::new(),
             lines: Vec::new(),
             use_regex: false,
@@ -174,8 +170,7 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
         } else {
             params.max_content
         };
-        let (content, truncated) =
-            truncate_around_match(&result.content, result.match_pos, effective_max);
+        let (content, truncated) = truncate_around_match(&result.content, result.match_pos, effective_max);
         result.content = content;
         result.truncated = truncated || result.truncated;
 
@@ -212,10 +207,7 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
 }
 
 /// 获取要搜索的项目目录
-fn get_project_dirs(
-    config: &Config,
-    params: &SearchParams,
-) -> Result<Vec<(String, PathBuf)>, ErrorResponse> {
+fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(String, PathBuf)>, ErrorResponse> {
     if params.all_projects {
         return config.list_project_dirs().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
@@ -279,9 +271,7 @@ fn collect_jsonl_files(
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    if let Some(session_id) =
-                        session_id_from_filename(&entry.file_name().to_string_lossy())
-                    {
+                    if let Some(session_id) = session_id_from_filename(&entry.file_name().to_string_lossy()) {
                         if session_matches_filter(&session_id, sessions) {
                             files.push((project_id.clone(), session_id, path));
                         }
@@ -304,10 +294,7 @@ fn collect_jsonl_files(
                         if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
                             let filename = entry.file_name().to_string_lossy().to_string();
                             if filename.starts_with("agent-") {
-                                let session_id = filename
-                                    .strip_suffix(".jsonl")
-                                    .unwrap_or(&filename)
-                                    .to_string();
+                                let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
                                 if session_matches_filter(&session_id, sessions) {
                                     files.push((project_id.clone(), session_id, path));
                                 }
@@ -377,11 +364,7 @@ fn search_file(
         }
 
         // 时间过滤
-        if !time_in_range(
-            &record.timestamp,
-            params.since.as_ref(),
-            params.until.as_ref(),
-        ) {
+        if !time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref()) {
             continue;
         }
 
@@ -491,8 +474,7 @@ mod tests {
         p.pattern = String::new(); // 全部命中
 
         let cap = 50;
-        let (lines_scanned, results) =
-            search_file("proj", "session-aaa", &path, &p, None, None, cap);
+        let (lines_scanned, results) = search_file("proj", "session-aaa", &path, &p, None, None, cap);
         assert!(
             results.len() <= cap,
             "results.len()={} should be <= cap={}",
@@ -521,8 +503,7 @@ mod tests {
         p.types = vec!["user".to_string()];
         p.pattern = String::new();
 
-        let (lines_scanned, results) =
-            search_file("proj", "session-bbb", &path, &p, None, None, 1000);
+        let (lines_scanned, results) = search_file("proj", "session-bbb", &path, &p, None, None, 1000);
         assert_eq!(results.len(), 30, "all 30 should be returned");
         assert_eq!(lines_scanned, 30);
 

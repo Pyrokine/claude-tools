@@ -180,10 +180,7 @@ impl ParsedRef {
         }
         let session_prefix = parts[0].to_string();
         let line = parts[1].parse().ok()?;
-        Some(Self {
-            session_prefix,
-            line,
-        })
+        Some(Self { session_prefix, line })
     }
 }
 
@@ -230,11 +227,7 @@ impl Range {
                 } else {
                     parts[1].parse().ok()
                 };
-                ranges.push(Range {
-                    start,
-                    end,
-                    exclude,
-                });
+                ranges.push(Range { start, end, exclude });
             } else if let Ok(n) = part.parse::<usize>() {
                 ranges.push(Range {
                     start: Some(n),

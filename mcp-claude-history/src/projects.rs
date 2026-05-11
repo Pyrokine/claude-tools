@@ -31,9 +31,7 @@ pub fn list_projects(config: &Config) -> Result<ProjectsResponse, ErrorResponse>
             for file in files.flatten() {
                 let file_path = file.path();
                 if file_path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    if let Some(_session_id) =
-                        session_id_from_filename(&file.file_name().to_string_lossy())
-                    {
+                    if let Some(_session_id) = session_id_from_filename(&file.file_name().to_string_lossy()) {
                         session_count += 1;
 
                         if let Ok(meta) = file.metadata() {

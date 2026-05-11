@@ -99,12 +99,12 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ### history_get
 
-| 参数        | 类型     | 说明                     |
-|-----------|--------|------------------------|
-| `ref`     | string | 必填，消息定位（session前8位:行号） |
-| `range`   | string | 字符范围（如 0-100000）       |
+| 参数        | 类型     | 说明                                         |
+|-----------|--------|--------------------------------------------|
+| `ref`     | string | 必填，消息定位（session前8位:行号）                     |
+| `range`   | string | 字符范围（如 0-100000）                           |
 | `output`  | string | 输出目录（自动提取图片，相对路径默认走受控临时目录，写入仓库请显式写 `cwd:`） |
-| `project` | string | 项目 ID                  |
+| `project` | string | 项目 ID                                      |
 
 ### history_context
 

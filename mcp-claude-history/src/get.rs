@@ -43,11 +43,8 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     })?;
 
     // 查找 session 文件
-    let (_project_id, _session_id, path) = find_session_file(
-        config,
-        &parsed_ref.session_prefix,
-        params.project.as_deref(),
-    )?;
+    let (_project_id, _session_id, path) =
+        find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
 
     // 读取指定行
     let file = File::open(&path).map_err(|e| ErrorResponse {
@@ -133,10 +130,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
             error: "content_too_large".to_string(),
             r#ref: params.r#ref,
             size: content_size,
-            suggestion: format!(
-                "使用 --output 导出到文件，或用 --range 0-{} 分块获取",
-                MAX_DIRECT_SIZE
-            ),
+            suggestion: format!("使用 --output 导出到文件，或用 --range 0-{} 分块获取", MAX_DIRECT_SIZE),
         });
     }
 
@@ -240,10 +234,7 @@ fn search_session_in_dirs(
                         }
                         let filename = entry.file_name().to_string_lossy().to_string();
                         if filename.starts_with("agent-") {
-                            let session_id = filename
-                                .strip_suffix(".jsonl")
-                                .unwrap_or(&filename)
-                                .to_string();
+                            let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
                             if ref_prefix(&session_id) == session_prefix {
                                 return Some((project_id.clone(), session_id, path));
                             }
@@ -265,7 +256,6 @@ fn write_output(
     content: &str,
     image_count: usize,
 ) -> Result<GetResponse, ErrorResponse> {
-
     // 仅当目录是新建时才 chmod 0o700，避免 chmod 用户已有目录
     let was_new = !output_dir.exists();
     fs::create_dir_all(output_dir).map_err(|e| ErrorResponse {
@@ -287,12 +277,11 @@ fn write_output(
         available: None,
     })?;
     set_private_permissions(&content_path, 0o600, "文件")?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("写入文件失败: {}", e),
-            available: None,
-        })?;
+    file.write_all(content.as_bytes()).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("写入文件失败: {}", e),
+        available: None,
+    })?;
 
     // 导出图片（失败时记录 warning，不中断）
     let mut image_paths = Vec::new();
@@ -346,11 +335,11 @@ fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
         message: format!("无法获取当前工作目录: {}", e),
         available: None,
     })?)
-    .map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("canonicalize cwd 失败: {}", e),
-        available: None,
-    })?;
+        .map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("canonicalize cwd 失败: {}", e),
+            available: None,
+        })?;
 
     let temp_root = controlled_temp_root()?;
 
@@ -384,11 +373,7 @@ fn controlled_temp_root() -> Result<PathBuf, ErrorResponse> {
     })
 }
 
-fn resolve_relative_output_dir(
-    relative: &str,
-    root: &Path,
-    prefix: &str,
-) -> Result<PathBuf, ErrorResponse> {
+fn resolve_relative_output_dir(relative: &str, root: &Path, prefix: &str) -> Result<PathBuf, ErrorResponse> {
     if relative.is_empty() {
         return Err(ErrorResponse {
             error: "invalid_output_dir".to_string(),
@@ -405,10 +390,7 @@ fn resolve_relative_output_dir(
             available: None,
         });
     }
-    if relative_path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if relative_path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(ErrorResponse {
             error: "invalid_output_dir".to_string(),
             message: format!("{} 路径不允许包含 `..` 组件", prefix),
@@ -427,11 +409,7 @@ fn resolve_relative_output_dir(
     Ok(candidate)
 }
 
-fn resolve_absolute_output_dir(
-    absolute: &Path,
-    cwd_root: &Path,
-    temp_root: &Path,
-) -> Result<PathBuf, ErrorResponse> {
+fn resolve_absolute_output_dir(absolute: &Path, cwd_root: &Path, temp_root: &Path) -> Result<PathBuf, ErrorResponse> {
     let canonical_target = canonicalize_or_ancestor(absolute).map_err(|e| ErrorResponse {
         error: "invalid_output_dir".to_string(),
         message: format!("canonicalize 输出路径失败: {}", e),

@@ -80,17 +80,14 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     // 编译 pattern
     let compiled_regex: Option<Regex> = if let Some(ref pat) = params.pattern {
         if params.regex {
-            match RegexBuilder::new(pat)
-                .case_insensitive(!params.case_sensitive)
-                .build()
-            {
+            match RegexBuilder::new(pat).case_insensitive(!params.case_sensitive).build() {
                 Ok(r) => Some(r),
                 Err(e) => {
                     return Err(ErrorResponse {
                         error: "invalid_regex".to_string(),
                         message: format!("无效的正则表达式: {}", e),
                         available: None,
-                    })
+                    });
                 }
             }
         } else {
@@ -117,11 +114,8 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     })?;
 
     // 查找 session 文件
-    let (_project_id, session_id, path) = find_session_file(
-        config,
-        &parsed_ref.session_prefix,
-        params.project.as_deref(),
-    )?;
+    let (_project_id, session_id, path) =
+        find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
 
     // 读取文件
     let file = File::open(&path).map_err(|e| ErrorResponse {
@@ -222,12 +216,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             let mut count = 0;
             for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
                 let type_ok = matches_types(msg.effective_type, &params.types);
-                let pattern_ok = matches_pattern(
-                    &msg.content,
-                    &compiled_regex,
-                    &plain_pattern,
-                    params.case_sensitive,
-                );
+                let pattern_ok = matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive);
                 if type_ok && pattern_ok {
                     count += 1;
                     end = i + 1;
@@ -246,12 +235,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     let mut total_chars = 0;
     let mut truncated_by_total = false;
 
-    for (i, msg) in all_messages
-        .iter()
-        .enumerate()
-        .take(end_idx)
-        .skip(start_idx)
-    {
+    for (i, msg) in all_messages.iter().enumerate().take(end_idx).skip(start_idx) {
         let is_anchor = i == anchor_idx;
         if !is_anchor && !matches_types(msg.effective_type, &params.types) {
             continue;
@@ -259,12 +243,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         // pattern 过滤（anchor 消息始终保留）
         let has_pattern_filter = compiled_regex.is_some() || plain_pattern.is_some();
         let pattern_ok = !has_pattern_filter
-            || matches_pattern(
-            &msg.content,
-            &compiled_regex,
-            &plain_pattern,
-            params.case_sensitive,
-        );
+            || matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive);
         if !is_anchor && !pattern_ok {
             continue;
         }

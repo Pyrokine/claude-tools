@@ -88,10 +88,7 @@ fn validate_project_id(project_id: &str) -> Result<(), ErrorResponse> {
     if !project_id.chars().all(allowed) {
         return Err(ErrorResponse {
             error: "invalid_project_id".to_string(),
-            message: format!(
-                "project_id 仅允许字母、数字、`-`、`_`,实际值: {}",
-                project_id
-            ),
+            message: format!("project_id 仅允许字母、数字、`-`、`_`,实际值: {}", project_id),
             available: None,
         });
     }
