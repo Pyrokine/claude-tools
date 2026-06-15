@@ -37,14 +37,16 @@ scripts/truncate.py <target> --line <N> --new-session --title "..."
 3. **session 列表里消失** — 可能是 [Issue #25920](https://github.com/anthropics/claude-code/issues/25920) 首条 user >
    15KB 触发 head-read bug，truncate 会自动补 custom-title 绕过
 4. **文件太大打开慢** — 截断到最近 1 万行以内(经验上限,更多会再触发 /compact)
-5. **/compact 报 `Invalid signature in thinking block`** — 用 CPA 等代理将 GPT 接入 CC 后切回 Claude，GPT 返回的
-   thinking block 里 `signature` 字段为空字符串，Claude API 校验失败。修复：扫描 jsonl 删除所有 `signature == ""` 的
-   thinking block，其余内容保留。
+5. **/compact 报 `Invalid signature in thinking block`** — 两种情况：
+    - 签名为空字符串：CPA 等代理将 GPT 接入 CC，GPT 返回的 thinking block 没有有效签名
+    - 签名存在但无效：oneapi/Bedrock 代理的 API key 和生成 thinking 时的 key 不一致，签名校验失败
+
+   修复：删除所有 thinking block（不只是空签名的），thinking 内容是内部推理，删除不影响对话继续
 
    ```python
-   # 快速修复脚本（先备份）
-   import json
-   path = 'your-session.jsonl'
+   import json, sys, os, shutil, time
+   path = sys.argv[1]
+   shutil.copy2(path, f"{path}.bak.{time.strftime('%Y%m%d%H%M%S')}")
    out = path + '.fixed'
    removed = 0
    with open(path) as fin, open(out, 'w') as fout:
@@ -58,18 +60,17 @@ scripts/truncate.py <target> --line <N> --new-session --title "..."
                if isinstance(content, list):
                    new_c = [b for b in content
                             if not (isinstance(b, dict)
-                                    and b.get('type') == 'thinking'
-                                    and not b.get('signature', ''))]
+                                    and b.get('type') == 'thinking')]
                    if len(new_c) != len(content):
                        removed += len(content) - len(new_c)
                        obj['message']['content'] = new_c
                        fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
                        continue
            except Exception as e:
-               print(f'warn: line parse error: {e}', flush=True)
+               print(f'warn: {e}', flush=True)
            fout.write(line)
-   print(f'removed {removed} empty-signature thinking blocks')
-   # 验证后 mv out → path
+   os.replace(out, path)
+   print(f'removed {removed} thinking blocks')
    ```
 
 ## 细节参考

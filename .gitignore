@@ -13,5 +13,9 @@ target/
 # OS
 .DS_Store
 
-# Claude Code
 .claude/
+.antigravitycli/
+.ccg/
+
+test-output/
+__pycache__/
