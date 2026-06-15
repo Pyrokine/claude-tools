@@ -35,10 +35,57 @@ impl Config {
         }
     }
 
-    /// 获取项目目录,project_id 必须只含字母、数字、`_`、`-`,不允许 `/`、`\`、`..`、首字符 `.`
+    /// 获取项目目录，允许传 project id；普通路径只会被归一化为已存在的唯一 project id
     pub fn project_dir(&self, project_id: &str) -> Result<PathBuf, ErrorResponse> {
-        validate_project_id(project_id)?;
+        let project_id = self.normalize_project_id(project_id)?;
         Ok(self.projects_dir.join(project_id))
+    }
+
+    pub fn normalize_project_id(&self, raw: &str) -> Result<String, ErrorResponse> {
+        if validate_project_id(raw).is_ok() {
+            return Ok(raw.to_string());
+        }
+
+        let normalized = raw.replace(['\\', '/', ':', '_'], "-");
+        let candidates: Vec<_> = self
+            .list_project_dirs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, _)| {
+                let path = project_id_to_display_path(&id);
+                if id == normalized || path == raw {
+                    Some(serde_json::json!({ "id": id, "path": path }))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if candidates.len() == 1
+            && let Some(id) = candidates[0].get("id").and_then(|v| v.as_str())
+        {
+            return Ok(id.to_string());
+        }
+
+        let mut available = serde_json::Map::new();
+        available.insert(
+            "candidate_project_id".to_string(),
+            serde_json::Value::String(normalized),
+        );
+        available.insert("candidates".to_string(), serde_json::Value::Array(candidates));
+        available.insert(
+            "examples".to_string(),
+            serde_json::json!(["project=<project-id>", "project=<absolute-project-path>"]),
+        );
+
+        Err(ErrorResponse {
+            error: "invalid_project_id".to_string(),
+            message: format!(
+                "project 参数既不是有效 project id，也不能唯一映射到已存在 project: {}",
+                raw
+            ),
+            available: Some(serde_json::Value::Object(available)),
+        })
     }
 
     /// 列出所有项目目录

@@ -31,6 +31,7 @@ pub struct GetParams {
     pub range: Option<(usize, usize)>,
     pub output: Option<String>,
     pub project: Option<String>,
+    pub redaction: RedactionMode,
 }
 
 /// 获取完整内容
@@ -82,55 +83,65 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
 
     // 提取内容和图片
     let (effective_type, _) = classify_message(&record);
-    let content = replace_images_with_placeholders(&record);
+    let raw_content = replace_images_with_placeholders(&record);
     let images = extract_images(&record);
     let image_count = images.len();
-    let content_size = content.chars().count();
+    let original_content_size = raw_content.chars().count();
 
-    // 如果指定了 output，写入文件
-    if let Some(output_dir) = params.output {
-        let resolved_output = resolve_output_dir(&output_dir)?;
-        return write_output(&resolved_output, &params.r#ref, &record, &content, image_count);
-    }
-
-    // 如果指定了 range，返回部分内容
-    if let Some((start, end)) = params.range {
-        // content_size 已是 content 的字符数，无需再次遍历
-        let content_len = content_size;
+    let ranged_content = if let Some((start, end)) = params.range {
         if start > end {
-            return Err(ErrorResponse {
-                error: "invalid_range".to_string(),
-                message: format!("range start({}) 大于 end({})", start, end),
-                available: None,
-            });
+            return Err(invalid_range_response(start, end, original_content_size));
         }
-        if start >= content_len {
-            return Err(ErrorResponse {
-                error: "invalid_range".to_string(),
-                message: format!("range start({}) 已超出内容长度({})", start, content_len),
-                available: None,
-            });
+        if start >= original_content_size {
+            return Err(invalid_range_response(start, end, original_content_size));
         }
-        let end = end.min(content_len);
-        let partial_content: String = content.chars().skip(start).take(end - start).collect();
-        let partial_size = partial_content.chars().count();
-        return Ok(GetResponse::Success {
-            r#ref: params.r#ref,
-            r#type: effective_type.to_string(),
-            content: partial_content,
-            content_size: partial_size,
+        let end = end.min(original_content_size);
+        raw_content.chars().skip(start).take(end - start).collect::<String>()
+    } else {
+        raw_content
+    };
+    let redaction = redact_text_with_mode(&ranged_content, params.redaction);
+    let content = redaction.text;
+    let selected_content_size = content.chars().count();
+
+    if let Some(output_raw) = params.output {
+        let resolved_output = resolve_output_files(
+            &output_raw,
+            &format!("{}.txt", params.r#ref.replace(':', "_")),
+            "manifest.json",
+        )?;
+        return write_output(OutputWriteRequest {
+            output: resolved_output,
+            r#ref: &params.r#ref,
+            record: &record,
+            content: &content,
+            content_size: selected_content_size,
+            original_content_size,
             image_count,
+            redaction_mode: params.redaction,
+            redacted_count: redaction.count,
         });
     }
 
-    // 检查内容大小（字符数）
     const MAX_DIRECT_SIZE: usize = 100_000;
-    if content_size > MAX_DIRECT_SIZE {
+    if selected_content_size > MAX_DIRECT_SIZE {
         return Ok(GetResponse::TooLarge {
             error: "content_too_large".to_string(),
             r#ref: params.r#ref,
-            size: content_size,
+            size: selected_content_size,
+            content_size: selected_content_size,
+            valid_range: valid_range_label(original_content_size),
             suggestion: format!("使用 --output 导出到文件，或用 --range 0-{} 分块获取", MAX_DIRECT_SIZE),
+            truncation_reason: format!(
+                "content_size {} exceeds max direct response {}",
+                selected_content_size, MAX_DIRECT_SIZE
+            ),
+            output_suggestion: "使用 output=tmp:export 导出到受控临时目录，或 output=cwd:export 持久化到当前工作目录"
+                .to_string(),
+            range_suggestion: format!("0-{}", MAX_DIRECT_SIZE.min(original_content_size)),
+            parsed_range: params.range.map(|(start, end)| RangeInfo { start, end }),
+            head: content.chars().take(2000).collect(),
+            tail: tail_chars(&content, 2000),
         });
     }
 
@@ -138,9 +149,46 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
         r#ref: params.r#ref,
         r#type: effective_type.to_string(),
         content,
-        content_size,
+        content_size: selected_content_size,
         image_count,
     })
+}
+
+fn tail_chars(content: &str, max_len: usize) -> String {
+    let char_count = content.chars().count();
+    if char_count <= max_len {
+        return content.to_string();
+    }
+    content.chars().skip(char_count - max_len).collect()
+}
+
+fn valid_range_example(original_content_size: usize) -> Option<String> {
+    if original_content_size == 0 {
+        return None;
+    }
+    Some(format!("0-{}", original_content_size.min(100_000)))
+}
+
+fn valid_range_label(original_content_size: usize) -> String {
+    valid_range_example(original_content_size).unwrap_or_else(|| "empty content has no valid range".to_string())
+}
+
+fn invalid_range_response(start: usize, end: usize, original_content_size: usize) -> ErrorResponse {
+    ErrorResponse {
+        error: "invalid_range".to_string(),
+        message: format!(
+            "range {}-{} 无效，original_content_size={}，valid_range 示例 {}",
+            start,
+            end,
+            original_content_size,
+            valid_range_label(original_content_size)
+        ),
+        available: Some(serde_json::json!({
+            "original_content_size": original_content_size,
+            "valid_range": valid_range_example(original_content_size),
+            "parsed_range": { "start": start, "end": end }
+        })),
+    }
 }
 
 /// 查找 session 文件
@@ -151,15 +199,16 @@ pub fn find_session_file(
 ) -> Result<(String, String, PathBuf), ErrorResponse> {
     // 确定要搜索的项目
     let project_dirs: Vec<(String, PathBuf)> = if let Some(pid) = project_id {
-        let dir = config.project_dir(pid)?;
+        let normalized = config.normalize_project_id(pid)?;
+        let dir = config.project_dir(&normalized)?;
         if !dir.exists() {
             return Err(ErrorResponse {
                 error: "project_not_found".to_string(),
-                message: format!("项目不存在: {}", pid),
+                message: format!("项目不存在: {}", normalized),
                 available: None,
             });
         }
-        vec![(pid.to_string(), dir)]
+        vec![(normalized, dir)]
     } else if let Some(pid) = config.current_project_id() {
         // 优先搜当前项目（current_project_id 返回的 id 已通过 cwd 转码,可信）
         match config.project_dir(&pid) {
@@ -170,26 +219,34 @@ pub fn find_session_file(
         config.list_project_dirs().unwrap_or_default()
     };
 
-    // 在项目中查找匹配的 session
-    if let Some(result) = search_session_in_dirs(&project_dirs, session_prefix) {
-        return Ok(result);
+    let mut matches = search_sessions_in_dirs(&project_dirs, session_prefix);
+
+    if project_id.is_none()
+        && let Ok(all_dirs) = config.list_project_dirs()
+    {
+        let remaining: Vec<_> = all_dirs
+            .into_iter()
+            .filter(|(id, _)| !project_dirs.iter().any(|(pid, _)| pid == id))
+            .collect();
+        if !remaining.is_empty() {
+            matches.extend(search_sessions_in_dirs(&remaining, session_prefix));
+        }
     }
 
-    // 当前项目未找到时，fallback 到搜索所有项目
-    // （search 返回的 ref 可能来自其他项目，用户未必传 project 参数）
-    if project_id.is_none() {
-        if let Ok(all_dirs) = config.list_project_dirs() {
-            // 排除已搜过的当前项目，避免重复扫描
-            let remaining: Vec<_> = all_dirs
-                .into_iter()
-                .filter(|(id, _)| !project_dirs.iter().any(|(pid, _)| pid == id))
-                .collect();
-            if !remaining.is_empty() {
-                if let Some(result) = search_session_in_dirs(&remaining, session_prefix) {
-                    return Ok(result);
-                }
-            }
-        }
+    if matches.len() == 1 {
+        return Ok(matches.remove(0));
+    }
+    if matches.len() > 1 {
+        return Err(ErrorResponse {
+            error: "session_ambiguous".to_string(),
+            message: format!("session prefix 不唯一: {}，请传 project 或完整 ref", session_prefix),
+            available: Some(serde_json::json!({
+                "candidates": matches
+                    .iter()
+                    .map(|(project, session, _)| format!("{}:{}", project, session))
+                    .collect::<Vec<_>>()
+            })),
+        });
     }
 
     Err(ErrorResponse {
@@ -200,12 +257,9 @@ pub fn find_session_file(
 }
 
 /// 在指定的项目目录列表中搜索匹配 session prefix 的文件
-fn search_session_in_dirs(
-    project_dirs: &[(String, PathBuf)],
-    session_prefix: &str,
-) -> Option<(String, String, PathBuf)> {
+fn search_sessions_in_dirs(project_dirs: &[(String, PathBuf)], session_prefix: &str) -> Vec<(String, String, PathBuf)> {
+    let mut matches = Vec::new();
     for (project_id, dir) in project_dirs {
-        // 搜索主目录的 .jsonl 文件
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -214,29 +268,30 @@ fn search_session_in_dirs(
                 }
 
                 let filename = entry.file_name().to_string_lossy().to_string();
-                if let Some(session_id) = session_id_from_filename(&filename) {
-                    if ref_prefix(&session_id) == session_prefix {
-                        return Some((project_id.clone(), session_id, path));
-                    }
+                if let Some(session_id) = session_id_from_filename(&filename)
+                    && (ref_prefix(&session_id) == session_prefix || session_id == session_prefix)
+                {
+                    matches.push((project_id.clone(), session_id, path));
                 }
             }
         }
 
-        // 搜索 subagents 目录中的 agent session
-        let subagents_pattern = dir.join("*/subagents");
-        if let Ok(entries) = glob::glob(&subagents_pattern.to_string_lossy()) {
-            for subdir in entries.flatten() {
-                if let Ok(sub_entries) = fs::read_dir(&subdir) {
-                    for entry in sub_entries.flatten() {
-                        let path = entry.path();
-                        if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                            continue;
-                        }
-                        let filename = entry.file_name().to_string_lossy().to_string();
-                        if filename.starts_with("agent-") {
-                            let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
-                            if ref_prefix(&session_id) == session_prefix {
-                                return Some((project_id.clone(), session_id, path));
+        for sidechain_dir in SIDECHAIN_SESSION_DIRS {
+            let pattern = dir.join("*/").join(sidechain_dir);
+            if let Ok(entries) = glob::glob(&pattern.to_string_lossy()) {
+                for subdir in entries.flatten() {
+                    if let Ok(sub_entries) = fs::read_dir(&subdir) {
+                        for entry in sub_entries.flatten() {
+                            let path = entry.path();
+                            if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                                continue;
+                            }
+                            let filename = entry.file_name().to_string_lossy().to_string();
+                            if filename.starts_with("agent-") {
+                                let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
+                                if ref_prefix(&session_id) == session_prefix || session_id == session_prefix {
+                                    matches.push((project_id.clone(), session_id, path));
+                                }
                             }
                         }
                     }
@@ -245,39 +300,110 @@ fn search_session_in_dirs(
         }
     }
 
-    None
+    matches
+}
+
+pub struct ResolvedOutputFiles {
+    pub directory: PathBuf,
+    pub content: PathBuf,
+    pub manifest: PathBuf,
+}
+
+pub fn resolve_output_files(
+    raw_output: &str,
+    default_file_name: &str,
+    default_manifest_name: &str,
+) -> Result<ResolvedOutputFiles, ErrorResponse> {
+    let trimmed = raw_output.trim();
+    let path_part = trimmed
+        .strip_prefix(TMP_PATH_PREFIX)
+        .or_else(|| trimmed.strip_prefix(CWD_PATH_PREFIX))
+        .unwrap_or(trimmed);
+    let requested_path = Path::new(path_part);
+    if requested_path.extension().is_none() {
+        let directory = resolve_output_dir(trimmed)?;
+        return Ok(ResolvedOutputFiles {
+            content: directory.join(default_file_name),
+            manifest: directory.join(default_manifest_name),
+            directory,
+        });
+    }
+
+    let file_name = requested_path.file_name().ok_or_else(|| ErrorResponse {
+        error: "invalid_output_dir".to_string(),
+        message: "output 指向文件时必须包含文件名".to_string(),
+        available: Some(serde_json::json!({
+            "examples": ["tmp:export.txt", "tmp:export/output.txt", "cwd:export/output.txt"]
+        })),
+    })?;
+    let parent = requested_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent_output = prefixed_parent_output(trimmed, parent);
+    let directory = resolve_output_dir(&parent_output)?;
+    let content = directory.join(file_name);
+    let manifest_name = format!(
+        "{}_manifest.json",
+        content.file_stem().and_then(|s| s.to_str()).unwrap_or("output")
+    );
+    let manifest = content.with_file_name(manifest_name);
+    Ok(ResolvedOutputFiles {
+        directory,
+        content,
+        manifest,
+    })
+}
+
+fn prefixed_parent_output(trimmed: &str, parent: &Path) -> String {
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if trimmed.starts_with(TMP_PATH_PREFIX) {
+        format!("{}{}", TMP_PATH_PREFIX, parent.display())
+    } else if trimmed.starts_with(CWD_PATH_PREFIX) {
+        format!("{}{}", CWD_PATH_PREFIX, parent.display())
+    } else {
+        parent.display().to_string()
+    }
+}
+
+struct OutputWriteRequest<'a> {
+    output: ResolvedOutputFiles,
+    r#ref: &'a str,
+    record: &'a MessageRecord,
+    content: &'a str,
+    content_size: usize,
+    original_content_size: usize,
+    image_count: usize,
+    redaction_mode: RedactionMode,
+    redacted_count: usize,
 }
 
 /// 写入输出文件
-fn write_output(
-    output_dir: &PathBuf,
-    r#ref: &str,
-    record: &MessageRecord,
-    content: &str,
-    image_count: usize,
-) -> Result<GetResponse, ErrorResponse> {
-    // 仅当目录是新建时才 chmod 0o700，避免 chmod 用户已有目录
+fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorResponse> {
+    let output_dir = request.output.directory;
+    let content_path = request.output.content;
+    let manifest_path = request.output.manifest;
+    let safe_ref = request.r#ref.replace(':', "_");
+
     let was_new = !output_dir.exists();
-    fs::create_dir_all(output_dir).map_err(|e| ErrorResponse {
+    fs::create_dir_all(&output_dir).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("无法创建输出目录: {}", e),
         available: None,
     })?;
     if was_new {
-        set_private_permissions(output_dir, 0o700, "目录")?;
+        set_private_permissions(&output_dir, 0o700, "目录")?;
     }
 
-    let safe_ref = r#ref.replace(':', "_");
-
     // 写入内容文件（mode 0o600）
-    let content_path = output_dir.join(format!("{}.txt", safe_ref));
     let mut file = File::create(&content_path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("无法创建文件: {}", e),
         available: None,
     })?;
     set_private_permissions(&content_path, 0o600, "文件")?;
-    file.write_all(content.as_bytes()).map_err(|e| ErrorResponse {
+    file.write_all(request.content.as_bytes()).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("写入文件失败: {}", e),
         available: None,
@@ -286,9 +412,9 @@ fn write_output(
     // 导出图片（失败时记录 warning，不中断）
     let mut image_paths = Vec::new();
     let mut image_warnings = Vec::new();
-    let images = extract_images(record);
+    let images = extract_images(request.record);
     for img in &images {
-        if let Some((ext, data)) = extract_image_data(record, img.index) {
+        if let Some((ext, data)) = extract_image_data(request.record, img.index) {
             let img_path = output_dir.join(format!("{}_img{}.{}", safe_ref, img.index, ext));
             match File::create(&img_path) {
                 Ok(mut img_file) => {
@@ -309,18 +435,65 @@ fn write_output(
         eprintln!("[get] 图片导出警告: {}", image_warnings.join("; "));
     }
 
+    let bytes = fs::metadata(&content_path).map(|m| m.len()).unwrap_or(0);
+    let lines = request.content.lines().count();
+    let redaction = redaction_info(
+        request.redaction_mode,
+        request.redacted_count,
+        request.redaction_mode == RedactionMode::Off || request.redacted_count > 0,
+    );
+    let manifest = serde_json::json!({
+        "schema": "mcp-claude-history.get-output.v1",
+        "ref": request.r#ref,
+        "content_size": request.content_size,
+        "original_content_size": request.original_content_size,
+        "content": content_path,
+        "images": &image_paths,
+        "bytes": bytes,
+        "lines": lines,
+        "complete": true,
+        "sample_kind": if request.content_size == request.original_content_size { "all" } else { "range" },
+        "redaction": &redaction,
+    });
+    let mut manifest_file = File::create(&manifest_path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法创建 manifest: {}", e),
+        available: None,
+    })?;
+    set_private_permissions(&manifest_path, 0o600, "manifest")?;
+    manifest_file
+        .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
+        .map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("写入 manifest 失败: {}", e),
+            available: None,
+        })?;
+
     Ok(GetResponse::Output {
-        r#ref: r#ref.to_string(),
+        r#ref: request.r#ref.to_string(),
         output: OutputInfo {
             content: content_path,
+            manifest: manifest_path,
             images: image_paths,
+            bytes,
+            lines,
+            schema: "mcp-claude-history.get-output.v1".to_string(),
+            complete: true,
+            sample_kind: if request.content_size == request.original_content_size {
+                "all"
+            } else {
+                "range"
+            }
+            .to_string(),
+            redaction,
         },
-        content_size: content.chars().count(),
-        image_count,
+        content_size: request.content_size,
+        original_content_size: request.original_content_size,
+        image_count: request.image_count,
     })
 }
 
-fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
+pub fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
     let trimmed = raw_output.trim();
     if trimmed.is_empty() {
         return Err(ErrorResponse {
@@ -335,11 +508,11 @@ fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
         message: format!("无法获取当前工作目录: {}", e),
         available: None,
     })?)
-        .map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("canonicalize cwd 失败: {}", e),
-            available: None,
-        })?;
+    .map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("canonicalize cwd 失败: {}", e),
+        available: None,
+    })?;
 
     let temp_root = controlled_temp_root()?;
 
@@ -423,10 +596,13 @@ fn resolve_absolute_output_dir(absolute: &Path, cwd_root: &Path, temp_root: &Pat
     Err(ErrorResponse {
         error: "invalid_output_dir".to_string(),
         message: format!(
-            "输出目录超出允许范围: {}，仅允许当前工作目录或受控临时目录",
+            "输出目录超出允许范围: {}，仅允许当前工作目录或受控临时目录；临时导出请使用 tmp:relative/path，仓库内持久化请使用 cwd:relative/path",
             canonical_target.display()
         ),
-        available: None,
+        available: Some(serde_json::json!({
+            "examples": ["tmp:export", "tmp:export/search-results.jsonl", "cwd:export"],
+            "note": "普通相对路径默认写入受控临时目录，tmp: 和 cwd: 后面都必须是相对路径"
+        })),
     })
 }
 

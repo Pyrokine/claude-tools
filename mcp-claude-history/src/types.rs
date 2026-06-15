@@ -36,9 +36,64 @@ pub struct SearchResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageInfo>,
     pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_input_redacted: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_redacted: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_is_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_filters: Vec<String>,
     /// 匹配位置（字符偏移），用于截断时居中显示上下文
     #[serde(skip)]
     pub match_pos: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchCoverage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    pub projects: Vec<String>,
+    pub sessions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub searched_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SearchSummary {
+    pub by_project: Vec<SummaryBucket>,
+    pub by_session: Vec<SummaryBucket>,
+    pub by_type: Vec<SummaryBucket>,
+    pub by_server: Vec<SummaryBucket>,
+    pub by_tool: Vec<SummaryBucket>,
+    pub by_day: Vec<SummaryBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchSliceInfo {
+    pub raw: String,
+    pub start: usize,
+    pub end: usize,
+    pub total_before_slice: usize,
+    pub total_after_slice: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryBucket {
+    pub key: String,
+    pub count: usize,
 }
 
 /// 图片信息
@@ -46,6 +101,14 @@ pub struct SearchResult {
 pub struct ImageInfo {
     pub index: usize,
     pub size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 /// 搜索统计
@@ -56,6 +119,20 @@ pub struct SearchStats {
     pub total_matches: usize,
     pub returned_count: usize,
     pub time_ms: u64,
+    pub total_matches_exact: bool,
+    pub incomplete: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_reasons: Vec<String>,
+    pub coverage: SearchCoverage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SearchSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slice: Option<SearchSliceInfo>,
+    pub effective_filters: EffectiveFilters,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// 是否触发了全局命中硬上限截断（GLOBAL_RESULT_CAP）；
     /// 客户端看到 has_more=false + truncated_global=true 应理解为"翻完但被截，需缩小搜索"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +146,57 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     pub has_more: bool,
     pub next_offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_query: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<SearchOutputInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EffectiveFilters {
+    pub pattern: String,
+    pub projects: Vec<String>,
+    pub all_projects: bool,
+    pub sessions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    pub types: Vec<String>,
+    pub subtypes: Vec<String>,
+    pub servers: Vec<String>,
+    pub tools: Vec<String>,
+    pub regex: bool,
+    pub case_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchOutputInfo {
+    pub results: PathBuf,
+    pub manifest: PathBuf,
+    pub format: String,
+    pub export_scope: String,
+    pub total_matches: usize,
+    pub written_count: usize,
+    pub content_truncated_count: usize,
+    pub complete: bool,
+    pub sample_kind: String,
+    pub bytes: u64,
+    pub lines: usize,
+    pub redacted_count: usize,
+    pub cap_reasons: Vec<String>,
+    pub redaction: RedactionInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RedactionInfo {
+    pub mode: String,
+    pub enabled: bool,
+    pub rules: Vec<String>,
+    pub redacted_count: usize,
+    pub raw_available: bool,
 }
 
 /// Get 响应
@@ -86,20 +214,42 @@ pub enum GetResponse {
         error: String,
         r#ref: String,
         size: usize,
+        content_size: usize,
+        valid_range: String,
         suggestion: String,
+        truncation_reason: String,
+        output_suggestion: String,
+        range_suggestion: String,
+        parsed_range: Option<RangeInfo>,
+        head: String,
+        tail: String,
     },
     Output {
         r#ref: String,
         output: OutputInfo,
         content_size: usize,
+        original_content_size: usize,
         image_count: usize,
     },
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RangeInfo {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct OutputInfo {
     pub content: PathBuf,
+    pub manifest: PathBuf,
     pub images: Vec<PathBuf>,
+    pub bytes: u64,
+    pub lines: usize,
+    pub schema: String,
+    pub complete: bool,
+    pub sample_kind: String,
+    pub redaction: RedactionInfo,
 }
 
 /// Context 响应
@@ -109,6 +259,10 @@ pub struct ContextResponse {
     pub messages: Vec<ContextMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +273,46 @@ pub struct ContextMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_anchor: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceResponse {
+    pub anchor_ref: String,
+    pub project: String,
+    pub session: String,
+    pub messages: Vec<TraceMessage>,
+    pub tool_calls: Vec<TraceToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceMessage {
+    pub r#ref: String,
+    pub r#type: String,
+    pub subtype: String,
+    pub timestamp: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_anchor: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToolCall {
+    pub r#ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
 }
 
 /// 项目信息
@@ -201,42 +395,6 @@ impl Range {
             (None, Some(e)) => n <= e,
             (None, None) => true,
         }
-    }
-
-    /// 解析范围字符串
-    pub fn parse_ranges(s: &str) -> Vec<Range> {
-        let mut ranges = Vec::new();
-        for part in s.split(',') {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-
-            let exclude = part.starts_with('!');
-            let part = if exclude { &part[1..] } else { part };
-
-            if part.contains('-') {
-                let parts: Vec<&str> = part.splitn(2, '-').collect();
-                let start = if parts[0].is_empty() {
-                    None
-                } else {
-                    parts[0].parse().ok()
-                };
-                let end = if parts.len() < 2 || parts[1].is_empty() {
-                    None
-                } else {
-                    parts[1].parse().ok()
-                };
-                ranges.push(Range { start, end, exclude });
-            } else if let Ok(n) = part.parse::<usize>() {
-                ranges.push(Range {
-                    start: Some(n),
-                    end: Some(n),
-                    exclude,
-                });
-            }
-        }
-        ranges
     }
 }
 
