@@ -18,7 +18,7 @@ const ptyStartSchema = z.object({
     cols: z.number().optional().describe('终端列数，默认 80'),
     term: z.string().optional().describe('终端类型，默认 xterm-256color'),
     cwd: z.string().optional().describe('工作目录'),
-    env: z.record(z.string()).optional().describe('环境变量'),
+    env: z.record(z.string(), z.string()).optional().describe('环境变量'),
     bufferSize: z.number().optional().describe('输出缓冲区大小（字节），默认 1MB'),
 })
 

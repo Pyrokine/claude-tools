@@ -124,8 +124,8 @@ export function registerForwardTools(server: McpServer): void {
 本地监听指定端口，将连接转发到远程主机
 
 用途：访问远程内网服务
-示例：ssh_forward_local(alias="server", localPort=8080, remoteHost="10.0.0.1", remotePort=80)
-效果：访问本地 localhost:8080 会转发到远程内网的 10.0.0.1:80`,
+示例：ssh_forward_local(alias="server", localPort=8080, remoteHost="<service-host>", remotePort=80)
+效果：访问本地 localhost:8080 会转发到远程服务 <service-host>:80`,
             inputSchema: forwardLocalSchema,
         },
         (args) => handleForwardLocal(args)

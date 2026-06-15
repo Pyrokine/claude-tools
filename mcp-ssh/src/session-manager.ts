@@ -40,6 +40,37 @@ interface SSHSession {
     reconnectTimer?: NodeJS.Timeout
 }
 
+interface CommandContext {
+    runAs?: string
+    loadProfile?: boolean
+    cwd?: string
+    envInjectedKeys?: string[]
+}
+
+interface OutputPreview {
+    stdout: string
+    stderr: string
+    stdoutTail: string
+    stderrTail: string
+    stdoutBytes: number
+    stderrBytes: number
+    stdoutTruncated?: boolean
+    stderrTruncated?: boolean
+    maxOutputSize?: number
+}
+
+const OUTPUT_PREVIEW_CHARS = 4096
+
+class CommandError extends Error {
+    constructor(
+        message: string,
+        readonly details: Record<string, unknown>
+    ) {
+        super(message)
+        this.name = 'CommandError'
+    }
+}
+
 export class SessionManager {
     private sessions: Map<string, SSHSession> = new Map()
     /** per-alias connect 进行中的 Promise,防止并发 connect 同一 alias 时重复建连 */
@@ -157,11 +188,21 @@ export class SessionManager {
     listSessions(): SSHSessionInfo[] {
         const result: SSHSessionInfo[] = []
         for (const [alias, session] of this.sessions) {
+            const authMethod = session.config.privateKeyPath
+                ? ('key' as const)
+                : session.config.password
+                  ? ('password' as const)
+                  : ('agent' as const)
+            const port = session.config.port || 22
             result.push({
                 alias,
+                identity: this.sessionIdentity(session),
                 host: session.config.host,
-                port: session.config.port || 22,
+                port,
                 username: session.config.username,
+                runAs: session.config.runAs,
+                keyPath: session.config.privateKeyPath,
+                authMethod,
                 connected: this.isAlive(session),
                 connectedAt: session.connectedAt,
                 lastUsedAt: session.lastUsedAt,
@@ -175,79 +216,11 @@ export class SessionManager {
      */
     async exec(alias: string, command: string, options: ExecOptions = {}): Promise<ExecResult> {
         const session = this.getSession(alias)
-        const startTime = Date.now()
-        const maxOutputSize = options.maxOutputSize ?? this.defaultMaxOutputSize
-        const fullCommand = this.buildCommand(command, session, options)
-
-        return new Promise((resolve, reject) => {
-            const timeout = options.timeout ?? this.defaultTimeout
-            let timeoutId: NodeJS.Timeout | null = null
-            let stdout = ''
-            let stderr = ''
-            let stdoutTruncated = false
-            let stderrTruncated = false
-
-            const execOptions: Ssh2ExecOptions = {}
-
-            // PTY 模式
-            if (options.pty) {
-                execOptions.pty = {
-                    rows: options.rows || 24,
-                    cols: options.cols || 80,
-                    term: options.term || 'xterm-256color',
-                }
-            }
-
-            session.client.exec(fullCommand, execOptions, (err, stream) => {
-                if (err) {
-                    reject(new Error(`Exec failed: ${err.message}`))
-                    return
-                }
-
-                // 设置超时
-                timeoutId = setTimeout(() => {
-                    stream.close()
-                    reject(new Error(`Command timed out after ${timeout}ms`))
-                }, timeout)
-
-                stream.on('close', (code: number) => {
-                    if (timeoutId) {
-                        clearTimeout(timeoutId)
-                    }
-                    resolve({
-                        success: code === 0,
-                        stdout: stdoutTruncated ? stdout + '\n... [truncated]' : stdout,
-                        stderr: stderrTruncated ? stderr + '\n... [truncated]' : stderr,
-                        exitCode: code,
-                        duration: Date.now() - startTime,
-                    })
-                })
-
-                stream.on('data', (data: Buffer) => {
-                    if (!stdoutTruncated) {
-                        const chunk = data.toString('utf-8')
-                        if (stdout.length + chunk.length > maxOutputSize) {
-                            stdout += chunk.slice(0, maxOutputSize - stdout.length)
-                            stdoutTruncated = true
-                        } else {
-                            stdout += chunk
-                        }
-                    }
-                })
-
-                stream.stderr.on('data', (data: Buffer) => {
-                    if (!stderrTruncated) {
-                        const chunk = data.toString('utf-8')
-                        if (stderr.length + chunk.length > maxOutputSize) {
-                            stderr += chunk.slice(0, maxOutputSize - stderr.length)
-                            stderrTruncated = true
-                        } else {
-                            stderr += chunk
-                        }
-                    }
-                })
-            })
-        })
+        const runAs = options.useLoginUser ? undefined : (options.runAs ?? session.config.runAs)
+        if (runAs) {
+            return this.execAsUser(alias, command, runAs, options)
+        }
+        return this.execDirect(alias, command, options, { cwd: options.cwd })
     }
 
     /**
@@ -270,11 +243,23 @@ export class SessionManager {
         }
 
         const { loadProfile = true, ...execOpts } = options
-
+        const session = this.getSession(alias)
         const wrappedCommand = loadProfile ? `${this.getLoadProfileCommand()}${command}` : command
+        const targetCommand = this.buildCommand(wrappedCommand, session, execOpts)
+        const suCommand = `su - ${targetUser} -c ${this.escapeShellArg(targetCommand)}`
+        const env = { ...session.config.defaultEnv, ...session.config.env, ...execOpts.env }
 
-        const suCommand = `su - ${targetUser} -c ${this.escapeShellArg(wrappedCommand)}`
-        return this.exec(alias, suCommand, execOpts)
+        return this.execDirect(
+            alias,
+            suCommand,
+            { ...execOpts, env: undefined, cwd: undefined, runAs: undefined, useLoginUser: true, skipSessionEnv: true },
+            {
+                runAs: targetUser,
+                loadProfile,
+                cwd: execOpts.cwd,
+                envInjectedKeys: Object.keys(env).filter((key) => this.isValidEnvKey(key)),
+            }
+        )
     }
 
     /**
@@ -300,6 +285,25 @@ export class SessionManager {
         return new Promise<ExecResult>((resolve, reject) => {
             let settled = false
             let streamRef: ClientChannel | null = null
+            let stdout = ''
+            let stderr = ''
+            let stdoutTail = ''
+            let stderrTail = ''
+            let stdoutBytes = 0
+            let stderrBytes = 0
+            let stdoutTruncated = false
+            let stderrTruncated = false
+            const outputPreview = (): OutputPreview => ({
+                stdout,
+                stderr,
+                stdoutTail,
+                stderrTail,
+                stdoutBytes,
+                stderrBytes,
+                stdoutTruncated,
+                stderrTruncated,
+                maxOutputSize,
+            })
             const timeoutId = setTimeout(() => {
                 if (settled) {
                     return
@@ -310,7 +314,7 @@ export class SessionManager {
                 } catch {
                     // ignore
                 }
-                reject(new Error(`Command timed out after ${timeout}ms`))
+                reject(this.createCommandTimeoutError(alias, timeout, { cwd: options.cwd }, outputPreview()))
             }, timeout)
 
             session.client.exec(fullCommand, {}, (err, stream) => {
@@ -327,11 +331,6 @@ export class SessionManager {
                 stream.write(sudoPassword + '\n')
                 stream.end()
 
-                let stdout = ''
-                let stderr = ''
-                let stdoutTruncated = false
-                let stderrTruncated = false
-
                 stream.on('close', (code: number) => {
                     clearTimeout(timeoutId)
                     if (settled) {
@@ -344,12 +343,19 @@ export class SessionManager {
                         stderr: stderrTruncated ? stderr + '\n... [truncated]' : stderr,
                         exitCode: code,
                         duration: Date.now() - startTime,
+                        failureKind: code === 0 ? undefined : 'remote_command',
+                        stdoutTruncated: stdoutTruncated || undefined,
+                        stderrTruncated: stderrTruncated || undefined,
+                        ...this.outputMetadata(outputPreview()),
+                        ...this.resultMetadata(session, options, { cwd: options.cwd }),
                     })
                 })
 
                 stream.on('data', (data: Buffer) => {
+                    const chunk = data.toString('utf-8')
+                    stdoutBytes += data.length
+                    stdoutTail = this.appendOutputTail(stdoutTail, chunk)
                     if (!stdoutTruncated) {
-                        const chunk = data.toString('utf-8')
                         if (stdout.length + chunk.length > maxOutputSize) {
                             stdout += chunk.slice(0, maxOutputSize - stdout.length)
                             stdoutTruncated = true
@@ -360,8 +366,10 @@ export class SessionManager {
                 })
 
                 stream.stderr.on('data', (data: Buffer) => {
+                    const chunk = data.toString('utf-8')
+                    stderrBytes += data.length
+                    stderrTail = this.appendOutputTail(stderrTail, chunk)
                     if (!stderrTruncated) {
-                        const chunk = data.toString('utf-8')
                         if (stderr.length + chunk.length > maxOutputSize) {
                             stderr += chunk.slice(0, maxOutputSize - stderr.length)
                             stderrTruncated = true
@@ -410,7 +418,18 @@ export class SessionManager {
     ptyRead(
         ptyId: string,
         options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}
-    ): { data: string; active: boolean; rows: number; cols: number } {
+    ): {
+        data: string
+        active: boolean
+        rows: number
+        cols: number
+        lastInputAt: number | null
+        lastOutputAt: number | null
+        lastReadAt: number
+        unreadRawBytes: number
+        rawBufferLimit: number
+        foregroundProcess: string
+    } {
         return this.ptyManager.read(ptyId, options)
     }
 
@@ -472,10 +491,189 @@ export class SessionManager {
         return this.forwardManager.list()
     }
 
+    private sessionIdentity(session: SSHSession): string {
+        return this.configIdentity(session.config)
+    }
+
+    private configIdentity(config: SSHConnectionConfig): string {
+        return `${config.username}@${config.host}:${config.port || 22}`
+    }
+
+    private resultMetadata(
+        session: SSHSession,
+        options: ExecOptions,
+        context: CommandContext
+    ): Omit<Partial<ExecResult>, 'stdout' | 'stderr' | 'exitCode' | 'duration' | 'success'> {
+        const env = options.skipSessionEnv
+            ? { ...options.env }
+            : { ...session.config.defaultEnv, ...session.config.env, ...options.env }
+        return {
+            loginUser: session.config.username,
+            effectiveUser: context.runAs ?? session.config.username,
+            identity: this.sessionIdentity(session),
+            cwd: context.cwd ?? options.cwd,
+            resolvedCwd: context.cwd ?? options.cwd,
+            shell: session.config.shell,
+            profileLoaded: context.loadProfile,
+            envInjectedKeys: context.envInjectedKeys ?? Object.keys(env).filter((key) => this.isValidEnvKey(key)),
+        }
+    }
+
+    private appendOutputTail(current: string, chunk: string): string {
+        const next = current + chunk
+        return next.length > OUTPUT_PREVIEW_CHARS ? next.slice(-OUTPUT_PREVIEW_CHARS) : next
+    }
+
+    private recommendedReadCommand(): string {
+        return '将远端命令输出重定向到文件，例如 command > /tmp/mcp-ssh-output.txt 2>&1，然后用 ssh_read_file(remotePath="/tmp/mcp-ssh-output.txt", tail=true, maxBytes=65536) 分块读取'
+    }
+
+    private outputMetadata(preview: OutputPreview): Partial<ExecResult> {
+        const truncated = preview.stdoutTruncated || preview.stderrTruncated
+        return {
+            stdoutBytes: preview.stdoutBytes,
+            stderrBytes: preview.stderrBytes,
+            stdoutHead: preview.stdoutTruncated ? preview.stdout.slice(0, OUTPUT_PREVIEW_CHARS) : undefined,
+            stdoutTail: preview.stdoutTruncated ? preview.stdoutTail : undefined,
+            stderrHead: preview.stderrTruncated ? preview.stderr.slice(0, OUTPUT_PREVIEW_CHARS) : undefined,
+            stderrTail: preview.stderrTruncated ? preview.stderrTail : undefined,
+            recommendedReadCommand: truncated ? this.recommendedReadCommand() : undefined,
+            maxOutputSize: truncated ? preview.maxOutputSize : undefined,
+            suggestion: truncated
+                ? '输出已截断，请提高 maxOutputSize，或将远端输出重定向到文件后用 ssh_read_file 分块读取'
+                : undefined,
+        }
+    }
+
+    private async execDirect(
+        alias: string,
+        command: string,
+        options: ExecOptions = {},
+        context: CommandContext = {}
+    ): Promise<ExecResult> {
+        const session = this.getSession(alias)
+        const startTime = Date.now()
+        const maxOutputSize = options.maxOutputSize ?? this.defaultMaxOutputSize
+        const fullCommand = this.buildCommand(command, session, options)
+
+        return new Promise((resolve, reject) => {
+            const timeout = options.timeout ?? this.defaultTimeout
+            let timeoutId: NodeJS.Timeout | null = null
+            let stdout = ''
+            let stderr = ''
+            let stdoutTail = ''
+            let stderrTail = ''
+            let stdoutBytes = 0
+            let stderrBytes = 0
+            let stdoutTruncated = false
+            let stderrTruncated = false
+            let settled = false
+
+            const execOptions: Ssh2ExecOptions = {}
+
+            if (options.pty) {
+                execOptions.pty = {
+                    rows: options.rows || 24,
+                    cols: options.cols || 80,
+                    term: options.term || 'xterm-256color',
+                }
+            }
+
+            session.client.exec(fullCommand, execOptions, (err, stream) => {
+                if (err) {
+                    settled = true
+                    reject(new Error(`Exec failed: ${err.message}`))
+                    return
+                }
+
+                const outputPreview = (): OutputPreview => ({
+                    stdout,
+                    stderr,
+                    stdoutTail,
+                    stderrTail,
+                    stdoutBytes,
+                    stderrBytes,
+                    stdoutTruncated,
+                    stderrTruncated,
+                    maxOutputSize,
+                })
+
+                timeoutId = setTimeout(() => {
+                    if (settled) {
+                        return
+                    }
+                    settled = true
+                    stream.close()
+                    reject(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
+                }, timeout)
+
+                stream.on('close', (code: number) => {
+                    if (timeoutId) {
+                        clearTimeout(timeoutId)
+                    }
+                    if (settled) {
+                        return
+                    }
+                    settled = true
+                    resolve({
+                        success: code === 0,
+                        stdout: stdoutTruncated ? stdout + '\n... [truncated]' : stdout,
+                        stderr: stderrTruncated ? stderr + '\n... [truncated]' : stderr,
+                        exitCode: code,
+                        duration: Date.now() - startTime,
+                        failureKind: code === 0 ? undefined : 'remote_command',
+                        stdoutTruncated: stdoutTruncated || undefined,
+                        stderrTruncated: stderrTruncated || undefined,
+                        ...this.outputMetadata(outputPreview()),
+                        ...this.resultMetadata(session, options, context),
+                    })
+                })
+
+                stream.on('data', (data: Buffer) => {
+                    const chunk = data.toString('utf-8')
+                    stdoutBytes += data.length
+                    stdoutTail = this.appendOutputTail(stdoutTail, chunk)
+                    if (!stdoutTruncated) {
+                        if (stdout.length + chunk.length > maxOutputSize) {
+                            stdout += chunk.slice(0, maxOutputSize - stdout.length)
+                            stdoutTruncated = true
+                        } else {
+                            stdout += chunk
+                        }
+                    }
+                })
+
+                stream.stderr.on('data', (data: Buffer) => {
+                    const chunk = data.toString('utf-8')
+                    stderrBytes += data.length
+                    stderrTail = this.appendOutputTail(stderrTail, chunk)
+                    if (!stderrTruncated) {
+                        if (stderr.length + chunk.length > maxOutputSize) {
+                            stderr += chunk.slice(0, maxOutputSize - stderr.length)
+                            stderrTruncated = true
+                        } else {
+                            stderr += chunk
+                        }
+                    }
+                })
+            })
+        })
+    }
+
     private async connectInternal(config: SSHConnectionConfig, alias: string): Promise<string> {
         // 检查是否已有活跃连接
         const existing = this.sessions.get(alias)
         if (existing && this.isAlive(existing)) {
+            const existingIdentity = this.sessionIdentity(existing)
+            const requestedIdentity = this.configIdentity(config)
+            if (existingIdentity !== requestedIdentity) {
+                throw new CommandError(`Alias '${alias}' is already connected to ${existingIdentity}`, {
+                    alias,
+                    existingIdentity,
+                    requestedIdentity,
+                    suggestion: '请换一个 alias，或先 ssh_disconnect 断开已有同名会话',
+                })
+            }
             existing.lastUsedAt = Date.now()
             return alias
         }
@@ -668,6 +866,40 @@ export class SessionManager {
         }, this.reconnectDelay)
     }
 
+    private createCommandTimeoutError(
+        alias: string,
+        timeout: number,
+        context: CommandContext,
+        preview?: OutputPreview
+    ): CommandError {
+        const output = preview ? this.outputMetadata(preview) : undefined
+        return new CommandError(`Command timed out after ${timeout}ms`, {
+            alias,
+            timeout,
+            timedOut: true,
+            failureKind: 'timeout',
+            runAs: context.runAs,
+            loadProfile: context.loadProfile,
+            cwd: context.cwd,
+            remoteProcessKnown: false,
+            stdoutHead: preview?.stdout.slice(0, OUTPUT_PREVIEW_CHARS),
+            stdoutTail: preview?.stdoutTail,
+            stderrHead: preview?.stderr.slice(0, OUTPUT_PREVIEW_CHARS),
+            stderrTail: preview?.stderrTail,
+            stdoutBytes: preview?.stdoutBytes,
+            stderrBytes: preview?.stderrBytes,
+            recommendedReadCommand: this.recommendedReadCommand(),
+            output,
+            suggestions: context.loadProfile
+                ? ['设置 loadProfile=false 后重试', '提高 timeout', '长时间交互命令改用 ssh_pty_start']
+                : [
+                      '提高 timeout',
+                      '长时间交互命令改用 ssh_pty_start',
+                      '大输出命令重定向到远端文件后用 ssh_read_file 分块读取',
+                  ],
+        })
+    }
+
     /**
      * 根据错误类型生成排查建议
      */
@@ -721,10 +953,12 @@ export class SessionManager {
     private buildCommand(
         command: string,
         session: SSHSession,
-        options: { env?: Record<string, string>; cwd?: string }
+        options: { env?: Record<string, string>; cwd?: string; skipSessionEnv?: boolean }
     ): string {
         let fullCommand = command
-        const env = { ...session.config.env, ...options.env }
+        const env = options.skipSessionEnv
+            ? { ...options.env }
+            : { ...session.config.defaultEnv, ...session.config.env, ...options.env }
 
         if (Object.keys(env).length > 0) {
             const validEntries = Object.entries(env).filter(([k]) => this.isValidEnvKey(k))
@@ -766,6 +1000,7 @@ export class SessionManager {
                 host: session.config.host,
                 port: session.config.port || 22,
                 username: session.config.username,
+                runAs: session.config.runAs,
                 connectedAt: session.connectedAt,
             })
         }

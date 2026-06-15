@@ -88,7 +88,7 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 }
 ```
 
-## 可用工具（29 个）
+## 可用工具（30 个）
 
 ### 连接管理
 
@@ -110,6 +110,7 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_exec_batch`    | 批量执行多条命令           |
 | `ssh_exec_parallel` | 在多台主机上并行执行命令       |
 | `ssh_quick_exec`    | 一次性执行：连接、执行、断开     |
+| `ssh_exec_script`   | 上传并执行远端临时脚本        |
 
 ### 文件操作
 
@@ -196,10 +197,38 @@ ssh_connect(configHost="myserver", configPath="/custom/path/config")
 ### 基础：连接和执行
 
 ```
-ssh_connect(host="192.168.1.100", user="root", keyPath="/home/.ssh/id_rsa", alias="myserver")
+ssh_connect(host="<server-host>", user="root", keyPath="/home/.ssh/id_rsa", alias="myserver")
 ssh_exec(alias="myserver", command="ls -la /home")
 ssh_disconnect(alias="myserver")
 ```
+
+### 连接模板和 runAs
+
+模板可以通过 `SSH_MCP_TEMPLATES` 或 `~/.mcp-ssh/templates.json` 提供，工具显式参数优先于模板值
+
+```json
+{
+    "app-dev": {
+        "host": "<server-host>",
+        "port": 22,
+        "user": "root",
+        "runAs": "appuser",
+        "defaultEnv": {
+            "APP_ENV": "dev"
+        }
+    }
+}
+```
+
+```
+ssh_connect(template="app-dev", alias="app-dev")
+ssh_exec(alias="app-dev", command="whoami && echo $APP_ENV")
+ssh_exec(alias="app-dev", command="whoami", useLoginUser=true)
+```
+
+`ssh_connect` 返回 `identity`、`loginUser`、`runAs`、`reused`、`defaultEnvKeys`、`envKeys`，以及同一 `user@host:port` identity
+下已连接 alias 的 `reusableSessions`，同一个 alias 连接到不同 identity 会被拒绝，并返回现有 identity 和请求
+identity，template 缺失时返回可用模板名，`configHost` 缺失时返回 SSH config 候选并提示调用 `ssh_config_list`
 
 ### 跳板机
 
@@ -207,7 +236,7 @@ ssh_disconnect(alias="myserver")
 
 ```
 ssh_connect(
-  host="10.0.0.5",
+  host="<internal-host>",
   user="root",
   keyPath="/home/.ssh/id_rsa",
   alias="internal",
@@ -224,13 +253,19 @@ ssh_connect(
 适用于 SSH 以 root 登录，但需要以其他用户执行命令的场景：
 
 ```
-1. ssh_connect(host="192.168.1.100", user="root", password="xxx", alias="server")
+1. ssh_connect(host="<server-host>", user="root", keyPath="/home/.ssh/id_rsa", alias="server")
 2. ssh_exec_as_user(alias="server", command="whoami", targetUser="appuser")
    // 输出: appuser
 ```
 
 默认加载 shell 配置以确保环境变量可用（`su -c` 创建非交互式 shell，不会自动执行 rc 文件），支持 bash（`.bashrc`）、zsh（`.zshrc`
 ）及其他 shell（`.profile`），如不需要可设置 `loadProfile=false`
+
+`ssh_exec` 和 `ssh_exec_as_user` 返回执行元数据：`loginUser`、`effectiveUser`、`identity`、`cwd`、`resolvedCwd`、`shell`、
+`profileLoaded`、`envInjectedKeys`、`failureKind`、`stdoutBytes`、`stderrBytes` 和截断提示，大输出会返回 `stdoutHead`、
+`stdoutTail`、`stderrHead`、`stderrTail` 和 `recommendedReadCommand`，timeout 错误也包含超时前已经产生的 head/tail 输出，包含
+destructive、process-control、service-control、credential-bearing、未限制 `find`、递归 `grep`、长管道、后台任务、直接
+`su - user -c` 或长运行模式的命令会返回带 `categories` 和 `signals` 的 `commandRisk`
 
 ### 交互式命令（PTY 模式）
 
@@ -240,13 +275,32 @@ ssh_connect(
 ssh_exec(alias="server", command="top -b -n 1", pty=true)
 ```
 
+### 临时脚本执行和日志查询 recipe
+
+```
+ssh_exec_script(alias="server", script="set -e\nwhoami\npwd", cwd="/tmp", runAs="appuser")
+```
+
+日志发现和过滤使用 `ssh_exec_script`，大结果再用 `ssh_read_file` 分块读取：
+
+```
+ssh_exec_script(
+  alias="server",
+  script="find /var/log/app -maxdepth 1 -type f -printf '%T@ %p\\n' | sort -nr | head -20 > /tmp/mcp-log-files.txt\ngrep -n -I -F 'ERROR' /var/log/app/*.log | head -100 > /tmp/mcp-log-errors.txt",
+  timeout=30000
+)
+ssh_read_file(alias="server", remotePath="/tmp/mcp-log-errors.txt", maxBytes=65536)
+```
+
+日志查询由通用命令和文件工具组合完成，不再提供独立的日志专用 MCP 工具
+
 ### 设置环境变量
 
 ```
 ssh_connect(
-  host="192.168.1.100",
+  host="<server-host>",
   user="root",
-  password="xxx",
+  keyPath="/home/.ssh/id_rsa",
   env={"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
 )
 ```
@@ -257,9 +311,9 @@ ssh_connect(
 
 ```
 ssh_quick_exec(
-  host="192.168.1.100",
+  host="<server-host>",
   user="root",
-  password="xxx",
+  keyPath="/home/.ssh/id_rsa",
   command="uptime"
 )
 ```
@@ -269,13 +323,23 @@ ssh_quick_exec(
 ```
 // 上传
 ssh_upload(alias="server", localPath="/tmp/config.json", remotePath="/etc/app/config.json")
+ssh_upload(alias="server", localPath="/tmp/config.json", remotePath="/etc/app/config.json", atomic=true, verifySize=true, verifyMd5=true, verifyMode="0644")
+// 目录返回 UPLOAD_PATH_IS_DIRECTORY，大文件上传成功后会提示优先使用 ssh_sync，并返回推荐调用
 
 // 下载
 ssh_download(alias="server", remotePath="/var/log/app.log", localPath="/tmp/app.log")
 
 // 读取文件内容
 ssh_read_file(alias="server", remotePath="/etc/hosts")
+ssh_read_file(alias="server", remotePath="/var/log/app.log", tail=true, maxBytes=65536)
+ssh_read_file(alias="server", remotePath="/var/log/app.log", offset=1048576, maxBytes=65536)
+ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180")
 ```
+
+`ssh_upload` 返回本地路径策略诊断、远端父目录探测、远端目标元数据和可选校验结果，`atomic=true` 会先上传到同目录临时文件，再
+rename 到目标路径，`verifySize`、`verifyMd5`、`verifyMode`、`verifyOwner`、`verifyMtime` 会追加显式传输后校验，`ssh_read_file`
+默认读取 1 MiB，`maxBytes` 超过 16 MiB 时会在远端传输前拒绝，返回 `total_size`、`read_offset`、`read_bytes`、
+`remaining_bytes`、`sample_kind` 和 `truncated`，调用方可以区分完整读取、头部样本、尾部样本、字节范围和行范围
 
 ### 目录同步（rsync）
 
@@ -312,7 +376,9 @@ ssh_sync(
 ssh_sync(..., dryRun=true)
 ```
 
-如果远程或本地没有 rsync，会自动回退到 SFTP
+如果远程或本地没有 rsync，会自动回退到 SFTP，同步响应包含 `transport`、`duration`、`dryRun`、`stats`、`commandSummary` 和
+`diagnostics`，其中 `diagnostics` 包含本地路径策略和远端父目录探测结果，SFTP 单文件传输会返回 `verification`，包含本地和远端的
+size、mode 或 permissions、mtime、owner/group，以及远端支持 `sha256sum` 时的 SHA-256 对比
 
 **注意**：rsync 模式使用 SSH 密钥/代理认证，并设置 `StrictHostKeyChecking=accept-new`（首次连接会自动接受主机密钥），
 如需严格的主机密钥验证与管理，请使用 SFTP 模式
@@ -328,7 +394,7 @@ ssh_pty_start(alias="server", command="top", rows=24, cols=80)
 
 // 2. 读取当前输出（轮询）
 ssh_pty_read(ptyId="pty_1_1234567890")
-// 返回: { "data": "top - 10:30:15 up 5 days...", "active": true }
+// 返回: { "data": "top - 10:30:15 up 5 days...", "active": true, "unreadRawBytes": 123, "foregroundProcess": "top" }
 
 // 3. 发送命令（如退出 top）
 ssh_pty_write(ptyId="pty_1_1234567890", data="q")
@@ -353,6 +419,9 @@ ssh_pty_read(ptyId="pty_1_xxx")
 ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 ```
 
+`ssh_pty_read` 和 `ssh_pty_list` 返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`unreadRawBytes`、`rawBufferLimit`、
+`foregroundProcess`，便于观察长时间运行的会话，无需读取完整 raw 流
+
 常用控制序列：
 
 - 回车: `\r` 或 `\n`
@@ -367,8 +436,8 @@ ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 访问远程内网服务或暴露本地服务：
 
 ```
-// 本地转发：通过 localhost:13306 访问远程 MySQL (10.0.0.5:3306)
-ssh_forward_local(alias="server", localPort=13306, remoteHost="10.0.0.5", remotePort=3306)
+// 本地转发：通过 localhost:13306 访问远程 MySQL (<service-host>:3306)
+ssh_forward_local(alias="server", localPort=13306, remoteHost="<service-host>", remotePort=3306)
 
 // 远程转发：将本地开发服务器 (3000) 暴露到远程端口 8080
 ssh_forward_remote(alias="server", remotePort=8080, localHost="127.0.0.1", localPort=3000)
@@ -392,17 +461,24 @@ ssh_forward_close(forwardId="fwd_1_xxx")
 | `keyPath`           | string | -     | SSH 私钥路径    |
 | `port`              | number | 22    | SSH 端口      |
 | `alias`             | string | 自动生成  | 连接别名，用于后续引用 |
+| `template`          | string | -     | 连接模板名       |
 | `env`               | object | -     | 环境变量        |
+| `defaultEnv`        | object | -     | 连接级默认环境变量   |
+| `runAs`             | string | -     | 默认执行用户      |
 | `keepaliveInterval` | number | 30000 | 心跳间隔（毫秒）    |
 
 ### 执行选项
 
-| 选项        | 类型      | 默认值   | 描述                 |
-|-----------|---------|-------|--------------------|
-| `timeout` | number  | 30000 | 命令超时（毫秒）           |
-| `cwd`     | string  | -     | 工作目录               |
-| `env`     | object  | -     | 额外环境变量             |
-| `pty`     | boolean | false | 启用 PTY 模式（用于交互式命令） |
+| 选项              | 类型      | 默认值       | 描述                     |
+|-----------------|---------|-----------|------------------------|
+| `timeout`       | number  | 30000     | 命令超时（毫秒）               |
+| `cwd`           | string  | -         | 工作目录                   |
+| `env`           | object  | -         | 额外环境变量                 |
+| `pty`           | boolean | false     | 启用 PTY 模式（用于交互式命令）     |
+| `maxOutputSize` | number  | 10 MB 字符  | 输出截断上限                 |
+| `runAs`         | string  | 连接级 runAs | 本次命令执行用户               |
+| `useLoginUser`  | boolean | false     | 跳过连接级 runAs            |
+| `loadProfile`   | boolean | true      | runAs 时加载目标用户 shell 配置 |
 
 ## 安全
 

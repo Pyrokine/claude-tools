@@ -78,6 +78,32 @@
 
 **预期**：两次都返回 success（同一 alias），但底层只建一个连接，第二次复用 pending Promise
 
+### connect-template-01: template + runAs
+
+**步骤**：设置 `SSH_MCP_TEMPLATES`，包含 host/user/port/runAs/defaultEnv；
+`ssh_connect(template="<template>", alias="<alias>")`；`ssh_exec(alias="<alias>", command="whoami && echo $TEST_ENV")`
+
+**预期**：whoami 返回 runAs 用户，环境变量来自 defaultEnv；`ssh_exec(..., useLoginUser=true)` 返回登录用户；connect 返回
+`identity`、`loginUser`、`runAs`、`reused`、`defaultEnvKeys`；`ssh_list_sessions` 返回 canonical `identity`
+
+### connect-reusable-sessions-01: 同 identity alias 候选
+
+**步骤**：
+
+1. `ssh_connect(host=<host>, user=<user>, keyPath=<path>, alias="mcp-test-a")`
+2. `ssh_connect(host=<host>, user=<user>, keyPath=<path>, alias="mcp-test-b")`
+
+**预期**：第二次 connect 返回 `identity`，`reusableSessions` 含 `mcp-test-a`，并给出可直接复用已有 alias 的 suggestion
+
+### connect-alias-conflict-01: alias identity 冲突
+
+**步骤**：
+
+1. `ssh_connect(host=<host-a>, user=<user>, keyPath=<path>, alias="mcp-conflict")`
+2. `ssh_connect(host=<host-b>, user=<user>, keyPath=<path>, alias="mcp-conflict")`
+
+**预期**：第二次 connect 被拒绝，错误包含 existing identity、requested identity 和更换 alias 或先 disconnect 的 suggestion
+
 ---
 
 ## 3. 命令执行（exec / exec_as_user / exec_batch / exec_parallel / exec_sudo）
@@ -86,7 +112,7 @@
 
 **步骤**：`ssh_exec(alias=..., command="echo hello && whoami")`
 
-**预期**：stdout 含 "hello"，exitCode=0
+**预期**：stdout 含 "hello"，exitCode=0；返回 `loginUser`、`effectiveUser`、`identity`、`envInjectedKeys`
 
 ### exec-02: 工作目录 + 环境变量
 
@@ -128,7 +154,42 @@
 
 **步骤**：`ssh_exec(alias=..., command="sleep 5", timeout=2000)`
 
-**预期**：timeout 错误明确，不挂死
+**预期**：timeout 错误明确，不挂死；返回 `failureKind="timeout"`、`timedOut=true`、
+`stdoutHead/stdoutTail/stderrHead/stderrTail`、`stdoutBytes/stderrBytes`、`recommendedReadCommand`；`loadProfile=true` 时
+suggestions 含 `loadProfile=false` 或提高 timeout
+
+### exec-max-output-01
+
+**步骤**：`ssh_exec(alias=..., command="yes x | head -1000", maxOutputSize=100)`
+
+**预期**：返回 `stdoutTruncated=true`、`stdoutBytes`、`stderrBytes`、`stdoutHead`、`stdoutTail`、`maxOutputSize` 和
+`recommendedReadCommand`
+
+### exec-command-risk-01
+
+**步骤**：分别执行或 dry-run 观察 `ssh_exec` 响应中的风险分类：`find /tmp`、`grep -R secret /tmp`、`sleep 60`、
+`tail -f /tmp/x`、`cmd1 | cmd2 | cmd3 | cmd4`、`kill 1`、`systemctl restart x`、`echo secret-marker`、
+`su - appuser -c whoami`
+
+**预期**：返回 `commandRisk.categories` 和 `commandRisk.signals`，覆盖
+long-running、process-control、service-control、credential-bearing、user-switch；直接 `su - user -c` 给出改用 `runAs` 或
+`ssh_exec_as_user` 的 suggestion
+
+### exec-script-01
+
+**步骤**：`ssh_exec_script(alias=..., script="set -e\nwhoami\npwd", cwd="/tmp")`
+
+**预期**：脚本执行成功，默认不返回 remotePath；连接级 `runAs` 或参数 `runAs` 生效时脚本仍保持 700 私有权限并能由目标用户执行；
+`keepScript=true` 时返回 remotePath 且远端文件存在
+
+### log-query-recipe-01
+
+**步骤**：写入 `/tmp/mcp-log-test/app.log`，用 `ssh_exec_script` 执行只读脚本，把
+`grep -n -I -F "ERROR" /tmp/mcp-log-test/*.log | head -100` 写到 `/tmp/mcp-log-test/errors.txt`，再用
+`ssh_read_file(alias=..., remotePath="/tmp/mcp-log-test/errors.txt", maxBytes=65536)` 读取
+
+**预期**：`ssh_exec_script` 成功，`ssh_read_file` 返回内容包含 ERROR 行，并带 `read_offset`、`read_bytes`、`sample_kind`、
+`remaining_bytes` 元数据
 
 ---
 
@@ -144,7 +205,8 @@
 4. `ssh_pty_read(ptyId=..., mode="screen")`
 5. `ssh_pty_close(ptyId=...)`
 
-**预期**：read 输出含 "pty_test"，close 后 ptyId 失效
+**预期**：read 输出含 "pty_test"，返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`unreadRawBytes`、`rawBufferLimit`、
+`foregroundProcess`，close 后 ptyId 失效
 
 ### pty-02: top 全屏刷新
 
@@ -161,6 +223,12 @@
 **步骤**：`ssh_pty_read(ptyId=..., mode="raw")`
 
 **预期**：包含 ANSI 转义序列原文
+
+### pty-list-observability-01
+
+**步骤**：创建 pty 后调用 `ssh_pty_list`
+
+**预期**：会话项含 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`unreadRawBytes`、`rawBufferLimit`、`foregroundProcess`
 
 ### pty-idle-timeout-01: idle-timeout 主动回收（C.7 验证）
 
@@ -222,13 +290,26 @@
 1. `ssh_write_file(alias=..., remotePath="/tmp/mcp-test-write", content="hello\n")`
 2. `ssh_read_file(alias=..., remotePath="/tmp/mcp-test-write")`
 
-**预期**：read 返回 "hello\n"
+**预期**：read 返回 "hello\n"，并包含 `total_size`、`read_offset`、`read_bytes`、`remaining_bytes`、`sample_kind`、`truncated`
 
 ### file-append-01
 
 **步骤**：`ssh_write_file(alias=..., remotePath=..., content="more\n", append=true)` 后 `ssh_read_file`
 
 **预期**：返回 "hello\nmore\n"
+
+### file-read-range-01
+
+**步骤**：写入 200 行测试文件后分别调用 `ssh_read_file(..., tail=true, maxBytes=64)`、
+`ssh_read_file(..., offset=128, maxBytes=64)`、`ssh_read_file(..., lineRange="120-130")`
+
+**预期**：返回内容符合尾部、字节范围和行范围；`sample_kind` 分别为 `tail`、`range`、`line_range`
+
+### file-read-limit-01
+
+**步骤**：`ssh_read_file(alias=..., remotePath="/tmp/mcp-test-write", maxBytes=16777217)`
+
+**预期**：schema 层拒绝请求，不发起远端传输；文档说明默认 1 MiB，最大 16 MiB
 
 ### file-info-01
 
@@ -253,7 +334,28 @@
 **步骤**：本地 `echo "abc" > /tmp/mcp-up.txt`；
 `ssh_upload(alias=..., localPath="/tmp/mcp-up.txt", remotePath="/tmp/mcp-up-r.txt")`；`ssh_read_file(.../mcp-up-r.txt)`
 
-**预期**：返回 "abc\n"
+**预期**：返回 "abc\n"；upload 响应含 `diagnostics.local`、`diagnostics.remoteParent`、`verification.local`、
+`verification.remote`
+
+### upload-02-directory-reject
+
+**步骤**：`ssh_upload(alias=..., localPath="/tmp", remotePath="/tmp/mcp-up-dir")`
+
+**预期**：返回 `success=false`、`code="UPLOAD_PATH_IS_DIRECTORY"`，suggestion 指向 `ssh_sync`
+
+### upload-03-large-file-suggestion
+
+**步骤**：上传超过 100MB 的单文件
+
+**预期**：上传成功时返回 `suggestion` 和 `recommendedSync`，提示大文件优先使用 `ssh_sync`
+
+### upload-04-atomic-verify
+
+**步骤**：本地 `echo "abc" > /tmp/mcp-up-verify.txt`；
+`ssh_upload(alias=..., localPath="/tmp/mcp-up-verify.txt", remotePath="/tmp/mcp-up-verify-r.txt", atomic=true, verifySize=true, verifyMd5=true, verifyMode="0644")`
+
+**预期**：返回 `atomic=true`；`diagnostics.tempRemotePath` 存在；`verification.checks.size=true`、
+`verification.checks.md5=true`，`verification.remote.mode` 可用于判断 mode 校验结果；目标文件内容为 "abc\n"
 
 ### download-01
 
@@ -268,7 +370,9 @@
 `ssh_sync(alias=..., localPath="/tmp/mcp-sync", remotePath="/tmp/mcp-sync-r", direction="upload", recursive=true)`
 ；远端验证树形结构
 
-**预期**：远端文件全部存在；sync 应优先用 rsync（如可用）回退 SFTP
+**预期**：远端文件全部存在；sync 应优先用 rsync（如可用）回退 SFTP；返回 `transport`、`duration`、`dryRun`、`stats`、
+`diagnostics.local`、`diagnostics.remoteParent`，stats 含 added/updated/deleted/skipped/failed；SFTP 单文件同步返回
+`verification`，包含 size、mode/permissions、mtime 和 SHA-256 对比
 
 ### sync-exclude-01
 
@@ -297,7 +401,7 @@
 3. `ssh_upload(localPath="/etc/passwd", remotePath="/tmp/x")` 应被拒绝
 4. `ssh_upload(localPath="/tmp/foo", remotePath="/tmp/x")` 应通过
 
-**预期**：白名单生效，未设环境变量时不限制
+**预期**：白名单生效，未设环境变量时不限制；失败响应包含 local、remoteParent 诊断
 
 ---
 

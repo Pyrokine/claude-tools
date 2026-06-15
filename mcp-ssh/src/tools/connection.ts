@@ -5,14 +5,71 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import { z } from 'zod'
 import { sessionManager } from '../session-manager.js'
 import { parseProxyJump, parseSSHConfig } from '../ssh-config.js'
-import { formatError, formatResult } from './utils.js'
+import { expandTilde, formatError, formatResult } from './utils.js'
+
+type ConnectionTemplate = {
+    configHost?: string
+    host?: string
+    user?: string
+    username?: string
+    password?: string
+    keyPath?: string
+    privateKeyPath?: string
+    port?: number
+    alias?: string
+    env?: Record<string, string>
+    defaultEnv?: Record<string, string>
+    runAs?: string
+    keepaliveInterval?: number
+}
+
+function loadTemplates(): Record<string, ConnectionTemplate> {
+    const fromEnv = process.env.SSH_MCP_TEMPLATES
+    if (fromEnv) {
+        return JSON.parse(fromEnv) as Record<string, ConnectionTemplate>
+    }
+
+    const filePath = path.join(os.homedir(), '.mcp-ssh', 'templates.json')
+    if (!fs.existsSync(filePath)) {
+        return {}
+    }
+    return JSON.parse(fs.readFileSync(expandTilde(filePath), 'utf-8')) as Record<string, ConnectionTemplate>
+}
+
+function getTemplate(name?: string): ConnectionTemplate {
+    if (!name) {
+        return {}
+    }
+    const templates = loadTemplates()
+    const template = templates[name]
+    if (!template) {
+        const available = Object.keys(templates)
+        const suggestion = available.length
+            ? `Available templates: ${available.slice(0, 20).join(', ')}`
+            : 'No templates found. Define SSH_MCP_TEMPLATES or ~/.mcp-ssh/templates.json'
+        throw new Error(`Template '${name}' not found. ${suggestion}`)
+    }
+    return template
+}
+
+function mergeEnv(
+    templateEnv: Record<string, string> | undefined,
+    argsEnv: Record<string, string> | undefined
+): Record<string, string> | undefined {
+    const merged = { ...templateEnv, ...argsEnv }
+    return Object.keys(merged).length > 0 ? merged : undefined
+}
 
 // ========== Schemas ==========
 
 const connectSchema = z.object({
+    template: z.string().optional().describe('连接模板名，从 SSH_MCP_TEMPLATES 或 ~/.mcp-ssh/templates.json 读取'),
     configHost: z.string().optional().describe('使用 ~/.ssh/config 中的 Host 配置（推荐）'),
     configPath: z.string().optional().describe('SSH 配置文件路径（默认 ~/.ssh/config）'),
     host: z.string().optional().describe('服务器地址（使用 configHost 时可省略）'),
@@ -21,7 +78,9 @@ const connectSchema = z.object({
     keyPath: z.string().optional().describe('SSH 私钥路径'),
     port: z.number().optional().describe('SSH 端口，默认 22'),
     alias: z.string().optional().describe('连接别名（可选，默认使用 configHost 或 host）'),
-    env: z.record(z.string()).optional().describe('环境变量'),
+    env: z.record(z.string(), z.string()).optional().describe('环境变量'),
+    defaultEnv: z.record(z.string(), z.string()).optional().describe('连接级默认环境变量'),
+    runAs: z.string().optional().describe('连接级默认执行用户，后续 ssh_exec 默认以该用户执行'),
     keepaliveInterval: z.number().optional().describe('心跳间隔（毫秒），默认 30000'),
     jumpHost: z
         .object({
@@ -53,11 +112,18 @@ const configListSchema = z.object({
 
 async function handleConnect(args: z.infer<typeof connectSchema>) {
     try {
-        // 解析 configHost
-        let host = args.host
-        let user = args.user
-        let port = args.port
-        let keyPath = args.keyPath
+        const template = getTemplate(args.template)
+        const configHost = args.configHost ?? template.configHost
+        let host = args.host ?? template.host
+        let user = args.user ?? template.user ?? template.username
+        let port = args.port ?? template.port
+        let keyPath = args.keyPath ?? template.keyPath ?? template.privateKeyPath
+        const password = args.password ?? template.password
+        const requestedAlias = args.alias ?? template.alias ?? configHost
+        const runAs = args.runAs ?? template.runAs
+        const defaultEnv = mergeEnv(template.defaultEnv, args.defaultEnv)
+        const env = mergeEnv(template.env, args.env)
+        const keepaliveInterval = args.keepaliveInterval ?? template.keepaliveInterval
         let jumpHostResolved:
             | {
                   host: string
@@ -68,11 +134,16 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
               }
             | undefined
 
-        if (args.configHost) {
+        if (configHost) {
             const allHosts = parseSSHConfig(args.configPath)
-            const hostConfig = allHosts.find((h) => h.host === args.configHost)
+            const hostConfig = allHosts.find((h) => h.host === configHost)
             if (!hostConfig) {
-                return formatResult({ success: false, error: `Host '${args.configHost}' not found in SSH config` })
+                return formatResult({
+                    success: false,
+                    error: `Host '${configHost}' not found in SSH config`,
+                    candidates: allHosts.map((item) => item.host).slice(0, 20),
+                    suggestion: '调用 ssh_config_list 查看完整 Host 列表，或直接传 host/user/port',
+                })
             }
             // 显式参数优先于 config 值
             host = host || hostConfig.hostName || hostConfig.host
@@ -88,18 +159,33 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                     const jumpHostConfig = allHosts.find((h) => h.host === parsed.host)
                     if (jumpHostConfig) {
                         // 使用 config 中的配置，但 parsed 的 user/port 优先
+                        const jumpUser = parsed.user || jumpHostConfig.user
+                        if (!jumpUser) {
+                            return formatResult({
+                                success: false,
+                                error: `ProxyJump '${parsed.host}' is missing user`,
+                                suggestion: '在 ProxyJump 中使用 user@host，或为跳板机 Host 配置 User',
+                            })
+                        }
                         jumpHostResolved = {
                             host: jumpHostConfig.hostName || jumpHostConfig.host,
                             port: parsed.port || jumpHostConfig.port || 22,
-                            username: parsed.user || jumpHostConfig.user || 'root',
+                            username: jumpUser,
                             privateKeyPath: jumpHostConfig.identityFile,
                         }
                     } else {
                         // 直接使用 parsed 的值
+                        if (!parsed.user) {
+                            return formatResult({
+                                success: false,
+                                error: `ProxyJump '${parsed.host}' is missing user`,
+                                suggestion: '在 ProxyJump 中使用 user@host，或为跳板机 Host 配置 User',
+                            })
+                        }
                         jumpHostResolved = {
                             host: parsed.host,
                             port: parsed.port || 22,
-                            username: parsed.user || 'root',
+                            username: parsed.user,
                         }
                     }
                 }
@@ -124,21 +210,45 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
               }
             : jumpHostResolved
 
+        const finalPort = port || 22
+        const finalAlias = requestedAlias || `${user}@${host}:${finalPort}`
+        const identity = `${user}@${host}:${finalPort}`
+        const sessionsBeforeConnect = sessionManager.listSessions()
+        const reused = sessionsBeforeConnect.some((session) => session.alias === finalAlias && session.connected)
+        const reusableSessions = sessionsBeforeConnect
+            .filter((session) => session.identity === identity && session.alias !== finalAlias && session.connected)
+            .map((session) => ({ alias: session.alias, runAs: session.runAs, connectedAt: session.connectedAt }))
         const alias = await sessionManager.connect({
             host,
-            port: port || 22,
+            port: finalPort,
             username: user,
-            password: args.password,
+            password,
             privateKeyPath: keyPath,
-            alias: args.alias || args.configHost,
-            env: args.env,
-            keepaliveInterval: args.keepaliveInterval,
+            alias: requestedAlias,
+            template: args.template,
+            runAs,
+            defaultEnv,
+            env,
+            keepaliveInterval,
             jumpHost,
         })
         return formatResult({
             success: true,
             alias,
-            message: `Connected to ${user}@${host}:${port || 22}${jumpHost ? ' via jump host' : ''}`,
+            reused,
+            identity,
+            loginUser: user,
+            runAs,
+            host,
+            port: finalPort,
+            defaultEnvKeys: defaultEnv ? Object.keys(defaultEnv) : [],
+            envKeys: env ? Object.keys(env) : [],
+            reusableSessions,
+            suggestion:
+                reusableSessions.length > 0
+                    ? '已有同 identity 的连接，可直接复用 reusableSessions 中的 alias'
+                    : undefined,
+            message: `Connected to ${identity}${jumpHost ? ' via jump host' : ''}`,
         })
     } catch (error) {
         return formatError(error)
@@ -212,8 +322,8 @@ export function registerConnectionTools(server: McpServer): void {
 
 示例:
 - 使用 ssh config: ssh_connect(configHost="myserver")
-- 密钥认证: ssh_connect(host="192.168.1.1", user="root", keyPath="/home/.ssh/id_rsa")
-- 跳板机: ssh_connect(host="内网IP", user="root", keyPath="...", jumpHost={host:"跳板机IP", user:"root", keyPath:"..."})`,
+- 密钥认证: ssh_connect(host="<server-host>", user="<ssh-user>", keyPath="/home/.ssh/id_rsa")
+- 跳板机: ssh_connect(host="<internal-host>", user="<ssh-user>", keyPath="...", jumpHost={host:"<bastion-host>", user:"<ssh-user>", keyPath:"..."})`,
             inputSchema: connectSchema,
         },
         (args) => handleConnect(args)

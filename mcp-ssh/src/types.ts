@@ -11,6 +11,9 @@ export interface SSHConnectionConfig {
     privateKey?: string
     passphrase?: string
     alias?: string
+    template?: string
+    runAs?: string
+    defaultEnv?: Record<string, string>
     // 高级配置
     keepaliveInterval?: number // 心跳间隔（毫秒）
     keepaliveCountMax?: number // 最大心跳失败次数
@@ -25,9 +28,13 @@ export interface SSHConnectionConfig {
 
 export interface SSHSessionInfo {
     alias: string
+    identity: string
     host: string
     port: number
     username: string
+    runAs?: string
+    keyPath?: string
+    authMethod: 'key' | 'password' | 'agent'
     connected: boolean
     connectedAt: number
     lastUsedAt: number
@@ -44,6 +51,10 @@ export interface ExecOptions {
     rows?: number
     cols?: number
     term?: string
+    runAs?: string
+    useLoginUser?: boolean
+    loadProfile?: boolean
+    skipSessionEnv?: boolean
 }
 
 export interface ExecResult {
@@ -52,6 +63,27 @@ export interface ExecResult {
     stderr: string
     exitCode: number
     duration: number // 执行时间（毫秒）
+    failureKind?: 'remote_command' | 'ssh_transport' | 'timeout'
+    stdoutTruncated?: boolean
+    stderrTruncated?: boolean
+    maxOutputSize?: number
+    stdoutHead?: string
+    stdoutTail?: string
+    stderrHead?: string
+    stderrTail?: string
+    stdoutBytes?: number
+    stderrBytes?: number
+    recommendedReadCommand?: string
+    suggestion?: string
+    loginUser?: string
+    effectiveUser?: string
+    identity?: string
+    cwd?: string
+    resolvedCwd?: string
+    shell?: string
+    profileLoaded?: boolean
+    envInjectedKeys?: string[]
+    timedOut?: boolean
 }
 
 export interface FileInfo {
@@ -80,6 +112,7 @@ export interface PersistedSession {
     host: string
     port: number
     username: string
+    runAs?: string
     connectedAt: number
 }
 
@@ -101,8 +134,13 @@ export interface PtySessionInfo {
     rows: number
     cols: number
     createdAt: number
+    lastInputAt: number | null
+    lastOutputAt: number | null
     lastReadAt: number
-    bufferSize: number // 当前缓冲区大小
+    bufferSize: number // 当前缓冲区字符长度
+    unreadRawBytes: number
+    rawBufferLimit: number
+    foregroundProcess: string
     active: boolean
 }
 

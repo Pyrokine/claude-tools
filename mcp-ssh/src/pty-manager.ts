@@ -26,8 +26,11 @@ interface PtySession {
     rows: number
     cols: number
     createdAt: number
+    lastInputAt: number | null
+    lastOutputAt: number | null
     lastReadAt: number
     rawBuffer: string
+    unreadRawBytes: number
     maxBufferSize: number
     active: boolean
 }
@@ -64,8 +67,11 @@ export class PtyManager {
             rows,
             cols,
             createdAt: Date.now(),
+            lastInputAt: null,
+            lastOutputAt: null,
             lastReadAt: Date.now(),
             rawBuffer: '',
+            unreadRawBytes: 0,
             maxBufferSize,
             active: true,
         }
@@ -76,12 +82,18 @@ export class PtyManager {
                 return
             }
             const chunk = data.toString('utf-8')
+            ptySession.lastOutputAt = Date.now()
             // 写入终端仿真器（解析 ANSI 序列）
             terminal.write(chunk)
             // 同时保留原始流（用于 raw 模式）
             ptySession.rawBuffer += chunk
+            ptySession.unreadRawBytes += Buffer.byteLength(chunk, 'utf-8')
             if (ptySession.rawBuffer.length > maxBufferSize) {
                 ptySession.rawBuffer = ptySession.rawBuffer.slice(-maxBufferSize)
+                ptySession.unreadRawBytes = Math.min(
+                    ptySession.unreadRawBytes,
+                    Buffer.byteLength(ptySession.rawBuffer, 'utf-8')
+                )
             }
         })
 
@@ -109,13 +121,25 @@ export class PtyManager {
         if (!session.active) {
             throw new Error(`PTY session '${ptyId}' is closed`)
         }
+        session.lastInputAt = Date.now()
         return session.stream.write(data)
     }
 
     read(
         ptyId: string,
         options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}
-    ): { data: string; active: boolean; rows: number; cols: number } {
+    ): {
+        data: string
+        active: boolean
+        rows: number
+        cols: number
+        lastInputAt: number | null
+        lastOutputAt: number | null
+        lastReadAt: number
+        unreadRawBytes: number
+        rawBufferLimit: number
+        foregroundProcess: string
+    } {
         const session = this.getSession(ptyId)
         const mode = options.mode || 'screen'
         const clear = options.clear !== false
@@ -127,6 +151,7 @@ export class PtyManager {
             data = session.rawBuffer
             if (clear) {
                 session.rawBuffer = ''
+                session.unreadRawBytes = 0
             }
         }
 
@@ -136,6 +161,12 @@ export class PtyManager {
             active: session.active,
             rows: session.rows,
             cols: session.cols,
+            lastInputAt: session.lastInputAt,
+            lastOutputAt: session.lastOutputAt,
+            lastReadAt: session.lastReadAt,
+            unreadRawBytes: session.unreadRawBytes,
+            rawBufferLimit: session.maxBufferSize,
+            foregroundProcess: session.command,
         }
     }
 
@@ -190,8 +221,13 @@ export class PtyManager {
                 rows: pty.rows,
                 cols: pty.cols,
                 createdAt: pty.createdAt,
+                lastInputAt: pty.lastInputAt,
+                lastOutputAt: pty.lastOutputAt,
                 lastReadAt: pty.lastReadAt,
                 bufferSize: pty.rawBuffer.length,
+                unreadRawBytes: pty.unreadRawBytes,
+                rawBufferLimit: pty.maxBufferSize,
+                foregroundProcess: pty.command,
                 active: pty.active,
             })
         }

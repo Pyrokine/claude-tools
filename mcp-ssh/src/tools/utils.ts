@@ -34,8 +34,17 @@ export function formatResult(data: unknown) {
  */
 export function formatError(error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
+    const details =
+        typeof error === 'object' && error !== null && 'details' in error
+            ? (error as { details: unknown }).details
+            : undefined
     return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }, null, 2) }],
+        content: [
+            {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: message, ...(details ? { details } : {}) }, null, 2),
+            },
+        ],
         isError: true,
     }
 }

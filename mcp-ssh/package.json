@@ -35,16 +35,16 @@
         "@modelcontextprotocol/sdk": "^1.29.0",
         "@xterm/headless": "^6.0.0",
         "ssh2": "^1.17.0",
-        "zod": "^3.25.76"
+        "zod": "^4.4.3"
     },
     "devDependencies": {
-        "@eslint/js": "^9.39.4",
-        "@types/node": "^25.0.9",
+        "@eslint/js": "^10.0.1",
+        "@types/node": "^25.9.1",
         "@types/ssh2": "^1.15.5",
-        "eslint": "9.26.0",
+        "eslint": "^10.4.0",
         "prettier": "^3.8.3",
-        "typescript": "^5.9.3",
-        "typescript-eslint": "^8.59.0"
+        "typescript": "^6.0.3",
+        "typescript-eslint": "^8.60.0"
     },
     "engines": {
         "node": ">=18.0.0"

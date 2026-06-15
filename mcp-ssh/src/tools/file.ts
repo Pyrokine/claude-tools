@@ -6,9 +6,13 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { createHash } from 'crypto'
+import * as fs from 'fs'
+import * as path from 'path'
 import { z } from 'zod'
 import * as fileOps from '../file-ops.js'
-import { formatError, formatResult } from './utils.js'
+import { sessionManager } from '../session-manager.js'
+import { escapeShellArg, formatError, formatResult } from './utils.js'
 
 // ========== Schemas ==========
 
@@ -16,6 +20,12 @@ const uploadSchema = z.object({
     alias: z.string().describe('连接别名'),
     localPath: z.string().describe('本地文件路径'),
     remotePath: z.string().describe('远程目标路径'),
+    atomic: z.boolean().optional().describe('是否先上传到同目录临时文件，校验后 rename 到目标路径'),
+    verifyOwner: z.union([z.string(), z.number()]).optional().describe('上传后校验远端 owner（用户名或 uid）'),
+    verifyMode: z.string().optional().describe('上传后校验远端权限，例如 0644 或 -rw-r--r--'),
+    verifyMd5: z.boolean().optional().describe('上传后比对本地和远端 MD5'),
+    verifySize: z.boolean().optional().describe('上传后校验文件大小'),
+    verifyMtime: z.boolean().optional().describe('上传后返回并比较本地和远端 mtime'),
 })
 
 const downloadSchema = z.object({
@@ -27,7 +37,16 @@ const downloadSchema = z.object({
 const readFileSchema = z.object({
     alias: z.string().describe('连接别名'),
     remotePath: z.string().describe('远程文件路径'),
-    maxBytes: z.number().optional().describe('最大读取字节数，默认 1MB'),
+    maxBytes: z
+        .number()
+        .int()
+        .positive()
+        .max(fileOps.HARD_READ_FILE_MAX_BYTES)
+        .optional()
+        .describe('最大读取字节数，默认 1MB，最大 16MB'),
+    offset: z.number().optional().describe('从指定字节偏移开始读取，与 tail/lineRange 互斥'),
+    tail: z.boolean().optional().describe('读取文件尾部 maxBytes 字节，与 offset/lineRange 互斥'),
+    lineRange: z.string().optional().describe('按行号读取，格式为 "start-end" 或 "start"，与 offset/tail 互斥'),
 })
 
 const writeFileSchema = z.object({
@@ -71,12 +90,275 @@ const syncSchema = z.object({
 
 // ========== Handlers ==========
 
-async function handleUpload(args: z.infer<typeof uploadSchema>) {
+const LARGE_UPLOAD_THRESHOLD = 100 * 1024 * 1024
+
+type LocalPathProbe = ReturnType<typeof fileOps.probeLocalPath>
+
+function summarizeLocalPathProbe(probe: LocalPathProbe): Record<string, unknown> {
+    const summary: Record<string, unknown> = {
+        exists: probe.exists,
+        allowList: probe.allowList,
+    }
+    if ('size' in probe) {
+        summary.size = probe.size
+    }
+    if ('mode' in probe) {
+        summary.mode = probe.mode
+    }
+    if ('mtimeMs' in probe) {
+        summary.mtimeMs = probe.mtimeMs
+    }
+    if ('isSymlink' in probe) {
+        summary.isSymlink = probe.isSymlink
+    }
+    if ('isDirectory' in probe) {
+        summary.isDirectory = probe.isDirectory
+    }
+    if ('isFile' in probe) {
+        summary.isFile = probe.isFile
+    }
+    return summary
+}
+
+function uploadPathError(code: string, message: string, diagnostics: Record<string, unknown>) {
+    return formatResult({
+        success: false,
+        code,
+        error: message,
+        diagnostics,
+    })
+}
+
+async function probeRemoteParent(alias: string, remotePath: string) {
+    const parent = path.posix.dirname(remotePath)
+    const escapedParent = escapeShellArg(parent)
+    const command = [
+        `if [ -d ${escapedParent} ]; then`,
+        `if [ -w ${escapedParent} ]; then printf writable; else printf not-writable; fi;`,
+        'else printf missing; fi',
+    ].join(' ')
     try {
-        const uploadResult = await fileOps.uploadFile(args.alias, args.localPath, args.remotePath)
-        return formatResult({ ...uploadResult, message: `Uploaded to ${args.remotePath}` })
+        const result = await sessionManager.exec(alias, command, {
+            timeout: 10000,
+            useLoginUser: true,
+            maxOutputSize: 4096,
+        })
+        const status = result.stdout.trim()
+        return { exists: status !== 'missing', writable: status === 'writable' }
     } catch (error) {
-        return formatError(error)
+        return { error: error instanceof Error ? error.message : String(error) }
+    }
+}
+
+function hashLocalFileMd5(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const hash = createHash('md5')
+        const stream = fs.createReadStream(filePath)
+        stream.on('data', (chunk) => hash.update(chunk))
+        stream.on('error', reject)
+        stream.on('end', () => resolve(hash.digest('hex')))
+    })
+}
+
+async function hashRemoteFileMd5(alias: string, remotePath: string): Promise<string | undefined> {
+    const result = await sessionManager.exec(alias, `md5sum ${escapeShellArg(remotePath)} | awk '{print $1}'`, {
+        timeout: 30000,
+        useLoginUser: true,
+        maxOutputSize: 4096,
+    })
+    const digest = result.stdout.trim().split(/\s+/)[0]
+    return /^[a-fA-F0-9]{32}$/.test(digest) ? digest : undefined
+}
+
+function permissionStringToOctal(permissions: string): string | undefined {
+    const bits = permissions.slice(-9)
+    if (bits.length !== 9) {
+        return undefined
+    }
+    const values = [bits.slice(0, 3), bits.slice(3, 6), bits.slice(6, 9)].map((part) => {
+        let value = 0
+        if (part[0] === 'r') {
+            value += 4
+        }
+        if (part[1] === 'w') {
+            value += 2
+        }
+        if (part[2] === 'x' || part[2] === 's' || part[2] === 't') {
+            value += 1
+        }
+        return value
+    })
+    return `0${values.join('')}`
+}
+
+async function probeRemoteFile(alias: string, remotePath: string) {
+    const escapedRemotePath = escapeShellArg(remotePath)
+    const command = [
+        `if [ -e ${escapedRemotePath} ]; then`,
+        `stat -c '%U\t%u\t%G\t%g\t%a\t%s\t%Y' ${escapedRemotePath};`,
+        'else printf missing; fi',
+    ].join(' ')
+    try {
+        const result = await sessionManager.exec(alias, command, {
+            timeout: 10000,
+            useLoginUser: true,
+            maxOutputSize: 4096,
+        })
+        if (result.stdout.trim() === 'missing') {
+            return { exists: false, remotePath }
+        }
+        const [ownerName, ownerId, groupName, groupId, mode, size, mtimeSeconds] = result.stdout.trim().split('\t')
+        return {
+            exists: true,
+            remotePath,
+            ownerName,
+            ownerId: Number(ownerId),
+            groupName,
+            groupId: Number(groupId),
+            mode: mode ? `0${mode}` : undefined,
+            size: Number(size),
+            mtimeMs: Number(mtimeSeconds) * 1000,
+        }
+    } catch {
+        const info = await fileOps.getFileInfo(alias, remotePath)
+        return {
+            exists: true,
+            remotePath,
+            ownerId: info.owner,
+            groupId: info.group,
+            mode: permissionStringToOctal(info.permissions),
+            permissions: info.permissions,
+            size: info.size,
+            mtimeMs: info.mtime.getTime(),
+        }
+    }
+}
+
+async function buildUploadVerification(
+    args: z.infer<typeof uploadSchema>,
+    local: ReturnType<typeof fileOps.probeLocalPath>
+): Promise<Record<string, unknown>> {
+    const remote = await probeRemoteFile(args.alias, args.remotePath)
+    const checks: Record<string, unknown> = {}
+    if (args.verifySize) {
+        checks.size = local.exists && remote.exists ? local.size === remote.size : false
+    }
+    if (args.verifyMtime) {
+        const mtimeDelta =
+            local.exists && remote.exists ? Math.abs((local.mtimeMs ?? 0) - (remote.mtimeMs ?? 0)) : undefined
+        checks.mtime = mtimeDelta !== undefined ? mtimeDelta < 2000 : false
+    }
+    if (args.verifyMode && remote.exists) {
+        checks.mode = remote.mode === args.verifyMode || remote.mode === args.verifyMode.replace(/^0?/, '0')
+    }
+    if (args.verifyOwner && remote.exists) {
+        const expectedOwner = String(args.verifyOwner)
+        checks.owner = String(remote.ownerId) === expectedOwner || remote.ownerName === expectedOwner
+    }
+    if (args.verifyMd5 && local.exists) {
+        const [localMd5, remoteMd5] = await Promise.all([
+            hashLocalFileMd5(local.resolvedPath),
+            hashRemoteFileMd5(args.alias, args.remotePath),
+        ])
+        checks.md5 = remoteMd5 ? localMd5 === remoteMd5 : undefined
+        return {
+            local: { ...summarizeLocalPathProbe(local), md5: localMd5 },
+            remote: { ...remote, md5: remoteMd5 },
+            checks,
+        }
+    }
+    return { local: summarizeLocalPathProbe(local), remote, checks }
+}
+
+async function cleanupRemotePath(alias: string, remotePath: string): Promise<void> {
+    await sessionManager.exec(alias, `rm -f ${escapeShellArg(remotePath)}`, {
+        timeout: 10000,
+        useLoginUser: true,
+        maxOutputSize: 4096,
+    })
+}
+
+async function applyRemoteMode(alias: string, remotePath: string, mode: string): Promise<void> {
+    const result = await sessionManager.exec(alias, `chmod ${escapeShellArg(mode)} ${escapeShellArg(remotePath)}`, {
+        timeout: 10000,
+        useLoginUser: true,
+        maxOutputSize: 4096,
+    })
+    if (!result.success) {
+        throw new Error(result.stderr || result.stdout || `chmod failed with exit code ${result.exitCode}`)
+    }
+}
+
+async function handleUpload(args: z.infer<typeof uploadSchema>) {
+    const local = fileOps.probeLocalPath(args.localPath)
+    if (local.exists && local.isDirectory) {
+        return uploadPathError('UPLOAD_PATH_IS_DIRECTORY', 'localPath is a directory', {
+            local: summarizeLocalPathProbe(local),
+            suggestion: '使用 ssh_sync 上传目录，或把 localPath 指向具体文件',
+        })
+    }
+
+    const largeFileSuggestion =
+        local.exists && typeof local.size === 'number' && local.size >= LARGE_UPLOAD_THRESHOLD
+            ? '大文件优先使用 ssh_sync，让 rsync 做增量传输'
+            : undefined
+    const recommendedSync =
+        largeFileSuggestion && local.exists
+            ? [
+                  `ssh_sync(alias=${JSON.stringify(args.alias)}`,
+                  `localPath=${JSON.stringify(args.localPath)}`,
+                  `remotePath=${JSON.stringify(args.remotePath)}`,
+                  'direction="upload")',
+              ].join(', ')
+            : undefined
+    const remoteParent = await probeRemoteParent(args.alias, args.remotePath)
+    const tempRemotePath = args.atomic
+        ? `${args.remotePath}.mcp-tmp-${process.pid}-${Date.now().toString(36)}`
+        : args.remotePath
+
+    try {
+        const uploadResult = await fileOps.uploadFile(args.alias, args.localPath, tempRemotePath)
+        if (local.exists && 'mode' in local && typeof local.mode === 'string') {
+            await applyRemoteMode(args.alias, tempRemotePath, local.mode)
+        }
+        if (args.atomic) {
+            const rename = await sessionManager.exec(
+                args.alias,
+                `mv -f -- ${escapeShellArg(tempRemotePath)} ${escapeShellArg(args.remotePath)}`,
+                { timeout: 30000, useLoginUser: true, maxOutputSize: 4096 }
+            )
+            if (!rename.success) {
+                const renameError =
+                    rename.stderr || rename.stdout || `atomic rename failed with exit code ${rename.exitCode}`
+                throw new Error(renameError)
+            }
+        }
+        return formatResult({
+            ...uploadResult,
+            message: `Uploaded to ${args.remotePath}`,
+            atomic: args.atomic === true,
+            suggestion: largeFileSuggestion,
+            recommendedSync,
+            diagnostics: {
+                local: summarizeLocalPathProbe(local),
+                remoteParent,
+                atomic: args.atomic === true,
+            },
+            verification: await buildUploadVerification(args, local),
+        })
+    } catch (error) {
+        if (args.atomic) {
+            await cleanupRemotePath(args.alias, tempRemotePath).catch(() => undefined)
+        }
+        return formatResult({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            diagnostics: {
+                local: summarizeLocalPathProbe(local),
+                remoteParent,
+                atomic: args.atomic === true,
+            },
+        })
     }
 }
 
@@ -85,13 +367,26 @@ async function handleDownload(args: z.infer<typeof downloadSchema>) {
         const downloadResult = await fileOps.downloadFile(args.alias, args.remotePath, args.localPath)
         return formatResult({ ...downloadResult, message: `Downloaded to ${args.localPath}` })
     } catch (error) {
-        return formatError(error)
+        return formatResult({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            diagnostics: {
+                local: summarizeLocalPathProbe(fileOps.probeLocalPath(args.localPath)),
+                localParent: summarizeLocalPathProbe(fileOps.probeLocalPath(path.dirname(args.localPath))),
+                remoteParent: await probeRemoteParent(args.alias, args.remotePath),
+            },
+        })
     }
 }
 
 async function handleReadFile(args: z.infer<typeof readFileSchema>) {
     try {
-        const readResult = await fileOps.readFile(args.alias, args.remotePath, args.maxBytes)
+        const readResult = await fileOps.readFile(args.alias, args.remotePath, {
+            maxBytes: args.maxBytes,
+            offset: args.offset,
+            tail: args.tail,
+            lineRange: args.lineRange,
+        })
         return formatResult({ success: true, ...readResult })
     } catch (error) {
         return formatError(error)
@@ -140,6 +435,10 @@ async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
 }
 
 async function handleSync(args: z.infer<typeof syncSchema>) {
+    const diagnostics = {
+        local: summarizeLocalPathProbe(fileOps.probeLocalPath(args.localPath)),
+        remoteParent: await probeRemoteParent(args.alias, args.remotePath),
+    }
     try {
         const syncResult = await fileOps.syncFiles(args.alias, args.localPath, args.remotePath, args.direction, {
             delete: args.delete,
@@ -153,9 +452,14 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
             direction: args.direction,
             localPath: args.localPath,
             remotePath: args.remotePath,
+            diagnostics,
         })
     } catch (error) {
-        return formatError(error)
+        return formatResult({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            diagnostics,
+        })
     }
 }
 
