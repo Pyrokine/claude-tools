@@ -6,7 +6,22 @@ export function generateAccessibilityTree(
     maxDepth: number,
     maxLength: number | null,
     refId: string | null
-): { pageContent: string; viewport: { width: number; height: number }; error?: string } {
+): {
+    pageContent: string
+    viewport: { width: number; height: number }
+    interactiveElements?: Array<{
+        refId: string
+        role: string
+        name: string
+        selector: string
+        visible: boolean
+        disabled: boolean
+        bounds: { x: number; y: number; width: number; height: number }
+        covered: boolean
+        frameId?: number
+    }>
+    error?: string
+} {
     // 初始化元素映射
     const win = window as Window & {
         __mcpElementMap?: Record<string, WeakRef<Element>>
@@ -259,6 +274,69 @@ export function generateAccessibilityTree(
         return newRefId
     }
 
+    function cssSelector(element: Element): string {
+        if (element.id) {
+            return `#${CSS.escape(element.id)}`
+        }
+        const parts: string[] = []
+        let current: Element | null = element
+        while (current && current !== document.body && parts.length < 4) {
+            const tag = current.tagName.toLowerCase()
+            const parent: Element | null = current.parentElement
+            if (!parent) {
+                parts.unshift(tag)
+                break
+            }
+            const currentTag = current.tagName
+            const siblings = Array.from(parent.children).filter((child: Element) => child.tagName === currentTag)
+            const nth = siblings.length > 1 ? `:nth-of-type(${siblings.indexOf(current) + 1})` : ''
+            parts.unshift(`${tag}${nth}`)
+            current = parent
+        }
+        return parts.join(' > ')
+    }
+
+    function isDisabled(element: Element): boolean {
+        return Boolean((element as HTMLButtonElement).disabled) || element.getAttribute('aria-disabled') === 'true'
+    }
+
+    function isCovered(element: Element): boolean {
+        const rect = element.getBoundingClientRect()
+        if (rect.width <= 0 || rect.height <= 0) {
+            return false
+        }
+        const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+        return Boolean(hit && hit !== element && !element.contains(hit) && !hit.contains(element))
+    }
+
+    const interactiveElements: Array<{
+        refId: string
+        role: string
+        name: string
+        selector: string
+        visible: boolean
+        disabled: boolean
+        bounds: { x: number; y: number; width: number; height: number }
+        covered: boolean
+    }> = []
+
+    function rememberInteractive(element: Element, elementRefId: string, role: string, name: string) {
+        if (!isInteractive(element) || interactiveElements.length >= 100) {
+            return
+        }
+        const rect = element.getBoundingClientRect()
+        interactiveElements.push({
+            refId: elementRefId,
+            role,
+            name,
+            selector: cssSelector(element),
+            visible: isVisible(element),
+            disabled: isDisabled(element),
+            bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            covered: isCovered(element),
+        })
+    }
+
     function traverse(element: Element, level: number, checkRefId: boolean) {
         if (level > maxDepth || !element || !element.tagName) {
             return
@@ -288,6 +366,7 @@ export function generateAccessibilityTree(
             }
 
             lines.push(line)
+            rememberInteractive(element, elementRefId, role, name)
 
             // 处理 select 的 options
             if (element.tagName.toLowerCase() === 'select') {
@@ -366,6 +445,7 @@ export function generateAccessibilityTree(
     return {
         pageContent: content,
         viewport: { width: window.innerWidth, height: window.innerHeight },
+        interactiveElements,
     }
 }
 
@@ -463,14 +543,63 @@ export function performScroll(
 
 // 代码执行
 export function executeCode(code: string): { success: boolean; result?: string; error?: string } {
+    function evaluateSerializationError(message: string, suggestion: string, context: Record<string, unknown>): string {
+        return JSON.stringify({
+            error: {
+                code: 'NON_SERIALIZABLE_EVALUATE_RESULT',
+                message,
+                suggestion,
+                context,
+            },
+        })
+    }
+
+    function serializeEvaluateResult(result: unknown): { success: boolean; result?: string; error?: string } {
+        if (result instanceof Node) {
+            const element = result instanceof Element ? result : result.parentElement
+            return {
+                success: false,
+                error: evaluateSerializationError(
+                    `返回值是 DOM 节点 ${result.nodeName}，不能直接 JSON 序列化`,
+                    '请返回 textContent、outerHTML、getAttribute(...) 等简单字段，或改用 extract type="text"/"html"',
+                    {
+                        nodeType: result.nodeType,
+                        nodeName: result.nodeName,
+                        selector: element?.id ? `#${CSS.escape(element.id)}` : element?.tagName.toLowerCase(),
+                    }
+                ),
+            }
+        }
+        if (result instanceof NodeList || result instanceof HTMLCollection) {
+            return {
+                success: false,
+                error: evaluateSerializationError(
+                    `返回值是 ${result.constructor.name}，不能直接 JSON 序列化`,
+                    '请用 Array.from(value).map(...) 提取需要的字段，例如 textContent、href、outerHTML',
+                    { className: result.constructor.name, length: result.length }
+                ),
+            }
+        }
+        try {
+            return { success: true, result: JSON.stringify(result) }
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error)
+            return {
+                success: false,
+                error: evaluateSerializationError(
+                    `evaluate 返回值无法 JSON 序列化: ${errorMsg}`,
+                    '请返回字符串、数字、布尔值、数组或普通对象，避免返回循环引用、BigInt、DOM 对象',
+                    { error: errorMsg }
+                ),
+            }
+        }
+    }
+
     try {
-        // 使用 Function 构造函数替代 eval，更容易处理返回值
         const fn = new Function(`return (${code})`)
-        const result = fn()
-        return { success: true, result: JSON.stringify(result) }
+        return serializeEvaluateResult(fn())
     } catch (error) {
         const errorMsg = error instanceof Error ? error.message : 'Unknown error'
-        // 检测 CSP 相关错误
         if (errorMsg.includes('Content Security Policy') || errorMsg.includes("'unsafe-eval'")) {
             return {
                 success: false,
@@ -547,7 +676,7 @@ export function extractHtmlWithImages(
         } catch (e) {
             const err = e as { name?: string; message?: string }
             if (err?.name === 'SyntaxError') {
-                throw new Error(`Invalid CSS selector: "${selector}" (${err.message})`)
+                throw new Error(`Invalid CSS selector: "${selector}" (${err.message})`, { cause: e })
             }
             throw e
         }
@@ -659,7 +788,7 @@ export function extractAttribute(
         } catch (e) {
             const err = e as { name?: string; message?: string }
             if (err?.name === 'SyntaxError') {
-                throw new Error(`Invalid CSS selector: "${selector}" (${err.message})`)
+                throw new Error(`Invalid CSS selector: "${selector}" (${err.message})`, { cause: e })
             }
             throw e
         }
@@ -1163,119 +1292,205 @@ export interface ActionabilityResult {
     actionable: boolean
     reason?: 'not-connected' | 'not-visible' | 'not-enabled' | 'covered' | 'pointer-events-none' | 'not-in-viewport'
     coveringElement?: string
+    coveringRect?: { x: number; y: number; width: number; height: number }
     rect?: { x: number; y: number; width: number; height: number }
+    clickPoint?: { x: number; y: number }
+    candidates?: Array<{
+        tag: string
+        selector: string
+        text: string
+        rect: { x: number; y: number; width: number; height: number }
+    }>
+    suggestions?: string[]
 }
 
-/**
- * 检查元素可操作性（注入到页面执行）
- *
- * 检查顺序（参考 Playwright injectedScript.ts:640-657）：
- * 1. Connected — 元素仍在 DOM 中
- * 2. Visible — 非零尺寸 + visibility !== hidden + opacity > 0（含父链）
- * 3. Enabled — 无 disabled + 无 aria-disabled
- * 4. Pointer-events — 非 pointer-events:none
- * 5. In viewport — getBoundingClientRect 在视口范围内（自动滚动后重检）
- * 6. Not covered — elementFromPoint(center) === 目标元素或其后代
- */
-export function checkActionability(refId: string): ActionabilityResult {
-    const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
-    const ref = win.__mcpElementMap?.[refId]
-    if (!ref) {
-        return { actionable: false, reason: 'not-connected' }
-    }
-    const element = ref.deref()
-    if (!element || !element.isConnected) {
-        return { actionable: false, reason: 'not-connected' }
+type ActionabilityHelpers = {
+    check(refId: string): ActionabilityResult
+    scrollIntoViewWithRetry(refId: string): ActionabilityResult
+}
+
+type ActionabilityWindow = Window & {
+    __mcpActionability?: ActionabilityHelpers
+    __mcpElementMap?: Record<string, WeakRef<Element>>
+}
+
+export function installActionabilityHelpers(): void {
+    const win = window as ActionabilityWindow
+
+    function plainRect(r: DOMRect): { x: number; y: number; width: number; height: number } {
+        return { x: r.x, y: r.y, width: r.width, height: r.height }
     }
 
-    // 1. Visible check（参考 Playwright domUtils.ts:87-134）
-    const style = window.getComputedStyle(element)
-
-    // display:none（自身或父链）
-    // checkVisibility() 检查 content-visibility 和 display:none 整条链
-    if (typeof element.checkVisibility === 'function') {
-        if (!element.checkVisibility()) {
-            return { actionable: false, reason: 'not-visible' }
+    function selectorFor(el: Element): string {
+        if (el.id) {
+            return `#${CSS.escape(el.id)}`
         }
-    }
-
-    // visibility:hidden
-    if (style.visibility !== 'visible') {
-        return { actionable: false, reason: 'not-visible' }
-    }
-
-    // 注：opacity:0 不视为 not-visible（与 Playwright actionability 一致）
-    // 元素仍接收事件，hit-test 能定位；如确实需要点击 opacity:0 元素，由 hit-test 决定
-
-    // 非零尺寸（display:contents 例外，递归检查子元素）
-    // 仅在 width 与 height 同时为 0 时判定不可见——单维度 0（如 inline 元素的高度）仍可能可点击；
-    // 含 svg/canvas/img/video 等视觉子元素的零尺寸壳也保留为可见，由后续 hit-test 决定
-    const rect = element.getBoundingClientRect()
-    if (style.display !== 'contents' && rect.width === 0 && rect.height === 0) {
-        const hasVisualChild = element.querySelector('svg, canvas, img, video') !== null
-        if (!hasVisualChild) {
-            return { actionable: false, reason: 'not-visible' }
+        const tag = el.tagName.toLowerCase()
+        const parent = el.parentElement
+        if (!parent) {
+            return tag
         }
+        const siblings = Array.from(parent.children).filter((child) => child.tagName === el.tagName)
+        const nth = siblings.length > 1 ? `:nth-of-type(${siblings.indexOf(el) + 1})` : ''
+        return `${tag}${nth}`
     }
 
-    // 2. Enabled check（参考 Playwright roleUtils.ts + Selenium dom.js:84）
-    const htmlEl = element as HTMLElement
-    if ('disabled' in htmlEl && (htmlEl as HTMLButtonElement).disabled) {
-        return { actionable: false, reason: 'not-enabled' }
+    function textFor(el: Element): string {
+        return (el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '')
+            .trim()
+            .slice(0, 80)
     }
-    // aria-disabled（包括祖先链）
-    let ancestor: Element | null = element
-    while (ancestor) {
-        if (ancestor.getAttribute('aria-disabled') === 'true') {
-            return { actionable: false, reason: 'not-enabled' }
+
+    function describeElement(el: Element): string {
+        const tag = el.tagName.toLowerCase()
+        const cls = el.className ? `.${String(el.className).split(/\s+/).filter(Boolean).slice(0, 2).join('.')}` : ''
+        const id = el.id ? `#${el.id}` : ''
+        return `<${tag}${id}${cls}>`
+    }
+
+    function candidatesAt(point: { x: number; y: number }): ActionabilityResult['candidates'] {
+        if (point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight) {
+            return []
         }
-        ancestor = ancestor.parentElement
+        return Array.from(document.elementsFromPoint(point.x, point.y))
+            .slice(0, 8)
+            .map((el) => ({
+                tag: el.tagName.toLowerCase(),
+                selector: selectorFor(el),
+                text: textFor(el),
+                rect: plainRect(el.getBoundingClientRect()),
+            }))
     }
 
-    // 3. Pointer-events check（参考 Selenium atoms/dom.js）
-    if (style.pointerEvents === 'none') {
-        return { actionable: false, reason: 'pointer-events-none' }
-    }
-
-    // 4. In viewport check
-    const vw = window.innerWidth
-    const vh = window.innerHeight
-    if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
-        return {
-            actionable: false,
-            reason: 'not-in-viewport',
-            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    function suggestionsFor(reason: NonNullable<ActionabilityResult['reason']>): string[] {
+        if (reason === 'covered') {
+            return ['点击点被其他元素覆盖，请关闭遮罩层、换用更精确 target，或确认后使用 force=true']
         }
+        if (reason === 'not-in-viewport') {
+            return ['元素不在视口内，请先滚动到目标元素或改用可见元素定位']
+        }
+        if (reason === 'not-visible') {
+            return ['元素不可见，请等待页面渲染完成，或改用当前可见的元素定位']
+        }
+        if (reason === 'not-enabled') {
+            return ['元素被禁用，请等待 enabled 状态或检查表单前置条件']
+        }
+        if (reason === 'pointer-events-none') {
+            return ['元素设置了 pointer-events:none，请定位实际接收事件的子元素或父元素']
+        }
+        return ['元素引用失效，请重新执行 extract type="state" 获取新的 refId']
     }
 
-    // 5. Covered check（参考 Playwright injectedScript.ts:955-1034）
-    const cx = rect.x + rect.width / 2
-    const cy = rect.y + rect.height / 2
-    const hitEl = document.elementFromPoint(cx, cy)
-    if (hitEl) {
-        // 检查 hitEl 是否是目标元素或其后代
-        if (hitEl !== element && !element.contains(hitEl)) {
-            // hitEl 不在目标元素子树中——被遮挡
-            // 再检查 hitEl 是否是目标元素的祖先（某些透明容器场景）
-            if (!hitEl.contains(element)) {
-                const tag = hitEl.tagName.toLowerCase()
-                const cls = hitEl.className ? `.${String(hitEl.className).split(/\s+/).slice(0, 2).join('.')}` : ''
-                const id = hitEl.id ? `#${hitEl.id}` : ''
-                const desc = `<${tag}${id}${cls}>`
-                return {
-                    actionable: false,
-                    reason: 'covered',
-                    coveringElement: desc,
-                    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-                }
+    function resolveElement(refId: string): Element | undefined {
+        return win.__mcpElementMap?.[refId]?.deref()
+    }
+
+    function check(refId: string): ActionabilityResult {
+        const element = resolveElement(refId)
+        if (!element || !element.isConnected) {
+            return {
+                actionable: false,
+                reason: 'not-connected',
+                suggestions: suggestionsFor('not-connected'),
             }
         }
+
+        const style = window.getComputedStyle(element)
+        const rect = element.getBoundingClientRect()
+        const clickPoint = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }
+        const failure = (
+            reason: NonNullable<ActionabilityResult['reason']>,
+            extra: Partial<ActionabilityResult> = {}
+        ): ActionabilityResult => ({
+            actionable: false,
+            reason,
+            rect: plainRect(rect),
+            clickPoint,
+            candidates: candidatesAt(clickPoint),
+            suggestions: suggestionsFor(reason),
+            ...extra,
+        })
+
+        if (typeof element.checkVisibility === 'function' && !element.checkVisibility()) {
+            return failure('not-visible')
+        }
+        if (style.visibility !== 'visible') {
+            return failure('not-visible')
+        }
+        if (style.display !== 'contents' && rect.width === 0 && rect.height === 0) {
+            const hasVisualChild = element.querySelector('svg, canvas, img, video') !== null
+            if (!hasVisualChild) {
+                return failure('not-visible')
+            }
+        }
+        const htmlEl = element as HTMLElement
+        if ('disabled' in htmlEl && (htmlEl as HTMLButtonElement).disabled) {
+            return failure('not-enabled')
+        }
+        let ancestor: Element | null = element
+        while (ancestor) {
+            if (ancestor.getAttribute('aria-disabled') === 'true') {
+                return failure('not-enabled')
+            }
+            ancestor = ancestor.parentElement
+        }
+        if (style.pointerEvents === 'none') {
+            return failure('pointer-events-none')
+        }
+        const vw = window.innerWidth
+        const vh = window.innerHeight
+        if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+            return failure('not-in-viewport')
+        }
+        const hitEl = document.elementFromPoint(clickPoint.x, clickPoint.y)
+        if (hitEl && hitEl !== element && !element.contains(hitEl) && !hitEl.contains(element)) {
+            return failure('covered', {
+                coveringElement: describeElement(hitEl),
+                coveringRect: plainRect(hitEl.getBoundingClientRect()),
+            })
+        }
+        return {
+            actionable: true,
+            rect: plainRect(rect),
+            clickPoint,
+            candidates: candidatesAt(clickPoint),
+        }
     }
 
-    return {
-        actionable: true,
-        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    function scrollIntoViewWithRetry(refId: string): ActionabilityResult {
+        const element = resolveElement(refId)
+        if (!element || !element.isConnected) {
+            return { actionable: false, reason: 'not-connected', suggestions: suggestionsFor('not-connected') }
+        }
+        const alignments: ScrollIntoViewOptions[] = [
+            { block: 'center', inline: 'center', behavior: 'instant' },
+            { block: 'end', inline: 'end', behavior: 'instant' },
+            { block: 'start', inline: 'start', behavior: 'instant' },
+            { block: 'nearest', inline: 'nearest', behavior: 'instant' },
+        ]
+        for (const alignment of alignments) {
+            element.scrollIntoView(alignment)
+            const result = check(refId)
+            if (result.actionable) {
+                return result
+            }
+        }
+        return check(refId)
     }
+
+    win.__mcpActionability = { check, scrollIntoViewWithRetry }
+}
+
+export function checkActionability(refId: string): ActionabilityResult {
+    const helpers = (window as ActionabilityWindow).__mcpActionability
+    if (!helpers) {
+        return {
+            actionable: false,
+            reason: 'not-connected',
+            suggestions: ['actionability helper 未安装，请重试当前操作'],
+        }
+    }
+    return helpers.check(refId)
 }
 
 /**
@@ -1291,120 +1506,20 @@ export function checkActionability(refId: string): ActionabilityResult {
 export function performActionableClick(
     refId: string,
     force: boolean
-): {
+): Partial<ActionabilityResult> & {
     success: boolean
     error?: string
-    reason?: string
-    coveringElement?: string
 } {
-    type ActionabilityResult = {
-        actionable: boolean
-        reason?: string
-        coveringElement?: string
-        rect?: { x: number; y: number; width: number; height: number }
+    const helpers = (window as ActionabilityWindow).__mcpActionability
+    if (!helpers) {
+        return {
+            success: false,
+            error: 'actionability helper 未安装，请重试当前操作',
+            reason: 'not-connected',
+            suggestions: ['actionability helper 未安装，请重试当前操作'],
+        }
     }
 
-    // 内联 checkActionability（chrome.scripting.executeScript 只序列化函数体，外部引用在页面上下文不可用）
-    function checkActionabilityInline(id: string): ActionabilityResult {
-        const w = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
-        const r = w.__mcpElementMap?.[id]
-        if (!r) {
-            return { actionable: false, reason: 'not-connected' }
-        }
-        const el = r.deref()
-        if (!el || !el.isConnected) {
-            return { actionable: false, reason: 'not-connected' }
-        }
-        const style = window.getComputedStyle(el)
-        if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) {
-            return { actionable: false, reason: 'not-visible' }
-        }
-        if (style.visibility !== 'visible') {
-            return { actionable: false, reason: 'not-visible' }
-        }
-        // 注：opacity:0 不视为 not-visible（与 Playwright actionability 一致）
-        const rect = el.getBoundingClientRect()
-        if (style.display !== 'contents' && rect.width === 0 && rect.height === 0) {
-            const hasVisualChild = el.querySelector('svg, canvas, img, video') !== null
-            if (!hasVisualChild) {
-                return { actionable: false, reason: 'not-visible' }
-            }
-        }
-        const htmlEl = el as HTMLElement
-        if ('disabled' in htmlEl && (htmlEl as HTMLButtonElement).disabled) {
-            return { actionable: false, reason: 'not-enabled' }
-        }
-        let ancestor: Element | null = el
-        while (ancestor) {
-            if (ancestor.getAttribute('aria-disabled') === 'true') {
-                return { actionable: false, reason: 'not-enabled' }
-            }
-            ancestor = ancestor.parentElement
-        }
-        if (style.pointerEvents === 'none') {
-            return { actionable: false, reason: 'pointer-events-none' }
-        }
-        const vw = window.innerWidth
-        const vh = window.innerHeight
-        if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
-            return {
-                actionable: false,
-                reason: 'not-in-viewport',
-                rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-            }
-        }
-        const cx = rect.x + rect.width / 2
-        const cy = rect.y + rect.height / 2
-        const hitEl = document.elementFromPoint(cx, cy)
-        if (hitEl && hitEl !== el && !el.contains(hitEl) && !hitEl.contains(el)) {
-            const tag = hitEl.tagName.toLowerCase()
-            const cls = hitEl.className ? `.${String(hitEl.className).split(/\s+/).slice(0, 2).join('.')}` : ''
-            const elId = hitEl.id ? `#${hitEl.id}` : ''
-            return {
-                actionable: false,
-                reason: 'covered',
-                coveringElement: `<${tag}${elId}${cls}>`,
-                rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-            }
-        }
-        return { actionable: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } }
-    }
-
-    // 内联 scrollIntoViewWithRetry
-    function scrollIntoViewWithRetryInline(id: string): ActionabilityResult {
-        const w = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
-        const r = w.__mcpElementMap?.[id]
-        if (!r) {
-            return { actionable: false, reason: 'not-connected' }
-        }
-        const el = r.deref()
-        if (!el || !el.isConnected) {
-            return { actionable: false, reason: 'not-connected' }
-        }
-        const alignments: ScrollIntoViewOptions[] = [
-            { block: 'center', inline: 'center', behavior: 'instant' },
-            { block: 'end', inline: 'end', behavior: 'instant' },
-            { block: 'start', inline: 'start', behavior: 'instant' },
-            { block: 'nearest', inline: 'nearest', behavior: 'instant' },
-        ]
-        for (const alignment of alignments) {
-            el.scrollIntoView(alignment)
-            const rect = el.getBoundingClientRect()
-            const vw = window.innerWidth
-            const vh = window.innerHeight
-            if (rect.top >= 0 && rect.bottom <= vh && rect.left >= 0 && rect.right <= vw) {
-                const cx = rect.x + rect.width / 2
-                const cy = rect.y + rect.height / 2
-                const hitEl = document.elementFromPoint(cx, cy)
-                if (hitEl && (hitEl === el || el.contains(hitEl))) {
-                    return { actionable: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } }
-                }
-            }
-        }
-        return checkActionabilityInline(id)
-    }
-
-    // 派发完整鼠标事件序列（HTMLElement.click() 不触发 React onClick 等受控组件）
     function dispatchClickSequence(el: HTMLElement): void {
         const rect = el.getBoundingClientRect()
         const cx = Math.round(rect.x + rect.width / 2)
@@ -1418,9 +1533,60 @@ export function performActionableClick(
             clientY: cy,
             view: window,
         }
-        el.dispatchEvent(new MouseEvent('mousedown', opts))
-        el.dispatchEvent(new MouseEvent('mouseup', { ...opts, buttons: 0 }))
-        el.dispatchEvent(new MouseEvent('click', { ...opts, buttons: 0 }))
+        const reactHandlers = Object.keys(el)
+            .filter((key) => key.startsWith('__reactProps'))
+            .map((key) => {
+                const props = (el as unknown as Record<string, Record<string, unknown>>)[key]
+                const handler = props?.onClick
+                if (typeof handler !== 'function') {
+                    return null
+                }
+                let called = false
+                props.onClick = function (...args: unknown[]) {
+                    called = true
+                    return handler.apply(this, args)
+                }
+                return { props, handler, wasCalled: () => called }
+            })
+            .filter(
+                (
+                    item
+                ): item is {
+                    props: Record<string, unknown>
+                    handler: (...args: unknown[]) => unknown
+                    wasCalled: () => boolean
+                } => item !== null
+            )
+
+        try {
+            el.dispatchEvent(new MouseEvent('mousedown', opts))
+            el.focus()
+            el.dispatchEvent(new MouseEvent('mouseup', { ...opts, buttons: 0 }))
+            const clickEvent = new MouseEvent('click', { ...opts, buttons: 0 })
+            el.dispatchEvent(clickEvent)
+            for (const item of reactHandlers) {
+                if (!item.wasCalled()) {
+                    item.handler.call(el, {
+                        type: 'click',
+                        target: el,
+                        currentTarget: el,
+                        nativeEvent: clickEvent,
+                        clientX: cx,
+                        clientY: cy,
+                        button: 0,
+                        buttons: 0,
+                        preventDefault: () => clickEvent.preventDefault(),
+                        stopPropagation: () => clickEvent.stopPropagation(),
+                        isDefaultPrevented: () => clickEvent.defaultPrevented,
+                        isPropagationStopped: () => false,
+                    })
+                }
+            }
+        } finally {
+            for (const item of reactHandlers) {
+                item.props.onClick = item.handler
+            }
+        }
     }
 
     // force 模式：跳过所有检查，直接点击
@@ -1441,11 +1607,11 @@ export function performActionableClick(
     }
 
     // 正常模式：actionability 检查
-    let result = checkActionabilityInline(refId)
+    let result = helpers.check(refId)
 
     // 不在视口 → 自动滚动
     if (!result.actionable && result.reason === 'not-in-viewport') {
-        result = scrollIntoViewWithRetryInline(refId)
+        result = helpers.scrollIntoViewWithRetry(refId)
     }
 
     if (!result.actionable) {
@@ -1458,6 +1624,11 @@ export function performActionableClick(
             error: msg,
             reason: result.reason,
             coveringElement: result.coveringElement,
+            coveringRect: result.coveringRect,
+            rect: result.rect,
+            clickPoint: result.clickPoint,
+            candidates: result.candidates,
+            suggestions: result.suggestions,
         }
     }
 

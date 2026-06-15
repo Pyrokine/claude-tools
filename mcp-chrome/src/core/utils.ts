@@ -1,4 +1,4 @@
-import { mkdir, realpath } from 'fs/promises'
+import { chmod, mkdir, realpath, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 
@@ -48,6 +48,7 @@ export function escapeXPathString(str: string): string {
 export async function getControlledTempRoot(serverName: string): Promise<string> {
     const root = join(tmpdir(), 'claude-tools', serverName)
     await mkdir(root, { recursive: true, mode: 0o700 })
+    await chmod(root, 0o700)
     return root
 }
 
@@ -60,7 +61,15 @@ export async function resolveScopedOutputPath(rawPath: string, serverName: strin
 }
 
 export async function ensureParentDir(path: string): Promise<void> {
-    await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+    const parent = dirname(path)
+    await mkdir(parent, { recursive: true, mode: 0o700 })
+    await restrictControlledTempDir(parent)
+}
+
+export async function writePrivateFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<void> {
+    await ensureParentDir(path)
+    await writeFile(path, data, encoding)
+    await chmod(path, 0o600)
 }
 
 async function resolveScopedPath(rawPath: string, serverName: string): Promise<ResolvedScopedPath> {
@@ -156,6 +165,14 @@ async function canonicalizeOrAncestor(path: string): Promise<string> {
 function assertWithinRoot(path: string, root: string): void {
     if (!isWithinRoot(path, root)) {
         throw new Error(`路径超出允许范围: ${path}，仅允许受控临时目录或当前工作目录`)
+    }
+}
+
+async function restrictControlledTempDir(path: string): Promise<void> {
+    const controlledRoot = resolve(tmpdir(), 'claude-tools')
+    const canonicalPath = await realpath(path)
+    if (isWithinRoot(canonicalPath, controlledRoot)) {
+        await chmod(canonicalPath, 0o700)
     }
 }
 

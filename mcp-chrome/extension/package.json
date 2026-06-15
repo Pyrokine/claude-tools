@@ -10,14 +10,14 @@
         "lint:css": "stylelint \"src/**/*.css\""
     },
     "dependencies": {
-        "zod": "^3.24.0"
+        "zod": "^4.4.3"
     },
     "devDependencies": {
-        "@crxjs/vite-plugin": "^2.0.0-beta.28",
-        "@types/chrome": "^0.0.287",
-        "stylelint": "^17.8.0",
+        "@crxjs/vite-plugin": "^2.4.0",
+        "@types/chrome": "^0.1.42",
+        "stylelint": "^17.12.0",
         "stylelint-config-standard": "^40.0.0",
-        "typescript": "^5.7.2",
-        "vite": "8.0.5"
+        "typescript": "^6.0.3",
+        "vite": "^8.0.14"
     }
 }

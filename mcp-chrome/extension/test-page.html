@@ -103,6 +103,21 @@
             z-index: 10;
             pointer-events: auto;
         }
+
+        #compare-box {
+            width: 220px;
+            height: 120px;
+            background: #1565c0;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+        }
+
+        #compare-box.compare-after {
+            background: #c62828;
+        }
     </style>
 </head>
 <body>
@@ -265,6 +280,14 @@
     <input id='combo-input' style='width: 250px;' type='text' value='select-all-then-delete'>
 </div>
 
+<!-- screenshot compare 测试 -->
+<div class='section'>
+    <h2>13. screenshot compare 测试</h2>
+    <div data-state='before' id='compare-box'>before screenshot state</div>
+    <button id='compare-toggle-btn'>切换截图对比状态</button>
+    <button id='compare-reset-btn'>重置截图对比状态</button>
+</div>
+
 <script>
     /**
      * 在日志容器头部插入一行文本
@@ -272,8 +295,8 @@
      * @param {string} text - 要前置的文本
      */
     function prependLog(el, text) {
-        el.prepend(document.createElement('br'));
-        el.prepend(document.createTextNode(text));
+        el.insertAdjacentHTML('afterbegin', '<br>');
+        el.insertAdjacentText('afterbegin', text);
     }
 
     // 测试图片的 data URI（避免 HTML 属性行超长）
@@ -283,8 +306,9 @@
 
     // 输入监听
     document.getElementById('text-input').addEventListener('input', function(/** @type {InputEvent} */ e) {
-        /** @type {HTMLInputElement} */
-        const target = e.target;
+        const target = /** @type {HTMLInputElement} */ (
+            e.currentTarget
+        );
         document.getElementById('input-result').textContent = '输入内容: ' + target.value;
         console.log('[MCP-TEST] Input changed:', target.value);
     });
@@ -311,7 +335,7 @@
     const mouseLog = document.getElementById('mouse-log');
 
     document.getElementById('click-test').addEventListener('click', function(/** @type {MouseEvent} */ e) {
-        const info = `click: button=${e.button} x=${e.clientX} y=${e.clientY}`;
+        const info = `单击测试 click: button=${e.button} x=${e.clientX} y=${e.clientY}`;
         prependLog(mouseLog, info);
         console.log('[MCP-TEST]', info);
     });
@@ -408,6 +432,25 @@
                 target.textContent += ' (idle)';
             }
         }, 50);
+    });
+
+    // 区域 13: screenshot compare
+    const compareBox = document.getElementById('compare-box');
+
+    function setCompareState(state) {
+        compareBox.dataset.state = state;
+        compareBox.classList.toggle('compare-after', state === 'after');
+        compareBox.textContent = state + ' screenshot state';
+    }
+
+    document.getElementById('compare-toggle-btn').addEventListener('click', function() {
+        setCompareState(compareBox.dataset.state === 'after' ? 'before' : 'after');
+        console.log('[MCP-TEST] compare state:', compareBox.dataset.state);
+    });
+
+    document.getElementById('compare-reset-btn').addEventListener('click', function() {
+        setCompareState('before');
+        console.log('[MCP-TEST] compare state reset');
     });
 
     // 页面加载完成

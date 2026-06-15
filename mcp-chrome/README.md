@@ -69,8 +69,9 @@ Extension mode controls your existing Chrome — shares login sessions, cookies,
 claude mcp add chrome -- node /path/to/mcp-chrome/dist/index.js
 ```
 
+Claude Desktop / Other Clients:
+
 ```json
-// Claude Desktop / Other Clients
 {
   "mcpServers": {
     "chrome": {
@@ -128,10 +129,14 @@ browse(action="open", url="https://example.com")
 | `refresh` | Reload page                           |
 | `close`   | Close browser connection              |
 
-Extension-specific: `list` returns additional fields: `managed` (whether tab is in MCP Chrome group), `isActive`
-(whether it's the current operation target), `windowId`, `index`, `pinned`, `incognito`, `status` (`loading`/
-`complete`).
-`open` auto-creates tab group (cyan color).
+Extension-specific: `list` returns the flat `targets` array plus a `windows` tree. Each target includes `managed`
+(whether tab is controlled by MCP Chrome), `isActive` (whether it's the current operation target), `windowId`, `index`,
+`pinned`, `incognito`, and `status` (`loading`/`complete`). The tree includes `windowCount`, `focusedWindowId`,
+`activeTargetId`, and each window's ordered `tabs` list, so callers can distinguish the active tab inside each window
+from the page currently visible in the focused window.
+`open` auto-creates tab group (cyan color). `open`, `back`, `forward`, and `refresh` accept `diagnostics=true` to return
+new console warnings/errors and failed network requests observed during the action, including the first `open` that
+creates a page automatically.
 
 ### input - Keyboard & Mouse Input
 
@@ -150,6 +155,9 @@ Event sequence model supporting arbitrary combinations:
 | `select`                                | Select text by content (mouse sim)                                                |
 | `replace`                               | Find and replace text                                                             |
 | `drag`                                  | HTML5 drag-and-drop (DragEvent in MAIN world, with `target` source + `to` target) |
+| `editorContext`                         | Read focused editor and selection context                                         |
+| `editorInsert`                          | Insert text at the current editor selection                                       |
+| `editorCommand`                         | Execute browser editing commands such as `bold` or `insertOrderedList`            |
 
 Special-case parameters:
 
@@ -158,12 +166,17 @@ Special-case parameters:
   CDP commands API has no JS-event equivalent.
 - `keydown` on a key already held emits `rawKeyDown` with `autoRepeat: true` (Puppeteer-compatible long-press).
 
-Parameters: `humanize` enables Bézier curve movement and random delays. `tabId` targets a specific tab. `frame` targets
-an iframe (CSS selector or index). Both Extension mode only.
+Parameters: `humanize` enables Bézier curve movement and random delays. `diagnostics=true` returns new console
+warnings/errors and failed network requests after the action. `tabId` targets a specific tab. `frame` targets an
+iframe (CSS selector or index). Both Extension mode only.
 
-**`click`-specific**: `force: true` skips actionability checks (useful for testing or hidden elements).
-**`type`-specific**: `dispatch: true` sets `.value` directly and fires `input`/`change` events — use for React/Vue
-controlled inputs where keyboard events don't update state. Requires a non-coordinate `target`. Extension mode only.
+**`click`-specific**: `force: true` skips actionability checks (useful for testing or hidden elements). Actionability
+failures return `ACTIONABILITY_FAILED` with `rect`, `clickPoint`, covering element details, candidate blockers, and
+suggestions.
+**`type`-specific**: `mode="controlled"` or `dispatch: true` sets `.value` directly and fires `input`/`change` events —
+use for React/Vue controlled inputs where keyboard events don't update state. Requires a non-coordinate `target`.
+Extension mode only. Controlled input and target lookup failures return structured context with `target`, `matchCount`,
+`nth`, `activeElement`, `selection`, and candidate controls.
 
 ### extract - Content Extraction
 
@@ -171,13 +184,20 @@ controlled inputs where keyboard events don't update state. Requires a non-coord
 |--------------|---------------------------------------------------|
 | `text`       | Extract text content                              |
 | `html`       | Extract HTML source                               |
+| `frameHtml`  | Extract HTML from the selected iframe             |
 | `attribute`  | Extract element attribute                         |
 | `screenshot` | Take screenshot (supports `target` element crop)  |
 | `state`      | Get page state (URL, title, interactive elements) |
 | `metadata`   | Extract page metadata (title, OG, JSON-LD, etc.)  |
 
 Parameters: `output` saves result to file (or directory for `images=data`). `images` (`info`/`data`) extracts image
-metadata or data alongside HTML. `tabId` targets a specific tab. `frame` targets an iframe. Both Extension mode only.
+metadata or data alongside HTML. `frameHtml` extracts the current iframe document after `frame` routing. Screenshot
+accepts `clip` for coordinate-region capture, `compareWith` for PNG baseline comparison, and `diffOutput` for a PNG diff
+image. Screenshot responses include `metadata.format`, `width`, `height`, `dimensionSource`, `byteSize`, `fullPage`,
+`scale`, `clip`, and `capabilities`. PNG comparison is capped before decode at 25 MiB per PNG and 12,000,000 pixels; use
+`clip` or `scale` for larger captures. Hidden Extension tabs return `HIDDEN_TAB_SCREENSHOT` instead of auto-focusing the
+browser. `state` returns `interactiveElements`; `metadata` returns `frames` in both Extension and CDP modes. `tabId`
+targets a specific tab. `frame` targets an iframe. Both Extension mode only.
 
 **`attribute` special prefix**: `computed:<property>` returns the computed CSS style value (e.g. `computed:color`,
 `computed:font-size`). Use `computed:*` to return all computed style properties as JSON (returns 300+ properties — use
@@ -206,37 +226,55 @@ the DOM settled, `domStable: false` if still mutating when the budget ran out.
 
 Execute JavaScript in page context.
 
-| Parameter    | Description                                                                                                                       |
-|--------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| `script`     | JavaScript code. Bare `return` statements auto-wrapped in IIFE                                                                    |
-| `scriptFile` | Read script from a local file (alternative to `script`, relative paths default to controlled temp dir, use `cwd:` for repo files) |
-| `args`       | Arguments passed to script (script must be a function expression)                                                                 |
-| `mode`       | `precise` (default, debugger API) or `stealth` (JS injection)                                                                     |
-| `output`     | Save result to file (relative paths default to controlled temp dir, use `cwd:` to persist in repo)                                |
-| `tabId`      | Target a specific tab (Extension mode)                                                                                            |
-| `frame`      | Target an iframe by CSS selector or index (Extension mode)                                                                        |
-| `timeout`    | End-to-end budget (ms)                                                                                                            |
+| Parameter     | Description                                                                                                                       |
+|---------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `script`      | JavaScript code. Bare `return` statements auto-wrapped in IIFE                                                                    |
+| `scriptFile`  | Read script from a local file (alternative to `script`, relative paths default to controlled temp dir, use `cwd:` for repo files) |
+| `args`        | Arguments passed to script (script must be a function expression)                                                                 |
+| `mode`        | `precise` (default, debugger API) or `stealth` (JS injection)                                                                     |
+| `output`      | Save result to file (relative paths default to controlled temp dir, use `cwd:` to persist in repo)                                |
+| `tabId`       | Target a specific tab (Extension mode)                                                                                            |
+| `frame`       | Target an iframe by CSS selector or index (Extension mode)                                                                        |
+| `timeout`     | End-to-end budget (ms)                                                                                                            |
+| `diagnostics` | Return new console warnings/errors and failed network requests after execution                                                    |
 
 `script` and `scriptFile` are mutually exclusive; at least one must be provided. Relative `scriptFile` and `output`
 paths default to the OS temp directory managed by `mcp-chrome`. Use `cwd:relative/path` when the file must live in the
 current working directory. Relative paths reject `..`, and on Windows they also reject `:` to avoid NTFS alternate data
 streams.
 
-Results >100KB are auto-saved to the controlled OS temp directory with a structured hint returned.
+Results >100KB are auto-saved to the controlled OS temp directory with a structured hint returned. DOM nodes,
+`NodeList`, and `HTMLCollection` results return `NON_SERIALIZABLE_EVALUATE_RESULT` with a hint to return simple fields
+such as `textContent` or `outerHTML`.
 
 ### manage - Page & Environment Management
 
-| Action       | Description                                               |
-|--------------|-----------------------------------------------------------|
-| `newPage`    | Create new page/tab                                       |
-| `closePage`  | Close page                                                |
-| `clearCache` | Clear cache/storage (use `cookies` tool to clear cookies) |
-| `viewport`   | Set viewport size                                         |
-| `userAgent`  | Set User-Agent                                            |
-| `emulate`    | Device emulation (iPhone, iPad, etc.)                     |
-| `inputMode`  | Query or set input mode (`precise` / `stealth`)           |
-| `stealth`    | Inject anti-detection scripts                             |
-| `cdp`        | Send raw CDP command (advanced, e.g. `Runtime.evaluate`)  |
+| Action         | Description                                                |
+|----------------|------------------------------------------------------------|
+| `newPage`      | Create new controlled page/tab                             |
+| `closePage`    | Close controlled page and return `affected.before/after`   |
+| `adoptPage`    | Mark an existing tab as controlled without focusing it     |
+| `releasePage`  | Remove a controlled tab from management without closing it |
+| `movePage`     | Move a controlled tab to another window or index           |
+| `reorderPage`  | Reorder a controlled tab inside its window                 |
+| `pinPage`      | Pin a controlled tab                                       |
+| `unpinPage`    | Unpin a controlled tab                                     |
+| `activatePage` | Activate a controlled tab and focus its window             |
+| `focusWindow`  | Focus an explicit window                                   |
+| `resizeWindow` | Resize or change state for an explicit window              |
+| `newWindow`    | Create a new controlled window                             |
+| `closeWindow`  | Close a window only when all tabs are managed              |
+| `clearCache`   | Clear cache/storage (use `cookies` tool to clear cookies)  |
+| `viewport`     | Set viewport size                                          |
+| `userAgent`    | Set User-Agent                                             |
+| `emulate`      | Device emulation (iPhone, iPad, etc.)                      |
+| `inputMode`    | Query or set input mode (`precise` / `stealth`)            |
+| `stealth`      | Inject anti-detection scripts                              |
+| `cdp`          | Send raw CDP command (advanced, e.g. `Runtime.evaluate`)   |
+
+Tab/window management actions are Extension-mode only. Actions that change visible browser state require explicit
+`targetId` or `windowId` and return `affected.before/after`. `closeWindow` refuses mixed windows with unmanaged tabs and
+returns `WINDOW_HAS_UNMANAGED_TABS`.
 
 **Stealth mode levels** (CDP launch parameter, set via `browse action=launch stealth=...`):
 
@@ -251,8 +289,9 @@ Results >100KB are auto-saved to the controlled OS temp directory with a structu
 | `console` | Console logs (with level filter)       |
 | `network` | Network request logs (with URL filter) |
 
-Parameters: `output` saves result to file. `tabId` targets a specific tab (Extension mode). `frame` is not applicable
-for logs.
+Parameters: `output` saves result to file. Network logs include completed requests, HTTP 4xx/5xx responses, and failed
+loads with `errorText`, `method`, `url`, `status`, `timestamp`, and `duration` when available. `tabId` targets a
+specific tab (Extension mode). `frame` is not applicable for logs.
 
 ### cookies - Cookie Management
 
@@ -273,6 +312,9 @@ All tools use a unified `Target` type for element location:
 ```typescript
 // By accessibility (recommended - most stable)
 { role: "button", name: "Submit" }
+
+// By accessibility with exact accessible name
+{ role: "button", name: "Submit", exact: true }
 
 // By text content
 { text: "Click here", exact: true }

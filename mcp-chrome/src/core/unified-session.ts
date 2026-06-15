@@ -7,18 +7,44 @@
  */
 
 import { ExtensionBridge } from '../extension/index.js'
-import type { IBrowserDriver, SetCookieParams } from './browser-driver.js'
+import {
+    type ActionableClickResult,
+    type BrowserTopology,
+    DriverCapabilityError,
+    type IBrowserDriver,
+    type ManagedPageResult,
+    type MovePageOptions,
+    type NewWindowOptions,
+    type PageManagementResult,
+    type ResizeWindowOptions,
+    type SetCookieParams,
+} from './browser-driver.js'
 import { isExtensionDisconnected } from './extension-errors.js'
 import { getKeyDefinition, getSession as getCdpSession } from './session.js'
 import type { CdpResultObject, TargetInfo, WaitUntil } from './types.js'
-import { extractCdpValue, formatCdpException, MODIFIER_KEYS } from './types.js'
+import {
+    extractCdpValue,
+    formatCdpException,
+    isKnownNonSerializableRemoteObject,
+    MODIFIER_KEYS,
+    NonSerializableEvaluateResultError,
+} from './types.js'
 
 export type ConnectionMode = 'extension' | 'cdp' | 'none'
+type ActiveConnectionMode = Exclude<ConnectionMode, 'none'>
 export type InputMode = 'stealth' | 'precise' // stealth=JS模拟, precise=debugger API
+
+interface CdpPropertyDescriptor {
+    name: string
+    value?: CdpResultObject
+    enumerable?: boolean
+    wasThrown?: boolean
+}
 
 interface UnifiedSessionState {
     url: string
     title: string
+    managed?: boolean
 }
 
 class UnifiedSessionManager {
@@ -32,6 +58,7 @@ class UnifiedSessionManager {
     /** 当前按下的所有键（用于 Puppeteer 风格的 rawKeyDown/autoRepeat 长按重复） */
     private pressedKeys = new Set<string>()
     private lastConnectionFailure = 0
+    private activeMode: ActiveConnectionMode | null = null
     private tabSwitchLock: Promise<void> = Promise.resolve() // 串行化 tab 切换，防止并发竞态
     private requireExtension = false // 指定 tabId 或 frame 时为 true，禁止 CDP 回退
     private currentFrameOffset: { x: number; y: number } | null = null // iframe 在主页面的偏移量（withFrame 期间有效）
@@ -68,13 +95,26 @@ class UnifiedSessionManager {
      * 获取当前连接模式
      */
     getMode(): ConnectionMode {
+        if (this.activeMode === 'extension' && this.extensionBridge?.isConnected()) {
+            return 'extension'
+        }
+        if (this.activeMode === 'cdp' && getCdpSession().isConnected()) {
+            return 'cdp'
+        }
+        this.activeMode = null
         if (this.extensionBridge?.isConnected()) {
+            this.activeMode = 'extension'
             return 'extension'
         }
         if (getCdpSession().isConnected()) {
+            this.activeMode = 'cdp'
             return 'cdp'
         }
         return 'none'
+    }
+
+    setActiveMode(mode: ActiveConnectionMode): void {
+        this.activeMode = mode
     }
 
     /**
@@ -112,6 +152,10 @@ class UnifiedSessionManager {
      * 是否 Extension 已连接
      */
     isExtensionConnected(): boolean {
+        return this.activeMode === 'extension' && (this.extensionBridge?.isConnected() ?? false)
+    }
+
+    isExtensionAvailable(): boolean {
         return this.extensionBridge?.isConnected() ?? false
     }
 
@@ -137,23 +181,30 @@ class UnifiedSessionManager {
             stealth?: 'off' | 'safe' | 'aggressive'
         } = {}
     ): Promise<TargetInfo & { mode: ConnectionMode }> {
+        const extensionReady =
+            this.activeMode === 'cdp'
+                ? (this.extensionBridge?.isConnected() ?? false)
+                : await this.ensureExtensionConnected(options.timeout)
         // 优先检查 Extension 是否已连接，如果断开则等待重连（受 timeout 约束）
-        if (await this.ensureExtensionConnected(options.timeout)) {
+        if (extensionReady) {
             // newPage 会设置 currentTabId，需要加锁
             const result = await this.withTabLock(async () => {
                 return this.extensionBridge!.newPage(undefined, options.timeout)
             })
+            this.activeMode = 'extension'
             return {
                 targetId: result.targetId,
                 type: result.type ?? 'page',
                 url: result.url,
                 title: result.title,
+                managed: result.managed,
                 mode: 'extension',
             }
         }
 
         // Fallback 到 CDP 模式
         const target = await getCdpSession().launch(options)
+        this.activeMode = 'cdp'
         return {
             ...target,
             mode: 'cdp',
@@ -197,6 +248,101 @@ class UnifiedSessionManager {
             incognito: t.incognito,
             status: t.status,
         }))
+    }
+
+    async listTopology(): Promise<BrowserTopology | null> {
+        const mode = this.getMode()
+        if (mode === 'none') {
+            return null
+        }
+        const driver = await this.getDriver()
+        if (!driver.listWindows) {
+            return null
+        }
+        return driver.listWindows()
+    }
+
+    async adoptPage(targetId: string): Promise<ManagedPageResult> {
+        const driver = await this.getDriver()
+        if (!driver.adoptPage) {
+            throw new DriverCapabilityError('adoptPage 仅支持 Extension 模式')
+        }
+        return driver.adoptPage(targetId)
+    }
+
+    async releasePage(targetId: string): Promise<ManagedPageResult> {
+        const driver = await this.getDriver()
+        if (!driver.releasePage) {
+            throw new DriverCapabilityError('releasePage 仅支持 Extension 模式')
+        }
+        return driver.releasePage(targetId)
+    }
+
+    async movePage(targetId: string, options: MovePageOptions): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.movePage) {
+            throw new DriverCapabilityError('movePage 仅支持 Extension 模式')
+        }
+        return driver.movePage(targetId, options)
+    }
+
+    async reorderPage(targetId: string, index: number): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.reorderPage) {
+            throw new DriverCapabilityError('reorderPage 仅支持 Extension 模式')
+        }
+        return driver.reorderPage(targetId, index)
+    }
+
+    async pinPage(targetId: string, pinned: boolean): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.pinPage) {
+            throw new DriverCapabilityError('pinPage 仅支持 Extension 模式')
+        }
+        return driver.pinPage(targetId, pinned)
+    }
+
+    async activatePageWithAffected(targetId: string): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        const bridge = driver as IBrowserDriver & {
+            activatePageWithAffected?: (targetId: string) => Promise<PageManagementResult>
+        }
+        if (!bridge.activatePageWithAffected) {
+            throw new DriverCapabilityError('activatePage 受控 affected 返回仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => bridge.activatePageWithAffected!(targetId))
+    }
+
+    async focusWindow(windowId: number): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.focusWindow) {
+            throw new DriverCapabilityError('focusWindow 仅支持 Extension 模式')
+        }
+        return driver.focusWindow(windowId)
+    }
+
+    async resizeWindow(windowId: number, options: ResizeWindowOptions): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.resizeWindow) {
+            throw new DriverCapabilityError('resizeWindow 仅支持 Extension 模式')
+        }
+        return driver.resizeWindow(windowId, options)
+    }
+
+    async newWindow(options: NewWindowOptions): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.newWindow) {
+            throw new DriverCapabilityError('newWindow 仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.newWindow!(options))
+    }
+
+    async closeWindow(windowId: number): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.closeWindow) {
+            throw new DriverCapabilityError('closeWindow 仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.closeWindow!(windowId))
     }
 
     /**
@@ -246,9 +392,8 @@ class UnifiedSessionManager {
         fullPage?: boolean
         scale?: number
         clip?: { x: number; y: number; width: number; height: number }
-    }): Promise<string> {
-        const result = await (await this.getDriver()).screenshot(options)
-        return result.data
+    }): Promise<{ data: string; format: string }> {
+        return (await this.getDriver()).screenshot(options)
     }
 
     /**
@@ -264,17 +409,14 @@ class UnifiedSessionManager {
      *
      * 返回结构化结果，让调用方知道操作是否真正生效
      */
-    async actionableClick(
-        refId: string,
-        force?: boolean
-    ): Promise<{
-        success: boolean
-        error?: string
-        reason?: string
-        coveringElement?: string
-    }> {
+    async actionableClick(refId: string, force?: boolean): Promise<ActionableClickResult> {
         const driver = await this.getDriver()
         return driver.actionableClick(refId, force)
+    }
+
+    async checkActionability(refId: string): Promise<ActionableClickResult> {
+        const driver = await this.getDriver()
+        return driver.checkActionability(refId)
     }
 
     /**
@@ -557,6 +699,14 @@ class UnifiedSessionManager {
         return driver.getAttribute(selector, refId, attribute)
     }
 
+    async getFrames(): Promise<Record<string, unknown>> {
+        const driver = await this.getDriver()
+        if (!driver.getFrames) {
+            return { frames: [] }
+        }
+        return driver.getFrames()
+    }
+
     /**
      * 获取 Cookies
      */
@@ -597,6 +747,7 @@ class UnifiedSessionManager {
                 type: result.type ?? 'page',
                 url: result.url,
                 title: result.title,
+                managed: result.managed,
             }
         }
         // Extension 模式 createTab 设置 currentTabId,需要加锁防止并发竞态
@@ -606,15 +757,14 @@ class UnifiedSessionManager {
     /**
      * 关闭页面
      */
-    async closePage(targetId?: string): Promise<void> {
+    async closePage(targetId?: string): Promise<void | PageManagementResult> {
         const driver = await this.getDriver()
         const isExt = this.isExtensionConnected()
         const op = () => driver.closePage(targetId)
         if (isExt) {
-            await this.withTabLock(op)
-        } else {
-            await op()
+            return this.withTabLock(op)
         }
+        return op()
     }
 
     /**
@@ -677,14 +827,18 @@ class UnifiedSessionManager {
         const driver = this.extensionBridge!
         return this.withTabLock(async () => {
             const previousTargetId = driver.getCurrentTargetId()
+            // 临时切换用 setCurrentTargetId，跳过 managed 校验（tabId 仅用于读取/执行，不改变持久 attach 目标）
             driver.setCurrentTargetId(tabId)
             // tabId 明确指定时，禁止 CDP 回退（CDP 不感知 Extension tab）
             const previousRequireExtension = this.requireExtension
+            const previousActiveMode = this.activeMode
             this.requireExtension = true
+            this.activeMode = 'extension'
             try {
                 return await fn()
             } finally {
                 this.requireExtension = previousRequireExtension
+                this.activeMode = previousActiveMode
                 driver.setCurrentTargetId(previousTargetId)
             }
         })
@@ -713,14 +867,17 @@ class UnifiedSessionManager {
         const previousFrameId = driver.getCurrentFrameId()
         const previousFrameOffset = this.currentFrameOffset
         const previousRequireExtension = this.requireExtension
+        const previousActiveMode = this.activeMode
         driver.setCurrentFrameId(frameId)
         this.currentFrameOffset = offset
         this.requireExtension = true
+        this.activeMode = 'extension'
         try {
             return await fn()
         } finally {
             // 字段赋值不会 throw,driver.setCurrentFrameId 是同步函数也不会 throw,无需嵌套 try
             this.requireExtension = previousRequireExtension
+            this.activeMode = previousActiveMode
             this.currentFrameOffset = previousFrameOffset
             driver.setCurrentFrameId(previousFrameId)
         }
@@ -731,8 +888,8 @@ class UnifiedSessionManager {
      */
     getState(): UnifiedSessionState | null {
         // driver.getState() 两侧都返回 DriverState | null（{url, title}），SessionState 含 targetId 是其超集，结构兼容
-        if (this.extensionBridge?.isConnected()) {
-            return this.extensionBridge.getState()
+        if (this.getMode() === 'extension') {
+            return this.extensionBridge!.getState()
         }
         return getCdpSession().getState()
     }
@@ -887,7 +1044,7 @@ class UnifiedSessionManager {
     ): Promise<void> {
         const driver = await this.getDriver()
         const isExt = this.isExtensionConnected()
-        if (this.inputMode === 'stealth' && isExt) {
+        if (isExt && (this.inputMode === 'stealth' || button === 'right')) {
             const { x, y } = this.currentMousePosition
             // stealth 通过单次脚本注入完成所有 mouse/click/dblclick/contextmenu 事件
             // refId 透传：嵌套 iframe overlay 场景下绕过 elementFromPoint 命中外层 IFRAME 的问题
@@ -965,10 +1122,16 @@ class UnifiedSessionManager {
         return (await this.getDriver()).getConsoleLogs(options)
     }
 
-    async getNetworkRequests(
-        options: { urlPattern?: string; clear?: boolean } = {}
-    ): Promise<
-        Array<{ url: string; method: string; status?: number; type: string; timestamp: number; duration?: number }>
+    async getNetworkRequests(options: { urlPattern?: string; clear?: boolean } = {}): Promise<
+        Array<{
+            url: string
+            method: string
+            status?: number
+            type: string
+            timestamp: number
+            duration?: number
+            errorText?: string
+        }>
     > {
         return (await this.getDriver()).getNetworkRequests(options)
     }
@@ -1021,21 +1184,22 @@ class UnifiedSessionManager {
             return this.checkCdpResult<T>(result)
         }
 
-        // 主 frame，无 args：直接 Runtime.evaluate
         const params: Record<string, unknown> = {
             expression,
-            returnByValue: true,
+            returnByValue: false,
             awaitPromise: true,
         }
         if (timeout !== undefined) {
             params.timeout = timeout
         }
-        // timeout 即端到端预算，直接作为 RPC 超时（不额外加 margin）
         const result = (await this.extensionBridge!.debuggerSend('Runtime.evaluate', params, undefined, timeout)) as {
             result?: CdpResultObject<T>
             exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
         }
-        return this.checkCdpResult<T>(result)
+        if (result.exceptionDetails) {
+            throw new Error(formatCdpException(result.exceptionDetails))
+        }
+        return this.materializeCdpResult<T>(result.result, timeout)
     }
 
     private async evaluateViaExtensionStealth<T>(expression: string, timeout?: number): Promise<T> {
@@ -1101,6 +1265,86 @@ class UnifiedSessionManager {
         return extractCdpValue<T>(result.result)
     }
 
+    private async materializeCdpResult<T>(result: CdpResultObject<T> | undefined, timeout?: number): Promise<T> {
+        if (!result?.objectId) {
+            return extractCdpValue<T>(result)
+        }
+        try {
+            return await this.materializeRemoteObject<T>(result, timeout, new Set())
+        } finally {
+            this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId: result.objectId }).catch(() => {})
+        }
+    }
+
+    private async materializeRemoteObject<T>(
+        result: CdpResultObject,
+        timeout: number | undefined,
+        seen: Set<string>
+    ): Promise<T> {
+        if (!result.objectId) {
+            return extractCdpValue<T>(result as CdpResultObject<T>)
+        }
+        if (isKnownNonSerializableRemoteObject(result) || seen.has(result.objectId)) {
+            throw new NonSerializableEvaluateResultError(result)
+        }
+
+        seen.add(result.objectId)
+        const properties = (await this.extensionBridge!.debuggerSend(
+            'Runtime.getProperties',
+            {
+                objectId: result.objectId,
+                ownProperties: true,
+                accessorPropertiesOnly: false,
+                generatePreview: false,
+            },
+            undefined,
+            timeout
+        )) as {
+            result?: CdpPropertyDescriptor[]
+            exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+        }
+        if (properties.exceptionDetails) {
+            throw new Error(formatCdpException(properties.exceptionDetails))
+        }
+
+        if (result.subtype === 'array') {
+            const array: unknown[] = []
+            for (const descriptor of properties.result ?? []) {
+                if (!descriptor.value || !/^\d+$/.test(descriptor.name)) {
+                    continue
+                }
+                array[Number(descriptor.name)] = await this.materializePropertyValue(descriptor.value, timeout, seen)
+            }
+            seen.delete(result.objectId)
+            return array as T
+        }
+
+        const object: Record<string, unknown> = {}
+        for (const descriptor of properties.result ?? []) {
+            if (!descriptor.enumerable || descriptor.wasThrown || !descriptor.value) {
+                continue
+            }
+            object[descriptor.name] = await this.materializePropertyValue(descriptor.value, timeout, seen)
+        }
+        seen.delete(result.objectId)
+        return object as T
+    }
+
+    private async materializePropertyValue(
+        value: CdpResultObject,
+        timeout: number | undefined,
+        seen: Set<string>
+    ): Promise<unknown> {
+        if (!value.objectId) {
+            return extractCdpValue(value)
+        }
+        try {
+            return await this.materializeRemoteObject(value, timeout, seen)
+        } finally {
+            this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId: value.objectId }).catch(() => {})
+        }
+    }
+
     /**
      * 检查 CDP 回退是否允许
      *
@@ -1131,9 +1375,15 @@ class UnifiedSessionManager {
      *               避免工具 timeout 被连接等待吞掉，不传则使用默认 30s
      */
     private async getDriver(timeout?: number): Promise<IBrowserDriver> {
+        if (this.activeMode === 'cdp' && getCdpSession().isConnected()) {
+            this.assertCdpFallbackAllowed()
+            return getCdpSession()
+        }
         if (await this.ensureExtensionConnected(timeout)) {
+            this.activeMode = 'extension'
             return this.extensionBridge!
         }
+        this.activeMode = 'cdp'
         return getCdpSession()
     }
 
@@ -1141,11 +1391,16 @@ class UnifiedSessionManager {
         if (!this.extensionBridge) {
             return this.assertCdpFallbackAllowed()
         }
+        if (this.activeMode === 'cdp' && getCdpSession().isConnected()) {
+            return this.assertCdpFallbackAllowed()
+        }
         if (this.extensionBridge.isConnected()) {
+            this.activeMode = 'extension'
             return true
         }
         // CDP 已连接时跳过 Extension 等待，直接使用 CDP 回退
         if (getCdpSession().isConnected()) {
+            this.activeMode = 'cdp'
             return this.assertCdpFallbackAllowed()
         }
         // 冷却期内不重复等待，避免每次操作都阻塞 30 秒
@@ -1179,6 +1434,7 @@ class UnifiedSessionManager {
      * 要求 code 必须是函数表达式（如 "(x) => x + 1"）
      */
     private async callFunctionOn<T>(code: string, args: unknown[], timeout?: number): Promise<T> {
+        const fallbackExpression = `(${code})(${args.map((a) => JSON.stringify(a)).join(', ')})`
         const globalResult = (await this.extensionBridge!.debuggerSend(
             'Runtime.evaluate',
             {
@@ -1187,14 +1443,18 @@ class UnifiedSessionManager {
             },
             undefined,
             timeout
-        )) as { result: { objectId: string } }
+        )) as { result?: CdpResultObject }
+        const globalObjectId = globalResult.result?.objectId
+        if (!globalObjectId) {
+            return this.evaluateViaExtensionPrecise<T>(fallbackExpression, fallbackExpression, undefined, timeout)
+        }
 
         try {
             const params: Record<string, unknown> = {
                 functionDeclaration: code,
-                objectId: globalResult.result.objectId,
+                objectId: globalObjectId,
                 arguments: args.map((a) => ({ value: a })),
-                returnByValue: true,
+                returnByValue: false,
                 awaitPromise: true,
             }
             if (timeout !== undefined) {
@@ -1209,10 +1469,19 @@ class UnifiedSessionManager {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
             }
-            return this.checkCdpResult<T>(result)
+            if (result.exceptionDetails) {
+                throw new Error(formatCdpException(result.exceptionDetails))
+            }
+            return await this.materializeCdpResult<T>(result.result, timeout)
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (message.includes('Either objectId or executionContextId or uniqueContextId must be specified')) {
+                return this.evaluateViaExtensionPrecise<T>(fallbackExpression, fallbackExpression, undefined, timeout)
+            }
+            throw error
         } finally {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', {
-                objectId: globalResult.result.objectId,
+                objectId: globalObjectId,
             }).catch(() => {})
         }
     }

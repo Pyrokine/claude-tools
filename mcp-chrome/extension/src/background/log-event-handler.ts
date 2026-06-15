@@ -7,7 +7,7 @@ import {
     NetworkEnableSchema,
     NetworkGetSchema,
 } from '../types/schemas'
-import { assertScriptable, getTargetTabId, isRestrictedUrl } from './action-utils'
+import { type ActionContext, assertManagedTab, assertScriptable, getTargetTabId, isRestrictedUrl } from './action-utils'
 import { DebuggerBlockedError, DebuggerManager } from './debugger-manager'
 import { LogManager } from './log-manager'
 
@@ -17,9 +17,9 @@ export class LogEventHandler {
         private debuggerManager: DebuggerManager
     ) {}
 
-    async consoleEnable(params: unknown): Promise<{ success: boolean }> {
+    async consoleEnable(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = ConsoleEnableSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'console_enable')
 
         // debugger 之前 blocked 现已可用 → 卸载 hook、把残留 logs 合并到 logManager 后清空
         const wasBlocked = this.debuggerManager.isBlocked(tabId)
@@ -82,9 +82,9 @@ export class LogEventHandler {
         return { success: true }
     }
 
-    async consoleGet(params: unknown): Promise<{ messages: ConsoleMessage[] }> {
+    async consoleGet(params: unknown, context: ActionContext): Promise<{ messages: ConsoleMessage[] }> {
         const p = ConsoleGetSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'console_get')
 
         let messages = this.logManager.getConsole(tabId)
 
@@ -185,18 +185,18 @@ export class LogEventHandler {
         return { messages }
     }
 
-    async consoleClear(params: unknown): Promise<{ success: boolean }> {
+    async consoleClear(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = ConsoleClearSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'console_clear')
 
         this.logManager.setConsole(tabId, [])
 
         return { success: true }
     }
 
-    async networkEnable(params: unknown): Promise<{ success: boolean }> {
+    async networkEnable(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = NetworkEnableSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'network_enable')
 
         try {
             await this.debuggerManager.ensureAttached(tabId)
@@ -216,9 +216,9 @@ export class LogEventHandler {
         return { success: true }
     }
 
-    async networkGet(params: unknown): Promise<{ requests: NetworkRequest[] }> {
+    async networkGet(params: unknown, context: ActionContext): Promise<{ requests: NetworkRequest[] }> {
         const p = NetworkGetSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'network_get')
 
         let requests = this.logManager.getNetwork(tabId)
 
@@ -284,13 +284,23 @@ export class LogEventHandler {
         return { requests }
     }
 
-    async networkClear(params: unknown): Promise<{ success: boolean }> {
+    async networkClear(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = NetworkClearSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'network_clear')
 
         this.logManager.setNetwork(tabId, [])
 
         return { success: true }
+    }
+
+    private async getManagedTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<number> {
+        const resolvedTabId = await getTargetTabId(tabId)
+        await assertManagedTab(resolvedTabId, context, operation)
+        return resolvedTabId
     }
 
     /** 卸载 fallback console hook,把残留 logs 合并到 logManager,清空注入数组 */

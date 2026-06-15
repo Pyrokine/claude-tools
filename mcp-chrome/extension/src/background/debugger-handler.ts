@@ -1,6 +1,6 @@
 import { ExpectedOperationError } from '../types/expected-errors'
 import { DebuggerAttachSchema, DebuggerDetachSchema, DebuggerSendSchema } from '../types/schemas'
-import { assertScriptable, getTargetTabId } from './action-utils'
+import { type ActionContext, assertManagedTab, assertScriptable, getTargetTabId } from './action-utils'
 import { DebuggerManager } from './debugger-manager'
 import { LogManager } from './log-manager'
 
@@ -28,10 +28,9 @@ export class DebuggerHandler {
         private logManager: LogManager
     ) {}
 
-    async debuggerAttach(params: unknown): Promise<{ success: boolean; tabId: number }> {
+    async debuggerAttach(params: unknown, context: ActionContext): Promise<{ success: boolean; tabId: number }> {
         const p = DebuggerAttachSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'debugger_attach')
         try {
             await this.debuggerManager.ensureAttached(tabId)
         } catch (e) {
@@ -40,9 +39,10 @@ export class DebuggerHandler {
         return { success: true, tabId }
     }
 
-    async debuggerDetach(params: unknown): Promise<{ success: boolean }> {
+    async debuggerDetach(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = DebuggerDetachSchema.parse(params) ?? {}
         const tabId = await getTargetTabId(p.tabId)
+        await assertManagedTab(tabId, context, 'debugger_detach')
 
         if (!this.debuggerManager.isAttached(tabId)) {
             return { success: true }
@@ -61,16 +61,29 @@ export class DebuggerHandler {
         return { success: true }
     }
 
-    async debuggerSend(params: unknown): Promise<unknown> {
+    async debuggerSend(params: unknown, context: ActionContext): Promise<unknown> {
         const p = DebuggerSendSchema.parse(params)
 
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'debugger_send')
         try {
             await this.debuggerManager.ensureAttached(tabId)
+            if (p.method === 'Emulation.setDeviceMetricsOverride') {
+                await chrome.tabs.setZoom(tabId, 1)
+            }
             return await chrome.debugger.sendCommand({ tabId }, p.method, p.params)
         } catch (e) {
             throw wrapDebuggerError(e)
         }
+    }
+
+    private async getManagedScriptableTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<number> {
+        const resolvedTabId = await getTargetTabId(tabId)
+        await assertManagedTab(resolvedTabId, context, operation)
+        await assertScriptable(resolvedTabId)
+        return resolvedTabId
     }
 }

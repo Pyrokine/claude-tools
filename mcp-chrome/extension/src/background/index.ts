@@ -11,7 +11,14 @@ import type { InternalMessage } from '../types'
 import { isExpectedOperationError } from '../types/expected-errors'
 import { ActionHandler } from './actions'
 import { HttpClient } from './http-client'
-import { getMcpTabGroupId, getMcpWindowId, setMcpTabGroupId, setMcpWindowId } from './tab-state'
+import {
+    getMcpTabGroupId,
+    getMcpWindowId,
+    restoreManagedTabs,
+    setMcpTabGroupId,
+    setMcpWindowId,
+    unmarkManagedTab,
+} from './tab-state'
 
 // ==================== 全局状态 ====================
 
@@ -127,6 +134,9 @@ chrome.windows.onRemoved.addListener((windowId) => {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
     // 清理 ActionHandler 中的 per-tab 内存（防止长时间运行后内存泄漏）
     actionHandler.cleanupTab(tabId)
+    void unmarkManagedTab(tabId).catch((error) => {
+        console.warn('[MCP] managed tab storage cleanup failed:', error)
+    })
 
     const groupId = getMcpTabGroupId()
     if (groupId === null) {
@@ -151,7 +161,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
         return
     }
     // changeInfo 包含 groupId（Chrome 88+），TypeScript 类型可能未声明
-    const info = changeInfo as chrome.tabs.TabChangeInfo & { groupId?: number }
+    const info = changeInfo as chrome.tabs.OnUpdatedInfo & { groupId?: number }
     if (info.groupId === groupId) {
         console.log(`[MCP] Tab ${tabId} joined MCP Chrome group`)
     }
@@ -176,7 +186,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // ==================== 自动连接 ====================
 
-// Service Worker 启动时立即尝试连接所有 MCP Server
+// Service Worker 启动时恢复 managed tab 集合并尝试连接所有 MCP Server
 setTimeout(() => {
+    void restoreManagedTabs()
     void httpClient.connect()
 }, 500)

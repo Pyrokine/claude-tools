@@ -222,8 +222,12 @@ export class Locator {
      * 通过可访问性树定位
      */
     private async findByAccessibility(): Promise<NodeId> {
-        const { role, name } = this.target as { role: string; name?: string }
-        this.log(`使用可访问性树定位: role=${role}, name=${name ?? '(any)'}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
+        const { role, name, exact = false } = this.target as { role: string; name?: string; exact?: boolean }
+        this.log(
+            `使用可访问性树定位: role=${role}, name=${name ?? '(any)'}, exact=${exact}${
+                this.nth > 0 ? `, nth=${this.nth}` : ''
+            }`
+        )
 
         // 启用可访问性
         await this.send('Accessibility.enable')
@@ -242,9 +246,11 @@ export class Locator {
             }>
         }
 
+        const matchingNodes = exact && name !== undefined ? nodes.filter((node) => node.name?.value === name) : nodes
+
         // 对所有匹配节点计数（含无 backendDOMNodeId 的节点），确保 nth 语义正确
         let matchCount = 0
-        for (const node of nodes) {
+        for (const node of matchingNodes) {
             if (matchCount < this.nth) {
                 ++matchCount
                 continue

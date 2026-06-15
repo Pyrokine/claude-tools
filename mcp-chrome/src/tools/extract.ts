@@ -4,6 +4,7 @@
  * 提取页面内容：
  * - text: 文本内容
  * - html: HTML 源码（可选附带图片元信息或图片数据）
+ * - frameHtml: iframe HTML 源码（Extension 模式，支持跨域 iframe）
  * - attribute: 元素属性
  * - screenshot: 截图
  * - state: 页面状态（精简的可交互元素列表）
@@ -11,20 +12,21 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { mkdir, writeFile } from 'fs/promises'
+import { readFile } from 'fs/promises'
 import { basename, extname, join } from 'path'
 import { z } from 'zod'
 import {
     CWD_PATH_PREFIX,
-    ensureParentDir,
     formatErrorResponse,
     formatResponse,
     getSession,
     getUnifiedSession,
     resolveScopedOutputPath,
     TMP_PATH_PREFIX,
+    writePrivateFile,
 } from '../core/index.js'
 import type { Target } from '../core/types.js'
+import { comparePngImages, MAX_COMPARE_PIXELS, MAX_COMPARE_PNG_BYTES, readPngHeader } from './png.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
 
 /** 图片元信息 */
@@ -52,7 +54,9 @@ const MAX_APPENDIX_IMAGES = 20
  * extract 参数 schema
  */
 const extractSchema = z.object({
-    type: z.enum(['text', 'html', 'attribute', 'screenshot', 'state', 'metadata']).describe('提取类型'),
+    type: z
+        .enum(['text', 'html', 'frameHtml', 'attribute', 'screenshot', 'state', 'metadata', 'diagnosticBundle'])
+        .describe('提取类型'),
     target: targetZodSchema
         .optional()
         .describe(
@@ -78,6 +82,17 @@ const extractSchema = z.object({
         .max(100)
         .optional()
         .describe('截图质量（screenshot，仅 jpeg/webp 有效），0-100，推荐 80'),
+    clip: z
+        .object({
+            x: z.number(),
+            y: z.number(),
+            width: z.number().positive(),
+            height: z.number().positive(),
+        })
+        .optional()
+        .describe('坐标区域截图（screenshot），单位为 CSS 像素'),
+    compareWith: z.string().optional().describe('截图对比基准 PNG 路径，遵循 output 相同的 tmp:/cwd: 路径规则'),
+    diffOutput: z.string().optional().describe('截图对比差异图输出路径，遵循 output 相同的 tmp:/cwd: 路径规则'),
     output: z
         .string()
         .optional()
@@ -109,14 +124,29 @@ const extractSchema = z.object({
 /**
  * extract 工具处理器
  */
-async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
+type ExtractArgs = z.infer<typeof extractSchema>
+
+type ExtractToolResponse = {
     content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>
     isError?: boolean
-}> {
+}
+
+interface ExtractContext {
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+    session: ReturnType<typeof getSession>
+    useExtension: boolean
+}
+
+async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
     try {
         const unifiedSession = getUnifiedSession()
         const useExtension = unifiedSession.isExtensionConnected()
         const session = getSession()
+
+        const frameHtmlError = validateFrameHtmlArgs(args, useExtension)
+        if (frameHtmlError) {
+            return frameHtmlError
+        }
 
         // 多 tab 并行：临时切换到指定 tab
         return await unifiedSession.withTabId(args.tabId, async () => {
@@ -126,268 +156,372 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
                     await waitForTargetExtension(unifiedSession, args.target, args.timeout)
                 }
 
-                switch (args.type) {
-                    case 'text': {
-                        const text = useExtension
-                            ? await extractTextExtension(unifiedSession, args.target)
-                            : await extractText(session, args.target, args.timeout)
-                        if (args.output) {
-                            const outputPath = await writeOutputFile(args.output, text, 'utf-8')
-                            return formatResponse({
-                                success: true,
-                                type: 'text',
-                                output: outputPath,
-                                size: text.length,
-                            })
-                        }
-                        return formatResponse({
-                            success: true,
-                            type: 'text',
-                            content: text,
-                        })
-                    }
-
-                    case 'html': {
-                        // 带图片提取的增强路径
-                        if (args.images) {
-                            return await handleHtmlWithImages(unifiedSession, session, useExtension, args)
-                        }
-
-                        // 原有路径：纯 HTML
-                        const html = useExtension
-                            ? await extractHtmlExtension(unifiedSession, args.target)
-                            : await extractHTML(session, args.target, args.timeout)
-                        if (args.output) {
-                            const outputPath = await writeOutputFile(args.output, html, 'utf-8')
-                            return formatResponse({
-                                success: true,
-                                type: 'html',
-                                output: outputPath,
-                                size: html.length,
-                            })
-                        }
-                        return formatResponse({
-                            success: true,
-                            type: 'html',
-                            content: html,
-                        })
-                    }
-
-                    case 'attribute': {
-                        if (!args.target) {
-                            return formatErrorResponse(new Error('attribute 提取需要 target 参数'))
-                        }
-                        if (!args.attribute) {
-                            return formatErrorResponse(new Error('attribute 提取需要 attribute 参数'))
-                        }
-
-                        let value: string | null
-                        if (useExtension) {
-                            value = await extractAttributeExtension(unifiedSession, args.target, args.attribute)
-                        } else {
-                            value = await extractAttribute(session, args.target, args.attribute, args.timeout)
-                        }
-
-                        return formatResponse({
-                            success: true,
-                            type: 'attribute',
-                            attribute: args.attribute,
-                            value,
-                        })
-                    }
-
-                    case 'screenshot': {
-                        // 有 target 时获取元素区域用于裁剪（支持所有 target 类型）
-                        let clip: { x: number; y: number; width: number; height: number } | undefined
-                        if (args.target) {
-                            const {
-                                selector,
-                                text,
-                                xpath,
-                                nth: nthParam,
-                            } = targetToFindParams(
-                                args.target as Target & {
-                                    nth?: number
-                                }
-                            )
-                            const nth = nthParam ?? 0
-                            // unified.find 内部根据 Extension 连接状态自动路由到 Extension/CDP 路径，
-                            // 返回视口绝对坐标（含 iframe 坐标修正）
-                            const found = await unifiedSession.find(selector, text, xpath)
-                            if (found.length > nth) {
-                                const rect = found[nth].rect
-                                if (rect.width > 0 && rect.height > 0) {
-                                    clip = rect
-                                }
-                            }
-                        }
-
-                        const base64 = await unifiedSession.screenshot({
-                            fullPage: clip ? false : (args.fullPage ?? false),
-                            scale: args.scale,
-                            format: args.format,
-                            quality: args.quality,
-                            clip,
-                        })
-                        if (args.output) {
-                            // 写入文件
-                            const outputPath = await writeOutputFile(args.output, Buffer.from(base64, 'base64'))
-                            return formatResponse({
-                                success: true,
-                                type: 'screenshot',
-                                output: outputPath,
-                            })
-                        }
-                        // 返回 base64 图片
-                        return {
-                            content: [
-                                {
-                                    type: 'image',
-                                    data: base64,
-                                    mimeType: `image/${args.format === 'jpeg' ? 'jpeg' : (args.format ?? 'png')}`,
-                                },
-                            ],
-                        }
-                    }
-
-                    case 'state': {
-                        // mode=domsnapshot：用 CDP DOMSnapshot.captureSnapshot 取全量快照（仅 CDP 模式）
-                        if (args.mode === 'domsnapshot') {
-                            if (useExtension) {
-                                return {
-                                    content: [
-                                        {
-                                            type: 'text',
-                                            text: JSON.stringify({
-                                                error: {
-                                                    code: 'INVALID_ARGUMENT',
-                                                    message:
-                                                        'mode=domsnapshot 仅 CDP 模式支持，Extension 模式请用默认 accessibility',
-                                                },
-                                            }),
-                                        },
-                                    ],
-                                    isError: true,
-                                }
-                            }
-                            const snapshot = await unifiedSession.sendCdpCommand('DOMSnapshot.captureSnapshot', {
-                                computedStyles: ['display', 'visibility', 'opacity'],
-                                includePaintOrder: false,
-                                includeDOMRects: true,
-                            })
-                            if (args.output) {
-                                const outputPath = await writeOutputFile(
-                                    args.output,
-                                    JSON.stringify(snapshot, null, 2),
-                                    'utf-8'
-                                )
-                                return formatResponse({
-                                    success: true,
-                                    type: 'state',
-                                    mode: 'domsnapshot',
-                                    output: outputPath,
-                                })
-                            }
-                            return formatResponse({
-                                success: true,
-                                type: 'state',
-                                mode: 'domsnapshot',
-                                snapshot,
-                            })
-                        }
-
-                        // 默认：accessibility 树（原行为）
-                        // 有 target 时获取子树的无障碍状态
-                        let refId: string | undefined
-                        if (args.target && useExtension) {
-                            const {
-                                selector,
-                                text,
-                                xpath,
-                                nth: nthParam,
-                            } = targetToFindParams(
-                                args.target as Target & {
-                                    nth?: number
-                                }
-                            )
-                            const nth = nthParam ?? 0
-                            const elements = await unifiedSession.find(selector, text, xpath)
-                            if (elements.length > 0 && nth < elements.length) {
-                                refId = elements[nth].refId
-                            }
-                        }
-
-                        const readPageOptions: { refId?: string; depth?: number } = {}
-                        if (refId) {
-                            readPageOptions.refId = refId
-                        }
-                        if (args.depth !== undefined) {
-                            readPageOptions.depth = args.depth
-                        }
-
-                        const state = await unifiedSession.readPage(
-                            Object.keys(readPageOptions).length > 0 ? readPageOptions : undefined
-                        )
-                        if (args.output) {
-                            const outputPath = await writeOutputFile(
-                                args.output,
-                                JSON.stringify(state, null, 2),
-                                'utf-8'
-                            )
-                            return formatResponse({
-                                success: true,
-                                type: 'state',
-                                output: outputPath,
-                            })
-                        }
-                        return formatResponse({
-                            success: true,
-                            type: 'state',
-                            state,
-                        })
-                    }
-
-                    case 'metadata': {
-                        const metadata = await unifiedSession.getMetadata()
-                        if (args.output) {
-                            const outputPath = await writeOutputFile(
-                                args.output,
-                                JSON.stringify(metadata, null, 2),
-                                'utf-8'
-                            )
-                            return formatResponse({
-                                success: true,
-                                type: 'metadata',
-                                output: outputPath,
-                            })
-                        }
-                        return formatResponse({
-                            success: true,
-                            type: 'metadata',
-                            ...metadata,
-                        })
-                    }
-
-                    default:
-                        return {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: JSON.stringify({
-                                        error: {
-                                            code: 'INVALID_ARGUMENT',
-                                            message: `未知提取类型: ${args.type}`,
-                                        },
-                                    }),
-                                },
-                            ],
-                            isError: true,
-                        }
-                }
+                return handleExtractInFrame({ unifiedSession, session, useExtension }, args)
             }) // withFrame
         }) // withTabId
     } catch (error) {
         return formatErrorResponse(error)
+    }
+}
+
+function validateFrameHtmlArgs(args: ExtractArgs, useExtension: boolean): ExtractToolResponse | undefined {
+    if (args.type !== 'frameHtml') {
+        return undefined
+    }
+    if (!useExtension) {
+        return {
+            content: [
+                {
+                    type: 'text',
+                    text: JSON.stringify({
+                        error: {
+                            code: 'UNSUPPORTED_MODE',
+                            message: 'frameHtml 需要 Extension 模式',
+                            suggestion: '请连接 MCP Chrome Extension，并通过 frame 参数指定 iframe selector 或 index',
+                        },
+                    }),
+                },
+            ],
+            isError: true,
+        }
+    }
+    if (args.frame === undefined) {
+        return formatErrorResponse(new Error('frameHtml 提取需要 frame 参数，例如 frame="iframe#main" 或 frame=0'))
+    }
+    return undefined
+}
+
+async function handleExtractInFrame(context: ExtractContext, args: ExtractArgs): Promise<ExtractToolResponse> {
+    switch (args.type) {
+        case 'text':
+            return handleTextExtract(context, args)
+        case 'html':
+            return handleHtmlExtract(context, args)
+        case 'frameHtml':
+            return handleFrameHtmlExtract(context, args)
+        case 'attribute':
+            return handleAttributeExtract(context, args)
+        case 'screenshot':
+            return handleScreenshotExtract(context, args)
+        case 'state':
+            return handleStateExtract(context, args)
+        case 'diagnosticBundle':
+            return handleDiagnosticBundleExtract(context, args)
+        case 'metadata':
+            return handleMetadataExtract(context, args)
+        default:
+            return invalidExtractTypeResponse(args)
+    }
+}
+
+async function handleTextExtract(
+    { unifiedSession, session, useExtension }: ExtractContext,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    const text = useExtension
+        ? await extractTextExtension(unifiedSession, args.target)
+        : await extractText(session, args.target, args.timeout)
+    if (args.output) {
+        const outputPath = await writeOutputFile(args.output, text, 'utf-8')
+        return formatResponse({ success: true, type: 'text', output: outputPath, size: text.length })
+    }
+    return formatResponse({ success: true, type: 'text', content: text })
+}
+
+async function handleHtmlExtract(context: ExtractContext, args: ExtractArgs): Promise<ExtractToolResponse> {
+    const { unifiedSession, session, useExtension } = context
+    if (args.images) {
+        return handleHtmlWithImages(unifiedSession, session, useExtension, args)
+    }
+
+    const html = useExtension
+        ? await extractHtmlExtension(unifiedSession, args.target)
+        : await extractHTML(session, args.target, args.timeout)
+    if (args.output) {
+        const outputPath = await writeOutputFile(args.output, html, 'utf-8')
+        return formatResponse({ success: true, type: 'html', output: outputPath, size: html.length })
+    }
+    return formatResponse({ success: true, type: 'html', content: html })
+}
+
+async function handleFrameHtmlExtract(
+    { unifiedSession }: ExtractContext,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    const html = await extractHtmlExtension(unifiedSession, args.target)
+    if (args.output) {
+        const outputPath = await writeOutputFile(args.output, html, 'utf-8')
+        return formatResponse({
+            success: true,
+            type: 'frameHtml',
+            frame: args.frame,
+            output: outputPath,
+            size: html.length,
+        })
+    }
+    return formatResponse({ success: true, type: 'frameHtml', frame: args.frame, content: html })
+}
+
+async function handleAttributeExtract(
+    { unifiedSession, session, useExtension }: ExtractContext,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    if (!args.target) {
+        return formatErrorResponse(new Error('attribute 提取需要 target 参数'))
+    }
+    if (!args.attribute) {
+        return formatErrorResponse(new Error('attribute 提取需要 attribute 参数'))
+    }
+
+    const value = useExtension
+        ? await extractAttributeExtension(unifiedSession, args.target, args.attribute)
+        : await extractAttribute(session, args.target, args.attribute, args.timeout)
+    return formatResponse({ success: true, type: 'attribute', attribute: args.attribute, value })
+}
+
+async function handleScreenshotExtract(
+    { unifiedSession, useExtension }: ExtractContext,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    let clip: { x: number; y: number; width: number; height: number } | undefined
+    if (args.target) {
+        const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
+        const nth = nthParam ?? 0
+        const found = await unifiedSession.find(selector, text, xpath)
+        if (found.length > nth) {
+            const rect = found[nth].rect
+            if (rect.width > 0 && rect.height > 0) {
+                const scrollOffset =
+                    args.frame === undefined ? await getPageScrollOffset(unifiedSession, args.timeout) : { x: 0, y: 0 }
+                clip = {
+                    x: rect.x + scrollOffset.x,
+                    y: rect.y + scrollOffset.y,
+                    width: rect.width,
+                    height: rect.height,
+                }
+            }
+        }
+    }
+
+    clip = args.clip ?? clip
+    const fullPage = clip ? false : (args.fullPage ?? false)
+    const scale = args.scale ?? 1
+    const screenshot = await unifiedSession.screenshot({
+        fullPage,
+        scale: args.scale,
+        format: args.format,
+        quality: args.quality,
+        clip,
+    })
+    const screenshotBuffer = Buffer.from(screenshot.data, 'base64')
+    const fallbackDimensions = await getScreenshotFallbackDimensions(
+        unifiedSession,
+        clip,
+        fullPage,
+        scale,
+        args.timeout
+    )
+    const dimensions = readImageDimensions(screenshotBuffer, screenshot.format, fallbackDimensions)
+    const metadata: Record<string, unknown> = {
+        format: screenshot.format,
+        width: dimensions?.width,
+        height: dimensions?.height,
+        dimensionSource: dimensions?.source,
+        scale,
+        fullPage,
+        clip,
+        size: screenshotBuffer.length,
+        byteSize: screenshotBuffer.length,
+        capabilities: screenshotCapabilities(useExtension),
+    }
+    if (args.compareWith) {
+        if (screenshot.format !== 'png') {
+            throw new Error('screenshot compare 仅支持 png 格式')
+        }
+        const baselinePath = await resolveScopedOutputPath(args.compareWith, 'mcp-chrome')
+        const baseline = await readFile(baselinePath.absolutePath)
+        const comparison = comparePngImages(baseline, screenshotBuffer)
+        metadata.comparison = {
+            pixelDiffRatio: comparison.pixelDiffRatio,
+            differentPixels: comparison.differentPixels,
+            totalPixels: comparison.totalPixels,
+            width: comparison.width,
+            height: comparison.height,
+        }
+        if (args.diffOutput) {
+            const diffPath = await writeOutputFile(args.diffOutput, comparison.diffPng)
+            metadata.comparison = { ...(metadata.comparison as Record<string, unknown>), diffOutput: diffPath }
+        }
+    }
+    if (args.output) {
+        const outputPath = await writeOutputFile(args.output, screenshotBuffer)
+        return formatResponse({ success: true, type: 'screenshot', output: outputPath, metadata })
+    }
+    return {
+        content: [
+            { type: 'text', text: JSON.stringify({ success: true, type: 'screenshot', metadata }, null, 2) },
+            {
+                type: 'image',
+                data: screenshot.data,
+                mimeType: `image/${screenshot.format === 'jpeg' ? 'jpeg' : screenshot.format}`,
+            },
+        ],
+    }
+}
+
+async function handleStateExtract(
+    { unifiedSession, useExtension }: ExtractContext,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    if (args.mode === 'domsnapshot') {
+        return handleDomSnapshotState(unifiedSession, useExtension, args)
+    }
+
+    let refId: string | undefined
+    if (args.target && useExtension) {
+        const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
+        const nth = nthParam ?? 0
+        const elements = await unifiedSession.find(selector, text, xpath)
+        if (elements.length > 0 && nth < elements.length) {
+            refId = elements[nth].refId
+        }
+    }
+
+    const readPageOptions: { refId?: string; depth?: number } = {}
+    if (refId) {
+        readPageOptions.refId = refId
+    }
+    if (args.depth !== undefined) {
+        readPageOptions.depth = args.depth
+    }
+
+    const state = await unifiedSession.readPage(Object.keys(readPageOptions).length > 0 ? readPageOptions : undefined)
+    if (args.output) {
+        const outputPath = await writeOutputFile(args.output, JSON.stringify(state, null, 2), 'utf-8')
+        return formatResponse({ success: true, type: 'state', output: outputPath })
+    }
+    return formatResponse({ success: true, type: 'state', state })
+}
+
+async function handleDomSnapshotState(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    useExtension: boolean,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    if (useExtension) {
+        return {
+            content: [
+                {
+                    type: 'text',
+                    text: JSON.stringify({
+                        error: {
+                            code: 'INVALID_ARGUMENT',
+                            message: 'mode=domsnapshot 仅 CDP 模式支持，Extension 模式请用默认 accessibility',
+                        },
+                    }),
+                },
+            ],
+            isError: true,
+        }
+    }
+    const snapshot = await unifiedSession.sendCdpCommand('DOMSnapshot.captureSnapshot', {
+        computedStyles: ['display', 'visibility', 'opacity'],
+        includePaintOrder: false,
+        includeDOMRects: true,
+    })
+    if (args.output) {
+        const outputPath = await writeOutputFile(args.output, JSON.stringify(snapshot, null, 2), 'utf-8')
+        return formatResponse({ success: true, type: 'state', mode: 'domsnapshot', output: outputPath })
+    }
+    return formatResponse({ success: true, type: 'state', mode: 'domsnapshot', snapshot })
+}
+
+async function handleDiagnosticBundleExtract(
+    { unifiedSession, useExtension }: ExtractContext,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    const state = unifiedSession.getState()
+    const metadata = await unifiedSession.getMetadata()
+    const frames = useExtension ? await unifiedSession.getFrames() : { frames: [] }
+    await unifiedSession.enableConsole()
+    await unifiedSession.enableNetwork()
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const networkRequests = await unifiedSession.getNetworkRequests()
+    const bundle = {
+        schema: 'mcp-chrome.diagnosticBundle.v1',
+        url: state?.url,
+        title: state?.title,
+        managed: state?.managed ?? false,
+        mode: unifiedSession.getMode(),
+        metadata,
+        frames,
+        consoleSummary: {
+            total: consoleLogs.length,
+            recentErrors: consoleLogs.filter((item) => ['error', 'warning', 'warn'].includes(item.level)).slice(-20),
+        },
+        networkSummary: {
+            total: networkRequests.length,
+            recentFailures: networkRequests
+                .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
+                .slice(-20),
+        },
+        capabilities: {
+            screenshot: true,
+            hiddenTabScreenshot: useExtension,
+            frames: useExtension,
+        },
+    }
+    const summary = {
+        url: bundle.url,
+        title: bundle.title,
+        managed: bundle.managed,
+        mode: bundle.mode,
+        frameCount: Array.isArray(frames.frames) ? frames.frames.length : 0,
+        consoleErrors: bundle.consoleSummary.recentErrors.length,
+        networkFailures: bundle.networkSummary.recentFailures.length,
+    }
+    if (args.output) {
+        const outputPath = await writeOutputFile(args.output, JSON.stringify(bundle, null, 2), 'utf-8')
+        return formatResponse({ success: true, type: 'diagnosticBundle', output: outputPath, summary })
+    }
+    return formatResponse({
+        success: true,
+        type: 'diagnosticBundle',
+        summary: { ...summary, capabilities: bundle.capabilities },
+        frames: bundle.frames,
+        console: bundle.consoleSummary.recentErrors,
+        failedRequests: bundle.networkSummary.recentFailures,
+    })
+}
+
+async function handleMetadataExtract(
+    { unifiedSession, useExtension }: ExtractContext,
+    args: ExtractArgs
+): Promise<ExtractToolResponse> {
+    const metadata = await unifiedSession.getMetadata()
+    const frames = useExtension ? await unifiedSession.getFrames() : { frames: [] }
+    if (args.output) {
+        const outputPath = await writeOutputFile(
+            args.output,
+            JSON.stringify({ ...metadata, ...frames }, null, 2),
+            'utf-8'
+        )
+        return formatResponse({ success: true, type: 'metadata', output: outputPath })
+    }
+    return formatResponse({ success: true, type: 'metadata', ...metadata, ...frames })
+}
+
+function invalidExtractTypeResponse(args: ExtractArgs): ExtractToolResponse {
+    return {
+        content: [
+            {
+                type: 'text',
+                text: JSON.stringify({
+                    error: { code: 'INVALID_ARGUMENT', message: `未知提取类型: ${args.type}` },
+                }),
+            },
+        ],
+        isError: true,
     }
 }
 
@@ -396,9 +530,171 @@ async function handleExtract(args: z.infer<typeof extractSchema>): Promise<{
 /** 写入文件前自动创建父目录，并收敛到受控范围 */
 async function writeOutputFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<string> {
     const resolvedPath = await resolveScopedOutputPath(path, 'mcp-chrome')
-    await ensureParentDir(resolvedPath.absolutePath)
-    await writeFile(resolvedPath.absolutePath, data, encoding)
+    await writePrivateFile(resolvedPath.absolutePath, data, encoding)
     return resolvedPath.absolutePath
+}
+
+interface PageScrollOffset {
+    x: number
+    y: number
+}
+
+async function getPageScrollOffset(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    timeout: number | undefined
+): Promise<PageScrollOffset> {
+    return unifiedSession.evaluate<PageScrollOffset>(
+        '(() => ({ x: window.scrollX || 0, y: window.scrollY || 0 }))()',
+        undefined,
+        timeout
+    )
+}
+
+interface ImageDimensions {
+    width: number
+    height: number
+    source: 'encoded' | 'captureArea'
+}
+
+async function getScreenshotFallbackDimensions(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    clip: { x: number; y: number; width: number; height: number } | undefined,
+    fullPage: boolean,
+    scale: number,
+    timeout: number | undefined
+): Promise<ImageDimensions | undefined> {
+    if (clip) {
+        return {
+            width: Math.round(clip.width * scale),
+            height: Math.round(clip.height * scale),
+            source: 'captureArea',
+        }
+    }
+    const size = await unifiedSession.evaluate<{ width: number; height: number }>(
+        fullPage
+            ? '(() => ({ width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight }))()'
+            : '(() => ({ width: window.innerWidth, height: window.innerHeight }))()',
+        undefined,
+        timeout
+    )
+    return {
+        width: Math.round(size.width * scale),
+        height: Math.round(size.height * scale),
+        source: 'captureArea',
+    }
+}
+
+function screenshotCapabilities(useExtension: boolean): Record<string, unknown> {
+    return {
+        formats: ['png', 'jpeg', 'webp'],
+        clip: true,
+        fullPage: true,
+        scale: true,
+        hiddenTabScreenshot: useExtension,
+        compare: {
+            formats: ['png'],
+            maxBytes: MAX_COMPARE_PNG_BYTES,
+            maxPixels: MAX_COMPARE_PIXELS,
+        },
+    }
+}
+
+function readImageDimensions(buffer: Buffer, format: string, fallback?: ImageDimensions): ImageDimensions | undefined {
+    try {
+        if (format === 'png') {
+            return { ...readPngHeader(buffer), source: 'encoded' }
+        }
+        if (format === 'jpeg') {
+            const size = readJpegDimensions(buffer)
+            return size ? { ...size, source: 'encoded' } : fallback
+        }
+        if (format === 'webp') {
+            const size = readWebpDimensions(buffer)
+            return size ? { ...size, source: 'encoded' } : fallback
+        }
+    } catch {
+        return fallback
+    }
+    return fallback
+}
+
+function readJpegDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+    if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) {
+        return undefined
+    }
+    let offset = 2
+    while (offset + 9 < buffer.length) {
+        if (buffer[offset] !== 0xff) {
+            offset++
+            continue
+        }
+        while (buffer[offset] === 0xff) {
+            offset++
+        }
+        const marker = buffer[offset++]
+        if (marker === 0xd9 || marker === 0xda) {
+            return undefined
+        }
+        const segmentLength = buffer.readUInt16BE(offset)
+        if (segmentLength < 2 || offset + segmentLength > buffer.length) {
+            return undefined
+        }
+        if (
+            (marker >= 0xc0 && marker <= 0xc3) ||
+            (marker >= 0xc5 && marker <= 0xc7) ||
+            (marker >= 0xc9 && marker <= 0xcb) ||
+            (marker >= 0xcd && marker <= 0xcf)
+        ) {
+            return {
+                height: buffer.readUInt16BE(offset + 3),
+                width: buffer.readUInt16BE(offset + 5),
+            }
+        }
+        offset += segmentLength
+    }
+    return undefined
+}
+
+function readWebpDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+    if (buffer.length < 30 || buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WEBP') {
+        return undefined
+    }
+    let offset = 12
+    while (offset + 8 <= buffer.length) {
+        const chunkType = buffer.toString('ascii', offset, offset + 4)
+        const chunkSize = buffer.readUInt32LE(offset + 4)
+        const data = offset + 8
+        if (data + chunkSize > buffer.length) {
+            return undefined
+        }
+        if (chunkType === 'VP8X' && chunkSize >= 10) {
+            return {
+                width: 1 + buffer.readUIntLE(data + 4, 3),
+                height: 1 + buffer.readUIntLE(data + 7, 3),
+            }
+        }
+        if (chunkType === 'VP8L' && chunkSize >= 5 && buffer[data] === 0x2f) {
+            const bits = buffer.readUInt32LE(data + 1)
+            return {
+                width: (bits & 0x3fff) + 1,
+                height: ((bits >> 14) & 0x3fff) + 1,
+            }
+        }
+        if (
+            chunkType === 'VP8 ' &&
+            chunkSize >= 10 &&
+            buffer[data + 3] === 0x9d &&
+            buffer[data + 4] === 0x01 &&
+            buffer[data + 5] === 0x2a
+        ) {
+            return {
+                width: buffer.readUInt16LE(data + 6) & 0x3fff,
+                height: buffer.readUInt16LE(data + 8) & 0x3fff,
+            }
+        }
+        offset += 8 + chunkSize + (chunkSize % 2)
+    }
+    return undefined
 }
 
 /**
@@ -643,10 +939,9 @@ async function writeImageDirectory(
     imageDataList: ImageData[]
 ): Promise<void> {
     const imagesDir = join(outputDir, 'images')
-    await mkdir(imagesDir, { recursive: true })
 
     // 写入 HTML
-    await writeFile(join(outputDir, 'content.html'), html, 'utf-8')
+    await writePrivateFile(join(outputDir, 'content.html'), html, 'utf-8')
 
     // 写入图片文件 + 构建索引（相同 src 去重）
     const indexEntries: Array<{
@@ -675,7 +970,7 @@ async function writeImageDirectory(
                 const safeName = sanitizeFilename(src)
                 const filename = `${i}-${safeName}${ext}`
                 file = `images/${filename}`
-                await writeFile(join(imagesDir, filename), Buffer.from(data.base64, 'base64'))
+                await writePrivateFile(join(imagesDir, filename), Buffer.from(data.base64, 'base64'))
                 writtenFiles.set(src, file)
             }
         }
@@ -691,7 +986,7 @@ async function writeImageDirectory(
     }
 
     // 写入索引
-    await writeFile(
+    await writePrivateFile(
         join(outputDir, 'index.json'),
         JSON.stringify(
             {
@@ -1049,7 +1344,9 @@ async function extractAttributeExtension(
         if (text) {
             // selector + text 组合：find 已实现 AND 过滤
             const elements = await unifiedSession.find(selector, text, undefined)
-            if (nth >= elements.length) return null
+            if (nth >= elements.length) {
+                return null
+            }
             return unifiedSession.getAttribute(undefined, elements[nth].refId, attribute)
         }
         if (nth > 0) {
@@ -1096,6 +1393,10 @@ async function waitForTargetExtension(
     target: Target,
     timeout: number
 ): Promise<void> {
+    if ('x' in target && 'y' in target) {
+        return
+    }
+
     const startTime = Date.now()
     const retryDelay = 100
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
@@ -1145,7 +1446,7 @@ export function registerExtractTool(server: McpServer): void {
     server.registerTool(
         'extract',
         {
-            description: `提取页面内容：文本、HTML（可附带图片）、属性、截图、状态、页面元信息`,
+            description: `提取页面内容：文本、HTML（可附带图片）、iframe HTML、属性、截图、状态、页面元信息`,
             inputSchema: extractSchema,
         },
         (args) => handleExtract(args)

@@ -1,5 +1,5 @@
 import { InputKeySchema, InputMouseSchema, InputTouchSchema, InputTypeSchema } from '../types/schemas'
-import { getTargetTabId } from './action-utils'
+import { type ActionContext, assertManagedTab, getTargetTabId } from './action-utils'
 import { DebuggerManager } from './debugger-manager'
 
 export class InputEventHandler {
@@ -15,10 +15,10 @@ export class InputEventHandler {
         this.buttonsState.delete(tabId)
     }
 
-    async inputKey(params: unknown): Promise<{ success: boolean }> {
+    async inputKey(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = InputKeySchema.parse(params)
 
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'input_key')
         await this.debuggerManager.ensureAttached(tabId)
 
         const cdpParams: Record<string, unknown> = {
@@ -64,10 +64,10 @@ export class InputEventHandler {
         return { success: true }
     }
 
-    async inputMouse(params: unknown): Promise<{ success: boolean }> {
+    async inputMouse(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = InputMouseSchema.parse(params)
 
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'input_mouse')
 
         // mouseWheel: chrome.debugger sendCommand for Input.dispatchMouseEvent(mouseWheel) never resolves
         // in Extension mode — dispatch WheelEvent via scripting.executeScript instead
@@ -159,10 +159,10 @@ export class InputEventHandler {
         return { success: true }
     }
 
-    async inputTouch(params: unknown): Promise<{ success: boolean }> {
+    async inputTouch(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = InputTouchSchema.parse(params)
 
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'input_touch')
 
         // CDP Input.dispatchTouchEvent 在 Extension chrome.debugger 模式下挂起（同 mouseWheel）
         // 改用 chrome.scripting.executeScript 注入 TouchEvent 合成派发
@@ -277,10 +277,10 @@ export class InputEventHandler {
         return { success: true }
     }
 
-    async inputType(params: unknown): Promise<{ success: boolean }> {
+    async inputType(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = InputTypeSchema.parse(params)
 
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'input_type')
         await this.debuggerManager.ensureAttached(tabId)
 
         const delay = p.delay ?? 0
@@ -322,5 +322,15 @@ export class InputEventHandler {
         }
 
         return { success: true }
+    }
+
+    private async getManagedTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<number> {
+        const resolvedTabId = await getTargetTabId(tabId)
+        await assertManagedTab(resolvedTabId, context, operation)
+        return resolvedTabId
     }
 }

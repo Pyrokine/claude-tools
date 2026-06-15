@@ -40,6 +40,109 @@ export interface TabsActivateParams {
     tabId: number
 }
 
+export interface TabsAdoptParams {
+    tabId: number
+}
+
+export interface TabsReleaseParams {
+    tabId: number
+}
+
+export interface TabsMoveParams {
+    tabId: number
+    windowId?: number
+    index?: number
+    active?: boolean
+}
+
+export interface TabsReorderParams {
+    tabId: number
+    index: number
+}
+
+export interface TabsPinParams {
+    tabId: number
+    pinned: boolean
+}
+
+export type BrowserWindowState = 'normal' | 'minimized' | 'maximized' | 'fullscreen' | 'locked-fullscreen'
+
+export interface WindowFocusParams {
+    windowId: number
+}
+
+export interface WindowResizeParams {
+    windowId: number
+    left?: number
+    top?: number
+    width?: number
+    height?: number
+    state?: BrowserWindowState
+}
+
+export interface WindowCreateParams {
+    url?: string
+    focused?: boolean
+    incognito?: boolean
+    left?: number
+    top?: number
+    width?: number
+    height?: number
+    state?: BrowserWindowState
+}
+
+export interface WindowCloseParams {
+    windowId: number
+}
+
+export interface ManagedTabChangeResult {
+    success: boolean
+    targetId: string
+    windowId: number
+    before: TabInfo
+    after: TabInfo | null
+}
+
+export interface ManagedWindowChangeResult {
+    success: boolean
+    windowId: number
+    targetId?: string
+    before?: WindowInfo | null
+    after?: WindowInfo | null
+}
+
+export interface WindowInfo {
+    id: number
+    focused: boolean
+    type: string
+    state?: string
+    incognito: boolean
+    alwaysOnTop: boolean
+    left?: number
+    top?: number
+    width?: number
+    height?: number
+    tabCount: number
+    activeTabId?: number
+    tabs: TabInfo[]
+}
+
+export interface TabGroupInfo {
+    id: number
+    title: string
+    color: string
+    windowId: number
+    collapsed: boolean
+}
+
+export interface BrowserTopology {
+    windowCount: number
+    focusedWindowId?: number
+    activeTargetId?: string
+    windows: WindowInfo[]
+    groups: TabGroupInfo[]
+}
+
 // ==================== 导航相关 ====================
 
 export type WaitUntil = 'load' | 'domcontentloaded' | 'networkidle'
@@ -89,6 +192,17 @@ export interface ReadPageResult {
         width: number
         height: number
     }
+    interactiveElements?: Array<{
+        refId: string
+        role: string
+        name: string
+        selector: string
+        visible: boolean
+        disabled: boolean
+        bounds: { x: number; y: number; width: number; height: number }
+        covered: boolean
+        frameId?: number
+    }>
     error?: string
 }
 
@@ -161,6 +275,17 @@ export interface ElementInfo {
     }
 }
 
+export interface FrameInfo {
+    index: number
+    frameId: number
+    parentFrameId: number
+    url: string
+    title?: string
+    name?: string
+    selector?: string
+    rect?: { x: number; y: number; width: number; height: number }
+}
+
 // ==================== Cookies ====================
 
 /**
@@ -209,10 +334,12 @@ export interface CookiesClearParams {
 
 // ==================== Tab Groups ====================
 
+export type TabGroupColor = `${chrome.tabGroups.Color}`
+
 export interface TabGroupCreateParams {
     tabIds: number[]
     title?: string
-    color?: chrome.tabGroups.ColorEnum
+    color?: TabGroupColor
 }
 
 export interface TabGroupAddParams {
@@ -315,4 +442,5 @@ export interface NetworkRequest {
     type: string
     timestamp: number
     duration?: number
+    errorText?: string
 }

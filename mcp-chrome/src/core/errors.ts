@@ -246,7 +246,19 @@ function detectVisibilityHint(errorMessage: string): string | null {
         'capturevisibletab',
     ]
     if (keywords.some((kw) => msg.includes(kw))) {
-        return '此操作可能需要 tab 在前台，请使用 browse(action="attach", targetId="<id>", activate=true) 激活目标 tab'
+        return '此操作需要 tab 可见时，请先确认目标是 managed 测试页，再显式使用 manage(action="activatePage", targetId="<id>") 或 manage(action="focusWindow", windowId=<id>)'
+    }
+    return null
+}
+
+function parseStructuredErrorMessage(errorMessage: string): object | null {
+    try {
+        const parsed = JSON.parse(errorMessage) as { error?: { code?: unknown; message?: unknown } }
+        if (typeof parsed.error?.code === 'string' && typeof parsed.error.message === 'string') {
+            return parsed
+        }
+    } catch {
+        return null
     }
     return null
 }
@@ -290,15 +302,16 @@ export function formatErrorResponse(error: unknown): {
 
     // 处理 BrowserError（带 toJSON 方法）
     const err = error as Error & { toJSON?: () => object }
-    const errorJson = err.toJSON?.() ?? {
-        error: {
-            code: 'UNKNOWN_ERROR',
-            message: err.message ?? String(error),
-        },
-    }
+    const errorMessage = err.message ?? String(error)
+    const errorJson = err.toJSON?.() ??
+        parseStructuredErrorMessage(errorMessage) ?? {
+            error: {
+                code: 'UNKNOWN_ERROR',
+                message: errorMessage,
+            },
+        }
 
     // 检测 visibility 相关错误，添加 hint
-    const errorMessage = err.message ?? String(error)
     const hint = detectVisibilityHint(errorMessage)
     if (hint) {
         ;(errorJson as Record<string, unknown>).hint = hint

@@ -46,10 +46,65 @@ export const TabsActivateSchema = z.object({
     tabId: z.number().int().nonnegative(),
 })
 
+export const TabsAdoptSchema = z.object({
+    tabId: z.number().int().nonnegative(),
+})
+
+export const TabsReleaseSchema = z.object({
+    tabId: z.number().int().nonnegative(),
+})
+
+export const TabsMoveSchema = z.object({
+    tabId: z.number().int().nonnegative(),
+    windowId: z.number().int().optional(),
+    index: z.number().int().nonnegative().optional(),
+    active: z.boolean().optional(),
+})
+
+export const TabsReorderSchema = z.object({
+    tabId: z.number().int().nonnegative(),
+    index: z.number().int().nonnegative(),
+})
+
+export const TabsPinSchema = z.object({
+    tabId: z.number().int().nonnegative(),
+    pinned: z.boolean(),
+})
+
+const windowState = z.enum(['normal', 'minimized', 'maximized', 'fullscreen', 'locked-fullscreen'])
+
+export const WindowFocusSchema = z.object({
+    windowId: z.number().int(),
+})
+
+export const WindowResizeSchema = z.object({
+    windowId: z.number().int(),
+    left: z.number().int().optional(),
+    top: z.number().int().optional(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    state: windowState.optional(),
+})
+
+export const WindowCreateSchema = z.object({
+    url: z.string().optional(),
+    focused: z.boolean().optional(),
+    incognito: z.boolean().optional(),
+    left: z.number().int().optional(),
+    top: z.number().int().optional(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    state: windowState.optional(),
+})
+
+export const WindowCloseSchema = z.object({
+    windowId: z.number().int(),
+})
+
 export const TabGroupCreateSchema = z.object({
     tabIds: z.array(z.number().int().nonnegative()).min(1),
     title: z.string().optional(),
-    color: z.string().optional() as z.ZodOptional<z.ZodType<chrome.tabGroups.ColorEnum>>,
+    color: z.enum(['blue', 'cyan', 'green', 'grey', 'orange', 'pink', 'purple', 'red', 'yellow']).optional(),
 })
 
 export const TabGroupAddSchema = z.object({
@@ -294,7 +349,7 @@ export const DebuggerDetachSchema = DebuggerAttachSchema
 export const DebuggerSendSchema = z.object({
     tabId: tabIdOpt,
     method: z.string().min(1),
-    params: z.record(z.unknown()).optional(),
+    params: z.record(z.string(), z.unknown()).optional(),
 })
 
 // ==================== Input events ====================
@@ -349,11 +404,7 @@ export const InputTouchSchema = z
     .superRefine((value, ctx) => {
         if ((value.type === 'touchStart' || value.type === 'touchMove') && value.touchPoints.length < 1) {
             ctx.addIssue({
-                code: z.ZodIssueCode.too_small,
-                minimum: 1,
-                type: 'array',
-                inclusive: true,
-                exact: false,
+                code: z.ZodIssueCode.custom,
                 path: ['touchPoints'],
                 message: 'Array must contain at least 1 element(s)',
             })

@@ -5,7 +5,7 @@ import {
     StealthMouseSchema,
     StealthTypeSchema,
 } from '../types/schemas'
-import { assertScriptable, getTargetTabId } from './action-utils'
+import { type ActionContext, assertManagedTab, assertScriptable, getTargetTabId } from './action-utils'
 import {
     injectStealthScripts,
     simulateKeyboardType,
@@ -15,10 +15,9 @@ import {
 } from './page-scripts'
 
 export class StealthHandler {
-    async stealthClick(params: unknown): Promise<{ success: boolean }> {
+    async stealthClick(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthClickSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_click')
 
         const args: [number, number, string, number?, string?] =
             typeof p.refId === 'string'
@@ -35,10 +34,9 @@ export class StealthHandler {
         return results[0].result as { success: boolean }
     }
 
-    async stealthType(params: unknown): Promise<{ success: boolean }> {
+    async stealthType(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthTypeSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_type')
 
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
@@ -50,10 +48,9 @@ export class StealthHandler {
         return results[0].result as { success: boolean }
     }
 
-    async stealthKey(params: unknown): Promise<{ success: boolean }> {
+    async stealthKey(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthKeySchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_key')
 
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
@@ -65,10 +62,9 @@ export class StealthHandler {
         return results[0].result as { success: boolean }
     }
 
-    async stealthMouse(params: unknown): Promise<{ success: boolean }> {
+    async stealthMouse(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthMouseSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_mouse')
 
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
@@ -80,10 +76,9 @@ export class StealthHandler {
         return results[0].result as { success: boolean }
     }
 
-    async stealthInject(params: unknown): Promise<{ success: boolean }> {
+    async stealthInject(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthInjectSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_inject')
 
         await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
@@ -92,5 +87,16 @@ export class StealthHandler {
         })
 
         return { success: true }
+    }
+
+    private async getManagedScriptableTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<number> {
+        const resolvedTabId = await getTargetTabId(tabId)
+        await assertManagedTab(resolvedTabId, context, operation)
+        await assertScriptable(resolvedTabId)
+        return resolvedTabId
     }
 }

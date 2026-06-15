@@ -1,7 +1,7 @@
 import type { TabInfo, WaitUntil } from '../types'
 import { ExpectedOperationError } from '../types/expected-errors'
 import { GoBackSchema, GoForwardSchema, NavigateSchema, ReloadSchema } from '../types/schemas'
-import { type ActionContext, getTargetTabId } from './action-utils.js'
+import { type ActionContext, assertManagedTab, getTargetTabId, tabToInfo } from './action-utils.js'
 import type { LogManager } from './log-manager.js'
 
 export class NavigationHandler {
@@ -11,6 +11,7 @@ export class NavigationHandler {
         const p = NavigateSchema.parse(params)
 
         const tabId = await getTargetTabId(p.tabId)
+        await assertManagedTab(tabId, context, 'navigate')
         await chrome.tabs.update(tabId, { url: p.url })
 
         if (p.waitUntil) {
@@ -18,24 +19,16 @@ export class NavigationHandler {
         }
 
         const tab = await chrome.tabs.get(tabId)
-        return {
-            id: tab.id!,
-            url: tab.url || '',
-            title: tab.title || '',
-            active: tab.active,
-            windowId: tab.windowId,
-            index: tab.index,
-            groupId: tab.groupId,
-            pinned: tab.pinned,
-            incognito: tab.incognito,
-            managed: context.mcpTabGroupId !== null && tab.groupId === context.mcpTabGroupId,
-            status: tab.status || 'unknown',
-        }
+        return tabToInfo(tab, context)
     }
 
-    async goBack(params: unknown): Promise<{ url: string; title: string; navigated: boolean }> {
+    async goBack(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{ url: string; title: string; navigated: boolean; managed: boolean }> {
         const p = GoBackSchema.parse(params) ?? {}
         const tabId = await getTargetTabId(p.tabId)
+        await assertManagedTab(tabId, context, 'go_back')
         const beforeTab = await chrome.tabs.get(tabId)
         const beforeUrl = beforeTab.url
 
@@ -61,12 +54,16 @@ export class NavigationHandler {
         }
 
         const tab = await chrome.tabs.get(tabId)
-        return { url: tab.url || '', title: tab.title || '', navigated }
+        return { url: tab.url || '', title: tab.title || '', navigated, managed: true }
     }
 
-    async goForward(params: unknown): Promise<{ url: string; title: string; navigated: boolean }> {
+    async goForward(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{ url: string; title: string; navigated: boolean; managed: boolean }> {
         const p = GoForwardSchema.parse(params) ?? {}
         const tabId = await getTargetTabId(p.tabId)
+        await assertManagedTab(tabId, context, 'go_forward')
         const beforeTab = await chrome.tabs.get(tabId)
         const beforeUrl = beforeTab.url
 
@@ -91,12 +88,13 @@ export class NavigationHandler {
         }
 
         const tab = await chrome.tabs.get(tabId)
-        return { url: tab.url || '', title: tab.title || '', navigated }
+        return { url: tab.url || '', title: tab.title || '', navigated, managed: true }
     }
 
-    async reload(params: unknown): Promise<{ url: string; title: string }> {
+    async reload(params: unknown, context: ActionContext): Promise<{ url: string; title: string; managed: boolean }> {
         const p = ReloadSchema.parse(params) ?? {}
         const tabId = await getTargetTabId(p.tabId)
+        await assertManagedTab(tabId, context, 'reload')
 
         await chrome.tabs.reload(tabId, { bypassCache: p.ignoreCache ?? false })
 
@@ -105,7 +103,7 @@ export class NavigationHandler {
         }
 
         const tab = await chrome.tabs.get(tabId)
-        return { url: tab.url || '', title: tab.title || '' }
+        return { url: tab.url || '', title: tab.title || '', managed: true }
     }
 
     async waitForNavigation(tabId: number, waitUntil: WaitUntil, timeout = 30000): Promise<void> {
@@ -264,7 +262,7 @@ export class NavigationHandler {
                 }
             }
 
-            const tabListener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+            const tabListener = (updatedTabId: number, changeInfo: chrome.tabs.OnUpdatedInfo) => {
                 if (updatedTabId !== tabId) {
                     return
                 }

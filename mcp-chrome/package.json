@@ -9,8 +9,8 @@
         "start": "node dist/index.js",
         "dev": "tsc -w",
         "prepare": "npm run build",
-        "lint": "eslint \"src/**/*.ts\"",
-        "lint:fix": "eslint \"src/**/*.ts\" --fix",
+        "lint": "eslint \"src/**/*.ts\" \"extension/src/**/*.ts\"",
+        "lint:fix": "eslint \"src/**/*.ts\" \"extension/src/**/*.ts\" --fix",
         "format": "prettier --write src/",
         "format:check": "prettier --check src/"
     },
@@ -26,17 +26,17 @@
     "license": "MIT",
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
-        "ws": "^8.19.0",
-        "zod": "^3.24.0"
+        "ws": "^8.21.0",
+        "zod": "^4.4.3"
     },
     "devDependencies": {
-        "@eslint/js": "^9.39.4",
-        "@types/node": "^22.0.0",
+        "@eslint/js": "^10.0.1",
+        "@types/node": "^25.9.1",
         "@types/ws": "^8.18.1",
-        "eslint": "9.26.0",
+        "eslint": "^10.4.0",
         "prettier": "^3.8.3",
-        "typescript": "^5.7.0",
-        "typescript-eslint": "^8.59.0"
+        "typescript": "^6.0.3",
+        "typescript-eslint": "^8.60.0"
     },
     "engines": {
         "node": ">=18"

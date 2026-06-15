@@ -5,6 +5,7 @@
  */
 
 import { ExpectedOperationError } from '../types/expected-errors'
+import { isManagedTab } from './tab-state'
 
 export interface ActionContext {
     mcpTabGroupId: number | null
@@ -47,6 +48,49 @@ export async function getTargetTabId(tabId?: number): Promise<number> {
         throw new ExpectedOperationError('No active tab found')
     }
     return activeTab.id
+}
+
+export function tabToInfo(tab: chrome.tabs.Tab, context: ActionContext) {
+    return {
+        id: tab.id!,
+        url: tab.url || '',
+        title: tab.title || '',
+        active: tab.active,
+        windowId: tab.windowId,
+        index: tab.index,
+        groupId: tab.groupId,
+        pinned: tab.pinned,
+        incognito: tab.incognito,
+        managed: isManagedTab(tab, context),
+        status: tab.status || 'unknown',
+    }
+}
+
+export async function assertManagedTab(
+    tabId: number,
+    context: ActionContext,
+    operation: string
+): Promise<chrome.tabs.Tab> {
+    let tab: chrome.tabs.Tab
+    try {
+        tab = await chrome.tabs.get(tabId)
+    } catch {
+        throw new ExpectedOperationError(`Tab ${tabId} 不存在（可能已被关闭）`)
+    }
+    if (!isManagedTab(tab, context)) {
+        const detail = JSON.stringify({
+            tabId,
+            managed: false,
+            groupId: tab.groupId,
+            mcpTabGroupId: context.mcpTabGroupId,
+            windowId: tab.windowId,
+            mcpWindowId: context.mcpWindowId,
+        })
+        throw new ExpectedOperationError(
+            `${operation} 拒绝操作非托管 tab, ${detail}, 请使用 browse(action="list") 选择 managed=true 的受控 tab, 或用 manage(action="newPage") 创建受控页面`
+        )
+    }
+    return tab
 }
 
 /**

@@ -28,6 +28,7 @@ const targetObjectSchema = z.intersection(
         z.object({
             role: z.string().describe('ARIA role（如 button、link、textbox）'),
             name: z.string().optional().describe('可访问名称（可选）'),
+            exact: z.boolean().optional().describe('是否精确匹配（默认 false）'),
         }),
         // CSS+text 必须在纯 text / 纯 CSS 之前：z.object strip 未知字段
         z.object({
@@ -227,18 +228,26 @@ export function targetToFindParams(target: Target & { nth?: number }): {
                 roleConditions.push(implicitXPath)
             }
             const nameStr = escapeXPathString(target.name)
-            // 多来源可访问名称：textContent, aria-label, title, placeholder, alt, value, label-for
-            // 注意：@value 读 HTML attribute（初始值），脚本动态写入的值需用 evaluate 定位
-            const nameConditions = [
-                `contains(.,${nameStr})`,
-                `contains(@aria-label,${nameStr})`,
-                `contains(@title,${nameStr})`,
-                `contains(@placeholder,${nameStr})`,
-                `contains(@alt,${nameStr})`,
-                `contains(@value,${nameStr})`,
-                `@id=//label[contains(.,${nameStr})]/@for`,
-            ].join(' or ')
-            xpath = `//*[(${roleConditions.join(' or ')}) and (${nameConditions})]`
+            const nameConditions = getExact(target)
+                ? [
+                      `normalize-space(.)=${nameStr}`,
+                      `@aria-label=${nameStr}`,
+                      `@title=${nameStr}`,
+                      `@placeholder=${nameStr}`,
+                      `@alt=${nameStr}`,
+                      `@value=${nameStr}`,
+                      `@id=//label[normalize-space(.)=${nameStr}]/@for`,
+                  ]
+                : [
+                      `contains(.,${nameStr})`,
+                      `contains(@aria-label,${nameStr})`,
+                      `contains(@title,${nameStr})`,
+                      `contains(@placeholder,${nameStr})`,
+                      `contains(@alt,${nameStr})`,
+                      `contains(@value,${nameStr})`,
+                      `@id=//label[contains(.,${nameStr})]/@for`,
+                  ]
+            xpath = `//*[(${roleConditions.join(' or ')}) and (${nameConditions.join(' or ')})]`
         } else {
             // role only：CSS 选择器匹配隐式标签 + 显式 role
             const escapedRole = escapeAttrValue(roleLower)

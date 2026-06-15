@@ -9,16 +9,15 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { writeFile } from 'fs/promises'
 import { z } from 'zod'
 import {
     CWD_PATH_PREFIX,
-    ensureParentDir,
     formatErrorResponse,
     formatResponse,
     getUnifiedSession,
     resolveScopedOutputPath,
     TMP_PATH_PREFIX,
+    writePrivateFile,
 } from '../core/index.js'
 
 /**
@@ -96,8 +95,7 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
 
                 if (args.output) {
                     const outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
-                    await ensureParentDir(outputPath)
-                    await writeFile(outputPath, JSON.stringify(cookies, null, 2), 'utf-8')
+                    await writePrivateFile(outputPath, JSON.stringify(cookies, null, 2), 'utf-8')
                     return formatResponse({
                         success: true,
                         action: 'get',

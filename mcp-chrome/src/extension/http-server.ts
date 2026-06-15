@@ -35,6 +35,35 @@ interface MessageHandler {
     timeout: NodeJS.Timeout
 }
 
+class ExtensionStructuredError extends Error {
+    constructor(
+        private readonly body: object,
+        message: string
+    ) {
+        super(message)
+        this.name = 'ExtensionStructuredError'
+    }
+
+    toJSON(): object {
+        return this.body
+    }
+}
+
+function parseExtensionError(error: string | undefined): Error {
+    const raw = error ?? 'Unknown error'
+    try {
+        const parsed = JSON.parse(raw) as {
+            error?: { code?: unknown; message?: unknown; suggestion?: unknown; context?: unknown }
+        }
+        if (typeof parsed.error?.code === 'string' && typeof parsed.error.message === 'string') {
+            return new ExtensionStructuredError(parsed, sanitizeErrorMessage(parsed.error.message))
+        }
+    } catch {
+        // 非结构化错误按普通字符串处理
+    }
+    return new Error(sanitizeErrorMessage(raw))
+}
+
 export class ExtensionHttpServer extends EventEmitter {
     private server: Server | null = null
     private wss: WebSocketServer | null = null
@@ -233,21 +262,27 @@ export class ExtensionHttpServer extends EventEmitter {
     }
 
     private tryListen(port: number, resolve: () => void, reject: (err: Error) => void): void {
-        this.server!.once('error', (err: NodeJS.ErrnoException) => {
+        const server = this.server!
+        const onListening = () => {
+            server.off('error', onError)
+            this.port = port
+            this.setupWebSocket()
+            console.error(`[HTTP] Server listening on http://127.0.0.1:${port}`)
+            resolve()
+        }
+        const onError = (err: NodeJS.ErrnoException) => {
+            server.off('listening', onListening)
             if (err.code === 'EADDRINUSE' && this.options.autoPort !== false && port < MAX_PORT) {
                 console.error(`[HTTP] Port ${port} already in use, trying ${port + 1}...`)
                 this.tryListen(port + 1, resolve, reject)
             } else {
                 reject(err)
             }
-        })
+        }
 
-        this.server!.listen(port, '127.0.0.1', () => {
-            this.port = port
-            this.setupWebSocket()
-            console.error(`[HTTP] Server listening on http://127.0.0.1:${port}`)
-            resolve()
-        })
+        server.once('listening', onListening)
+        server.once('error', onError)
+        server.listen(port, '127.0.0.1')
     }
 
     private handleHttpRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -337,8 +372,7 @@ export class ExtensionHttpServer extends EventEmitter {
                 if (message.success) {
                     handler.resolve(message.data)
                 } else {
-                    // 对 Extension 上报的错误信息再做一层服务端脱敏（剥离主机绝对路径残留）
-                    handler.reject(new Error(sanitizeErrorMessage(message.error ?? 'Unknown error')))
+                    handler.reject(parseExtensionError(message.error))
                 }
             }
         } catch (error) {

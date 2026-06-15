@@ -51,10 +51,10 @@ export function sanitizeErrorMessage(input: unknown): string {
     }
 
     // chrome-extension://<id>/<path> → chrome-extension://<id>/<redacted>
-    msg = msg.replace(/chrome-extension:\/\/([a-z0-9]{32})\/[^\s)"']*/g, 'chrome-extension://$1/<redacted>')
+    msg = msg.replace(/(?<prefix>chrome-extension:\/\/[a-z0-9]{32})\/[^\s)"']*/g, '$<prefix>/<redacted>')
 
     // V8 stack frame: " at func (file:line:col)" → " at func (...)"
-    msg = msg.replace(/\(([^)]*\.[jt]s):\d+:\d+\)/g, '($1)')
+    msg = msg.replace(/\((?<file>[^)]*\.[jt]s):\d+:\d+\)/g, '($<file>)')
 
     // node:internal stack 中的绝对路径
     msg = msg.replace(/at\s+\/[^\s:]+:\d+:\d+/g, 'at <internal>')

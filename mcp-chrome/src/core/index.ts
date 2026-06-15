@@ -9,6 +9,7 @@ export {
     TMP_PATH_PREFIX,
     ensureParentDir,
     escapeXPathString,
+    writePrivateFile,
     getControlledTempRoot,
     resolveScopedInputPath,
     resolveScopedOutputPath,

@@ -32,6 +32,7 @@ export interface CdpResultObject<T = unknown> {
     className?: string
     description?: string
     value?: T
+    objectId?: string
 }
 
 /** 从 CDP exceptionDetails 提取有用的错误信息（含完整堆栈） */
@@ -39,15 +40,75 @@ export function formatCdpException(details: CdpExceptionDetails): string {
     return details.exception?.description ?? details.text ?? 'Unknown error'
 }
 
+function buildSerializationHint(result?: CdpResultObject): { message: string; suggestion: string } {
+    const typeName = result?.className ?? result?.subtype ?? result?.type ?? 'unknown'
+    const description = result?.description ? ` (${result.description.substring(0, 200)})` : ''
+    const className = result?.className ?? ''
+
+    if (result?.subtype === 'node' || /^(?:HTML|SVG).*Element$/.test(className) || className === 'Text') {
+        return {
+            message: `返回值是 DOM 节点 ${typeName}${description}，不能直接 JSON 序列化`,
+            suggestion:
+                '请返回 textContent、outerHTML、getAttribute(...) 等简单字段，或改用 extract type="text"/"html"',
+        }
+    }
+    if (className === 'NodeList' || className === 'HTMLCollection') {
+        return {
+            message: `返回值是 ${className}${description}，不能直接 JSON 序列化`,
+            suggestion: '请用 Array.from(value).map(...) 提取需要的字段，例如 textContent、href、outerHTML',
+        }
+    }
+    return {
+        message: `返回值类型 ${typeName}${description} 无法序列化`,
+        suggestion: '请在脚本中返回 JSON 可序列化的简单类型，或将需要的属性提取为简单对象',
+    }
+}
+
+export function isKnownNonSerializableRemoteObject(result?: CdpResultObject): boolean {
+    const className = result?.className ?? ''
+    return (
+        result?.subtype === 'node' ||
+        /^(?:HTML|SVG).*Element$/.test(className) ||
+        className === 'Text' ||
+        className === 'NodeList' ||
+        className === 'HTMLCollection'
+    )
+}
+
+export class NonSerializableEvaluateResultError extends Error {
+    readonly code = 'NON_SERIALIZABLE_EVALUATE_RESULT'
+    readonly suggestion: string
+    readonly context: Record<string, unknown>
+
+    constructor(result?: CdpResultObject) {
+        const hint = buildSerializationHint(result)
+        super(hint.message)
+        this.name = 'NonSerializableEvaluateResultError'
+        this.suggestion = hint.suggestion
+        this.context = {
+            type: result?.type,
+            subtype: result?.subtype,
+            className: result?.className,
+            description: result?.description,
+        }
+    }
+
+    toJSON(): object {
+        return {
+            error: {
+                code: this.code,
+                message: this.message,
+                suggestion: this.suggestion,
+                context: this.context,
+            },
+        }
+    }
+}
+
 /** 从 CDP result 提取返回值，不可序列化时抛出诊断错误 */
 export function extractCdpValue<T>(result?: CdpResultObject<T>): T {
     if (!result || (result.value === undefined && result.type !== 'undefined')) {
-        const typeName = result?.className ?? result?.subtype ?? result?.type ?? 'unknown'
-        const preview = result?.description ? ` (${result.description.substring(0, 200)})` : ''
-        throw new Error(
-            `返回值类型 ${typeName}${preview} 无法序列化，` +
-                '请在脚本中用 JSON.stringify() 包装返回值，或将需要的属性提取为简单类型'
-        )
+        throw new NonSerializableEvaluateResultError(result)
     }
     return result.value as T
 }
@@ -62,7 +123,7 @@ export function extractCdpValue<T>(result?: CdpResultObject<T>): T {
  */
 export type Target =
     // 语义化定位（推荐，参考 Playwright）
-    | { role: string; name?: string } // 可访问性树：getByRole
+    | { role: string; name?: string; exact?: boolean } // 可访问性树：getByRole
     | { text: string; exact?: boolean } // 文本内容：getByText
     | { label: string; exact?: boolean } // 关联 label：getByLabel
     | { placeholder: string; exact?: boolean } // 占位符：getByPlaceholder
@@ -118,6 +179,9 @@ export type InputEventType =
     | 'select'
     | 'replace'
     | 'drag'
+    | 'editorContext'
+    | 'editorInsert'
+    | 'editorCommand'
 
 /**
  * 输入事件
@@ -146,10 +210,14 @@ export interface InputEvent {
     // 查找文本参数（select/replace 事件）
     find?: string
     nth?: number
-    // dispatch 模式（type 事件）
+    // 编辑器命令参数（editorCommand 事件）
+    command?: string
+    // dispatch / controlled 模式（type 事件）
     dispatch?: boolean
+    mode?: 'keyboard' | 'controlled'
     // 强制执行（click 事件）
     force?: boolean
+    forceReason?: string
 }
 
 /**
@@ -246,6 +314,7 @@ export interface NetworkRequestEntry {
     timestamp: number
     duration?: number
     size?: number
+    errorText?: string
 }
 
 /**
@@ -256,6 +325,7 @@ export interface TargetInfo {
     type: string
     url: string
     title: string
+    managed?: boolean
     /** 是否复用了已运行的浏览器（launch 时如果连接到已有浏览器则为 true） */
     reused?: boolean
 }
@@ -369,7 +439,7 @@ export const devices: Record<string, DeviceDescriptor> = {
 /**
  * 判断 Target 类型的工具函数
  */
-export function isRoleTarget(target: Target): target is { role: string; name?: string } {
+export function isRoleTarget(target: Target): target is { role: string; name?: string; exact?: boolean } {
     return 'role' in target
 }
 

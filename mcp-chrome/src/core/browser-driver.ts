@@ -92,9 +92,22 @@ export interface HtmlWithImagesResult {
     images: ImageInfo[]
 }
 
+export interface InteractiveElementInfo {
+    refId: string
+    role: string
+    name: string
+    selector: string
+    visible: boolean
+    disabled: boolean
+    bounds: { x: number; y: number; width: number; height: number }
+    covered: boolean
+    frameId?: number
+}
+
 export interface ReadPageResult {
     pageContent: string
     viewport: { width: number; height: number }
+    interactiveElements?: InteractiveElementInfo[]
     error?: string
 }
 
@@ -105,11 +118,23 @@ export interface ReadPageOptions {
     refId?: string
 }
 
+export interface ActionabilityDiagnosticCandidate {
+    tag: string
+    selector: string
+    text: string
+    rect: { x: number; y: number; width: number; height: number }
+}
+
 export interface ActionableClickResult {
     success: boolean
     error?: string
     reason?: string
     coveringElement?: string
+    coveringRect?: { x: number; y: number; width: number; height: number }
+    rect?: { x: number; y: number; width: number; height: number }
+    clickPoint?: { x: number; y: number }
+    candidates?: ActionabilityDiagnosticCandidate[]
+    suggestions?: string[]
 }
 
 export interface DispatchInputResult {
@@ -165,6 +190,7 @@ export interface FrameResolveResult {
 export interface DriverState {
     url: string
     title: string
+    managed?: boolean
 }
 
 export interface ListedTarget {
@@ -183,11 +209,73 @@ export interface ListedTarget {
     status?: string
 }
 
+export interface BrowserWindowInfo {
+    id: number
+    focused: boolean
+    type: string
+    state?: string
+    incognito: boolean
+    alwaysOnTop: boolean
+    left?: number
+    top?: number
+    width?: number
+    height?: number
+    tabCount: number
+    activeTabId?: number
+    tabs: ListedTarget[]
+}
+
+export interface BrowserTopology {
+    windowCount: number
+    focusedWindowId?: number
+    activeTargetId?: string
+    windows: BrowserWindowInfo[]
+}
+
+export interface ManagedPageResult {
+    target: ListedTarget
+    managedBefore: boolean
+    managedAfter: boolean
+}
+
+export interface PageManagementResult {
+    targetId?: string
+    windowId?: number
+    before?: ListedTarget | BrowserWindowInfo | null
+    after?: ListedTarget | BrowserWindowInfo | null
+}
+
+export interface NewWindowOptions {
+    url?: string
+    focused?: boolean
+    incognito?: boolean
+    left?: number
+    top?: number
+    width?: number
+    height?: number
+    state?: string
+}
+
+export interface ResizeWindowOptions {
+    left?: number
+    top?: number
+    width?: number
+    height?: number
+    state?: string
+}
+
+export interface MovePageOptions {
+    windowId?: number
+    index?: number
+    activate?: boolean
+}
+
 export interface NewTabResult {
     targetId: string
     url: string
     title: string
     type?: string
+    managed?: boolean
 }
 
 // ==================== 接口定义 ====================
@@ -220,6 +308,7 @@ export interface IBrowserDriver {
     getPageText(selector?: string): Promise<string>
     getHtmlWithImages(selector?: string, outer?: boolean): Promise<HtmlWithImagesResult>
     getMetadata(): Promise<Record<string, unknown>>
+    getFrames?(): Promise<Record<string, unknown>>
 
     // ---- 元素查找 ----
     find(selector?: string, text?: string, xpath?: string, timeout?: number): Promise<FindResult[]>
@@ -228,6 +317,7 @@ export interface IBrowserDriver {
     /** Extension 真做；CDP throw（CDP 模式应通过 input 工具坐标点击） */
     click(refId: string): Promise<void>
     actionableClick(refId: string, force?: boolean): Promise<ActionableClickResult>
+    checkActionability(refId: string): Promise<ActionableClickResult>
     dispatchInput(refId: string, text: string): Promise<DispatchInputResult>
     dragAndDrop(srcRefId: string, dstRefId: string): Promise<DragAndDropResult>
     getComputedStyle(refId: string, prop: string): Promise<string | null>
@@ -278,8 +368,18 @@ export interface IBrowserDriver {
 
     // ---- Tab / 状态 ----
     listTargets(): Promise<ListedTarget[]>
+    listWindows?(): Promise<BrowserTopology>
+    adoptPage?(targetId: string): Promise<ManagedPageResult>
+    releasePage?(targetId: string): Promise<ManagedPageResult>
+    movePage?(targetId: string, options: MovePageOptions): Promise<PageManagementResult>
+    reorderPage?(targetId: string, index: number): Promise<PageManagementResult>
+    pinPage?(targetId: string, pinned: boolean): Promise<PageManagementResult>
+    focusWindow?(windowId: number): Promise<PageManagementResult>
+    resizeWindow?(windowId: number, options: ResizeWindowOptions): Promise<PageManagementResult>
+    newWindow?(options: NewWindowOptions): Promise<PageManagementResult>
+    closeWindow?(windowId: number): Promise<PageManagementResult>
     newPage(url?: string, timeout?: number): Promise<NewTabResult>
-    closePage(targetId?: string): Promise<void>
+    closePage(targetId?: string): Promise<void | PageManagementResult>
     activatePage(targetId: string): Promise<void>
     selectPage(targetId: string): Promise<void>
     getCurrentTargetId(): string | null
@@ -341,8 +441,21 @@ export interface IExtensionDriverExtras {
  * 上层 (UnifiedSessionManager) 据此分支 fallback 或转换错误信息
  */
 export class DriverCapabilityError extends Error {
+    readonly code = 'DRIVER_CAPABILITY_ERROR'
+    readonly suggestion = '请检查当前连接模式、目标页面和工具参数'
+
     constructor(message: string) {
         super(message)
         this.name = 'DriverCapabilityError'
+    }
+
+    toJSON(): object {
+        return {
+            error: {
+                code: this.code,
+                message: this.message,
+                suggestion: this.suggestion,
+            },
+        }
     }
 }

@@ -27,6 +27,7 @@ import {
     type InputMouseType,
     type InputTouchPoint,
     type InputTouchType,
+    type InteractiveElementInfo,
     type ListedTarget,
     type NewTabResult,
     type ReadPageOptions,
@@ -632,6 +633,7 @@ class SessionManager implements IBrowserDriver {
         }
         if (clip) {
             captureParams.clip = { ...clip, scale: scale ?? 1 }
+            captureParams.captureBeyondViewport = true
         }
 
         if (fullPage) {
@@ -766,11 +768,11 @@ class SessionManager implements IBrowserDriver {
 
     // ==================== IBrowserDriver: 页面读取 ====================
 
-    /** Extension readPage 等价物：CDP 通过 getPageState 构造 pageContent 文本 */
+    /** Extension readPage 等价物：CDP 通过页面 DOM 构造 pageContent 和 interactiveElements */
     async readPage(_options?: ReadPageOptions): Promise<ReadPageResult> {
         const state = await this.getPageState()
-        const elements = state.elements ?? []
-        const lines = elements.map((e) => {
+        const interactiveElements = await this.collectInteractiveElements()
+        const lines = interactiveElements.map((e) => {
             let line = e.role
             if (e.name) {
                 line += ` "${e.name}"`
@@ -780,7 +782,100 @@ class SessionManager implements IBrowserDriver {
         return {
             pageContent: lines.join('\n'),
             viewport: state.viewport,
+            interactiveElements,
         }
+    }
+
+    async collectInteractiveElements(): Promise<InteractiveElementInfo[]> {
+        return this.evaluate<InteractiveElementInfo[]>(`(() => {
+            function selectorFor(el) {
+                if (!(el instanceof Element)) return '';
+                if (el.id) return '#' + CSS.escape(el.id);
+                var parts = [];
+                var current = el;
+                while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 4) {
+                    var part = current.tagName.toLowerCase();
+                    if (current.classList && current.classList.length) {
+                        part += '.' + Array.from(current.classList).slice(0, 2).map(function(cls) { return CSS.escape(cls); }).join('.');
+                    }
+                    var parent = current.parentElement;
+                    if (parent) {
+                        var siblings = Array.from(parent.children).filter(function(child) { return child.tagName === current.tagName; });
+                        if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
+                    }
+                    parts.unshift(part);
+                    current = parent;
+                }
+                return parts.join(' > ');
+            }
+            function roleFor(el) {
+                var explicit = el.getAttribute('role');
+                if (explicit) return explicit;
+                var tag = el.tagName.toLowerCase();
+                var type = (el.getAttribute('type') || '').toLowerCase();
+                if (tag === 'button' || type === 'button' || type === 'submit' || type === 'reset') return 'button';
+                if (tag === 'a' && el.hasAttribute('href')) return 'link';
+                if (tag === 'textarea' || tag === 'input' && !['checkbox', 'radio', 'range'].includes(type)) return 'textbox';
+                if (type === 'checkbox') return 'checkbox';
+                if (type === 'radio') return 'radio';
+                if (tag === 'select') return 'combobox';
+                if (type === 'range') return 'slider';
+                if (el.isContentEditable) return 'textbox';
+                return tag;
+            }
+            function nameFor(el) {
+                return (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder') || el.textContent || '').replace(new RegExp('\\s+', 'g'), ' ').trim().slice(0, 160);
+            }
+            var selector = 'button,a[href],input,textarea,select,[role],[contenteditable="true"],[tabindex]:not([tabindex="-1"])';
+            return Array.from(document.querySelectorAll(selector)).slice(0, 100).map(function(el, index) {
+                var rect = el.getBoundingClientRect();
+                var cx = rect.left + rect.width / 2;
+                var cy = rect.top + rect.height / 2;
+                var top = rect.width > 0 && rect.height > 0 ? document.elementFromPoint(cx, cy) : null;
+                var visible = rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+                return {
+                    refId: 'cdp-' + index,
+                    role: roleFor(el),
+                    name: nameFor(el),
+                    selector: selectorFor(el),
+                    visible: visible,
+                    disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
+                    bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                    covered: Boolean(visible && top && top !== el && !el.contains(top)),
+                    frameId: 0
+                };
+            });
+        })()`)
+    }
+
+    async getFrames(): Promise<Record<string, unknown>> {
+        this.ensureSession()
+        const frameTree = (await this.send('Page.getFrameTree')) as {
+            frameTree: {
+                frame: { id: string; parentId?: string; url: string; name?: string; mimeType?: string }
+                childFrames?: Array<unknown>
+            }
+        }
+        const frames: Array<Record<string, unknown>> = []
+        const visit = (node: typeof frameTree.frameTree, parentFrameId?: string): void => {
+            const index = frames.length
+            frames.push({
+                index,
+                frameId: node.frame.id,
+                parentFrameId: node.frame.parentId ?? parentFrameId,
+                url: node.frame.url,
+                title: index === 0 ? this.state?.title : undefined,
+                name: node.frame.name,
+                selector: undefined,
+                rect: undefined,
+                mimeType: node.frame.mimeType,
+            })
+            for (const child of node.childFrames ?? []) {
+                visit(child as typeof frameTree.frameTree, node.frame.id)
+            }
+        }
+        visit(frameTree.frameTree)
+        return { frames }
     }
 
     /** CDP 通过 evaluate 注入函数枚举 IMG */
@@ -920,6 +1015,10 @@ class SessionManager implements IBrowserDriver {
 
     actionableClick(_refId: string, _force?: boolean): Promise<ActionableClickResult> {
         return Promise.reject(new DriverCapabilityError('actionableClick 仅支持 Extension 模式'))
+    }
+
+    checkActionability(_refId: string): Promise<ActionableClickResult> {
+        return Promise.reject(new DriverCapabilityError('checkActionability 仅支持 Extension 模式'))
     }
 
     dispatchInput(_refId: string, _text: string): Promise<DispatchInputResult> {
@@ -1879,9 +1978,22 @@ class SessionManager implements IBrowserDriver {
             }
         })
 
-        // 网络请求失败时清理 requestMap，防止泄漏
+        // 网络请求失败时写入日志再清理 requestMap，防止 diagnostics 丢失失败请求
         this.cdp!.onEvent('Network.loadingFailed', (params: unknown) => {
-            const p = params as { requestId: string }
+            const p = params as { requestId: string; timestamp: number; errorText?: string; type?: string }
+            const request = this.requestMap.get(p.requestId)
+            if (request) {
+                const { _monotonic, ...requestData } = request
+                this.networkRequests.push({
+                    ...requestData,
+                    type: p.type ?? requestData.type,
+                    errorText: p.errorText,
+                    duration: Math.round((p.timestamp - _monotonic) * 1000),
+                })
+                if (this.networkRequests.length > SessionManager.MAX_LOG_ENTRIES) {
+                    this.networkRequests.splice(0, this.networkRequests.length - 800)
+                }
+            }
             this.requestMap.delete(p.requestId)
         })
     }

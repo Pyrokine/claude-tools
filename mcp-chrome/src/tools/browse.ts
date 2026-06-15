@@ -38,18 +38,78 @@ const browseSchema = z.object({
         .string()
         .optional()
         .describe(
-            '目标 ID（attach），从 list 结果中获取，Extension 模式为数字 Tab ID，CDP 模式为 WebSocket target ID，仅在当前 mode 下有效'
+            '目标 ID（attach/close），从 list 结果中获取，Extension 模式为数字 Tab ID，CDP 模式为 WebSocket target ID，仅在当前 mode 下有效'
         ),
     activate: z.boolean().optional().describe('是否激活 Tab（attach），默认 false 只设置操作目标不切到前台'),
     url: z.string().optional().describe('目标 URL（open）'),
     wait: z.enum(['load', 'domcontentloaded', 'networkidle']).optional().describe('等待条件（open/refresh）'),
     ignoreCache: z.boolean().optional().describe('刷新时是否忽略缓存（refresh）'),
     timeout: z.coerce.number().optional().describe('超时毫秒'),
+    diagnostics: z.boolean().optional().describe('open 后返回新增 console error/warning 和失败网络请求摘要'),
 })
 
 /**
  * browse 工具处理器
  */
+interface DiagnosticsStart {
+    consoleCount: number
+    networkCount: number
+}
+
+async function captureDiagnosticsStart(
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+): Promise<DiagnosticsStart> {
+    await unifiedSession.enableConsole()
+    await unifiedSession.enableNetwork()
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return { consoleCount: consoleLogs.length, networkCount: network.length }
+}
+
+async function captureDiagnosticsDelta(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    start: DiagnosticsStart
+): Promise<Record<string, unknown>> {
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return {
+        console: consoleLogs
+            .slice(start.consoleCount)
+            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
+            .slice(-20),
+        failedRequests: network
+            .slice(start.networkCount)
+            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
+            .slice(-20),
+    }
+}
+
+function pageStateMetadata(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    background: boolean
+): Record<string, unknown> {
+    const state = unifiedSession.getState()
+    return {
+        url: state?.url,
+        title: state?.title,
+        managed: state?.managed ?? false,
+        background,
+    }
+}
+
+async function runWithDiagnostics<T extends Record<string, unknown>>(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    enabled: boolean | undefined,
+    action: () => Promise<T>
+): Promise<T & { diagnostics?: Record<string, unknown> }> {
+    const start = enabled ? await captureDiagnosticsStart(unifiedSession) : undefined
+    const result: T & { diagnostics?: Record<string, unknown> } = await action()
+    if (start) {
+        result.diagnostics = await captureDiagnosticsDelta(unifiedSession, start)
+    }
+    return result
+}
+
 async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
@@ -96,6 +156,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     timeout: args.timeout ?? DEFAULT_TIMEOUT,
                     stealth: args.stealth as 'off' | 'safe' | 'aggressive' | undefined,
                 })
+                unifiedSession.setActiveMode('cdp')
                 const reused = target.reused ?? false
                 return formatResponse({
                     success: true,
@@ -113,7 +174,10 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
             case 'connect': {
                 // 显式传 port 时走 CDP 连接（即使 Extension 服务器已启动）
                 if (useExtension && !args.port) {
-                    const connected = unifiedSession.isExtensionConnected()
+                    const connected = unifiedSession.isExtensionAvailable()
+                    if (connected) {
+                        unifiedSession.setActiveMode('extension')
+                    }
                     return formatResponse({
                         success: connected,
                         action: 'connect',
@@ -148,6 +212,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     timeout: args.timeout ?? DEFAULT_TIMEOUT,
                     stealth: args.stealth as 'off' | 'safe' | 'aggressive' | undefined,
                 })
+                unifiedSession.setActiveMode('cdp')
                 return formatResponse({
                     success: true,
                     action: 'connect',
@@ -160,12 +225,39 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
             case 'list': {
                 const mode = unifiedSession.getMode()
                 const targets = await unifiedSession.listTargets()
+                const topology = await unifiedSession.listTopology()
+                const windows = topology?.windows.map((window) => ({
+                    ...window,
+                    tabs: window.tabs.map((tab) => ({
+                        targetId: tab.targetId ?? String(tab.id),
+                        type: tab.type ?? 'page',
+                        url: tab.url,
+                        title: tab.title,
+                        mode,
+                        isActive: tab.active ?? false,
+                        managed: tab.managed,
+                        windowId: tab.windowId,
+                        index: tab.index,
+                        groupId: tab.groupId,
+                        pinned: tab.pinned,
+                        incognito: tab.incognito,
+                        status: tab.status,
+                    })),
+                }))
 
                 const result: Record<string, unknown> = {
                     success: true,
                     action: 'list',
                     mode,
                     targets,
+                    ...(topology
+                        ? {
+                              windowCount: topology.windowCount,
+                              focusedWindowId: topology.focusedWindowId,
+                              activeTargetId: topology.activeTargetId,
+                              windows,
+                          }
+                        : {}),
                 }
 
                 // 当没有连接时，提供安装提示
@@ -208,6 +300,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     mode: unifiedSession.getMode(),
                     targetId: args.targetId,
                     activated: args.activate ?? false,
+                    ...pageStateMetadata(unifiedSession, !(args.activate ?? false)),
                 })
             }
 
@@ -230,86 +323,131 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     }
                 }
                 const currentState = unifiedSession.getState()
-                if (currentState === null) {
-                    await unifiedSession.newPage(args.url)
-                } else {
-                    await unifiedSession.navigate(args.url, {
-                        wait: args.wait as WaitUntil,
-                        timeout: args.timeout ?? DEFAULT_TIMEOUT,
-                    })
+                if (
+                    unifiedSession.getMode() === 'extension' &&
+                    currentState !== null &&
+                    currentState.managed !== true
+                ) {
+                    return {
+                        content: [
+                            {
+                                type: 'text',
+                                text: JSON.stringify(
+                                    {
+                                        error: {
+                                            code: 'UNMANAGED_TAB',
+                                            message: 'open 拒绝导航非托管 tab',
+                                            suggestion:
+                                                '请使用 browse(action="list") 选择 managed=true 的受控 tab，或用 manage(action="newPage") 创建受控页面',
+                                            context: {
+                                                managed: currentState.managed ?? false,
+                                                url: currentState.url,
+                                                title: currentState.title,
+                                            },
+                                        },
+                                    },
+                                    null,
+                                    2
+                                ),
+                            },
+                        ],
+                        isError: true,
+                    }
                 }
-                const state = unifiedSession.getState()
-                return formatResponse({
-                    success: true,
-                    action: 'open',
-                    mode: unifiedSession.getMode(),
-                    url: state?.url,
-                    title: state?.title,
-                })
+                if (currentState === null) {
+                    await unifiedSession.newPage()
+                }
+                return formatResponse(
+                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
+                        await unifiedSession.navigate(args.url!, {
+                            wait: args.wait as WaitUntil,
+                            timeout: args.timeout ?? DEFAULT_TIMEOUT,
+                        })
+                        return {
+                            success: true,
+                            action: 'open',
+                            mode: unifiedSession.getMode(),
+                            ...pageStateMetadata(unifiedSession, true),
+                        }
+                    })
+                )
             }
 
             case 'back': {
-                const result = await unifiedSession.goBack(args.timeout)
-                const state = unifiedSession.getState()
-                return formatResponse({
-                    success: true,
-                    action: 'back',
-                    mode: unifiedSession.getMode(),
-                    navigated: result.navigated,
-                    url: state?.url,
-                    title: state?.title,
-                    ...(result.navigated ? {} : { note: '无后退历史' }),
-                })
+                return formatResponse(
+                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
+                        const result = await unifiedSession.goBack(args.timeout)
+                        return {
+                            success: true,
+                            action: 'back',
+                            mode: unifiedSession.getMode(),
+                            navigated: result.navigated,
+                            ...pageStateMetadata(unifiedSession, true),
+                            ...(result.navigated ? {} : { note: '无后退历史' }),
+                        }
+                    })
+                )
             }
 
             case 'forward': {
-                const result = await unifiedSession.goForward(args.timeout)
-                const state = unifiedSession.getState()
-                return formatResponse({
-                    success: true,
-                    action: 'forward',
-                    mode: unifiedSession.getMode(),
-                    navigated: result.navigated,
-                    url: state?.url,
-                    title: state?.title,
-                    ...(result.navigated ? {} : { note: '无前进历史' }),
-                })
+                return formatResponse(
+                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
+                        const result = await unifiedSession.goForward(args.timeout)
+                        return {
+                            success: true,
+                            action: 'forward',
+                            mode: unifiedSession.getMode(),
+                            navigated: result.navigated,
+                            ...pageStateMetadata(unifiedSession, true),
+                            ...(result.navigated ? {} : { note: '无前进历史' }),
+                        }
+                    })
+                )
             }
 
             case 'refresh': {
-                await unifiedSession.reload({
-                    ignoreCache: args.ignoreCache ?? false,
-                    waitUntil: args.wait,
-                    timeout: args.timeout ?? DEFAULT_TIMEOUT,
-                })
-                const state = unifiedSession.getState()
-                return formatResponse({
-                    success: true,
-                    action: 'refresh',
-                    mode: unifiedSession.getMode(),
-                    url: state?.url,
-                    title: state?.title,
-                })
+                return formatResponse(
+                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
+                        await unifiedSession.reload({
+                            ignoreCache: args.ignoreCache ?? false,
+                            waitUntil: args.wait,
+                            timeout: args.timeout ?? DEFAULT_TIMEOUT,
+                        })
+                        return {
+                            success: true,
+                            action: 'refresh',
+                            mode: unifiedSession.getMode(),
+                            ...pageStateMetadata(unifiedSession, true),
+                        }
+                    })
+                )
             }
 
             case 'close': {
-                // Extension 模式：关闭当前 attach 的 tab（与 manage closePage 行为一致）
+                // Extension 模式：关闭指定或当前 attach 的 tab（与 manage closePage 行为一致）
                 // CDP 模式：关闭浏览器会话
                 const currentMode = unifiedSession.getMode()
                 if (currentMode === 'extension') {
-                    await unifiedSession.closePage()
+                    const affected = await unifiedSession.closePage(args.targetId)
                     return formatResponse({
                         success: true,
                         action: 'close',
                         mode: 'extension',
+                        targetId: args.targetId,
+                        ...(affected ? { affected } : {}),
                     })
                 }
                 if (currentMode === 'cdp') {
-                    await cdpSession.close()
+                    if (args.targetId) {
+                        await cdpSession.closePage(args.targetId)
+                    } else {
+                        await cdpSession.close()
+                    }
                     return formatResponse({
                         success: true,
                         action: 'close',
                         mode: 'cdp',
+                        targetId: args.targetId,
                     })
                 }
                 return formatResponse({

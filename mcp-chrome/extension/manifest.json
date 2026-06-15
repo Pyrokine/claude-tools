@@ -3,7 +3,17 @@
     "name": "MCP Chrome",
     "version": "2.0.2",
     "description": "Browser automation for Claude Code via MCP protocol",
-    "permissions": ["alarms", "tabs", "activeTab", "scripting", "webNavigation", "tabGroups", "cookies", "debugger"],
+    "permissions": [
+        "alarms",
+        "tabs",
+        "activeTab",
+        "scripting",
+        "webNavigation",
+        "tabGroups",
+        "cookies",
+        "debugger",
+        "storage"
+    ],
     "host_permissions": ["<all_urls>"],
     "background": {
         "service_worker": "src/background/index.ts",

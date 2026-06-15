@@ -10,7 +10,7 @@ export default defineConfig({
         // page-scripts 中的函数通过 chrome.scripting.executeScript({ func }) 注入页面
         // 序列化时只取函数体，压缩后的模块级变量引用在页面上下文不存在
         minify: false,
-        rollupOptions: {
+        rolldownOptions: {
             input: {
                 popup: 'src/popup/popup.html',
             },

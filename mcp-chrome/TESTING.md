@@ -16,16 +16,17 @@ tab，禁止清全局缓存/cookies，只能动测试 tab 和测试创建的 `mc
 - Chrome Extension 已在 `chrome://extensions/` 刷新为最新 dist，popup 显示 **已连接**
 - MCP server 已加载最新 dist（src 有任何改动 → `npm run build` → 重启 CC，否则跑到的是旧进程）
 - 全程使用 `manage action=newPage` 创建的测试 tab，**严禁操作用户已有 tab**
-- 所有浏览操作默认 `activated=false`（后台），**严禁抢占用户前台**
+- 所有浏览操作默认 `activated=false`（后台）；只有截图 compare 等需要可见 renderer 的用例可临时 `manage activatePage`
+  ，且目标必须是 agent 自己创建的 managed 测试 tab
 - 清理只针对测试 tab 和 `mcp_test_*` 前缀的 cookie，严禁 `cookies clear` 无过滤
-- **output 文件路径必须在 mcp-chrome server cwd 内**（通常是 `./test-output/` 子目录），跑前确保该目录存在：
-  `mkdir -p test-output`，跑后可清空
+- output 相对路径默认写入 mcp-chrome 受控临时目录；需要保留在仓库内时使用 `cwd:test-output/...`，跑前确认 `test-output`
+  存在，跑后可清空
 
 ### 0.2 测试载体
 
 | 载体            | 位置                                                   | 作用                                   |
 |---------------|------------------------------------------------------|--------------------------------------|
-| **test-page** | `file:///<repo>/mcp-chrome/extension/test-page.html` | 受控页面，12 region，可注入 evaluate 监听器做行为断言 |
+| **test-page** | `file:///<repo>/mcp-chrome/extension/test-page.html` | 受控页面，13 region，可注入 evaluate 监听器做行为断言 |
 | **demoqa**    | `https://demoqa.com/`                                | 真实站点，验证 iframe / modal / 动态表单 / 真实拖拽 |
 
 每个用例在字段 `载体` 里标注 `test-page` / `demoqa` / `任意` / `N/A`
@@ -83,10 +84,10 @@ FAIL 时只需报 ID + 失败断言即可
 1. [browse](#1-browse) — 9 actions
 2. [cookies](#2-cookies) — 4 actions
 3. [evaluate](#3-evaluate) — 2 modes + 参数矩阵
-4. [extract](#4-extract) — 6 types
+4. [extract](#4-extract) — 7 types
 5. [input](#5-input) — 14 event types
 6. [logs](#6-logs) — 2 types
-7. [manage](#7-manage) — 9 actions
+7. [manage](#7-manage) — 18 actions
 8. [wait](#8-wait) — 4 types
 9. [错误分支 / 边界](#9-错误分支--边界)
 10. [test-page region 索引](#10-test-page-region-索引)
@@ -119,6 +120,8 @@ FAIL 时只需报 ID + 失败断言即可
     - `success=true`
     - `targets` 是非空数组
     - 每个元素包含 `targetId / type / url / title / mode / managed / isActive / windowId / index`
+    - Extension 模式返回 `windows` 树，包含 `windowCount / focusedWindowId / activeTargetId / windows[].tabs[]`
+    - `windows[].tabs[]` 按 `index` 升序排列，每个窗口最多一个 `active=true` tab
 - 载体：N/A
 
 ### browse-attach-01-background
@@ -142,6 +145,14 @@ FAIL 时只需报 ID + 失败断言即可
 - 前置：当前 attach 到某 test tab
 - 操作：`browse { action: "open", url: "about:blank", wait: "load" }`
 - 断言：`success=true`，`url` 字段为 `about:blank`
+- 载体：N/A
+
+### browse-open-03-diagnostics-first-page
+
+- 前置：当前没有 attach 页面，或 attach 状态为空
+- 操作：`browse { action: "open", url: "about:blank", wait: "load", diagnostics: true }`
+- 断言：`success=true`，响应含 `diagnostics.console` 和 `diagnostics.failedRequests` 数组，首次自动创建页面时也返回
+  diagnostics
 - 载体：N/A
 
 ### browse-open-02-wait-networkidle
@@ -188,6 +199,13 @@ FAIL 时只需报 ID + 失败断言即可
 - 载体：test-page
 - 备注：extension 模式下 `browse close` 实际关的是当前 attach 的 tab，CDP 模式下关闭浏览器会话
 
+### browse-managed-guard-01
+
+- 前置：`browse list` 找到 managed=false 的用户 tab，但只 attach activate=false，不导航不关闭
+- 操作：`browse { action:"open", url:"about:blank" }`
+- 断言：返回 `UNMANAGED_TAB`，建议使用 managed=true 测试 tab 或 manage newPage
+- 载体：N/A
+
 ### browse-list-02-mode-field
 
 - 前置：Extension 模式已接管
@@ -229,7 +247,7 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### cookies-get-05-output-json
 
-- 操作：`cookies { action: "get", domain: "demoqa.com", output: "./test-output/mcp-test-cookies.json" }`
+- 操作：`cookies { action: "get", domain: "demoqa.com", output: "cwd:test-output/mcp-test-cookies.json" }`
 - 断言：
     - `success=true`
     - `./test-output/mcp-test-cookies.json` 存在且为合法 JSON
@@ -353,6 +371,19 @@ FAIL 时只需报 ID + 失败断言即可
 - 载体：test-page
 - 备注：双 tab 对比可选（需自建第二个 managed test tab，Phase 1 环境可 SKIP）
 
+### evaluate-diagnostics-01
+
+- 操作：`evaluate { script: "console.warn('mcp_diag_warn'); fetch('/mcp_diag_404')", diagnostics: true }`
+- 断言：返回 `diagnostics.console` 含 warning，`diagnostics.failedRequests` 含失败请求摘要
+- 载体：test-page
+
+### evaluate-nonserializable-01-dom-node
+
+- 操作：`evaluate { script: "document.body" }`
+- 断言：返回 `isError=true`，`error.code === "NON_SERIALIZABLE_EVALUATE_RESULT"`，`error.suggestion` 含 `outerHTML` 或
+  `textContent`
+- 载体：test-page
+
 ---
 
 ## 4. extract
@@ -462,11 +493,11 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### extract-html-04-images-data
 
-- 操作：`extract { type: "html", target: { css: "body" }, images: "data", output: "./test-output/mcp-test-html" }`
+- 操作：`extract { type: "html", target: { css: "body" }, images: "data", output: "cwd:test-output/mcp-test-html" }`
 - 断言：`./test-output/mcp-test-html/index.json` 存在且记录 img 元信息
 - 载体：test-page
 - 清理：`rm -rf ./test-output/mcp-test-html`
-- 备注：test-page 使用 data URI 图片，不会生成独立图片文件；真实 URL 图片会落盘到 images/ 子目录
+- 备注：test-page 使用 data URI 图片，不会生成独立图片文件；真实 URL 图片会写入 images/ 子目录
 
 ### extract-attribute-01
 
@@ -483,43 +514,61 @@ FAIL 时只需报 ID + 失败断言即可
 ### extract-screenshot-01-viewport
 
 - 前置：测试 tab 处于可见状态（其窗口 focused 且 tab active）
-- 操作：`extract { type: "screenshot", output: "./test-output/mcp-shot.png" }`
+- 操作：`extract { type: "screenshot", output: "cwd:test-output/mcp-shot.png" }`
 - 断言：
     - `success=true`
     - `./test-output/mcp-shot.png` 存在，`file` 命令识别为 PNG，尺寸 > 10KB
 - 载体：test-page
 - 清理：`rm ./test-output/mcp-shot.png`
-- 备注：hidden tab 下会抛错 "screenshot 需要 tab 可见"
+- 备注：hidden tab 下返回 `error.code === "HIDDEN_TAB_SCREENSHOT"`，不会自动切前台
 
 ### extract-screenshot-02-fullpage
 
-- 操作：`extract { type: "screenshot", fullPage: true, output: "./test-output/mcp-fs.png" }`
+- 操作：`extract { type: "screenshot", fullPage: true, output: "cwd:test-output/mcp-fs.png" }`
 - 断言：文件尺寸 > viewport-only 截图（test-page 总高明显大于视口）
 - 载体：test-page
 
 ### extract-screenshot-03-jpeg
 
-- 操作：`extract { type: "screenshot", format: "jpeg", quality: 80, output: "./test-output/mcp-s.jpg" }`
+- 操作：`extract { type: "screenshot", format: "jpeg", quality: 80, output: "cwd:test-output/mcp-s.jpg" }`
 - 断言：`file ./test-output/mcp-s.jpg` 识别为 JPEG
 - 清理：`rm ./test-output/mcp-s.jpg`
 
 ### extract-screenshot-04-element
 
-- 操作：`extract { type: "screenshot", target: { css: "#btn-id" }, output: "./test-output/mcp-el.png" }`
-- 断言：文件存在，尺寸 < 全页截图（仅包含按钮）
+- 操作：`extract { type: "screenshot", target: { css: "#btn-id" }, output: "cwd:test-output/mcp-el.png" }`
+- 断言：文件存在，尺寸 < 全页截图（仅包含按钮）；目标元素滚动后仍应截到元素本身，不应返回空白区域
 - 清理：`rm ./test-output/mcp-el.png`
 
 ### extract-screenshot-05-scale
 
-- 操作：`extract { type: "screenshot", fullPage: true, scale: 0.5, output: "./test-output/mcp-half.png" }`
+- 操作：`extract { type: "screenshot", fullPage: true, scale: 0.5, output: "cwd:test-output/mcp-half.png" }`
 - 断言：文件尺寸显著小于 scale=1 的 fullpage 截图
 - 清理：`rm ./test-output/mcp-half.png`
+
+### extract-screenshot-06-clip
+
+- 操作：
+  `extract { type: "screenshot", clip: { x: 0, y: 0, width: 200, height: 120 }, output: "cwd:test-output/mcp-clip.png" }`
+- 断言：返回 `metadata.clip` 与入参一致，`metadata.width/height/byteSize/format/dimensionSource/capabilities`
+  存在，文件存在且尺寸小于全页截图
+- 清理：`rm ./test-output/mcp-clip.png`
+
+### extract-screenshot-07-compare
+
+- 前置：attach test-page，必要时对 managed 测试 tab 执行 `manage activatePage`；点击 `#compare-reset-btn` 后调用
+  `extract { type: "screenshot", target: { css: "#compare-box" }, output: "cwd:test-output/mcp-before.png" }`
+- 操作：点击 `#compare-toggle-btn` 后调用
+  `extract { type: "screenshot", target: { css: "#compare-box" }, compareWith: "cwd:test-output/mcp-before.png", diffOutput: "cwd:test-output/mcp-diff.png", output: "cwd:test-output/mcp-after.png" }`
+- 断言：返回 `metadata.comparison.pixelDiffRatio > 0`、`differentPixels > 0`、`totalPixels > 0`，差异图文件存在
+- 边界：使用超过 25 MiB 或 12,000,000 像素的 PNG 作为 `compareWith` 时返回明确错误，提示使用 `clip` 或 `scale`
+- 清理：`rm ./test-output/mcp-before.png ./test-output/mcp-after.png ./test-output/mcp-diff.png`
 
 ### extract-state-01-whole
 
 - 操作：`extract { type: "state" }`
-- 断言：返回结构 `{ state: { pageContent, viewport } }`，`pageContent` 非空字符串（含 accessibility tree 文本），
-  `viewport.width/height` 为数字
+- 断言：返回结构 `{ state: { pageContent, viewport, interactiveElements } }`，`pageContent` 非空字符串（含 accessibility
+  tree 文本），`viewport.width/height` 为数字，`interactiveElements` 含 role/name/selector/visible/disabled/bounds/covered
 - 载体：test-page
 
 ### extract-state-02-target
@@ -551,14 +600,21 @@ FAIL 时只需报 ID + 失败断言即可
 ### extract-metadata-01
 
 - 操作：`extract { type: "metadata" }`
-- 断言：返回含 `url / title / description / charset / viewport / og / twitter / jsonLd / alternates / feeds`（部分字段可
-  null/undefined）
+- 断言：返回含 `url / title / description / charset / viewport / og / twitter / jsonLd / alternates / feeds / frames`
+  （部分字段可 null/undefined），`frames` 含 index/frameId/parentFrameId/url/title/name/selector/rect，Extension 和 CDP
+  模式都应返回 frames 数组
 - 载体：demoqa 或 test-page
 
 ### extract-frame-01
 
 - 操作：`extract { type: "text", target: { css: "#frame-btn" }, frame: "iframe#test-frame" }`
 - 断言：`result === "Frame Button"`
+- 载体：test-page
+
+### extract-frameHtml-01
+
+- 操作：`extract { type: "frameHtml", frame: "iframe#test-frame" }`
+- 断言：返回 `type === "frameHtml"`，`content` 含 `frame-btn`
 - 载体：test-page
 
 ---
@@ -616,10 +672,17 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：`input { events: [{type:"click", target:{css:"#covered-btn"}, force:true}] }`
 - 断言：click 触发（跳过 actionability 检查）
 
+### input-click-08-actionability-diagnostics
+
+- 前置：test-page region 12 应有一个被遮挡的 button（z-index overlay）
+- 操作：`input { events: [{type:"click", target:{css:"#covered-btn"}}] }`
+- 断言：返回 `isError=true`，`error.code === "ACTIONABILITY_FAILED"`，`error.context` 含 `rect`、`clickPoint`、
+  `coveringElement`、`candidates`
+
 ### input-click-09-react-synthetic
 
 - 前置：attach 到 demoqa.com/buttons
-- 操作：`input { events: [{type:"click", target:{role:"button", name:"Click Me"}}] }`
+- 操作：`input { events: [{type:"click", target:{role:"button", name:"Click Me", exact:true}}] }`
 - 断言：页面显示 "You have done a dynamic click"（React onClick 触发）
 - 载体：demoqa
 
@@ -698,6 +761,13 @@ FAIL 时只需报 ID + 失败断言即可
 - 前置：attach React 框架页面（demoqa 的某个受控 input）
 - 操作：`type { dispatch: true, ... }`
 - 断言：React 状态更新（受控组件 value 反映）
+- 载体：demoqa
+
+### input-type-05-controlled
+
+- 前置：attach React/Vue 受控 input
+- 操作：`input { events: [{type:"type", target:{css:"input"}, text:"abc", mode:"controlled"}], diagnostics:true }`
+- 断言：value 更新并触发 input/change；失败时错误包含 matchCount、activeElement、candidates；diagnostics 字段存在
 - 载体：demoqa
 
 ### input-type-06-crlf-normalize
@@ -800,7 +870,27 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：第 2 个 keydown 的 `repeat === true`（CDP 路径会发 `rawKeyDown` + `autoRepeat: true`）
 - 载体：test-page
 
-### 5.8 stealth 专项
+### 5.8 editor 专项
+
+### input-editor-01-context
+
+- 前置：focus 到 #edit-contenteditable，并选中一段文本
+- 操作：`input { events: [{type:"editorContext", target:{css:"#edit-contenteditable"}}] }`
+- 断言：返回 `eventResults[0].editableElement.isContentEditable=true`，`selectedText` 与当前选区一致
+
+### input-editor-02-insert
+
+- 前置：focus 到 #edit-contenteditable
+- 操作：`input { events: [{type:"editorInsert", target:{css:"#edit-contenteditable"}, text:" inserted"}] }`
+- 断言：`#edit-contenteditable.textContent` 包含 `inserted`，当前 inline 格式未被整块替换
+
+### input-editor-03-command
+
+- 前置：focus 到 #edit-contenteditable，并选中文本
+- 操作：`input { events: [{type:"editorCommand", target:{css:"#edit-contenteditable"}, command:"bold"}] }`
+- 断言：目标内容出现加粗效果或 DOM 中出现 `<b>`/`<strong>` 包裹
+
+### 5.9 stealth 专项
 
 ### input-stealth-click-01-buttons
 
@@ -851,7 +941,8 @@ FAIL 时只需报 ID + 失败断言即可
 ### input-timeout-01
 
 - 操作：`input { timeout: 500, events: [{type:"click", target:{css:"#nonexistent"}}] }`
-- 断言：在 500ms+ε 内抛错，错误消息包含 "未找到" 或 "timeout"
+- 断言：在 500ms+ε 内抛错，错误 `code` 为 `TARGET_NOT_FOUND` 或 timeout 类错误，`context` 含
+  `target/matchCount/nth/page.activeElement/page.selection/page.candidates`
 
 ---
 
@@ -890,9 +981,16 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：`logs { type:"network", urlPattern:"*demoqa.com*" }`
 - 断言：每项 url 匹配模式
 
+### logs-network-03-failed-request
+
+- 前置：attach 到 test-page，执行 `evaluate { script:"fetch('/mcp_missing_resource').catch(()=>{})" }` 或
+  `browse/evaluate diagnostics=true` 触发失败请求
+- 操作：`logs { type:"network" }`
+- 断言：返回数组含失败请求或 4xx/5xx 请求，字段含 `url/method/status/errorText/timestamp/duration` 中可由当前浏览器提供的值
+
 ### logs-output-01
 
-- 操作：`logs { type:"console", output:"./test-output/mcp-logs.json" }`
+- 操作：`logs { type:"console", output:"cwd:test-output/mcp-logs.json" }`
 - 断言：文件存在且为合法 JSON 数组
 - 清理：`rm ./test-output/mcp-logs.json`
 
@@ -910,7 +1008,87 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：先 newPage 创建 T
 - 操作：`manage { action:"closePage", targetId:<T> }`
-- 断言：`success=true`，`browse list` 找不到 T
+- 断言：`success=true`，返回 `affected.before.targetId=<T>` 且 `affected.after=null`，`browse list` 找不到 T
+
+### manage-adoptPage-01
+
+- 前置：`browse list` 找到一个 `managed=false` 的目标 T，只读取列表，不导航不激活
+- 操作：`manage { action:"adoptPage", targetId:<T> }`
+- 断言：`success=true`，`managedBefore=false`，`managedAfter=true`，再次 `browse list` 中 T 为 `managed=true`
+- 清理：执行 `manage releasePage targetId=<T>`，不要关闭用户已有 tab
+
+### manage-releasePage-01
+
+- 前置：先 newPage 创建受控 tab T
+- 操作：`manage { action:"releasePage", targetId:<T> }`
+- 断言：`success=true`，`managedBefore=true`，再次 `browse list` 中 T 为 `managed=false`
+- 清理：重新 `adoptPage` 后执行 `closePage` 关闭测试 tab
+
+### manage-movePage-01
+
+- 前置：先 newWindow 创建测试窗口 W，再 newPage 创建受控 tab T
+- 操作：`manage { action:"movePage", targetId:<T>, windowId:<W>, index:0 }`
+- 断言：`success=true`，返回 `affected.before/after`，`affected.after.windowId=<W>` 且 `affected.after.index=0`
+- 清理：关闭测试窗口或测试 tab
+
+### manage-reorderPage-01
+
+- 前置：同一测试窗口内创建两个受控 tab T1/T2
+- 操作：`manage { action:"reorderPage", targetId:<T2>, index:0 }`
+- 断言：`success=true`，`affected.before.index != affected.after.index`，再次 `browse list` 中 T2 排在 index 0
+
+### manage-pinPage-01
+
+- 前置：先 newPage 创建 T
+- 操作：`manage { action:"pinPage", targetId:<T> }`
+- 断言：`success=true`，`affected.before.pinned=false`，`affected.after.pinned=true`
+- 清理：`manage unpinPage targetId=<T>` 后关闭 T
+
+### manage-unpinPage-01
+
+- 前置：先将测试 tab T 执行 `pinPage`
+- 操作：`manage { action:"unpinPage", targetId:<T> }`
+- 断言：`success=true`，`affected.before.pinned=true`，`affected.after.pinned=false`
+
+### manage-activatePage-01
+
+- 状态：只在需要可见 renderer 的用例或本地手动发版验证中执行，目标必须是 agent 自己创建的 managed 测试 tab T
+- 前置：只使用 agent 自己创建的测试 tab T
+- 操作：`manage { action:"activatePage", targetId:<T> }`
+- 断言：`success=true`，`affected.after.active=true`
+
+### manage-focusWindow-01
+
+- 状态：**SKIP**（会抢占前台，常规回归不执行）
+- 前置：只使用 agent 自己创建的测试窗口 W
+- 操作：`manage { action:"focusWindow", windowId:<W> }`
+- 断言：`success=true`，`affected.after.focused=true`
+
+### manage-resizeWindow-01
+
+- 前置：先 newWindow 创建测试窗口 W，不使用用户窗口
+- 操作：`manage { action:"resizeWindow", windowId:<W>, width:900, height:700 }`
+- 断言：`success=true`，`affected.before/after` 存在，`affected.after.width` 和 `affected.after.height` 接近设置值
+- 清理：`manage closeWindow windowId=<W>`
+
+### manage-newWindow-01
+
+- 前置：仅在独立测试窗口场景执行
+- 操作：`manage { action:"newWindow", url:"about:blank", focused:false }`
+- 断言：`success=true`，返回 `affected.windowId` 和 `affected.targetId`，`affected.after.tabs[]` 全部 `managed=true`
+- 清理：`manage closeWindow windowId=<affected.windowId>`
+
+### manage-closeWindow-01
+
+- 前置：先 newWindow 创建测试窗口 W，确认窗口内全是 managed tab
+- 操作：`manage { action:"closeWindow", windowId:<W> }`
+- 断言：`success=true`，`affected.before.windowId=<W>`，`affected.after=null`，再次 `browse list` 找不到 W
+
+### manage-closeWindow-02-unmanaged-guard
+
+- 前置：`browse list` 找到含 `managed=false` tab 的用户窗口 W，只读取列表，不聚焦不导航
+- 操作：`manage { action:"closeWindow", windowId:<W> }`
+- 断言：返回 `WINDOW_HAS_UNMANAGED_TABS`，窗口仍存在
 
 ### manage-viewport-01
 
@@ -925,7 +1103,8 @@ FAIL 时只需报 ID + 失败断言即可
 ### manage-emulate-01-iphone
 
 - 操作：`manage { action:"emulate", device:"iPhone 13" }`
-- 断言：`evaluate "navigator.userAgent"` 含 "iPhone"，`evaluate "window.innerWidth"` 约 390
+- 断言：`evaluate "navigator.userAgent"` 含 "iPhone"，`navigator.maxTouchPoints` 为 1，`visualViewport.width` 与
+  `document.documentElement.clientWidth` 约 390
 
 ### manage-emulate-02-list
 
@@ -1094,10 +1273,11 @@ test-page.html 现有 region（供用例引用）：
 | 10 iframe             | 跨框架交互                      | #test-frame, #frame-btn, #frame-input, #frame-result                                                |
 | 11 wait               | 延迟/哈希/burst mutation       | #show-later-btn, #show-later-target, #hashnav-btn, #burst-mutation-btn, #burst-mutation-target      |
 | 12 force + combo keys | 覆盖层 + 组合键输入                | #covered-btn, #combo-input                                                                          |
+| 13 screenshot compare | 固定截图差异区域                   | #compare-box, #compare-toggle-btn, #compare-reset-btn                                               |
 
 **本清单引用但 test-page 尚未覆盖的元素**（待补区）：
 
-- 无（横向滚动容器 `#scroll-container-x` 已补）
+- 无（横向滚动容器 `#scroll-container-x` 和截图差异区域 `#compare-box` 已补）
 
 ---
 

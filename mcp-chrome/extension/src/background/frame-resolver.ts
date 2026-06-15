@@ -1,16 +1,24 @@
 import { ExpectedOperationError } from '../types/expected-errors'
 import { EvaluateInFrameSchema, GetAllFramesSchema, ResolveFrameSchema } from '../types/schemas'
-import { assertScriptable, getFrameOffset, getTargetTabId } from './action-utils.js'
+import {
+    type ActionContext,
+    assertManagedTab,
+    assertScriptable,
+    getFrameOffset,
+    getTargetTabId,
+} from './action-utils.js'
 import type { DebuggerManager } from './debugger-manager.js'
 
 export class FrameResolver {
     constructor(private debuggerManager: DebuggerManager) {}
 
-    async resolveFrame(params: unknown): Promise<{ frameId: number; offset: { x: number; y: number } | null }> {
+    async resolveFrame(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{ frameId: number; offset: { x: number; y: number } | null }> {
         const p = ResolveFrameSchema.parse(params)
 
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'resolve_frame')
 
         // 获取所有 frames
         const allFrames = await chrome.webNavigation.getAllFrames({ tabId })
@@ -32,7 +40,7 @@ export class FrameResolver {
             world: 'MAIN',
             func: (frame: string | number) => {
                 const iframes = Array.from(document.querySelectorAll('iframe, frame')) as HTMLIFrameElement[]
-                let target: HTMLIFrameElement | null = null
+                let target: HTMLIFrameElement | null
                 let index = -1
 
                 if (typeof frame === 'number') {
@@ -98,23 +106,106 @@ export class FrameResolver {
         return { frameId: matchedFrameId, offset }
     }
 
-    async getAllFrames(params: unknown): Promise<{
-        frames: Array<{ frameId: number; parentFrameId: number; url: string }>
+    async getAllFrames(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{
+        frames: Array<{
+            index: number
+            frameId: number
+            parentFrameId: number | null
+            url: string
+            title: string | null
+            name: string | null
+            selector: string | null
+            rect: { x: number; y: number; width: number; height: number } | null
+        }>
     }> {
         const p = GetAllFramesSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_all_frames')
 
         const frames = await chrome.webNavigation.getAllFrames({ tabId })
         if (!frames) {
             throw new Error('Failed to get frames')
         }
 
+        type DomFrame = {
+            index: number
+            url: string
+            title: string | null
+            name: string | null
+            selector: string | null
+            rect: { x: number; y: number; width: number; height: number }
+        }
+
+        let mainFrameInfo: {
+            title: string | null
+            rect: { x: number; y: number; width: number; height: number }
+        } = { title: null, rect: { x: 0, y: 0, width: 0, height: 0 } }
+        let domFrames: DomFrame[] = []
+        try {
+            const result = await chrome.scripting.executeScript({
+                target: { tabId, frameIds: [0] },
+                world: 'MAIN',
+                func: () => ({
+                    main: {
+                        title: document.title || null,
+                        rect: { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight },
+                    },
+                    frames: Array.from(document.querySelectorAll('iframe, frame')).map((frame, index) => {
+                        const el = frame as HTMLIFrameElement
+                        const rect = el.getBoundingClientRect()
+                        const selector = el.id
+                            ? `#${CSS.escape(el.id)}`
+                            : `${el.tagName.toLowerCase()}:nth-of-type(${index + 1})`
+                        return {
+                            index,
+                            url: el.src || '',
+                            title: el.title || null,
+                            name: el.name || null,
+                            selector,
+                            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                        }
+                    }),
+                }),
+            })
+            const pageFrames = result[0]?.result as { main?: typeof mainFrameInfo; frames?: DomFrame[] } | undefined
+            mainFrameInfo = pageFrames?.main ?? mainFrameInfo
+            domFrames = pageFrames?.frames ?? []
+        } catch {
+            domFrames = []
+        }
+
+        const directChildFrames = frames.filter((frame) => frame.parentFrameId === 0 && frame.frameId !== 0)
+        const getDomFrame = (frame: chrome.webNavigation.GetAllFrameResultDetails): DomFrame | undefined => {
+            if (frame.parentFrameId !== 0) {
+                return undefined
+            }
+            const directIndex = directChildFrames.findIndex((candidate) => candidate.frameId === frame.frameId)
+            const byIndex = directIndex >= 0 ? domFrames[directIndex] : undefined
+            if (byIndex) {
+                return byIndex
+            }
+            const navigationMatches = directChildFrames.filter((candidate) => candidate.url === frame.url)
+            const domMatches = domFrames.filter((candidate) => candidate.url === frame.url)
+            return navigationMatches.length === 1 && domMatches.length === 1 ? domMatches[0] : undefined
+        }
+
         return {
-            frames: frames.map((f) => ({
-                frameId: f.frameId,
-                parentFrameId: f.parentFrameId,
-                url: f.url,
-            })),
+            frames: frames.map((frame, index) => {
+                const isMainFrame = frame.frameId === 0
+                const dom = isMainFrame ? undefined : getDomFrame(frame)
+                return {
+                    index,
+                    frameId: frame.frameId,
+                    parentFrameId: isMainFrame ? null : frame.parentFrameId,
+                    url: frame.url,
+                    title: isMainFrame ? mainFrameInfo.title : (dom?.title ?? null),
+                    name: isMainFrame ? null : (dom?.name ?? null),
+                    selector: isMainFrame ? null : (dom?.selector ?? null),
+                    rect: isMainFrame ? mainFrameInfo.rect : (dom?.rect ?? null),
+                }
+            }),
         }
     }
 
@@ -124,12 +215,12 @@ export class FrameResolver {
      * 通过 Runtime.enable 获取 iframe 的执行上下文 ID，
      * 然后用 Runtime.evaluate + contextId 在 iframe 主世界中执行代码，绕过 CSP
      */
-    async evaluateInFrame(params: unknown): Promise<unknown> {
+    async evaluateInFrame(params: unknown, context: ActionContext): Promise<unknown> {
         const p = EvaluateInFrameSchema.parse(params)
         const returnByValue = (params as { returnByValue?: boolean })?.returnByValue
         const awaitPromise = (params as { awaitPromise?: boolean })?.awaitPromise
 
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'evaluate_in_frame')
         await this.debuggerManager.ensureAttached(tabId)
 
         // 获取 Extension frameId 对应的 URL
@@ -197,6 +288,17 @@ export class FrameResolver {
         }
 
         return await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', evalParams)
+    }
+
+    private async getManagedScriptableTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<number> {
+        const resolvedTabId = await getTargetTabId(tabId)
+        await assertManagedTab(resolvedTabId, context, operation)
+        await assertScriptable(resolvedTabId)
+        return resolvedTabId
     }
 
     /** 在 CDP frame tree 中递归收集所有匹配 URL 的 frameId */

@@ -5,17 +5,17 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { readFile, writeFile } from 'fs/promises'
+import { readFile } from 'fs/promises'
 import { z } from 'zod'
 import {
     CWD_PATH_PREFIX,
-    ensureParentDir,
     formatErrorResponse,
     formatResponse,
     getUnifiedSession,
     resolveScopedInputPath,
     resolveScopedOutputPath,
     TMP_PATH_PREFIX,
+    writePrivateFile,
 } from '../core/index.js'
 
 /**
@@ -49,6 +49,7 @@ const evaluateSchema = z.object({
         .describe(
             '执行模式，precise（默认）使用 debugger API，可绕过 CSP；stealth 使用 JS 注入，不触发调试提示但受 CSP 限制'
         ),
+    diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
     tabId: z
         .string()
         .optional()
@@ -66,6 +67,39 @@ const evaluateSchema = z.object({
 /**
  * evaluate 工具处理器
  */
+interface DiagnosticsStart {
+    consoleCount: number
+    networkCount: number
+}
+
+async function captureDiagnosticsStart(
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+): Promise<DiagnosticsStart> {
+    await unifiedSession.enableConsole()
+    await unifiedSession.enableNetwork()
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return { consoleCount: consoleLogs.length, networkCount: network.length }
+}
+
+async function captureDiagnosticsDelta(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    start: DiagnosticsStart
+): Promise<Record<string, unknown>> {
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return {
+        console: consoleLogs
+            .slice(start.consoleCount)
+            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
+            .slice(-20),
+        failedRequests: network
+            .slice(start.networkCount)
+            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
+            .slice(-20),
+    }
+}
+
 async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
@@ -97,17 +131,21 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
+                const diagnosticsStart = args.diagnostics ? await captureDiagnosticsStart(unifiedSession) : undefined
                 const result = await unifiedSession.evaluate(script, args.mode, args.timeout, args.args as unknown[])
                 const normalizedResult = result === undefined ? null : result
+                const diagnostics = diagnosticsStart
+                    ? await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
+                    : undefined
 
                 if (outputPath) {
                     // string 类型直接写入原始文本，其他类型 JSON 序列化
                     const content = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                    await ensureParentDir(outputPath)
-                    await writeFile(outputPath, content, 'utf-8')
+                    await writePrivateFile(outputPath, content, 'utf-8')
                     return formatResponse({
                         success: true,
                         output: outputPath,
+                        ...(diagnostics ? { diagnostics } : {}),
                     })
                 }
 
@@ -122,18 +160,22 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                         )
                     ).absolutePath
                     const fileContent = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                    await ensureParentDir(autoSavedPath)
-                    await writeFile(autoSavedPath, fileContent, 'utf-8')
+                    await writePrivateFile(autoSavedPath, fileContent, 'utf-8')
                     return formatResponse({
                         success: true,
                         autoSaved: true,
                         path: autoSavedPath,
                         size: fileContent.length,
                         hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
+                        ...(diagnostics ? { diagnostics } : {}),
                     })
                 }
 
-                return formatResponse({ success: true, result: normalizedResult })
+                return formatResponse({
+                    success: true,
+                    result: normalizedResult,
+                    ...(diagnostics ? { diagnostics } : {}),
+                })
             })
         }) // withTabId
     } catch (error) {

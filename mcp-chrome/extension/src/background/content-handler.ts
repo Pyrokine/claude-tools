@@ -20,7 +20,14 @@ import {
     ScrollSchema,
     TypeSchema,
 } from '../types/schemas'
-import { assertScriptable, getFrameOffset, getTargetTabId, isRestrictedUrl } from './action-utils'
+import {
+    type ActionContext,
+    assertManagedTab,
+    assertScriptable,
+    getFrameOffset,
+    getTargetTabId,
+    isRestrictedUrl,
+} from './action-utils'
 import { DebuggerBlockedError, DebuggerManager } from './debugger-manager'
 import {
     type ActionabilityResult,
@@ -35,6 +42,7 @@ import {
     findElements,
     generateAccessibilityTree,
     getComputedStyleFromElement,
+    installActionabilityHelpers,
     performActionableClick,
     performClick,
     performDragAndDrop,
@@ -62,13 +70,21 @@ function wrapInjectionError(msg: string): Error {
     return new Error(msg)
 }
 
+function structuredOperationError(
+    code: string,
+    message: string,
+    suggestion: string,
+    context: Record<string, unknown>
+): ExpectedOperationError {
+    return new ExpectedOperationError(JSON.stringify({ error: { code, message, suggestion, context } }))
+}
+
 export class ContentHandler {
     constructor(private debuggerManager: DebuggerManager) {}
 
-    async readPage(params: unknown): Promise<ReadPageResult> {
+    async readPage(params: unknown, context: ActionContext): Promise<ReadPageResult> {
         const p = ReadPageSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'read_page')
         const result = await this.injectScript<ReadPageResult>(tabId, p.frameId, generateAccessibilityTree, [
             p.filter || 'all',
             p.depth ?? 15,
@@ -78,12 +94,15 @@ export class ContentHandler {
         if (result === undefined || result === null) {
             throw new Error('Failed to read page')
         }
+        if (p.frameId !== undefined && result.interactiveElements) {
+            result.interactiveElements = result.interactiveElements.map((item) => ({ ...item, frameId: p.frameId }))
+        }
         return result
     }
 
-    async screenshot(params: unknown): Promise<ScreenshotResult> {
+    async screenshot(params: unknown, context: ActionContext): Promise<ScreenshotResult> {
         const p = ScreenshotSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'screenshot')
 
         try {
             // 使用 debugger API 截图（不需要 tab 在前台）
@@ -102,8 +121,11 @@ export class ContentHandler {
             returnByValue: true,
         })) as { result: { value: string } }
         if (visibility?.value === 'hidden') {
-            throw new ExpectedOperationError(
-                'screenshot 需要 tab 可见；当前 tab 处于 hidden 状态，请先把目标 tab/窗口带到前台或 activate 该 tab'
+            throw structuredOperationError(
+                'HIDDEN_TAB_SCREENSHOT',
+                'screenshot 需要 tab 可见，当前 tab 处于 hidden 状态',
+                'Extension 截图依赖可见 renderer，请显式使用 manage(action="activatePage") 或 manage(action="focusWindow")，也可在 CDP/headless 测试浏览器中截图',
+                { tabId, visibilityState: visibility.value }
             )
         }
 
@@ -152,7 +174,7 @@ export class ContentHandler {
         const result = (await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
             format: effectiveFormat,
             ...(p.quality !== undefined && effectiveFormat !== 'png' ? { quality: p.quality } : {}),
-            ...(p.clip ? { clip: { ...p.clip, scale: p.scale ?? 1 } } : {}),
+            ...(p.clip ? { clip: { ...p.clip, scale: p.scale ?? 1 }, captureBeyondViewport: true } : {}),
         })) as { data: string }
 
         return {
@@ -161,38 +183,35 @@ export class ContentHandler {
         }
     }
 
-    async click(params: unknown): Promise<{ success: boolean }> {
+    async click(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = ClickSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'click')
         return this.injectScript<{ success: boolean }>(tabId, p.frameId, performClick, [p.refId])
     }
 
-    async actionableClick(params: unknown): Promise<{
-        success: boolean
-        error?: string
-        reason?: string
-        coveringElement?: string
-    }> {
+    async actionableClick(
+        params: unknown,
+        context: ActionContext
+    ): Promise<Partial<ActionabilityResult> & { success: boolean; error?: string }> {
         const p = ActionableClickSchema.parse(params)
 
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'actionable_click')
 
         // 渐进退避重试（参考 Playwright dom.ts:300）
         const delays = [0, 20, 100, 100, 500]
-        let lastResult: { success: boolean; error?: string; reason?: string; coveringElement?: string } | null = null
+        let lastResult: (Partial<ActionabilityResult> & { success: boolean; error?: string }) | null = null
         for (let attempt = 0; attempt <= delays.length; attempt++) {
             if (attempt > 0) {
                 await new Promise((resolve) => setTimeout(resolve, delays[attempt - 1]))
             }
 
-            lastResult = await this.injectScript<{
-                success: boolean
-                error?: string
-                reason?: string
-                coveringElement?: string
-            }>(tabId, p.frameId, performActionableClick, [p.refId, p.force ?? false])
+            await this.injectScript<void>(tabId, p.frameId, installActionabilityHelpers, [])
+            lastResult = await this.injectScript<Partial<ActionabilityResult> & { success: boolean; error?: string }>(
+                tabId,
+                p.frameId,
+                performActionableClick,
+                [p.refId, p.force ?? false]
+            )
 
             if (lastResult.success) {
                 return lastResult
@@ -212,6 +231,7 @@ export class ContentHandler {
 
         // 所有重试耗尽，直接使用最后一次结果（避免额外 IPC 调用）
         return {
+            ...lastResult,
             success: false,
             error:
                 lastResult?.reason === 'covered'
@@ -222,27 +242,28 @@ export class ContentHandler {
         }
     }
 
-    async checkActionabilityAction(params: unknown): Promise<ActionabilityResult> {
+    async checkActionabilityAction(params: unknown, context: ActionContext): Promise<ActionabilityResult> {
         const p = CheckActionabilitySchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'check_actionability')
+        await this.injectScript<void>(tabId, p.frameId, installActionabilityHelpers, [])
         return this.injectScript<ActionabilityResult>(tabId, p.frameId, checkActionability, [p.refId])
     }
 
-    async dispatchInputAction(params: unknown): Promise<{ success: boolean; error?: string }> {
+    async dispatchInputAction(params: unknown, context: ActionContext): Promise<{ success: boolean; error?: string }> {
         const p = DispatchInputSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'dispatch_input')
         return this.injectScript<{ success: boolean; error?: string }>(tabId, p.frameId, dispatchInputToElement, [
             p.refId,
             p.text ?? '',
         ])
     }
 
-    async dragAndDropAction(params: unknown): Promise<{ success: boolean; error?: string; code?: string }> {
+    async dragAndDropAction(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{ success: boolean; error?: string; code?: string }> {
         const p = DragAndDropSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'drag_and_drop')
         return this.injectScript<{ success: boolean; error?: string; code?: string }>(
             tabId,
             p.frameId,
@@ -251,17 +272,15 @@ export class ContentHandler {
         )
     }
 
-    async getComputedStyleAction(params: unknown): Promise<string | null> {
+    async getComputedStyleAction(params: unknown, context: ActionContext): Promise<string | null> {
         const p = GetComputedStyleSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_computed_style')
         return this.injectScript<string | null>(tabId, p.frameId, getComputedStyleFromElement, [p.refId, p.prop ?? ''])
     }
 
-    async type(params: unknown): Promise<{ success: boolean }> {
+    async type(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = TypeSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'type')
         return this.injectScript<{ success: boolean }>(tabId, p.frameId, performType, [
             p.refId,
             p.text,
@@ -269,10 +288,12 @@ export class ContentHandler {
         ])
     }
 
-    async scroll(params: unknown): Promise<{ success: boolean; scrollX: number; scrollY: number }> {
+    async scroll(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{ success: boolean; scrollX: number; scrollY: number }> {
         const p = ScrollSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'scroll')
         return this.injectScript<{ success: boolean; scrollX: number; scrollY: number }>(
             tabId,
             p.frameId,
@@ -281,19 +302,21 @@ export class ContentHandler {
         )
     }
 
-    async evaluate(params: unknown): Promise<{ success: boolean; result?: string; error?: string }> {
+    async evaluate(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{ success: boolean; result?: string; error?: string }> {
         const p = EvaluateSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'evaluate')
         // world: 'MAIN' 在页面上下文中执行（绕过 Extension CSP，但页面 CSP 仍可拦截）
         return this.injectScript<{ success: boolean; result?: string; error?: string }>(tabId, p.frameId, executeCode, [
             p.code,
         ])
     }
 
-    async find(params: unknown): Promise<ElementInfo[]> {
+    async find(params: unknown, context: ActionContext): Promise<ElementInfo[]> {
         const p = FindSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
+        const tabId = await this.getManagedTabId(p.tabId, context, 'find')
         const frameId = p.frameId ?? 0
 
         // 受限 URL 返回空数组（而非抛异常，避免 auto-wait 轮询时大量错误）
@@ -338,10 +361,9 @@ export class ContentHandler {
         return elements
     }
 
-    async getText(params: unknown): Promise<{ text: string }> {
+    async getText(params: unknown, context: ActionContext): Promise<{ text: string }> {
         const p = GetTextSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_text')
         const data = await this.injectScript<{ text: string; error?: string } | undefined>(
             tabId,
             p.frameId,
@@ -357,10 +379,9 @@ export class ContentHandler {
         return { text: data.text }
     }
 
-    async getHtml(params: unknown): Promise<{ html: string }> {
+    async getHtml(params: unknown, context: ActionContext): Promise<{ html: string }> {
         const p = GetHtmlSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_html')
         const data = await this.injectScript<{ html: string; error?: string } | undefined>(
             tabId,
             p.frameId,
@@ -376,7 +397,10 @@ export class ContentHandler {
         return { html: data.html }
     }
 
-    async getHtmlWithImages(params: unknown): Promise<{
+    async getHtmlWithImages(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{
         html: string
         images: Array<{
             index: number
@@ -390,8 +414,7 @@ export class ContentHandler {
         }>
     }> {
         const p = GetHtmlWithImagesSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_html_with_images')
         return this.injectScript<{
             html: string
             images: Array<{
@@ -407,10 +430,9 @@ export class ContentHandler {
         }>(tabId, p.frameId, extractHtmlWithImages, [p.selector ?? null, p.outer ?? true])
     }
 
-    async getAttribute(params: unknown): Promise<{ value: string | null }> {
+    async getAttribute(params: unknown, context: ActionContext): Promise<{ value: string | null }> {
         const p = GetAttributeSchema.parse(params)
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_attribute')
         const data = await this.injectScript<{ value: string | null } | undefined>(tabId, p.frameId, extractAttribute, [
             p.selector ?? null,
             p.refId ?? null,
@@ -424,11 +446,30 @@ export class ContentHandler {
         return data
     }
 
-    async getMetadata(params: unknown): Promise<Record<string, unknown>> {
+    async getMetadata(params: unknown, context: ActionContext): Promise<Record<string, unknown>> {
         const p = GetMetadataSchema.parse(params) ?? {}
-        const tabId = await getTargetTabId(p.tabId)
-        await assertScriptable(tabId)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_metadata')
         return this.injectScript<Record<string, unknown>>(tabId, p.frameId, extractMetadata, [])
+    }
+
+    private async getManagedTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<number> {
+        const resolvedTabId = await getTargetTabId(tabId)
+        await assertManagedTab(resolvedTabId, context, operation)
+        return resolvedTabId
+    }
+
+    private async getManagedScriptableTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<number> {
+        const resolvedTabId = await this.getManagedTabId(tabId, context, operation)
+        await assertScriptable(resolvedTabId)
+        return resolvedTabId
     }
 
     /**

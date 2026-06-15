@@ -7,17 +7,17 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { writeFile } from 'fs/promises'
+import { stat } from 'fs/promises'
 import { z } from 'zod'
 import {
     CWD_PATH_PREFIX,
-    ensureParentDir,
     formatErrorResponse,
     formatResponse,
     getSession,
     getUnifiedSession,
     resolveScopedOutputPath,
     TMP_PATH_PREFIX,
+    writePrivateFile,
 } from '../core/index.js'
 
 /**
@@ -41,6 +41,49 @@ const logsSchema = z.object({
         ),
 })
 
+const DEFAULT_LOG_LIMIT = 100
+
+function latestItems<T>(items: T[], limit: number): T[] {
+    return items.slice(-limit)
+}
+
+function sampleKind(hasOutput: boolean, hasExplicitLimit: boolean): 'all' | 'latest' {
+    if (!hasOutput) {
+        return 'latest'
+    }
+    return hasExplicitLimit ? 'latest' : 'all'
+}
+
+async function writeLogsOutput(
+    output: string,
+    type: 'console' | 'network',
+    logs: unknown[],
+    metadata: Record<string, unknown>
+): Promise<{ output: string; manifest: string; bytes: number }> {
+    const outputPath = (await resolveScopedOutputPath(output, 'mcp-chrome')).absolutePath
+    await writePrivateFile(outputPath, JSON.stringify(logs, null, 2), 'utf-8')
+    const manifestPath = outputPath.replace(/\.[^/\\.]+$/, '') + '_manifest.json'
+    const bytes = (await stat(outputPath)).size
+    await writePrivateFile(
+        manifestPath,
+        JSON.stringify(
+            {
+                schema: 'mcp-chrome.logs.v1',
+                type,
+                outputPath,
+                bytes,
+                lines: logs.length,
+                complete: metadata.sample_kind === 'all',
+                ...metadata,
+            },
+            null,
+            2
+        ),
+        'utf-8'
+    )
+    return { output: outputPath, manifest: manifestPath, bytes }
+}
+
 /**
  * logs 工具处理器
  */
@@ -51,7 +94,7 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
     try {
         const unifiedSession = getUnifiedSession()
         const mode = unifiedSession.getMode()
-        const limit = args.limit ?? 100
+        const responseLimit = args.limit ?? DEFAULT_LOG_LIMIT
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             switch (args.type) {
@@ -68,30 +111,39 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     if (mode === 'extension') {
                         // Extension 模式：使用 debugger API 获取控制台日志
                         await unifiedSession.enableConsole()
-                        const extLogs = await unifiedSession.getConsoleLogs({
+                        logs = await unifiedSession.getConsoleLogs({
                             level: args.level === 'all' ? undefined : args.level,
                             clear: args.clear,
                         })
-                        logs = extLogs.slice(0, limit)
                     } else {
                         // CDP 模式
                         const session = getSession()
-                        const allLogs = await session.getConsoleLogs({
+                        logs = await session.getConsoleLogs({
                             level: args.level === 'all' ? undefined : args.level,
                             clear: args.clear,
                         })
-                        logs = allLogs.slice(-limit)
                     }
 
+                    const hasExplicitLimit = args.limit !== undefined
+                    const selectedLogs = args.output && !hasExplicitLimit ? logs : latestItems(logs, responseLimit)
+                    const kind = sampleKind(Boolean(args.output), hasExplicitLimit)
                     if (args.output) {
-                        const outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
-                        await ensureParentDir(outputPath)
-                        await writeFile(outputPath, JSON.stringify(logs, null, 2), 'utf-8')
+                        const written = await writeLogsOutput(args.output, 'console', selectedLogs, {
+                            sample_kind: kind,
+                            limit_applied: hasExplicitLimit ? responseLimit : null,
+                            total_buffered: logs.length,
+                            level: args.level ?? 'all',
+                            mode,
+                        })
                         return formatResponse({
                             success: true,
                             type: 'console',
-                            output: outputPath,
-                            count: logs.length,
+                            output: written.output,
+                            manifest: written.manifest,
+                            count: selectedLogs.length,
+                            totalBuffered: logs.length,
+                            sample_kind: kind,
+                            bytes: written.bytes,
                             mode,
                         })
                     }
@@ -99,7 +151,11 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     return formatResponse({
                         success: true,
                         type: 'console',
-                        logs,
+                        logs: selectedLogs,
+                        count: selectedLogs.length,
+                        totalBuffered: logs.length,
+                        sample_kind: kind,
+                        limit: responseLimit,
                         mode,
                     })
                 }
@@ -117,30 +173,40 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     if (mode === 'extension') {
                         // Extension 模式：使用 debugger API 获取网络日志
                         await unifiedSession.enableNetwork()
-                        const extRequests = await unifiedSession.getNetworkRequests({
+                        requests = await unifiedSession.getNetworkRequests({
                             urlPattern: args.urlPattern,
                             clear: args.clear,
                         })
-                        requests = extRequests.slice(0, limit)
                     } else {
                         // CDP 模式
                         const session = getSession()
-                        const allRequests = await session.getNetworkRequests({
+                        requests = await session.getNetworkRequests({
                             urlPattern: args.urlPattern,
                             clear: args.clear,
                         })
-                        requests = allRequests.slice(-limit)
                     }
 
+                    const hasExplicitLimit = args.limit !== undefined
+                    const selectedRequests =
+                        args.output && !hasExplicitLimit ? requests : latestItems(requests, responseLimit)
+                    const kind = sampleKind(Boolean(args.output), hasExplicitLimit)
                     if (args.output) {
-                        const outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
-                        await ensureParentDir(outputPath)
-                        await writeFile(outputPath, JSON.stringify(requests, null, 2), 'utf-8')
+                        const written = await writeLogsOutput(args.output, 'network', selectedRequests, {
+                            sample_kind: kind,
+                            limit_applied: hasExplicitLimit ? responseLimit : null,
+                            total_buffered: requests.length,
+                            urlPattern: args.urlPattern,
+                            mode,
+                        })
                         return formatResponse({
                             success: true,
                             type: 'network',
-                            output: outputPath,
-                            count: requests.length,
+                            output: written.output,
+                            manifest: written.manifest,
+                            count: selectedRequests.length,
+                            totalBuffered: requests.length,
+                            sample_kind: kind,
+                            bytes: written.bytes,
                             mode,
                         })
                     }
@@ -148,7 +214,11 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     return formatResponse({
                         success: true,
                         type: 'network',
-                        requests,
+                        requests: selectedRequests,
+                        count: selectedRequests.length,
+                        totalBuffered: requests.length,
+                        sample_kind: kind,
+                        limit: responseLimit,
                         mode,
                     })
                 }

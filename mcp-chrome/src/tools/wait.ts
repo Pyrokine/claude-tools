@@ -17,6 +17,52 @@ import { targetToFindParams, targetZodSchema } from './schema.js'
 /** 轮询间隔（毫秒） */
 const POLL_INTERVAL = 100
 
+interface DiagnosticsStart {
+    consoleCount: number
+    networkCount: number
+}
+
+async function captureDiagnosticsStart(
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+): Promise<DiagnosticsStart> {
+    await unifiedSession.enableConsole()
+    await unifiedSession.enableNetwork()
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return { consoleCount: consoleLogs.length, networkCount: network.length }
+}
+
+async function captureDiagnosticsDelta(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    start: DiagnosticsStart
+): Promise<Record<string, unknown>> {
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return {
+        console: consoleLogs
+            .slice(start.consoleCount)
+            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
+            .slice(-20),
+        failedRequests: network
+            .slice(start.networkCount)
+            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
+            .slice(-20),
+    }
+}
+
+async function withDiagnostics<T extends Record<string, unknown>>(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    enabled: boolean | undefined,
+    action: () => Promise<T>
+): Promise<T & { diagnostics?: Record<string, unknown> }> {
+    const start = enabled ? await captureDiagnosticsStart(unifiedSession) : undefined
+    const result: T & { diagnostics?: Record<string, unknown> } = await action()
+    if (start) {
+        result.diagnostics = await captureDiagnosticsDelta(unifiedSession, start)
+    }
+    return result
+}
+
 /**
  * wait 参数 schema
  */
@@ -25,6 +71,7 @@ const waitSchema = z.object({
     target: targetZodSchema.optional().describe('目标元素（for=element 时必填；navigation/time/idle 不需要）'),
     state: z.enum(['visible', 'hidden', 'attached', 'detached']).optional().describe('元素状态（element）'),
     ms: z.number().optional().describe('毫秒（time：等待时长；idle：DOM mutation 静默期，默认 500ms）'),
+    diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
     tabId: z
         .string()
         .optional()
@@ -74,22 +121,28 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                         }
                         const state = args.state ?? 'visible'
 
-                        if (mode === 'extension') {
-                            await waitForElementExtension(unifiedSession, args.target, state, timeout)
-                        } else {
-                            const session = getSession()
-                            await waitForElement(session, args.target, state, timeout)
-                        }
-
-                        return formatResponse({
-                            success: true,
-                            waited: 'element',
-                            state,
-                            mode,
-                        })
+                        return formatResponse(
+                            await withDiagnostics(unifiedSession, args.diagnostics, async () => {
+                                if (mode === 'extension') {
+                                    await waitForElementExtension(unifiedSession, args.target!, state, timeout)
+                                } else {
+                                    const session = getSession()
+                                    await waitForElement(session, args.target!, state, timeout)
+                                }
+                                return {
+                                    success: true,
+                                    waited: 'element',
+                                    state,
+                                    mode,
+                                }
+                            })
+                        )
                     }
 
                     case 'navigation': {
+                        const diagnosticsStart = args.diagnostics
+                            ? await captureDiagnosticsStart(unifiedSession)
+                            : undefined
                         if (mode === 'extension') {
                             // Extension 模式：轮询 document.readyState 等待页面加载完成
                             const navStart = Date.now()
@@ -154,6 +207,9 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 url: navUrl,
                                 title: navTitle,
                                 mode,
+                                ...(diagnosticsStart
+                                    ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
+                                    : {}),
                             })
                         }
 
@@ -167,6 +223,9 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                             url: sessionState?.url,
                             title: sessionState?.title,
                             mode,
+                            ...(diagnosticsStart
+                                ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
+                                : {}),
                         })
                     }
 
@@ -196,6 +255,9 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                     }
 
                     case 'idle': {
+                        const diagnosticsStart = args.diagnostics
+                            ? await captureDiagnosticsStart(unifiedSession)
+                            : undefined
                         if (mode === 'extension') {
                             // Extension 模式：readyState complete + DOM mutation 静默检测
                             const idleStart = Date.now()
@@ -278,6 +340,14 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                         waited: 'idle',
                                         domStable,
                                         mode,
+                                        ...(diagnosticsStart
+                                            ? {
+                                                  diagnostics: await captureDiagnosticsDelta(
+                                                      unifiedSession,
+                                                      diagnosticsStart
+                                                  ),
+                                              }
+                                            : {}),
                                     })
                                 } catch {
                                     // evaluate 超时或断连——降级返回 domStable: false（readyState 已 complete）
@@ -286,6 +356,14 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                         waited: 'idle',
                                         domStable: false,
                                         mode,
+                                        ...(diagnosticsStart
+                                            ? {
+                                                  diagnostics: await captureDiagnosticsDelta(
+                                                      unifiedSession,
+                                                      diagnosticsStart
+                                                  ),
+                                              }
+                                            : {}),
                                     })
                                 }
                             }
@@ -295,6 +373,9 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 waited: 'idle',
                                 domStable: false,
                                 mode,
+                                ...(diagnosticsStart
+                                    ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
+                                    : {}),
                             })
                         }
 
@@ -305,6 +386,9 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                             success: true,
                             waited: 'idle',
                             mode,
+                            ...(diagnosticsStart
+                                ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
+                                : {}),
                         })
                     }
 

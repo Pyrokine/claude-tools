@@ -37,6 +37,9 @@ const inputEventSchema = z.object({
             'select',
             'replace',
             'drag',
+            'editorContext',
+            'editorInsert',
+            'editorCommand',
         ])
         .describe('事件类型'),
     key: z.string().optional().describe('按键（keydown/keyup）'),
@@ -68,6 +71,11 @@ const inputEventSchema = z.object({
     ms: z.number().optional().describe('等待毫秒'),
     find: z.string().optional().describe('要查找并选中的文本（select/replace）'),
     nth: z.number().optional().describe('第 N 个匹配（select/replace，从 0 开始，默认 0 即第一个）'),
+    command: z.string().optional().describe('浏览器编辑命令（editorCommand），如 bold、italic、insertOrderedList'),
+    mode: z
+        .enum(['keyboard', 'controlled'])
+        .optional()
+        .describe('输入模式（type），keyboard=键盘事件，controlled=直接设置 value 并触发 input/change 事件'),
     dispatch: z
         .boolean()
         .optional()
@@ -80,6 +88,7 @@ const inputEventSchema = z.object({
         .describe(
             '强制执行（click），跳过可操作性检查（可见性、遮挡检测等），直接在目标元素上触发事件，用于已知需要绕过检查的场景'
         ),
+    forceReason: z.string().optional().describe('force=true 时必填，说明为什么需要跳过可操作性检查'),
 })
 
 /**
@@ -88,6 +97,7 @@ const inputEventSchema = z.object({
 const inputSchema = z.object({
     events: z.array(inputEventSchema).describe('事件序列'),
     humanize: z.boolean().optional().describe('启用人类行为模拟（贝塞尔曲线移动、随机延迟）'),
+    diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
     tabId: z
         .string()
         .optional()
@@ -103,6 +113,29 @@ const inputSchema = z.object({
         ),
 })
 
+class StructuredToolError extends Error {
+    constructor(
+        private readonly code: string,
+        message: string,
+        private readonly suggestion: string,
+        private readonly context: Record<string, unknown>
+    ) {
+        super(message)
+        this.name = 'StructuredToolError'
+    }
+
+    toJSON(): object {
+        return {
+            error: {
+                code: this.code,
+                message: this.message,
+                suggestion: this.suggestion,
+                context: this.context,
+            },
+        }
+    }
+}
+
 /**
  * input 工具处理器
  */
@@ -117,39 +150,19 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
-                // 根据连接模式选择执行方式
+                const diagnosticsStart = args.diagnostics ? await captureDiagnosticsStart(unifiedSession) : undefined
                 const warnings: string[] = []
-                if (mode === 'extension') {
-                    // Extension 模式：使用 debugger API
-                    for (const event of args.events) {
-                        const w = await executeEventExtension(
-                            unifiedSession,
-                            event as InputEvent,
-                            humanize,
-                            args.timeout
-                        )
-                        if (w) {
-                            warnings.push(w)
-                        }
-                    }
-                } else {
-                    // CDP 模式：逐事件分发（无 Extension bridge）
-                    const session = getSession()
-                    for (const event of args.events) {
-                        if (event.type === 'select' || event.type === 'replace') {
-                            // select/replace 通过 unifiedSession（内部自适应双模式）
-                            const w = await executeEventExtension(
-                                unifiedSession,
-                                event as InputEvent,
-                                humanize,
-                                args.timeout
-                            )
-                            if (w) {
-                                warnings.push(w)
-                            }
-                        } else {
-                            await executeEvent(session, event as InputEvent, humanize, args.timeout)
-                        }
+                const eventResults: unknown[] = []
+                const session = mode === 'extension' ? undefined : getSession()
+                for (const event of args.events) {
+                    const result = await executeInputEvent(
+                        { unifiedSession, session, mode, humanize, timeout: args.timeout },
+                        event as InputEvent
+                    )
+                    if (typeof result === 'string') {
+                        warnings.push(result)
+                    } else if (result) {
+                        eventResults.push(result)
                     }
                 }
 
@@ -160,6 +173,12 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
                 }
                 if (warnings.length > 0) {
                     result.warnings = warnings
+                }
+                if (eventResults.length > 0) {
+                    result.eventResults = eventResults
+                }
+                if (diagnosticsStart) {
+                    result.diagnostics = await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
                 }
                 return formatResponse(result)
             }) // withFrame
@@ -191,6 +210,75 @@ interface InputLocateResult {
     selectionEnd: number
 }
 
+interface TextSelectionDiagnostics {
+    scope: Record<string, unknown>
+    activeElement: Record<string, unknown> | null
+    selection: Record<string, unknown>
+    candidates: Array<Record<string, unknown>>
+}
+
+interface DiagnosticsStart {
+    consoleCount: number
+    networkCount: number
+}
+
+type InputEventResult = string | Record<string, unknown> | undefined
+
+interface InputExecutionContext {
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+    session?: ReturnType<typeof getSession>
+    mode: ReturnType<ReturnType<typeof getUnifiedSession>['getMode']>
+    humanize: boolean
+    timeout?: number
+}
+
+const unifiedOnlyEventTypes = new Set<InputEvent['type']>([
+    'select',
+    'replace',
+    'editorContext',
+    'editorInsert',
+    'editorCommand',
+])
+
+async function executeInputEvent(context: InputExecutionContext, event: InputEvent): Promise<InputEventResult> {
+    if (context.mode === 'extension' || unifiedOnlyEventTypes.has(event.type)) {
+        return executeUnifiedEvent(context.unifiedSession, event, context.humanize, context.timeout)
+    }
+    if (!context.session) {
+        throw new Error('CDP 输入事件缺少 session')
+    }
+    await executeCdpEvent(context.session, event, context.humanize, context.timeout)
+    return undefined
+}
+
+async function captureDiagnosticsStart(
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+): Promise<DiagnosticsStart> {
+    await unifiedSession.enableConsole()
+    await unifiedSession.enableNetwork()
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return { consoleCount: consoleLogs.length, networkCount: network.length }
+}
+
+async function captureDiagnosticsDelta(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    start: DiagnosticsStart
+): Promise<Record<string, unknown>> {
+    const consoleLogs = await unifiedSession.getConsoleLogs()
+    const network = await unifiedSession.getNetworkRequests()
+    return {
+        console: consoleLogs
+            .slice(start.consoleCount)
+            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
+            .slice(-20),
+        failedRequests: network
+            .slice(start.networkCount)
+            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
+            .slice(-20),
+    }
+}
+
 /**
  * 通过真实鼠标事件选中页面文本
  *
@@ -208,17 +296,17 @@ async function focusTargetForCommands(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
     timeout?: number
-): Promise<void> {
+): Promise<boolean> {
     if ('x' in target || 'y' in target) {
-        return
+        return true
     }
     const params = targetToFindParams(target as Target & { nth?: number })
     const els = await unifiedSession.find(params.selector, params.text, params.xpath, timeout)
     const nth0 = params.nth ?? 0
     if (els.length <= nth0) {
-        return
+        return false
     }
-    await unifiedSession.evaluate(
+    const focused = await unifiedSession.evaluate(
         `(() => {
             const ref = window.__mcpElementMap?.[${JSON.stringify(els[nth0].refId)}]
             const el = ref?.deref()
@@ -231,6 +319,7 @@ async function focusTargetForCommands(
         undefined,
         timeout
     )
+    return focused === true
 }
 
 async function focusTargetIfNeeded(
@@ -253,6 +342,113 @@ async function focusTargetIfNeeded(
             console.warn('[MCP] focusTargetIfNeeded 聚焦失败，select/replace 将回退到 mouseClick 聚焦:', err)
         }
     }
+}
+
+async function collectTextSelectionDiagnostics(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    findText: string,
+    scopeTarget: Target | undefined,
+    nth: number,
+    scopeSelector: string | null,
+    scopeText: string | null,
+    scopeXpath: string | null,
+    timeout?: number
+): Promise<TextSelectionDiagnostics> {
+    return await unifiedSession.evaluate<TextSelectionDiagnostics>(
+        `function(findText, nth, scopeTarget, scopeSelector, scopeText, scopeXpath) {
+        function selectorFor(el) {
+            if (!(el instanceof Element)) return null;
+            if (el.id) return '#' + CSS.escape(el.id);
+            var parts = [];
+            var current = el;
+            while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 4) {
+                var part = current.tagName.toLowerCase();
+                if (current.classList && current.classList.length) {
+                    part += '.' + Array.from(current.classList).slice(0, 2).map(function(cls) { return CSS.escape(cls); }).join('.');
+                }
+                var parent = current.parentElement;
+                if (parent) {
+                    var siblings = Array.from(parent.children).filter(function(child) { return child.tagName === current.tagName; });
+                    if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
+                }
+                parts.unshift(part);
+                current = parent;
+            }
+            return parts.join(' > ');
+        }
+        function summarizeElement(el) {
+            if (!(el instanceof Element)) return null;
+            var rect = el.getBoundingClientRect();
+            var value = 'value' in el ? String(el.value || '') : '';
+            var text = (el.innerText || el.textContent || value || '').replace(new RegExp('\\\\s+', 'g'), ' ').trim();
+            return {
+                tag: el.tagName.toLowerCase(),
+                id: el.id || undefined,
+                selector: selectorFor(el),
+                text: text.slice(0, 160),
+                valuePreview: value ? value.slice(0, 160) : undefined,
+                visible: rect.width > 0 && rect.height > 0,
+                disabled: Boolean(el.disabled),
+                readOnly: Boolean(el.readOnly),
+                contentEditable: Boolean(el.isContentEditable),
+                bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
+            };
+        }
+        var root = document.body;
+        if (scopeXpath) {
+            var xr = document.evaluate(scopeXpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            root = xr.singleNodeValue;
+        } else if (scopeSelector) {
+            var candidates = document.querySelectorAll(scopeSelector);
+            if (scopeText) {
+                for (var ci = 0; ci < candidates.length; ci++) {
+                    if ((candidates[ci].textContent || '').includes(scopeText)) { root = candidates[ci]; break; }
+                }
+            } else {
+                root = candidates[0];
+            }
+        } else if (scopeText) {
+            var all = document.querySelectorAll('*');
+            for (var ai = 0; ai < all.length; ai++) {
+                if ((all[ai].textContent || '').includes(scopeText)) { root = all[ai]; break; }
+            }
+        }
+        var candidateElements = [];
+        if (root instanceof Element) {
+            candidateElements.push(root);
+            candidateElements = candidateElements.concat(Array.from(root.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"], button, a')).slice(0, 12));
+        }
+        var active = document.activeElement;
+        var selection = window.getSelection();
+        return {
+            scope: {
+                target: scopeTarget,
+                nth: nth,
+                findText: findText,
+                selector: scopeSelector,
+                text: scopeText,
+                xpath: scopeXpath,
+                rootFound: Boolean(root)
+            },
+            activeElement: summarizeElement(active),
+            selection: {
+                text: selection ? selection.toString().slice(0, 160) : '',
+                collapsed: selection ? selection.isCollapsed : true,
+                anchorNode: selection && selection.anchorNode ? selection.anchorNode.nodeName : null,
+                focusNode: selection && selection.focusNode ? selection.focusNode.nodeName : null,
+                inputSelection: active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA') ? {
+                    selectionStart: active.selectionStart,
+                    selectionEnd: active.selectionEnd,
+                    valuePreview: String(active.value || '').slice(0, 160)
+                } : undefined
+            },
+            candidates: candidateElements.map(summarizeElement).filter(Boolean)
+        };
+    }`,
+        undefined,
+        timeout,
+        [findText, nth, scopeTarget ?? null, scopeSelector, scopeText, scopeXpath]
+    )
 }
 
 async function selectText(
@@ -409,13 +605,41 @@ async function selectText(
     )
 
     if (!result || result.type === 'noscope') {
-        throw new Error(`未找到目标元素: ${JSON.stringify(scopeTarget)}`)
+        const diagnostics = await collectTextSelectionDiagnostics(
+            unifiedSession,
+            findText,
+            scopeTarget,
+            nth,
+            scopeSelector,
+            scopeText,
+            scopeXpath,
+            timeout
+        )
+        throw new StructuredToolError(
+            'TEXT_SCOPE_NOT_FOUND',
+            `未找到目标元素: ${JSON.stringify(scopeTarget)}`,
+            '请检查 target 是否能定位到包含目标文本的元素，或先用 extract(state) 查看可交互元素',
+            diagnostics as unknown as Record<string, unknown>
+        )
     }
     if (result.type === 'notfound') {
-        throw new Error(
+        const diagnostics = await collectTextSelectionDiagnostics(
+            unifiedSession,
+            findText,
+            scopeTarget,
+            nth,
+            scopeSelector,
+            scopeText,
+            scopeXpath,
+            timeout
+        )
+        throw new StructuredToolError(
+            'TEXT_NOT_FOUND',
             scopeTarget
                 ? `目标元素内未找到文本 "${findText}"${nth > 0 ? `（第 ${nth} 个匹配）` : ''}`
-                : `未找到文本: "${findText}"${nth > 0 ? `（第 ${nth} 个匹配）` : ''}`
+                : `未找到文本: "${findText}"${nth > 0 ? `（第 ${nth} 个匹配）` : ''}`,
+            '请检查 find 文本、nth 序号和 target 范围；context.candidates 提供了当前范围内的候选文本和 selector',
+            diagnostics as unknown as Record<string, unknown>
         )
     }
 
@@ -448,394 +672,529 @@ async function selectText(
     return coords.formatted
 }
 
+async function executeEditingCommands(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    commands: string[],
+    timeout?: number
+): Promise<Record<string, unknown>> {
+    const result = await unifiedSession.evaluate<{
+        success: boolean
+        executed: Array<{ command: string; success: boolean }>
+        selection?: Record<string, unknown>
+    }>(
+        `function(commands) {
+            function summarizeSelection() {
+                var active = document.activeElement;
+                if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+                    return {
+                        type: active.tagName.toLowerCase(),
+                        selectionStart: active.selectionStart,
+                        selectionEnd: active.selectionEnd,
+                        selectedText: String(active.value || '').slice(active.selectionStart || 0, active.selectionEnd || 0)
+                    };
+                }
+                var selection = window.getSelection();
+                return {
+                    type: 'document',
+                    text: selection ? selection.toString() : '',
+                    collapsed: selection ? selection.isCollapsed : true
+                };
+            }
+            function commandSelectAll() {
+                var active = document.activeElement;
+                if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA') && typeof active.select === 'function') {
+                    active.select();
+                    active.dispatchEvent(new Event('select', {bubbles: true}));
+                    return true;
+                }
+                if (active && active.isContentEditable) {
+                    var range = document.createRange();
+                    range.selectNodeContents(active);
+                    var selection = window.getSelection();
+                    if (!selection) return false;
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    return true;
+                }
+                return document.execCommand('selectAll');
+            }
+            var executed = commands.map(function(command) {
+                if (command === 'selectAll') {
+                    return {command: command, success: commandSelectAll()};
+                }
+                if (['copy', 'cut', 'paste', 'undo', 'redo'].indexOf(command) !== -1) {
+                    return {command: command, success: document.execCommand(command)};
+                }
+                return {command: command, success: false};
+            });
+            return {success: executed.every(function(item) { return item.success; }), executed: executed, selection: summarizeSelection()};
+        }`,
+        undefined,
+        timeout,
+        [commands]
+    )
+    if (!result.success) {
+        throw new StructuredToolError(
+            'EDIT_COMMAND_FAILED',
+            `编辑命令执行失败: ${commands.join(', ')}`,
+            '请确认当前页面已有可编辑焦点，或给 keydown 事件提供 target 参数',
+            result as unknown as Record<string, unknown>
+        )
+    }
+    return result as unknown as Record<string, unknown>
+}
+
 /**
  * 验证事件参数（两种执行模式共享），避免在 Extension/CDP 两个 switch 中重复校验
  */
+function requiredEventParam(event: InputEvent, name: keyof InputEvent): never {
+    throw new Error(`events[].${String(name)} 是 ${event.type} 事件的必填参数`)
+}
+
 function validateEvent(event: InputEvent): void {
     if (event.commands && event.commands.length > 0 && event.type !== 'keydown') {
         throw new Error(
-            `commands 参数只能用于 keydown 事件，当前事件类型为 ${event.type}，如需触发编辑命令，请把 commands 放在 keydown 事件上`
+            `events[].commands 只能用于 keydown 事件，当前事件类型为 ${event.type}，如需触发编辑命令，请把 commands 放在 keydown 事件上`
         )
+    }
+    if (event.force && !event.forceReason) {
+        throw new Error('events[].forceReason 在 force=true 时必填')
     }
     switch (event.type) {
         case 'keydown':
         case 'keyup':
             if (!event.key) {
-                throw new Error(`${event.type} 事件需要 key 参数`)
+                requiredEventParam(event, 'key')
+            }
+            break
+        case 'mousemove':
+        case 'touchstart':
+        case 'touchmove':
+            if (!event.target) {
+                requiredEventParam(event, 'target')
+            }
+            break
+        case 'type':
+            if (!event.text) {
+                requiredEventParam(event, 'text')
+            }
+            break
+        case 'select':
+            if (!event.find) {
+                requiredEventParam(event, 'find')
+            }
+            break
+        case 'replace':
+            if (!event.find) {
+                requiredEventParam(event, 'find')
+            }
+            if (event.text === undefined) {
+                requiredEventParam(event, 'text')
+            }
+            break
+        case 'drag':
+            if (!event.target) {
+                requiredEventParam(event, 'target')
+            }
+            if (!event.to) {
+                requiredEventParam(event, 'to')
+            }
+            break
+        case 'editorInsert':
+            if (!event.text) {
+                requiredEventParam(event, 'text')
+            }
+            break
+        case 'editorCommand':
+            if (!event.command) {
+                requiredEventParam(event, 'command')
             }
             break
         case 'wait':
             if (event.ms === undefined) {
-                throw new Error('wait 事件需要 ms 参数')
+                requiredEventParam(event, 'ms')
             }
             break
     }
 }
 
-/**
- * Extension 模式：执行单个事件
- *
- * @returns 可选警告信息（如格式丢失提示）
- */
-async function executeEventExtension(
+interface UnifiedInputContext {
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+    humanize: boolean
+    timeout?: number
+}
+
+type UnifiedInputHandler = (context: UnifiedInputContext, event: InputEvent) => Promise<InputEventResult>
+
+async function executeUnifiedEvent(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     event: InputEvent,
     humanize: boolean,
     timeout?: number
-): Promise<string | undefined> {
+): Promise<InputEventResult> {
     validateEvent(event)
-    switch (event.type) {
-        case 'keydown': {
-            if (unifiedSession.getInputMode() === 'stealth' && event.commands && event.commands.length > 0) {
-                throw new Error(
-                    'commands 参数不支持 stealth 输入模式，请先调用 manage action=inputMode inputMode=precise 切换后重试'
-                )
-            }
-            if (event.commands && event.commands.length > 0 && event.target) {
-                await focusTargetForCommands(unifiedSession, event.target, timeout)
-            }
-            await unifiedSession.keyDown(event.key!, event.commands)
-            break
-        }
-
-        case 'keyup': {
-            await unifiedSession.keyUp(event.key!)
-            break
-        }
-
-        case 'click': {
-            const button = event.button ?? 'left'
-            const clickCount = event.clickCount ?? 1
-            if (event.target) {
-                // 坐标型 target：不过 actionableClick，但仍需 getTargetPointExtension 做 iframe offset 修正
-                if ('x' in event.target && 'y' in event.target) {
-                    const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-                    await unifiedSession.mouseMove(point.x, point.y)
-                    await unifiedSession.mouseClick(button, clickCount)
-                    break
-                }
-                // 左键单击：优先用 actionable click（带可操作性检查、自动滚动、遮挡检测）
-                // 非左键 / 多击：actionableClick 依赖 HTMLElement.click() 只能触发单次左键，必须走坐标路径
-                if (button === 'left' && clickCount === 1) {
-                    const {
-                        selector,
-                        text: searchText,
-                        xpath,
-                        nth: nthParam,
-                    } = targetToFindParams(event.target as Target & { nth?: number })
-                    const elements = await unifiedSession.find(selector, searchText, xpath, timeout)
-                    const nth = nthParam ?? 0
-                    if (elements.length > 0 && nth < elements.length) {
-                        const refId = elements[nth].refId
-                        const result = await unifiedSession.actionableClick(refId, event.force)
-                        if (!result.success) {
-                            throw new Error(result.error || 'Click failed')
-                        }
-                        break
-                    }
-                }
-                // fallback: 找不到 refId 或需走坐标路径时
-                // refId 透传：stealth 模式下嵌套 iframe overlay 场景绕过 elementFromPoint
-                const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-                await unifiedSession.mouseMove(point.x, point.y)
-                await unifiedSession.mouseClick(
-                    button,
-                    clickCount,
-                    typeof point.refId === 'string' ? point.refId : undefined
-                )
-                break
-            }
-            await unifiedSession.mouseClick(button, clickCount)
-            break
-        }
-
-        case 'mousedown': {
-            if (event.target) {
-                const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-                await unifiedSession.mouseMove(point.x, point.y)
-            }
-            await unifiedSession.mouseDown(event.button ?? 'left')
-            break
-        }
-
-        case 'mouseup': {
-            await unifiedSession.mouseUp(event.button ?? 'left')
-            break
-        }
-
-        case 'mousemove': {
-            if (!event.target) {
-                throw new Error('mousemove 事件需要 target 参数')
-            }
-            const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-
-            if (humanize && event.steps && event.steps > 1) {
-                const path = generateBezierPath(unifiedSession.getMousePosition(), point, event.steps)
-                for (const p of path) {
-                    await unifiedSession.mouseMove(p.x, p.y)
-                    await randomDelay(getMouseMoveDelay(), getMouseMoveDelay() * 2)
-                }
-            } else {
-                await unifiedSession.mouseMove(point.x, point.y)
-            }
-            break
-        }
-
-        case 'wheel': {
-            if (event.target) {
-                const {
-                    selector,
-                    text,
-                    xpath,
-                    nth: nthParam,
-                } = targetToFindParams(event.target as Target & { nth?: number })
-                const elements = await unifiedSession.find(selector, text, xpath, timeout)
-                const nth = nthParam ?? 0
-                if (elements.length > nth) {
-                    // 用 refId 直接滚动目标元素（支持视口外元素）
-                    await unifiedSession.scroll(event.deltaX ?? 0, event.deltaY ?? 0, elements[nth].refId)
-                    break
-                }
-                // 找不到元素时 fallback 到坐标方式
-                const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-                await unifiedSession.mouseMove(point.x, point.y)
-            }
-            await unifiedSession.mouseWheel(event.deltaX ?? 0, event.deltaY ?? 0)
-            break
-        }
-
-        case 'touchstart': {
-            if (!event.target) {
-                throw new Error('touchstart 事件需要 target 参数')
-            }
-            const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-            await unifiedSession.touchStart(point.x, point.y)
-            break
-        }
-
-        case 'touchmove': {
-            if (!event.target) {
-                throw new Error('touchmove 事件需要 target 参数')
-            }
-            const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-            await unifiedSession.touchMove(point.x, point.y)
-            break
-        }
-
-        case 'touchend': {
-            await unifiedSession.touchEnd()
-            break
-        }
-
-        case 'type': {
-            if (!event.text) {
-                throw new Error('type 事件需要 text 参数')
-            }
-
-            // dispatch 模式：直接设置 value + 触发事件（兼容 React/Vue 受控组件）
-            if (event.dispatch) {
-                // 定位目标元素
-                if (!event.target) {
-                    throw new Error('dispatch 模式需要 target 参数定位输入元素')
-                }
-                if ('x' in event.target && 'y' in event.target) {
-                    throw new Error('dispatch 模式不支持坐标型 target，请使用 CSS 选择器、role 或文本定位')
-                }
-                const {
-                    selector,
-                    text: searchText,
-                    xpath,
-                    nth: nthParam,
-                } = targetToFindParams(event.target as Target & { nth?: number })
-                const elements = await unifiedSession.find(selector, searchText, xpath, timeout)
-                const nth = nthParam ?? 0
-                if (elements.length === 0 || nth >= elements.length) {
-                    throw new Error('目标元素未找到')
-                }
-                const refId = elements[nth].refId
-
-                // 通过 Extension ISOLATED 世界执行 dispatch（访问 __mcpElementMap）
-                // 参考 Playwright fill()：nativeInputValueSetter + dispatchEvent
-                const result = await unifiedSession.dispatchInput(refId, event.text)
-                if (!result.success) {
-                    throw new Error(result.error || 'dispatch 输入失败')
-                }
-                break
-            }
-
-            // 默认模式：键盘事件
-            // 如果有 target，先点击目标（聚焦）
-            if (event.target) {
-                const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
-                await unifiedSession.mouseMove(point.x, point.y)
-                await unifiedSession.mouseClick('left')
-            } else {
-                const hasActiveFocus = await unifiedSession.evaluate<boolean>(
-                    '!!document.activeElement && ' +
-                        'document.activeElement !== document.body && ' +
-                        'document.activeElement !== document.documentElement'
-                )
-                if (!hasActiveFocus) {
-                    throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')
-                }
-            }
-
-            const delay = event.delay ?? 0
-            if (humanize) {
-                for (const char of event.text) {
-                    await unifiedSession.typeText(char)
-                    await randomDelay(getTypingDelay(delay), getTypingDelay(delay) * 1.5)
-                }
-            } else {
-                await unifiedSession.typeText(event.text, delay)
-            }
-            break
-        }
-
-        case 'wait': {
-            await new Promise((resolve) => setTimeout(resolve, event.ms!))
-            break
-        }
-
-        case 'select': {
-            if (!event.find) {
-                throw new Error('select 事件需要 find 参数')
-            }
-            // 自动聚焦目标元素（selectText 内 mouseClick focus 对 React 等场景不可靠）
-            await focusTargetIfNeeded(unifiedSession, event.target, event.nth, timeout)
-            await selectText(unifiedSession, event.find, event.target, event.nth, timeout)
-            break
-        }
-
-        case 'replace': {
-            if (!event.find) {
-                throw new Error('replace 事件需要 find 参数')
-            }
-            if (event.text === undefined) {
-                throw new Error('replace 事件需要 text 参数')
-            }
-            // 自动聚焦目标元素
-            await focusTargetIfNeeded(unifiedSession, event.target, event.nth, timeout)
-            // Step 1: 选中文本
-            const formatted = await selectText(unifiedSession, event.find, event.target, event.nth, timeout)
-            // 轮询等待选区同步（最多 500ms）
-            let selectionConfirmed = false
-            for (let i = 0; i < 25; i++) {
-                const hasSelection = await unifiedSession.evaluate<boolean>(
-                    `(function() {
-                        var el = document.activeElement;
-                        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
-                            return el.selectionStart !== el.selectionEnd;
-                        }
-                        var sel = window.getSelection();
-                        return sel && !sel.isCollapsed;
-                    })()`
-                )
-                if (hasSelection) {
-                    selectionConfirmed = true
-                    break
-                }
-                await new Promise((resolve) => setTimeout(resolve, 20))
-            }
-            if (!selectionConfirmed) {
-                throw new Error(`选区同步失败：文本 "${event.find}" 已定位但未能建立选区，无法执行替换`)
-            }
-
-            // Step 2: 检测可编辑性并替换
-            const replaceResult = await unifiedSession.evaluate<'ok' | 'readonly' | 'fallback'>(
-                `function(replacementText) {
-                var el = document.activeElement;
-                // input/textarea：使用 setRangeText 直接替换选区
-                if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.setRangeText) {
-                    if (el.readOnly || el.disabled) return 'readonly';
-                    el.setRangeText(replacementText, el.selectionStart, el.selectionEnd, 'end');
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    return 'ok';
-                }
-                // 检测 contenteditable
-                var sel = window.getSelection();
-                if (!sel || sel.isCollapsed) return 'readonly';
-                var anchor = sel.anchorNode;
-                var editable = anchor instanceof Element ? anchor : anchor && anchor.parentElement;
-                while (editable && !editable.isContentEditable && editable !== document.body) {
-                    editable = editable.parentElement;
-                }
-                if (!editable || !editable.isContentEditable) return 'readonly';
-                // contenteditable：execCommand 让浏览器自行产出事件序列
-                if (document.execCommand('insertText', false, replacementText)) return 'ok';
-                return 'fallback';
-            }`,
-                undefined,
-                timeout,
-                [event.text]
-            )
-            if (replaceResult === 'readonly') {
-                throw new Error(`目标元素不可编辑，已选中文本 "${event.find}" 但无法替换`)
-            }
-            if (replaceResult === 'fallback') {
-                // Fallback: 键盘输入覆盖选区
-                await unifiedSession.typeText(event.text)
-            }
-            if (formatted) {
-                return `替换的文本原在 <${formatted}> 标签内，替换后格式可能丢失`
-            }
-            break
-        }
-
-        case 'drag': {
-            if (!event.target) {
-                throw new Error('drag 事件需要 target 参数（拖拽源）')
-            }
-            if (!event.to) {
-                throw new Error('drag 事件需要 to 参数（拖拽目标）')
-            }
-            // drag 仅支持选择器类 target（CSS/text/xpath/ARIA 等），不支持坐标
-            // 理由：drag 依赖 refId 在 Extension ISOLATED 世界 dispatchEvent，坐标无法生成 refId
-            if ('x' in event.target || 'y' in event.target) {
-                throw new Error('drag 的 target 不支持坐标类型，请使用选择器（css/text/xpath/role 等）')
-            }
-            if ('x' in event.to || 'y' in event.to) {
-                throw new Error('drag 的 to 不支持坐标类型，请使用选择器（css/text/xpath/role 等）')
-            }
-            // 用 find 定位确认元素存在（支持 ARIA/testId 等高级定位），拿 refId 传入 extension 侧 dispatchEvent
-            const srcParams = targetToFindParams(event.target as Target & { nth?: number })
-            const dstParams = targetToFindParams(event.to as Target & { nth?: number })
-            const srcNth = srcParams.nth ?? 0
-            const dstNth = dstParams.nth ?? 0
-
-            // 执行 drag，失败时重试一次（React 重渲染可能导致 refId 失效）
-            const attemptDrag = async (): Promise<{ success: boolean; error?: string; code?: string }> => {
-                const srcEls = await unifiedSession.find(srcParams.selector, srcParams.text, srcParams.xpath, timeout)
-                const dstEls = await unifiedSession.find(dstParams.selector, dstParams.text, dstParams.xpath, timeout)
-                if (srcEls.length <= srcNth) {
-                    throw new Error(`drag 源元素未找到: ${JSON.stringify(event.target)}`)
-                }
-                if (dstEls.length <= dstNth) {
-                    throw new Error(`drag 目标元素未找到: ${JSON.stringify(event.to)}`)
-                }
-                return unifiedSession.dragAndDrop(srcEls[srcNth].refId, dstEls[dstNth].refId)
-            }
-
-            let dragResult = await attemptDrag()
-            let retried = false
-            // 仅对 refId 失效（REF_STALE）重试：源/目标元素从 DOM 移除，典型是 React 重渲染
-            if (!dragResult.success && dragResult.code === 'REF_STALE') {
-                console.warn('[MCP] drag refId 失效，自动重试一次:', dragResult.error)
-                dragResult = await attemptDrag()
-                retried = true
-            }
-            if (!dragResult.success) {
-                throw new Error(dragResult.error || 'drag 执行失败')
-            }
-            if (retried) {
-                return 'drag 因 refId 失效已自动重试一次（可能是 React 等框架重渲染导致）'
-            }
-            break
-        }
-
-        default:
-            throw new Error(`未知事件类型: ${(event as { type: string }).type}`)
+    const handler = unifiedInputHandlers[event.type]
+    if (!handler) {
+        throw new Error(`未知事件类型: ${(event as { type: string }).type}`)
     }
+    return handler({ unifiedSession, humanize, timeout }, event)
+}
+
+const unifiedInputHandlers: Record<InputEvent['type'], UnifiedInputHandler> = {
+    keydown: handleUnifiedKeyDown,
+    keyup: handleUnifiedKeyUp,
+    click: handleUnifiedClick,
+    mousedown: handleUnifiedMouseDown,
+    mouseup: handleUnifiedMouseUp,
+    mousemove: handleUnifiedMouseMove,
+    wheel: handleUnifiedWheel,
+    touchstart: handleUnifiedTouchStart,
+    touchmove: handleUnifiedTouchMove,
+    touchend: handleUnifiedTouchEnd,
+    type: handleUnifiedType,
+    wait: handleUnifiedWait,
+    select: handleUnifiedSelect,
+    replace: handleUnifiedReplace,
+    editorContext: handleUnifiedEditorContext,
+    editorInsert: handleUnifiedEditorInsert,
+    editorCommand: handleUnifiedEditorCommand,
+    drag: handleUnifiedDrag,
+}
+
+async function handleUnifiedKeyDown(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    if (unifiedSession.getInputMode() === 'stealth' && event.commands && event.commands.length > 0) {
+        throw new Error(
+            'commands 参数不支持 stealth 输入模式，请先调用 manage action=inputMode inputMode=precise 切换后重试'
+        )
+    }
+    if (event.commands && event.commands.length > 0 && event.target) {
+        const focused = await focusTargetForCommands(unifiedSession, event.target, timeout)
+        if (!focused) {
+            throw new Error('commands 目标未找到或未成功聚焦')
+        }
+    }
+    await unifiedSession.keyDown(event.key!, event.commands)
+    if (event.commands && event.commands.length > 0) {
+        return await executeEditingCommands(unifiedSession, event.commands, timeout)
+    }
+    return undefined
+}
+
+async function handleUnifiedKeyUp(
+    { unifiedSession }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    await unifiedSession.keyUp(event.key!)
+    return undefined
+}
+
+async function handleUnifiedClick(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    const button = event.button ?? 'left'
+    const clickCount = event.clickCount ?? 1
+    if (!event.target) {
+        await unifiedSession.mouseClick(button, clickCount)
+        return undefined
+    }
+
+    if ('x' in event.target && 'y' in event.target) {
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        await unifiedSession.mouseMove(point.x, point.y)
+        await unifiedSession.mouseClick(button, clickCount)
+        return undefined
+    }
+
+    if (button === 'left' && clickCount === 1) {
+        const {
+            selector,
+            text: searchText,
+            xpath,
+            nth: nthParam,
+        } = targetToFindParams(event.target as Target & { nth?: number })
+        const elements = await unifiedSession.find(selector, searchText, xpath, timeout)
+        const nth = nthParam ?? 0
+        if (elements.length > 0 && nth < elements.length) {
+            const result = await unifiedSession.actionableClick(elements[nth].refId, event.force === true)
+            if (!result.success) {
+                throw new StructuredToolError(
+                    'ACTIONABILITY_FAILED',
+                    result.error || 'Click failed',
+                    result.suggestions?.[0] ??
+                        '请根据 context.rect、context.clickPoint 和 context.coveringElement 调整 target',
+                    result as unknown as Record<string, unknown>
+                )
+            }
+            return undefined
+        }
+    }
+
+    const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+    await unifiedSession.mouseMove(point.x, point.y)
+    await unifiedSession.mouseClick(button, clickCount, typeof point.refId === 'string' ? point.refId : undefined)
+    return undefined
+}
+
+async function handleUnifiedMouseDown(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    if (event.target) {
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        await unifiedSession.mouseMove(point.x, point.y)
+    }
+    await unifiedSession.mouseDown(event.button ?? 'left')
+    return undefined
+}
+
+async function handleUnifiedMouseUp(
+    { unifiedSession }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    await unifiedSession.mouseUp(event.button ?? 'left')
+    return undefined
+}
+
+async function handleUnifiedMouseMove(
+    { unifiedSession, humanize, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout)
+
+    if (humanize && event.steps && event.steps > 1) {
+        const path = generateBezierPath(unifiedSession.getMousePosition(), point, event.steps)
+        for (const p of path) {
+            await unifiedSession.mouseMove(p.x, p.y)
+            await randomDelay(getMouseMoveDelay(), getMouseMoveDelay() * 2)
+        }
+    } else {
+        await unifiedSession.mouseMove(point.x, point.y)
+    }
+    return undefined
+}
+
+async function handleUnifiedWheel(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    if (event.target) {
+        const { selector, text, xpath, nth: nthParam } = targetToFindParams(event.target as Target & { nth?: number })
+        const elements = await unifiedSession.find(selector, text, xpath, timeout)
+        const nth = nthParam ?? 0
+        if (elements.length > nth) {
+            await unifiedSession.scroll(event.deltaX ?? 0, event.deltaY ?? 0, elements[nth].refId)
+            return undefined
+        }
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        await unifiedSession.mouseMove(point.x, point.y)
+    }
+    await unifiedSession.mouseWheel(event.deltaX ?? 0, event.deltaY ?? 0)
+    return undefined
+}
+
+async function handleUnifiedTouchStart(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout)
+    await unifiedSession.touchStart(point.x, point.y)
+    return undefined
+}
+
+async function handleUnifiedTouchMove(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout)
+    await unifiedSession.touchMove(point.x, point.y)
+    return undefined
+}
+
+async function handleUnifiedTouchEnd({ unifiedSession }: UnifiedInputContext): Promise<InputEventResult> {
+    await unifiedSession.touchEnd()
+    return undefined
+}
+
+async function handleUnifiedType(
+    { unifiedSession, humanize, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    if (event.mode === 'controlled' || event.dispatch) {
+        await inputControlled(unifiedSession, event, timeout)
+        return undefined
+    }
+
+    if (event.target) {
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        await unifiedSession.mouseMove(point.x, point.y)
+        await unifiedSession.mouseClick('left')
+    } else {
+        const hasActiveFocus = await unifiedSession.evaluate<boolean>(
+            '!!document.activeElement && ' +
+                'document.activeElement !== document.body && ' +
+                'document.activeElement !== document.documentElement'
+        )
+        if (!hasActiveFocus) {
+            throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')
+        }
+    }
+
+    const delay = event.delay ?? 0
+    if (humanize) {
+        for (const char of event.text!) {
+            await unifiedSession.typeText(char)
+            await randomDelay(getTypingDelay(delay), getTypingDelay(delay) * 1.5)
+        }
+    } else {
+        await unifiedSession.typeText(event.text!, delay)
+    }
+    return undefined
+}
+
+async function handleUnifiedWait(_context: UnifiedInputContext, event: InputEvent): Promise<InputEventResult> {
+    await new Promise((resolve) => setTimeout(resolve, event.ms!))
+    return undefined
+}
+
+async function handleUnifiedSelect(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    await focusTargetIfNeeded(unifiedSession, event.target, event.nth, timeout)
+    await selectText(unifiedSession, event.find!, event.target, event.nth, timeout)
+    return undefined
+}
+
+async function handleUnifiedReplace(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    await focusTargetIfNeeded(unifiedSession, event.target, event.nth, timeout)
+    const formatted = await selectText(unifiedSession, event.find!, event.target, event.nth, timeout)
+    let selectionConfirmed = false
+    for (let i = 0; i < 25; i++) {
+        const hasSelection = await unifiedSession.evaluate<boolean>(
+            `(function() {
+                var el = document.activeElement;
+                if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+                    return el.selectionStart !== el.selectionEnd;
+                }
+                var sel = window.getSelection();
+                return sel && !sel.isCollapsed;
+            })()`
+        )
+        if (hasSelection) {
+            selectionConfirmed = true
+            break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    if (!selectionConfirmed) {
+        throw new Error(`选区同步失败：文本 "${event.find}" 已定位但未能建立选区，无法执行替换`)
+    }
+
+    const replaceResult = await unifiedSession.evaluate<'ok' | 'readonly' | 'fallback'>(
+        `function(replacementText) {
+        var el = document.activeElement;
+        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.setRangeText) {
+            if (el.readOnly || el.disabled) return 'readonly';
+            el.setRangeText(replacementText, el.selectionStart, el.selectionEnd, 'end');
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            return 'ok';
+        }
+        var sel = window.getSelection();
+        if (!sel || sel.isCollapsed) return 'readonly';
+        var anchor = sel.anchorNode;
+        var editable = anchor instanceof Element ? anchor : anchor && anchor.parentElement;
+        while (editable && !editable.isContentEditable && editable !== document.body) {
+            editable = editable.parentElement;
+        }
+        if (!editable || !editable.isContentEditable) return 'readonly';
+        if (document.execCommand('insertText', false, replacementText)) return 'ok';
+        return 'fallback';
+    }`,
+        undefined,
+        timeout,
+        [event.text]
+    )
+    if (replaceResult === 'readonly') {
+        throw new Error(`目标元素不可编辑，已选中文本 "${event.find}" 但无法替换`)
+    }
+    if (replaceResult === 'fallback') {
+        await unifiedSession.typeText(event.text!)
+    }
+    if (formatted) {
+        return `替换的文本原在 <${formatted}> 标签内，替换后格式可能丢失`
+    }
+    return undefined
+}
+
+async function handleUnifiedEditorContext(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    return (await editorAction(unifiedSession, 'context', event, timeout)) as Record<string, unknown>
+}
+
+async function handleUnifiedEditorInsert(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    await editorAction(unifiedSession, 'insert', event, timeout)
+    return undefined
+}
+
+async function handleUnifiedEditorCommand(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    await editorAction(unifiedSession, 'command', event, timeout)
+    return undefined
+}
+
+async function handleUnifiedDrag(
+    { unifiedSession, timeout }: UnifiedInputContext,
+    event: InputEvent
+): Promise<InputEventResult> {
+    if ('x' in event.target! || 'y' in event.target!) {
+        throw new Error('drag 的 target 不支持坐标类型，请使用选择器（css/text/xpath/role 等）')
+    }
+    if ('x' in event.to! || 'y' in event.to!) {
+        throw new Error('drag 的 to 不支持坐标类型，请使用选择器（css/text/xpath/role 等）')
+    }
+
+    const srcParams = targetToFindParams(event.target as Target & { nth?: number })
+    const dstParams = targetToFindParams(event.to as Target & { nth?: number })
+    const srcNth = srcParams.nth ?? 0
+    const dstNth = dstParams.nth ?? 0
+
+    const attemptDrag = async (): Promise<{ success: boolean; error?: string; code?: string }> => {
+        const srcEls = await unifiedSession.find(srcParams.selector, srcParams.text, srcParams.xpath, timeout)
+        const dstEls = await unifiedSession.find(dstParams.selector, dstParams.text, dstParams.xpath, timeout)
+        if (srcEls.length <= srcNth) {
+            throw new Error(`drag 源元素未找到: ${JSON.stringify(event.target)}`)
+        }
+        if (dstEls.length <= dstNth) {
+            throw new Error(`drag 目标元素未找到: ${JSON.stringify(event.to)}`)
+        }
+        return unifiedSession.dragAndDrop(srcEls[srcNth].refId, dstEls[dstNth].refId)
+    }
+
+    let dragResult = await attemptDrag()
+    let retried = false
+    if (!dragResult.success && dragResult.code === 'REF_STALE') {
+        console.warn('[MCP] drag refId 失效，自动重试一次:', dragResult.error)
+        dragResult = await attemptDrag()
+        retried = true
+    }
+    if (!dragResult.success) {
+        throw new Error(dragResult.error || 'drag 执行失败')
+    }
+    return retried ? 'drag 因 refId 失效已自动重试一次（可能是 React 等框架重渲染导致）' : undefined
 }
 
 /**
@@ -849,6 +1208,185 @@ async function executeEventExtension(
  *   - precise 模式直接使用
  *   - stealth 模式需减 offset 转为 iframe 相对坐标
  */
+async function inputControlled(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    event: InputEvent,
+    timeout?: number
+): Promise<void> {
+    if (!event.target) {
+        throw new Error('controlled 输入需要 target 参数定位输入元素')
+    }
+    if ('x' in event.target && 'y' in event.target) {
+        throw new Error('controlled 输入不支持坐标型 target，请使用 CSS 选择器、role 或文本定位')
+    }
+    const {
+        selector,
+        text: searchText,
+        xpath,
+        nth: nthParam,
+    } = targetToFindParams(event.target as Target & { nth?: number })
+    const elements = await unifiedSession.find(selector, searchText, xpath, timeout)
+    const nth = nthParam ?? 0
+    if (elements.length === 0 || nth >= elements.length) {
+        throw new StructuredToolError(
+            'TARGET_NOT_FOUND',
+            `controlled 输入目标未找到: ${JSON.stringify(event.target)}`,
+            '请检查 target 是否能定位到 input、textarea、select 或 contenteditable 元素；context.candidates 提供当前页面候选元素',
+            await buildTargetDiagnosticContext(unifiedSession, event.target, elements.length, nth, timeout)
+        )
+    }
+    const result = await unifiedSession.dispatchInput(elements[nth].refId, event.text ?? '')
+    if (!result.success) {
+        throw new StructuredToolError(
+            'CONTROLLED_INPUT_FAILED',
+            result.error || 'controlled 输入失败',
+            '请检查目标元素是否可编辑、未 disabled，并确认当前 frame 与 target 匹配',
+            await buildTargetDiagnosticContext(
+                unifiedSession,
+                event.target,
+                elements.length,
+                nth,
+                timeout,
+                result.error || 'controlled 输入失败'
+            )
+        )
+    }
+}
+
+async function buildTargetDiagnosticContext(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    target: Target,
+    matchCount: number,
+    nth: number,
+    timeout?: number,
+    reason = '目标元素未找到'
+): Promise<Record<string, unknown>> {
+    let page: unknown
+    try {
+        page = await unifiedSession.evaluate(
+            `(() => {
+                const active = document.activeElement;
+                const selection = window.getSelection();
+                const candidates = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable="true"], button, a, [role="button"], [role="textbox"], [role="combobox"]')).slice(0, 20);
+                return {
+                    activeElement: active ? {
+                        tag: active.tagName.toLowerCase(),
+                        id: active.id || undefined,
+                        className: typeof active.className === 'string' ? active.className : undefined,
+                        text: (active.textContent || '').trim().slice(0, 80),
+                        value: 'value' in active ? active.value : undefined,
+                        selectionStart: 'selectionStart' in active ? active.selectionStart : undefined,
+                        selectionEnd: 'selectionEnd' in active ? active.selectionEnd : undefined
+                    } : null,
+                    selection: {
+                        text: selection ? selection.toString().slice(0, 160) : '',
+                        collapsed: selection ? selection.isCollapsed : true,
+                        anchorNode: selection && selection.anchorNode ? selection.anchorNode.nodeName : null,
+                        focusNode: selection && selection.focusNode ? selection.focusNode.nodeName : null
+                    },
+                    candidates: candidates.map(function(el) {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            tag: el.tagName.toLowerCase(),
+                            id: el.id || undefined,
+                            role: el.getAttribute('role') || undefined,
+                            text: (el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 80),
+                            visible: rect.width > 0 && rect.height > 0,
+                            disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                            bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
+                        };
+                    })
+                };
+            })()`,
+            undefined,
+            timeout
+        )
+    } catch (err) {
+        page = { diagnosticError: err instanceof Error ? err.message : String(err) }
+    }
+    return { reason, target, matchCount, nth, page }
+}
+
+async function editorAction(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    action: 'context' | 'insert' | 'command',
+    event: InputEvent,
+    timeout?: number
+): Promise<unknown> {
+    if (event.target) {
+        const focused = await focusTargetForCommands(unifiedSession, event.target, timeout)
+        if (!focused) {
+            throw new Error('editor 目标未找到或未成功聚焦')
+        }
+    }
+
+    return unifiedSession.evaluate(
+        `function(action, text, command) {
+            var active = document.activeElement;
+            var sel = window.getSelection();
+            var editable = active;
+            if (!editable || editable === document.body || editable === document.documentElement) {
+                var anchor = sel && sel.anchorNode;
+                editable = anchor instanceof Element ? anchor : anchor && anchor.parentElement;
+                while (editable && !editable.isContentEditable && editable !== document.body) {
+                    editable = editable.parentElement;
+                }
+            }
+            var isInput = !!active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+            var isEditable = !!editable && editable.isContentEditable;
+            if (!isInput && !isEditable) {
+                throw new Error('editor 事件需要已聚焦 input、textarea 或 contenteditable 元素');
+            }
+
+            if (action === 'context') {
+                var selectedText = '';
+                if (isInput) {
+                    selectedText = active.value.slice(active.selectionStart || 0, active.selectionEnd || 0);
+                } else if (sel) {
+                    selectedText = sel.toString();
+                }
+                return {
+                    activeElement: active ? {
+                        tag: active.tagName.toLowerCase(),
+                        id: active.id || undefined,
+                        isContentEditable: !!active.isContentEditable,
+                        selectionStart: isInput ? active.selectionStart : undefined,
+                        selectionEnd: isInput ? active.selectionEnd : undefined
+                    } : null,
+                    editableElement: editable ? {
+                        tag: editable.tagName.toLowerCase(),
+                        id: editable.id || undefined,
+                        isContentEditable: !!editable.isContentEditable
+                    } : null,
+                    selectedText: selectedText,
+                    selectionCollapsed: isInput ? active.selectionStart === active.selectionEnd : !sel || sel.isCollapsed
+                };
+            }
+
+            if (action === 'insert') {
+                if (isInput) {
+                    active.setRangeText(text, active.selectionStart || 0, active.selectionEnd || 0, 'end');
+                    active.dispatchEvent(new Event('input', {bubbles: true}));
+                    active.dispatchEvent(new Event('change', {bubbles: true}));
+                    return {success: true};
+                }
+                if (document.execCommand('insertText', false, text)) {
+                    return {success: true};
+                }
+                throw new Error('editorInsert 无法插入文本');
+            }
+
+            if (!document.execCommand(command, false, text || null)) {
+                throw new Error('editorCommand 执行失败: ' + command);
+            }
+            return {success: true, command: command};
+        }`,
+        undefined,
+        timeout,
+        [action, event.text ?? '', event.command ?? '']
+    )
+}
+
 async function getTargetPointExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
@@ -868,13 +1406,30 @@ async function getTargetPointExtension(
 
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
     const elements = await unifiedSession.find(selector, text, xpath, timeout)
+    const nth = nthParam ?? 0
     if (elements.length === 0) {
-        throw new Error(`未找到目标元素: ${JSON.stringify(target)}`)
+        throw new StructuredToolError(
+            'TARGET_NOT_FOUND',
+            `未找到目标元素: ${JSON.stringify(target)}`,
+            '请检查 target 是否正确，或先用 extract type=state 查看 interactiveElements 候选',
+            await buildTargetDiagnosticContext(unifiedSession, target, elements.length, nth, timeout)
+        )
     }
 
-    const nth = nthParam ?? 0
     if (nth >= elements.length) {
-        throw new Error(`第 ${nth} 个匹配元素不存在（共 ${elements.length} 个）`)
+        throw new StructuredToolError(
+            'TARGET_INDEX_OUT_OF_RANGE',
+            `第 ${nth} 个匹配元素不存在（共 ${elements.length} 个）`,
+            '请降低 nth，或先用 extract type=state 查看当前匹配到的候选元素',
+            await buildTargetDiagnosticContext(
+                unifiedSession,
+                target,
+                elements.length,
+                nth,
+                timeout,
+                '目标元素序号越界'
+            )
+        )
     }
 
     // 视口外时滚动后重新取 rect：与 actionableClick (left+single) 行为对齐，
@@ -927,7 +1482,7 @@ async function getTargetPointExtension(
         }
     }
 
-    // iframe + precise：消费者（chrome.debugger）需要父视口绝对。
+    // iframe + precise：消费者（chrome.debugger）需要父视口绝对，
     // scrollIntoView({block:'center'}) 会 cascade 到父框架，导致 frameOffset 与父绝对 rect 都过期，
     // refetch find() 让 content-handler 重新计算 frameOffset 并返回最新父绝对 rect
     const refreshed = await unifiedSession.find(selector, text, xpath, timeout)
@@ -935,153 +1490,146 @@ async function getTargetPointExtension(
     return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, refId }
 }
 
-/**
- * CDP 模式：执行单个事件
- */
-async function executeEvent(
+interface CdpInputContext {
+    session: ReturnType<typeof getSession>
+    humanize: boolean
+    timeout?: number
+}
+
+type CdpInputHandler = (context: CdpInputContext, event: InputEvent) => Promise<void>
+
+async function executeCdpEvent(
     session: ReturnType<typeof getSession>,
     event: InputEvent,
     humanize: boolean,
     timeout?: number
 ): Promise<void> {
     validateEvent(event)
-    switch (event.type) {
-        case 'keydown': {
-            await session.keyDown(event.key!, event.commands)
-            break
-        }
-
-        case 'keyup': {
-            await session.keyUp(event.key!)
-            break
-        }
-
-        case 'click': {
-            if (event.target) {
-                await moveToTarget(session, event.target, humanize, timeout)
-            }
-            const cdpButton = event.button ?? 'left'
-            const cdpClickCount = event.clickCount ?? 1
-            for (let i = 1; i <= cdpClickCount; i++) {
-                await session.mouseDown(cdpButton, i)
-                await session.mouseUp(cdpButton, i)
-            }
-            break
-        }
-
-        case 'mousedown': {
-            // 如果有 target，先移动到目标位置
-            if (event.target) {
-                await moveToTarget(session, event.target, humanize, timeout)
-            }
-            await session.mouseDown(event.button ?? 'left')
-            break
-        }
-
-        case 'mouseup': {
-            await session.mouseUp(event.button ?? 'left')
-            break
-        }
-
-        case 'mousemove': {
-            if (!event.target) {
-                throw new Error('mousemove 事件需要 target 参数')
-            }
-            await moveToTarget(session, event.target, humanize, timeout, event.steps)
-            break
-        }
-
-        case 'wheel': {
-            // 如果有 target，先移动到目标位置
-            if (event.target) {
-                await moveToTarget(session, event.target, humanize, timeout)
-            }
-            await session.mouseWheel(event.deltaX ?? 0, event.deltaY ?? 0)
-            break
-        }
-
-        case 'touchstart': {
-            if (!event.target) {
-                throw new Error('touchstart 事件需要 target 参数')
-            }
-            const point = await getTargetPoint(session, event.target, timeout)
-            await session.touchStart(point.x, point.y)
-            break
-        }
-
-        case 'touchmove': {
-            if (!event.target) {
-                throw new Error('touchmove 事件需要 target 参数')
-            }
-            const point = await getTargetPoint(session, event.target, timeout)
-
-            if (humanize && event.steps && event.steps > 1) {
-                // 人类化触屏移动
-                const current = session.getBehaviorSimulator().getCurrentPosition()
-                const path = generateBezierPath(current, point, event.steps)
-                for (const p of path) {
-                    await session.touchMove(p.x, p.y)
-                    await randomDelay(5, 15)
-                }
-            } else {
-                await session.touchMove(point.x, point.y)
-            }
-            break
-        }
-
-        case 'touchend': {
-            await session.touchEnd()
-            break
-        }
-
-        case 'type': {
-            if (!event.text) {
-                throw new Error('type 事件需要 text 参数')
-            }
-            if (event.dispatch) {
-                throw new Error('dispatch 模式需要 Extension 连接，当前为 CDP 模式')
-            }
-            // 如果有 target，先点击目标（聚焦），使用 input 等待类型
-            if (event.target) {
-                await moveToTarget(session, event.target, humanize, timeout, undefined, 'input')
-                await session.mouseDown('left')
-                await session.mouseUp('left')
-            } else {
-                const hasActiveFocus = await session.evaluate<boolean>(
-                    '!!document.activeElement && ' +
-                        'document.activeElement !== document.body && ' +
-                        'document.activeElement !== document.documentElement'
-                )
-                if (!hasActiveFocus) {
-                    throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')
-                }
-            }
-
-            const delay = event.delay ?? 0
-            if (humanize) {
-                // 人类化打字
-                for (const char of event.text) {
-                    await session.type(char)
-                    await randomDelay(getTypingDelay(delay), getTypingDelay(delay) * 1.5)
-                }
-            } else {
-                await session.type(event.text, delay)
-            }
-            break
-        }
-
-        case 'wait': {
-            await new Promise((resolve) => setTimeout(resolve, event.ms!))
-            break
-        }
-
-        default:
-            // drag 仅在 Extension 模式可用，给出明确错误而非通用"未知事件类型"
-            if ((event as { type: string }).type === 'drag') {
-                throw new Error('drag 事件仅在 Extension 模式下可用，当前为 CDP 模式')
-            }
-            throw new Error(`未知事件类型: ${(event as { type: string }).type}`)
+    const handler = cdpInputHandlers[event.type]
+    if (!handler) {
+        throw new Error(`未知事件类型: ${(event as { type: string }).type}`)
     }
+    await handler({ session, humanize, timeout }, event)
+}
+
+const cdpInputHandlers: Partial<Record<InputEvent['type'], CdpInputHandler>> = {
+    keydown: handleCdpKeyDown,
+    keyup: handleCdpKeyUp,
+    click: handleCdpClick,
+    mousedown: handleCdpMouseDown,
+    mouseup: handleCdpMouseUp,
+    mousemove: handleCdpMouseMove,
+    wheel: handleCdpWheel,
+    touchstart: handleCdpTouchStart,
+    touchmove: handleCdpTouchMove,
+    touchend: handleCdpTouchEnd,
+    type: handleCdpType,
+    wait: handleCdpWait,
+    drag: handleCdpDrag,
+}
+
+async function handleCdpKeyDown({ session }: CdpInputContext, event: InputEvent): Promise<void> {
+    await session.keyDown(event.key!, event.commands)
+}
+
+async function handleCdpKeyUp({ session }: CdpInputContext, event: InputEvent): Promise<void> {
+    await session.keyUp(event.key!)
+}
+
+async function handleCdpClick({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    if (event.target) {
+        await moveToTarget(session, event.target, humanize, timeout)
+    }
+    const cdpButton = event.button ?? 'left'
+    const cdpClickCount = event.clickCount ?? 1
+    for (let i = 1; i <= cdpClickCount; i++) {
+        await session.mouseDown(cdpButton, i)
+        await session.mouseUp(cdpButton, i)
+    }
+}
+
+async function handleCdpMouseDown({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    if (event.target) {
+        await moveToTarget(session, event.target, humanize, timeout)
+    }
+    await session.mouseDown(event.button ?? 'left')
+}
+
+async function handleCdpMouseUp({ session }: CdpInputContext, event: InputEvent): Promise<void> {
+    await session.mouseUp(event.button ?? 'left')
+}
+
+async function handleCdpMouseMove({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    await moveToTarget(session, event.target!, humanize, timeout, event.steps)
+}
+
+async function handleCdpWheel({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    if (event.target) {
+        await moveToTarget(session, event.target, humanize, timeout)
+    }
+    await session.mouseWheel(event.deltaX ?? 0, event.deltaY ?? 0)
+}
+
+async function handleCdpTouchStart({ session, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    const point = await getTargetPoint(session, event.target!, timeout)
+    await session.touchStart(point.x, point.y)
+}
+
+async function handleCdpTouchMove({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    const point = await getTargetPoint(session, event.target!, timeout)
+
+    if (humanize && event.steps && event.steps > 1) {
+        const current = session.getBehaviorSimulator().getCurrentPosition()
+        const path = generateBezierPath(current, point, event.steps)
+        for (const p of path) {
+            await session.touchMove(p.x, p.y)
+            await randomDelay(5, 15)
+        }
+    } else {
+        await session.touchMove(point.x, point.y)
+    }
+}
+
+async function handleCdpTouchEnd({ session }: CdpInputContext): Promise<void> {
+    await session.touchEnd()
+}
+
+async function handleCdpType({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    if (event.dispatch || event.mode === 'controlled') {
+        throw new Error('controlled/dispatch 输入需要 Extension 连接，当前为 CDP 模式')
+    }
+    if (event.target) {
+        await moveToTarget(session, event.target, humanize, timeout, undefined, 'input')
+        await session.mouseDown('left')
+        await session.mouseUp('left')
+    } else {
+        const hasActiveFocus = await session.evaluate<boolean>(
+            '!!document.activeElement && ' +
+                'document.activeElement !== document.body && ' +
+                'document.activeElement !== document.documentElement'
+        )
+        if (!hasActiveFocus) {
+            throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')
+        }
+    }
+
+    const delay = event.delay ?? 0
+    if (humanize) {
+        for (const char of event.text!) {
+            await session.type(char)
+            await randomDelay(getTypingDelay(delay), getTypingDelay(delay) * 1.5)
+        }
+    } else {
+        await session.type(event.text!, delay)
+    }
+}
+
+async function handleCdpWait(_context: CdpInputContext, event: InputEvent): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, event.ms!))
+}
+
+async function handleCdpDrag(): Promise<void> {
+    throw new Error('drag 事件仅在 Extension 模式下可用，当前为 CDP 模式')
 }
 
 /**
@@ -1178,6 +1726,12 @@ export function registerInputTool(server: McpServer): void {
     {type: "keydown", key: "a", commands: ["selectAll"]},
     {type: "keyup", key: "a"}
   ]
+
+最短示例：
+  click: {events:[{type:"click",target:{css:"button[type=submit]"}}]}
+  type: {events:[{type:"type",target:{css:"input[name=q]"},text:"hello"}]}
+  controlled type: {events:[{type:"type",mode:"controlled",target:{css:"input[name=q]"},text:"hello"}]}
+  replace: {events:[{type:"replace",target:{css:"textarea"},find:"old",text:"new"}]}
 注意：纯键盘事件（不带 commands）仅保证 JS keyboard event 可被监听，不保证触发浏览器原生编辑行为；
       全选/复制/粘贴等语义用 commands；"全选并替换文本"用 select/replace 事件更简洁；
       commands 仅支持 inputMode=precise，stealth 模式下会报错`,

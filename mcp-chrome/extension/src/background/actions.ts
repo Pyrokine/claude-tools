@@ -58,9 +58,20 @@ export class ActionHandler {
     private registerActions() {
         // Tab 操作
         this.actions.set('tabs_list', this.tabHandler.tabsList.bind(this.tabHandler))
+        this.actions.set('tabs_topology', this.tabHandler.tabsTopology.bind(this.tabHandler))
         this.actions.set('tabs_create', this.tabHandler.tabsCreate.bind(this.tabHandler))
         this.actions.set('tabs_close', this.tabHandler.tabsClose.bind(this.tabHandler))
         this.actions.set('tabs_activate', this.tabHandler.tabsActivate.bind(this.tabHandler))
+        this.actions.set('tabs_activate_managed', this.tabHandler.tabsActivateManaged.bind(this.tabHandler))
+        this.actions.set('tabs_adopt', this.tabHandler.tabsAdopt.bind(this.tabHandler))
+        this.actions.set('tabs_release', this.tabHandler.tabsRelease.bind(this.tabHandler))
+        this.actions.set('tabs_move', this.tabHandler.tabsMove.bind(this.tabHandler))
+        this.actions.set('tabs_reorder', this.tabHandler.tabsReorder.bind(this.tabHandler))
+        this.actions.set('tabs_pin', this.tabHandler.tabsPin.bind(this.tabHandler))
+        this.actions.set('window_focus', this.tabHandler.windowFocus.bind(this.tabHandler))
+        this.actions.set('window_resize', this.tabHandler.windowResize.bind(this.tabHandler))
+        this.actions.set('window_create', this.tabHandler.windowCreate.bind(this.tabHandler))
+        this.actions.set('window_close', this.tabHandler.windowClose.bind(this.tabHandler))
 
         // 导航操作
         this.actions.set('navigate', this.navigationHandler.navigate.bind(this.navigationHandler))

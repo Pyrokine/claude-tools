@@ -184,8 +184,23 @@ export class LogManager {
         }
 
         if (method === 'Network.loadingFailed') {
-            const p = params as { requestId: string }
-            this.pendingRequests.get(tabId)?.delete(p.requestId)
+            const p = params as { requestId: string; timestamp: number; errorText?: string }
+            const tabPending = this.pendingRequests.get(tabId)
+            const pending = tabPending?.get(p.requestId)
+            if (pending) {
+                const { _monotonic, _addedAt: _, ...requestData } = pending
+                const requests = this.networkRequests.get(tabId) || []
+                requests.push({
+                    ...requestData,
+                    errorText: p.errorText,
+                    duration: Math.round((p.timestamp - _monotonic) * 1000),
+                })
+                if (requests.length > 1100) {
+                    requests.splice(0, requests.length - 1000)
+                }
+                this.networkRequests.set(tabId, requests)
+            }
+            tabPending?.delete(p.requestId)
         }
     }
 
