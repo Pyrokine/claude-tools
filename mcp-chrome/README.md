@@ -95,6 +95,15 @@ browse(action="open", url="https://example.com")
 extract(type="screenshot")
 ```
 
+**Optional pairing token**
+
+By default, local Extension mode does not require a token. To restrict the Extension connection, start the MCP server
+with `MCP_CHROME_PAIRING_TOKEN`, then enter the same token in the Extension popup:
+
+```bash
+MCP_CHROME_PAIRING_TOKEN="your-token" node /path/to/mcp-chrome/dist/index.js
+```
+
 ### Mode 2: CDP Mode (Fallback)
 
 CDP mode launches or connects to a dedicated Chrome instance. Used when the Extension is not installed, or for

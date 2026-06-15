@@ -6,6 +6,9 @@ const statusIndicator = document.getElementById('statusIndicator')!
 const statusText = document.getElementById('statusText')!
 const connectBtn = document.getElementById('connectBtn') as HTMLButtonElement
 const disconnectBtn = document.getElementById('disconnectBtn') as HTMLButtonElement
+const pairingTokenInput = document.getElementById('pairingTokenInput') as HTMLInputElement
+const saveTokenBtn = document.getElementById('saveTokenBtn') as HTMLButtonElement
+const authHelp = document.getElementById('authHelp')!
 
 // 获取状态
 async function updateStatus() {
@@ -32,6 +35,10 @@ async function updateStatus() {
             connectBtn.disabled = false
             disconnectBtn.disabled = true
         }
+
+        authHelp.textContent = response.pairingTokenConfigured
+            ? '已配置 token，只连接同 token 的 MCP Server'
+            : '未配置 token，使用本地信任模式'
     } catch (error) {
         console.error('Failed to get status:', error)
         statusIndicator.className = 'status-indicator disconnected'
@@ -57,6 +64,20 @@ connectBtn.addEventListener('click', async () => {
         console.error('Connect failed:', error)
         statusText.textContent = '连接失败'
         connectBtn.disabled = false
+    }
+})
+
+saveTokenBtn.addEventListener('click', async () => {
+    saveTokenBtn.disabled = true
+    try {
+        await chrome.runtime.sendMessage({ type: 'SET_PAIRING_TOKEN', token: pairingTokenInput.value })
+        pairingTokenInput.value = ''
+        await updateStatus()
+    } catch (error) {
+        console.error('Save token failed:', error)
+        authHelp.textContent = '保存 token 失败'
+    } finally {
+        saveTokenBtn.disabled = false
     }
 })
 

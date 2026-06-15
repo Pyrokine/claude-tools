@@ -22,6 +22,14 @@
         <button class='btn btn-secondary' disabled id='disconnectBtn'>断开</button>
     </div>
 
+    <div class='auth-section'>
+        <label class='auth-label' for='pairingTokenInput'>Pairing token（可选）</label>
+        <input autocomplete='off' class='auth-input' id='pairingTokenInput' placeholder='未配置时使用本地信任模式'
+               type='password'>
+        <button class='btn btn-secondary' id='saveTokenBtn'>保存 token</button>
+        <p class='auth-help' id='authHelp'>配置后只连接使用同一 token 的 MCP Server</p>
+    </div>
+
     <div class='info-section'>
         <p class='info-text'>
             通过 WebSocket 与 MCP Server 通信

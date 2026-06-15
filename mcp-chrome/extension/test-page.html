@@ -439,7 +439,11 @@
 
     function setCompareState(state) {
         compareBox.dataset.state = state;
-        compareBox.classList.toggle('compare-after', state === 'after');
+        if (state === 'after') {
+            compareBox.classList.add('compare-after');
+        } else {
+            compareBox.classList.remove('compare-after');
+        }
         compareBox.textContent = state + ' screenshot state';
     }
 

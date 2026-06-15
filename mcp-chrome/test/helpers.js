@@ -19,7 +19,7 @@ export class McpClient {
         this.process = null;
         this.requestId = 0;
         this.pending = new Map(); // id -> {resolve, reject}
-        this.buffer = '';
+        this.buffer = Buffer.alloc(0);
     }
 
     /**
@@ -33,7 +33,7 @@ export class McpClient {
 
         // 解析 stdout 的 JSON-RPC 消息
         this.process.stdout.on('data', (chunk) => {
-            this.buffer += chunk.toString();
+            this.buffer = Buffer.concat([this.buffer, chunk]);
             this._processBuffer();
         });
 
@@ -141,30 +141,28 @@ export class McpClient {
 
     _processBuffer() {
         while (true) {
-            // 查找 Content-Length 头
-            const headerEnd = this.buffer.indexOf('\r\n\r\n');
+            const headerEnd = this.buffer.indexOf(Buffer.from('\r\n\r\n'));
             if (headerEnd === -1) {
                 break;
             }
 
-            const header = this.buffer.slice(0, headerEnd);
+            const header = this.buffer.subarray(0, headerEnd).toString('ascii');
             const match = header.match(/Content-Length:\s*(?<len>\d+)/i);
             if (!match) {
-                // 无效头，跳过
-                this.buffer = this.buffer.slice(headerEnd + 4);
+                this.buffer = this.buffer.subarray(headerEnd + 4);
                 continue;
             }
 
-            const contentLength = parseInt(match.groups.len);
+            const contentLength = parseInt(match.groups.len, 10);
             const bodyStart = headerEnd + 4;
             const bodyEnd = bodyStart + contentLength;
 
             if (this.buffer.length < bodyEnd) {
                 break;
-            } // 数据不完整
+            }
 
-            const body = this.buffer.slice(bodyStart, bodyEnd);
-            this.buffer = this.buffer.slice(bodyEnd);
+            const body = this.buffer.subarray(bodyStart, bodyEnd).toString('utf8');
+            this.buffer = this.buffer.subarray(bodyEnd);
 
             try {
                 const message = JSON.parse(body);

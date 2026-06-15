@@ -105,7 +105,7 @@ const manageSchema = z.object({
         .enum(['normal', 'minimized', 'maximized', 'fullscreen', 'locked-fullscreen'])
         .optional()
         .describe('窗口状态（newWindow/resizeWindow）'),
-    url: z.string().optional().describe('newWindow 初始 URL'),
+    url: z.string().optional().describe('newPage/newWindow 初始 URL'),
     cacheType: z
         .enum(['all', 'storage', 'cache'])
         .optional()

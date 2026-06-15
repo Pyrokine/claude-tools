@@ -204,55 +204,74 @@ export class BrowserLauncher {
                 return
             }
 
-            const timer = setTimeout(() => {
-                reject(new TimeoutError(`等待浏览器启动超时 (${timeout}ms)`))
-            }, timeout)
-
+            let settled = false
             let stderr = ''
             const stderrStream = this.process.stderr
+            const timer = setTimeout(() => {
+                fail(new TimeoutError(`等待浏览器启动超时 (${timeout}ms)`), true)
+            }, timeout)
 
+            const cleanup = () => {
+                clearTimeout(timer)
+                stderrStream?.removeListener('data', onStderr)
+                this.process?.removeListener('error', onError)
+                this.process?.removeListener('exit', onExit)
+            }
+            const finish = (url: string) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                cleanup()
+                resolve(url)
+            }
+            const fail = (error: Error, killProcess = false) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                cleanup()
+                if (killProcess && this.process && !this.process.killed) {
+                    this.process.kill()
+                    this.process = null
+                }
+                reject(error)
+            }
             const onStderr = (data: Buffer) => {
                 stderr += data.toString()
 
                 // 解析 DevTools listening on ws://...
                 const match = stderr.match(/DevTools listening on (?<url>ws:\/\/\S+)/)
                 if (match) {
-                    clearTimeout(timer)
                     // 解析端口
                     const portMatch = match.groups!.url.match(/:(?<port>\d+)\//)
                     if (portMatch) {
                         this._port = parseInt(portMatch.groups!.port, 10)
                     }
-                    // 端点已拿到，移除 listener 避免后续 stderr 持续累积内存
-                    stderrStream?.removeListener('data', onStderr)
-                    resolve(match.groups!.url)
+                    finish(match.groups!.url)
                 }
             }
-
-            stderrStream?.on('data', onStderr)
-
-            this.process.on('error', (error: Error) => {
-                clearTimeout(timer)
-                stderrStream?.removeListener('data', onStderr)
-                reject(error)
-            })
-
-            this.process.on('exit', (code) => {
-                clearTimeout(timer)
-                stderrStream?.removeListener('data', onStderr)
+            const onError = (error: Error) => {
+                fail(error)
+            }
+            const onExit = (code: number | null) => {
                 if (code === 0) {
                     // Chrome 退出码 0：通常是把请求委托给了已运行的实例后自行退出，
                     // 此时没有 DevTools 端点可连接
-                    reject(
+                    fail(
                         new Error(
                             '浏览器进程已退出（code 0），可能已有相同 profile 的 Chrome 实例在运行\n' +
                                 '请关闭已运行的 Chrome 或指定不同的 userDataDir'
                         )
                     )
                 } else if (code !== null) {
-                    reject(new Error(`浏览器进程退出，代码: ${code}\n${stderr}`))
+                    fail(new Error(`浏览器进程退出，代码: ${code}\n${stderr}`))
                 }
-            })
+            }
+
+            stderrStream?.on('data', onStderr)
+            this.process.on('error', onError)
+            this.process.on('exit', onExit)
         })
     }
 }

@@ -404,7 +404,7 @@ export const InputTouchSchema = z
     .superRefine((value, ctx) => {
         if ((value.type === 'touchStart' || value.type === 'touchMove') && value.touchPoints.length < 1) {
             ctx.addIssue({
-                code: z.ZodIssueCode.custom,
+                code: 'custom',
                 path: ['touchPoints'],
                 message: 'Array must contain at least 1 element(s)',
             })

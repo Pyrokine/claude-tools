@@ -1,4 +1,4 @@
-import { chmod, mkdir, realpath, writeFile } from 'fs/promises'
+import { chmod, mkdir, open, realpath, rename, rm } from 'fs/promises'
 import { tmpdir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 
@@ -68,8 +68,22 @@ export async function ensureParentDir(path: string): Promise<void> {
 
 export async function writePrivateFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<void> {
     await ensureParentDir(path)
-    await writeFile(path, data, encoding)
-    await chmod(path, 0o600)
+    const tempPath = join(dirname(path), `.${basename(path)}.tmp-${process.pid}-${Date.now().toString(36)}`)
+    const handle = await open(tempPath, 'wx', 0o600)
+    let closed = false
+    try {
+        await handle.writeFile(data, encoding)
+        await handle.close()
+        closed = true
+        await rename(tempPath, path)
+        await chmod(path, 0o600)
+    } catch (error) {
+        if (!closed) {
+            await handle.close().catch(() => undefined)
+        }
+        await rm(tempPath, { force: true }).catch(() => undefined)
+        throw error
+    }
 }
 
 async function resolveScopedPath(rawPath: string, serverName: string): Promise<ResolvedScopedPath> {
@@ -153,10 +167,9 @@ async function canonicalizeOrAncestor(path: string): Promise<string> {
             }
             tail.unshift(basename(current))
             current = parent
-            try {
-                return resolve(await realpath(current), ...tail)
-            } catch {
-                continue
+            const resolvedAncestor = await realpath(current).catch(() => undefined)
+            if (resolvedAncestor) {
+                return resolve(resolvedAncestor, ...tail)
             }
         }
     }

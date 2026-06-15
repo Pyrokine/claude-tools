@@ -23,6 +23,7 @@ import { isExtensionDisconnected } from './extension-errors.js'
 import { getKeyDefinition, getSession as getCdpSession } from './session.js'
 import type { CdpResultObject, TargetInfo, WaitUntil } from './types.js'
 import {
+    EvaluateResultTooLargeError,
     extractCdpValue,
     formatCdpException,
     isKnownNonSerializableRemoteObject,
@@ -41,6 +42,12 @@ interface CdpPropertyDescriptor {
     wasThrown?: boolean
 }
 
+interface CdpMaterializeState {
+    seen: Set<string>
+    nodes: number
+    chars: number
+}
+
 interface UnifiedSessionState {
     url: string
     title: string
@@ -50,6 +57,9 @@ interface UnifiedSessionState {
 class UnifiedSessionManager {
     private static instance: UnifiedSessionManager
     private static readonly CONNECTION_COOLDOWN = 30000 // 连接失败后 30 秒内不重试
+    private static readonly CDP_MATERIALIZE_MAX_DEPTH = 8
+    private static readonly CDP_MATERIALIZE_MAX_NODES = 2000
+    private static readonly CDP_MATERIALIZE_MAX_CHARS = 1_000_000
     private extensionBridge: ExtensionBridge | null = null
     private inputMode: InputMode = 'precise' // 默认使用 precise 模式，可绕过 CSP 限制
     private currentMousePosition: { x: number; y: number } = { x: 0, y: 0 } // 跟踪鼠标位置
@@ -1270,7 +1280,7 @@ class UnifiedSessionManager {
             return extractCdpValue<T>(result)
         }
         try {
-            return await this.materializeRemoteObject<T>(result, timeout, new Set())
+            return await this.materializeRemoteObject<T>(result, timeout, { seen: new Set(), nodes: 0, chars: 0 }, 0)
         } finally {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId: result.objectId }).catch(() => {})
         }
@@ -1279,70 +1289,149 @@ class UnifiedSessionManager {
     private async materializeRemoteObject<T>(
         result: CdpResultObject,
         timeout: number | undefined,
-        seen: Set<string>
+        state: CdpMaterializeState,
+        depth: number
     ): Promise<T> {
         if (!result.objectId) {
-            return extractCdpValue<T>(result as CdpResultObject<T>)
+            return this.trackMaterializedValue(extractCdpValue<T>(result as CdpResultObject<T>), state, depth)
         }
-        if (isKnownNonSerializableRemoteObject(result) || seen.has(result.objectId)) {
+        if (isKnownNonSerializableRemoteObject(result) || state.seen.has(result.objectId)) {
             throw new NonSerializableEvaluateResultError(result)
         }
 
-        seen.add(result.objectId)
-        const properties = (await this.extensionBridge!.debuggerSend(
-            'Runtime.getProperties',
-            {
-                objectId: result.objectId,
-                ownProperties: true,
-                accessorPropertiesOnly: false,
-                generatePreview: false,
-            },
-            undefined,
-            timeout
-        )) as {
-            result?: CdpPropertyDescriptor[]
-            exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
-        }
-        if (properties.exceptionDetails) {
-            throw new Error(formatCdpException(properties.exceptionDetails))
-        }
+        this.trackMaterializedNode(result, state, depth)
+        state.seen.add(result.objectId)
+        try {
+            const properties = (await this.extensionBridge!.debuggerSend(
+                'Runtime.getProperties',
+                {
+                    objectId: result.objectId,
+                    ownProperties: true,
+                    accessorPropertiesOnly: false,
+                    generatePreview: false,
+                },
+                undefined,
+                timeout
+            )) as {
+                result?: CdpPropertyDescriptor[]
+                exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+            }
+            if (properties.exceptionDetails) {
+                throw new Error(formatCdpException(properties.exceptionDetails))
+            }
 
-        if (result.subtype === 'array') {
-            const array: unknown[] = []
-            for (const descriptor of properties.result ?? []) {
-                if (!descriptor.value || !/^\d+$/.test(descriptor.name)) {
+            const descriptors = properties.result ?? []
+            state.nodes += descriptors.length
+            this.assertMaterializeBudget(state, depth, result)
+
+            if (result.subtype === 'array') {
+                const array: unknown[] = []
+                for (const descriptor of descriptors) {
+                    if (!descriptor.value || !/^\d+$/.test(descriptor.name)) {
+                        continue
+                    }
+                    const index = Number(descriptor.name)
+                    if (index >= UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES) {
+                        this.throwMaterializeLimit(state, depth, result)
+                    }
+                    this.trackMaterializedPropertyName(descriptor.name, state, depth, result)
+                    array[index] = await this.materializePropertyValue(descriptor.value, timeout, state, depth + 1)
+                }
+                return array as T
+            }
+
+            const object: Record<string, unknown> = {}
+            for (const descriptor of descriptors) {
+                if (!descriptor.enumerable || descriptor.wasThrown || !descriptor.value) {
                     continue
                 }
-                array[Number(descriptor.name)] = await this.materializePropertyValue(descriptor.value, timeout, seen)
+                this.trackMaterializedPropertyName(descriptor.name, state, depth, result)
+                object[descriptor.name] = await this.materializePropertyValue(
+                    descriptor.value,
+                    timeout,
+                    state,
+                    depth + 1
+                )
             }
-            seen.delete(result.objectId)
-            return array as T
+            return object as T
+        } finally {
+            state.seen.delete(result.objectId)
         }
-
-        const object: Record<string, unknown> = {}
-        for (const descriptor of properties.result ?? []) {
-            if (!descriptor.enumerable || descriptor.wasThrown || !descriptor.value) {
-                continue
-            }
-            object[descriptor.name] = await this.materializePropertyValue(descriptor.value, timeout, seen)
-        }
-        seen.delete(result.objectId)
-        return object as T
     }
 
     private async materializePropertyValue(
         value: CdpResultObject,
         timeout: number | undefined,
-        seen: Set<string>
+        state: CdpMaterializeState,
+        depth: number
     ): Promise<unknown> {
         if (!value.objectId) {
-            return extractCdpValue(value)
+            return this.trackMaterializedValue(extractCdpValue(value), state, depth)
         }
         try {
-            return await this.materializeRemoteObject(value, timeout, seen)
+            return await this.materializeRemoteObject(value, timeout, state, depth)
         } finally {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId: value.objectId }).catch(() => {})
         }
+    }
+
+    private trackMaterializedNode(result: CdpResultObject, state: CdpMaterializeState, depth: number): void {
+        state.nodes += 1
+        state.chars += result.description?.length ?? 0
+        this.assertMaterializeBudget(state, depth, result)
+    }
+
+    private trackMaterializedPropertyName(
+        name: string,
+        state: CdpMaterializeState,
+        depth: number,
+        result: CdpResultObject
+    ): void {
+        state.chars += name.length
+        this.assertMaterializeBudget(state, depth, result)
+    }
+
+    private trackMaterializedValue<T>(value: T, state: CdpMaterializeState, depth: number): T {
+        state.nodes += 1
+        state.chars += this.estimateSerializedLength(value)
+        this.assertMaterializeBudget(state, depth)
+        return value
+    }
+
+    private estimateSerializedLength(value: unknown): number {
+        if (value === undefined) {
+            return 'undefined'.length
+        }
+        try {
+            return JSON.stringify(value)?.length ?? String(value).length
+        } catch {
+            return String(value).length
+        }
+    }
+
+    private assertMaterializeBudget(state: CdpMaterializeState, depth: number, result?: CdpResultObject): void {
+        if (
+            depth > UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH ||
+            state.nodes > UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES ||
+            state.chars > UnifiedSessionManager.CDP_MATERIALIZE_MAX_CHARS
+        ) {
+            this.throwMaterializeLimit(state, depth, result)
+        }
+    }
+
+    private throwMaterializeLimit(state: CdpMaterializeState, depth: number, result?: CdpResultObject): never {
+        throw new EvaluateResultTooLargeError({
+            depth,
+            nodes: state.nodes,
+            chars: state.chars,
+            maxDepth: UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH,
+            maxNodes: UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES,
+            maxChars: UnifiedSessionManager.CDP_MATERIALIZE_MAX_CHARS,
+            type: result?.type,
+            subtype: result?.subtype,
+            className: result?.className,
+            description: result?.description?.slice(0, 200),
+        })
     }
 
     /**
@@ -1434,7 +1523,7 @@ class UnifiedSessionManager {
      * 要求 code 必须是函数表达式（如 "(x) => x + 1"）
      */
     private async callFunctionOn<T>(code: string, args: unknown[], timeout?: number): Promise<T> {
-        const fallbackExpression = `(${code})(${args.map((a) => JSON.stringify(a)).join(', ')})`
+        const buildFallbackExpression = () => `(${code})(${args.map((a) => JSON.stringify(a)).join(', ')})`
         const globalResult = (await this.extensionBridge!.debuggerSend(
             'Runtime.evaluate',
             {
@@ -1446,6 +1535,7 @@ class UnifiedSessionManager {
         )) as { result?: CdpResultObject }
         const globalObjectId = globalResult.result?.objectId
         if (!globalObjectId) {
+            const fallbackExpression = buildFallbackExpression()
             return this.evaluateViaExtensionPrecise<T>(fallbackExpression, fallbackExpression, undefined, timeout)
         }
 
@@ -1476,6 +1566,7 @@ class UnifiedSessionManager {
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             if (message.includes('Either objectId or executionContextId or uniqueContextId must be specified')) {
+                const fallbackExpression = buildFallbackExpression()
                 return this.evaluateViaExtensionPrecise<T>(fallbackExpression, fallbackExpression, undefined, timeout)
             }
             throw error

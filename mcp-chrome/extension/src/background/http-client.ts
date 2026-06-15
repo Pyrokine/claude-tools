@@ -14,23 +14,64 @@ const PORT_RANGE_END = 19299
 const HEALTH_CHECK_TIMEOUT = 500
 const MAX_RECONNECT_DELAY = 30000
 const HEARTBEAT_TIMEOUT = 20000
+const PAIRING_TOKEN_STORAGE_KEY = 'mcp_pairing_token'
 
 interface ServerConnection {
     ws: WebSocket
     heartbeatTimer: ReturnType<typeof setTimeout> | null
 }
 
+interface VerifiedAuth {
+    clientNonce: string
+    serverNonce: string
+    clientProof: string
+}
+
+interface HealthResponse {
+    status?: string
+    authRequired?: boolean
+    auth?: {
+        clientNonce?: string
+        serverNonce?: string
+        serverProof?: string
+    }
+}
+
 type MessageHandler = (message: { id: string; action: string; params: unknown }, port: number) => void
 type StatusHandler = (status: 'connected' | 'disconnected' | 'connecting', connectedCount: number) => void
 
+function bytesToHex(bytes: Uint8Array): string {
+    return Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')
+}
+
+function randomHex(bytes = 16): string {
+    const data = new Uint8Array(bytes)
+    crypto.getRandomValues(data)
+    return bytesToHex(data)
+}
+
+async function hmacHex(token: string, payload: string): Promise<string> {
+    const encoder = new TextEncoder()
+    const key = await crypto.subtle.importKey('raw', encoder.encode(token), { name: 'HMAC', hash: 'SHA-256' }, false, [
+        'sign',
+    ])
+    const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payload))
+    return bytesToHex(new Uint8Array(signature))
+}
+
 export class HttpClient {
     private connections = new Map<number, ServerConnection>()
+    private verifiedAuth = new Map<number, VerifiedAuth>()
     private messageHandler: MessageHandler | null = null
     private statusHandler: StatusHandler | null = null
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null
     private reconnectAttempts = 0
     private shouldReconnect = true
     private connecting = false
+    private pairingToken: string | null = null
+    private pairingTokenLoaded = false
 
     onMessage(handler: MessageHandler): void {
         this.messageHandler = handler
@@ -38,6 +79,17 @@ export class HttpClient {
 
     onStatusChange(handler: StatusHandler): void {
         this.statusHandler = handler
+    }
+
+    async setPairingToken(token: string): Promise<void> {
+        this.pairingToken = token.trim()
+        this.pairingTokenLoaded = true
+        await chrome.storage.local.set({ [PAIRING_TOKEN_STORAGE_KEY]: this.pairingToken })
+        this.disconnect()
+    }
+
+    async hasPairingToken(): Promise<boolean> {
+        return (await this.getPairingToken()).length > 0
     }
 
     /**
@@ -98,6 +150,7 @@ export class HttpClient {
             conn.ws.close()
         }
         this.connections.clear()
+        this.verifiedAuth.clear()
         this.statusHandler?.('disconnected', 0)
     }
 
@@ -124,6 +177,17 @@ export class HttpClient {
         conn.ws.send(JSON.stringify({ id, success, data, error }))
     }
 
+    private async getPairingToken(): Promise<string> {
+        if (this.pairingTokenLoaded) {
+            return this.pairingToken ?? ''
+        }
+        const result = await chrome.storage.local.get(PAIRING_TOKEN_STORAGE_KEY)
+        this.pairingToken =
+            typeof result[PAIRING_TOKEN_STORAGE_KEY] === 'string' ? result[PAIRING_TOKEN_STORAGE_KEY] : ''
+        this.pairingTokenLoaded = true
+        return this.pairingToken ?? ''
+    }
+
     private async connectToPort(port: number): Promise<boolean> {
         // 已连接则跳过
         if (this.connections.has(port)) {
@@ -132,7 +196,13 @@ export class HttpClient {
 
         return new Promise((resolve) => {
             try {
-                const url = `ws://127.0.0.1:${port}/`
+                const auth = this.verifiedAuth.get(port)
+                const authQuery = auth
+                    ? `?clientNonce=${encodeURIComponent(auth.clientNonce)}&serverNonce=${encodeURIComponent(
+                          auth.serverNonce
+                      )}&clientProof=${encodeURIComponent(auth.clientProof)}`
+                    : ''
+                const url = `ws://127.0.0.1:${port}/${authQuery}`
                 const ws = new WebSocket(url)
                 let resolved = false
 
@@ -203,6 +273,7 @@ export class HttpClient {
 
         this.stopHeartbeat(port)
         this.connections.delete(port)
+        this.verifiedAuth.delete(port)
 
         if (this.connections.size > 0) {
             this.statusHandler?.('connected', this.connections.size)
@@ -248,15 +319,42 @@ export class HttpClient {
 
     private async checkPort(port: number): Promise<boolean> {
         try {
+            const token = await this.getPairingToken()
+            const clientNonce = randomHex()
             const controller = new AbortController()
             const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT)
 
-            const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
+            const response = await fetch(`http://127.0.0.1:${port}/api/health?clientNonce=${clientNonce}`, {
                 signal: controller.signal,
             })
 
             clearTimeout(timeoutId)
-            return response.ok
+            if (!response.ok) {
+                return false
+            }
+
+            const health = (await response.json().catch(() => null)) as HealthResponse | null
+            if (health?.authRequired) {
+                if (!token || !health.auth?.serverNonce || !health.auth.serverProof) {
+                    return false
+                }
+                const expected = await hmacHex(token, `server:${clientNonce}:${health.auth.serverNonce}`)
+                if (expected !== health.auth.serverProof) {
+                    return false
+                }
+                this.verifiedAuth.set(port, {
+                    clientNonce,
+                    serverNonce: health.auth.serverNonce,
+                    clientProof: await hmacHex(token, `client:${clientNonce}:${health.auth.serverNonce}`),
+                })
+                return true
+            }
+
+            if (token) {
+                return false
+            }
+            this.verifiedAuth.delete(port)
+            return health?.status === 'ok'
         } catch {
             return false
         }

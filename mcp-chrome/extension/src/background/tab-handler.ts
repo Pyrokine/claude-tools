@@ -58,6 +58,28 @@ function structuredOperationError(
     return new ExpectedOperationError(JSON.stringify({ error: { code, message, suggestion, context } }))
 }
 
+async function assertManagedWindow(windowId: number, context: ActionContext, action: string): Promise<WindowInfo> {
+    const info = await getWindowInfo(windowId, context)
+    if (context.mcpWindowId === windowId) {
+        return info
+    }
+    const unmanagedTabs = info.tabs.filter((tab) => !tab.managed)
+    if (info.tabs.length > 0 && unmanagedTabs.length === 0) {
+        return info
+    }
+    throw structuredOperationError(
+        'UNMANAGED_WINDOW',
+        `${action} 拒绝操作非 MCP 管理的浏览器窗口`,
+        '请先用 manage(action="newWindow") 创建受控窗口，或只传入全部 tab 都是 managed=true 的窗口',
+        {
+            action,
+            windowId,
+            tabCount: info.tabCount,
+            unmanagedTabIds: unmanagedTabs.map((tab) => tab.id),
+        }
+    )
+}
+
 export class TabHandler {
     constructor(private navigationHandler: NavigationHandler) {}
 
@@ -340,7 +362,7 @@ export class TabHandler {
 
     async windowFocus(params: unknown, context: ActionContext): Promise<ManagedWindowChangeResult> {
         const p = WindowFocusSchema.parse(params)
-        const before = await getWindowInfo(p.windowId, context)
+        const before = await assertManagedWindow(p.windowId, context, 'window_focus')
         await chrome.windows.update(p.windowId, { focused: true })
         const after = await getWindowInfo(p.windowId, context)
         return { success: true, windowId: p.windowId, before, after }
@@ -348,7 +370,7 @@ export class TabHandler {
 
     async windowResize(params: unknown, context: ActionContext): Promise<ManagedWindowChangeResult> {
         const p = WindowResizeSchema.parse(params)
-        const before = await getWindowInfo(p.windowId, context)
+        const before = await assertManagedWindow(p.windowId, context, 'window_resize')
         await chrome.windows.update(p.windowId, {
             ...(p.left !== undefined ? { left: p.left } : {}),
             ...(p.top !== undefined ? { top: p.top } : {}),

@@ -74,10 +74,15 @@ async function handleInternalMessage(message: InternalMessage): Promise<unknown>
             httpClient.disconnect()
             return { success: true }
 
+        case 'SET_PAIRING_TOKEN':
+            await httpClient.setPairingToken(message.token)
+            return { success: true }
+
         case 'GET_STATUS':
             return {
                 connected: httpClient.isConnected(),
                 ports: httpClient.getConnectedPorts(),
+                pairingTokenConfigured: await httpClient.hasPairingToken(),
             }
 
         default:

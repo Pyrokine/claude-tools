@@ -366,7 +366,17 @@ export interface GetStatusMessage {
     type: 'GET_STATUS'
 }
 
-export type InternalMessage = StatusUpdateMessage | ConnectMessage | DisconnectMessage | GetStatusMessage
+export interface SetPairingTokenMessage {
+    type: 'SET_PAIRING_TOKEN'
+    token: string
+}
+
+export type InternalMessage =
+    | StatusUpdateMessage
+    | ConnectMessage
+    | DisconnectMessage
+    | GetStatusMessage
+    | SetPairingTokenMessage
 
 // ==================== Debugger (CDP) 操作 ====================
 

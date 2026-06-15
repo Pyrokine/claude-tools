@@ -105,6 +105,27 @@ export class NonSerializableEvaluateResultError extends Error {
     }
 }
 
+export class EvaluateResultTooLargeError extends Error {
+    readonly code = 'EVALUATE_RESULT_TOO_LARGE'
+    readonly suggestion = '请在脚本中只返回必要字段、分页结果，或返回字符串并配合 output 写入文件'
+
+    constructor(readonly context: Record<string, unknown>) {
+        super('evaluate 返回值过大，已停止展开 CDP 远端对象')
+        this.name = 'EvaluateResultTooLargeError'
+    }
+
+    toJSON(): object {
+        return {
+            error: {
+                code: this.code,
+                message: this.message,
+                suggestion: this.suggestion,
+                context: this.context,
+            },
+        }
+    }
+}
+
 /** 从 CDP result 提取返回值，不可序列化时抛出诊断错误 */
 export function extractCdpValue<T>(result?: CdpResultObject<T>): T {
     if (!result || (result.value === undefined && result.type !== 'undefined')) {

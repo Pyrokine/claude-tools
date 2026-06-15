@@ -1,6 +1,6 @@
 {
     "name": "@pyrokine/mcp-chrome",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "description": "Chrome browser automation MCP Server using Chrome DevTools Protocol",
     "main": "dist/index.js",
     "type": "module",
@@ -31,12 +31,12 @@
     },
     "devDependencies": {
         "@eslint/js": "^10.0.1",
-        "@types/node": "^25.9.1",
+        "@types/node": "^25.9.3",
         "@types/ws": "^8.18.1",
-        "eslint": "^10.4.0",
-        "prettier": "^3.8.3",
+        "eslint": "^10.5.0",
+        "prettier": "^3.8.4",
         "typescript": "^6.0.3",
-        "typescript-eslint": "^8.60.0"
+        "typescript-eslint": "^8.61.0"
     },
     "engines": {
         "node": ">=18"
@@ -45,6 +45,9 @@
         "mcp-chrome": "dist/index.js"
     },
     "files": [
-        "dist"
+        "dist",
+        "README.md",
+        "README_zh.md",
+        "LICENSE"
     ]
 }

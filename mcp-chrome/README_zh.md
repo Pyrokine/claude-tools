@@ -92,6 +92,15 @@ browse(action="open", url="https://example.com")
 extract(type="screenshot")
 ```
 
+**可选配对 token**
+
+默认本地 Extension 模式不需要 token，如需限制 Extension 连接，启动 MCP server 时设置 `MCP_CHROME_PAIRING_TOKEN`，再在
+Extension popup 中输入同一个 token：
+
+```bash
+MCP_CHROME_PAIRING_TOKEN="your-token" node /path/to/mcp-chrome/dist/index.js
+```
+
 ### 模式二：CDP 模式（回退）
 
 CDP 模式启动或连接独立的 Chrome 实例，适用于未安装 Extension 或需要无头/隔离的场景，

@@ -8,6 +8,7 @@
  * - 心跳检测：定期 ping 检测 Extension 存活
  */
 
+import { createHmac, randomBytes, timingSafeEqual } from 'crypto'
 import { EventEmitter } from 'events'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { readFileSync } from 'node:fs'
@@ -23,6 +24,8 @@ const DEFAULT_PORT = 19222
 const MAX_PORT = 19299
 const REQUEST_TIMEOUT = DEFAULT_TIMEOUT
 const HEARTBEAT_INTERVAL = 15000 // 每 15 秒发送一次 ping，下次 ping 前检查 pong
+const AUTH_CHALLENGE_TTL_MS = 60_000
+const AUTH_CHALLENGE_MAX_ENTRIES = 1024
 
 export interface HttpServerOptions {
     port?: number
@@ -33,6 +36,21 @@ interface MessageHandler {
     resolve: (value: unknown) => void
     reject: (error: Error) => void
     timeout: NodeJS.Timeout
+}
+
+interface AuthChallenge {
+    expiresAt: number
+}
+
+function hmacHex(token: string, payload: string): string {
+    return createHmac('sha256', token).update(payload).digest('hex')
+}
+
+function timingSafeEqualHex(left: string, right: string): boolean {
+    if (!/^[0-9a-f]+$/i.test(left) || !/^[0-9a-f]+$/i.test(right) || left.length !== right.length) {
+        return false
+    }
+    return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'))
 }
 
 class ExtensionStructuredError extends Error {
@@ -73,6 +91,8 @@ export class ExtensionHttpServer extends EventEmitter {
     private extensionVersion: string | null = null
     private heartbeatInterval: NodeJS.Timeout | null = null
     private pongReceived = false
+    private readonly pairingToken = process.env.MCP_CHROME_PAIRING_TOKEN?.trim() ?? ''
+    private readonly authChallenges = new Map<string, AuthChallenge>()
 
     constructor(private options: HttpServerOptions = {}) {
         super()
@@ -219,6 +239,12 @@ export class ExtensionHttpServer extends EventEmitter {
                 socket.destroy()
                 return
             }
+            if (!this.verifyWebSocketAuth(req.url ?? '/')) {
+                console.error('[HTTP] Rejected WebSocket upgrade: pairing token proof failed')
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+                socket.destroy()
+                return
+            }
 
             this.wss!.handleUpgrade(req, socket, head, (ws) => {
                 this.wss!.emit('connection', ws, req)
@@ -259,6 +285,60 @@ export class ExtensionHttpServer extends EventEmitter {
                 console.error('[HTTP] WebSocket error:', error.message)
             })
         })
+    }
+
+    private createAuthChallenge(clientNonce: string): {
+        clientNonce: string
+        serverNonce: string
+        serverProof: string
+    } {
+        this.trimAuthChallenges()
+        const serverNonce = randomBytes(16).toString('hex')
+        this.authChallenges.set(`${clientNonce}:${serverNonce}`, { expiresAt: Date.now() + AUTH_CHALLENGE_TTL_MS })
+        return {
+            clientNonce,
+            serverNonce,
+            serverProof: hmacHex(this.pairingToken, `server:${clientNonce}:${serverNonce}`),
+        }
+    }
+
+    private verifyWebSocketAuth(rawUrl: string): boolean {
+        if (!this.pairingToken) {
+            return true
+        }
+        this.removeExpiredAuthChallenges()
+        const url = new URL(rawUrl, 'http://127.0.0.1')
+        const clientNonce = url.searchParams.get('clientNonce') ?? ''
+        const serverNonce = url.searchParams.get('serverNonce') ?? ''
+        const clientProof = url.searchParams.get('clientProof') ?? ''
+        const challengeKey = `${clientNonce}:${serverNonce}`
+        if (!clientNonce || !serverNonce || !clientProof || !this.authChallenges.has(challengeKey)) {
+            return false
+        }
+        const expected = hmacHex(this.pairingToken, `client:${clientNonce}:${serverNonce}`)
+        const valid = timingSafeEqualHex(clientProof, expected)
+        this.authChallenges.delete(challengeKey)
+        return valid
+    }
+
+    private removeExpiredAuthChallenges(): void {
+        const now = Date.now()
+        for (const [key, challenge] of this.authChallenges) {
+            if (challenge.expiresAt <= now) {
+                this.authChallenges.delete(key)
+            }
+        }
+    }
+
+    private trimAuthChallenges(): void {
+        this.removeExpiredAuthChallenges()
+        while (this.authChallenges.size >= AUTH_CHALLENGE_MAX_ENTRIES) {
+            const oldestKey = this.authChallenges.keys().next().value
+            if (!oldestKey) {
+                return
+            }
+            this.authChallenges.delete(oldestKey)
+        }
     }
 
     private tryListen(port: number, resolve: () => void, reject: (err: Error) => void): void {
@@ -305,15 +385,33 @@ export class ExtensionHttpServer extends EventEmitter {
             return
         }
 
-        const url = req.url ?? '/'
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1')
 
-        if (url.startsWith('/api/health')) {
+        if (url.pathname === '/api/health') {
+            if (this.pairingToken) {
+                const clientNonce = url.searchParams.get('clientNonce')
+                if (!clientNonce) {
+                    res.writeHead(401)
+                    res.end(JSON.stringify({ status: 'auth_required', authRequired: true, port: this.port }))
+                    return
+                }
+                res.writeHead(200)
+                res.end(
+                    JSON.stringify({
+                        status: 'ok',
+                        port: this.port,
+                        authRequired: true,
+                        auth: this.createAuthChallenge(clientNonce),
+                    })
+                )
+                return
+            }
             res.writeHead(200)
-            res.end(JSON.stringify({ status: 'ok', port: this.port }))
+            res.end(JSON.stringify({ status: 'ok', port: this.port, authRequired: false }))
             return
         }
 
-        if (url.startsWith('/api/info')) {
+        if (url.pathname === '/api/info') {
             res.writeHead(200)
             res.end(
                 JSON.stringify({
