@@ -23,13 +23,14 @@ import sys
 import time
 import uuid as _uuid
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
 
 def resolve_jsonl(
         arg: str,
-        project_hash: str | None
+        project_hash: Optional[str]
 ) -> Path:
     p = Path(arg)
     if p.is_file():
@@ -53,14 +54,14 @@ def resolve_jsonl(
         print(f"Multiple matches for '{arg}':", file=sys.stderr)
         for m in matches:
             print(f"  {m}", file=sys.stderr)
-        sys.exit(2)
+        raise SystemExit(2)
     print(f"No jsonl found for '{arg}'", file=sys.stderr)
-    sys.exit(2)
+    raise SystemExit(2)
 
 
 def verify_chain(
-        lines: list[str]
-) -> tuple[int, int]:
+        lines: List[str]
+) -> Tuple[int, int]:
     uuids = set()
     parents = set()
     for raw in lines:
@@ -82,9 +83,9 @@ def session_id_from_path(
 
 
 def rewrite_session_id(
-        lines: list[str],
+        lines: List[str],
         new_id: str
-) -> list[str]:
+) -> List[str]:
     out = []
     for raw in lines:
         try:
@@ -146,7 +147,7 @@ def main() -> int:
         print("                WARNING: truncation leaves dangling parentUuid — resume may load partial history")
 
     if args.new_session:
-        print(f"New session   : {new_id}")
+        print(f"New session   : {session_id_for_title}")
         print(f"Target        : {target_path}")
     else:
         print(f"Target        : {target_path} (in-place)")

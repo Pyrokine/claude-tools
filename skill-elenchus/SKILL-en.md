@@ -396,14 +396,14 @@ Aggregate all results into `report.md`:
 ## Summary
 
 | Severity | Count |
-|---|---|
+| --- | --- |
 | CRITICAL | N |
 | HIGH | N |
 | MEDIUM | N |
 | LOW | N |
 
 | Verdict | Count |
-|---|---|
+| --- | --- |
 | CONFIRMED (unanimous) | N |
 | CONFIRMED (majority) | N |
 | SUSTAINED (after arbitration) | N |
@@ -412,14 +412,21 @@ Aggregate all results into `report.md`:
 | UNRESOLVED | N |
 
 ## CRITICAL Findings
+
 ## HIGH Findings
+
 ## MEDIUM Findings
+
 ## LOW Findings
+
 ## Overturned Findings (Reference)
+
 ## Unresolved Disputes
 
 ## Fix Plan
+
 Ordered by priority, each item includes:
+
 - **Issue**: Corresponding FINDING number and summary
 - **Fix instruction**: file:line level specific action
 - **Acceptance criteria**: How to verify the fix

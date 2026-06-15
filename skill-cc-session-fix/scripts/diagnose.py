@@ -23,13 +23,14 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
 
 def resolve_jsonl(
         arg: str,
-        project_hash: str | None
+        project_hash: Optional[str]
 ) -> Path:
     p = Path(arg)
     if p.is_file():
@@ -53,14 +54,14 @@ def resolve_jsonl(
         print(f"Multiple matches for '{arg}':", file=sys.stderr)
         for m in matches:
             print(f"  {m}", file=sys.stderr)
-        sys.exit(2)
+        raise SystemExit(2)
     print(f"No jsonl found for '{arg}'", file=sys.stderr)
-    sys.exit(2)
+    raise SystemExit(2)
 
 
 def load_lines(
         path: Path
-) -> list[dict | None]:
+) -> List[Optional[Dict[str, Any]]]:
     records = []
     with path.open() as f:
         for line in f:
@@ -108,7 +109,7 @@ def extract_summary(
 
 
 def analyze(
-        records: list[dict | None]
+        records: List[Optional[Dict[str, Any]]]
 ) -> dict:
     uuids = set()
     parents = set()
@@ -134,7 +135,7 @@ def analyze(
             if typ in ("user", "assistant"):
                 dialog_entries.append((idx, ts, u))
 
-    children_of: dict[str, list[int]] = {}
+    children_of: Dict[str, List[int]] = {}
     for idx, obj in enumerate(records, start=1):
         if obj is None:
             continue
@@ -206,7 +207,7 @@ def analyze(
 def print_report(
         path: Path,
         info: dict,
-        records: list[dict | None]
+        records: List[Optional[Dict[str, Any]]]
 ) -> None:
     size = path.stat().st_size
     print(f"File        : {path}")

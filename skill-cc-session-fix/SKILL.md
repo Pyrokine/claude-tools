@@ -44,33 +44,43 @@ scripts/truncate.py <target> --line <N> --new-session --title "..."
    修复：删除所有 thinking block（不只是空签名的），thinking 内容是内部推理，删除不影响对话继续
 
    ```python
-   import json, sys, os, shutil, time
-   path = sys.argv[1]
-   shutil.copy2(path, f"{path}.bak.{time.strftime('%Y%m%d%H%M%S')}")
-   out = path + '.fixed'
-   removed = 0
-   with open(path) as fin, open(out, 'w') as fout:
-       for line in fin:
-           s = line.strip()
-           if not s:
-               fout.write(line); continue
-           try:
-               obj = json.loads(s)
-               content = obj.get('message', {}).get('content', [])
-               if isinstance(content, list):
-                   new_c = [b for b in content
-                            if not (isinstance(b, dict)
-                                    and b.get('type') == 'thinking')]
-                   if len(new_c) != len(content):
-                       removed += len(content) - len(new_c)
-                       obj['message']['content'] = new_c
+   import json
+   import os
+   import shutil
+   import sys
+   import time
+
+
+   def strip_thinking_blocks(path):
+       out = path + '.fixed'
+       removed = 0
+       with open(path) as fin, open(out, 'w') as fout:
+           for line in fin:
+               if not line.strip():
+                   fout.write(line)
+                   continue
+               try:
+                   obj = json.loads(line)
+                   content = obj.get('message', {}).get('content', [])
+                   if isinstance(content, list):
+                       new_content = [
+                           block for block in content
+                           if not (isinstance(block, dict) and block.get('type') == 'thinking')
+                       ]
+                       removed += len(content) - len(new_content)
+                       obj['message']['content'] = new_content
                        fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
                        continue
-           except Exception as e:
-               print(f'warn: {e}', flush=True)
-           fout.write(line)
-   os.replace(out, path)
-   print(f'removed {removed} thinking blocks')
+               except Exception as exc:
+                   print(f'warn: {exc}', flush=True)
+               fout.write(line)
+       os.replace(out, path)
+       return removed
+
+
+   path = sys.argv[1]
+   shutil.copy2(path, f"{path}.bak.{time.strftime('%Y%m%d%H%M%S')}")
+   print(f'removed {strip_thinking_blocks(path)} thinking blocks')
    ```
 
 ## 细节参考
