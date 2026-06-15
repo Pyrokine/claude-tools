@@ -2,7 +2,7 @@
  * SSH File Operations - 文件操作
  */
 
-import { execSync, spawnSync } from 'child_process'
+import { spawn } from 'child_process'
 import { createHash } from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -20,7 +20,67 @@ const S_IFLNK = 0o120000
 
 // rsync 可用性缓存（per alias，连接存续期内不变,disconnect 时由 SessionManager 主动清理）
 const RSYNC_CACHE_TTL_MS = 5 * 60_000
+const LOCAL_PROCESS_OUTPUT_LIMIT = 200_000
 const rsyncCache = new Map<string, { value: boolean; expiresAt: number }>()
+
+type LocalProcessResult = {
+    status: number | null
+    stdout: string
+    stderr: string
+    error?: Error
+    timedOut?: boolean
+}
+
+function appendLimitedOutput(current: string, chunk: string): string {
+    if (current.length >= LOCAL_PROCESS_OUTPUT_LIMIT) {
+        return current
+    }
+    return (current + chunk).slice(0, LOCAL_PROCESS_OUTPUT_LIMIT)
+}
+
+function runLocalProcess(command: string, args: string[], timeout: number): Promise<LocalProcessResult> {
+    return new Promise((resolve) => {
+        let stdout = ''
+        let stderr = ''
+        let settled = false
+        let timedOut = false
+        let killTimer: NodeJS.Timeout | undefined
+        const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+        const timer = setTimeout(() => {
+            timedOut = true
+            child.kill('SIGTERM')
+            killTimer = setTimeout(() => child.kill('SIGKILL'), 5000)
+        }, timeout)
+        child.stdout.on('data', (chunk: Buffer) => {
+            stdout = appendLimitedOutput(stdout, chunk.toString('utf-8'))
+        })
+        child.stderr.on('data', (chunk: Buffer) => {
+            stderr = appendLimitedOutput(stderr, chunk.toString('utf-8'))
+        })
+        child.on('error', (error) => {
+            if (settled) {
+                return
+            }
+            settled = true
+            clearTimeout(timer)
+            if (killTimer) {
+                clearTimeout(killTimer)
+            }
+            resolve({ status: null, stdout, stderr, error, timedOut })
+        })
+        child.on('close', (status) => {
+            if (settled) {
+                return
+            }
+            settled = true
+            clearTimeout(timer)
+            if (killTimer) {
+                clearTimeout(killTimer)
+            }
+            resolve({ status, stdout, stderr, timedOut })
+        })
+    })
+}
 
 /** 由 SessionManager.disconnect 调用,防止 alias 重连后读到旧主机的判断 */
 export function clearRsyncCache(alias?: string): void {
@@ -31,8 +91,49 @@ export function clearRsyncCache(alias?: string): void {
     }
 }
 
+function positiveIntegerEnv(name: string, defaultValue: number): number {
+    const value = Number(process.env[name])
+    return Number.isInteger(value) && value > 0 ? value : defaultValue
+}
+
 /** SFTP 并发上限,避免单 SSH session 上太多 channel */
-const SFTP_PARALLEL_LIMIT = Number(process.env.SSH_MCP_SFTP_PARALLEL) || 8
+const SFTP_PARALLEL_LIMIT = positiveIntegerEnv('SSH_MCP_SFTP_PARALLEL', 8)
+const SFTP_SYNC_MAX_FILES = positiveIntegerEnv('SSH_MCP_SFTP_MAX_FILES', 10_000)
+const SFTP_SYNC_MAX_DIRECTORIES = positiveIntegerEnv('SSH_MCP_SFTP_MAX_DIRECTORIES', 2_000)
+const SFTP_SYNC_MAX_DEPTH = positiveIntegerEnv('SSH_MCP_SFTP_MAX_DEPTH', 64)
+const SFTP_SYNC_MAX_BYTES = positiveIntegerEnv('SSH_MCP_SFTP_MAX_BYTES', 10 * 1024 * 1024 * 1024)
+
+type SftpTraversalState = {
+    files: number
+    directories: number
+    bytes: number
+}
+
+function assertSftpTraversalBudget(state: SftpTraversalState, depth: number, currentPath: string): void {
+    if (depth > SFTP_SYNC_MAX_DEPTH) {
+        throw new Error(`SFTP sync traversal depth exceeded at ${currentPath} (max ${SFTP_SYNC_MAX_DEPTH})`)
+    }
+    if (state.files > SFTP_SYNC_MAX_FILES) {
+        throw new Error(`SFTP sync file count exceeded at ${currentPath} (max ${SFTP_SYNC_MAX_FILES})`)
+    }
+    if (state.directories > SFTP_SYNC_MAX_DIRECTORIES) {
+        throw new Error(`SFTP sync directory count exceeded at ${currentPath} (max ${SFTP_SYNC_MAX_DIRECTORIES})`)
+    }
+    if (state.bytes > SFTP_SYNC_MAX_BYTES) {
+        throw new Error(`SFTP sync byte budget exceeded at ${currentPath} (max ${SFTP_SYNC_MAX_BYTES})`)
+    }
+}
+
+function recordSftpDirectory(state: SftpTraversalState, depth: number, currentPath: string): void {
+    state.directories++
+    assertSftpTraversalBudget(state, depth, currentPath)
+}
+
+function recordSftpFile(state: SftpTraversalState, size: number, depth: number, currentPath: string): void {
+    state.files++
+    state.bytes += size
+    assertSftpTraversalBudget(state, depth, currentPath)
+}
 
 /**
  * 简单的并发控制：把异步任务限制在 limit 个 in-flight,串行入队
@@ -724,17 +825,9 @@ async function syncWithRsync(
         followSymlinks?: boolean
     }
 ): Promise<SyncResult> {
-    // 检查本地是否有 rsync
-    let hasLocalRsync = false
-    try {
-        const cmd = os.platform() === 'win32' ? 'where rsync' : 'which rsync'
-        execSync(cmd, { stdio: 'pipe' })
-        hasLocalRsync = true
-    } catch {
-        // rsync 不可用，由 hasLocalRsync 标记处理
-    }
-
-    if (!hasLocalRsync) {
+    const checkCommand = os.platform() === 'win32' ? 'where' : 'which'
+    const checkResult = await runLocalProcess(checkCommand, ['rsync'], 10_000)
+    if (checkResult.status !== 0) {
         // 本地没有 rsync，回退到 SFTP
         return syncWithSftp(alias, localPath, remotePath, direction, options)
     }
@@ -814,15 +907,13 @@ async function syncWithRsync(
             : [...args, '-e', sshCmd, '--', remoteSpec, localPath]
 
     try {
-        const result = spawnSync('rsync', rsyncArgs, {
-            encoding: 'utf-8',
-            timeout: 600000,
-            stdio: ['pipe', 'pipe', 'pipe'],
-        })
+        const result = await runLocalProcess('rsync', rsyncArgs, 600000)
 
         if (result.error || result.status !== 0) {
-            const stderr = (result.stderr ?? '').trim()
-            const reason = result.error?.message ?? `exit code ${result.status}`
+            const stderr = result.stderr.trim()
+            const reason = result.timedOut
+                ? 'timed out after 600000ms'
+                : (result.error?.message ?? `exit code ${result.status}`)
             const fallback = await syncWithSftp(alias, localPath, remotePath, direction, options)
             const warning = `rsync 失败原因: ${reason}${stderr ? ` | stderr: ${stderr}` : ''} | 已 fallback 到 SFTP（性能可能较差）`
             console.warn(`[mcp-ssh] ${warning}`)
@@ -832,7 +923,7 @@ async function syncWithRsync(
             }
         }
 
-        const output = result.stdout ?? ''
+        const output = result.stdout
         const stats = parseRsyncStats(output)
         const filesTransferred = stats.added + stats.updated
 
@@ -1111,7 +1202,9 @@ async function syncWithSftp(
                     remotePath,
                     options.exclude,
                     undefined,
-                    options.followSymlinks ?? false
+                    options.followSymlinks ?? false,
+                    { files: 0, directories: 0, bytes: 0 },
+                    0
                 )
                 return buildDirectorySyncResult(result, warnings)
             }
@@ -1126,7 +1219,19 @@ async function syncWithSftp(
         // download
         const info = await getFileInfo(alias, remotePath)
         if (info.isDirectory && options.recursive !== false) {
-            const result = await downloadDirectory(alias, remotePath, localPath, options.exclude)
+            const result = await downloadDirectory(
+                alias,
+                remotePath,
+                localPath,
+                options.exclude,
+                undefined,
+                {
+                    files: 0,
+                    directories: 0,
+                    bytes: 0,
+                },
+                0
+            )
             return buildDirectorySyncResult(result, warnings)
         }
         const existed = fs.existsSync(localPath)
@@ -1154,16 +1259,17 @@ async function uploadDirectory(
     remotePath: string,
     exclude?: string[],
     sharedSftp?: SFTPWrapper,
-    followSymlinks: boolean = false
+    followSymlinks: boolean = false,
+    traversal: SftpTraversalState = { files: 0, directories: 0, bytes: 0 },
+    depth: number = 0
 ): Promise<DirectoryTransferResult> {
     const accumulator = new DirectoryTransferAccumulator()
 
-    // 顶层调用时开启一个 SFTP 会话，递归调用复用
+    recordSftpDirectory(traversal, depth, localPath)
     const ownSftp = !sharedSftp
     const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
 
     try {
-        // 确保远程目录存在
         await mkdir(alias, remotePath, true)
 
         const items = fs.readdirSync(localPath)
@@ -1184,6 +1290,7 @@ async function uploadDirectory(
             if (stats.isDirectory()) {
                 subDirItems.push(item)
             } else if (stats.isFile()) {
+                recordSftpFile(traversal, stats.size, depth, itemLocalPath)
                 fileItems.push({ name: item, stats })
             }
         }
@@ -1206,7 +1313,16 @@ async function uploadDirectory(
         for (const item of subDirItems) {
             const itemLocalPath = path.join(localPath, item)
             const itemRemotePath = path.posix.join(remotePath, item)
-            const result = await uploadDirectory(alias, itemLocalPath, itemRemotePath, exclude, sftp, followSymlinks)
+            const result = await uploadDirectory(
+                alias,
+                itemLocalPath,
+                itemRemotePath,
+                exclude,
+                sftp,
+                followSymlinks,
+                traversal,
+                depth + 1
+            )
             accumulator.merge(result)
         }
     } finally {
@@ -1226,16 +1342,17 @@ async function downloadDirectory(
     remotePath: string,
     localPath: string,
     exclude?: string[],
-    sharedSftp?: SFTPWrapper
+    sharedSftp?: SFTPWrapper,
+    traversal: SftpTraversalState = { files: 0, directories: 0, bytes: 0 },
+    depth: number = 0
 ): Promise<DirectoryTransferResult> {
     const accumulator = new DirectoryTransferAccumulator()
 
-    // 顶层调用时开启一个 SFTP 会话，递归调用复用
+    recordSftpDirectory(traversal, depth, remotePath)
     const ownSftp = !sharedSftp
     const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
 
     try {
-        // 确保本地目录存在
         if (!fs.existsSync(localPath)) {
             fs.mkdirSync(localPath, { recursive: true })
         }
@@ -1252,6 +1369,7 @@ async function downloadDirectory(
             if (item.isDirectory) {
                 dirItems.push(item)
             } else if (item.isFile) {
+                recordSftpFile(traversal, item.size, depth, item.path)
                 fileItems.push(item)
             } else if (item.isSymlink) {
                 symlinkItems.push(item)
@@ -1274,7 +1392,7 @@ async function downloadDirectory(
 
         for (const item of dirItems) {
             const itemLocalPath = path.join(localPath, item.name)
-            const result = await downloadDirectory(alias, item.path, itemLocalPath, exclude, sftp)
+            const result = await downloadDirectory(alias, item.path, itemLocalPath, exclude, sftp, traversal, depth + 1)
             accumulator.merge(result)
         }
 

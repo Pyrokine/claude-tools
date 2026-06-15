@@ -330,7 +330,16 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             if (!rename.success) {
                 const renameError =
                     rename.stderr || rename.stdout || `atomic rename failed with exit code ${rename.exitCode}`
-                throw new Error(renameError)
+                await cleanupRemotePath(args.alias, tempRemotePath).catch(() => undefined)
+                return formatResult({
+                    success: false,
+                    error: renameError,
+                    diagnostics: {
+                        local: summarizeLocalPathProbe(local),
+                        remoteParent,
+                        atomic: true,
+                    },
+                })
             }
         }
         return formatResult({

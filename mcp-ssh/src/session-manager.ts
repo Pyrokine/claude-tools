@@ -18,8 +18,10 @@ import { PtyManager } from './pty-manager.js'
 import { sanitizeKeyError, validateKeyFile } from './security.js'
 import { escapeShellArg, expandTilde } from './tools/utils.js'
 import {
+    DEFAULT_EXEC_MAX_OUTPUT_SIZE,
     ExecOptions,
     ExecResult,
+    HARD_EXEC_MAX_OUTPUT_SIZE,
     PersistedSession,
     PortForwardInfo,
     PtyOptions,
@@ -82,7 +84,7 @@ export class SessionManager {
     private defaultKeepaliveCountMax = 3
     private defaultTimeout = 30000 // 30秒
     private maxReconnectAttempts = 3
-    private defaultMaxOutputSize = 10 * 1024 * 1024 // 10*1024*1024 UTF-16 chars（ASCII 时约 10MB 字节）
+    private defaultMaxOutputSize = DEFAULT_EXEC_MAX_OUTPUT_SIZE
     private reconnectDelay = 5000 // 5秒
 
     constructor(persistPath?: string) {
@@ -279,7 +281,7 @@ export class SessionManager {
         const session = this.getSession(alias)
         const startTime = Date.now()
         const timeout = options.timeout ?? this.defaultTimeout
-        const maxOutputSize = options.maxOutputSize ?? this.defaultMaxOutputSize
+        const maxOutputSize = this.normalizeMaxOutputSize(options.maxOutputSize)
         const fullCommand = this.buildCommand(`sudo -S ${command}`, session, options)
 
         return new Promise<ExecResult>((resolve, reject) => {
@@ -545,6 +547,20 @@ export class SessionManager {
         }
     }
 
+    private normalizeMaxOutputSize(value: number | undefined): number {
+        const maxOutputSize = value ?? this.defaultMaxOutputSize
+        if (!Number.isInteger(maxOutputSize) || maxOutputSize <= 0 || maxOutputSize > HARD_EXEC_MAX_OUTPUT_SIZE) {
+            throw new CommandError('Invalid maxOutputSize', {
+                maxOutputSize,
+                min: 1,
+                max: HARD_EXEC_MAX_OUTPUT_SIZE,
+                suggestion:
+                    '使用 1 到 HARD_EXEC_MAX_OUTPUT_SIZE 之间的整数，超大输出请重定向到远端文件后用 ssh_read_file 分块读取',
+            })
+        }
+        return maxOutputSize
+    }
+
     private async execDirect(
         alias: string,
         command: string,
@@ -553,7 +569,7 @@ export class SessionManager {
     ): Promise<ExecResult> {
         const session = this.getSession(alias)
         const startTime = Date.now()
-        const maxOutputSize = options.maxOutputSize ?? this.defaultMaxOutputSize
+        const maxOutputSize = this.normalizeMaxOutputSize(options.maxOutputSize)
         const fullCommand = this.buildCommand(command, session, options)
 
         return new Promise((resolve, reject) => {

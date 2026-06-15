@@ -9,10 +9,18 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
-import type { ExecResult } from '../types.js'
+import { type ExecResult, HARD_EXEC_MAX_OUTPUT_SIZE } from '../types.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js' // ========== Schemas ==========
 
 // ========== Schemas ==========
+
+const maxOutputSizeSchema = z
+    .number()
+    .int()
+    .positive()
+    .max(HARD_EXEC_MAX_OUTPUT_SIZE)
+    .optional()
+    .describe('最大输出字符数，超过后截断并返回提示')
 
 const execSchema = z.object({
     alias: z.string().describe('连接别名'),
@@ -24,7 +32,7 @@ const execSchema = z.object({
     cwd: z.string().optional().describe('工作目录（可选）'),
     env: z.record(z.string(), z.string()).optional().describe('额外环境变量'),
     pty: z.boolean().optional().describe('是否使用 PTY 模式（用于 top 等交互式命令）'),
-    maxOutputSize: z.number().optional().describe('最大输出字符数，超过后截断并返回提示'),
+    maxOutputSize: maxOutputSizeSchema,
     runAs: z.string().optional().describe('本次命令使用的目标用户，覆盖连接级 runAs'),
     useLoginUser: z.boolean().optional().describe('设为 true 时跳过连接级 runAs，直接以登录用户执行'),
     loadProfile: z.boolean().optional().describe('runAs 执行时是否加载目标用户 shell 配置，默认 true'),
@@ -37,7 +45,7 @@ const execAsUserSchema = z.object({
     timeout: z.number().optional().describe('超时（毫秒）'),
     cwd: z.string().optional().describe('工作目录（可选）'),
     env: z.record(z.string(), z.string()).optional().describe('额外环境变量'),
-    maxOutputSize: z.number().optional().describe('最大输出字符数，超过后截断并返回提示'),
+    maxOutputSize: maxOutputSizeSchema,
     loadProfile: z
         .boolean()
         .optional()
@@ -49,7 +57,7 @@ const execSudoSchema = z.object({
     command: z.string().describe('要执行的命令'),
     sudoPassword: z.string().optional().describe('sudo 密码（如果需要）'),
     timeout: z.number().optional().describe('超时（毫秒）'),
-    maxOutputSize: z.number().optional().describe('最大输出字符数，超过后截断并返回提示'),
+    maxOutputSize: maxOutputSizeSchema,
 })
 
 const execBatchSchema = z.object({
@@ -85,7 +93,7 @@ const execScriptSchema = z.object({
     env: z.record(z.string(), z.string()).optional().describe('额外环境变量'),
     timeout: z.number().optional().describe('超时（毫秒）'),
     keepScript: z.boolean().optional().describe('是否保留远端临时脚本，默认 false'),
-    maxOutputSize: z.number().optional().describe('最大输出字符数，超过后截断并返回提示'),
+    maxOutputSize: maxOutputSizeSchema,
 })
 
 // ========== Handlers ==========
@@ -125,7 +133,7 @@ function classifyCommandRisk(command: string): CommandRisk | undefined {
     if (pipeCount >= 3) {
         pushRisk(categories, signals, 'long-running', 'long_pipeline')
     }
-    if (/(?:^|[;&])\s*[^;&]+&\s*(?:$|[;&])/.test(command)) {
+    if (/(^|[^&])&(?!&)/.test(command)) {
         pushRisk(categories, signals, 'process-control', 'background_task')
     }
     if (/\b(?:rm\s+-[a-zA-Z]*r|dd\s+if=|mkfs|fdisk|parted|shutdown|reboot)\b/.test(lowerCommand)) {
@@ -219,16 +227,18 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
     try {
         const stopOnError = args.stopOnError !== false
         type BatchEntry =
-            | ({ index: number; command: string } & ExecResult)
-            | { index: number; command: string; success: false; error: string }
+            | ({ index: number; commandRedacted: true; commandRisk?: CommandRisk } & ExecResult)
+            | { index: number; commandRedacted: true; commandRisk?: CommandRisk; success: false; error: string }
         const results: BatchEntry[] = []
 
         for (let i = 0; i < args.commands.length; i++) {
+            const commandRisk = classifyCommandRisk(args.commands[i])
             try {
                 const execResult = await sessionManager.exec(args.alias, args.commands[i], { timeout: args.timeout })
                 results.push({
                     index: i,
-                    command: args.commands[i],
+                    commandRedacted: true,
+                    commandRisk,
                     ...execResult,
                 })
                 if (execResult.exitCode !== 0 && stopOnError) {
@@ -237,7 +247,8 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
             } catch (err) {
                 results.push({
                     index: i,
-                    command: args.commands[i],
+                    commandRedacted: true,
+                    commandRisk,
                     success: false,
                     error: err instanceof Error ? err.message : String(err),
                 })

@@ -2,6 +2,9 @@
  * SSH MCP Pro - 类型定义
  */
 
+export const DEFAULT_EXEC_MAX_OUTPUT_SIZE = 10 * 1024 * 1024
+export const HARD_EXEC_MAX_OUTPUT_SIZE = 50 * 1024 * 1024
+
 export interface SSHConnectionConfig {
     host: string
     port: number

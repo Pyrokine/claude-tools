@@ -315,15 +315,17 @@ export function registerConnectionTools(server: McpServer): void {
     server.registerTool(
         'ssh_connect',
         {
-            description: `建立 SSH 连接并保持会话，支持密码、密钥认证，支持跳板机
-
-可通过 configHost 参数使用 ~/.ssh/config 中的配置，无需重复填写连接信息
-支持 Host 多别名、Host * 全局默认继承、ProxyJump（user@host:port 格式）
-
-示例:
-- 使用 ssh config: ssh_connect(configHost="myserver")
-- 密钥认证: ssh_connect(host="<server-host>", user="<ssh-user>", keyPath="/home/.ssh/id_rsa")
-- 跳板机: ssh_connect(host="<internal-host>", user="<ssh-user>", keyPath="...", jumpHost={host:"<bastion-host>", user:"<ssh-user>", keyPath:"..."})`,
+            description: [
+                '建立 SSH 连接并保持会话，支持密码、密钥认证，支持跳板机',
+                '',
+                '可通过 configHost 参数使用 ~/.ssh/config 中的配置，无需重复填写连接信息',
+                '支持 Host 多别名、Host * 全局默认继承、ProxyJump（user@host:port 格式）',
+                '',
+                '示例',
+                '- 使用 ssh config，传入 configHost 为 "myserver"',
+                '- 密钥认证，传入 host、user、keyPath',
+                '- 跳板机，传入 host、user、keyPath 和 jumpHost 配置',
+            ].join('\n'),
             inputSchema: connectSchema,
         },
         (args) => handleConnect(args)
