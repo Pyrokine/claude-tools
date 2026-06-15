@@ -5,10 +5,10 @@ use crate::utils::*;
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -87,7 +87,7 @@ impl Default for SearchParams {
 /// 上限 = clamp((offset + limit) * 2, 1_000, GLOBAL_RESULT_CAP)
 /// 不让 offset 把单文件 cap 拉到无限，否则并行 search_file 会先 OOM 再被全局截断
 fn per_file_cap(params: &SearchParams) -> usize {
-    if params.summary || params.aggregate || params.output.is_some() || params.dry_run {
+    if params.output.is_some() || params.dry_run {
         return usize::MAX;
     }
     if let Some(slice) = &params.slice {
@@ -105,6 +105,7 @@ fn per_file_cap(params: &SearchParams) -> usize {
 
 /// 全局命中硬上限（防止 OOM；超过即截断 + 在响应里标 truncated）
 const GLOBAL_RESULT_CAP: usize = 50_000;
+const STREAMING_UUID_DEDUPE_CAP: usize = GLOBAL_RESULT_CAP;
 
 const TYPE_VALUES: &[&str] = &["assistant", "user", "summary", "system", "other"];
 const SUBTYPE_VALUES: &[&str] = &[
@@ -284,6 +285,16 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
 
     if params.output.is_some() {
         return search_to_output_streaming(
+            &params,
+            &inputs.files,
+            inputs.regex.as_ref(),
+            inputs.search_pattern.as_ref(),
+            start,
+        );
+    }
+
+    if params.aggregate {
+        return search_aggregate_streaming(
             &params,
             &inputs.files,
             inputs.regex.as_ref(),
@@ -820,6 +831,20 @@ fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), ErrorResponse
     Ok(())
 }
 
+fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法创建输出文件: {}", e),
+        available: None,
+    })?;
+    set_private_permissions(path, 0o600)?;
+    Ok(file)
+}
+
 fn prefixed_parent_output(raw: &str, parent: &Path) -> String {
     let parent = parent.to_string_lossy();
     if let Some(rest) = raw.strip_prefix("tmp:") {
@@ -992,12 +1017,7 @@ fn streaming_slice_info(params: &SearchParams, total_matches: usize) -> Option<S
 
 fn create_search_output_file(output: &str) -> Result<(PathBuf, PathBuf, File), ErrorResponse> {
     let (results_path, manifest_path) = resolve_search_output_paths(output)?;
-    let file = File::create(&results_path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建搜索结果文件: {}", e),
-        available: None,
-    })?;
-    set_private_permissions(&results_path, 0o600)?;
+    let file = open_private_output_file(&results_path)?;
     Ok((results_path, manifest_path, file))
 }
 
@@ -1055,12 +1075,7 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         "cap_reasons": ctx.incomplete_reasons,
         "redaction": &redaction,
     });
-    let mut manifest_file = File::create(ctx.manifest_path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建搜索 manifest: {}", e),
-        available: None,
-    })?;
-    set_private_permissions(ctx.manifest_path, 0o600)?;
+    let mut manifest_file = open_private_output_file(ctx.manifest_path)?;
     manifest_file
         .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
         .map_err(|e| ErrorResponse {
@@ -1199,30 +1214,25 @@ fn collect_jsonl_files(
     files
 }
 
-fn search_to_output_streaming(
+fn search_aggregate_streaming(
     params: &SearchParams,
     files: &[(String, String, PathBuf)],
     regex: Option<&Regex>,
     pattern: Option<&SearchPattern>,
     start: Instant,
 ) -> Result<SearchResponse, ErrorResponse> {
-    let output = params.output.as_ref().expect("output checked by caller");
-    let (results_path, manifest_path, mut file) = create_search_output_file(output)?;
     let searched_files = files
         .iter()
         .map(|(_, _, path)| path.display().to_string())
         .collect::<Vec<_>>();
-    let (selection_start, selection_end, explicit_range) = streaming_selection(params);
     let mut aggregation = SearchAggregation::default();
     let mut seen_uuids = HashSet::new();
     let mut files_scanned = 0;
     let mut lines_scanned = 0;
     let mut total_matches = 0;
-    let mut written_count = 0;
-    let mut content_truncated_count = 0;
-    let mut redacted_count = 0;
+    let mut incomplete_reasons = Vec::new();
 
-    for (project_id, session_id, path) in files {
+    'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
         let Ok(input) = File::open(path) else {
             continue;
@@ -1251,8 +1261,116 @@ fn search_to_output_streaming(
             let Some(result) = build_search_result(&ctx, line_num, record) else {
                 continue;
             };
-            if !result.uuid.is_empty() && !seen_uuids.insert(result.uuid.clone()) {
+            if !result.uuid.is_empty() {
+                if seen_uuids.contains(&result.uuid) {
+                    continue;
+                }
+                if seen_uuids.len() >= STREAMING_UUID_DEDUPE_CAP {
+                    incomplete_reasons.push("uuid_dedupe_cap".to_string());
+                    break 'files;
+                }
+                seen_uuids.insert(result.uuid.clone());
+            }
+            total_matches += 1;
+            aggregation.observe(&result);
+        }
+    }
+
+    incomplete_reasons.sort();
+    incomplete_reasons.dedup();
+    let summary_value = Some(aggregation.summary());
+    let coverage = aggregation.coverage(searched_files);
+    let warning = build_response_warning(&incomplete_reasons, params);
+
+    Ok(SearchResponse {
+        stats: SearchStats {
+            files_scanned,
+            lines_scanned,
+            total_matches,
+            returned_count: 0,
+            time_ms: start.elapsed().as_millis() as u64,
+            total_matches_exact: incomplete_reasons.is_empty(),
+            incomplete: !incomplete_reasons.is_empty(),
+            incomplete_reasons,
+            coverage,
+            summary: summary_value,
+            slice: None,
+            effective_filters: effective_filters(params),
+            ignored_keys: params.ignored_keys.clone(),
+            warnings: params.warnings.clone(),
+            truncated_global: None,
+        },
+        results: Vec::new(),
+        has_more: false,
+        next_offset: 0,
+        next_query: None,
+        output: None,
+        warning,
+    })
+}
+
+fn search_to_output_streaming(
+    params: &SearchParams,
+    files: &[(String, String, PathBuf)],
+    regex: Option<&Regex>,
+    pattern: Option<&SearchPattern>,
+    start: Instant,
+) -> Result<SearchResponse, ErrorResponse> {
+    let output = params.output.as_ref().expect("output checked by caller");
+    let (results_path, manifest_path, mut file) = create_search_output_file(output)?;
+    let searched_files = files
+        .iter()
+        .map(|(_, _, path)| path.display().to_string())
+        .collect::<Vec<_>>();
+    let (selection_start, selection_end, explicit_range) = streaming_selection(params);
+    let mut aggregation = SearchAggregation::default();
+    let mut seen_uuids = HashSet::new();
+    let mut files_scanned = 0;
+    let mut lines_scanned = 0;
+    let mut total_matches = 0;
+    let mut written_count = 0;
+    let mut content_truncated_count = 0;
+    let mut redacted_count = 0;
+    let mut incomplete_reasons = Vec::new();
+
+    'files: for (project_id, session_id, path) in files {
+        files_scanned += 1;
+        let Ok(input) = File::open(path) else {
+            continue;
+        };
+        let prefix = ref_prefix(session_id);
+        for (line_num, line) in BufReader::new(input).lines().enumerate() {
+            let line_num = line_num + 1;
+            lines_scanned += 1;
+            if !line_in_ranges(line_num, &params.lines) {
                 continue;
+            }
+            let Ok(line) = line else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<MessageRecord>(&line) else {
+                continue;
+            };
+            let ctx = RecordBuildContext {
+                project_id,
+                session_id,
+                prefix: &prefix,
+                params,
+                regex,
+                pattern,
+            };
+            let Some(result) = build_search_result(&ctx, line_num, record) else {
+                continue;
+            };
+            if !result.uuid.is_empty() {
+                if seen_uuids.contains(&result.uuid) {
+                    continue;
+                }
+                if seen_uuids.len() >= STREAMING_UUID_DEDUPE_CAP {
+                    incomplete_reasons.push("uuid_dedupe_cap".to_string());
+                    break 'files;
+                }
+                seen_uuids.insert(result.uuid.clone());
             }
 
             let result_index = total_matches;
@@ -1291,9 +1409,10 @@ fn search_to_output_streaming(
     })?;
     let bytes = fs::metadata(&results_path).map(|m| m.len()).unwrap_or(0);
     let slice_info = streaming_slice_info(params, total_matches);
+    incomplete_reasons.sort();
+    incomplete_reasons.dedup();
     let summary_value = (params.summary || params.aggregate).then(|| aggregation.summary());
     let coverage = aggregation.coverage(searched_files);
-    let incomplete_reasons = Vec::new();
     let output = Some(write_search_manifest(SearchManifestContext {
         results_path: &results_path,
         manifest_path: &manifest_path,
@@ -1305,23 +1424,12 @@ fn search_to_output_streaming(
         content_truncated_count,
         redaction: params.redaction,
         redacted_count,
-        complete: true,
+        complete: incomplete_reasons.is_empty(),
         explicit_range,
         incomplete_reasons: &incomplete_reasons,
         bytes,
     })?);
-    let warning = if params.warnings.is_empty() && params.ignored_keys.is_empty() {
-        None
-    } else {
-        let mut parts = Vec::new();
-        if !params.warnings.is_empty() {
-            parts.push(format!("查询提示: {}", params.warnings.join("; ")));
-        }
-        if !params.ignored_keys.is_empty() {
-            parts.push(format!("存在未识别参数: {}", params.ignored_keys.join(",")));
-        }
-        Some(parts.join("；"))
-    };
+    let warning = build_response_warning(&incomplete_reasons, params);
 
     Ok(SearchResponse {
         stats: SearchStats {
@@ -1330,8 +1438,8 @@ fn search_to_output_streaming(
             total_matches,
             returned_count: 0,
             time_ms: start.elapsed().as_millis() as u64,
-            total_matches_exact: true,
-            incomplete: false,
+            total_matches_exact: incomplete_reasons.is_empty(),
+            incomplete: !incomplete_reasons.is_empty(),
             incomplete_reasons,
             coverage,
             summary: summary_value,
@@ -1535,10 +1643,11 @@ fn search_file(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::{env, fs, process};
 
     fn write_jsonl(dir: &Path, name: &str, lines: usize) -> PathBuf {
         let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
+        let mut f = fs::File::create(&path).unwrap();
         for i in 0..lines {
             // 构造最小可被 classify_message 识别为 "user" 类型的 jsonl 行
             // 时间戳带毫秒偏移以保证 sort 顺序
@@ -1576,8 +1685,8 @@ mod tests {
 
     #[test]
     fn test_search_file_early_stop_at_cap() {
-        let tmp = std::env::temp_dir().join(format!("mcp-search-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = env::temp_dir().join(format!("mcp-search-test-{}", process::id()));
+        fs::create_dir_all(&tmp).unwrap();
         let path = write_jsonl(&tmp, "session-aaa.jsonl", 200);
 
         let mut p = SearchParams::default();
@@ -1604,13 +1713,13 @@ mod tests {
             cap
         );
 
-        std::fs::remove_dir_all(&tmp).ok();
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn test_search_file_no_break_when_under_cap() {
-        let tmp = std::env::temp_dir().join(format!("mcp-search-test2-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = env::temp_dir().join(format!("mcp-search-test2-{}", process::id()));
+        fs::create_dir_all(&tmp).unwrap();
         let path = write_jsonl(&tmp, "session-bbb.jsonl", 30);
 
         let mut p = SearchParams::default();
@@ -1622,6 +1731,6 @@ mod tests {
         assert_eq!(file_result.lines_scanned, 30);
         assert!(!file_result.truncated, "should not mark truncation under cap");
 
-        std::fs::remove_dir_all(&tmp).ok();
+        fs::remove_dir_all(&tmp).ok();
     }
 }

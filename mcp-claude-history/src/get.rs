@@ -2,10 +2,10 @@ use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const TMP_PATH_PREFIX: &str = "tmp:";
@@ -23,6 +23,20 @@ fn set_private_permissions(path: &Path, mode: u32, target: &str) -> Result<(), E
 #[cfg(not(unix))]
 fn set_private_permissions(_path: &Path, _mode: u32, _target: &str) -> Result<(), ErrorResponse> {
     Ok(())
+}
+
+fn open_private_file(path: &Path, target: &str) -> Result<File, ErrorResponse> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法创建{}: {}", target, e),
+        available: None,
+    })?;
+    set_private_permissions(path, 0o600, target)?;
+    Ok(file)
 }
 
 /// Get 参数
@@ -396,13 +410,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         set_private_permissions(&output_dir, 0o700, "目录")?;
     }
 
-    // 写入内容文件（mode 0o600）
-    let mut file = File::create(&content_path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建文件: {}", e),
-        available: None,
-    })?;
-    set_private_permissions(&content_path, 0o600, "文件")?;
+    let mut file = open_private_file(&content_path, "文件")?;
     file.write_all(request.content.as_bytes()).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("写入文件失败: {}", e),
@@ -416,17 +424,16 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
     for img in &images {
         if let Some((ext, data)) = extract_image_data(request.record, img.index) {
             let img_path = output_dir.join(format!("{}_img{}.{}", safe_ref, img.index, ext));
-            match File::create(&img_path) {
+            match open_private_file(&img_path, "图片文件") {
                 Ok(mut img_file) => {
                     if let Err(e) = img_file.write_all(&data) {
                         image_warnings.push(format!("图片 {} 写入失败: {}", img.index, e));
                     } else {
-                        let _ = set_private_permissions(&img_path, 0o600, "图片文件");
                         image_paths.push(img_path);
                     }
                 }
                 Err(e) => {
-                    image_warnings.push(format!("图片 {} 创建失败: {}", img.index, e));
+                    image_warnings.push(format!("图片 {} 创建失败: {}", img.index, e.message));
                 }
             }
         }
@@ -455,12 +462,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         "sample_kind": if request.content_size == request.original_content_size { "all" } else { "range" },
         "redaction": &redaction,
     });
-    let mut manifest_file = File::create(&manifest_path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建 manifest: {}", e),
-        available: None,
-    })?;
-    set_private_permissions(&manifest_path, 0o600, "manifest")?;
+    let mut manifest_file = open_private_file(&manifest_path, "manifest")?;
     manifest_file
         .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
         .map_err(|e| ErrorResponse {

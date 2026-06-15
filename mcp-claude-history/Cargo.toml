@@ -1,6 +1,6 @@
 [package]
 name = "mcp-claude-history"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 description = "MCP tool for searching Claude Code conversation history"
 authors = ["pyro"]
@@ -11,20 +11,20 @@ name = "mcp-claude-history"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-regex = "1.12"
-rayon = "1.12"
-clap = { version = "4.6", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
-base64 = "0.22"
-glob = "0.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+regex = "1.12.4"
+rayon = "1.12.0"
+clap = { version = "4.6.1", features = ["derive"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+base64 = "0.22.1"
+glob = "0.3.3"
 dirs = "6.0.0"
 # rmcp 用于新 MCP 协议层（替换手写 JSON-RPC）
-rmcp = { version = "1.6", features = ["server", "transport-io", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
-schemars = "1.2"
-anyhow = "1"
+rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"] }
+schemars = "1.2.1"
+anyhow = "1.0.102"
 
 [profile.release]
 opt-level = 3

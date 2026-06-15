@@ -806,7 +806,7 @@ pub fn redact_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
             "[redacted-host]".to_string()
         });
     let text = INTERNAL_URL_RE
-        .get_or_init(|| Regex::new(r#"https?://[^\s\"'<>]+"#).expect("valid regex"))
+        .get_or_init(|| Regex::new(r#"https?://[^\s"'<>]+"#).expect("valid regex"))
         .replace_all(&result, |_: &regex::Captures<'_>| {
             count += 1;
             "[redacted-url]".to_string()

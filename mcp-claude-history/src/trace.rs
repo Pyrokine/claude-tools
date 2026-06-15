@@ -3,10 +3,10 @@ use crate::get::{find_session_file, resolve_output_files};
 use crate::types::*;
 use crate::utils::*;
 use regex::{Regex, RegexBuilder};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -21,6 +21,20 @@ fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorResponse> 
 #[cfg(not(unix))]
 fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
     Ok(())
+}
+
+fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法创建输出文件: {}", e),
+        available: None,
+    })?;
+    set_private_permissions(path, 0o600)?;
+    Ok(file)
 }
 
 pub struct TraceParams {
@@ -351,12 +365,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         if was_new {
             set_private_permissions(&output_dir, 0o700)?;
         }
-        let mut file = File::create(&out_path).map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("无法创建输出文件: {}", e),
-            available: None,
-        })?;
-        set_private_permissions(&out_path, 0o600)?;
+        let mut file = open_private_output_file(&out_path)?;
         let mut written_messages = 0usize;
         let mut redacted_count = 0usize;
         for (idx, item) in records.iter().enumerate().take(end).skip(start) {
@@ -447,12 +456,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             "sample_kind": "selected_range",
             "redaction": &redaction,
         });
-        let mut manifest_file = File::create(&manifest_path).map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("无法创建 trace manifest: {}", e),
-            available: None,
-        })?;
-        set_private_permissions(&manifest_path, 0o600)?;
+        let mut manifest_file = open_private_output_file(&manifest_path)?;
         manifest_file
             .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
             .map_err(|e| ErrorResponse {
