@@ -81,32 +81,36 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ### history_search
 
-| 参数               | 类型      | 默认值                    | 说明                                                       |
-|------------------|---------|------------------------|----------------------------------------------------------|
-| `pattern`        | string  | ""                     | 搜索词（空字符串返回所有）                                            |
-| `project`        | string  | 当前项目                   | 项目 ID（逗号分隔）                                              |
-| `all`            | boolean | false                  | 搜索所有项目                                                   |
-| `sessions`       | string  | -                      | 会话 ID（逗号分隔）                                              |
-| `since`          | string  | -                      | 起始时间，支持 RFC3339 或 YYYY-MM-DD                             |
-| `until`          | string  | -                      | 结束时间，支持 RFC3339 或 YYYY-MM-DD                             |
-| `types`          | string  | assistant,user,summary | 消息类型                                                     |
-| `servers`        | string  | -                      | MCP server 过滤，逗号分隔                                       |
-| `tools`          | string  | -                      | MCP tool 过滤，逗号分隔                                         |
-| `lines`          | string  | -                      | 行号范围（如 100-200, !300-400）                                |
-| `regex`          | boolean | false                  | 使用正则                                                     |
-| `case_sensitive` | boolean | false                  | 区分大小写                                                    |
-| `subagents`      | boolean | false                  | 包含 `subagents` 和 `remote-agents` 下的 sidechain transcript |
-| `summary`        | boolean | false                  | 返回聚合摘要，不返回完整结果正文                                         |
-| `output`         | string  | -                      | 写结果文件，相对路径默认走受控临时目录                                      |
-| `output_format`  | string  | jsonl                  | `jsonl`                                                  |
-| `redaction`      | string  | auto                   | `auto`、`strict` 或 `off`                                  |
-| `offset`         | number  | 0                      | 跳过前 N 条，不能和 `slice` 同用                                   |
-| `limit`          | number  | -                      | 最多返回 N 条，不能和 `slice` 同用                                  |
-| `slice`          | string  | -                      | 过滤和排序后的 Python 风格消息切片                                    |
-| `max_content`    | number  | 4000                   | 单条最大字符数                                                  |
-| `max_total`      | number  | 40000                  | 总最大字符数                                                   |
+| 参数                    | 类型      | 默认值                    | 说明                                                       |
+|-----------------------|---------|------------------------|----------------------------------------------------------|
+| `pattern`             | string  | ""                     | 搜索词（空字符串返回所有）                                            |
+| `project`             | string  | 当前项目                   | 项目 ID（逗号分隔）                                              |
+| `all`                 | boolean | false                  | 搜索所有项目                                                   |
+| `sessions`            | string  | -                      | 会话 ID（逗号分隔）                                              |
+| `since`               | string  | -                      | 起始时间，支持 RFC3339 或 YYYY-MM-DD                             |
+| `until`               | string  | -                      | 结束时间，支持 RFC3339 或 YYYY-MM-DD                             |
+| `types`               | string  | assistant,user,summary | 消息类型                                                     |
+| `servers`             | string  | -                      | MCP server 过滤，逗号分隔                                       |
+| `tools`               | string  | -                      | MCP tool 过滤，逗号分隔                                         |
+| `lines`               | string  | -                      | 行号范围（如 100-200, !300-400）                                |
+| `regex`               | boolean | false                  | 使用正则                                                     |
+| `case_sensitive`      | boolean | false                  | 区分大小写                                                    |
+| `subagents`           | boolean | false                  | 包含 `subagents` 和 `remote-agents` 下的 sidechain transcript |
+| `summary`             | boolean | false                  | 返回聚合摘要，不返回完整结果正文                                         |
+| `failed_tool_results` | boolean | false                  | 只返回 harness 标记 `is_error=true` 的 tool_result             |
+| `tool_payload_errors` | boolean | false                  | 只返回 JSON payload 自身报告错误的 tool_result                     |
+| `output`              | string  | -                      | 写结果文件，相对路径默认走受控临时目录                                      |
+| `output_format`       | string  | jsonl                  | `jsonl`                                                  |
+| `redaction`           | string  | auto                   | `auto`、`strict` 或 `off`                                  |
+| `offset`              | number  | 0                      | 跳过前 N 条，不能和 `slice` 同用                                   |
+| `limit`               | number  | -                      | 最多返回 N 条，不能和 `slice` 同用                                  |
+| `slice`               | string  | -                      | 过滤和排序后的 Python 风格消息切片                                    |
+| `max_content`         | number  | 4000                   | 单条最大字符数                                                  |
+| `max_total`           | number  | 40000                  | 总最大字符数                                                   |
 
-默认 `types` 包含 `summary`，会检索上下文压缩摘要，只看原始对话时使用 `types=assistant,user`
+默认 `types` 包含 `summary`，会检索上下文压缩摘要，只看原始对话时使用 `types=assistant,user`，`failed_tool_results`
+保持旧语义，只检查
+`tool_result.is_error`；`tool_payload_errors` 用于查找工具结果成功返回但正文 JSON 中包含 `success=false` 或 `error` 的记录
 
 搜索输出默认使用 `redaction=auto` 处理消息正文、`tool_use` 预览和结构化 tool 字段，`auto` 覆盖 Authorization header，以及常见
 password、token、cookie、API key、secret、private key、key path 字段，`strict` 还会处理 private key block、private host name 和
@@ -206,6 +210,9 @@ mcp-claude-history search "bug" --project -home-user-myproject
 
 # 过滤 MCP tool call 并返回摘要
 mcp-claude-history search "" --servers mcp-chrome --tools browse,evaluate --summary
+
+# 查找工具结果成功返回但正文 JSON 仍报告错误的记录
+mcp-claude-history search "" --tool-payload-errors --servers mcp-chrome
 
 # 写 JSONL 便于分块处理
 mcp-claude-history search "error" --output tmp:history/error.jsonl --output-format jsonl

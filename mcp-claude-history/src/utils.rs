@@ -1,5 +1,6 @@
-use crate::types::{ImageInfo, MessageRecord, RedactionInfo, ToolInfo};
+use crate::types::{ErrorResponse, ImageInfo, MessageRecord, RedactionInfo, ToolInfo};
 use regex::Regex;
+use std::io::Write;
 use std::sync::OnceLock;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,106 @@ pub fn parse_redaction_mode_param(value: &str) -> Result<RedactionMode, String> 
     }
 }
 
+pub struct ExportMessage<'a> {
+    pub line_num: usize,
+    pub effective_type: &'a str,
+    pub subtype: &'a str,
+    pub content: &'a str,
+    pub redacted_count: usize,
+}
+
+pub struct MessageExportFilters<'a> {
+    pub types: &'a [String],
+    pub subtypes: &'a [String],
+    pub compiled_regex: &'a Option<Regex>,
+    pub plain_pattern: &'a Option<String>,
+    pub case_sensitive: bool,
+}
+
+fn export_io_error(error: std::io::Error) -> ErrorResponse {
+    ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("写文件失败: {}", error),
+        available: None,
+    }
+}
+
+fn export_matches_types(effective_type: &str, types: &[String]) -> bool {
+    types.is_empty() || types.iter().any(|t| t == effective_type)
+}
+
+fn export_matches_subtypes(subtype: &str, subtypes: &[String]) -> bool {
+    subtypes.is_empty() || subtypes.iter().any(|t| t == subtype)
+}
+
+fn export_matches_pattern(
+    content: &str,
+    compiled: &Option<Regex>,
+    plain: &Option<String>,
+    case_sensitive: bool,
+) -> bool {
+    if let Some(re) = compiled {
+        return re.is_match(content);
+    }
+    if let Some(p) = plain {
+        if case_sensitive {
+            return content.contains(p.as_str());
+        }
+        return content.to_lowercase().contains(p.as_str());
+    }
+    true
+}
+
+pub fn write_filtered_message_export<'a, W, I>(
+    writer: &mut W,
+    prefix: &str,
+    items: I,
+    anchor_idx: usize,
+    filters: MessageExportFilters<'_>,
+) -> Result<(usize, usize), ErrorResponse>
+    where
+        W: Write,
+        I: IntoIterator<Item=(usize, ExportMessage<'a>)>,
+{
+    let mut written_messages = 0usize;
+    let mut redacted_count = 0usize;
+    let has_pattern_filter = filters.compiled_regex.is_some() || filters.plain_pattern.is_some();
+
+    for (idx, item) in items {
+        let is_anchor = idx == anchor_idx;
+        if !is_anchor
+            && (!export_matches_types(item.effective_type, filters.types)
+            || !export_matches_subtypes(item.subtype, filters.subtypes))
+        {
+            continue;
+        }
+        if !is_anchor
+            && has_pattern_filter
+            && !export_matches_pattern(
+            item.content,
+            filters.compiled_regex,
+            filters.plain_pattern,
+            filters.case_sensitive,
+        )
+        {
+            continue;
+        }
+        let anchor_mark = if is_anchor { " [anchor]" } else { "" };
+        writeln!(
+            writer,
+            "=== {}:{} {} {}{} ===",
+            prefix, item.line_num, item.effective_type, item.subtype, anchor_mark
+        )
+            .map_err(export_io_error)?;
+        writeln!(writer, "{}", item.content).map_err(export_io_error)?;
+        writeln!(writer).map_err(export_io_error)?;
+        written_messages += 1;
+        redacted_count += item.redacted_count;
+    }
+
+    Ok((written_messages, redacted_count))
+}
+
 /// 消息分类：(effective_type, subtype)
 ///
 /// effective_type：修正后的类型（isCompactSummary 的 user → summary）
@@ -58,8 +159,8 @@ pub fn classify_message(record: &MessageRecord) -> (&'static str, &'static str) 
                 }
                 if let Some(arr) = content.as_array()
                     && arr
-                        .iter()
-                        .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    .iter()
+                    .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
                 {
                     return ("user", "tool_result");
                 }
@@ -757,7 +858,7 @@ pub fn redact_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
             Regex::new(
                 r#"(?i)\b((?:password|passwd|pwd|token|cookie|api[_-]?key|secret|private[_-]?key|keypath|key_path)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)"#,
             )
-            .expect("valid regex")
+                .expect("valid regex")
         })
         .replace_all(&result, |caps: &regex::Captures<'_>| {
             count += 1;
@@ -799,7 +900,7 @@ pub fn redact_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
             Regex::new(
                 r"\b(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})\b",
             )
-            .expect("valid regex")
+                .expect("valid regex")
         })
         .replace_all(&result, |_: &regex::Captures<'_>| {
             count += 1;
@@ -889,26 +990,78 @@ fn is_sensitive_key(lower_key: &str, mode: RedactionMode) -> bool {
         || lower_key.contains("keypath")
         || lower_key.contains("key_path")
         || (mode == RedactionMode::Strict
-            && (lower_key.contains("host")
-                || lower_key.contains("url")
-                || lower_key.contains("endpoint")
-                || lower_key.contains("domain")))
+        && (lower_key.contains("host")
+        || lower_key.contains("url")
+        || lower_key.contains("endpoint")
+        || lower_key.contains("domain")))
 }
 
 pub struct StructuredToolData {
     pub input: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub result_is_error: Option<bool>,
+    pub result_has_error_payload: Option<bool>,
     pub raw_available: bool,
     pub redacted: bool,
 }
 
-pub fn extract_structured_tool_data_with_mode(record: &MessageRecord, mode: RedactionMode) -> StructuredToolData {
+fn json_payload_has_error(value: &serde_json::Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    if map.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        return true;
+    }
+    if map.get("isError").and_then(|v| v.as_bool()) == Some(true)
+        || map.get("is_error").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return true;
+    }
+    map.get("error").is_some_and(|error| match error {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        _ => true,
+    })
+}
+
+fn parse_json_payload_text(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(text.trim()).ok()
+}
+
+fn tool_result_has_error_payload(item: &serde_json::Value) -> bool {
+    let Some(content) = item.get("content") else {
+        return false;
+    };
+    if let Some(text) = content.as_str() {
+        return parse_json_payload_text(text)
+            .as_ref()
+            .is_some_and(json_payload_has_error);
+    }
+    let Some(items) = content.as_array() else {
+        return json_payload_has_error(content);
+    };
+    items.iter().any(|content_item| {
+        content_item
+            .get("text")
+            .and_then(|v| v.as_str())
+            .and_then(parse_json_payload_text)
+            .as_ref()
+            .is_some_and(json_payload_has_error)
+            || json_payload_has_error(content_item)
+    })
+}
+
+pub fn extract_structured_tool_data_with_mode(
+    record: &MessageRecord,
+    mode: RedactionMode,
+    detect_error_payload: bool,
+) -> StructuredToolData {
     let Some(message) = &record.message else {
         return StructuredToolData {
             input: None,
             result: None,
             result_is_error: None,
+            result_has_error_payload: None,
             raw_available: false,
             redacted: false,
         };
@@ -918,6 +1071,7 @@ pub fn extract_structured_tool_data_with_mode(record: &MessageRecord, mode: Reda
             input: None,
             result: None,
             result_is_error: None,
+            result_has_error_payload: None,
             raw_available: false,
             redacted: false,
         };
@@ -926,6 +1080,7 @@ pub fn extract_structured_tool_data_with_mode(record: &MessageRecord, mode: Reda
     let mut input = None;
     let mut result = None;
     let mut result_is_error = None;
+    let mut result_has_error_payload = None;
     for item in content {
         match item.get("type").and_then(|t| t.as_str()) {
             Some("tool_use") => {
@@ -936,6 +1091,10 @@ pub fn extract_structured_tool_data_with_mode(record: &MessageRecord, mode: Reda
             Some("tool_result") => {
                 result = Some(redact_value_with_mode(item, mode));
                 result_is_error = item.get("is_error").and_then(|v| v.as_bool());
+                if detect_error_payload {
+                    result_has_error_payload =
+                        Some(result_has_error_payload.unwrap_or(false) || tool_result_has_error_payload(item));
+                }
             }
             _ => {}
         }
@@ -946,6 +1105,7 @@ pub fn extract_structured_tool_data_with_mode(record: &MessageRecord, mode: Reda
         input,
         result,
         result_is_error,
+        result_has_error_payload,
         raw_available,
         redacted: mode.enabled() && raw_available,
     }

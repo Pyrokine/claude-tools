@@ -37,6 +37,7 @@ pub struct SearchParams {
     pub summary: bool,
     pub aggregate: bool,
     pub failed_tool_results: bool,
+    pub tool_payload_errors: bool,
     pub dry_run: bool,
     pub redaction: RedactionMode,
     pub ignored_keys: Vec<String>,
@@ -72,6 +73,7 @@ impl Default for SearchParams {
             summary: false,
             aggregate: false,
             failed_tool_results: false,
+            tool_payload_errors: false,
             dry_run: false,
             redaction: RedactionMode::Auto,
             ignored_keys: Vec::new(),
@@ -193,7 +195,7 @@ fn normalize_filters(mut params: SearchParams) -> SearchParams {
         }
     }
 
-    if params.failed_tool_results {
+    if params.failed_tool_results || params.tool_payload_errors {
         normalized_types.clear();
         final_subtypes.clear();
         push_unique(&mut normalized_types, "user");
@@ -219,6 +221,7 @@ fn effective_filters(params: &SearchParams) -> EffectiveFilters {
         subtypes: params.subtypes.clone(),
         servers: params.servers.clone(),
         tools: params.tools.clone(),
+        tool_payload_errors: params.tool_payload_errors,
         regex: params.use_regex,
         case_sensitive: params.case_sensitive,
     }
@@ -456,10 +459,10 @@ fn collect_search_results(
 
     results.sort_by(|a, b| {
         a.timestamp
-            .cmp(&b.timestamp)
-            .then_with(|| a.project.cmp(&b.project))
-            .then_with(|| a.session.cmp(&b.session))
-            .then_with(|| a.line.cmp(&b.line))
+         .cmp(&b.timestamp)
+         .then_with(|| a.project.cmp(&b.project))
+         .then_with(|| a.session.cmp(&b.session))
+         .then_with(|| a.line.cmp(&b.line))
     });
 
     let mut seen_uuids = HashSet::new();
@@ -733,6 +736,9 @@ fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Va
     if params.failed_tool_results {
         query.insert("failed_tool_results".to_string(), serde_json::Value::Bool(true));
     }
+    if params.tool_payload_errors {
+        query.insert("tool_payload_errors".to_string(), serde_json::Value::Bool(true));
+    }
     if params.subagents {
         query.insert("subagents".to_string(), serde_json::Value::Bool(true));
     }
@@ -778,8 +784,8 @@ fn build_coverage(results: &[SearchResult], searched_files: Vec<String>) -> Sear
 
 fn buckets(map: BTreeMap<String, usize>) -> Vec<SummaryBucket> {
     map.into_iter()
-        .map(|(key, count)| SummaryBucket { key, count })
-        .collect()
+       .map(|(key, count)| SummaryBucket { key, count })
+       .collect()
 }
 
 fn build_summary(results: &[SearchResult]) -> SearchSummary {
@@ -1048,7 +1054,7 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
     } else {
         "incomplete"
     }
-    .to_string();
+        .to_string();
     let sample_kind = if ctx.explicit_range { "range" } else { "all" }.to_string();
     let redaction = redaction_info(
         ctx.redaction,
@@ -1497,8 +1503,12 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         }
     }
 
-    let structured_tool_data = extract_structured_tool_data_with_mode(&record, ctx.params.redaction);
+    let structured_tool_data =
+        extract_structured_tool_data_with_mode(&record, ctx.params.redaction, ctx.params.tool_payload_errors);
     if ctx.params.failed_tool_results && structured_tool_data.result_is_error != Some(true) {
+        return None;
+    }
+    if ctx.params.tool_payload_errors && structured_tool_data.result_has_error_payload != Some(true) {
         return None;
     }
 
@@ -1538,6 +1548,12 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
     if let Some(tool) = &tool_info.tool {
         matched_filters.push(format!("tool={}", tool));
     }
+    if ctx.params.failed_tool_results {
+        matched_filters.push("failed_tool_results=true".to_string());
+    }
+    if ctx.params.tool_payload_errors {
+        matched_filters.push("tool_payload_errors=true".to_string());
+    }
 
     Some(SearchResult {
         r#ref: format!("{}:{}", ctx.prefix, line_num),
@@ -1558,6 +1574,7 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         tool_input_redacted: structured_tool_data.input,
         tool_result_redacted: structured_tool_data.result,
         tool_result_is_error: structured_tool_data.result_is_error,
+        tool_result_has_error_payload: structured_tool_data.result_has_error_payload,
         raw_available: (structured_tool_data.raw_available || content_redacted).then_some(true),
         redacted: (structured_tool_data.redacted || content_redacted).then_some(true),
         matched_filters,

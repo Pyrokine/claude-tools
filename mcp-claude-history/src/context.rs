@@ -383,47 +383,35 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             set_private_permissions(&output_dir, 0o700)?;
         }
         let mut file = open_private_output_file(&out_path)?;
-        let mut written_messages = 0usize;
-        let mut redacted_count = 0usize;
-        for (i, msg) in all_messages.iter().enumerate().take(end_idx).skip(start_idx) {
-            let is_anchor = i == anchor_idx;
-            if !is_anchor
-                && (!matches_types(msg.effective_type, &params.types)
-                    || !matches_subtypes(msg.subtype, &params.subtypes))
-            {
-                continue;
-            }
-            let has_pattern_filter = compiled_regex.is_some() || plain_pattern.is_some();
-            if !is_anchor
-                && has_pattern_filter
-                && !matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive)
-            {
-                continue;
-            }
-            let anchor_mark = if is_anchor { " [anchor]" } else { "" };
-            writeln!(
-                file,
-                "=== {}:{} {} {}{} ===",
-                prefix, msg.line_num, msg.effective_type, msg.subtype, anchor_mark
-            )
-            .map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写文件失败: {}", e),
-                available: None,
-            })?;
-            writeln!(file, "{}", msg.content).map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写文件失败: {}", e),
-                available: None,
-            })?;
-            writeln!(file).map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写文件失败: {}", e),
-                available: None,
-            })?;
-            written_messages += 1;
-            redacted_count += msg.redacted_count;
-        }
+        let (written_messages, redacted_count) = write_filtered_message_export(
+            &mut file,
+            &prefix,
+            all_messages
+                .iter()
+                .enumerate()
+                .take(end_idx)
+                .skip(start_idx)
+                .map(|(idx, msg)| {
+                    (
+                        idx,
+                        ExportMessage {
+                            line_num: msg.line_num,
+                            effective_type: msg.effective_type,
+                            subtype: msg.subtype,
+                            content: &msg.content,
+                            redacted_count: msg.redacted_count,
+                        },
+                    )
+                }),
+            anchor_idx,
+            MessageExportFilters {
+                types: &params.types,
+                subtypes: &params.subtypes,
+                compiled_regex: &compiled_regex,
+                plain_pattern: &plain_pattern,
+                case_sensitive: params.case_sensitive,
+            },
+        )?;
         file.flush().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
             message: format!("刷新 context 输出失败: {}", e),

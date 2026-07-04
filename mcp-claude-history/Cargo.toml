@@ -1,6 +1,6 @@
 [package]
 name = "mcp-claude-history"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 description = "MCP tool for searching Claude Code conversation history"
 authors = ["pyro"]
@@ -21,10 +21,10 @@ base64 = "0.22.1"
 glob = "0.3.3"
 dirs = "6.0.0"
 # rmcp 用于新 MCP 协议层（替换手写 JSON-RPC）
-rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "2.1.0", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"] }
 schemars = "1.2.1"
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 
 [profile.release]
 opt-level = 3

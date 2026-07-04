@@ -37,9 +37,9 @@ fn split_csv(value: Option<String>) -> Vec<String> {
     value
         .map(|v| {
             v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+             .map(|s| s.trim().to_string())
+             .filter(|s| !s.is_empty())
+             .collect()
         })
         .unwrap_or_default()
 }
@@ -167,6 +167,10 @@ enum Commands {
         /// Only return failed tool_result messages
         #[arg(long)]
         failed_tool_results: bool,
+
+        /// Only return tool_result messages whose JSON payload reports an error
+        #[arg(long)]
+        tool_payload_errors: bool,
 
         /// Preview scanned projects, sessions and files without reading message contents
         #[arg(long)]
@@ -431,6 +435,7 @@ async fn main() -> anyhow::Result<()> {
             summary,
             aggregate,
             failed_tool_results,
+            tool_payload_errors,
             dry_run,
             output,
             output_format,
@@ -473,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
                     summary,
                     aggregate,
                     failed_tool_results,
+                    tool_payload_errors,
                     dry_run,
                     redaction: parse_redaction(redaction)?,
                     ignored_keys: Vec::new(),

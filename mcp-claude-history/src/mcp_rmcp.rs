@@ -55,6 +55,13 @@ pub struct SearchToolParams {
     pub failed_tool_results: Option<bool>,
     #[serde(default, alias = "failedToolsOnly", alias = "tool_error")]
     pub failed_tools_only: Option<bool>,
+    #[serde(
+        default,
+        alias = "toolPayloadErrors",
+        alias = "payload_errors",
+        alias = "error_payload_only"
+    )]
+    pub tool_payload_errors: Option<bool>,
     #[serde(default, alias = "dryRun", alias = "explain")]
     pub dry_run: Option<bool>,
     #[serde(default)]
@@ -192,9 +199,9 @@ pub struct McpHistoryService {
 
 fn comma_split(s: &str) -> Vec<String> {
     s.split(',')
-        .map(|x| x.trim().to_string())
-        .filter(|x| !x.is_empty())
-        .collect()
+     .map(|x| x.trim().to_string())
+     .filter(|x| !x.is_empty())
+     .collect()
 }
 
 fn arg_error(message: impl Into<String>) -> ErrorResponse {
@@ -257,7 +264,7 @@ fn pretty_error(error: ErrorResponse) -> String {
 }
 
 fn ok_text(text: String) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 impl McpHistoryService {
@@ -326,6 +333,7 @@ impl McpHistoryService {
             summary: p.summary.unwrap_or(false),
             aggregate: p.aggregate.unwrap_or(false),
             failed_tool_results: p.failed_tool_results.unwrap_or(false) || p.failed_tools_only.unwrap_or(false),
+            tool_payload_errors: p.tool_payload_errors.unwrap_or(false),
             dry_run: p.dry_run.unwrap_or(false),
             redaction,
             ignored_keys,

@@ -47,6 +47,8 @@ pub struct SearchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result_is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_has_error_payload: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_available: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted: Option<bool>,
@@ -168,6 +170,7 @@ pub struct EffectiveFilters {
     pub subtypes: Vec<String>,
     pub servers: Vec<String>,
     pub tools: Vec<String>,
+    pub tool_payload_errors: bool,
     pub regex: bool,
     pub case_sensitive: bool,
 }

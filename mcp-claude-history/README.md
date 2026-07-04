@@ -81,33 +81,38 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ### history_search
 
-| Parameter        | Type    | Default                | Description                                                         |
-|------------------|---------|------------------------|---------------------------------------------------------------------|
-| `pattern`        | string  | ""                     | Search pattern (empty returns all)                                  |
-| `project`        | string  | current                | Project ID (comma-separated)                                        |
-| `all`            | boolean | false                  | Search all projects                                                 |
-| `sessions`       | string  | -                      | Session IDs (comma-separated)                                       |
-| `since`          | string  | -                      | Start time, RFC3339 or YYYY-MM-DD                                   |
-| `until`          | string  | -                      | End time, RFC3339 or YYYY-MM-DD                                     |
-| `types`          | string  | assistant,user,summary | Message types                                                       |
-| `servers`        | string  | -                      | MCP server filter, comma-separated                                  |
-| `tools`          | string  | -                      | MCP tool filter, comma-separated                                    |
-| `lines`          | string  | -                      | Line ranges (e.g., 100-200, !300-400)                               |
-| `regex`          | boolean | false                  | Use regex                                                           |
-| `case_sensitive` | boolean | false                  | Case sensitive                                                      |
-| `subagents`      | boolean | false                  | Include sidechain transcripts under `subagents` and `remote-agents` |
-| `summary`        | boolean | false                  | Return grouped summary instead of full result content               |
-| `output`         | string  | -                      | Write result file, relative paths use controlled temp               |
-| `output_format`  | string  | jsonl                  | `jsonl`                                                             |
-| `redaction`      | string  | auto                   | `auto`, `strict`, or `off`                                          |
-| `offset`         | number  | 0                      | Skip first N results, mutually exclusive with `slice`               |
-| `limit`          | number  | -                      | Max results to return, mutually exclusive with `slice`              |
-| `slice`          | string  | -                      | Python-style message slice after filtering and sorting              |
-| `max_content`    | number  | 4000                   | Max chars per result                                                |
-| `max_total`      | number  | 40000                  | Max total chars                                                     |
+| Parameter             | Type    | Default                | Description                                                         |
+|-----------------------|---------|------------------------|---------------------------------------------------------------------|
+| `pattern`             | string  | ""                     | Search pattern (empty returns all)                                  |
+| `project`             | string  | current                | Project ID (comma-separated)                                        |
+| `all`                 | boolean | false                  | Search all projects                                                 |
+| `sessions`            | string  | -                      | Session IDs (comma-separated)                                       |
+| `since`               | string  | -                      | Start time, RFC3339 or YYYY-MM-DD                                   |
+| `until`               | string  | -                      | End time, RFC3339 or YYYY-MM-DD                                     |
+| `types`               | string  | assistant,user,summary | Message types                                                       |
+| `servers`             | string  | -                      | MCP server filter, comma-separated                                  |
+| `tools`               | string  | -                      | MCP tool filter, comma-separated                                    |
+| `lines`               | string  | -                      | Line ranges (e.g., 100-200, !300-400)                               |
+| `regex`               | boolean | false                  | Use regex                                                           |
+| `case_sensitive`      | boolean | false                  | Case sensitive                                                      |
+| `subagents`           | boolean | false                  | Include sidechain transcripts under `subagents` and `remote-agents` |
+| `summary`             | boolean | false                  | Return grouped summary instead of full result content               |
+| `failed_tool_results` | boolean | false                  | Only return tool results where the harness marked `is_error=true`   |
+| `tool_payload_errors` | boolean | false                  | Only return tool results whose JSON payload reports an error        |
+| `output`              | string  | -                      | Write result file, relative paths use controlled temp               |
+| `output_format`       | string  | jsonl                  | `jsonl`                                                             |
+| `redaction`           | string  | auto                   | `auto`, `strict`, or `off`                                          |
+| `offset`              | number  | 0                      | Skip first N results, mutually exclusive with `slice`               |
+| `limit`               | number  | -                      | Max results to return, mutually exclusive with `slice`              |
+| `slice`               | string  | -                      | Python-style message slice after filtering and sorting              |
+| `max_content`         | number  | 4000                   | Max chars per result                                                |
+| `max_total`           | number  | 40000                  | Max total chars                                                     |
 
 Default `types` includes `summary`, which means context-compression summaries are searchable. Use `types=assistant,user`
-when you only want original conversation turns.
+when you only want original conversation turns. `failed_tool_results` keeps the old harness-level meaning and only
+checks
+`tool_result.is_error`; `tool_payload_errors` is for tools that returned `success=false` or an `error` JSON payload
+inside a successful tool result.
 
 Search output uses `redaction=auto` by default for message content, `tool_use` previews, and structured tool fields.
 `auto` covers Authorization headers plus common password, token, cookie, API key, secret, private key, and key path
@@ -210,6 +215,9 @@ mcp-claude-history search "bug" --project -home-user-myproject
 
 # Filter MCP tool calls and return a summary
 mcp-claude-history search "" --servers mcp-chrome --tools browse,evaluate --summary
+
+# Find successful tool results whose JSON payload still reports an error
+mcp-claude-history search "" --tool-payload-errors --servers mcp-chrome
 
 # Write JSONL for chunked processing
 mcp-claude-history search "error" --output tmp:history/error.jsonl --output-format jsonl

@@ -486,7 +486,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
             } else {
                 "range"
             }
-            .to_string(),
+                .to_string(),
             redaction,
         },
         content_size: request.content_size,
@@ -510,11 +510,11 @@ pub fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
         message: format!("无法获取当前工作目录: {}", e),
         available: None,
     })?)
-    .map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("canonicalize cwd 失败: {}", e),
-        available: None,
-    })?;
+        .map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("canonicalize cwd 失败: {}", e),
+            available: None,
+        })?;
 
     let temp_root = controlled_temp_root()?;
 

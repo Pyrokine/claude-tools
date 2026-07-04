@@ -321,16 +321,16 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         tool_calls.retain(|tc| {
             let server_ok = params.servers.is_empty()
                 || tc
-                    .server
-                    .as_deref()
-                    .map(|s| params.servers.iter().any(|f| f == s))
-                    .unwrap_or(false);
+                .server
+                .as_deref()
+                .map(|s| params.servers.iter().any(|f| f == s))
+                .unwrap_or(false);
             let tool_ok = params.tools.is_empty()
                 || tc
-                    .tool
-                    .as_deref()
-                    .map(|t| params.tools.iter().any(|f| f == t))
-                    .unwrap_or(false);
+                .tool
+                .as_deref()
+                .map(|t| params.tools.iter().any(|f| f == t))
+                .unwrap_or(false);
             server_ok && tool_ok
         });
     }
@@ -366,47 +366,30 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             set_private_permissions(&output_dir, 0o700)?;
         }
         let mut file = open_private_output_file(&out_path)?;
-        let mut written_messages = 0usize;
-        let mut redacted_count = 0usize;
-        for (idx, item) in records.iter().enumerate().take(end).skip(start) {
-            let is_anchor = idx == anchor_idx;
-            if !is_anchor
-                && (!matches_types(item.effective_type, &params.types)
-                    || !matches_subtypes(item.subtype, &params.subtypes))
-            {
-                continue;
-            }
-            let has_pattern_filter = compiled_regex.is_some() || plain_pattern.is_some();
-            if !is_anchor
-                && has_pattern_filter
-                && !matches_pattern(&item.content, &compiled_regex, &plain_pattern, params.case_sensitive)
-            {
-                continue;
-            }
-            let anchor_mark = if is_anchor { " [anchor]" } else { "" };
-            writeln!(
-                file,
-                "=== {}:{} {} {}{} ===",
-                prefix, item.line_num, item.effective_type, item.subtype, anchor_mark
-            )
-            .map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写文件失败: {}", e),
-                available: None,
-            })?;
-            writeln!(file, "{}", item.content).map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写文件失败: {}", e),
-                available: None,
-            })?;
-            writeln!(file).map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写文件失败: {}", e),
-                available: None,
-            })?;
-            written_messages += 1;
-            redacted_count += item.redacted_count;
-        }
+        let (written_messages, redacted_count) = write_filtered_message_export(
+            &mut file,
+            &prefix,
+            records.iter().enumerate().take(end).skip(start).map(|(idx, item)| {
+                (
+                    idx,
+                    ExportMessage {
+                        line_num: item.line_num,
+                        effective_type: item.effective_type,
+                        subtype: item.subtype,
+                        content: &item.content,
+                        redacted_count: item.redacted_count,
+                    },
+                )
+            }),
+            anchor_idx,
+            MessageExportFilters {
+                types: &params.types,
+                subtypes: &params.subtypes,
+                compiled_regex: &compiled_regex,
+                plain_pattern: &plain_pattern,
+                case_sensitive: params.case_sensitive,
+            },
+        )?;
         if !response.tool_calls.is_empty() {
             writeln!(file, "=== tool_calls ===").map_err(|e| ErrorResponse {
                 error: "io_error".to_string(),
