@@ -1140,6 +1140,21 @@ async function buildSingleFileVerification(
     }
 }
 
+async function resolveSftpUploadFileTarget(alias: string, localPath: string, remotePath: string): Promise<string> {
+    if (remotePath.endsWith('/')) {
+        return path.posix.join(remotePath, path.basename(localPath))
+    }
+    try {
+        const info = await getFileInfo(alias, remotePath)
+        if (info.isDirectory) {
+            return path.posix.join(remotePath, path.basename(localPath))
+        }
+    } catch {
+        // Missing remote targets are handled by uploadFile below.
+    }
+    return remotePath
+}
+
 async function syncWithSftp(
     alias: string,
     localPath: string,
@@ -1208,11 +1223,12 @@ async function syncWithSftp(
                 )
                 return buildDirectorySyncResult(result, warnings)
             }
-            const existed = await remoteExists(alias, remotePath)
-            const { size } = await uploadFile(alias, localPath, remotePath)
+            const targetRemotePath = await resolveSftpUploadFileTarget(alias, localPath, remotePath)
+            const existed = await remoteExists(alias, targetRemotePath)
+            const { size } = await uploadFile(alias, localPath, targetRemotePath)
             return {
                 ...buildSyncResult(1, size, warnings, 0, { added: existed ? 0 : 1, updated: existed ? 1 : 0 }),
-                verification: await buildSingleFileVerification(alias, localPath, remotePath, 'upload'),
+                verification: await buildSingleFileVerification(alias, localPath, targetRemotePath, 'upload'),
             }
         }
 

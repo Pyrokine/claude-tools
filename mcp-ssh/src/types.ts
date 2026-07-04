@@ -78,6 +78,7 @@ export interface ExecResult {
     stderrBytes?: number
     recommendedReadCommand?: string
     suggestion?: string
+    emptyOutputFailure?: boolean
     loginUser?: string
     effectiveUser?: string
     identity?: string

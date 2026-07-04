@@ -194,6 +194,10 @@ ssh_connect(configHost="myserver", configPath="/custom/path/config")
 4. ssh_exec_parallel(aliases=["server1", "server2", "server3"], command="uptime")
 ```
 
+每台主机的结果保留与 `ssh_exec` 相同的执行元数据，包括 `failureKind`、`effectiveUser`、`cwd`、截断字段和诊断建议。
+`ssh_exec_parallel` 单次最多 32 个 alias，默认最多并发 4 台主机，可用 `maxConcurrency` 调整（最大 8），并支持 `maxOutputSize`
+限制每台主机的输出
+
 ### 基础：连接和执行
 
 ```
@@ -337,8 +341,10 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180"
 ```
 
 `ssh_upload` 返回本地路径策略诊断、远端父目录探测、远端目标元数据和可选校验结果，`atomic=true` 会先上传到同目录临时文件，再
-rename 到目标路径，`verifySize`、`verifyMd5`、`verifyMode`、`verifyOwner`、`verifyMtime` 会追加显式传输后校验，`ssh_read_file`
-默认读取 1 MiB，`maxBytes` 超过 16 MiB 时会在远端传输前拒绝，返回 `total_size`、`read_offset`、`read_bytes`、
+rename 到目标路径，`verifySize`、`verifyMd5`、`verifyMode`、`verifyOwner`、`verifyMtime` 会追加显式传输后校验，命令执行结果在远端命令非零退出且没有
+stdout/stderr 时返回
+`emptyOutputFailure=true`，同时给出 effective user、cwd 和可用的后续读取建议，`ssh_read_file` 默认读取 1 MiB，`maxBytes` 超过
+16 MiB 时会在远端传输前拒绝，返回 `total_size`、`read_offset`、`read_bytes`、
 `remaining_bytes`、`sample_kind` 和 `truncated`，调用方可以区分完整读取、头部样本、尾部样本、字节范围和行范围
 
 ### 目录同步（rsync）
@@ -374,11 +380,16 @@ ssh_sync(
 
 // 试运行（预览，不实际传输）
 ssh_sync(..., dryRun=true)
+
+// 上传单文件后校验远端 owner/mode
+ssh_sync(..., direction="upload", verifyOwner="appuser", verifyMode="0644")
 ```
 
 如果远程或本地没有 rsync，会自动回退到 SFTP，同步响应包含 `transport`、`duration`、`dryRun`、`stats`、`commandSummary` 和
 `diagnostics`，其中 `diagnostics` 包含本地路径策略和远端父目录探测结果，SFTP 单文件传输会返回 `verification`，包含本地和远端的
-size、mode 或 permissions、mtime、owner/group，以及远端支持 `sha256sum` 时的 SHA-256 对比
+size、mode 或 permissions、mtime、owner/group，以及远端支持 `sha256sum` 时的 SHA-256 对比，upload 单文件同步可用
+`verifyOwner` 和 `verifyMode` 追加基于远端元数据的 `ownerMode` 校验，目录同步不递归扫描 owner/mode，会返回 skipped
+verification 说明
 
 **注意**：rsync 模式使用 SSH 密钥/代理认证，并设置 `StrictHostKeyChecking=accept-new`（首次连接会自动接受主机密钥），
 如需严格的主机密钥验证与管理，请使用 SFTP 模式

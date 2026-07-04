@@ -349,6 +349,7 @@ export class SessionManager {
                         stdoutTruncated: stdoutTruncated || undefined,
                         stderrTruncated: stderrTruncated || undefined,
                         ...this.outputMetadata(outputPreview()),
+                        ...this.emptyOutputFailureMetadata(code, outputPreview()),
                         ...this.resultMetadata(session, options, { cwd: options.cwd }),
                     })
                 })
@@ -530,6 +531,18 @@ export class SessionManager {
         return '将远端命令输出重定向到文件，例如 command > /tmp/mcp-ssh-output.txt 2>&1，然后用 ssh_read_file(remotePath="/tmp/mcp-ssh-output.txt", tail=true, maxBytes=65536) 分块读取'
     }
 
+    private emptyOutputFailureMetadata(exitCode: number, preview: OutputPreview): Partial<ExecResult> {
+        if (exitCode === 0 || preview.stdoutBytes > 0 || preview.stderrBytes > 0) {
+            return {}
+        }
+        return {
+            emptyOutputFailure: true,
+            recommendedReadCommand: this.recommendedReadCommand(),
+            suggestion:
+                '远端命令以非零退出码结束，但没有 stdout/stderr。请检查 cwd、effectiveUser、shell/profile，或用 set -x / 显式重定向输出到文件后再用 ssh_read_file 读取',
+        }
+    }
+
     private outputMetadata(preview: OutputPreview): Partial<ExecResult> {
         const truncated = preview.stdoutTruncated || preview.stderrTruncated
         return {
@@ -641,6 +654,7 @@ export class SessionManager {
                         stdoutTruncated: stdoutTruncated || undefined,
                         stderrTruncated: stderrTruncated || undefined,
                         ...this.outputMetadata(outputPreview()),
+                        ...this.emptyOutputFailureMetadata(code, outputPreview()),
                         ...this.resultMetadata(session, options, context),
                     })
                 })

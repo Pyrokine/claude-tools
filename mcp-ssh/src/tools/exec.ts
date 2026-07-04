@@ -77,10 +77,22 @@ const quickExecSchema = z.object({
     timeout: z.number().optional().describe('超时（毫秒）'),
 })
 
+const EXEC_PARALLEL_MAX_ALIASES = 32
+const EXEC_PARALLEL_DEFAULT_CONCURRENCY = 4
+const EXEC_PARALLEL_MAX_CONCURRENCY = 8
+
 const execParallelSchema = z.object({
-    aliases: z.array(z.string()).describe('连接别名列表'),
+    aliases: z.array(z.string()).min(1).max(EXEC_PARALLEL_MAX_ALIASES).describe('连接别名列表'),
     command: z.string().describe('要执行的命令'),
     timeout: z.number().optional().describe('每个命令的超时（毫秒），默认 30000'),
+    maxOutputSize: maxOutputSizeSchema,
+    maxConcurrency: z
+        .number()
+        .int()
+        .positive()
+        .max(EXEC_PARALLEL_MAX_CONCURRENCY)
+        .optional()
+        .describe('最大并发执行数，默认 4，最大 8'),
 })
 
 const execScriptSchema = z.object({
@@ -289,18 +301,35 @@ async function handleQuickExec(args: z.infer<typeof quickExecSchema>) {
     }
 }
 
+async function mapWithConcurrency<T, R>(
+    items: T[],
+    limit: number,
+    worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+    const results = new Array<R>(items.length)
+    let nextIndex = 0
+    const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (nextIndex < items.length) {
+            const index = nextIndex++
+            results[index] = await worker(items[index], index)
+        }
+    })
+    await Promise.all(runners)
+    return results
+}
+
 async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
     try {
-        const execPromises = args.aliases.map(async (alias) => {
+        const concurrency = Math.min(args.maxConcurrency ?? EXEC_PARALLEL_DEFAULT_CONCURRENCY, args.aliases.length)
+        const results = await mapWithConcurrency(args.aliases, concurrency, async (alias) => {
             try {
-                const execResult = await sessionManager.exec(alias, args.command, { timeout: args.timeout })
+                const execResult = await sessionManager.exec(alias, args.command, {
+                    timeout: args.timeout,
+                    maxOutputSize: args.maxOutputSize,
+                })
                 return {
                     alias,
-                    success: execResult.success,
-                    exitCode: execResult.exitCode,
-                    stdout: execResult.stdout,
-                    stderr: execResult.stderr,
-                    duration: execResult.duration,
+                    ...execResult,
                 }
             } catch (err) {
                 return {
@@ -311,10 +340,10 @@ async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
             }
         })
 
-        const results = await Promise.all(execPromises)
         return formatResult({
             success: results.every((r) => r.success),
             total: args.aliases.length,
+            concurrency,
             results,
         })
     } catch (error) {

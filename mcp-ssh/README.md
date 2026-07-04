@@ -194,6 +194,10 @@ Execute the same command on multiple connected hosts:
 4. ssh_exec_parallel(aliases=["server1", "server2", "server3"], command="uptime")
 ```
 
+Each host result keeps the same execution metadata as `ssh_exec`, including `failureKind`, `effectiveUser`, `cwd`,
+truncation fields, and diagnostic suggestions. `ssh_exec_parallel` limits one call to 32 aliases, runs up to 4 hosts at
+a time by default (configurable with `maxConcurrency`, max 8), and accepts `maxOutputSize` to cap each host result.
+
 ### Basic: Connect and Execute
 
 ```
@@ -343,6 +347,9 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180"
 `ssh_upload` returns local path policy diagnostics, remote parent probing, remote target metadata, and optional
 verification checks. `atomic=true` uploads to a same-directory temporary file, then renames it to the target path.
 `verifySize`, `verifyMd5`, `verifyMode`, `verifyOwner`, and `verifyMtime` add explicit post-transfer checks.
+Command execution results include `emptyOutputFailure=true` when the remote command exits non-zero without
+stdout/stderr,
+with the effective user, cwd, and a suggested follow-up read command when available.
 `ssh_read_file` defaults to 1 MiB and rejects `maxBytes` above 16 MiB before remote transfer. It returns `total_size`,
 `read_offset`, `read_bytes`, `remaining_bytes`, `sample_kind`, and `truncated` so callers can distinguish a full read
 from a head, tail, byte range, or line range sample.
@@ -380,11 +387,16 @@ ssh_sync(
 
 // Dry run (preview without actual transfer)
 ssh_sync(..., dryRun=true)
+
+// Upload one file and verify remote owner/mode after transfer
+ssh_sync(..., direction="upload", verifyOwner="appuser", verifyMode="0644")
 ```
 
 If rsync is not available on remote or local, it automatically falls back to SFTP. Sync responses include `transport`,
 `duration`, `dryRun`, `stats`, and `commandSummary`. SFTP single-file transfers include a `verification` object with
 local and remote size, mode or permissions, mtime, owner/group, and SHA-256 comparison when the remote has `sha256sum`.
+For upload single-file sync, `verifyOwner` and `verifyMode` add an `ownerMode` verification block based on remote file
+metadata. Directory sync does not recursively scan owner/mode; it returns a skipped verification note instead.
 
 **Note**: rsync mode uses SSH key/agent authentication and sets `StrictHostKeyChecking=accept-new`.
 If you require strict host key verification and management, use SFTP mode instead.

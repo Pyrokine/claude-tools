@@ -86,6 +86,8 @@ const syncSchema = z.object({
         .boolean()
         .optional()
         .describe('upload 时是否跟随本地 symlink，默认 false（跳过 symlink 并 warn，避免上传链接目标内容）'),
+    verifyOwner: z.union([z.string(), z.number()]).optional().describe('upload 后校验远端 owner（用户名或 uid）'),
+    verifyMode: z.string().optional().describe('upload 后校验远端权限，例如 0644 或 -rw-r--r--'),
 })
 
 // ========== Handlers ==========
@@ -195,7 +197,7 @@ async function probeRemoteFile(alias: string, remotePath: string) {
     const escapedRemotePath = escapeShellArg(remotePath)
     const command = [
         `if [ -e ${escapedRemotePath} ]; then`,
-        `stat -c '%U\t%u\t%G\t%g\t%a\t%s\t%Y' ${escapedRemotePath};`,
+        `stat -c '%U\t%u\t%G\t%g\t%a\t%s\t%Y\t%F' ${escapedRemotePath};`,
         'else printf missing; fi',
     ].join(' ')
     try {
@@ -207,7 +209,9 @@ async function probeRemoteFile(alias: string, remotePath: string) {
         if (result.stdout.trim() === 'missing') {
             return { exists: false, remotePath }
         }
-        const [ownerName, ownerId, groupName, groupId, mode, size, mtimeSeconds] = result.stdout.trim().split('\t')
+        const [ownerName, ownerId, groupName, groupId, mode, size, mtimeSeconds, fileType] = result.stdout
+            .trim()
+            .split('\t')
         return {
             exists: true,
             remotePath,
@@ -218,6 +222,9 @@ async function probeRemoteFile(alias: string, remotePath: string) {
             mode: mode ? `0${mode}` : undefined,
             size: Number(size),
             mtimeMs: Number(mtimeSeconds) * 1000,
+            fileType,
+            isDirectory: fileType === 'directory',
+            isFile: fileType?.startsWith('regular ') ?? false,
         }
     } catch {
         const info = await fileOps.getFileInfo(alias, remotePath)
@@ -230,6 +237,9 @@ async function probeRemoteFile(alias: string, remotePath: string) {
             permissions: info.permissions,
             size: info.size,
             mtimeMs: info.mtime.getTime(),
+            isDirectory: info.isDirectory,
+            isFile: info.isFile,
+            isSymlink: info.isSymlink,
         }
     }
 }
@@ -249,7 +259,8 @@ async function buildUploadVerification(
         checks.mtime = mtimeDelta !== undefined ? mtimeDelta < 2000 : false
     }
     if (args.verifyMode && remote.exists) {
-        checks.mode = remote.mode === args.verifyMode || remote.mode === args.verifyMode.replace(/^0?/, '0')
+        const expectedMode = normalizeExpectedMode(args.verifyMode)
+        checks.mode = expectedMode !== undefined && remote.mode === expectedMode
     }
     if (args.verifyOwner && remote.exists) {
         const expectedOwner = String(args.verifyOwner)
@@ -268,6 +279,104 @@ async function buildUploadVerification(
         }
     }
     return { local: summarizeLocalPathProbe(local), remote, checks }
+}
+
+function normalizeExpectedMode(mode: string): string | undefined {
+    const trimmed = mode.trim()
+    if (/^[0-7]{3,4}$/.test(trimmed)) {
+        return trimmed.length === 3 ? `0${trimmed}` : trimmed
+    }
+    return permissionStringToOctal(trimmed)
+}
+
+function buildSyncVerificationChecks(
+    args: z.infer<typeof syncSchema>,
+    remote: Awaited<ReturnType<typeof probeRemoteFile>>
+): Record<string, boolean> {
+    const checks: Record<string, boolean> = {}
+    if (args.verifyOwner !== undefined) {
+        const expectedOwner = String(args.verifyOwner)
+        checks.owner = remote.exists && (String(remote.ownerId) === expectedOwner || remote.ownerName === expectedOwner)
+    }
+    if (args.verifyMode !== undefined) {
+        const expectedMode = normalizeExpectedMode(args.verifyMode)
+        checks.mode = remote.exists && expectedMode !== undefined && remote.mode === expectedMode
+    }
+    return checks
+}
+
+async function resolveSyncUploadVerificationPath(
+    args: z.infer<typeof syncSchema>,
+    local: ReturnType<typeof fileOps.probeLocalPath>
+): Promise<string> {
+    const requestedRemote = await probeRemoteFile(args.alias, args.remotePath)
+    if (requestedRemote.exists && requestedRemote.isDirectory) {
+        return path.posix.join(args.remotePath, path.basename(local.resolvedPath))
+    }
+    if (!requestedRemote.exists && args.remotePath.endsWith('/')) {
+        return path.posix.join(args.remotePath, path.basename(local.resolvedPath))
+    }
+    return args.remotePath
+}
+
+async function buildSyncUploadVerification(
+    args: z.infer<typeof syncSchema>,
+    local: ReturnType<typeof fileOps.probeLocalPath>
+): Promise<Record<string, unknown> | undefined> {
+    if (args.verifyOwner === undefined && args.verifyMode === undefined) {
+        return undefined
+    }
+    if (args.direction !== 'upload' || args.dryRun) {
+        return {
+            kind: 'owner_mode',
+            skipped: true,
+            reason: 'verifyOwner/verifyMode 只在非 dryRun 的 upload 场景校验远端 owner/mode',
+        }
+    }
+    if (!local.exists || !local.isFile) {
+        return {
+            kind: 'owner_mode',
+            skipped: true,
+            reason: 'verifyOwner/verifyMode 只对单文件 upload 做后置校验，目录同步不会递归扫描远端权限',
+            suggestion: '如需目录权限校验，请同步完成后对目标文件调用 ssh_file_info 或用 ssh_exec 执行显式检查',
+        }
+    }
+
+    const verificationRemotePath = await resolveSyncUploadVerificationPath(args, local)
+    const remote = await probeRemoteFile(args.alias, verificationRemotePath)
+    const checks = buildSyncVerificationChecks(args, remote)
+    const matched = Object.values(checks).every(Boolean)
+    return {
+        kind: 'owner_mode',
+        matched,
+        expected: {
+            owner: args.verifyOwner,
+            mode: args.verifyMode,
+            normalizedMode: args.verifyMode ? normalizeExpectedMode(args.verifyMode) : undefined,
+        },
+        requestedRemotePath: args.remotePath,
+        remote,
+        checks,
+        suggestion: matched
+            ? undefined
+            : '同步已完成，但远端 owner/mode 与期望不一致；工具不会自动 chown/chmod，请按需用 ssh_exec 显式处理权限',
+    }
+}
+
+function mergeSyncVerification(
+    existing: Record<string, unknown> | undefined,
+    ownerMode: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+    if (!ownerMode) {
+        return existing
+    }
+    if (!existing) {
+        return ownerMode
+    }
+    return {
+        ...existing,
+        ownerMode,
+    }
 }
 
 async function cleanupRemotePath(alias: string, remotePath: string): Promise<void> {
@@ -444,8 +553,9 @@ async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
 }
 
 async function handleSync(args: z.infer<typeof syncSchema>) {
+    const local = fileOps.probeLocalPath(args.localPath)
     const diagnostics = {
-        local: summarizeLocalPathProbe(fileOps.probeLocalPath(args.localPath)),
+        local: summarizeLocalPathProbe(local),
         remoteParent: await probeRemoteParent(args.alias, args.remotePath),
     }
     try {
@@ -456,8 +566,10 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
             recursive: args.recursive,
             followSymlinks: args.followSymlinks,
         })
+        const ownerModeVerification = syncResult.success ? await buildSyncUploadVerification(args, local) : undefined
         return formatResult({
             ...syncResult,
+            verification: mergeSyncVerification(syncResult.verification, ownerModeVerification),
             direction: args.direction,
             localPath: args.localPath,
             remotePath: args.remotePath,
