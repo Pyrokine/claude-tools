@@ -14,6 +14,7 @@ import { z } from 'zod'
 import { generateBezierPath, getMouseMoveDelay, getTypingDelay, randomDelay } from '../anti-detection/index.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import type { InputEvent, Target } from '../core/types.js'
+import { postConditionSchema, waitForPostCondition } from './post-condition.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
 
 /**
@@ -98,6 +99,9 @@ const inputSchema = z.object({
     events: z.array(inputEventSchema).describe('事件序列'),
     humanize: z.boolean().optional().describe('启用人类行为模拟（贝塞尔曲线移动、随机延迟）'),
     diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
+    postCondition: postConditionSchema
+        .optional()
+        .describe('动作执行后要验证的页面状态；不传时 success 只表示事件已发出，不表示业务结果已达成'),
     tabId: z
         .string()
         .optional()
@@ -176,6 +180,9 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
                 }
                 if (eventResults.length > 0) {
                     result.eventResults = eventResults
+                }
+                if (args.postCondition) {
+                    result.postCondition = await waitForPostCondition(unifiedSession, args.postCondition, 'input')
                 }
                 if (diagnosticsStart) {
                     result.diagnostics = await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)

@@ -1420,7 +1420,14 @@ class UnifiedSessionManager {
     }
 
     private throwMaterializeLimit(state: CdpMaterializeState, depth: number, result?: CdpResultObject): never {
+        const exceeded =
+            depth > UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH
+                ? 'depth'
+                : state.nodes > UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES
+                  ? 'nodes'
+                  : 'chars'
         throw new EvaluateResultTooLargeError({
+            exceeded,
             depth,
             nodes: state.nodes,
             chars: state.chars,

@@ -25,6 +25,22 @@ import {
 const httpClient = new HttpClient()
 const actionHandler = new ActionHandler()
 
+function sanitizeErrorMessage(message: string): string {
+    return message.replace(/chrome-extension:\/\/[a-z0-9]{32}\/[^\s)"']*/g, 'chrome-extension://<redacted>/<redacted>')
+}
+
+function structuredErrorPayload(error: unknown): string | null {
+    const json = (error as { toJSON?: () => object }).toJSON?.()
+    if (!json) {
+        return null
+    }
+    const body = json as { error?: { message?: unknown } }
+    if (typeof body.error?.message === 'string') {
+        body.error.message = sanitizeErrorMessage(body.error.message)
+    }
+    return JSON.stringify(body)
+}
+
 // ==================== WebSocket 消息处理 ====================
 
 httpClient.onMessage(async (message, port) => {
@@ -38,11 +54,7 @@ httpClient.onMessage(async (message, port) => {
         httpClient.sendResponse(id, true, result, undefined, port)
     } catch (error) {
         const rawMsg = error instanceof Error ? error.message : 'Unknown error'
-        // 错误信息脱敏：剥离 chrome-extension://<id>/ 路径,避免向 server 泄露扩展内部路径
-        const msg = rawMsg.replace(
-            /chrome-extension:\/\/[a-z0-9]{32}\/[^\s)"']*/g,
-            'chrome-extension://<redacted>/<redacted>'
-        )
+        const msg = structuredErrorPayload(error) ?? sanitizeErrorMessage(rawMsg)
         // 预期的操作错误用 warn，不污染 Extension 错误面板
         if (isExpectedOperationError(error)) {
             console.warn(`[MCP] ${action}: ${rawMsg}`)

@@ -105,13 +105,38 @@ export class NonSerializableEvaluateResultError extends Error {
     }
 }
 
+export type EvaluateMaterializeLimit = 'depth' | 'nodes' | 'chars'
+
+function evaluateLimitMessage(limit: EvaluateMaterializeLimit): string {
+    switch (limit) {
+        case 'depth':
+            return 'evaluate 返回对象层级过深，已停止展开 CDP 远端对象'
+        case 'nodes':
+            return 'evaluate 返回对象节点数过多，已停止展开 CDP 远端对象'
+        case 'chars':
+            return 'evaluate 返回内容过大，已停止展开 CDP 远端对象'
+    }
+}
+
+function evaluateLimitSuggestion(limit: EvaluateMaterializeLimit): string {
+    switch (limit) {
+        case 'depth':
+            return '请在脚本中返回扁平对象、指定字段，或先 JSON.stringify 深层对象再返回字符串'
+        case 'nodes':
+            return '请在脚本中减少返回字段、分页结果，或返回字符串并配合 output 写入文件'
+        case 'chars':
+            return '请在脚本中只返回必要字段、分页结果，或返回字符串并配合 output 写入文件'
+    }
+}
+
 export class EvaluateResultTooLargeError extends Error {
     readonly code = 'EVALUATE_RESULT_TOO_LARGE'
-    readonly suggestion = '请在脚本中只返回必要字段、分页结果，或返回字符串并配合 output 写入文件'
+    readonly suggestion: string
 
-    constructor(readonly context: Record<string, unknown>) {
-        super('evaluate 返回值过大，已停止展开 CDP 远端对象')
+    constructor(readonly context: Record<string, unknown> & { exceeded: EvaluateMaterializeLimit }) {
+        super(evaluateLimitMessage(context.exceeded))
         this.name = 'EvaluateResultTooLargeError'
+        this.suggestion = evaluateLimitSuggestion(context.exceeded)
     }
 
     toJSON(): object {

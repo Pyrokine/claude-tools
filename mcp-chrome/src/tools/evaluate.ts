@@ -17,6 +17,7 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
+import { postConditionSchema, waitForPostCondition } from './post-condition.js'
 
 /**
  * evaluate 参数 schema
@@ -50,6 +51,9 @@ const evaluateSchema = z.object({
             '执行模式，precise（默认）使用 debugger API，可绕过 CSP；stealth 使用 JS 注入，不触发调试提示但受 CSP 限制'
         ),
     diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
+    postCondition: postConditionSchema
+        .optional()
+        .describe('脚本执行后要验证的页面状态；不传时 success 只表示脚本已执行并返回，不表示业务结果已达成'),
     tabId: z
         .string()
         .optional()
@@ -137,6 +141,9 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                 const diagnostics = diagnosticsStart
                     ? await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
                     : undefined
+                const postCondition = args.postCondition
+                    ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate')
+                    : undefined
 
                 if (outputPath) {
                     // string 类型直接写入原始文本，其他类型 JSON 序列化
@@ -146,6 +153,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                         success: true,
                         output: outputPath,
                         ...(diagnostics ? { diagnostics } : {}),
+                        ...(postCondition ? { postCondition } : {}),
                     })
                 }
 
@@ -168,6 +176,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                         size: fileContent.length,
                         hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
                         ...(diagnostics ? { diagnostics } : {}),
+                        ...(postCondition ? { postCondition } : {}),
                     })
                 }
 
@@ -175,6 +184,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                     success: true,
                     result: normalizedResult,
                     ...(diagnostics ? { diagnostics } : {}),
+                    ...(postCondition ? { postCondition } : {}),
                 })
             })
         }) // withTabId

@@ -499,30 +499,45 @@ export class ContentHandler {
     private async screenshotFallback(tabId: number, p: ScreenshotInput): Promise<ScreenshotResult> {
         const tab = await chrome.tabs.get(tabId)
         if (!tab.active) {
-            throw new Error(
-                'screenshot fallback 路径需要 tab 在其窗口内为 active；debugger 被占用时无法对非 active tab 截图'
+            throw structuredOperationError(
+                'DEBUGGER_BLOCKED_SCREENSHOT_UNAVAILABLE',
+                'debugger 被占用，且当前 tab 不是窗口内 active tab，无法通过 captureVisibleTab 截图',
+                '请关闭占用 debugger 的扩展，或只在 managed 测试页上显式 activatePage 后重试；不要激活用户工作 tab',
+                { tabId, fallback: 'captureVisibleTab', active: tab.active }
             )
         }
         // captureVisibleTab 只能截可视区域、只支持 png/jpeg；遇到 fullPage/clip/scale/webp
         // 应明确报错而非静默降级，避免上层拿到「viewport-only 但 success=true」或「PNG 字节贴 webp mimeType」
         if (p?.fullPage) {
-            throw new Error(
-                'screenshot fallback 不支持 fullPage（captureVisibleTab 仅可视区域）；请关闭占用 debugger 的扩展（如 React DevTools）后重试'
+            throw structuredOperationError(
+                'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                'debugger 被占用时的 screenshot fallback 不支持 fullPage',
+                '请关闭占用 debugger 的扩展后重试；fallback 只能截取当前可视区域',
+                { tabId, fallback: 'captureVisibleTab', unsupported: 'fullPage' }
             )
         }
         if (p?.clip) {
-            throw new Error(
-                'screenshot fallback 不支持 clip 参数（captureVisibleTab 不支持区域裁剪）；请关闭占用 debugger 的扩展后重试'
+            throw structuredOperationError(
+                'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                'debugger 被占用时的 screenshot fallback 不支持 clip',
+                '请关闭占用 debugger 的扩展后重试；fallback 不支持区域裁剪',
+                { tabId, fallback: 'captureVisibleTab', unsupported: 'clip' }
             )
         }
         if (p?.scale !== undefined && p.scale !== 1) {
-            throw new Error(
-                'screenshot fallback 不支持 scale 参数（captureVisibleTab 不支持缩放）；请关闭占用 debugger 的扩展后重试'
+            throw structuredOperationError(
+                'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                'debugger 被占用时的 screenshot fallback 不支持 scale',
+                '请关闭占用 debugger 的扩展后重试；fallback 不支持缩放截图',
+                { tabId, fallback: 'captureVisibleTab', unsupported: 'scale', scale: p.scale }
             )
         }
         if (p?.format && p.format !== 'jpeg' && p.format !== 'png') {
-            throw new Error(
-                `screenshot fallback 不支持 format="${p.format}"（captureVisibleTab 仅支持 png/jpeg）；请关闭占用 debugger 的扩展后重试`
+            throw structuredOperationError(
+                'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                `debugger 被占用时的 screenshot fallback 不支持 format="${p.format}"`,
+                '请关闭占用 debugger 的扩展后重试；fallback 仅支持 png/jpeg',
+                { tabId, fallback: 'captureVisibleTab', unsupported: 'format', format: p.format }
             )
         }
         const format = p?.format === 'jpeg' ? 'jpeg' : 'png'
@@ -531,6 +546,12 @@ export class ContentHandler {
             quality: p?.quality,
         })
         const data = dataUrl.split(',')[1]
-        return { data, format }
+        return {
+            data,
+            format,
+            degraded: true,
+            fallback: 'captureVisibleTab',
+            limitations: ['viewport-only'],
+        }
     }
 }

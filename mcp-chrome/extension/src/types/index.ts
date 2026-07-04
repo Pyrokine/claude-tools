@@ -218,6 +218,9 @@ export interface ScreenshotParams {
 export interface ScreenshotResult {
     data: string
     format: string
+    degraded?: boolean
+    fallback?: string
+    limitations?: string[]
 }
 
 // ==================== DOM 操作 ====================

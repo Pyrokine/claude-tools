@@ -1,12 +1,32 @@
+import { ExpectedOperationError } from '../types/expected-errors.js'
 import type { LogManager } from './log-manager.js'
 
-export class DebuggerBlockedError extends Error {
+export class DebuggerBlockedError extends ExpectedOperationError {
+    readonly code = 'DEBUGGER_BLOCKED'
+
+    readonly suggestion =
+        '当前 tab 的 chrome.debugger 被其他调试器占用。请关闭 DevTools 或其他调试扩展，换用未被占用的 managed tab，或在不需要 debugger 的场景改用 mode="stealth"'
+
+    readonly context: { tabId: number }
+
     constructor(tabId: number) {
         super(
             `Debugger blocked on tab ${tabId} (another debugger attached). ` +
                 'Close other DevTools extensions (React DevTools, etc.) to enable full functionality.'
         )
         this.name = 'DebuggerBlockedError'
+        this.context = { tabId }
+    }
+
+    toJSON(): object {
+        return {
+            error: {
+                code: this.code,
+                message: this.message,
+                suggestion: this.suggestion,
+                context: this.context,
+            },
+        }
     }
 }
 

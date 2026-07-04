@@ -54,6 +54,57 @@ import {
     type WaitUntil,
 } from './types.js'
 
+function wildcardSegmentMatches(value: string, segment: string, index: number): boolean {
+    if (index + segment.length > value.length) {
+        return false
+    }
+
+    for (let i = 0; i < segment.length; ++i) {
+        const expected = segment[i]
+        if (expected !== '?' && expected !== value[index + i]) {
+            return false
+        }
+    }
+
+    return true
+}
+
+function wildcardSegmentIndexOf(value: string, segment: string, start: number): number {
+    if (!segment.includes('?')) {
+        return value.indexOf(segment, start)
+    }
+
+    for (let i = start; i <= value.length - segment.length; ++i) {
+        if (wildcardSegmentMatches(value, segment, i)) {
+            return i
+        }
+    }
+
+    return -1
+}
+
+function matchesUrlPattern(url: string, pattern: string): boolean {
+    const value = url.toLowerCase()
+    const normalizedPattern = pattern.toLowerCase().replace(/\*+/g, '*')
+
+    if (!normalizedPattern.includes('*') && !normalizedPattern.includes('?')) {
+        return value.includes(normalizedPattern)
+    }
+
+    const segments = normalizedPattern.split('*').filter((segment) => segment.length > 0)
+    let position = 0
+
+    for (const segment of segments) {
+        const index = wildcardSegmentIndexOf(value, segment, position)
+        if (index < 0) {
+            return false
+        }
+        position = index + segment.length
+    }
+
+    return true
+}
+
 /**
  * 会话状态
  */
@@ -1385,17 +1436,7 @@ class SessionManager implements IBrowserDriver {
         const { urlPattern, clear } = options
         let requests = this.networkRequests
         if (urlPattern) {
-            try {
-                // 转义正则元字符，仅保留 * 和 ? 的通配语义
-                const escaped = urlPattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-                const pattern = escaped.replace(/\*/g, '.*').replace(/\?/g, '.')
-                const regex = new RegExp(pattern, 'i')
-                requests = requests.filter((r) => regex.test(r.url))
-            } catch {
-                // 构造失败时退化为字符串包含匹配
-                const pat = urlPattern.toLowerCase()
-                requests = requests.filter((r) => r.url.toLowerCase().includes(pat))
-            }
+            requests = requests.filter((r) => matchesUrlPattern(String(r.url ?? ''), urlPattern))
         }
         const result = requests.slice(-100)
         if (clear) {

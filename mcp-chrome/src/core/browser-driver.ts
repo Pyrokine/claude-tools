@@ -34,6 +34,9 @@ export interface ScreenshotOptions {
 export interface ScreenshotResult {
     data: string
     format: string
+    degraded?: boolean
+    fallback?: string
+    limitations?: string[]
 }
 
 export interface ConsoleLogOptions {

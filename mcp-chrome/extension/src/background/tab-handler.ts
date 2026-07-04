@@ -58,6 +58,25 @@ function structuredOperationError(
     return new ExpectedOperationError(JSON.stringify({ error: { code, message, suggestion, context } }))
 }
 
+const WINDOW_FOCUS_OBSERVE_TIMEOUT_MS = 1000
+const WINDOW_FOCUS_OBSERVE_INTERVAL_MS = 100
+
+async function delay(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForWindowFocus(windowId: number, context: ActionContext): Promise<WindowInfo> {
+    const deadline = Date.now() + WINDOW_FOCUS_OBSERVE_TIMEOUT_MS
+    let info = await getWindowInfo(windowId, context)
+
+    while (!info.focused && Date.now() < deadline) {
+        await delay(WINDOW_FOCUS_OBSERVE_INTERVAL_MS)
+        info = await getWindowInfo(windowId, context)
+    }
+
+    return info
+}
+
 async function assertManagedWindow(windowId: number, context: ActionContext, action: string): Promise<WindowInfo> {
     const info = await getWindowInfo(windowId, context)
     if (context.mcpWindowId === windowId) {
@@ -364,7 +383,20 @@ export class TabHandler {
         const p = WindowFocusSchema.parse(params)
         const before = await assertManagedWindow(p.windowId, context, 'window_focus')
         await chrome.windows.update(p.windowId, { focused: true })
-        const after = await getWindowInfo(p.windowId, context)
+        const after = await waitForWindowFocus(p.windowId, context)
+        if (!after.focused) {
+            throw structuredOperationError(
+                'WINDOW_FOCUS_NOT_OBSERVED',
+                'focusWindow 已请求聚焦窗口，但 Chrome 未观测到目标窗口获得焦点',
+                '请确认目标窗口属于 managed 测试窗口，并检查当前桌面环境是否允许浏览器扩展主动聚焦窗口；需要可见 tab 时可改用 manage(action="activatePage") 激活目标测试 tab',
+                {
+                    windowId: p.windowId,
+                    beforeFocused: before.focused,
+                    afterFocused: after.focused,
+                    activeTabId: after.activeTabId,
+                }
+            )
+        }
         return { success: true, windowId: p.windowId, before, after }
     }
 
