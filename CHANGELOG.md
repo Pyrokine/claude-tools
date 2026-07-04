@@ -1,5 +1,71 @@
 # Changelog
 
+## v1.15.0 - 2026-07-04
+
+## Versions
+
+- mcp-chrome: 2.2.0 → 2.3.0
+- mcp-claude-history: 1.7.0 → 1.8.0
+- mcp-ssh: 2.2.0 → 2.3.0
+
+## What's Changed
+
+### mcp-chrome
+
+- feat: Add `postCondition` to `input` and `evaluate` so callers can verify page state after actions
+- fix: Return structured diagnostics for debugger conflicts, screenshot fallback limits, evaluate result limits, and window focus observation
+- fix: Match network log `urlPattern` with deterministic wildcard matching to avoid extension worker stalls on long URLs
+- docs: Update README and README_zh for post-condition, screenshot fallback, network URL filters, and focusWindow behavior
+
+### mcp-claude-history
+
+- feat: Add `tool_payload_errors` search filtering and `tool_result_has_error_payload` result metadata
+- refactor: Share filtered export writing between context and trace output
+- chore: Upgrade `rmcp` to 2.1.0 and refresh Rust dependencies
+- docs: Update README and README_zh for payload-level tool error filtering
+
+### mcp-ssh
+
+- feat: Add empty-output failure diagnostics for silent non-zero command exits
+- feat: Preserve per-host execution metadata in `ssh_exec_parallel`, with alias count, concurrency, and output-size limits
+- feat: Add `ssh_sync` owner and mode verification for upload single-file syncs
+- fix: Resolve SFTP upload targets when syncing a local file into a remote directory
+- docs: Update README and README_zh for execution metadata and sync verification behavior
+
+---
+
+## 版本
+
+- mcp-chrome: 2.2.0 → 2.3.0
+- mcp-claude-history: 1.7.0 → 1.8.0
+- mcp-ssh: 2.2.0 → 2.3.0
+
+## 更新内容
+
+### mcp-chrome
+
+- feat: 为 `input` 和 `evaluate` 新增 `postCondition`，让调用方在动作后验证页面状态
+- fix: 为 debugger 占用、截图 fallback 限制、evaluate 结果限制和窗口聚焦观测返回结构化诊断
+- fix: network log `urlPattern` 改为确定性通配符匹配，避免超长 URL 导致扩展 worker 卡住
+- docs: 更新 README 和 README_zh，覆盖 post-condition、截图 fallback、network URL 过滤和 focusWindow 行为
+
+### mcp-claude-history
+
+- feat: 新增 `tool_payload_errors` 搜索过滤和 `tool_result_has_error_payload` 结果元数据
+- refactor: context 和 trace 输出复用过滤导出写入逻辑
+- chore: 升级 `rmcp` 到 2.1.0，并刷新 Rust 依赖
+- docs: 更新 README 和 README_zh，说明 payload 层工具错误过滤
+
+### mcp-ssh
+
+- feat: 为非零退出且无输出的远端命令新增 empty-output 失败诊断
+- feat: `ssh_exec_parallel` 保留每台主机的执行元数据，并增加 alias 数量、并发数和输出大小限制
+- feat: 为 `ssh_sync` upload 单文件同步新增 owner 和 mode 校验
+- fix: local file 同步到远端目录时，正确解析 SFTP upload 目标文件路径
+- docs: 更新 README 和 README_zh，说明执行元数据和同步校验行为
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.14.1...v1.15.0
+
 ## v1.14.1 - 2026-06-16
 
 ## Versions
@@ -45,14 +111,17 @@
 ### mcp-chrome
 
 - feat: Add optional pairing-token authentication while keeping zero-config local use as the default
-- feat: Harden managed tab and window boundaries, including safer close, activate, focus, resize, and navigation behavior
-- feat: Add controlled input, richer select/replace diagnostics, structured page state, frame metadata, clip screenshots, PNG comparison, and action diagnostics
+- feat: Harden managed tab and window boundaries, including safer close, activate, focus, resize, and navigation
+  behavior
+- feat: Add controlled input, richer select/replace diagnostics, structured page state, frame metadata, clip
+  screenshots, PNG comparison, and action diagnostics
 - fix: Bound CDP evaluate materialization, auth challenge storage, Chrome launch cleanup, and MCP frame parsing
 - docs: Update README, README_zh, and TESTING for the expanded browser automation behavior
 
 ### mcp-claude-history
 
-- feat: Add stricter parameter validation, server/tool filters, summary and JSONL output modes, and richer pagination/export diagnostics
+- feat: Add stricter parameter validation, server/tool filters, summary and JSONL output modes, and richer
+  pagination/export diagnostics
 - fix: Create exported content and manifests with private permissions and cap streaming UUID dedupe state
 - chore: Update Rust dependencies and bump package version
 - docs: Update README, README_zh, and TESTING for search, export, and range behavior
@@ -60,7 +129,8 @@
 ### mcp-ssh
 
 - feat: Add template/runAs/defaultEnv workflow, exec_script, maxOutputSize diagnostics, and command risk hints
-- fix: Redact batch commands, bound output and SFTP traversal resources, make rsync async, and correct background-task detection
+- fix: Redact batch commands, bound output and SFTP traversal resources, make rsync async, and correct background-task
+  detection
 - docs: Update README, README_zh, and TESTING for execution, transfer, and diagnostic behavior
 
 ### workflow and skills
@@ -81,7 +151,8 @@
 
 - feat: 新增可选 pairing token 认证，同时默认保留零配置本地使用方式
 - feat: 加固 managed tab 和 window 边界，包括 close、activate、focus、resize 和 navigation 行为
-- feat: 新增 controlled input、更丰富的 select/replace 诊断、结构化页面状态、frame metadata、clip screenshot、PNG 对比和 action diagnostics
+- feat: 新增 controlled input、更丰富的 select/replace 诊断、结构化页面状态、frame metadata、clip screenshot、PNG 对比和
+  action diagnostics
 - fix: 限制 CDP evaluate 结果展开、auth challenge 存储、Chrome 启动清理和 MCP frame 解析边界
 - docs: 更新 README、README_zh 和 TESTING，覆盖扩展后的浏览器自动化行为
 
@@ -176,7 +247,8 @@
 
 ### mcp-claude-history
 
-- feat: output path routing — relative paths default to system temp (`<tmp>/claude-tools/mcp-claude-history/`), `cwd:` prefix writes to cwd, `tmp:` prefix explicit temp
+- feat: output path routing — relative paths default to system temp (`<tmp>/claude-tools/mcp-claude-history/`), `cwd:`
+  prefix writes to cwd, `tmp:` prefix explicit temp
 - chore: Rust edition 2021 → 2024
 - chore: rmcp 0.7 → 1.6 (builder API, MCP protocol version → 2025-11-25)
 - chore: schemars 0.9 → 1.2, regex 1.10 → 1.12, rayon 1.10 → 1.12, clap 4.5 → 4.6
@@ -223,7 +295,8 @@
 ### mcp-chrome
 
 - fix: keep browser operations bound to the intended session instead of drifting to the active tab
-- fix: move relative `output` and `scriptFile` paths into a controlled system temp directory, with explicit `cwd:` paths for repo persistence
+- fix: move relative `output` and `scriptFile` paths into a controlled system temp directory, with explicit `cwd:` paths
+  for repo persistence
 - docs: update README and TESTING guidance for the new path semantics
 
 ### mcp-claude-history
@@ -363,7 +436,8 @@
 
 ### mcp-ssh 2.0.0
 
-- feat: first public 2.0.0 release with security hardening, path whitelist, idle-timeout cleanup, and session/forward robustness improvements
+- feat: first public 2.0.0 release with security hardening, path whitelist, idle-timeout cleanup, and session/forward
+  robustness improvements
 - docs: refresh bilingual README and add TESTING guide
 
 ### mcp-claude-history 1.4.0
@@ -433,8 +507,10 @@
 
 ### mcp-chrome 1.7.0
 
-- feat: actionability checks before click — 5-item check (visible, enabled, pointer-events, in-viewport, covered) + progressive backoff retry [0,20,100,100,500ms] + auto scroll-into-view
-- feat: `input dispatch` mode — set value via nativeInputValueSetter + trigger input/change events, compatible with React/Vue controlled components
+- feat: actionability checks before click — 5-item check (visible, enabled, pointer-events, in-viewport, covered) +
+  progressive backoff retry [0,20,100,100,500ms] + auto scroll-into-view
+- feat: `input dispatch` mode — set value via nativeInputValueSetter + trigger input/change events, compatible with
+  React/Vue controlled components
 - feat: `input force` — bypass actionability checks
 - feat: `extract depth` — DOM traversal depth limit for state extraction
 - feat: `extract computed:prop` — get computed style value via ISOLATED world Extension action
@@ -462,7 +538,8 @@
 
 - feat: multi-expert parallel dialectical analysis skill
 - Supports Flow A (code changes / design proposals) and Flow B (abstract questions / decisions)
-- 5 independent expert agents (logic, security, design, performance, convention) + cross-examination + dispute arbitration
+- 5 independent expert agents (logic, security, design, performance, convention) + cross-examination + dispute
+  arbitration
 
 ---
 
@@ -477,7 +554,8 @@
 
 ### mcp-chrome 1.7.0
 
-- feat: 点击前可操作性检查 — 5 项检查（可见、可用、pointer-events、视口内、未被遮挡）+ 渐进退避重试 [0,20,100,100,500ms] + 自动 scroll-into-view
+- feat: 点击前可操作性检查 — 5 项检查（可见、可用、pointer-events、视口内、未被遮挡）+ 渐进退避重试 [0,20,100,100,500ms] + 自动
+  scroll-into-view
 - feat: `input dispatch` 模式 — 通过 nativeInputValueSetter 设置 value + 触发 input/change 事件，兼容 React/Vue 受控组件
 - feat: `input force` — 跳过可操作性检查
 - feat: `extract depth` — state 提取的 DOM 遍历深度限制
@@ -770,7 +848,8 @@
 
 ### mcp-chrome
 
-- feat: Structured image extraction — `images` parameter (`info`/`data`) for HTML extraction with image metadata and data
+- feat: Structured image extraction — `images` parameter (`info`/`data`) for HTML extraction with image metadata and
+  data
 - feat: Page metadata extraction — `type: "metadata"` for title, OG, JSON-LD, feeds, etc.
 - feat: Element screenshot — `target` parameter crops screenshot to specific element (all locator types)
 - feat: Element state subtree — `target` parameter for accessibility subtree extraction
@@ -826,7 +905,8 @@
 
 ### mcp-chrome
 
-- feat: Screenshot `format` (png/jpeg/webp) and `quality` (0-100) params to reduce size and avoid timeouts on complex pages
+- feat: Screenshot `format` (png/jpeg/webp) and `quality` (0-100) params to reduce size and avoid timeouts on complex
+  pages
 - feat: Target `nth` index to disambiguate multiple matching elements across all locator strategies
 - feat: Keyboard modifier tracking — Ctrl/Alt/Shift/Meta state passed to all key and mouse events
 - fix: `resetState()` clears modifiers and mouse position
@@ -840,7 +920,8 @@
 
 ### mcp-ssh
 
-- refactor: Split monolithic `index.ts` (1100+ lines) into 6 focused tool modules (connection, exec, file, forward, pty, utils)
+- refactor: Split monolithic `index.ts` (1100+ lines) into 6 focused tool modules (connection, exec, file, forward, pty,
+  utils)
 - refactor: Migrate from manual `Server` + `setRequestHandler` to `McpServer` + `registerTool`
 
 ### mcp-claude-history
