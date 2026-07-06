@@ -262,6 +262,8 @@ pub struct ContextResponse {
     pub messages: Vec<ContextMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +289,8 @@ pub struct TraceResponse {
     pub tool_calls: Vec<TraceToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]

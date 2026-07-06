@@ -2,42 +2,12 @@ use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const TMP_PATH_PREFIX: &str = "tmp:";
 const CWD_PATH_PREFIX: &str = "cwd:";
-
-#[cfg(unix)]
-fn set_private_permissions(path: &Path, mode: u32, target: &str) -> Result<(), ErrorResponse> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法设置{}权限: {}", target, e),
-        available: None,
-    })
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path, _mode: u32, _target: &str) -> Result<(), ErrorResponse> {
-    Ok(())
-}
-
-fn open_private_file(path: &Path, target: &str) -> Result<File, ErrorResponse> {
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建{}: {}", target, e),
-        available: None,
-    })?;
-    set_private_permissions(path, 0o600, target)?;
-    Ok(file)
-}
 
 /// Get 参数
 pub struct GetParams {
@@ -407,10 +377,10 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         available: None,
     })?;
     if was_new {
-        set_private_permissions(&output_dir, 0o700, "目录")?;
+        set_private_permissions(&output_dir, 0o700)?;
     }
 
-    let mut file = open_private_file(&content_path, "文件")?;
+    let mut file = open_private_output_file(&content_path)?;
     file.write_all(request.content.as_bytes()).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("写入文件失败: {}", e),
@@ -424,7 +394,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
     for img in &images {
         if let Some((ext, data)) = extract_image_data(request.record, img.index) {
             let img_path = output_dir.join(format!("{}_img{}.{}", safe_ref, img.index, ext));
-            match open_private_file(&img_path, "图片文件") {
+            match open_private_output_file(&img_path) {
                 Ok(mut img_file) => {
                     if let Err(e) = img_file.write_all(&data) {
                         image_warnings.push(format!("图片 {} 写入失败: {}", img.index, e));
@@ -462,7 +432,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         "sample_kind": if request.content_size == request.original_content_size { "all" } else { "range" },
         "redaction": &redaction,
     });
-    let mut manifest_file = open_private_file(&manifest_path, "manifest")?;
+    let mut manifest_file = open_private_output_file(&manifest_path)?;
     manifest_file
         .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
         .map_err(|e| ErrorResponse {
@@ -486,7 +456,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
             } else {
                 "range"
             }
-                .to_string(),
+            .to_string(),
             redaction,
         },
         content_size: request.content_size,
@@ -510,11 +480,11 @@ pub fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
         message: format!("无法获取当前工作目录: {}", e),
         available: None,
     })?)
-        .map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("canonicalize cwd 失败: {}", e),
-            available: None,
-        })?;
+    .map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("canonicalize cwd 失败: {}", e),
+        available: None,
+    })?;
 
     let temp_root = controlled_temp_root()?;
 
@@ -540,7 +510,7 @@ fn controlled_temp_root() -> Result<PathBuf, ErrorResponse> {
         message: format!("无法创建临时目录: {}", e),
         available: None,
     })?;
-    set_private_permissions(&root, 0o700, "临时目录")?;
+    set_private_permissions(&root, 0o700)?;
     fs::canonicalize(&root).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("canonicalize 临时目录失败: {}", e),

@@ -2,40 +2,8 @@ use crate::config::Config;
 use crate::get::{find_session_file, resolve_output_files};
 use crate::types::*;
 use crate::utils::*;
-use regex::{Regex, RegexBuilder};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
-
-#[cfg(unix)]
-fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorResponse> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法设置输出权限: {}", e),
-        available: None,
-    })
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
-    Ok(())
-}
-
-fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建输出文件: {}", e),
-        available: None,
-    })?;
-    set_private_permissions(path, 0o600)?;
-    Ok(file)
-}
 
 pub struct TraceParams {
     pub r#ref: String,
@@ -83,56 +51,8 @@ struct ToolResultRef {
     preview: String,
 }
 
-fn matches_types(effective_type: &str, types: &[String]) -> bool {
-    types.is_empty() || types.iter().any(|t| t == effective_type)
-}
-
-fn matches_subtypes(subtype: &str, subtypes: &[String]) -> bool {
-    subtypes.is_empty() || subtypes.iter().any(|t| t == subtype)
-}
-
-fn matches_pattern(content: &str, compiled: &Option<Regex>, plain: &Option<String>, case_sensitive: bool) -> bool {
-    if let Some(re) = compiled {
-        return re.is_match(content);
-    }
-    if let Some(p) = plain {
-        if case_sensitive {
-            return content.contains(p.as_str());
-        }
-        return content.to_lowercase().contains(p.as_str());
-    }
-    true
-}
-
 pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, ErrorResponse> {
-    // 编译 pattern
-    let compiled_regex: Option<Regex> = if let Some(ref pat) = params.pattern {
-        if params.regex {
-            match RegexBuilder::new(pat).case_insensitive(!params.case_sensitive).build() {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    return Err(ErrorResponse {
-                        error: "invalid_regex".to_string(),
-                        message: format!("无效的正则表达式: {}", e),
-                        available: None,
-                    });
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let plain_pattern: Option<String> = if params.pattern.is_some() && !params.regex {
-        if params.case_sensitive {
-            params.pattern.clone()
-        } else {
-            params.pattern.as_ref().map(|p| p.to_lowercase())
-        }
-    } else {
-        None
-    };
+    let content_filter = build_content_filter(&params.pattern, params.regex, params.case_sensitive)?;
 
     let parsed_ref = ParsedRef::parse(&params.r#ref).ok_or_else(|| ErrorResponse {
         error: "ref_invalid".to_string(),
@@ -151,16 +71,24 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
     let reader = BufReader::new(file);
     let mut records = Vec::new();
     let mut anchor_idx = None;
+    let mut read_errors = 0usize;
+    let mut parse_errors = 0usize;
 
     for (line_num, line) in reader.lines().enumerate() {
         let line_num = line_num + 1;
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(_) => {
+                read_errors += 1;
+                continue;
+            }
         };
         let record: MessageRecord = match serde_json::from_str(&line) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
         };
         let (effective_type, subtype) = classify_message(&record);
         let redaction = redact_text_with_mode(
@@ -240,14 +168,9 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         if params.before > 0 {
             let mut count = 0usize;
             for i in (0..anchor_idx).rev() {
-                let type_ok = matches_types(records[i].effective_type, &params.types)
-                    && matches_subtypes(records[i].subtype, &params.subtypes);
-                let pat_ok = matches_pattern(
-                    &records[i].content,
-                    &compiled_regex,
-                    &plain_pattern,
-                    params.case_sensitive,
-                );
+                let type_ok = message_type_matches(records[i].effective_type, &params.types)
+                    && message_subtype_matches(records[i].subtype, &params.subtypes);
+                let pat_ok = content_filter.matches(&records[i].content);
                 if type_ok && pat_ok {
                     count += 1;
                     start = i;
@@ -261,9 +184,9 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         if params.after > 0 {
             let mut count = 0usize;
             for (i, msg) in records.iter().enumerate().skip(anchor_idx + 1) {
-                let type_ok =
-                    matches_types(msg.effective_type, &params.types) && matches_subtypes(msg.subtype, &params.subtypes);
-                let pat_ok = matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive);
+                let type_ok = message_type_matches(msg.effective_type, &params.types)
+                    && message_subtype_matches(msg.subtype, &params.subtypes);
+                let pat_ok = content_filter.matches(&msg.content);
                 if type_ok && pat_ok {
                     count += 1;
                     end = i + 1;
@@ -284,15 +207,12 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
     for (idx, item) in records.iter().enumerate().take(end).skip(start) {
         let is_anchor = idx == anchor_idx;
         if !is_anchor
-            && (!matches_types(item.effective_type, &params.types) || !matches_subtypes(item.subtype, &params.subtypes))
+            && (!message_type_matches(item.effective_type, &params.types)
+                || !message_subtype_matches(item.subtype, &params.subtypes))
         {
             continue;
         }
-        let has_pattern_filter = compiled_regex.is_some() || plain_pattern.is_some();
-        if !is_anchor
-            && has_pattern_filter
-            && !matches_pattern(&item.content, &compiled_regex, &plain_pattern, params.case_sensitive)
-        {
+        if !is_anchor && content_filter.has_filter() && !content_filter.matches(&item.content) {
             continue;
         }
         let (content, was_truncated) = truncate_content(&item.content, params.max_content);
@@ -321,20 +241,21 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         tool_calls.retain(|tc| {
             let server_ok = params.servers.is_empty()
                 || tc
-                .server
-                .as_deref()
-                .map(|s| params.servers.iter().any(|f| f == s))
-                .unwrap_or(false);
+                    .server
+                    .as_deref()
+                    .map(|s| params.servers.iter().any(|f| f == s))
+                    .unwrap_or(false);
             let tool_ok = params.tools.is_empty()
                 || tc
-                .tool
-                .as_deref()
-                .map(|t| params.tools.iter().any(|f| f == t))
-                .unwrap_or(false);
+                    .tool
+                    .as_deref()
+                    .map(|t| params.tools.iter().any(|f| f == t))
+                    .unwrap_or(false);
             server_ok && tool_ok
         });
     }
 
+    let warnings = jsonl_read_warnings(read_errors, parse_errors);
     let response = TraceResponse {
         anchor_ref: params.r#ref.clone(),
         project: project_id,
@@ -342,6 +263,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         messages,
         tool_calls,
         truncated: truncated.then_some(true),
+        warnings,
         output_path: None,
         output: None,
     };
@@ -385,9 +307,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             MessageExportFilters {
                 types: &params.types,
                 subtypes: &params.subtypes,
-                compiled_regex: &compiled_regex,
-                plain_pattern: &plain_pattern,
-                case_sensitive: params.case_sensitive,
+                content_filter: &content_filter,
             },
         )?;
         if !response.tool_calls.is_empty() {
@@ -454,6 +374,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             messages: response.messages,
             tool_calls: response.tool_calls,
             truncated: response.truncated,
+            warnings: response.warnings,
             output_path: Some(out_path.clone()),
             output: Some(OutputInfo {
                 content: out_path,

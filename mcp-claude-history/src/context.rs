@@ -2,12 +2,8 @@ use crate::config::Config;
 use crate::get::{find_session_file, resolve_output_files};
 use crate::types::*;
 use crate::utils::*;
-use regex::{Regex, RegexBuilder};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
 
 /// Context 参数
 pub struct ContextParams {
@@ -30,34 +26,6 @@ pub struct ContextParams {
     /// 导出到文件，支持 tmp: / cwd: 前缀
     pub output: Option<String>,
     pub redaction: RedactionMode,
-}
-
-#[cfg(unix)]
-fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorResponse> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法设置输出权限: {}", e),
-        available: None,
-    })
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
-    Ok(())
-}
-
-fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建输出文件: {}", e),
-        available: None,
-    })?;
-    set_private_permissions(path, 0o600)?;
-    Ok(file)
 }
 
 impl Default for ContextParams {
@@ -92,66 +60,9 @@ struct ClassifiedMessage {
     redacted_count: usize,
 }
 
-/// 检查消息类型是否匹配
-fn matches_types(effective_type: &str, types: &[String]) -> bool {
-    types.is_empty() || types.iter().any(|t| t == effective_type)
-}
-
-fn matches_subtypes(subtype: &str, subtypes: &[String]) -> bool {
-    subtypes.is_empty() || subtypes.iter().any(|t| t == subtype)
-}
-
-/// 检查消息内容是否匹配 pattern
-fn matches_pattern(
-    content: &str,
-    pattern: &Option<Regex>,
-    plain_pattern: &Option<String>,
-    case_sensitive: bool,
-) -> bool {
-    if let Some(re) = pattern {
-        return re.is_match(content);
-    }
-    if let Some(p) = plain_pattern {
-        if case_sensitive {
-            return content.contains(p.as_str());
-        }
-        // plain_pattern 在 case-insensitive 时已预先 to_lowercase，直接比较
-        return content.to_lowercase().contains(p.as_str());
-    }
-    true // 无 pattern 时匹配所有
-}
-
 /// 获取上下文
 pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse, ErrorResponse> {
-    // 编译 pattern
-    let compiled_regex: Option<Regex> = if let Some(ref pat) = params.pattern {
-        if params.regex {
-            match RegexBuilder::new(pat).case_insensitive(!params.case_sensitive).build() {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    return Err(ErrorResponse {
-                        error: "invalid_regex".to_string(),
-                        message: format!("无效的正则表达式: {}", e),
-                        available: None,
-                    });
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    // case-insensitive 时预先 to_lowercase，避免每次调用 matches_pattern 时重复分配
-    let plain_pattern: Option<String> = if params.pattern.is_some() && !params.regex {
-        if params.case_sensitive {
-            params.pattern.clone()
-        } else {
-            params.pattern.as_ref().map(|p| p.to_lowercase())
-        }
-    } else {
-        None
-    };
+    let content_filter = build_content_filter(&params.pattern, params.regex, params.case_sensitive)?;
     // 解析 ref
     let parsed_ref = ParsedRef::parse(&params.r#ref).ok_or_else(|| ErrorResponse {
         error: "ref_invalid".to_string(),
@@ -176,17 +87,25 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     // 收集所有消息（带分类信息）
     let mut all_messages: Vec<ClassifiedMessage> = Vec::new();
     let mut anchor_idx = None;
+    let mut read_errors = 0usize;
+    let mut parse_errors = 0usize;
 
     for (line_num, line) in reader.lines().enumerate() {
         let line_num = line_num + 1; // 1-based
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(_) => {
+                read_errors += 1;
+                continue;
+            }
         };
 
         let record: MessageRecord = match serde_json::from_str(&line) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
         };
 
         let (effective_type, subtype) = classify_message(&record);
@@ -272,14 +191,9 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         if before > 0 {
             let mut count = 0;
             for i in (0..anchor_idx).rev() {
-                let type_ok = matches_types(all_messages[i].effective_type, &params.types)
-                    && matches_subtypes(all_messages[i].subtype, &params.subtypes);
-                let pattern_ok = matches_pattern(
-                    &all_messages[i].content,
-                    &compiled_regex,
-                    &plain_pattern,
-                    params.case_sensitive,
-                );
+                let type_ok = message_type_matches(all_messages[i].effective_type, &params.types)
+                    && message_subtype_matches(all_messages[i].subtype, &params.subtypes);
+                let pattern_ok = content_filter.matches(&all_messages[i].content);
                 if type_ok && pattern_ok {
                     count += 1;
                     start = i;
@@ -295,10 +209,9 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             if after > 0 {
                 let mut count = 0;
                 for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
-                    let type_ok = matches_types(msg.effective_type, &params.types)
-                        && matches_subtypes(msg.subtype, &params.subtypes);
-                    let pattern_ok =
-                        matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive);
+                    let type_ok = message_type_matches(msg.effective_type, &params.types)
+                        && message_subtype_matches(msg.subtype, &params.subtypes);
+                    let pattern_ok = content_filter.matches(&msg.content);
                     if type_ok && pattern_ok {
                         count += 1;
                         end = i + 1;
@@ -324,14 +237,13 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     for (i, msg) in all_messages.iter().enumerate().take(end_idx).skip(start_idx) {
         let is_anchor = i == anchor_idx;
         if !is_anchor
-            && (!matches_types(msg.effective_type, &params.types) || !matches_subtypes(msg.subtype, &params.subtypes))
+            && (!message_type_matches(msg.effective_type, &params.types)
+                || !message_subtype_matches(msg.subtype, &params.subtypes))
         {
             continue;
         }
         // pattern 过滤（anchor 消息始终保留）
-        let has_pattern_filter = compiled_regex.is_some() || plain_pattern.is_some();
-        let pattern_ok = !has_pattern_filter
-            || matches_pattern(&msg.content, &compiled_regex, &plain_pattern, params.case_sensitive);
+        let pattern_ok = !content_filter.has_filter() || content_filter.matches(&msg.content);
         if !is_anchor && !pattern_ok {
             continue;
         }
@@ -354,10 +266,12 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         });
     }
 
+    let warnings = jsonl_read_warnings(read_errors, parse_errors);
     let response = ContextResponse {
         anchor_ref: params.r#ref.clone(),
         messages,
         truncated: if truncated_by_total { Some(true) } else { None },
+        warnings,
         output_path: None,
         output: None,
     };
@@ -407,9 +321,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             MessageExportFilters {
                 types: &params.types,
                 subtypes: &params.subtypes,
-                compiled_regex: &compiled_regex,
-                plain_pattern: &plain_pattern,
-                case_sensitive: params.case_sensitive,
+                content_filter: &content_filter,
             },
         )?;
         file.flush().map_err(|e| ErrorResponse {
@@ -445,6 +357,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             anchor_ref: response.anchor_ref,
             messages: response.messages,
             truncated: response.truncated,
+            warnings: response.warnings,
             output_path: Some(out_path.clone()),
             output: Some(OutputInfo {
                 content: out_path,

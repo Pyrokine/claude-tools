@@ -5,10 +5,8 @@ use crate::utils::*;
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -127,6 +125,17 @@ struct FileSearchResult {
     lines_scanned: usize,
     results: Vec<SearchResult>,
     truncated: bool,
+    read_errors: usize,
+    parse_errors: usize,
+}
+
+fn push_jsonl_error_reasons(reasons: &mut Vec<String>, read_errors: usize, parse_errors: usize) {
+    if read_errors > 0 {
+        reasons.push(format!("read_errors={}", read_errors));
+    }
+    if parse_errors > 0 {
+        reasons.push(format!("parse_errors={}", parse_errors));
+    }
 }
 
 fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
@@ -447,6 +456,8 @@ fn collect_search_results(
     let mut files_scanned = 0;
     let mut lines_scanned = 0;
     let mut incomplete_reasons = Vec::new();
+    let mut read_errors = 0usize;
+    let mut parse_errors = 0usize;
 
     for file_result in file_results {
         files_scanned += 1;
@@ -454,15 +465,18 @@ fn collect_search_results(
         if file_result.truncated {
             incomplete_reasons.push("per_file_cap".to_string());
         }
+        read_errors += file_result.read_errors;
+        parse_errors += file_result.parse_errors;
         results.extend(file_result.results);
     }
+    push_jsonl_error_reasons(&mut incomplete_reasons, read_errors, parse_errors);
 
     results.sort_by(|a, b| {
         a.timestamp
-         .cmp(&b.timestamp)
-         .then_with(|| a.project.cmp(&b.project))
-         .then_with(|| a.session.cmp(&b.session))
-         .then_with(|| a.line.cmp(&b.line))
+            .cmp(&b.timestamp)
+            .then_with(|| a.project.cmp(&b.project))
+            .then_with(|| a.session.cmp(&b.session))
+            .then_with(|| a.line.cmp(&b.line))
     });
 
     let mut seen_uuids = HashSet::new();
@@ -784,8 +798,8 @@ fn build_coverage(results: &[SearchResult], searched_files: Vec<String>) -> Sear
 
 fn buckets(map: BTreeMap<String, usize>) -> Vec<SummaryBucket> {
     map.into_iter()
-       .map(|(key, count)| SummaryBucket { key, count })
-       .collect()
+        .map(|(key, count)| SummaryBucket { key, count })
+        .collect()
 }
 
 fn build_summary(results: &[SearchResult]) -> SearchSummary {
@@ -821,34 +835,6 @@ fn build_summary(results: &[SearchResult]) -> SearchSummary {
         by_tool: buckets(by_tool),
         by_day: buckets(by_day),
     }
-}
-
-#[cfg(unix)]
-fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorResponse> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法设置输出文件权限: {}", e),
-        available: None,
-    })
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
-    Ok(())
-}
-
-fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建输出文件: {}", e),
-        available: None,
-    })?;
-    set_private_permissions(path, 0o600)?;
-    Ok(file)
 }
 
 fn prefixed_parent_output(raw: &str, parent: &Path) -> String {
@@ -1054,7 +1040,7 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
     } else {
         "incomplete"
     }
-        .to_string();
+    .to_string();
     let sample_kind = if ctx.explicit_range { "range" } else { "all" }.to_string();
     let redaction = redaction_info(
         ctx.redaction,
@@ -1237,25 +1223,38 @@ fn search_aggregate_streaming(
     let mut lines_scanned = 0;
     let mut total_matches = 0;
     let mut incomplete_reasons = Vec::new();
+    let mut read_errors = 0usize;
+    let mut parse_errors = 0usize;
 
     'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
         let Ok(input) = File::open(path) else {
+            read_errors += 1;
             continue;
         };
         let prefix = ref_prefix(session_id);
+        let mut tool_uses = BTreeMap::new();
         for (line_num, line) in BufReader::new(input).lines().enumerate() {
             let line_num = line_num + 1;
             lines_scanned += 1;
             if !line_in_ranges(line_num, &params.lines) {
                 continue;
             }
-            let Ok(line) = line else {
-                continue;
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => {
+                    read_errors += 1;
+                    continue;
+                }
             };
-            let Ok(record) = serde_json::from_str::<MessageRecord>(&line) else {
-                continue;
+            let record = match serde_json::from_str::<MessageRecord>(&line) {
+                Ok(record) => record,
+                Err(_) => {
+                    parse_errors += 1;
+                    continue;
+                }
             };
+            observe_tool_uses(&mut tool_uses, &record);
             let ctx = RecordBuildContext {
                 project_id,
                 session_id,
@@ -1263,6 +1262,7 @@ fn search_aggregate_streaming(
                 params,
                 regex,
                 pattern,
+                tool_uses: &tool_uses,
             };
             let Some(result) = build_search_result(&ctx, line_num, record) else {
                 continue;
@@ -1282,6 +1282,7 @@ fn search_aggregate_streaming(
         }
     }
 
+    push_jsonl_error_reasons(&mut incomplete_reasons, read_errors, parse_errors);
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     let summary_value = Some(aggregation.summary());
@@ -1338,25 +1339,38 @@ fn search_to_output_streaming(
     let mut content_truncated_count = 0;
     let mut redacted_count = 0;
     let mut incomplete_reasons = Vec::new();
+    let mut read_errors = 0usize;
+    let mut parse_errors = 0usize;
 
     'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
         let Ok(input) = File::open(path) else {
+            read_errors += 1;
             continue;
         };
         let prefix = ref_prefix(session_id);
+        let mut tool_uses = BTreeMap::new();
         for (line_num, line) in BufReader::new(input).lines().enumerate() {
             let line_num = line_num + 1;
             lines_scanned += 1;
             if !line_in_ranges(line_num, &params.lines) {
                 continue;
             }
-            let Ok(line) = line else {
-                continue;
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => {
+                    read_errors += 1;
+                    continue;
+                }
             };
-            let Ok(record) = serde_json::from_str::<MessageRecord>(&line) else {
-                continue;
+            let record = match serde_json::from_str::<MessageRecord>(&line) {
+                Ok(record) => record,
+                Err(_) => {
+                    parse_errors += 1;
+                    continue;
+                }
             };
+            observe_tool_uses(&mut tool_uses, &record);
             let ctx = RecordBuildContext {
                 project_id,
                 session_id,
@@ -1364,6 +1378,7 @@ fn search_to_output_streaming(
                 params,
                 regex,
                 pattern,
+                tool_uses: &tool_uses,
             };
             let Some(result) = build_search_result(&ctx, line_num, record) else {
                 continue;
@@ -1415,6 +1430,7 @@ fn search_to_output_streaming(
     })?;
     let bytes = fs::metadata(&results_path).map(|m| m.len()).unwrap_or(0);
     let slice_info = streaming_slice_info(params, total_matches);
+    push_jsonl_error_reasons(&mut incomplete_reasons, read_errors, parse_errors);
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     let summary_value = (params.summary || params.aggregate).then(|| aggregation.summary());
@@ -1471,6 +1487,54 @@ struct RecordBuildContext<'a> {
     params: &'a SearchParams,
     regex: Option<&'a Regex>,
     pattern: Option<&'a SearchPattern>,
+    tool_uses: &'a BTreeMap<String, ToolInfo>,
+}
+
+fn observe_tool_uses(tool_uses: &mut BTreeMap<String, ToolInfo>, record: &MessageRecord) {
+    let Some(content) = record
+        .message
+        .as_ref()
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return;
+    };
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        tool_uses.insert(id.to_string(), parse_mcp_tool_name(name));
+    }
+}
+
+fn linked_tool_result_info(record: &MessageRecord, tool_uses: &BTreeMap<String, ToolInfo>) -> Option<ToolInfo> {
+    let content = record.message.as_ref()?.get("content")?.as_array()?;
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            continue;
+        }
+        let Some(id) = item.get("tool_use_id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        if let Some(info) = tool_uses.get(id) {
+            return Some(info.clone());
+        }
+    }
+    None
+}
+
+fn record_tool_info(record: &MessageRecord, tool_uses: &BTreeMap<String, ToolInfo>) -> ToolInfo {
+    let tool_info = extract_tool_info(record);
+    if tool_info.server.is_some() || tool_info.tool.is_some() {
+        return tool_info;
+    }
+    linked_tool_result_info(record, tool_uses).unwrap_or(tool_info)
 }
 
 fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: MessageRecord) -> Option<SearchResult> {
@@ -1485,7 +1549,7 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         return None;
     }
 
-    let tool_info = extract_tool_info(&record);
+    let tool_info = record_tool_info(&record, ctx.tool_uses);
     if !ctx.params.servers.is_empty() {
         let Some(server) = &tool_info.server else {
             return None;
@@ -1595,6 +1659,8 @@ fn search_file(
     let mut results = Vec::new();
     let mut lines_scanned = 0;
     let mut truncated = false;
+    let mut read_errors = 0usize;
+    let mut parse_errors = 0usize;
 
     let file = match File::open(path) {
         Ok(f) => f,
@@ -1603,12 +1669,15 @@ fn search_file(
                 lines_scanned: 0,
                 results,
                 truncated: false,
+                read_errors: 1,
+                parse_errors: 0,
             };
         }
     };
 
     let reader = BufReader::new(file);
     let prefix = ref_prefix(session_id);
+    let mut tool_uses = BTreeMap::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line_num = line_num + 1; // 1-based
@@ -1621,14 +1690,21 @@ fn search_file(
 
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(_) => {
+                read_errors += 1;
+                continue;
+            }
         };
 
         // 解析 JSON
         let record: MessageRecord = match serde_json::from_str(&line) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
         };
+        observe_tool_uses(&mut tool_uses, &record);
 
         let ctx = RecordBuildContext {
             project_id,
@@ -1637,6 +1713,7 @@ fn search_file(
             params,
             regex,
             pattern,
+            tool_uses: &tool_uses,
         };
         if let Some(result) = build_search_result(&ctx, line_num, record) {
             results.push(result);
@@ -1653,6 +1730,8 @@ fn search_file(
         lines_scanned,
         results,
         truncated,
+        read_errors,
+        parse_errors,
     }
 }
 
@@ -1664,7 +1743,7 @@ mod tests {
 
     fn write_jsonl(dir: &Path, name: &str, lines: usize) -> PathBuf {
         let path = dir.join(name);
-        let mut f = fs::File::create(&path).unwrap();
+        let mut f = File::create(&path).unwrap();
         for i in 0..lines {
             // 构造最小可被 classify_message 识别为 "user" 类型的 jsonl 行
             // 时间戳带毫秒偏移以保证 sort 顺序

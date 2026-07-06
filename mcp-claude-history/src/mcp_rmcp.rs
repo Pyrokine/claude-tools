@@ -4,25 +4,25 @@
 //! tokio::task::spawn_blocking 包装，避免阻塞 rmcp 异步运行时
 
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters}, model::*, schemars,
-    tool,
-    tool_handler,
-    tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
+    ErrorData as McpError, ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::*,
+    schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use crate::config::Config;
-use crate::context::{context, ContextParams};
-use crate::get::{get, GetParams};
+use crate::context::{ContextParams, context};
+use crate::get::{GetParams, get};
 use crate::projects::list_projects;
-use crate::search::{search, SearchParams};
+use crate::search::{SearchParams, search};
 use crate::sessions::list_sessions;
-use crate::trace::{trace, TraceParams};
+use crate::trace::{TraceParams, trace};
 use crate::types::ErrorResponse;
 use crate::utils::{
-    parse_line_ranges_param, parse_message_slice_param, parse_range_param, parse_redaction_mode_param, parse_time_param,
-    RedactionMode,
+    parse_optional_line_ranges_param, parse_optional_message_slice_param, parse_optional_range_param,
+    parse_optional_redaction_mode_param, parse_optional_time_param, split_csv_param,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -197,74 +197,23 @@ pub struct McpHistoryService {
     tool_router: ToolRouter<Self>,
 }
 
-fn comma_split(s: &str) -> Vec<String> {
-    s.split(',')
-     .map(|x| x.trim().to_string())
-     .filter(|x| !x.is_empty())
-     .collect()
-}
-
-fn arg_error(message: impl Into<String>) -> ErrorResponse {
-    ErrorResponse {
-        error: "invalid_arguments".to_string(),
-        message: message.into(),
-        available: None,
-    }
-}
-
-fn parse_optional_time(
-    value: Option<String>,
-    name: &str,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, ErrorResponse> {
-    value
-        .as_deref()
-        .map(|s| parse_time_param(s, name).map_err(arg_error))
-        .transpose()
-}
-
-fn parse_optional_range(value: Option<String>) -> Result<Option<(usize, usize)>, ErrorResponse> {
-    value.as_deref().map(parse_range_param).transpose().map_err(arg_error)
-}
-
-fn parse_optional_slice(value: Option<String>) -> Result<Option<crate::utils::MessageSlice>, ErrorResponse> {
-    value
-        .as_deref()
-        .map(parse_message_slice_param)
-        .transpose()
-        .map_err(arg_error)
-}
-
-fn parse_optional_lines(value: Option<String>) -> Result<Vec<crate::types::Range>, ErrorResponse> {
-    value
-        .as_deref()
-        .map(parse_line_ranges_param)
-        .transpose()
-        .map_err(arg_error)
-        .map(|v| v.unwrap_or_default())
-}
-
-fn parse_redaction(value: Option<String>) -> Result<RedactionMode, ErrorResponse> {
-    value
-        .as_deref()
-        .map(parse_redaction_mode_param)
-        .transpose()
-        .map_err(arg_error)
-        .map(|v| v.unwrap_or_default())
-}
-
-fn pretty_or<E: serde::Serialize>(r: Result<impl serde::Serialize, E>) -> String {
-    match r {
-        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_default(),
-        Err(e) => serde_json::to_string_pretty(&e).unwrap_or_default(),
-    }
-}
-
 fn pretty_error(error: ErrorResponse) -> String {
     serde_json::to_string_pretty(&error).unwrap_or_default()
 }
 
 fn ok_text(text: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+fn error_text(text: String) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+}
+
+fn tool_text_result(result: Result<impl serde::Serialize, ErrorResponse>) -> Result<CallToolResult, McpError> {
+    match result {
+        Ok(value) => ok_text(serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Err(error) => error_text(pretty_error(error)),
+    }
 }
 
 impl McpHistoryService {
@@ -282,32 +231,32 @@ impl McpHistoryService {
     async fn history_search(&self, Parameters(p): Parameters<SearchToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
 
-        let projects: Vec<String> = p.project.as_deref().map(comma_split).unwrap_or_default();
-        let sessions: Vec<String> = p.sessions.as_deref().map(comma_split).unwrap_or_default();
-        let types: Vec<String> = comma_split(p.types.as_deref().unwrap_or("assistant,user,summary"));
-        let subtypes: Vec<String> = p.subtypes.as_deref().map(comma_split).unwrap_or_default();
-        let servers: Vec<String> = p.servers.as_deref().map(comma_split).unwrap_or_default();
-        let tools: Vec<String> = p.tools.as_deref().map(comma_split).unwrap_or_default();
+        let projects: Vec<String> = split_csv_param(p.project.as_deref());
+        let sessions: Vec<String> = split_csv_param(p.sessions.as_deref());
+        let types: Vec<String> = split_csv_param(Some(p.types.as_deref().unwrap_or("assistant,user,summary")));
+        let subtypes: Vec<String> = split_csv_param(p.subtypes.as_deref());
+        let servers: Vec<String> = split_csv_param(p.servers.as_deref());
+        let tools: Vec<String> = split_csv_param(p.tools.as_deref());
         let ignored_keys = p.extra.keys().cloned().collect::<Vec<_>>();
-        let lines = match parse_optional_lines(p.lines.clone()) {
+        let lines = match parse_optional_line_ranges_param(p.lines.as_deref()) {
             Ok(lines) => lines,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
-        let since = match parse_optional_time(p.since.clone(), "since") {
+        let since = match parse_optional_time_param(p.since.as_deref(), "since") {
             Ok(since) => since,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
-        let until = match parse_optional_time(p.until.clone(), "until") {
+        let until = match parse_optional_time_param(p.until.as_deref(), "until") {
             Ok(until) => until,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
-        let slice = match parse_optional_slice(p.slice.clone()) {
+        let slice = match parse_optional_message_slice_param(p.slice.as_deref()) {
             Ok(slice) => slice,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
-        let redaction = match parse_redaction(p.redaction.clone()) {
+        let redaction = match parse_optional_redaction_mode_param(p.redaction.as_deref()) {
             Ok(redaction) => redaction,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
 
         let params = SearchParams {
@@ -345,19 +294,19 @@ impl McpHistoryService {
         let result = tokio::task::spawn_blocking(move || search(&cfg, params))
             .await
             .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
-        ok_text(pretty_or(result))
+        tool_text_result(result)
     }
 
     #[tool(description = "Get full content of a message by ref")]
     async fn history_get(&self, Parameters(p): Parameters<GetToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
-        let range = match parse_optional_range(p.range.clone()) {
+        let range = match parse_optional_range_param(p.range.as_deref()) {
             Ok(range) => range,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
-        let redaction = match parse_redaction(p.redaction.clone()) {
+        let redaction = match parse_optional_redaction_mode_param(p.redaction.as_deref()) {
             Ok(redaction) => redaction,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
         let params = GetParams {
             r#ref: p.r#ref,
@@ -369,17 +318,17 @@ impl McpHistoryService {
         let result = tokio::task::spawn_blocking(move || get(&cfg, params))
             .await
             .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
-        ok_text(pretty_or(result))
+        tool_text_result(result)
     }
 
     #[tool(description = "Get surrounding messages for context")]
     async fn history_context(&self, Parameters(p): Parameters<ContextToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
-        let types: Vec<String> = p.types.as_deref().map(comma_split).unwrap_or_default();
-        let subtypes: Vec<String> = p.subtypes.as_deref().map(comma_split).unwrap_or_default();
-        let redaction = match parse_redaction(p.redaction.clone()) {
+        let types: Vec<String> = split_csv_param(p.types.as_deref());
+        let subtypes: Vec<String> = split_csv_param(p.subtypes.as_deref());
+        let redaction = match parse_optional_redaction_mode_param(p.redaction.as_deref()) {
             Ok(redaction) => redaction,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
         let params = ContextParams {
             r#ref: p.r#ref,
@@ -402,15 +351,15 @@ impl McpHistoryService {
         let result = tokio::task::spawn_blocking(move || context(&cfg, params))
             .await
             .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
-        ok_text(pretty_or(result))
+        tool_text_result(result)
     }
 
     #[tool(description = "Trace nearby messages and tool call/result pairs for a message ref")]
     async fn history_trace(&self, Parameters(p): Parameters<TraceToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
-        let redaction = match parse_redaction(p.redaction.clone()) {
+        let redaction = match parse_optional_redaction_mode_param(p.redaction.as_deref()) {
             Ok(redaction) => redaction,
-            Err(e) => return ok_text(pretty_error(e)),
+            Err(e) => return error_text(pretty_error(e)),
         };
         let params = TraceParams {
             r#ref: p.r#ref,
@@ -419,13 +368,13 @@ impl McpHistoryService {
             project: p.project,
             max_content: p.max_content.unwrap_or(4000),
             max_total: p.max_total.unwrap_or(40000),
-            types: p.types.as_deref().map(comma_split).unwrap_or_default(),
-            subtypes: p.subtypes.as_deref().map(comma_split).unwrap_or_default(),
+            types: split_csv_param(p.types.as_deref()),
+            subtypes: split_csv_param(p.subtypes.as_deref()),
             pattern: p.pattern,
             regex: p.regex.unwrap_or(false),
             case_sensitive: p.case_sensitive.unwrap_or(false),
-            servers: p.servers.as_deref().map(comma_split).unwrap_or_default(),
-            tools: p.tools.as_deref().map(comma_split).unwrap_or_default(),
+            servers: split_csv_param(p.servers.as_deref()),
+            tools: split_csv_param(p.tools.as_deref()),
             until_type: p.until_type,
             until_ref: p.until_ref,
             direction: p.direction.unwrap_or_else(|| "forward".to_string()),
@@ -435,7 +384,7 @@ impl McpHistoryService {
         let result = tokio::task::spawn_blocking(move || trace(&cfg, params))
             .await
             .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
-        ok_text(pretty_or(result))
+        tool_text_result(result)
     }
 
     #[tool(description = "List all projects with conversation history")]
@@ -444,7 +393,7 @@ impl McpHistoryService {
         let result = tokio::task::spawn_blocking(move || list_projects(&cfg))
             .await
             .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
-        ok_text(pretty_or(result))
+        tool_text_result(result)
     }
 
     #[tool(description = "List sessions in a project")]
@@ -457,7 +406,7 @@ impl McpHistoryService {
         let result = tokio::task::spawn_blocking(move || list_sessions(&cfg, project.as_deref()))
             .await
             .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
-        ok_text(pretty_or(result))
+        tool_text_result(result)
     }
 }
 

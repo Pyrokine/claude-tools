@@ -12,77 +12,18 @@ mod utils;
 use clap::{Parser, Subcommand};
 
 use config::Config;
-use context::{context, ContextParams};
-use get::{get, GetParams};
+use context::{ContextParams, context};
+use get::{GetParams, get};
 use mcp_rmcp::run_mcp_server_rmcp;
 use projects::list_projects;
-use search::{search, SearchParams};
+use search::{SearchParams, search};
 use sessions::list_sessions;
-use trace::{trace, TraceParams};
+use trace::{TraceParams, trace};
 use types::ErrorResponse;
 use utils::{
-    parse_line_ranges_param, parse_message_slice_param, parse_range_param, parse_redaction_mode_param, parse_time_param,
-    RedactionMode,
+    parse_optional_line_ranges_param, parse_optional_message_slice_param, parse_optional_range_param,
+    parse_optional_redaction_mode_param, parse_optional_time_param, split_csv_param,
 };
-
-fn arg_error(message: impl Into<String>) -> ErrorResponse {
-    ErrorResponse {
-        error: "invalid_arguments".to_string(),
-        message: message.into(),
-        available: None,
-    }
-}
-
-fn split_csv(value: Option<String>) -> Vec<String> {
-    value
-        .map(|v| {
-            v.split(',')
-             .map(|s| s.trim().to_string())
-             .filter(|s| !s.is_empty())
-             .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_optional_time(
-    value: Option<String>,
-    name: &str,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, ErrorResponse> {
-    value
-        .as_deref()
-        .map(|s| parse_time_param(s, name).map_err(arg_error))
-        .transpose()
-}
-
-fn parse_optional_range(value: Option<String>) -> Result<Option<(usize, usize)>, ErrorResponse> {
-    value.as_deref().map(parse_range_param).transpose().map_err(arg_error)
-}
-
-fn parse_optional_slice(value: Option<String>) -> Result<Option<utils::MessageSlice>, ErrorResponse> {
-    value
-        .as_deref()
-        .map(parse_message_slice_param)
-        .transpose()
-        .map_err(arg_error)
-}
-
-fn parse_optional_lines(value: Option<String>) -> Result<Vec<types::Range>, ErrorResponse> {
-    value
-        .as_deref()
-        .map(parse_line_ranges_param)
-        .transpose()
-        .map_err(arg_error)
-        .map(|v| v.unwrap_or_default())
-}
-
-fn parse_redaction(value: Option<String>) -> Result<RedactionMode, ErrorResponse> {
-    value
-        .as_deref()
-        .map(parse_redaction_mode_param)
-        .transpose()
-        .map_err(arg_error)
-        .map(|v| v.unwrap_or_default())
-}
 
 /// 把 domain Result<T, E> 序列化为 Result<String, String>:
 ///   - 成功 → Ok(json)
@@ -456,22 +397,18 @@ async fn main() -> anyhow::Result<()> {
                     projects: project.unwrap_or_default(),
                     all_projects: all,
                     sessions: sessions.unwrap_or_default(),
-                    since: parse_optional_time(since, "since")?,
-                    until: parse_optional_time(until, "until")?,
-                    types: types
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                    subtypes: split_csv(subtypes),
-                    servers: split_csv(servers),
-                    tools: split_csv(tools),
-                    lines: parse_optional_lines(lines)?,
+                    since: parse_optional_time_param(since.as_deref(), "since")?,
+                    until: parse_optional_time_param(until.as_deref(), "until")?,
+                    types: split_csv_param(Some(types.as_str())),
+                    subtypes: split_csv_param(subtypes.as_deref()),
+                    servers: split_csv_param(servers.as_deref()),
+                    tools: split_csv_param(tools.as_deref()),
+                    lines: parse_optional_line_ranges_param(lines.as_deref())?,
                     use_regex: regex,
                     case_sensitive,
                     offset,
                     limit,
-                    slice: parse_optional_slice(slice)?,
+                    slice: parse_optional_message_slice_param(slice.as_deref())?,
                     max_content,
                     max_content_tool_result: 500,
                     max_total,
@@ -480,7 +417,7 @@ async fn main() -> anyhow::Result<()> {
                     failed_tool_results,
                     tool_payload_errors,
                     dry_run,
-                    redaction: parse_redaction(redaction)?,
+                    redaction: parse_optional_redaction_mode_param(redaction.as_deref())?,
                     ignored_keys: Vec::new(),
                     warnings: Vec::new(),
                     output,
@@ -501,9 +438,9 @@ async fn main() -> anyhow::Result<()> {
             output,
             project,
             redaction,
-        } => match parse_optional_range(range) {
+        } => match parse_optional_range_param(range.as_deref()) {
             Ok(range) => {
-                let params = parse_redaction(redaction).map(|redaction| GetParams {
+                let params = parse_optional_redaction_mode_param(redaction.as_deref()).map(|redaction| GetParams {
                     r#ref,
                     range,
                     output,
@@ -535,7 +472,7 @@ async fn main() -> anyhow::Result<()> {
             max_total,
             output,
             redaction,
-        } => match parse_redaction(redaction) {
+        } => match parse_optional_redaction_mode_param(redaction.as_deref()) {
             Ok(redaction) => {
                 let params = ContextParams {
                     r#ref,
@@ -545,10 +482,8 @@ async fn main() -> anyhow::Result<()> {
                     until_ref,
                     direction,
                     project,
-                    types: types
-                        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-                        .unwrap_or_default(),
-                    subtypes: split_csv(subtypes),
+                    types: split_csv_param(types.as_deref()),
+                    subtypes: split_csv_param(subtypes.as_deref()),
                     max_content,
                     max_total,
                     pattern,
@@ -582,7 +517,7 @@ async fn main() -> anyhow::Result<()> {
             direction,
             output,
             redaction,
-        } => match parse_redaction(redaction) {
+        } => match parse_optional_redaction_mode_param(redaction.as_deref()) {
             Ok(redaction) => {
                 let params = TraceParams {
                     r#ref,
@@ -591,19 +526,13 @@ async fn main() -> anyhow::Result<()> {
                     project,
                     max_content,
                     max_total,
-                    types: types
-                        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-                        .unwrap_or_default(),
-                    subtypes: split_csv(subtypes),
+                    types: split_csv_param(types.as_deref()),
+                    subtypes: split_csv_param(subtypes.as_deref()),
                     pattern,
                     regex,
                     case_sensitive,
-                    servers: servers
-                        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-                        .unwrap_or_default(),
-                    tools: tools
-                        .map(|t| t.split(',').map(|x| x.trim().to_string()).collect())
-                        .unwrap_or_default(),
+                    servers: split_csv_param(servers.as_deref()),
+                    tools: split_csv_param(tools.as_deref()),
                     until_type,
                     until_ref,
                     direction,

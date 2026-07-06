@@ -1,6 +1,10 @@
-use crate::types::{ErrorResponse, ImageInfo, MessageRecord, RedactionInfo, ToolInfo};
-use regex::Regex;
+use crate::types::{ErrorResponse, ImageInfo, MessageRecord, Range, RedactionInfo, ToolInfo};
+use regex::{Regex, RegexBuilder};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::sync::OnceLock;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +49,7 @@ pub struct ExportMessage<'a> {
 pub struct MessageExportFilters<'a> {
     pub types: &'a [String],
     pub subtypes: &'a [String],
-    pub compiled_regex: &'a Option<Regex>,
-    pub plain_pattern: &'a Option<String>,
-    pub case_sensitive: bool,
+    pub content_filter: &'a ContentFilter,
 }
 
 fn export_io_error(error: std::io::Error) -> ErrorResponse {
@@ -58,15 +60,80 @@ fn export_io_error(error: std::io::Error) -> ErrorResponse {
     }
 }
 
-fn export_matches_types(effective_type: &str, types: &[String]) -> bool {
+#[cfg(unix)]
+pub fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorResponse> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法设置输出路径权限: {}", e),
+        available: None,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
+    Ok(())
+}
+
+fn reject_final_symlink(path: &Path) -> Result<(), ErrorResponse> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ErrorResponse {
+            error: "invalid_output_file".to_string(),
+            message: format!("输出文件不能是符号链接: {}", path.display()),
+            available: None,
+        });
+    }
+    Ok(())
+}
+
+pub fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
+    reject_final_symlink(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法创建输出文件: {}", e),
+        available: None,
+    })?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("无法设置输出文件权限: {}", e),
+            available: None,
+        })?;
+    #[cfg(not(unix))]
+    set_private_permissions(path, 0o600)?;
+    Ok(file)
+}
+
+pub fn jsonl_read_warnings(read_errors: usize, parse_errors: usize) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if read_errors > 0 {
+        warnings.push(format!("读取 JSONL 时跳过 {} 行或文件", read_errors));
+    }
+    if parse_errors > 0 {
+        warnings.push(format!("解析 JSONL 时跳过 {} 行", parse_errors));
+    }
+    warnings
+}
+
+pub fn message_type_matches(effective_type: &str, types: &[String]) -> bool {
     types.is_empty() || types.iter().any(|t| t == effective_type)
 }
 
-fn export_matches_subtypes(subtype: &str, subtypes: &[String]) -> bool {
+pub fn message_subtype_matches(subtype: &str, subtypes: &[String]) -> bool {
     subtypes.is_empty() || subtypes.iter().any(|t| t == subtype)
 }
 
-fn export_matches_pattern(
+pub fn message_content_matches(
     content: &str,
     compiled: &Option<Regex>,
     plain: &Option<String>,
@@ -84,6 +151,61 @@ fn export_matches_pattern(
     true
 }
 
+pub struct ContentFilter {
+    compiled_regex: Option<Regex>,
+    plain_pattern: Option<String>,
+    case_sensitive: bool,
+}
+
+impl ContentFilter {
+    pub fn has_filter(&self) -> bool {
+        self.compiled_regex.is_some() || self.plain_pattern.is_some()
+    }
+
+    pub fn matches(&self, content: &str) -> bool {
+        message_content_matches(content, &self.compiled_regex, &self.plain_pattern, self.case_sensitive)
+    }
+}
+
+pub fn build_content_filter(
+    pattern: &Option<String>,
+    use_regex: bool,
+    case_sensitive: bool,
+) -> Result<ContentFilter, ErrorResponse> {
+    let compiled_regex = if let Some(pat) = pattern {
+        if use_regex {
+            Some(
+                RegexBuilder::new(pat)
+                    .case_insensitive(!case_sensitive)
+                    .build()
+                    .map_err(|e| ErrorResponse {
+                        error: "invalid_regex".to_string(),
+                        message: format!("无效的正则表达式: {}", e),
+                        available: None,
+                    })?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let plain_pattern = if pattern.is_some() && !use_regex {
+        if case_sensitive {
+            pattern.clone()
+        } else {
+            pattern.as_ref().map(|p| p.to_lowercase())
+        }
+    } else {
+        None
+    };
+    Ok(ContentFilter {
+        compiled_regex,
+        plain_pattern,
+        case_sensitive,
+    })
+}
+
 pub fn write_filtered_message_export<'a, W, I>(
     writer: &mut W,
     prefix: &str,
@@ -91,31 +213,23 @@ pub fn write_filtered_message_export<'a, W, I>(
     anchor_idx: usize,
     filters: MessageExportFilters<'_>,
 ) -> Result<(usize, usize), ErrorResponse>
-    where
-        W: Write,
-        I: IntoIterator<Item=(usize, ExportMessage<'a>)>,
+where
+    W: Write,
+    I: IntoIterator<Item = (usize, ExportMessage<'a>)>,
 {
     let mut written_messages = 0usize;
     let mut redacted_count = 0usize;
-    let has_pattern_filter = filters.compiled_regex.is_some() || filters.plain_pattern.is_some();
+    let has_pattern_filter = filters.content_filter.has_filter();
 
     for (idx, item) in items {
         let is_anchor = idx == anchor_idx;
         if !is_anchor
-            && (!export_matches_types(item.effective_type, filters.types)
-            || !export_matches_subtypes(item.subtype, filters.subtypes))
+            && (!message_type_matches(item.effective_type, filters.types)
+                || !message_subtype_matches(item.subtype, filters.subtypes))
         {
             continue;
         }
-        if !is_anchor
-            && has_pattern_filter
-            && !export_matches_pattern(
-            item.content,
-            filters.compiled_regex,
-            filters.plain_pattern,
-            filters.case_sensitive,
-        )
-        {
+        if !is_anchor && has_pattern_filter && !filters.content_filter.matches(item.content) {
             continue;
         }
         let anchor_mark = if is_anchor { " [anchor]" } else { "" };
@@ -124,7 +238,7 @@ pub fn write_filtered_message_export<'a, W, I>(
             "=== {}:{} {} {}{} ===",
             prefix, item.line_num, item.effective_type, item.subtype, anchor_mark
         )
-            .map_err(export_io_error)?;
+        .map_err(export_io_error)?;
         writeln!(writer, "{}", item.content).map_err(export_io_error)?;
         writeln!(writer).map_err(export_io_error)?;
         written_messages += 1;
@@ -159,8 +273,8 @@ pub fn classify_message(record: &MessageRecord) -> (&'static str, &'static str) 
                 }
                 if let Some(arr) = content.as_array()
                     && arr
-                    .iter()
-                    .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                        .iter()
+                        .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
                 {
                     return ("user", "tool_result");
                 }
@@ -478,7 +592,7 @@ pub fn normalize_message_slice(slice: &MessageSlice, len: usize) -> (usize, usiz
     if end < start { (start, start) } else { (start, end) }
 }
 
-pub fn parse_line_ranges_param(s: &str) -> Result<Vec<crate::types::Range>, String> {
+pub fn parse_line_ranges_param(s: &str) -> Result<Vec<Range>, String> {
     let mut ranges = Vec::new();
     for part in s.split(',') {
         let raw = part.trim();
@@ -515,12 +629,12 @@ pub fn parse_line_ranges_param(s: &str) -> Result<Vec<crate::types::Range>, Stri
             {
                 return Err(format!("lines 起点大于终点: {}", raw));
             }
-            ranges.push(crate::types::Range { start, end, exclude });
+            ranges.push(Range { start, end, exclude });
         } else {
             let line = value
                 .parse::<usize>()
                 .map_err(|_| format!("无效的 lines 行号: {}", raw))?;
-            ranges.push(crate::types::Range {
+            ranges.push(Range {
                 start: Some(line),
                 end: Some(line),
                 exclude,
@@ -528,6 +642,61 @@ pub fn parse_line_ranges_param(s: &str) -> Result<Vec<crate::types::Range>, Stri
         }
     }
     Ok(ranges)
+}
+
+pub fn invalid_arguments(message: impl Into<String>) -> ErrorResponse {
+    ErrorResponse {
+        error: "invalid_arguments".to_string(),
+        message: message.into(),
+        available: None,
+    }
+}
+
+pub fn split_csv_param(value: Option<&str>) -> Vec<String> {
+    value
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn parse_optional_time_param(
+    value: Option<&str>,
+    name: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, ErrorResponse> {
+    value
+        .map(|s| parse_time_param(s, name).map_err(invalid_arguments))
+        .transpose()
+}
+
+pub fn parse_optional_range_param(value: Option<&str>) -> Result<Option<(usize, usize)>, ErrorResponse> {
+    value.map(parse_range_param).transpose().map_err(invalid_arguments)
+}
+
+pub fn parse_optional_message_slice_param(value: Option<&str>) -> Result<Option<MessageSlice>, ErrorResponse> {
+    value
+        .map(parse_message_slice_param)
+        .transpose()
+        .map_err(invalid_arguments)
+}
+
+pub fn parse_optional_line_ranges_param(value: Option<&str>) -> Result<Vec<Range>, ErrorResponse> {
+    value
+        .map(parse_line_ranges_param)
+        .transpose()
+        .map_err(invalid_arguments)
+        .map(|v| v.unwrap_or_default())
+}
+
+pub fn parse_optional_redaction_mode_param(value: Option<&str>) -> Result<RedactionMode, ErrorResponse> {
+    value
+        .map(parse_redaction_mode_param)
+        .transpose()
+        .map_err(invalid_arguments)
+        .map(|v| v.unwrap_or_default())
 }
 
 /// 截断内容到指定长度
@@ -900,7 +1069,7 @@ pub fn redact_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
             Regex::new(
                 r"\b(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})\b",
             )
-                .expect("valid regex")
+            .expect("valid regex")
         })
         .replace_all(&result, |_: &regex::Captures<'_>| {
             count += 1;
@@ -990,10 +1159,10 @@ fn is_sensitive_key(lower_key: &str, mode: RedactionMode) -> bool {
         || lower_key.contains("keypath")
         || lower_key.contains("key_path")
         || (mode == RedactionMode::Strict
-        && (lower_key.contains("host")
-        || lower_key.contains("url")
-        || lower_key.contains("endpoint")
-        || lower_key.contains("domain")))
+            && (lower_key.contains("host")
+                || lower_key.contains("url")
+                || lower_key.contains("endpoint")
+                || lower_key.contains("domain")))
 }
 
 pub struct StructuredToolData {
