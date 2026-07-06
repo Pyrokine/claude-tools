@@ -1,5 +1,65 @@
 # Changelog
 
+## v1.15.1 - 2026-07-05
+
+## Versions
+
+- mcp-chrome: 2.3.0 → 2.3.1
+- mcp-claude-history: 1.8.0 → 1.8.1
+- mcp-ssh: 2.3.0 → 2.3.1
+
+## What's Changed
+
+### mcp-chrome
+
+- fix: Keep zero-config local auto-connect while preserving optional pairing-token hardening
+- fix: Reject unfiltered cookie reads in the Extension layer
+- fix: Return idle timeout when DOM mutations do not become quiet, and keep screenshot fallback dimensions best-effort
+- fix: Wait for Extension navigation to observe URL or title changes instead of returning on an already-complete page
+
+### mcp-claude-history
+
+- fix: Return MCP tool-level errors for business errors instead of success text
+- fix: Reject symlink output targets and report JSONL read/parse warnings in context, trace, and search
+- fix: Apply server and tool filters to payload-error search results through `tool_use_id` metadata
+
+### mcp-ssh
+
+- fix: Fail SFTP fallback syncs that request delete, and close SFTP channels on stat or read failures
+- fix: Enforce byte-capped `lineRange` output without remote temp files and report UTF-8 byte counts for `writeFile`
+- fix: Cover SSH channel open with command timeout, validate PTY buffer sizes, and honor `verifyOwner=0`
+
+---
+
+## 版本
+
+- mcp-chrome: 2.3.0 → 2.3.1
+- mcp-claude-history: 1.8.0 → 1.8.1
+- mcp-ssh: 2.3.0 → 2.3.1
+
+## 更新内容
+
+### mcp-chrome
+
+- fix: 保留零配置本地自动连接，同时保留可选 pairing-token 加固
+- fix: Extension 层拒绝无过滤条件的 cookie 读取
+- fix: DOM mutation 未达到静默条件时返回 idle 超时，截图 fallback 的尺寸信息改为 best-effort
+- fix: Extension 导航等待以 URL 或标题变化为准，避免已完成页面提前返回
+
+### mcp-claude-history
+
+- fix: 业务错误改为 MCP tool-level error，不再包装成成功文本
+- fix: 拒绝 symlink 输出目标，并在 context、trace 和 search 中报告 JSONL 读取或解析 warning
+- fix: payload-error 搜索结果通过 `tool_use_id` 元数据应用 server 和 tool 过滤
+
+### mcp-ssh
+
+- fix: SFTP fallback 收到 delete 请求时返回失败，并在 stat 或 read 失败时关闭 SFTP channel
+- fix: `lineRange` 不再创建远端临时文件，按字节限制输出，并让 `writeFile` 返回 UTF-8 字节数
+- fix: command timeout 覆盖 SSH channel open，校验 PTY bufferSize，并正确处理 `verifyOwner=0`
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.15.0...v1.15.1
+
 ## v1.15.0 - 2026-07-04
 
 ## Versions
@@ -13,9 +73,11 @@
 ### mcp-chrome
 
 - feat: Add `postCondition` to `input` and `evaluate` so callers can verify page state after actions
-- fix: Return structured diagnostics for debugger conflicts, screenshot fallback limits, evaluate result limits, and window focus observation
+- fix: Return structured diagnostics for debugger conflicts, screenshot fallback limits, evaluate result limits, and
+  window focus observation
 - fix: Match network log `urlPattern` with deterministic wildcard matching to avoid extension worker stalls on long URLs
-- docs: Update README and README_zh for post-condition, screenshot fallback, network URL filters, and focusWindow behavior
+- docs: Update README and README_zh for post-condition, screenshot fallback, network URL filters, and focusWindow
+  behavior
 
 ### mcp-claude-history
 
@@ -27,7 +89,8 @@
 ### mcp-ssh
 
 - feat: Add empty-output failure diagnostics for silent non-zero command exits
-- feat: Preserve per-host execution metadata in `ssh_exec_parallel`, with alias count, concurrency, and output-size limits
+- feat: Preserve per-host execution metadata in `ssh_exec_parallel`, with alias count, concurrency, and output-size
+  limits
 - feat: Add `ssh_sync` owner and mode verification for upload single-file syncs
 - fix: Resolve SFTP upload targets when syncing a local file into a remote directory
 - docs: Update README and README_zh for execution metadata and sync verification behavior
