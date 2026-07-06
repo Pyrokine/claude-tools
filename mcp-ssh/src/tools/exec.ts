@@ -145,7 +145,7 @@ function classifyCommandRisk(command: string): CommandRisk | undefined {
     if (pipeCount >= 3) {
         pushRisk(categories, signals, 'long-running', 'long_pipeline')
     }
-    if (/(^|[^&])&(?!&)/.test(command)) {
+    if (/(?:^|[^&])&(?!&)/.test(command)) {
         pushRisk(categories, signals, 'process-control', 'background_task')
     }
     if (/\b(?:rm\s+-[a-zA-Z]*r|dd\s+if=|mkfs|fdisk|parted|shutdown|reboot)\b/.test(lowerCommand)) {

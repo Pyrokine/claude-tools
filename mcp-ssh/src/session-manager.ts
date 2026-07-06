@@ -597,6 +597,7 @@ export class SessionManager {
             let stdoutTruncated = false
             let stderrTruncated = false
             let settled = false
+            let activeStream: ClientChannel | null = null
 
             const execOptions: Ssh2ExecOptions = {}
 
@@ -608,42 +609,57 @@ export class SessionManager {
                 }
             }
 
+            const outputPreview = (): OutputPreview => ({
+                stdout,
+                stderr,
+                stdoutTail,
+                stderrTail,
+                stdoutBytes,
+                stderrBytes,
+                stdoutTruncated,
+                stderrTruncated,
+                maxOutputSize,
+            })
+
+            const clearTimer = () => {
+                if (timeoutId) {
+                    clearTimeout(timeoutId)
+                    timeoutId = null
+                }
+            }
+
+            const rejectOnce = (error: Error) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                clearTimer()
+                activeStream?.close()
+                reject(error)
+            }
+
+            timeoutId = setTimeout(() => {
+                rejectOnce(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
+            }, timeout)
+
             session.client.exec(fullCommand, execOptions, (err, stream) => {
                 if (err) {
-                    settled = true
-                    reject(new Error(`Exec failed: ${err.message}`))
+                    rejectOnce(new Error(`Exec failed: ${err.message}`))
+                    return
+                }
+                if (settled) {
+                    stream.close()
                     return
                 }
 
-                const outputPreview = (): OutputPreview => ({
-                    stdout,
-                    stderr,
-                    stdoutTail,
-                    stderrTail,
-                    stdoutBytes,
-                    stderrBytes,
-                    stdoutTruncated,
-                    stderrTruncated,
-                    maxOutputSize,
-                })
-
-                timeoutId = setTimeout(() => {
-                    if (settled) {
-                        return
-                    }
-                    settled = true
-                    stream.close()
-                    reject(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
-                }, timeout)
+                activeStream = stream
 
                 stream.on('close', (code: number) => {
-                    if (timeoutId) {
-                        clearTimeout(timeoutId)
-                    }
                     if (settled) {
                         return
                     }
                     settled = true
+                    clearTimer()
                     resolve({
                         success: code === 0,
                         stdout: stdoutTruncated ? stdout + '\n... [truncated]' : stdout,

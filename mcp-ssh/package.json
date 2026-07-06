@@ -1,6 +1,6 @@
 {
     "name": "@pyrokine/mcp-ssh",
-    "version": "2.3.0",
+    "version": "2.3.1",
     "description": "A comprehensive SSH MCP Server for Claude Code",
     "type": "module",
     "main": "dist/index.js",
@@ -29,7 +29,7 @@
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "https://github.com/Pyrokine/claude-tools.git"
+        "url": "git+https://github.com/Pyrokine/claude-tools.git"
     },
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",

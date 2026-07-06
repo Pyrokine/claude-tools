@@ -11,6 +11,8 @@ import type { PtyOptions, PtySessionInfo } from './types.js'
 const Terminal = xterm.Terminal as typeof import('@xterm/headless').Terminal
 type TerminalType = import('@xterm/headless').Terminal
 
+export const HARD_PTY_BUFFER_SIZE = 16 * 1024 * 1024
+
 /** PTY 创建所需的外部依赖 */
 export interface PtyDependencies {
     /** 通过 alias 获取 SSH client 并执行命令 */
@@ -51,7 +53,7 @@ export class PtyManager {
         const ptyId = this.generateId()
         const rows = options.rows || 24
         const cols = options.cols || 80
-        const maxBufferSize = options.bufferSize || this.defaultBufferSize
+        const maxBufferSize = this.normalizeBufferSize(options.bufferSize)
 
         const stream = await deps.execPty(alias, command, options)
 
@@ -232,6 +234,16 @@ export class PtyManager {
             })
         }
         return result
+    }
+
+    private normalizeBufferSize(bufferSize?: number): number {
+        if (bufferSize === undefined) {
+            return this.defaultBufferSize
+        }
+        if (!Number.isSafeInteger(bufferSize) || bufferSize <= 0 || bufferSize > HARD_PTY_BUFFER_SIZE) {
+            throw new Error(`bufferSize 必须是 1 到 ${HARD_PTY_BUFFER_SIZE} 之间的整数`)
+        }
+        return bufferSize
     }
 
     private startIdleSweeper(): void {

@@ -262,7 +262,7 @@ async function buildUploadVerification(
         const expectedMode = normalizeExpectedMode(args.verifyMode)
         checks.mode = expectedMode !== undefined && remote.mode === expectedMode
     }
-    if (args.verifyOwner && remote.exists) {
+    if (args.verifyOwner !== undefined && remote.exists) {
         const expectedOwner = String(args.verifyOwner)
         checks.owner = String(remote.ownerId) === expectedOwner || remote.ownerName === expectedOwner
     }

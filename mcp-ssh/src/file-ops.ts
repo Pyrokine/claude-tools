@@ -401,22 +401,29 @@ export async function downloadFile(
     localPath = expandTilde(localPath)
     validateLocalPathAgainstAllowList(localPath)
     const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
-    const totalSize = (await sftpStat(sftp, remotePath)).size
+    try {
+        const totalSize = (await sftpStat(sftp, remotePath)).size
 
-    // 确保本地目录存在
-    const localDir = path.dirname(localPath)
-    if (!fs.existsSync(localDir)) {
-        fs.mkdirSync(localDir, { recursive: true })
+        // 确保本地目录存在
+        const localDir = path.dirname(localPath)
+        if (!fs.existsSync(localDir)) {
+            fs.mkdirSync(localDir, { recursive: true })
+        }
+
+        return await pipeWithProgress(
+            sftp.createReadStream(remotePath),
+            fs.createWriteStream(localPath),
+            sftp,
+            totalSize,
+            onProgress,
+            !sharedSftp
+        )
+    } catch (error) {
+        if (!sharedSftp) {
+            sftp.end()
+        }
+        throw error
     }
-
-    return pipeWithProgress(
-        sftp.createReadStream(remotePath),
-        fs.createWriteStream(localPath),
-        sftp,
-        totalSize,
-        onProgress,
-        !sharedSftp
-    )
 }
 
 export const DEFAULT_READ_FILE_MAX_BYTES = 1024 * 1024
@@ -505,21 +512,30 @@ async function readLineRange(
     lineRange: string
 ): Promise<ReadFileResult> {
     const { start, end } = parseLineRange(lineRange)
-    const command = [
-        `awk 'NR>=${start} && NR<=${end} { print } NR>${end} { exit }'`,
-        escapeShellArg(remotePath),
-        '|',
-        'head',
-        '-c',
-        String(maxBytes),
+    const awkProgram = [
+        'BEGIN { written = 0 }',
+        `NR>=${start} && NR<=${end} {`,
+        'line = $0 "\\n"',
+        'remaining = max - written',
+        'if (remaining <= 0) { exit }',
+        'if (length(line) > remaining) { printf "%s", substr(line, 1, remaining); exit }',
+        'printf "%s", line',
+        'written += length(line)',
+        '}',
+        `NR>${end} { exit }`,
     ].join(' ')
+    const command = `LC_ALL=C awk -v max=${maxBytes} ${escapeShellArg(awkProgram)} ${escapeShellArg(remotePath)}`
     const result = await sessionManager.exec(alias, command, {
         timeout: 30000,
         useLoginUser: true,
         maxOutputSize: maxBytes + 4096,
     })
-    if (!result.success && result.stderr.trim().length > 0) {
-        throw new Error(result.stderr.trim())
+    if (!result.success) {
+        const message =
+            result.stderr.trim() ||
+            result.stdout.trim() ||
+            `remote lineRange command failed with exit code ${result.exitCode}`
+        throw new Error(message)
     }
     const readBytes = Buffer.byteLength(result.stdout, 'utf-8')
     return {
@@ -548,7 +564,13 @@ export async function readFile(
     validateReadFileOptions(readOptions)
 
     const sftp = await sessionManager.getSftp(alias)
-    const actualSize = (await sftpStat(sftp, remotePath)).size
+    let actualSize: number
+    try {
+        actualSize = (await sftpStat(sftp, remotePath)).size
+    } catch (error) {
+        sftp.end()
+        throw error
+    }
 
     if (readOptions.lineRange) {
         sftp.end()
@@ -623,13 +645,14 @@ export async function writeFile(
 ): Promise<{ success: boolean; size: number }> {
     const sftp = await sessionManager.getSftp(alias)
     const flags = append ? 'a' : 'w'
+    const contentBuffer = Buffer.from(content, 'utf-8')
 
     return new Promise((resolve, reject) => {
         const writeStream = sftp.createWriteStream(remotePath, { flags })
 
         writeStream.on('close', () => {
             sftp.end()
-            resolve({ success: true, size: content.length })
+            resolve({ success: true, size: contentBuffer.length })
         })
 
         writeStream.on('error', (err: Error) => {
@@ -637,7 +660,7 @@ export async function writeFile(
             reject(err)
         })
 
-        writeStream.write(content)
+        writeStream.write(contentBuffer)
         writeStream.end()
     })
 }
@@ -1186,6 +1209,7 @@ async function syncWithSftp(
                 recursive: options.recursive !== false,
                 followSymlinks: options.followSymlinks === true,
                 deleteRequested: options.delete === true,
+                deleteSupported: options.delete ? false : undefined,
                 excludeCount: options.exclude?.length ?? 0,
                 localExists,
                 localIsDirectory: localStats?.isDirectory(),
@@ -1196,6 +1220,15 @@ async function syncWithSftp(
             output:
                 'Dry run mode: would transfer files via SFTP' +
                 (warnings.length ? `. Warning: ${warnings.join('; ')}` : ''),
+        }
+    }
+
+    if (options.delete) {
+        return {
+            success: false,
+            method: 'sftp',
+            stats: { added: 0, updated: 0, deleted: 0, skipped: 0, failed: 1 },
+            output: 'delete option is not supported in SFTP mode (requires rsync)',
         }
     }
 

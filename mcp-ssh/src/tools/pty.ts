@@ -6,6 +6,7 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import { HARD_PTY_BUFFER_SIZE } from '../pty-manager.js'
 import { sessionManager } from '../session-manager.js'
 import { formatError, formatResult } from './utils.js' // ========== Schemas ==========
 
@@ -19,7 +20,13 @@ const ptyStartSchema = z.object({
     term: z.string().optional().describe('终端类型，默认 xterm-256color'),
     cwd: z.string().optional().describe('工作目录'),
     env: z.record(z.string(), z.string()).optional().describe('环境变量'),
-    bufferSize: z.number().optional().describe('输出缓冲区大小（字节），默认 1MB'),
+    bufferSize: z
+        .number()
+        .int()
+        .positive()
+        .max(HARD_PTY_BUFFER_SIZE)
+        .optional()
+        .describe('输出缓冲区大小（字节），默认 1MB'),
 })
 
 const ptyWriteSchema = z.object({
