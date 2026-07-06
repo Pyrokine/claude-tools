@@ -289,18 +289,6 @@ export type CacheType = 'all' | 'storage' | 'cache'
 export type SameSite = 'Strict' | 'Lax' | 'None'
 
 /**
- * Cookie 选项
- */
-export interface CookieOptions {
-    domain?: string
-    path?: string
-    expires?: number
-    httpOnly?: boolean
-    secure?: boolean
-    sameSite?: SameSite
-}
-
-/**
  * Cookie 数据
  */
 export interface Cookie {

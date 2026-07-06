@@ -61,13 +61,3 @@ export function sanitizeErrorMessage(input: unknown): string {
 
     return msg
 }
-
-/**
- * 对错误对象做脱敏,返回 string（用于直接拼到 message 字段）
- */
-export function sanitizeError(err: unknown): string {
-    if (err instanceof Error) {
-        return sanitizeErrorMessage(err)
-    }
-    return sanitizeErrorMessage(String(err))
-}

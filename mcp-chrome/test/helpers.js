@@ -3,7 +3,6 @@
  *
  * 封装与 mcp-chrome 的 JSON-RPC 通信
  */
-/* eslint-env node */
 
 import { spawn } from 'child_process';
 import { dirname, resolve } from 'path';

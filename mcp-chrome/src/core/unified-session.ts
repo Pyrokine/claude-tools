@@ -134,6 +134,17 @@ class UnifiedSessionManager {
         return this.inputMode
     }
 
+    getCurrentTargetId(): string | null {
+        const mode = this.getMode()
+        if (mode === 'extension') {
+            return this.extensionBridge?.getCurrentTargetId() ?? null
+        }
+        if (mode === 'cdp') {
+            return getCdpSession().getCurrentTargetId()
+        }
+        return null
+    }
+
     /**
      * 获取当前 iframe 在主页面的偏移量（仅 withFrame 期间有效）
      */
@@ -1557,26 +1568,36 @@ class UnifiedSessionManager {
             if (timeout !== undefined) {
                 params.timeout = timeout
             }
-            const result = (await this.extensionBridge!.debuggerSend(
-                'Runtime.callFunctionOn',
-                params,
-                undefined,
-                timeout
-            )) as {
+
+            let result: {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
             }
+            try {
+                result = (await this.extensionBridge!.debuggerSend(
+                    'Runtime.callFunctionOn',
+                    params,
+                    undefined,
+                    timeout
+                )) as typeof result
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                if (message.includes('Either objectId or executionContextId or uniqueContextId must be specified')) {
+                    const fallbackExpression = buildFallbackExpression()
+                    return this.evaluateViaExtensionPrecise<T>(
+                        fallbackExpression,
+                        fallbackExpression,
+                        undefined,
+                        timeout
+                    )
+                }
+                throw error
+            }
+
             if (result.exceptionDetails) {
                 throw new Error(formatCdpException(result.exceptionDetails))
             }
             return await this.materializeCdpResult<T>(result.result, timeout)
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            if (message.includes('Either objectId or executionContextId or uniqueContextId must be specified')) {
-                const fallbackExpression = buildFallbackExpression()
-                return this.evaluateViaExtensionPrecise<T>(fallbackExpression, fallbackExpression, undefined, timeout)
-            }
-            throw error
         } finally {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', {
                 objectId: globalObjectId,

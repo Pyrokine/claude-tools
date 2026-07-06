@@ -92,14 +92,15 @@ browse(action="open", url="https://example.com")
 extract(type="screenshot")
 ```
 
-**可选配对 token**
+**配对 token**
 
-默认本地 Extension 模式不需要 token，如需限制 Extension 连接，启动 MCP server 时设置 `MCP_CHROME_PAIRING_TOKEN`，再在
-Extension popup 中输入同一个 token：
+Extension 模式默认保留零配置本地自动连接，在多用户机器、CI runner、或不可信本地进程可访问 `127.0.0.1:19222-19299` 的容器环境中，启动 MCP server 时设置 `MCP_CHROME_PAIRING_TOKEN`，再在 Extension popup 中输入同一个 token：
 
 ```bash
 MCP_CHROME_PAIRING_TOKEN="your-token" node /path/to/mcp-chrome/dist/index.js
 ```
+
+需要强制配对 token 时，在 server 设置 `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0`，并在 Extension popup 关闭“允许无 token 本地连接”，
 
 ### 模式二：CDP 模式（回退）
 
@@ -540,10 +541,9 @@ mcp-chrome/
 
 ## 安全说明
 
-- **信任边界**：本服务器无应用层认证，仅依赖 `127.0.0.1` 绑定 + 同 UID 信任，与 Playwright、Puppeteer、chrome-launcher
-  采用同一信任模型，禁止部署在多用户系统、CI runner、`--net=host` 容器等不可信代码可访问
-  `127.0.0.1:19222-19299` 的环境中，WebSocket 握手要求 `chrome-extension://` Origin 头，可挡掉浏览器页面和 curl，
-  但拦不住同 UID 的本地恶意进程
+- **信任边界**：Extension 模式默认自动连接本地 MCP server，在多用户系统、CI runner、`--net=host` 容器等不可信代码可访问
+  `127.0.0.1:19222-19299` 的环境中，应使用 `MCP_CHROME_PAIRING_TOKEN`，或设置 `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0`，WebSocket 握手要求 `chrome-extension://`
+  Origin 头，可挡掉浏览器页面和 curl，但拦不住同 UID 的本地恶意进程
 - Extension 模式：共享浏览器会话，请仅在受信任的机器上使用
 - CDP 模式：通过 DevTools Protocol 提供完整浏览器控制能力
 - 默认端口仅绑定到 127.0.0.1（本地访问）

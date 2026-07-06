@@ -15,6 +15,7 @@ const HEALTH_CHECK_TIMEOUT = 500
 const MAX_RECONNECT_DELAY = 30000
 const HEARTBEAT_TIMEOUT = 20000
 const PAIRING_TOKEN_STORAGE_KEY = 'mcp_pairing_token'
+const ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY = 'mcp_allow_insecure_no_token_v2'
 
 interface ServerConnection {
     ws: WebSocket
@@ -72,6 +73,7 @@ export class HttpClient {
     private connecting = false
     private pairingToken: string | null = null
     private pairingTokenLoaded = false
+    private allowInsecureNoToken: boolean | null = null
 
     onMessage(handler: MessageHandler): void {
         this.messageHandler = handler
@@ -86,10 +88,26 @@ export class HttpClient {
         this.pairingTokenLoaded = true
         await chrome.storage.local.set({ [PAIRING_TOKEN_STORAGE_KEY]: this.pairingToken })
         this.disconnect()
+        if (this.pairingToken) {
+            await this.connect()
+        }
     }
 
     async hasPairingToken(): Promise<boolean> {
         return (await this.getPairingToken()).length > 0
+    }
+
+    async setAllowInsecureNoToken(allow: boolean): Promise<void> {
+        this.allowInsecureNoToken = allow
+        await chrome.storage.local.set({ [ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY]: allow })
+        this.disconnect()
+        if (allow) {
+            await this.connect()
+        }
+    }
+
+    async isAllowInsecureNoToken(): Promise<boolean> {
+        return await this.getAllowInsecureNoToken()
     }
 
     /**
@@ -186,6 +204,16 @@ export class HttpClient {
             typeof result[PAIRING_TOKEN_STORAGE_KEY] === 'string' ? result[PAIRING_TOKEN_STORAGE_KEY] : ''
         this.pairingTokenLoaded = true
         return this.pairingToken ?? ''
+    }
+
+    private async getAllowInsecureNoToken(): Promise<boolean> {
+        if (this.allowInsecureNoToken !== null) {
+            return this.allowInsecureNoToken
+        }
+        const result = await chrome.storage.local.get(ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY)
+        // 与 server 侧默认一致：未显式关闭时允许本地自动连接；v2 key 避免旧版 false 值污染默认行为
+        this.allowInsecureNoToken = result[ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY] !== false
+        return this.allowInsecureNoToken
     }
 
     private async connectToPort(port: number): Promise<boolean> {
@@ -350,7 +378,7 @@ export class HttpClient {
                 return true
             }
 
-            if (token) {
+            if (token || !(await this.getAllowInsecureNoToken())) {
                 return false
             }
             this.verifiedAuth.delete(port)

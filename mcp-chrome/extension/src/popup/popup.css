@@ -88,6 +88,14 @@ h1 {
     line-height: 1.35;
 }
 
+.auth-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #666;
+}
+
 .btn {
     flex: 1;
     padding: 10px 16px;

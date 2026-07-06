@@ -425,18 +425,6 @@ export interface IBrowserDriver {
     evaluate(code: string, args?: unknown[], timeout?: number): Promise<unknown>
 }
 
-/** 类型守卫：判断是否为 Extension 实现 */
-export interface IExtensionDriverExtras {
-    /** Extension 模式特有：等待 WebSocket 重连 */
-    waitForConnection(timeout?: number): Promise<boolean>
-    /** Extension 模式特有：是否已连接 */
-    isConnected(): boolean
-    /** Extension 模式特有：当前 tabId（chrome tab 数字 ID） */
-    getCurrentTabId?(): number | null
-    /** Extension 模式特有：直接设置 tabId（绕过 attach） */
-    setCurrentTabId?(tabId: number | null): void
-}
-
 // ==================== 通用错误 ====================
 
 /**

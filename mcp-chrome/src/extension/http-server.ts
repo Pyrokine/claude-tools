@@ -92,6 +92,8 @@ export class ExtensionHttpServer extends EventEmitter {
     private heartbeatInterval: NodeJS.Timeout | null = null
     private pongReceived = false
     private readonly pairingToken = process.env.MCP_CHROME_PAIRING_TOKEN?.trim() ?? ''
+    // 本地零配置自动连接是默认契约；pairing token 只用于共享环境加固
+    private readonly allowUnauthenticatedExtension = process.env.MCP_CHROME_ALLOW_INSECURE_NO_TOKEN !== '0'
     private readonly authChallenges = new Map<string, AuthChallenge>()
 
     constructor(private options: HttpServerOptions = {}) {
@@ -304,7 +306,7 @@ export class ExtensionHttpServer extends EventEmitter {
 
     private verifyWebSocketAuth(rawUrl: string): boolean {
         if (!this.pairingToken) {
-            return true
+            return this.allowUnauthenticatedExtension
         }
         this.removeExpiredAuthChallenges()
         const url = new URL(rawUrl, 'http://127.0.0.1')
@@ -406,8 +408,21 @@ export class ExtensionHttpServer extends EventEmitter {
                 )
                 return
             }
-            res.writeHead(200)
-            res.end(JSON.stringify({ status: 'ok', port: this.port, authRequired: false }))
+            if (this.allowUnauthenticatedExtension) {
+                res.writeHead(200)
+                res.end(JSON.stringify({ status: 'ok', port: this.port, authRequired: false, insecure: true }))
+                return
+            }
+            res.writeHead(401)
+            res.end(
+                JSON.stringify({
+                    status: 'auth_required',
+                    port: this.port,
+                    authRequired: true,
+                    message:
+                        'No pairing token configured and no-token local connections are disabled. Unset MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0 or set MCP_CHROME_PAIRING_TOKEN.',
+                })
+            )
             return
         }
 

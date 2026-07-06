@@ -104,6 +104,68 @@ async function captureDiagnosticsDelta(
     }
 }
 
+type ToolResponse = {
+    content: Array<{ type: 'text'; text: string }>
+    isError?: boolean
+}
+
+function cspErrorResponse(): ToolResponse {
+    return {
+        content: [
+            {
+                type: 'text',
+                text: JSON.stringify({
+                    error: {
+                        code: 'CSP_BLOCKED',
+                        message: 'CSP 限制：此页面禁止动态代码执行',
+                        suggestion: '请添加 mode="precise" 参数使用 debugger API 绕过 CSP（会显示调试提示）',
+                    },
+                }),
+            },
+        ],
+        isError: true,
+    }
+}
+
+function appendDiagnostics(response: ToolResponse, diagnostics: Record<string, unknown>): ToolResponse {
+    const text = response.content[0]?.text
+    if (!text) {
+        return response
+    }
+    try {
+        const parsed = JSON.parse(text) as Record<string, unknown>
+        parsed.diagnostics = diagnostics
+        return {
+            ...response,
+            content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }],
+        }
+    } catch {
+        return response
+    }
+}
+
+async function formatEvaluateErrorResponse(
+    error: unknown,
+    unifiedSession?: ReturnType<typeof getUnifiedSession>,
+    diagnosticsStart?: DiagnosticsStart
+): Promise<ToolResponse> {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    const response =
+        errorMessage.includes('CSP') ||
+        errorMessage.includes('Content Security Policy') ||
+        errorMessage.includes('unsafe-eval')
+            ? cspErrorResponse()
+            : formatErrorResponse(error)
+    if (!unifiedSession || !diagnosticsStart) {
+        return response
+    }
+    try {
+        return appendDiagnostics(response, await captureDiagnosticsDelta(unifiedSession, diagnosticsStart))
+    } catch {
+        return response
+    }
+}
+
 async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
@@ -136,83 +198,70 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
                 const diagnosticsStart = args.diagnostics ? await captureDiagnosticsStart(unifiedSession) : undefined
-                const result = await unifiedSession.evaluate(script, args.mode, args.timeout, args.args as unknown[])
-                const normalizedResult = result === undefined ? null : result
-                const diagnostics = diagnosticsStart
-                    ? await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
-                    : undefined
-                const postCondition = args.postCondition
-                    ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate')
-                    : undefined
+                try {
+                    const result = await unifiedSession.evaluate(
+                        script,
+                        args.mode,
+                        args.timeout,
+                        args.args as unknown[]
+                    )
+                    const normalizedResult = result === undefined ? null : result
+                    const diagnostics = diagnosticsStart
+                        ? await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
+                        : undefined
+                    const postCondition = args.postCondition
+                        ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate')
+                        : undefined
 
-                if (outputPath) {
-                    // string 类型直接写入原始文本，其他类型 JSON 序列化
-                    const content = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                    await writePrivateFile(outputPath, content, 'utf-8')
+                    if (outputPath) {
+                        // string 类型直接写入原始文本，其他类型 JSON 序列化
+                        const content = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
+                        await writePrivateFile(outputPath, content, 'utf-8')
+                        return formatResponse({
+                            success: true,
+                            output: outputPath,
+                            ...(diagnostics ? { diagnostics } : {}),
+                            ...(postCondition ? { postCondition } : {}),
+                        })
+                    }
+
+                    const serialized = JSON.stringify({ success: true, result: normalizedResult }, null, 2)
+                    // 检测结果大小，超过 100KB 自动保存到受控临时目录
+                    if (serialized.length > 100_000) {
+                        const suffix = typeof result === 'string' ? 'txt' : 'json'
+                        const autoSavedPath = (
+                            await resolveScopedOutputPath(
+                                `${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`,
+                                'mcp-chrome'
+                            )
+                        ).absolutePath
+                        const fileContent =
+                            typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
+                        await writePrivateFile(autoSavedPath, fileContent, 'utf-8')
+                        return formatResponse({
+                            success: true,
+                            autoSaved: true,
+                            path: autoSavedPath,
+                            size: fileContent.length,
+                            hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
+                            ...(diagnostics ? { diagnostics } : {}),
+                            ...(postCondition ? { postCondition } : {}),
+                        })
+                    }
+
                     return formatResponse({
                         success: true,
-                        output: outputPath,
+                        result: normalizedResult,
                         ...(diagnostics ? { diagnostics } : {}),
                         ...(postCondition ? { postCondition } : {}),
                     })
+                } catch (error) {
+                    return await formatEvaluateErrorResponse(error, unifiedSession, diagnosticsStart)
                 }
-
-                const serialized = JSON.stringify({ success: true, result: normalizedResult }, null, 2)
-                // 检测结果大小，超过 100KB 自动保存到受控临时目录
-                if (serialized.length > 100_000) {
-                    const suffix = typeof result === 'string' ? 'txt' : 'json'
-                    const autoSavedPath = (
-                        await resolveScopedOutputPath(
-                            `${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`,
-                            'mcp-chrome'
-                        )
-                    ).absolutePath
-                    const fileContent = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                    await writePrivateFile(autoSavedPath, fileContent, 'utf-8')
-                    return formatResponse({
-                        success: true,
-                        autoSaved: true,
-                        path: autoSavedPath,
-                        size: fileContent.length,
-                        hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
-                        ...(diagnostics ? { diagnostics } : {}),
-                        ...(postCondition ? { postCondition } : {}),
-                    })
-                }
-
-                return formatResponse({
-                    success: true,
-                    result: normalizedResult,
-                    ...(diagnostics ? { diagnostics } : {}),
-                    ...(postCondition ? { postCondition } : {}),
-                })
             })
         }) // withTabId
     } catch (error) {
-        // 检测 CSP 错误，提示使用 precise 模式
-        const errorMessage = error instanceof Error ? error.message : String(error)
-        if (
-            errorMessage.includes('CSP') ||
-            errorMessage.includes('Content Security Policy') ||
-            errorMessage.includes('unsafe-eval')
-        ) {
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: JSON.stringify({
-                            error: {
-                                code: 'CSP_BLOCKED',
-                                message: 'CSP 限制：此页面禁止动态代码执行',
-                                suggestion: '请添加 mode="precise" 参数使用 debugger API 绕过 CSP（会显示调试提示）',
-                            },
-                        }),
-                    },
-                ],
-                isError: true,
-            }
-        }
-        return formatErrorResponse(error)
+        return await formatEvaluateErrorResponse(error)
     }
 }
 

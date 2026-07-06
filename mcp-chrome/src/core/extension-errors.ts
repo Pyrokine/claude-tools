@@ -11,27 +11,6 @@ export class ExtensionDisconnectedError extends Error {
     }
 }
 
-export class ExtensionNotConnectedError extends Error {
-    constructor(message = 'Extension not connected') {
-        super(message)
-        this.name = 'ExtensionNotConnectedError'
-    }
-}
-
-export class ExtensionScriptError extends Error {
-    constructor(message: string) {
-        super(message)
-        this.name = 'ExtensionScriptError'
-    }
-}
-
-export class ExtensionRequestTimeoutError extends Error {
-    constructor(message: string) {
-        super(message)
-        this.name = 'ExtensionRequestTimeoutError'
-    }
-}
-
 /** 判断是否是 Extension 断开类错误（含原 string-match 的兼容判断） */
 export function isExtensionDisconnected(err: unknown): boolean {
     if (err instanceof ExtensionDisconnectedError) {

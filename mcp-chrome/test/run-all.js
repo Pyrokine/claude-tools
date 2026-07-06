@@ -9,7 +9,6 @@
  *
  * 测试站点：demoqa.com
  */
-/* eslint-env node */
 
 import { McpClient, parseToolResult, TestReporter } from './helpers.js';
 

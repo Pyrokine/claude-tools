@@ -90,11 +90,16 @@ async function handleInternalMessage(message: InternalMessage): Promise<unknown>
             await httpClient.setPairingToken(message.token)
             return { success: true }
 
+        case 'SET_ALLOW_INSECURE_NO_TOKEN':
+            await httpClient.setAllowInsecureNoToken(message.allow)
+            return { success: true }
+
         case 'GET_STATUS':
             return {
                 connected: httpClient.isConnected(),
                 ports: httpClient.getConnectedPorts(),
                 pairingTokenConfigured: await httpClient.hasPairingToken(),
+                allowInsecureNoToken: await httpClient.isAllowInsecureNoToken(),
             }
 
         default:

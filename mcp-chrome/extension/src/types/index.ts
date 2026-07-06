@@ -374,12 +374,18 @@ export interface SetPairingTokenMessage {
     token: string
 }
 
+export interface SetAllowInsecureNoTokenMessage {
+    type: 'SET_ALLOW_INSECURE_NO_TOKEN'
+    allow: boolean
+}
+
 export type InternalMessage =
     | StatusUpdateMessage
     | ConnectMessage
     | DisconnectMessage
     | GetStatusMessage
     | SetPairingTokenMessage
+    | SetAllowInsecureNoTokenMessage
 
 // ==================== Debugger (CDP) 操作 ====================
 

@@ -142,7 +142,10 @@
     <input id='text-input' placeholder='在这里输入' type='text'>
     <label for='textarea'>多行文本:</label>
     <textarea id='textarea' placeholder='多行文本'></textarea>
+    <label for='controlled-input'>受控输入:</label>
+    <input data-change-events='0' data-input-events='0' id='controlled-input' type='text'>
     <div id='input-result'></div>
+    <div id='controlled-result'></div>
 </div>
 
 <!-- 键盘事件测试 -->
@@ -311,6 +314,26 @@
         );
         document.getElementById('input-result').textContent = '输入内容: ' + target.value;
         console.log('[MCP-TEST] Input changed:', target.value);
+    });
+
+    const controlledInput = document.getElementById('controlled-input');
+    const controlledResult = document.getElementById('controlled-result');
+
+    function incrementControlledCounter(name) {
+        const current = Number(controlledInput.dataset[name] || '0');
+        controlledInput.dataset[name] = String(current + 1);
+    }
+
+    controlledInput.addEventListener('input', function(/** @type {InputEvent} */ e) {
+        const target = /** @type {HTMLInputElement} */ (
+            e.currentTarget
+        );
+        incrementControlledCounter('inputEvents');
+        controlledResult.textContent = 'controlled input: ' + target.value;
+    });
+
+    controlledInput.addEventListener('change', function() {
+        incrementControlledCounter('changeEvents');
     });
 
     // 键盘事件

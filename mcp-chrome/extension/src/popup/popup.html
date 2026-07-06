@@ -23,11 +23,16 @@
     </div>
 
     <div class='auth-section'>
-        <label class='auth-label' for='pairingTokenInput'>Pairing token（可选）</label>
-        <input autocomplete='off' class='auth-input' id='pairingTokenInput' placeholder='未配置时使用本地信任模式'
+        <label class='auth-label' for='pairingTokenInput'>Pairing token</label>
+        <input autocomplete='off' class='auth-input' id='pairingTokenInput'
+               placeholder='可选，必须与 MCP_CHROME_PAIRING_TOKEN 一致'
                type='password'>
         <button class='btn btn-secondary' id='saveTokenBtn'>保存 token</button>
-        <p class='auth-help' id='authHelp'>配置后只连接使用同一 token 的 MCP Server</p>
+        <label class='auth-checkbox'>
+            <input id='allowInsecureNoTokenInput' type='checkbox'>
+            允许无 token 本地连接
+        </label>
+        <p class='auth-help' id='authHelp'>默认自动连接本地 MCP Server，可用 pairing token 加固</p>
     </div>
 
     <div class='info-section'>

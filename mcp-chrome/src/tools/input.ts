@@ -801,10 +801,10 @@ function validateEvent(event: InputEvent): void {
             break
         case 'drag':
             if (!event.target) {
-                requiredEventParam(event, 'target')
+                throw new Error('drag 事件需要 target 参数')
             }
             if (!event.to) {
-                requiredEventParam(event, 'to')
+                throw new Error('drag 事件需要 to 参数')
             }
             break
         case 'editorInsert':
@@ -1167,10 +1167,16 @@ async function handleUnifiedDrag(
     { unifiedSession, timeout }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    if ('x' in event.target! || 'y' in event.target!) {
+    if (!event.target) {
+        throw new Error('drag 事件需要 target 参数')
+    }
+    if (!event.to) {
+        throw new Error('drag 事件需要 to 参数')
+    }
+    if ('x' in event.target || 'y' in event.target) {
         throw new Error('drag 的 target 不支持坐标类型，请使用选择器（css/text/xpath/role 等）')
     }
-    if ('x' in event.to! || 'y' in event.to!) {
+    if ('x' in event.to || 'y' in event.to) {
         throw new Error('drag 的 to 不支持坐标类型，请使用选择器（css/text/xpath/role 等）')
     }
 

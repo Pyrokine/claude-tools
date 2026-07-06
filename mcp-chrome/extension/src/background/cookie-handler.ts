@@ -1,8 +1,12 @@
+import { ExpectedOperationError } from '../types/expected-errors'
 import { CookiesClearSchema, CookiesDeleteSchema, CookiesGetSchema, CookiesSetSchema } from '../types/schemas'
 
 export class CookieHandler {
     async cookiesGet(params: unknown): Promise<chrome.cookies.Cookie[]> {
         const p = CookiesGetSchema.parse(params) ?? {}
+        if (!p.url && !p.domain && !p.name) {
+            throw new ExpectedOperationError('cookies action=get 必须带 name/domain/url 至少一个过滤参数（避免读取全量 cookies）')
+        }
 
         const filter: chrome.cookies.GetAllDetails = {}
         if (p.url) {
@@ -29,8 +33,11 @@ export class CookieHandler {
 
     async cookiesSet(params: unknown): Promise<{ success: boolean }> {
         const p = CookiesSetSchema.parse(params)
+        if (p.expirationDate !== undefined && p.expirationDate > 100_000_000_000) {
+            throw new ExpectedOperationError('expirationDate 必须是 Unix 秒级时间戳，不能使用毫秒级 Date.now()')
+        }
 
-        await chrome.cookies.set({
+        const cookie = await chrome.cookies.set({
             url: p.url,
             name: p.name,
             value: p.value || '',
@@ -41,6 +48,9 @@ export class CookieHandler {
             sameSite: p.sameSite,
             expirationDate: p.expirationDate,
         })
+        if (!cookie) {
+            throw new ExpectedOperationError(`cookie 设置失败: ${p.name} @ ${p.url}`)
+        }
 
         return { success: true }
     }
@@ -61,7 +71,7 @@ export class CookieHandler {
 
         // 二层校验：禁止无过滤清全站（避免误删用户登录态）
         if (!p.url && !p.domain && !p.name) {
-            throw new Error('cookies action=clear 必须带 name/domain/url 至少一个过滤参数（项目规范）')
+            throw new ExpectedOperationError('cookies action=clear 必须带 name/domain/url 至少一个过滤参数（项目规范）')
         }
 
         const filter: chrome.cookies.GetAllDetails = {}

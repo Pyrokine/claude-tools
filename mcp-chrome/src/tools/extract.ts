@@ -314,14 +314,11 @@ async function handleScreenshotExtract(
         clip,
     })
     const screenshotBuffer = Buffer.from(screenshot.data, 'base64')
-    const fallbackDimensions = await getScreenshotFallbackDimensions(
-        unifiedSession,
-        clip,
-        fullPage,
-        scale,
-        args.timeout
-    )
-    const dimensions = readImageDimensions(screenshotBuffer, screenshot.format, fallbackDimensions)
+    const encodedDimensions = readImageDimensions(screenshotBuffer, screenshot.format)
+    const fallbackDimensions = encodedDimensions
+        ? undefined
+        : await getScreenshotFallbackDimensions(unifiedSession, clip, fullPage, scale, args.timeout)
+    const dimensions = encodedDimensions ?? fallbackDimensions
     const metadata: Record<string, unknown> = {
         format: screenshot.format,
         width: dimensions?.width,
@@ -570,17 +567,21 @@ async function getScreenshotFallbackDimensions(
             source: 'captureArea',
         }
     }
-    const size = await unifiedSession.evaluate<{ width: number; height: number }>(
-        fullPage
-            ? '(() => ({ width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight }))()'
-            : '(() => ({ width: window.innerWidth, height: window.innerHeight }))()',
-        undefined,
-        timeout
-    )
-    return {
-        width: Math.round(size.width * scale),
-        height: Math.round(size.height * scale),
-        source: 'captureArea',
+    try {
+        const size = await unifiedSession.evaluate<{ width: number; height: number }>(
+            fullPage
+                ? '(() => ({ width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight }))()'
+                : '(() => ({ width: window.innerWidth, height: window.innerHeight }))()',
+            undefined,
+            timeout
+        )
+        return {
+            width: Math.round(size.width * scale),
+            height: Math.round(size.height * scale),
+            source: 'captureArea',
+        }
+    } catch {
+        return undefined
     }
 }
 

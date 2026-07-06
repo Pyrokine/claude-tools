@@ -43,8 +43,6 @@ export class DebuggerManager {
     private cleanupEpoch = new Map<number, number>()
     /** setupListeners 幂等标志,防止热重载多实例叠加注册 */
     private listenersBound = false
-    private boundOnDetach: ((source: chrome.debugger.Debuggee, reason: string) => void) | null = null
-    private boundOnEvent: ((source: chrome.debugger.Debuggee, method: string, params?: unknown) => void) | null = null
 
     constructor(private logManager: LogManager) {}
 
@@ -70,18 +68,17 @@ export class DebuggerManager {
         this.listenersBound = true
 
         // 监听 debugger 断开（仅处理本实例 attach 过的 tab,避免与其他扩展冲突）
-        this.boundOnDetach = (source, reason) => {
+        chrome.debugger.onDetach.addListener((source, reason) => {
             if (!source.tabId || !this.attachedTabs.has(source.tabId)) {
                 return
             }
             this.cleanupTab(source.tabId)
             this.logManager.cleanupTab(source.tabId)
             console.log(`[MCP] Debugger detached from tab ${source.tabId}: ${reason}`)
-        }
-        chrome.debugger.onDetach.addListener(this.boundOnDetach)
+        })
 
         // 监听 debugger 事件（仅本实例 attach 过的 tab）
-        this.boundOnEvent = (source, method, params) => {
+        chrome.debugger.onEvent.addListener((source, method, params) => {
             if (!source.tabId || !this.attachedTabs.has(source.tabId)) {
                 return
             }
@@ -123,21 +120,7 @@ export class DebuggerManager {
             if (method === 'Runtime.executionContextsCleared') {
                 this.executionContexts.delete(tabId)
             }
-        }
-        chrome.debugger.onEvent.addListener(this.boundOnEvent)
-    }
-
-    /** 拆除监听器（用于热重载 / 多实例场景） */
-    dispose(): void {
-        if (this.boundOnDetach) {
-            chrome.debugger.onDetach.removeListener(this.boundOnDetach)
-            this.boundOnDetach = null
-        }
-        if (this.boundOnEvent) {
-            chrome.debugger.onEvent.removeListener(this.boundOnEvent)
-            this.boundOnEvent = null
-        }
-        this.listenersBound = false
+        })
     }
 
     async ensureAttached(tabId: number): Promise<void> {

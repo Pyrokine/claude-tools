@@ -24,14 +24,6 @@ export class LogManager {
         this.startSweep()
     }
 
-    /** 用于 service worker 关闭等场景手动停止 sweeper */
-    stopSweep(): void {
-        if (this.sweepTimer) {
-            clearInterval(this.sweepTimer)
-            this.sweepTimer = null
-        }
-    }
-
     /** 是否已为 tab 初始化 console 缓冲（外部判定是否需要 init） */
     hasConsole(tabId: number): boolean {
         return this.consoleMessages.has(tabId)

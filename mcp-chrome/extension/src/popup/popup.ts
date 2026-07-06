@@ -8,6 +8,7 @@ const connectBtn = document.getElementById('connectBtn') as HTMLButtonElement
 const disconnectBtn = document.getElementById('disconnectBtn') as HTMLButtonElement
 const pairingTokenInput = document.getElementById('pairingTokenInput') as HTMLInputElement
 const saveTokenBtn = document.getElementById('saveTokenBtn') as HTMLButtonElement
+const allowInsecureNoTokenInput = document.getElementById('allowInsecureNoTokenInput') as HTMLInputElement
 const authHelp = document.getElementById('authHelp')!
 
 // 获取状态
@@ -36,9 +37,12 @@ async function updateStatus() {
             disconnectBtn.disabled = true
         }
 
+        allowInsecureNoTokenInput.checked = response.allowInsecureNoToken === true
         authHelp.textContent = response.pairingTokenConfigured
             ? '已配置 token，只连接同 token 的 MCP Server'
-            : '未配置 token，使用本地信任模式'
+            : response.allowInsecureNoToken
+              ? '未配置 token，将自动连接本地 MCP Server'
+              : '未配置 token，不会连接未认证的 MCP Server'
     } catch (error) {
         console.error('Failed to get status:', error)
         statusIndicator.className = 'status-indicator disconnected'
@@ -78,6 +82,22 @@ saveTokenBtn.addEventListener('click', async () => {
         authHelp.textContent = '保存 token 失败'
     } finally {
         saveTokenBtn.disabled = false
+    }
+})
+
+allowInsecureNoTokenInput.addEventListener('change', async () => {
+    allowInsecureNoTokenInput.disabled = true
+    try {
+        await chrome.runtime.sendMessage({
+            type: 'SET_ALLOW_INSECURE_NO_TOKEN',
+            allow: allowInsecureNoTokenInput.checked,
+        })
+        await updateStatus()
+    } catch (error) {
+        console.error('Save insecure mode failed:', error)
+        authHelp.textContent = '保存无 token 连接设置失败'
+    } finally {
+        allowInsecureNoTokenInput.disabled = false
     }
 })
 

@@ -63,6 +63,27 @@ async function withDiagnostics<T extends Record<string, unknown>>(
     return result
 }
 
+async function getExtensionNavigationSnapshot(
+    unifiedSession: ReturnType<typeof getUnifiedSession>
+): Promise<{ readyState: string; url: string; title: string }> {
+    const targetId = unifiedSession.getCurrentTargetId()
+    if (!targetId) {
+        throw new Error('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
+    }
+
+    const targets = await unifiedSession.listTargets()
+    const target = targets.find((item) => item.targetId === targetId)
+    if (!target) {
+        throw new Error(`Tab ${targetId} 不存在，请先 browse(action="list") 查看可用页面`)
+    }
+
+    return {
+        readyState: target.status === 'complete' ? 'complete' : 'loading',
+        url: target.url,
+        title: target.title,
+    }
+}
+
 /**
  * wait 参数 schema
  */
@@ -144,10 +165,27 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                             ? await captureDiagnosticsStart(unifiedSession)
                             : undefined
                         if (mode === 'extension') {
-                            // Extension 模式：轮询 document.readyState 等待页面加载完成
                             const navStart = Date.now()
                             let navCompleted = false
                             let navLastError: Error | null = null
+                            let initialUrl: string | null = null
+                            let initialTitle: string | null = null
+                            let sawLoading = false
+                            let navUrl: string | null = null
+                            let navTitle: string | null = null
+
+                            try {
+                                const initial = await getExtensionNavigationSnapshot(unifiedSession)
+                                if (unifiedSession.isExtensionConnected()) {
+                                    initialUrl = initial.url
+                                    initialTitle = initial.title
+                                    sawLoading = initial.readyState !== 'complete'
+                                }
+                            } catch (err) {
+                                sawLoading = true
+                                navLastError = err instanceof Error ? err : new Error(String(err))
+                            }
+
                             while (Date.now() - navStart < timeout) {
                                 if (!unifiedSession.isExtensionConnected()) {
                                     navLastError = new Error('Extension 未连接')
@@ -155,24 +193,27 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                     continue
                                 }
                                 try {
-                                    const remaining = timeout - (Date.now() - navStart)
-                                    const readyState = await unifiedSession.evaluate<string>(
-                                        'document.readyState',
-                                        undefined,
-                                        remaining
-                                    )
-                                    // evaluate 带 timeout 时，Extension 断连会静默回退 CDP，返回错误 tab 的数据
+                                    const pageInfo = await getExtensionNavigationSnapshot(unifiedSession)
                                     if (!unifiedSession.isExtensionConnected()) {
-                                        navLastError = new Error('Extension 在 evaluate 期间断开')
+                                        navLastError = new Error('Extension 在查询导航状态期间断开')
                                         await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                                         continue
                                     }
-                                    if (readyState === 'complete') {
-                                        navCompleted = true
-                                        break
+
+                                    if (pageInfo.readyState !== 'complete') {
+                                        sawLoading = true
+                                    } else {
+                                        const changed =
+                                            (initialUrl !== null && pageInfo.url !== initialUrl) ||
+                                            (initialTitle !== null && pageInfo.title !== initialTitle)
+                                        if (sawLoading || changed || initialUrl === null) {
+                                            navUrl = pageInfo.url
+                                            navTitle = pageInfo.title
+                                            navCompleted = true
+                                            break
+                                        }
                                     }
                                 } catch (err) {
-                                    // 页面正在导航中，evaluate 可能失败
                                     navLastError = err instanceof Error ? err : new Error(String(err))
                                 }
                                 await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
@@ -181,26 +222,7 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 const msg = `等待导航完成超时 (${timeout}ms)`
                                 throw new TimeoutError(navLastError ? `${msg}: ${navLastError.message}` : msg)
                             }
-                            // 从实际 tab 中查询 URL/title，而非依赖全局缓存状态（支持 tabId 参数）
-                            const navRemaining = timeout - (Date.now() - navStart)
-                            let navUrl: string | null = null
-                            let navTitle: string | null = null
-                            if (navRemaining > 0) {
-                                try {
-                                    const pageInfo = await unifiedSession.evaluate<{ url: string; title: string }>(
-                                        '({url: location.href, title: document.title})',
-                                        undefined,
-                                        navRemaining
-                                    )
-                                    // CDP 回退的数据来自错误 tab，丢弃
-                                    if (unifiedSession.isExtensionConnected()) {
-                                        navUrl = pageInfo.url
-                                        navTitle = pageInfo.title
-                                    }
-                                } catch {
-                                    // 预算耗尽或连接断开，降级返回（导航本身已成功）
-                                }
-                            }
+
                             return formatResponse({
                                 success: true,
                                 waited: 'navigation',
@@ -301,40 +323,89 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                             // Phase 2: DOM mutation 静默检测
                             // 注入 MutationObserver，等待 quietPeriod 毫秒内无 DOM 变更
                             const mutationRemaining = timeout - (Date.now() - idleStart)
-                            if (mutationRemaining > quietPeriod) {
+                            const scriptTimeout = mutationRemaining - POLL_INTERVAL
+                            if (scriptTimeout > quietPeriod) {
                                 try {
-                                    const domStable = await unifiedSession.evaluate<boolean>(
-                                        `(function(quietMs, timeoutMs) {
-                                            return new Promise(function(resolve) {
-                                                var startTime = Date.now();
-                                                var lastMutation = Date.now();
-                                                var observer = new MutationObserver(function() {
-                                                    lastMutation = Date.now();
-                                                });
-                                                observer.observe(document.body, {
-                                                    childList: true,
-                                                    subtree: true,
-                                                    characterData: true
-                                                });
-                                                var check = function() {
-                                                    var elapsed = Date.now() - lastMutation;
-                                                    if (elapsed >= quietMs) {
-                                                        observer.disconnect();
-                                                        resolve(true);
-                                                    } else if (Date.now() - startTime + quietMs > timeoutMs) {
-                                                        observer.disconnect();
-                                                        resolve(false);
-                                                    } else {
-                                                        setTimeout(check, Math.min(100, quietMs - elapsed));
-                                                    }
-                                                };
-                                                setTimeout(check, quietMs);
-                                            });
-                                        })`,
-                                        undefined,
-                                        mutationRemaining,
-                                        [quietPeriod, mutationRemaining]
-                                    )
+                                    const domStable = await new Promise<boolean>((resolve, reject) => {
+                                        let settled = false
+                                        const timer = setTimeout(() => {
+                                            settled = true
+                                            resolve(false)
+                                        }, scriptTimeout)
+
+                                        unifiedSession
+                                            .evaluate<boolean>(
+                                                `(function(quietMs, timeoutMs) {
+                                                    return new Promise(function(resolve) {
+                                                        var target = document.documentElement || document.body;
+                                                        if (!target) {
+                                                            resolve(false);
+                                                            return;
+                                                        }
+
+                                                        var lastMutation = Date.now();
+                                                        var settled = false;
+                                                        var observer = new MutationObserver(function() {
+                                                            lastMutation = Date.now();
+                                                        });
+                                                        var timer = setTimeout(function() {
+                                                            finish(false);
+                                                        }, timeoutMs);
+
+                                                        function finish(value) {
+                                                            if (settled) {
+                                                                return;
+                                                            }
+                                                            settled = true;
+                                                            clearTimeout(timer);
+                                                            observer.disconnect();
+                                                            resolve(value);
+                                                        }
+
+                                                        function check() {
+                                                            var elapsed = Date.now() - lastMutation;
+                                                            if (elapsed >= quietMs) {
+                                                                finish(true);
+                                                                return;
+                                                            }
+                                                            setTimeout(check, Math.min(100, quietMs - elapsed));
+                                                        }
+
+                                                        observer.observe(target, {
+                                                            childList: true,
+                                                            subtree: true,
+                                                            characterData: true,
+                                                            attributes: true
+                                                        });
+                                                        setTimeout(check, quietMs);
+                                                    });
+                                                })`,
+                                                undefined,
+                                                mutationRemaining,
+                                                [quietPeriod, scriptTimeout]
+                                            )
+                                            .then((value) => {
+                                                if (settled) {
+                                                    return
+                                                }
+                                                settled = true
+                                                clearTimeout(timer)
+                                                resolve(value)
+                                            })
+                                            .catch((err: unknown) => {
+                                                if (settled) {
+                                                    return
+                                                }
+                                                settled = true
+                                                clearTimeout(timer)
+                                                reject(err)
+                                            })
+                                    })
+                                    if (!domStable) {
+                                        throw new TimeoutError(
+                                            `等待页面 idle 超时 (${timeout}ms): DOM 未达到 ${quietPeriod}ms 静默`
+                                        )
+                                    }
                                     return formatResponse({
                                         success: true,
                                         waited: 'idle',
@@ -349,34 +420,18 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                               }
                                             : {}),
                                     })
-                                } catch {
-                                    // evaluate 超时或断连——降级返回 domStable: false（readyState 已 complete）
-                                    return formatResponse({
-                                        success: true,
-                                        waited: 'idle',
-                                        domStable: false,
-                                        mode,
-                                        ...(diagnosticsStart
-                                            ? {
-                                                  diagnostics: await captureDiagnosticsDelta(
-                                                      unifiedSession,
-                                                      diagnosticsStart
-                                                  ),
-                                              }
-                                            : {}),
-                                    })
+                                } catch (err) {
+                                    if (err instanceof TimeoutError) {
+                                        throw err
+                                    }
+                                    const message = err instanceof Error ? err.message : String(err)
+                                    throw new TimeoutError(`等待页面 idle 超时 (${timeout}ms): ${message}`)
                                 }
                             }
 
-                            return formatResponse({
-                                success: true,
-                                waited: 'idle',
-                                domStable: false,
-                                mode,
-                                ...(diagnosticsStart
-                                    ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
-                                    : {}),
-                            })
+                            throw new TimeoutError(
+                                `等待页面 idle 超时 (${timeout}ms): 剩余时间不足以完成 ${quietPeriod}ms DOM 静默检测`
+                            )
                         }
 
                         // CDP 模式

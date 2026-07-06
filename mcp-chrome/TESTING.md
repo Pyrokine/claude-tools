@@ -14,6 +14,7 @@
 tab，禁止清全局缓存/cookies，只能动测试 tab 和测试创建的 `mcp_test_*` 前缀数据，任何与此冲突的用例就地标 SKIP
 
 - Chrome Extension 已在 `chrome://extensions/` 刷新为最新 dist，popup 显示 **已连接**
+- CC 重启后 Extension 应自动连接本地 MCP Server；除非测试强制 token 或手动连接流程，否则“需要点连接”不能作为发版前置条件
 - MCP server 已加载最新 dist（src 有任何改动 → `npm run build` → 重启 CC，否则跑到的是旧进程）
 - 全程使用 `manage action=newPage` 创建的测试 tab，**严禁操作用户已有 tab**
 - 所有浏览操作默认 `activated=false`（后台）；只有截图 compare 等需要可见 renderer 的用例可临时 `manage activatePage`
@@ -27,9 +28,9 @@ tab，禁止清全局缓存/cookies，只能动测试 tab 和测试创建的 `mc
 | 载体            | 位置                                                   | 作用                                   |
 |---------------|------------------------------------------------------|--------------------------------------|
 | **test-page** | `file:///<repo>/mcp-chrome/extension/test-page.html` | 受控页面，13 region，可注入 evaluate 监听器做行为断言 |
-| **demoqa**    | `https://demoqa.com/`                                | 真实站点，验证 iframe / modal / 动态表单 / 真实拖拽 |
+| **demoqa**    | `https://demoqa.com/`                                | 可选真实站点补充；外部网络不可达时不得阻塞发版门禁 |
 
-每个用例在字段 `载体` 里标注 `test-page` / `demoqa` / `任意` / `N/A`
+每个用例在字段 `载体` 里标注 `test-page` / `demoqa` / `任意` / `N/A`。发版门禁优先使用 `test-page` 和 `about:blank` 受控页面；外部站点只作补充观察，导航超时或网络不可达时记录 SKIP，并执行对应受控页面用例
 
 ### 0.3 执行流程
 
@@ -158,24 +159,24 @@ FAIL 时只需报 ID + 失败断言即可
 ### browse-open-02-wait-networkidle
 
 - 前置：attach 到 test tab
-- 操作：`browse { action: "open", url: "https://example.com", wait: "networkidle" }`
-- 断言：`success=true`，返回耗时明显长于 load（真正等 idle）
-- 载体：demoqa / example.com
+- 操作：`browse { action: "open", url: "file:///<repo>/mcp-chrome/extension/test-page.html#networkidle", wait: "networkidle" }`
+- 断言：`success=true`，`url` 以 `file:///` 开头且包含 `#networkidle`，返回耗时包含 networkidle 静默等待
+- 载体：test-page
 
 ### browse-back-01
 
-- 前置：测试 tab open 到 example.com → 再 open 到 example.org，形成两页历史
+- 前置：测试 tab open 到 `file:///<repo>/mcp-chrome/extension/test-page.html#page-a` → 再 open 到 `file:///<repo>/mcp-chrome/extension/test-page.html#page-b`，形成两页历史
 - 操作：`browse { action: "back" }`
-- 断言：`success=true`，当前 url 回到 example.com
-- 载体：任意
+- 断言：`success=true`，当前 URL 回到 `#page-a`
+- 载体：test-page
 - 备注：`chrome.tabs.goBack` 在 `chrome.tabs.update` 产生的历史栈上可能失败，实现里用 `history.back()` fallback
 
 ### browse-forward-01
 
 - 前置：接 `browse-back-01` 之后
 - 操作：`browse { action: "forward" }`
-- 断言：`success=true`，url 回到 example.org
-- 载体：任意
+- 断言：`success=true`，当前 URL 回到 `#page-b`
+- 载体：test-page
 
 ### browse-refresh-01
 
@@ -219,72 +220,77 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### cookies-get-01
 
-- 前置：attach 到 demoqa.com
-- 操作：`cookies { action: "get" }`（不带过滤）
-- 断言：`success=true`，返回数组（可能为空）
-- 载体：demoqa
-- 备注：无过滤会返回浏览器全部 cookie（可能数百条超出 token 限制），跑前可先只看 count 或 output 到文件
+- 前置：attach 到任意 managed test tab
+- 操作：`cookies { action: "get" }`（不带 name/domain/url 过滤）
+- 断言：返回错误，消息包含 `必须带 name/domain/url 至少一个过滤参数`
+- 载体：任意
+- 备注：get 不允许无过滤读取全量 cookie，后续读取用 name、domain 或 url 收窄范围
 
 ### cookies-get-02-domain-filter
 
-- 前置：attach 到 demoqa.com
-- 操作：`cookies { action: "get", domain: "demoqa.com" }`
-- 断言：每个 cookie 的 domain 字段以 `demoqa.com` 结尾或相等
-- 载体：demoqa
+- 前置：先 set `mcp_test_domain` 到 `https://mcp-chrome.test/`
+- 操作：`cookies { action: "get", domain: "mcp-chrome.test" }`
+- 断言：每个 cookie 的 domain 字段以 `mcp-chrome.test` 结尾或相等，且能读到 `mcp_test_domain`
+- 载体：任意
+- 清理：`cookies delete name=mcp_test_domain url=https://mcp-chrome.test/`
 
 ### cookies-get-03-url-filter
 
-- 前置：attach 任一 tab
-- 操作：`cookies { action: "get", url: "https://demoqa.com/" }`
-- 断言：返回 cookies 与 `demoqa.com` 匹配
+- 前置：先 set `mcp_test_url` 到 `https://mcp-chrome.test/`
+- 操作：`cookies { action: "get", url: "https://mcp-chrome.test/" }`
+- 断言：返回 cookies 与 `mcp-chrome.test` 匹配，且能读到 `mcp_test_url`
 - 载体：任意
+- 清理：`cookies delete name=mcp_test_url url=https://mcp-chrome.test/`
 
 ### cookies-get-04-secure-only
 
-- 操作：`cookies { action: "get", secure: true }`
-- 断言：每个返回的 cookie 的 `secure=true`
+- 前置：先 set secure cookie `mcp_test_secure` 到 `https://mcp-chrome.test/`
+- 操作：`cookies { action: "get", url: "https://mcp-chrome.test/", secure: true }`
+- 断言：每个返回的 cookie 的 `secure=true`，且能读到 `mcp_test_secure`
 - 载体：任意
+- 清理：`cookies delete name=mcp_test_secure url=https://mcp-chrome.test/`
 
 ### cookies-get-05-output-json
 
-- 操作：`cookies { action: "get", domain: "demoqa.com", output: "cwd:test-output/mcp-test-cookies.json" }`
+- 前置：先 set `mcp_test_output` 到 `https://mcp-chrome.test/`
+- 操作：`cookies { action: "get", domain: "mcp-chrome.test", output: "cwd:test-output/mcp-test-cookies.json" }`
 - 断言：
     - `success=true`
     - `./test-output/mcp-test-cookies.json` 存在且为合法 JSON
-- 载体：demoqa
-- 清理：`rm ./test-output/mcp-test-cookies.json`
+- 载体：任意
+- 清理：`cookies delete name=mcp_test_output url=https://mcp-chrome.test/`，删除 `./test-output/mcp-test-cookies.json`
 
 ### cookies-set-01
 
-- 前置：attach 到 test-page（file://）
-- 操作：`cookies { action: "set", name: "mcp_test_a", value: "1", url: "https://demoqa.com/" }`
-- 断言：`success=true`，随后 `cookies get name=mcp_test_a url=https://demoqa.com/` 能读到 value=1
-- 载体：demoqa（file:// 无法写 cookie，url 字段必填 https 地址）
-- 清理：`cookies delete name=mcp_test_a url=https://demoqa.com/`
+- 前置：attach 到任意 managed test tab
+- 操作：`cookies { action: "set", name: "mcp_test_a", value: "1", url: "https://mcp-chrome.test/" }`
+- 断言：`success=true`，随后 `cookies get name=mcp_test_a url=https://mcp-chrome.test/` 能读到 value=1
+- 载体：任意（cookie 的 url 字段使用受控测试域名，不访问外网）
+- 清理：`cookies delete name=mcp_test_a url=https://mcp-chrome.test/`
 
 ### cookies-set-02-with-attrs
 
 - 操作：
-  `cookies { action: "set", name: "mcp_test_b", value: "2", url: "https://demoqa.com/", secure: true, httpOnly: true, sameSite: "Lax", expirationDate: <now+3600> }`
-- 断言：读回后所有属性一致
-- 清理：`cookies delete name=mcp_test_b url=https://demoqa.com/`
+  `cookies { action: "set", name: "mcp_test_b", value: "2", url: "https://mcp-chrome.test/", secure: true, httpOnly: true, sameSite: "Lax", expirationDate: <Math.floor(Date.now()/1000)+3600> }`
+- 断言：读回后 value、secure、httpOnly、sameSite、expirationDate 一致；`expirationDate` 必须是 Unix 秒级时间戳
+- 清理：`cookies delete name=mcp_test_b url=https://mcp-chrome.test/`
 
 ### cookies-delete-01
 
-- 前置：先 set mcp_test_c
-- 操作：`cookies { action: "delete", name: "mcp_test_c", url: "https://demoqa.com/" }`
+- 前置：先 set mcp_test_c 到 `https://mcp-chrome.test/`
+- 操作：`cookies { action: "delete", name: "mcp_test_c", url: "https://mcp-chrome.test/" }`
 - 断言：`success=true`，再 get 找不到
-- 载体：demoqa
+- 载体：任意
 
 ### cookies-clear-01-domain
 
-- 状态：**SKIP**（与 MEMORY "只删 mcp_test_* 前缀" 冲突，clear 无 name 过滤，domain=demoqa.com 会清包括用户跟踪/登录 cookie）
-- 前置：先 set mcp_test_d 到 demoqa.com
-- 操作：`cookies { action: "clear", domain: "demoqa.com" }`
-- 断言：`success=true`，之后 `cookies get domain=demoqa.com` 不含 mcp_test_d
-- 载体：demoqa
+- 状态：**SKIP**（与 MEMORY "只删 mcp_test_* 前缀" 冲突，clear 无 name 过滤，domain=mcp-chrome.test 会清同域非测试 cookie）
+- 前置：先 set mcp_test_d 到 mcp-chrome.test
+- 操作：`cookies { action: "clear", domain: "mcp-chrome.test" }`
+- 断言：`success=true`，之后 `cookies get domain=mcp-chrome.test` 不含 mcp_test_d
+- 载体：任意
 - 注意：**不得运行无参数的 clear**，会清所有 cookie；手工跑时用独立 Chrome profile
-- 替代验证：用 `cookies delete name=mcp_test_d url=https://demoqa.com/` 清理测试 cookie
+- 替代验证：用 `cookies delete name=mcp_test_d url=https://mcp-chrome.test/` 清理测试 cookie
 
 ---
 
@@ -513,7 +519,7 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### extract-screenshot-01-viewport
 
-- 前置：测试 tab 处于可见状态（其窗口 focused 且 tab active）
+- 前置：测试 tab 处于可见状态（其窗口 focused 且 tab active）；对 managed 测试 tab 执行 `manage activatePage` 后等待约 800ms 再截图
 - 操作：`extract { type: "screenshot", output: "cwd:test-output/mcp-shot.png" }`
 - 断言：
     - `success=true`
@@ -603,7 +609,7 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：返回含 `url / title / description / charset / viewport / og / twitter / jsonLd / alternates / feeds / frames`
   （部分字段可 null/undefined），`frames` 含 index/frameId/parentFrameId/url/title/name/selector/rect，Extension 和 CDP
   模式都应返回 frames 数组
-- 载体：demoqa 或 test-page
+- 载体：test-page
 
 ### extract-frame-01
 
@@ -679,12 +685,12 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：返回 `isError=true`，`error.code === "ACTIONABILITY_FAILED"`，`error.context` 含 `rect`、`clickPoint`、
   `coveringElement`、`candidates`
 
-### input-click-09-react-synthetic
+### input-click-09-synthetic-event
 
-- 前置：attach 到 demoqa.com/buttons
-- 操作：`input { events: [{type:"click", target:{role:"button", name:"Click Me", exact:true}}] }`
-- 断言：页面显示 "You have done a dynamic click"（React onClick 触发）
-- 载体：demoqa
+- 前置：attach 到 test-page，清空 `#mouse-log`
+- 操作：`input { events: [{type:"click", target:{role:"button", name:"单击测试", exact:true}}] }`
+- 断言：`#mouse-log.textContent` 包含 `单击测试 click`
+- 载体：test-page
 
 ### input-mousedown-01
 
@@ -758,17 +764,17 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### input-type-05-dispatch
 
-- 前置：attach React 框架页面（demoqa 的某个受控 input）
-- 操作：`type { dispatch: true, ... }`
-- 断言：React 状态更新（受控组件 value 反映）
-- 载体：demoqa
+- 前置：attach 到 test-page，清空 `#controlled-input`，并把 `data-input-events/data-change-events` 置为 `0`
+- 操作：`input { events: [{type:"type", target:{css:"#controlled-input"}, text:"abc", dispatch:true}] }`
+- 断言：`#controlled-input.value === "abc"`，`#controlled-result.textContent` 包含 `controlled input: abc`，`data-input-events` 大于 0
+- 载体：test-page
 
 ### input-type-05-controlled
 
-- 前置：attach React/Vue 受控 input
-- 操作：`input { events: [{type:"type", target:{css:"input"}, text:"abc", mode:"controlled"}], diagnostics:true }`
+- 前置：attach 到 test-page，清空 `#controlled-input`，并把 `data-input-events/data-change-events` 置为 `0`
+- 操作：`input { events: [{type:"type", target:{css:"#controlled-input"}, text:"abc", mode:"controlled"}], diagnostics:true }`
 - 断言：value 更新并触发 input/change；失败时错误包含 matchCount、activeElement、candidates；diagnostics 字段存在
-- 载体：demoqa
+- 载体：test-page
 
 ### input-type-06-crlf-normalize
 
@@ -971,14 +977,15 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### logs-network-01
 
-- 前置：open 到 demoqa（会发网络请求）
+- 前置：attach 到 test-page，执行 `evaluate { script:"fetch('/mcp_missing_resource').catch(()=>{})" }`
 - 操作：`logs { type: "network" }`
-- 断言：返回数组非空，每项含 url/method/status
-- 载体：demoqa
+- 断言：返回数组非空，每项含 url/method/status 或 errorText 中可由当前浏览器提供的值
+- 载体：test-page
 
 ### logs-network-02-url-pattern
 
-- 操作：`logs { type:"network", urlPattern:"*demoqa.com*" }`
+- 前置：接 `logs-network-01`
+- 操作：`logs { type:"network", urlPattern:"*mcp_missing_resource*" }`
 - 断言：每项 url 匹配模式
 
 ### logs-network-03-failed-request
@@ -1137,9 +1144,16 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### wait-idle-01
 
-- 前置：attach test-page，触发 burst mutation（region 11 按钮）
-- 操作：`wait { for:"idle", ms:500 }`
-- 断言：返回时间接近 mutation 结束后 500ms
+- 前置：attach 全新 test-page，执行 evaluate 创建 Web Worker，每 50ms 更新一次 `#burst-mutation-target`，1s 后停止
+- 操作：`wait { for:"idle", ms:500, timeout:8000 }`
+- 断言：`success=true`，随后读取 `#burst-mutation-target.dataset.workerTick` 大于 0，返回时间在 mutation 结束并达到 500ms DOM 静默后
+- 载体：test-page
+
+### wait-idle-02-timeout
+
+- 前置：attach test-page，执行 evaluate 创建 Web Worker，每 50ms 更新一次 `#burst-mutation-target`，2s 后停止
+- 操作：`wait { for:"idle", ms:500, timeout:1200 }`
+- 断言：返回 timeout 错误，消息包含 `DOM 未达到 500ms 静默`
 - 载体：test-page
 
 ### wait-element-01-visible
@@ -1162,10 +1176,10 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### wait-navigation-01
 
-- 前置：attach 到 example.com
-- 操作：`wait { for:"navigation", timeout:3000 }`，同时用 evaluate 触发 `location.href="example.org"`
-- 断言：wait 返回，新 url=example.org
-- 载体：example.com/.org
+- 前置：attach 到 test-page，先执行 `evaluate { script:"(() => { document.title = 'mcp-nav-start'; setTimeout(() => { document.title = 'mcp-nav-done'; location.hash = 'mcp-nav-' + Date.now(); }, 100); return true; })()" }`
+- 操作：`wait { for:"navigation", timeout:3000 }`
+- 断言：wait 返回，新 title 为 `mcp-nav-done`，URL hash 包含 `mcp-nav-`
+- 载体：test-page
 
 ### wait-timeout-01
 

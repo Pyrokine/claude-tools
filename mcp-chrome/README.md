@@ -95,14 +95,18 @@ browse(action="open", url="https://example.com")
 extract(type="screenshot")
 ```
 
-**Optional pairing token**
+**Pairing token**
 
-By default, local Extension mode does not require a token. To restrict the Extension connection, start the MCP server
-with `MCP_CHROME_PAIRING_TOKEN`, then enter the same token in the Extension popup:
+Extension mode keeps zero-config local auto-connect by default. On shared machines, CI runners, or containers where
+untrusted local processes can reach `127.0.0.1:19222-19299`, set `MCP_CHROME_PAIRING_TOKEN` on the MCP server and enter the
+same token in the Extension popup:
 
 ```bash
 MCP_CHROME_PAIRING_TOKEN="your-token" node /path/to/mcp-chrome/dist/index.js
 ```
+
+To require a pairing token instead of zero-config local use, set `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0` on the server and
+disable "Allow no-token local connection" in the Extension popup.
 
 ### Mode 2: CDP Mode (Fallback)
 
@@ -561,11 +565,10 @@ mcp-chrome/
 
 ## Security Notes
 
-- **Trust boundary**: This server has no application-layer authentication — it relies on `127.0.0.1` binding plus
-  same-UID trust, matching the model used by Playwright, Puppeteer, and chrome-launcher. Do NOT run on multi-user
-  systems, CI runners, or containers with `--net=host` where untrusted code can reach `127.0.0.1:19222-19299`. WebSocket
-  upgrades require a `chrome-extension://` Origin header, which blocks browser pages and curl, but does not stop a
-  malicious local process running as the same user.
+- **Trust boundary**: Extension mode auto-connects to local MCP servers by default. Use `MCP_CHROME_PAIRING_TOKEN`, or set
+  `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0`, on multi-user systems, CI runners, or containers with `--net=host` where
+  untrusted code can reach `127.0.0.1:19222-19299`. WebSocket upgrades require a `chrome-extension://` Origin header,
+  which blocks browser pages and curl, but does not stop a malicious local process running as the same user.
 - Extension mode: shares your browser sessions — only use on trusted machines
 - CDP mode: provides full browser control via DevTools Protocol
 - Default ports bind to 127.0.0.1 only (localhost)
