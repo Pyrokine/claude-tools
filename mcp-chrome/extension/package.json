@@ -1,6 +1,6 @@
 {
     "name": "mcp-chrome-extension",
-    "version": "2.3.1",
+    "version": "2.3.2",
     "private": true,
     "type": "module",
     "scripts": {
@@ -11,6 +11,9 @@
     },
     "dependencies": {
         "zod": "^4.4.3"
+    },
+    "engines": {
+        "node": ">=20.19.0"
     },
     "devDependencies": {
         "@crxjs/vite-plugin": "^2.6.1",

@@ -1,5 +1,55 @@
 # Changelog
 
+## v1.15.2 - 2026-07-07
+
+## Versions
+
+- mcp-chrome: 2.3.1 → 2.3.2
+- mcp-claude-history: 1.8.1
+- mcp-ssh: 2.3.1 → 2.3.2
+
+## What's Changed
+
+### mcp-chrome
+
+- fix: Bound input wait events by the remaining input timeout and allow empty text in `type` events
+- fix: Update key state only after successful `keyDown` dispatch
+- fix: Include post-condition diagnostics, form values, and shared timeout budgeting in `evaluate` checks
+- fix: Clear fallback console logs from both `console_get clear=true` and `console_clear`
+- fix: Include the built Chrome Extension in the npm package and document npm/source installation
+- docs: Update the documented Node requirement to 20.19 or newer
+
+### mcp-ssh
+
+- chore: Align the Node engine requirement with the current toolchain and refresh npm lockfile metadata
+- docs: Update the documented Node requirement and npm/source installation commands
+
+---
+
+## 版本
+
+- mcp-chrome: 2.3.1 → 2.3.2
+- mcp-claude-history: 1.8.1
+- mcp-ssh: 2.3.1 → 2.3.2
+
+## 更新内容
+
+### mcp-chrome
+
+- fix: `input` 的 wait 事件受剩余 timeout 限制，并允许 `type` 事件传入空字符串
+- fix: `keyDown` 发送成功后才更新按键状态
+- fix: `evaluate` 的 post-condition 检查覆盖 diagnostics、表单值和共享超时预算
+- fix: `console_get clear=true` 和 `console_clear` 都会清理 fallback console 日志
+- fix: npm 包包含构建后的 Chrome Extension，并补充 npm 和源码安装说明
+- docs: 更新文档中的 Node 要求到 20.19 或更新版本
+
+### mcp-ssh
+
+- chore: Node engine 要求与当前工具链保持一致，并刷新 npm lockfile 元数据
+- docs: 更新 Node 要求和 npm / 源码安装命令
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.15.1...v1.15.2
+
 ## v1.15.1 - 2026-07-05
 
 ## Versions
