@@ -206,11 +206,11 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                         args.args as unknown[]
                     )
                     const normalizedResult = result === undefined ? null : result
-                    const diagnostics = diagnosticsStart
-                        ? await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
-                        : undefined
                     const postCondition = args.postCondition
                         ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate')
+                        : undefined
+                    const diagnostics = diagnosticsStart
+                        ? await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
                         : undefined
 
                     if (outputPath) {

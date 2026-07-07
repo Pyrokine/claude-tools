@@ -17,6 +17,8 @@ import type { InputEvent, Target } from '../core/types.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
 
+const INPUT_WAIT_MAX_MS = 60_000
+
 /**
  * InputEvent schema
  */
@@ -69,7 +71,13 @@ const inputEventSchema = z.object({
     deltaY: z.number().optional().describe('垂直滚动量'),
     text: z.string().max(10000).optional().describe('输入文本（type，最大 10000 字符）或替换文本（replace）'),
     delay: z.number().min(0).max(100).optional().describe('按键间隔毫秒（type 事件最大 100ms，避免长时延 DoS）'),
-    ms: z.number().optional().describe('等待毫秒'),
+    ms: z
+        .number()
+        .int()
+        .min(0)
+        .max(INPUT_WAIT_MAX_MS)
+        .optional()
+        .describe('等待毫秒（wait 事件最大 60000ms，且不能超过 input 剩余 timeout）'),
     find: z.string().optional().describe('要查找并选中的文本（select/replace）'),
     nth: z.number().optional().describe('第 N 个匹配（select/replace，从 0 开始，默认 0 即第一个）'),
     command: z.string().optional().describe('浏览器编辑命令（editorCommand），如 bold、italic、insertOrderedList'),
@@ -158,9 +166,17 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
                 const warnings: string[] = []
                 const eventResults: unknown[] = []
                 const session = mode === 'extension' ? undefined : getSession()
+                const inputStartedAt = Date.now()
                 for (const event of args.events) {
+                    const eventTimeout =
+                        args.timeout === undefined
+                            ? undefined
+                            : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
+                    if (eventTimeout !== undefined && eventTimeout <= 0) {
+                        throw new Error(`input 超时 (${args.timeout}ms)`)
+                    }
                     const result = await executeInputEvent(
-                        { unifiedSession, session, mode, humanize, timeout: args.timeout },
+                        { unifiedSession, session, mode, humanize, timeout: eventTimeout },
                         event as InputEvent
                     )
                     if (typeof result === 'string') {
@@ -782,7 +798,7 @@ function validateEvent(event: InputEvent): void {
             }
             break
         case 'type':
-            if (!event.text) {
+            if (event.text === undefined) {
                 requiredEventParam(event, 'text')
             }
             break
@@ -1062,7 +1078,14 @@ async function handleUnifiedType(
     return undefined
 }
 
-async function handleUnifiedWait(_context: UnifiedInputContext, event: InputEvent): Promise<InputEventResult> {
+function ensureWaitFitsTimeout(ms: number, timeout: number | undefined): void {
+    if (timeout !== undefined && ms > timeout) {
+        throw new Error(`events[].ms (${ms}ms) 超过 input 剩余 timeout (${timeout}ms)`)
+    }
+}
+
+async function handleUnifiedWait({ timeout }: UnifiedInputContext, event: InputEvent): Promise<InputEventResult> {
+    ensureWaitFitsTimeout(event.ms!, timeout)
     await new Promise((resolve) => setTimeout(resolve, event.ms!))
     return undefined
 }
@@ -1637,7 +1660,8 @@ async function handleCdpType({ session, humanize, timeout }: CdpInputContext, ev
     }
 }
 
-async function handleCdpWait(_context: CdpInputContext, event: InputEvent): Promise<void> {
+async function handleCdpWait({ timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    ensureWaitFitsTimeout(event.ms!, timeout)
     await new Promise((resolve) => setTimeout(resolve, event.ms!))
 }
 

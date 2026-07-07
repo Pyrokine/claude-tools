@@ -943,14 +943,12 @@ class UnifiedSessionManager {
 
         // Puppeteer 风格：连续 keyDown 同 key → rawKeyDown + autoRepeat（长按重复）
         const isRepeat = this.pressedKeys.has(key)
-        this.pressedKeys.add(key)
-
-        if (MODIFIER_KEYS[key]) {
-            this.modifiers |= MODIFIER_KEYS[key]
-        }
+        const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers | MODIFIER_KEYS[key] : this.modifiers
 
         if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthKey(key, 'down', this.getModifierNames())
+            await driver.stealthKey(key, 'down', this.getModifierNames(nextModifiers))
+            this.modifiers = nextModifiers
+            this.pressedKeys.add(key)
             return
         }
 
@@ -960,10 +958,12 @@ class UnifiedSessionManager {
             code: def.code,
             ...(commands && commands.length > 0 ? {} : { text: def.text }),
             windowsVirtualKeyCode: def.keyCode,
-            modifiers: this.modifiers,
+            modifiers: nextModifiers,
             commands,
             autoRepeat: isRepeat || undefined,
         })
+        this.modifiers = nextModifiers
+        this.pressedKeys.add(key)
     }
 
     /**

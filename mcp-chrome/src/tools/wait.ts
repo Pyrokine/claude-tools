@@ -16,6 +16,7 @@ import { targetToFindParams, targetZodSchema } from './schema.js'
 
 /** 轮询间隔（毫秒） */
 const POLL_INTERVAL = 100
+const NAVIGATION_SNAPSHOT_TIMEOUT = 1000
 
 interface DiagnosticsStart {
     consoleCount: number
@@ -64,23 +65,37 @@ async function withDiagnostics<T extends Record<string, unknown>>(
 }
 
 async function getExtensionNavigationSnapshot(
-    unifiedSession: ReturnType<typeof getUnifiedSession>
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    timeout = NAVIGATION_SNAPSHOT_TIMEOUT
 ): Promise<{ readyState: string; url: string; title: string }> {
     const targetId = unifiedSession.getCurrentTargetId()
     if (!targetId) {
         throw new Error('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
     }
 
-    const targets = await unifiedSession.listTargets()
-    const target = targets.find((item) => item.targetId === targetId)
-    if (!target) {
-        throw new Error(`Tab ${targetId} 不存在，请先 browse(action="list") 查看可用页面`)
-    }
+    try {
+        const pageState = await unifiedSession.evaluate<{ readyState?: string; url?: string; title?: string }>(
+            '({ readyState: document.readyState, url: location.href, title: document.title })',
+            'stealth',
+            timeout
+        )
+        return {
+            readyState: pageState.readyState === 'complete' ? 'complete' : 'loading',
+            url: pageState.url ?? '',
+            title: pageState.title ?? '',
+        }
+    } catch {
+        const targets = await unifiedSession.listTargets()
+        const target = targets.find((item) => item.targetId === targetId)
+        if (!target) {
+            throw new Error(`Tab ${targetId} 不存在，请先 browse(action="list") 查看可用页面`)
+        }
 
-    return {
-        readyState: target.status === 'complete' ? 'complete' : 'loading',
-        url: target.url,
-        title: target.title,
+        return {
+            readyState: target.status === 'complete' ? 'complete' : 'loading',
+            url: target.url,
+            title: target.title,
+        }
     }
 }
 
@@ -175,7 +190,10 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                             let navTitle: string | null = null
 
                             try {
-                                const initial = await getExtensionNavigationSnapshot(unifiedSession)
+                                const initial = await getExtensionNavigationSnapshot(
+                                    unifiedSession,
+                                    Math.min(timeout, NAVIGATION_SNAPSHOT_TIMEOUT)
+                                )
                                 if (unifiedSession.isExtensionConnected()) {
                                     initialUrl = initial.url
                                     initialTitle = initial.title
@@ -186,14 +204,18 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 navLastError = err instanceof Error ? err : new Error(String(err))
                             }
 
-                            while (Date.now() - navStart < timeout) {
+                            while (!navCompleted && Date.now() - navStart < timeout) {
                                 if (!unifiedSession.isExtensionConnected()) {
                                     navLastError = new Error('Extension 未连接')
                                     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
                                     continue
                                 }
                                 try {
-                                    const pageInfo = await getExtensionNavigationSnapshot(unifiedSession)
+                                    const remaining = timeout - (Date.now() - navStart)
+                                    const pageInfo = await getExtensionNavigationSnapshot(
+                                        unifiedSession,
+                                        Math.min(remaining, NAVIGATION_SNAPSHOT_TIMEOUT)
+                                    )
                                     if (!unifiedSession.isExtensionConnected()) {
                                         navLastError = new Error('Extension 在查询导航状态期间断开')
                                         await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))

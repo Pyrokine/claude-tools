@@ -212,25 +212,7 @@ export class LogEventHandler {
         // 清除已读消息
         if (p.clear) {
             this.logManager.setConsole(tabId, [])
-            // 同时清除 fallback 日志
-            if (this.debuggerManager.isBlocked(tabId)) {
-                try {
-                    const tab = await chrome.tabs.get(tabId)
-                    if (!isRestrictedUrl(tab.url)) {
-                        await chrome.scripting.executeScript({
-                            target: { tabId, frameIds: [0] },
-                            func: () => {
-                                type McpWindow = Window & { __mcpConsoleLogs?: unknown[] }
-                                const mcpWin = window as McpWindow
-                                mcpWin.__mcpConsoleLogs = []
-                            },
-                            world: 'MAIN',
-                        })
-                    }
-                } catch (e) {
-                    console.warn('[logs] console clear fallback (executeScript) failed:', e)
-                }
-            }
+            await this.clearFallbackConsole(tabId)
         }
 
         return { messages }
@@ -241,6 +223,7 @@ export class LogEventHandler {
         const tabId = await this.getManagedTabId(p.tabId, context, 'console_clear')
 
         this.logManager.setConsole(tabId, [])
+        await this.clearFallbackConsole(tabId)
 
         return { success: true }
     }
@@ -342,6 +325,26 @@ export class LogEventHandler {
         const resolvedTabId = await getTargetTabId(tabId)
         await assertManagedTab(resolvedTabId, context, operation)
         return resolvedTabId
+    }
+
+    private async clearFallbackConsole(tabId: number): Promise<void> {
+        try {
+            const tab = await chrome.tabs.get(tabId)
+            if (isRestrictedUrl(tab.url)) {
+                return
+            }
+            await chrome.scripting.executeScript({
+                target: { tabId, frameIds: [0] },
+                func: () => {
+                    type McpWindow = Window & { __mcpConsoleLogs?: unknown[] }
+                    const mcpWin = window as McpWindow
+                    mcpWin.__mcpConsoleLogs = []
+                },
+                world: 'MAIN',
+            })
+        } catch (e) {
+            console.warn('[logs] console clear fallback (executeScript) failed:', e)
+        }
     }
 
     /** 卸载 fallback console hook,把残留 logs 合并到 logManager,清空注入数组 */
