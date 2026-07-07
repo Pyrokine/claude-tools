@@ -6,7 +6,7 @@ Chrome browser automation MCP Server with dual-mode architecture: **Extension mo
 existing browser, **CDP mode** (fallback) launches a dedicated instance.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-green.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/node-%3E%3D20.19-green.svg)](https://nodejs.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
 ## Features
@@ -36,18 +36,31 @@ existing browser, **CDP mode** (fallback) launches a dedicated instance.
 
 ## Installation
 
+Requires Node.js 20.19 or newer.
+
+### npm
+
 ```bash
 npm install -g @pyrokine/mcp-chrome
+claude mcp add chrome -- mcp-chrome
+npm root -g
 ```
 
-Or from source:
+For Extension mode, open `chrome://extensions/`, enable Developer mode, click "Load unpacked", and select `<npm-root>/@pyrokine/mcp-chrome/extension/dist`.
+
+### From source
 
 ```bash
 git clone https://github.com/Pyrokine/claude-tools.git
 cd claude-tools/mcp-chrome
 npm install
 npm run build
+npm --prefix extension install
+npm --prefix extension run build
+claude mcp add chrome -- node "$PWD/dist/index.js"
 ```
+
+For Extension mode, load `extension/dist` in Chrome.
 
 ## Quick Start
 
@@ -65,7 +78,10 @@ Extension mode controls your existing Chrome — shares login sessions, cookies,
 **Step 2: Configure MCP Client**
 
 ```bash
-# Claude Code
+# npm installation
+claude mcp add chrome -- mcp-chrome
+
+# source build
 claude mcp add chrome -- node /path/to/mcp-chrome/dist/index.js
 ```
 

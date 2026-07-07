@@ -5,7 +5,7 @@ English | [中文](README_zh.md)
 SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.)
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-green.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/node-%3E%3D20.19-green.svg)](https://nodejs.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
 ![Linux](https://img.shields.io/badge/Linux-tested-success)
@@ -48,10 +48,13 @@ SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.)
 
 ## Installation
 
+Requires Node.js 20.19 or newer.
+
 ### npm (Recommended)
 
 ```bash
 npm install -g @pyrokine/mcp-ssh
+claude mcp add ssh -- mcp-ssh
 ```
 
 ### From Source
@@ -61,6 +64,7 @@ git clone https://github.com/Pyrokine/claude-tools.git
 cd claude-tools/mcp-ssh
 npm install
 npm run build
+claude mcp add ssh -- node "$PWD/dist/index.js"
 ```
 
 ## Configuration
@@ -68,6 +72,10 @@ npm run build
 ### Claude Code
 
 ```bash
+# npm installation
+claude mcp add ssh -- mcp-ssh
+
+# source build
 claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 ```
 

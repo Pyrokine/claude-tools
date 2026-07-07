@@ -5,7 +5,7 @@
 一个功能完善的 SSH MCP 服务器，适用于 AI 助手（Claude、Cursor、Windsurf 等）
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-green.svg)](https://nodejs.org/)
+[![Node](https://img.shields.io/badge/node-%3E%3D20.19-green.svg)](https://nodejs.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
 ![Linux](https://img.shields.io/badge/Linux-tested-success)
@@ -48,10 +48,13 @@
 
 ## 安装
 
+需要 Node.js 20.19 或更新版本。
+
 ### npm（推荐）
 
 ```bash
 npm install -g @pyrokine/mcp-ssh
+claude mcp add ssh -- mcp-ssh
 ```
 
 ### 从源码安装
@@ -61,6 +64,7 @@ git clone https://github.com/Pyrokine/claude-tools.git
 cd claude-tools/mcp-ssh
 npm install
 npm run build
+claude mcp add ssh -- node "$PWD/dist/index.js"
 ```
 
 ## 配置
@@ -68,6 +72,10 @@ npm run build
 ### Claude Code
 
 ```bash
+# npm 安装
+claude mcp add ssh -- mcp-ssh
+
+# 源码构建
 claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 ```
 
