@@ -27,14 +27,14 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
     if !project_dir.exists() {
         return Err(ErrorResponse {
             error: "project_not_found".to_string(),
-            message: format!("项目不存在: {}", project_id),
+            message: format!("项目不存在: {project_id}"),
             available: None,
         });
     }
 
     let entries = fs::read_dir(&project_dir).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法读取项目目录: {}", e),
+        message: format!("无法读取项目目录: {e}"),
         available: None,
     })?;
 
@@ -115,7 +115,7 @@ fn get_session_stats(path: &std::path::Path) -> (usize, String, String, Option<S
             {
                 let preview: String = text.chars().take(100).collect();
                 topic = Some(if text.chars().count() > 100 {
-                    format!("{}...", preview)
+                    format!("{preview}...")
                 } else {
                     preview
                 });

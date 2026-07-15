@@ -5,12 +5,12 @@
 Claude Code 对话历史搜索工具
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
 ![Linux](https://img.shields.io/badge/Linux_x86__64-tested-success)
-![macOS](https://img.shields.io/badge/macOS-untested-yellow)
-![Windows](https://img.shields.io/badge/Windows-unsupported-red)
+![macOS](https://img.shields.io/badge/macOS-build_available-blue)
+![Windows](https://img.shields.io/badge/Windows-build_available-blue)
 
 ## 功能特性
 
@@ -24,7 +24,14 @@ Claude Code 对话历史搜索工具
 
 ### 下载二进制（推荐）
 
-从 [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases) 下载最新版本：
+从 [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases) 下载最新版本，原有 target triple 资产名继续保留，已有自动化无需修改
+
+| 平台 | 稳定资产名 |
+|---|---|
+| Linux x86_64 | `mcp-claude-history-linux-x86_64.tar.gz` |
+| macOS Intel | `mcp-claude-history-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `mcp-claude-history-macos-aarch64.tar.gz` |
+| Windows x86_64 | `mcp-claude-history-windows-x86_64.zip` |
 
 ```bash
 # 下载并安装
@@ -68,7 +75,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 }
 ```
 
-## 可用工具（6 个）
+## 可用工具（7 个）
 
 | 工具                 | 描述                 |
 |--------------------|--------------------|
@@ -76,6 +83,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `history_get`      | 获取完整消息内容           |
 | `history_context`  | 获取消息上下文            |
 | `history_trace`    | 追踪附近消息和 tool 调用结果对 |
+| `history_build_info` | 查看当前运行二进制的构建身份  |
 | `history_projects` | 列出所有项目             |
 | `history_sessions` | 列出项目的会话            |
 
@@ -105,8 +113,9 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `offset`              | number  | 0                      | 跳过前 N 条，不能和 `slice` 同用                                   |
 | `limit`               | number  | -                      | 最多返回 N 条，不能和 `slice` 同用                                  |
 | `slice`               | string  | -                      | 过滤和排序后的 Python 风格消息切片                                    |
-| `max_content`         | number  | 4000                   | 单条最大字符数                                                  |
-| `max_total`           | number  | 40000                  | 总最大字符数                                                   |
+| `max_content`         | number  | 4000                   | 普通结果预览的最大字符数（1 至 1,000,000）                              |
+| `max_content_tool_result` | number | 500                  | tool result 独立预览上限（1 至 1,000,000）                          |
+| `max_total`           | number  | 40000                  | 紧凑 `SearchResponse` JSON 最大字节数（512 至 10,000,000）             |
 
 默认 `types` 包含 `summary`，会检索上下文压缩摘要，只看原始对话时使用 `types=assistant,user`，`failed_tool_results`
 保持旧语义，只检查
@@ -122,6 +131,10 @@ URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处
 
 `slice` 使用 Python 半开区间语义，在全部过滤和按时间排序后执行，`[-10:]` 返回最近 10 条匹配消息，`[-10:-1]` 排除最新消息，最多返回
 9 条
+
+`max_total` 统计 `history_search` 返回的紧凑 UTF-8 JSON 文本，不包含 JSON-RPC 和 MCP transport framing，响应会返回
+`serialized_bytes`、`max_total_bytes`、`limits_applied` 和 `complete`，导出的 JSONL 内容不受对话响应预算缩减，
+`next_query` 和导出 manifest 会保留 `max_content_tool_result`
 
 ### history_get
 
@@ -158,7 +171,8 @@ URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处
 | `case_sensitive` | boolean | false   | 是否区分大小写                                  |
 
 **说明**：锚点消息（由 `ref` 指定）始终包含在结果中，不受 `types` 和 `pattern` 过滤影响；设置 `pattern` 后，`before`/`after`
-的计数仅统计匹配该 pattern 的消息
+的计数仅统计匹配该 pattern 的消息，合法 JSONL session metadata record 会被忽略且不产生解析警告，损坏 JSON 和不完整消息 record
+仍会产生警告，`history_trace` 使用相同的 record 处理规则
 
 ### history_trace
 
@@ -183,7 +197,14 @@ URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处
 | `max_content`    | number  | 4000    | 单条最大字符数                            |
 | `max_total`      | number  | 40000   | messages 总最大字符数                    |
 
-`history_trace` 返回附近原始消息，并在 `tool_calls` 中列出识别到的 tool 调用和对应 tool_result
+`history_trace` 返回附近原始消息，并在 `tool_calls` 中列出识别到的 tool 调用和对应 tool_result，有
+`tool_use_id` 的 result 只匹配相同 ID；没有 ID 时先匹配 assistant parent UUID，再在仅有一个 pending call 时使用旧版顺序兼容，
+每个 call 返回 `match_method`，未匹配和歧义 result 进入有数量上限的 `association_issues`
+
+### history_build_info
+
+返回当前运行二进制的 package version、commit、target、profile、UTC 构建时间、dirty 状态和构建身份是否可复现，本地 dirty
+构建不会标记为可复现，CLI 对应命令为 `mcp-claude-history build-info`
 
 ## 使用示例
 

@@ -106,6 +106,13 @@ fn per_file_cap(params: &SearchParams) -> usize {
 /// 全局命中硬上限（防止 OOM；超过即截断 + 在响应里标 truncated）
 const GLOBAL_RESULT_CAP: usize = 50_000;
 const STREAMING_UUID_DEDUPE_CAP: usize = GLOBAL_RESULT_CAP;
+pub const DEFAULT_MAX_CONTENT: usize = 4_000;
+pub const DEFAULT_MAX_CONTENT_TOOL_RESULT: usize = 500;
+pub const DEFAULT_MAX_TOTAL: usize = 40_000;
+pub const MIN_CONTENT_LIMIT: usize = 1;
+pub const MAX_CONTENT_LIMIT: usize = 1_000_000;
+pub const MIN_TOTAL_LIMIT: usize = 512;
+pub const MAX_TOTAL_LIMIT: usize = 10_000_000;
 
 const TYPE_VALUES: &[&str] = &["assistant", "user", "summary", "system", "other"];
 const SUBTYPE_VALUES: &[&str] = &[
@@ -127,14 +134,24 @@ struct FileSearchResult {
     truncated: bool,
     read_errors: usize,
     parse_errors: usize,
+    metadata_parse_errors: usize,
+    metadata_issues: Vec<String>,
 }
 
-fn push_jsonl_error_reasons(reasons: &mut Vec<String>, read_errors: usize, parse_errors: usize) {
+fn push_jsonl_error_reasons(
+    reasons: &mut Vec<String>,
+    read_errors: usize,
+    parse_errors: usize,
+    metadata_parse_errors: usize,
+) {
     if read_errors > 0 {
-        reasons.push(format!("read_errors={}", read_errors));
+        reasons.push(format!("read_errors={read_errors}"));
     }
     if parse_errors > 0 {
-        reasons.push(format!("parse_errors={}", parse_errors));
+        reasons.push(format!("parse_errors={parse_errors}"));
+    }
+    if metadata_parse_errors > 0 {
+        reasons.push(format!("metadata_parse_error={metadata_parse_errors}"));
     }
 }
 
@@ -162,9 +179,9 @@ fn normalize_filters(mut params: SearchParams) -> SearchParams {
             }
             params
                 .warnings
-                .push(format!("types={} 是 subtype，已自动转入 subtypes", value));
+                .push(format!("types={value} 是 subtype，已自动转入 subtypes"));
         } else {
-            params.warnings.push(format!("未知 type 过滤值: {}", value));
+            params.warnings.push(format!("未知 type 过滤值: {value}"));
             push_unique(&mut normalized_types, value.clone());
         }
     }
@@ -180,9 +197,9 @@ fn normalize_filters(mut params: SearchParams) -> SearchParams {
             push_unique(&mut normalized_types, value.clone());
             params
                 .warnings
-                .push(format!("subtypes={} 是 type，已自动转入 types", value));
+                .push(format!("subtypes={value} 是 type，已自动转入 types"));
         } else {
-            params.warnings.push(format!("未知 subtype 过滤值: {}", value));
+            params.warnings.push(format!("未知 subtype 过滤值: {value}"));
             push_unique(&mut final_subtypes, value);
         }
     }
@@ -198,7 +215,7 @@ fn normalize_filters(mut params: SearchParams) -> SearchParams {
             }
             params
                 .warnings
-                .push(format!("tools={} 是完整 MCP tool 名，已拆分为 server/tool", value));
+                .push(format!("tools={value} 是完整 MCP tool 名，已拆分为 server/tool"));
         } else {
             push_unique(&mut normalized_tools, parsed.tool.unwrap_or_else(|| value.clone()));
         }
@@ -286,42 +303,41 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
     }
 
     let inputs = prepare_search_inputs(config, &params)?;
-    if params.dry_run {
-        return Ok(build_dry_run_response(
+    let max_total = params.max_total;
+    let continuation_query = build_next_query(&params, params.offset);
+    let response = if params.dry_run {
+        Ok(build_dry_run_response(
             &params,
             &inputs.project_dirs,
             &inputs.files,
             start,
-        ));
-    }
-
-    if params.output.is_some() {
-        return search_to_output_streaming(
+        ))
+    } else if params.output.is_some() {
+        search_to_output_streaming(
             &params,
             &inputs.files,
             inputs.regex.as_ref(),
             inputs.search_pattern.as_ref(),
             start,
-        );
-    }
-
-    if params.aggregate {
-        return search_aggregate_streaming(
+        )
+    } else if params.aggregate {
+        search_aggregate_streaming(
             &params,
             &inputs.files,
             inputs.regex.as_ref(),
             inputs.search_pattern.as_ref(),
             start,
+        )
+    } else {
+        let collection = collect_search_results(
+            &params,
+            &inputs.files,
+            inputs.regex.as_ref(),
+            inputs.search_pattern.as_ref(),
         );
-    }
-
-    let collection = collect_search_results(
-        &params,
-        &inputs.files,
-        inputs.regex.as_ref(),
-        inputs.search_pattern.as_ref(),
-    );
-    build_search_response(params, inputs.files, collection, start)
+        build_search_response(params, inputs.files, collection, start)
+    }?;
+    apply_response_budget(response, max_total, continuation_query)
 }
 
 fn prepare_search_params(params: SearchParams) -> Result<SearchParams, ErrorResponse> {
@@ -336,8 +352,27 @@ fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
     {
         return Err(ErrorResponse {
             error: "invalid_arguments".to_string(),
-            message: format!("output_format 仅支持 jsonl，收到 {}", format),
+            message: format!("output_format 仅支持 jsonl，收到 {format}"),
             available: Some(serde_json::json!({ "formats": ["jsonl"] })),
+        });
+    }
+    for (name, value) in [
+        ("max_content", params.max_content),
+        ("max_content_tool_result", params.max_content_tool_result),
+    ] {
+        if !(MIN_CONTENT_LIMIT..=MAX_CONTENT_LIMIT).contains(&value) {
+            return Err(ErrorResponse {
+                error: "invalid_arguments".to_string(),
+                message: format!("{name} 必须在 {MIN_CONTENT_LIMIT}..={MAX_CONTENT_LIMIT} 之间"),
+                available: Some(serde_json::json!({ "min": MIN_CONTENT_LIMIT, "max": MAX_CONTENT_LIMIT })),
+            });
+        }
+    }
+    if !(MIN_TOTAL_LIMIT..=MAX_TOTAL_LIMIT).contains(&params.max_total) {
+        return Err(ErrorResponse {
+            error: "invalid_arguments".to_string(),
+            message: format!("max_total 必须在 {MIN_TOTAL_LIMIT}..={MAX_TOTAL_LIMIT} 字节之间"),
+            available: Some(serde_json::json!({ "min": MIN_TOTAL_LIMIT, "max": MAX_TOTAL_LIMIT })),
         });
     }
     if params.slice.is_some() && (params.offset > 0 || params.limit.is_some()) {
@@ -385,7 +420,7 @@ fn build_search_regex(params: &SearchParams) -> Result<Option<Regex>, ErrorRespo
         .map(Some)
         .map_err(|e| ErrorResponse {
             error: "invalid_regex".to_string(),
-            message: format!("无效的正则表达式: {}", e),
+            message: format!("无效的正则表达式: {e}"),
             available: None,
         })
 }
@@ -435,6 +470,10 @@ fn build_dry_run_response(
         next_query: None,
         output: None,
         warning: None,
+        serialized_bytes: 0,
+        max_total_bytes: params.max_total,
+        limits_applied: Vec::new(),
+        complete: true,
     }
 }
 
@@ -458,6 +497,7 @@ fn collect_search_results(
     let mut incomplete_reasons = Vec::new();
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
+    let mut metadata_parse_errors = 0usize;
 
     for file_result in file_results {
         files_scanned += 1;
@@ -467,9 +507,18 @@ fn collect_search_results(
         }
         read_errors += file_result.read_errors;
         parse_errors += file_result.parse_errors;
+        metadata_parse_errors += file_result.metadata_parse_errors;
+        for issue in file_result.metadata_issues {
+            push_unique(&mut incomplete_reasons, issue);
+        }
         results.extend(file_result.results);
     }
-    push_jsonl_error_reasons(&mut incomplete_reasons, read_errors, parse_errors);
+    push_jsonl_error_reasons(
+        &mut incomplete_reasons,
+        read_errors,
+        parse_errors,
+        metadata_parse_errors,
+    );
 
     results.sort_by(|a, b| {
         a.timestamp
@@ -541,37 +590,25 @@ fn select_search_window(params: &SearchParams, all_results: &[SearchResult]) -> 
     }
 }
 
-fn truncate_selected_results(params: &SearchParams, selected_results: Vec<SearchResult>) -> (Vec<SearchResult>, bool) {
-    const METADATA_OVERHEAD: usize = 300;
+fn truncate_selected_results(params: &SearchParams, selected_results: Vec<SearchResult>) -> Vec<SearchResult> {
     if params.aggregate {
-        return (Vec::new(), false);
+        return Vec::new();
     }
 
-    let mut final_results = Vec::new();
-    let mut total_chars = 0;
-    let mut max_total_hit = false;
-
-    for mut result in selected_results {
-        let effective_max = if result.subtype == "tool_result" {
-            params.max_content_tool_result
-        } else {
-            params.max_content
-        };
-        let (content, truncated) = truncate_around_match(&result.content, result.match_pos, effective_max);
-        result.content = content;
-        result.truncated = truncated || result.truncated;
-
-        let result_size = result.content.chars().count() + METADATA_OVERHEAD;
-        if total_chars + result_size > params.max_total && !final_results.is_empty() {
-            max_total_hit = true;
-            break;
-        }
-
-        total_chars += result_size;
-        final_results.push(result);
-    }
-
-    (final_results, max_total_hit)
+    selected_results
+        .into_iter()
+        .map(|mut result| {
+            let effective_max = if result.subtype == "tool_result" {
+                params.max_content_tool_result
+            } else {
+                params.max_content
+            };
+            let (content, truncated) = truncate_around_match(&result.content, result.match_pos, effective_max);
+            result.content = content;
+            result.truncated = truncated || result.truncated;
+            result
+        })
+        .collect()
 }
 
 fn build_search_response(
@@ -582,11 +619,7 @@ fn build_search_response(
 ) -> Result<SearchResponse, ErrorResponse> {
     let total_matches = collection.results.len();
     let window = select_search_window(&params, &collection.results);
-    let (final_results, max_total_hit) = truncate_selected_results(&params, window.selected_results);
-
-    if max_total_hit {
-        collection.incomplete_reasons.push("max_total".to_string());
-    }
+    let final_results = truncate_selected_results(&params, window.selected_results);
     let has_more = !params.aggregate && final_results.len() < window.selected_count;
     if has_more {
         collection.incomplete_reasons.push("has_more".to_string());
@@ -636,7 +669,207 @@ fn build_search_response(
         next_query,
         output: None,
         warning,
+        serialized_bytes: 0,
+        max_total_bytes: params.max_total,
+        limits_applied: Vec::new(),
+        complete: true,
     })
+}
+
+fn compact_response_size(response: &SearchResponse) -> Result<usize, ErrorResponse> {
+    serde_json::to_vec(response)
+        .map(|bytes| bytes.len())
+        .map_err(|e| ErrorResponse {
+            error: "serialize_error".to_string(),
+            message: format!("序列化搜索响应失败: {e}"),
+            available: None,
+        })
+}
+
+fn update_serialized_size(response: &mut SearchResponse) -> Result<usize, ErrorResponse> {
+    for _ in 0..4 {
+        let size = compact_response_size(response)?;
+        if response.serialized_bytes == size {
+            return Ok(size);
+        }
+        response.serialized_bytes = size;
+    }
+    compact_response_size(response)
+}
+
+fn mark_budget_limit(response: &mut SearchResponse) {
+    if !response.limits_applied.iter().any(|value| value == "max_total") {
+        response.limits_applied.push("max_total".to_string());
+    }
+    if !response
+        .stats
+        .incomplete_reasons
+        .iter()
+        .any(|value| value == "max_total")
+    {
+        response.stats.incomplete_reasons.push("max_total".to_string());
+    }
+    response.stats.incomplete = true;
+    response.stats.total_matches_exact = false;
+    response.complete = false;
+}
+
+fn trim_summary(response: &mut SearchResponse) -> bool {
+    let Some(summary) = response.stats.summary.as_mut() else {
+        return false;
+    };
+    for buckets in [
+        &mut summary.by_day,
+        &mut summary.by_tool,
+        &mut summary.by_server,
+        &mut summary.by_session,
+        &mut summary.by_project,
+        &mut summary.by_type,
+    ] {
+        if buckets.pop().is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn trim_response_metadata(response: &mut SearchResponse) -> bool {
+    if response.stats.coverage.searched_files.pop().is_some()
+        || response.stats.coverage.skipped_files.pop().is_some()
+        || response.stats.warnings.pop().is_some()
+        || response.stats.ignored_keys.pop().is_some()
+    {
+        return true;
+    }
+    trim_summary(response)
+}
+
+fn replace_structured_value_with_preview(value: &mut Option<serde_json::Value>) -> bool {
+    let Some(original) = value.take() else {
+        return false;
+    };
+    if original.get("budget_preview").and_then(serde_json::Value::as_bool) == Some(true) {
+        *value = Some(original);
+        return false;
+    }
+    let serialized = serde_json::to_string(&original).unwrap_or_default();
+    let (preview, _) = truncate_content(&serialized, 100);
+    *value = Some(serde_json::json!({
+        "preview": preview,
+        "truncated": true,
+        "budget_preview": true,
+        "original_bytes": serialized.len()
+    }));
+    true
+}
+
+fn trim_last_result_metadata(response: &mut SearchResponse) -> bool {
+    let Some(result) = response.results.last_mut() else {
+        return false;
+    };
+    if replace_structured_value_with_preview(&mut result.tool_result_redacted)
+        || replace_structured_value_with_preview(&mut result.tool_input_redacted)
+    {
+        result.truncated = true;
+        return true;
+    }
+    if !result.images.is_empty() {
+        result.images.clear();
+        result.truncated = true;
+        return true;
+    }
+    if result.matched_filters.pop().is_some() {
+        result.truncated = true;
+        return true;
+    }
+    false
+}
+
+fn shorten_last_result(response: &mut SearchResponse, max_total: usize) -> Result<bool, ErrorResponse> {
+    let Some(last_index) = response.results.len().checked_sub(1) else {
+        return Ok(false);
+    };
+    let original = response.results[last_index].content.clone();
+    if original.is_empty() {
+        return Ok(false);
+    }
+    let mut low = 0usize;
+    let mut high = original.chars().count();
+    let mut best = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let (preview, _) = truncate_content(&original, mid);
+        response.results[last_index].content = preview;
+        response.results[last_index].truncated = true;
+        let size = update_serialized_size(response)?;
+        if size <= max_total {
+            best = Some(response.results[last_index].content.clone());
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if let Some(content) = best {
+        response.results[last_index].content = content;
+        update_serialized_size(response)?;
+        return Ok(true);
+    }
+    response.results[last_index].content = original;
+    Ok(false)
+}
+
+fn apply_response_budget(
+    mut response: SearchResponse,
+    max_total: usize,
+    continuation_query: serde_json::Value,
+) -> Result<SearchResponse, ErrorResponse> {
+    let original_result_count = response.results.len();
+    let base_offset = response.next_offset.saturating_sub(original_result_count);
+    response.max_total_bytes = max_total;
+    response.complete = !response.stats.incomplete;
+    if update_serialized_size(&mut response)? <= max_total {
+        return Ok(response);
+    }
+
+    mark_budget_limit(&mut response);
+    loop {
+        response.stats.returned_count = response.results.len();
+        response.next_offset = base_offset.saturating_add(response.results.len());
+        response.has_more = response.has_more || response.results.len() < original_result_count;
+        if response.has_more {
+            let next_query = response
+                .next_query
+                .get_or_insert_with(|| continuation_query.clone())
+                .as_object_mut()
+                .expect("build_next_query returns an object");
+            next_query.insert("offset".to_string(), serde_json::json!(response.next_offset));
+            next_query.insert("max_total".to_string(), serde_json::json!(max_total));
+        }
+        if update_serialized_size(&mut response)? <= max_total {
+            return Ok(response);
+        }
+        if shorten_last_result(&mut response, max_total)? || trim_last_result_metadata(&mut response) {
+            continue;
+        }
+        if response.results.pop().is_some() {
+            continue;
+        }
+        if trim_response_metadata(&mut response) {
+            continue;
+        }
+        return Err(ErrorResponse {
+            error: "response_too_large".to_string(),
+            message: "搜索响应 metadata 超过 max_total 字节预算，请缩小搜索范围或提高 max_total".to_string(),
+            available: Some(serde_json::json!({
+                "serialized_bytes": response.serialized_bytes,
+                "max_total_bytes": max_total,
+                "limits_applied": response.limits_applied,
+                "complete": false
+            })),
+        });
+    }
 }
 
 fn build_response_warning(incomplete_reasons: &[String], params: &SearchParams) -> Option<String> {
@@ -669,23 +902,20 @@ fn ensure_session_filters_unambiguous(
         let mut matches = BTreeSet::new();
         for (project, session, _) in files {
             if session == filter || ref_prefix(session) == *filter {
-                matches.insert(format!("{}:{}", project, session));
+                matches.insert(format!("{project}:{session}"));
             }
         }
         if matches.is_empty() {
             return Err(ErrorResponse {
                 error: "session_not_found".to_string(),
-                message: format!("找不到 session 过滤条件: {}", filter),
+                message: format!("找不到 session 过滤条件: {filter}"),
                 available: None,
             });
         }
         if matches.len() > 1 {
             return Err(ErrorResponse {
                 error: "session_ambiguous".to_string(),
-                message: format!(
-                    "session 过滤条件不唯一: {}，请使用完整 session id 或指定 project",
-                    filter
-                ),
+                message: format!("session 过滤条件不唯一: {filter}，请使用完整 session id 或指定 project"),
                 available: Some(serde_json::json!({ "candidates": matches.into_iter().collect::<Vec<_>>() })),
             });
         }
@@ -756,6 +986,12 @@ fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Va
     if params.subagents {
         query.insert("subagents".to_string(), serde_json::Value::Bool(true));
     }
+    query.insert("max_content".to_string(), serde_json::json!(params.max_content));
+    query.insert(
+        "max_content_tool_result".to_string(),
+        serde_json::json!(params.max_content_tool_result),
+    );
+    query.insert("max_total".to_string(), serde_json::json!(params.max_total));
     if params.redaction != RedactionMode::Auto {
         query.insert(
             "redaction".to_string(),
@@ -877,7 +1113,7 @@ fn resolve_search_output_paths(raw_output: &str) -> Result<(PathBuf, PathBuf), E
         let dir = resolve_output_dir(trimmed)?;
         fs::create_dir_all(&dir).map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("无法创建搜索输出目录: {}", e),
+            message: format!("无法创建搜索输出目录: {e}"),
             available: None,
         })?;
         set_private_permissions(&dir, 0o700)?;
@@ -888,7 +1124,11 @@ fn resolve_search_output_paths(raw_output: &str) -> Result<(PathBuf, PathBuf), E
         error: "invalid_output_dir".to_string(),
         message: "output 指向 .jsonl 文件时必须包含文件名".to_string(),
         available: Some(serde_json::json!({
-            "examples": ["tmp:search-results.jsonl", "tmp:export/search-results.jsonl", "cwd:export/search-results.jsonl"]
+            "examples": [
+                "tmp:search-results.jsonl",
+                "tmp:export/search-results.jsonl",
+                "cwd:export/search-results.jsonl"
+            ]
         })),
     })?;
     let parent = requested_path.parent().unwrap_or_else(|| Path::new("."));
@@ -896,7 +1136,7 @@ fn resolve_search_output_paths(raw_output: &str) -> Result<(PathBuf, PathBuf), E
     let dir = resolve_output_dir(&parent_output)?;
     fs::create_dir_all(&dir).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法创建搜索输出目录: {}", e),
+        message: format!("无法创建搜索输出目录: {e}"),
         available: None,
     })?;
     set_private_permissions(&dir, 0o700)?;
@@ -1028,6 +1268,8 @@ struct SearchManifestContext<'a> {
     explicit_range: bool,
     incomplete_reasons: &'a [String],
     bytes: u64,
+    max_content: usize,
+    max_content_tool_result: usize,
 }
 
 fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputInfo, ErrorResponse> {
@@ -1065,6 +1307,8 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         "slice": ctx.slice,
         "incomplete_reasons": ctx.incomplete_reasons,
         "cap_reasons": ctx.incomplete_reasons,
+        "max_content": ctx.max_content,
+        "max_content_tool_result": ctx.max_content_tool_result,
         "redaction": &redaction,
     });
     let mut manifest_file = open_private_output_file(ctx.manifest_path)?;
@@ -1072,7 +1316,7 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
         .map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("写入搜索 manifest 失败: {}", e),
+            message: format!("写入搜索 manifest 失败: {e}"),
             available: None,
         })?;
 
@@ -1107,7 +1351,7 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
     if params.all_projects {
         return config.list_project_dirs().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("无法读取项目目录: {}", e),
+            message: format!("无法读取项目目录: {e}"),
             available: None,
         });
     }
@@ -1121,7 +1365,7 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
             if !dir.exists() {
                 return Err(ErrorResponse {
                     error: "project_not_found".to_string(),
-                    message: format!("项目不存在: {}", normalized),
+                    message: format!("项目不存在: {normalized}"),
                     available: Some(config.available_projects_json()),
                 });
             }
@@ -1225,6 +1469,7 @@ fn search_aggregate_streaming(
     let mut incomplete_reasons = Vec::new();
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
+    let mut metadata_parse_errors = 0usize;
 
     'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
@@ -1233,13 +1478,11 @@ fn search_aggregate_streaming(
             continue;
         };
         let prefix = ref_prefix(session_id);
-        let mut tool_uses = BTreeMap::new();
+        let mut tool_uses = ToolUseIndex::default();
         for (line_num, line) in BufReader::new(input).lines().enumerate() {
             let line_num = line_num + 1;
             lines_scanned += 1;
-            if !line_in_ranges(line_num, &params.lines) {
-                continue;
-            }
+            let in_range = line_in_ranges(line_num, &params.lines);
             let line = match line {
                 Ok(line) => line,
                 Err(_) => {
@@ -1247,14 +1490,25 @@ fn search_aggregate_streaming(
                     continue;
                 }
             };
-            let record = match serde_json::from_str::<MessageRecord>(&line) {
-                Ok(record) => record,
+            let record = match parse_message_record(&line) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
                 Err(_) => {
-                    parse_errors += 1;
+                    if in_range {
+                        parse_errors += 1;
+                    } else {
+                        metadata_parse_errors += 1;
+                    }
                     continue;
                 }
             };
             observe_tool_uses(&mut tool_uses, &record);
+            if !in_range {
+                continue;
+            }
+            if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
+                push_unique(&mut incomplete_reasons, issue);
+            }
             let ctx = RecordBuildContext {
                 project_id,
                 session_id,
@@ -1282,7 +1536,12 @@ fn search_aggregate_streaming(
         }
     }
 
-    push_jsonl_error_reasons(&mut incomplete_reasons, read_errors, parse_errors);
+    push_jsonl_error_reasons(
+        &mut incomplete_reasons,
+        read_errors,
+        parse_errors,
+        metadata_parse_errors,
+    );
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     let summary_value = Some(aggregation.summary());
@@ -1313,6 +1572,10 @@ fn search_aggregate_streaming(
         next_query: None,
         output: None,
         warning,
+        serialized_bytes: 0,
+        max_total_bytes: params.max_total,
+        limits_applied: Vec::new(),
+        complete: true,
     })
 }
 
@@ -1341,6 +1604,7 @@ fn search_to_output_streaming(
     let mut incomplete_reasons = Vec::new();
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
+    let mut metadata_parse_errors = 0usize;
 
     'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
@@ -1349,13 +1613,11 @@ fn search_to_output_streaming(
             continue;
         };
         let prefix = ref_prefix(session_id);
-        let mut tool_uses = BTreeMap::new();
+        let mut tool_uses = ToolUseIndex::default();
         for (line_num, line) in BufReader::new(input).lines().enumerate() {
             let line_num = line_num + 1;
             lines_scanned += 1;
-            if !line_in_ranges(line_num, &params.lines) {
-                continue;
-            }
+            let in_range = line_in_ranges(line_num, &params.lines);
             let line = match line {
                 Ok(line) => line,
                 Err(_) => {
@@ -1363,14 +1625,25 @@ fn search_to_output_streaming(
                     continue;
                 }
             };
-            let record = match serde_json::from_str::<MessageRecord>(&line) {
-                Ok(record) => record,
+            let record = match parse_message_record(&line) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
                 Err(_) => {
-                    parse_errors += 1;
+                    if in_range {
+                        parse_errors += 1;
+                    } else {
+                        metadata_parse_errors += 1;
+                    }
                     continue;
                 }
             };
             observe_tool_uses(&mut tool_uses, &record);
+            if !in_range {
+                continue;
+            }
+            if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
+                push_unique(&mut incomplete_reasons, issue);
+            }
             let ctx = RecordBuildContext {
                 project_id,
                 session_id,
@@ -1411,12 +1684,12 @@ fn search_to_output_streaming(
             }
             let line = serde_json::to_string(&result).map_err(|e| ErrorResponse {
                 error: "serialize_error".to_string(),
-                message: format!("序列化搜索结果失败: {}", e),
+                message: format!("序列化搜索结果失败: {e}"),
                 available: None,
             })?;
-            writeln!(file, "{}", line).map_err(|e| ErrorResponse {
+            writeln!(file, "{line}").map_err(|e| ErrorResponse {
                 error: "io_error".to_string(),
-                message: format!("写入搜索结果失败: {}", e),
+                message: format!("写入搜索结果失败: {e}"),
                 available: None,
             })?;
             written_count += 1;
@@ -1425,12 +1698,17 @@ fn search_to_output_streaming(
 
     file.flush().map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("刷新搜索结果文件失败: {}", e),
+        message: format!("刷新搜索结果文件失败: {e}"),
         available: None,
     })?;
     let bytes = fs::metadata(&results_path).map(|m| m.len()).unwrap_or(0);
     let slice_info = streaming_slice_info(params, total_matches);
-    push_jsonl_error_reasons(&mut incomplete_reasons, read_errors, parse_errors);
+    push_jsonl_error_reasons(
+        &mut incomplete_reasons,
+        read_errors,
+        parse_errors,
+        metadata_parse_errors,
+    );
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     let summary_value = (params.summary || params.aggregate).then(|| aggregation.summary());
@@ -1450,6 +1728,8 @@ fn search_to_output_streaming(
         explicit_range,
         incomplete_reasons: &incomplete_reasons,
         bytes,
+        max_content: params.max_content,
+        max_content_tool_result: params.max_content_tool_result,
     })?);
     let warning = build_response_warning(&incomplete_reasons, params);
 
@@ -1477,7 +1757,17 @@ fn search_to_output_streaming(
         next_query: None,
         output,
         warning,
+        serialized_bytes: 0,
+        max_total_bytes: params.max_total,
+        limits_applied: Vec::new(),
+        complete: true,
     })
+}
+
+#[derive(Default)]
+struct ToolUseIndex {
+    by_id: BTreeMap<String, ToolInfo>,
+    by_assistant_uuid: BTreeMap<String, Vec<ToolInfo>>,
 }
 
 struct RecordBuildContext<'a> {
@@ -1487,10 +1777,10 @@ struct RecordBuildContext<'a> {
     params: &'a SearchParams,
     regex: Option<&'a Regex>,
     pattern: Option<&'a SearchPattern>,
-    tool_uses: &'a BTreeMap<String, ToolInfo>,
+    tool_uses: &'a ToolUseIndex,
 }
 
-fn observe_tool_uses(tool_uses: &mut BTreeMap<String, ToolInfo>, record: &MessageRecord) {
+fn observe_tool_uses(tool_uses: &mut ToolUseIndex, record: &MessageRecord) {
     let Some(content) = record
         .message
         .as_ref()
@@ -1509,32 +1799,63 @@ fn observe_tool_uses(tool_uses: &mut BTreeMap<String, ToolInfo>, record: &Messag
         let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
             continue;
         };
-        tool_uses.insert(id.to_string(), parse_mcp_tool_name(name));
+        let info = parse_mcp_tool_name(name);
+        tool_uses.by_id.insert(id.to_string(), info.clone());
+        tool_uses
+            .by_assistant_uuid
+            .entry(record.uuid.clone())
+            .or_default()
+            .push(info);
     }
 }
 
-fn linked_tool_result_info(record: &MessageRecord, tool_uses: &BTreeMap<String, ToolInfo>) -> Option<ToolInfo> {
-    let content = record.message.as_ref()?.get("content")?.as_array()?;
+fn linked_tool_result_info(record: &MessageRecord, tool_uses: &ToolUseIndex) -> (Option<ToolInfo>, Option<String>) {
+    let Some(content) = record
+        .message
+        .as_ref()
+        .and_then(|message| message.get("content"))
+        .and_then(|value| value.as_array())
+    else {
+        return (None, None);
+    };
     for item in content {
         if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
             continue;
         }
-        let Some(id) = item.get("tool_use_id").and_then(|id| id.as_str()) else {
-            continue;
-        };
-        if let Some(info) = tool_uses.get(id) {
-            return Some(info.clone());
+        if let Some(id) = item.get("tool_use_id").and_then(|id| id.as_str()) {
+            return tool_uses
+                .by_id
+                .get(id)
+                .cloned()
+                .map_or((None, Some("unknown_id".to_string())), |info| (Some(info), None));
         }
+        for parent in [
+            record.source_tool_assistant_uuid.as_deref(),
+            record.parent_uuid.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(matches) = tool_uses.by_assistant_uuid.get(parent) {
+                return if matches.len() == 1 {
+                    (matches.first().cloned(), None)
+                } else {
+                    (None, Some("ambiguous_parent".to_string()))
+                };
+            }
+        }
+        return (None, Some("missing_id".to_string()));
     }
-    None
+    (None, None)
 }
 
-fn record_tool_info(record: &MessageRecord, tool_uses: &BTreeMap<String, ToolInfo>) -> ToolInfo {
+fn record_tool_info(record: &MessageRecord, tool_uses: &ToolUseIndex) -> (ToolInfo, Option<String>) {
     let tool_info = extract_tool_info(record);
     if tool_info.server.is_some() || tool_info.tool.is_some() {
-        return tool_info;
+        return (tool_info, None);
     }
-    linked_tool_result_info(record, tool_uses).unwrap_or(tool_info)
+    let (linked, issue) = linked_tool_result_info(record, tool_uses);
+    (linked.unwrap_or(tool_info), issue)
 }
 
 fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: MessageRecord) -> Option<SearchResult> {
@@ -1549,7 +1870,7 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         return None;
     }
 
-    let tool_info = record_tool_info(&record, ctx.tool_uses);
+    let (tool_info, metadata_incomplete_reason) = record_tool_info(&record, ctx.tool_uses);
     if !ctx.params.servers.is_empty() {
         let Some(server) = &tool_info.server else {
             return None;
@@ -1607,10 +1928,10 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         matched_filters.push("time=true".to_string());
     }
     if let Some(server) = &tool_info.server {
-        matched_filters.push(format!("server={}", server));
+        matched_filters.push(format!("server={server}"));
     }
     if let Some(tool) = &tool_info.tool {
-        matched_filters.push(format!("tool={}", tool));
+        matched_filters.push(format!("tool={tool}"));
     }
     if ctx.params.failed_tool_results {
         matched_filters.push("failed_tool_results=true".to_string());
@@ -1635,6 +1956,7 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         project: ctx.project_id.to_string(),
         server: tool_info.server,
         tool: tool_info.tool,
+        metadata_incomplete_reason,
         tool_input_redacted: structured_tool_data.input,
         tool_result_redacted: structured_tool_data.result,
         tool_result_is_error: structured_tool_data.result_is_error,
@@ -1661,6 +1983,8 @@ fn search_file(
     let mut truncated = false;
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
+    let mut metadata_parse_errors = 0usize;
+    let mut metadata_issues = Vec::new();
 
     let file = match File::open(path) {
         Ok(f) => f,
@@ -1671,23 +1995,21 @@ fn search_file(
                 truncated: false,
                 read_errors: 1,
                 parse_errors: 0,
+                metadata_parse_errors: 0,
+                metadata_issues: Vec::new(),
             };
         }
     };
 
     let reader = BufReader::new(file);
     let prefix = ref_prefix(session_id);
-    let mut tool_uses = BTreeMap::new();
+    let mut tool_uses = ToolUseIndex::default();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line_num = line_num + 1; // 1-based
         lines_scanned += 1;
 
-        // 行号过滤
-        if !line_in_ranges(line_num, &params.lines) {
-            continue;
-        }
-
+        let in_range = line_in_ranges(line_num, &params.lines);
         let line = match line {
             Ok(l) => l,
             Err(_) => {
@@ -1697,14 +2019,25 @@ fn search_file(
         };
 
         // 解析 JSON
-        let record: MessageRecord = match serde_json::from_str(&line) {
-            Ok(r) => r,
+        let record = match parse_message_record(&line) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
             Err(_) => {
-                parse_errors += 1;
+                if in_range {
+                    parse_errors += 1;
+                } else {
+                    metadata_parse_errors += 1;
+                }
                 continue;
             }
         };
         observe_tool_uses(&mut tool_uses, &record);
+        if !in_range {
+            continue;
+        }
+        if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
+            push_unique(&mut metadata_issues, issue);
+        }
 
         let ctx = RecordBuildContext {
             project_id,
@@ -1732,10 +2065,13 @@ fn search_file(
         truncated,
         read_errors,
         parse_errors,
+        metadata_parse_errors,
+        metadata_issues,
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -1749,13 +2085,141 @@ mod tests {
             // 时间戳带毫秒偏移以保证 sort 顺序
             writeln!(
                 f,
-                r#"{{"uuid":"u-{i:08}","type":"user","timestamp":"2026-04-26T10:00:{:02}.{:03}Z","message":{{"role":"user","content":"hit-{i}"}}}}"#,
-                i % 60,
-                i % 1000,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("u-{i:08}"),
+                    "type": "user",
+                    "timestamp": format!("2026-04-26T10:00:{:02}.{:03}Z", i % 60, i % 1000),
+                    "message": {"role": "user", "content": format!("hit-{i}")}
+                })
             )
-                .unwrap();
+            .unwrap();
         }
         path
+    }
+
+    fn response_with_content(content: String) -> SearchResponse {
+        SearchResponse {
+            stats: SearchStats {
+                files_scanned: 1,
+                lines_scanned: 1,
+                total_matches: 1,
+                returned_count: 1,
+                time_ms: 0,
+                total_matches_exact: true,
+                incomplete: false,
+                incomplete_reasons: Vec::new(),
+                coverage: SearchCoverage {
+                    start: None,
+                    end: None,
+                    projects: vec!["project".to_string()],
+                    sessions: vec!["session".to_string()],
+                    searched_files: Vec::new(),
+                    skipped_files: Vec::new(),
+                },
+                summary: None,
+                slice: None,
+                effective_filters: effective_filters(&SearchParams::default()),
+                ignored_keys: Vec::new(),
+                warnings: Vec::new(),
+                truncated_global: None,
+            },
+            results: vec![SearchResult {
+                r#ref: "session:1".to_string(),
+                session: "session".to_string(),
+                line: 1,
+                uuid: "uuid".to_string(),
+                r#type: "user".to_string(),
+                subtype: "human".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                content_size: content.chars().count(),
+                content,
+                truncated: false,
+                image_count: 0,
+                images: Vec::new(),
+                project: "project".to_string(),
+                server: None,
+                tool: None,
+                metadata_incomplete_reason: None,
+                tool_input_redacted: None,
+                tool_result_redacted: None,
+                tool_result_is_error: None,
+                tool_result_has_error_payload: None,
+                raw_available: None,
+                redacted: None,
+                matched_filters: Vec::new(),
+                match_pos: None,
+            }],
+            has_more: false,
+            next_offset: 1,
+            next_query: None,
+            output: None,
+            warning: None,
+            serialized_bytes: 0,
+            max_total_bytes: DEFAULT_MAX_TOTAL,
+            limits_applied: Vec::new(),
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn final_response_budget_counts_compact_json_bytes() {
+        let response = response_with_content("\\\"中文".repeat(2_000));
+        let continuation = build_next_query(&SearchParams::default(), 0);
+        let budgeted = apply_response_budget(response, 2_000, continuation).unwrap();
+        let bytes = serde_json::to_vec(&budgeted).unwrap();
+        assert!(bytes.len() <= 2_000, "serialized response was {} bytes", bytes.len());
+        assert_eq!(budgeted.serialized_bytes, bytes.len());
+        assert_eq!(budgeted.max_total_bytes, 2_000);
+        assert!(budgeted.limits_applied.iter().any(|limit| limit == "max_total"));
+        assert!(!budgeted.complete);
+    }
+
+    #[test]
+    fn budget_preserves_query_and_bounded_structured_tool_preview() {
+        let mut response = response_with_content("short".to_string());
+        response.results[0].subtype = "tool_result".to_string();
+        response.results[0].tool_result_redacted = Some(serde_json::json!({
+            "payload": "x".repeat(20_000)
+        }));
+        let params = SearchParams {
+            pattern: "needle".to_string(),
+            projects: vec!["project".to_string()],
+            max_content_tool_result: 123,
+            ..Default::default()
+        };
+        let budgeted = apply_response_budget(response, 2_000, build_next_query(&params, 0)).unwrap();
+        assert_eq!(budgeted.results.len(), 1);
+        assert_eq!(budgeted.results[0].r#ref, "session:1");
+        assert_eq!(
+            budgeted.results[0]
+                .tool_result_redacted
+                .as_ref()
+                .and_then(|value| value.get("truncated"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(serde_json::to_vec(&budgeted).unwrap().len() <= 2_000);
+
+        let mut paged_response = response_with_content("first".to_string());
+        let mut oversized = paged_response.results[0].clone();
+        oversized.r#ref = "r".repeat(5_000);
+        paged_response.results.push(oversized);
+        paged_response.stats.total_matches = 2;
+        paged_response.stats.returned_count = 2;
+        paged_response.next_offset = 2;
+        let paged = apply_response_budget(paged_response, 2_000, build_next_query(&params, 0)).unwrap();
+        assert_eq!(paged.results.len(), 1);
+        let query = paged.next_query.unwrap();
+        assert_eq!(query.get("pattern").and_then(serde_json::Value::as_str), Some("needle"));
+        assert_eq!(
+            query.get("project").and_then(serde_json::Value::as_str),
+            Some("project")
+        );
+        assert_eq!(
+            query.get("max_content_tool_result").and_then(serde_json::Value::as_u64),
+            Some(123)
+        );
     }
 
     #[test]
@@ -1804,12 +2268,172 @@ mod tests {
         // lines_scanned 在 break 前已 +1，所以 ≤ cap 行（每行命中即 push 后才检查 break）
         assert!(
             lines_scanned <= cap + 1 && lines_scanned >= cap,
-            "lines_scanned={} should be near cap={}",
-            lines_scanned,
-            cap
+            "lines_scanned={lines_scanned} should be near cap={cap}"
         );
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn line_range_observes_tool_use_before_filtering_result_rows() {
+        assert!(
+            parse_message_record(r#"{"type":"custom-title","customTitle":"fixture"}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_message_record(r#"{"type":"assistant","message":{}}"#).is_err());
+
+        let tmp = env::temp_dir().join(format!("mcp-search-metadata-test-{}", process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("session-metadata.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "custom-title",
+                "customTitle": "metadata fixture"
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "assistant-1",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": [{"type": "tool_use", "id": "call-1", "name": "mcp__mcp-chrome__browse"}]}
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "user-1",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "ok"}]}
+            })
+        )
+        .unwrap();
+
+        let mut params = SearchParams::default();
+        params.types = vec!["user".to_string()];
+        params.subtypes = vec!["tool_result".to_string()];
+        params.lines = vec![Range {
+            start: Some(3),
+            end: Some(3),
+            exclude: false,
+        }];
+        let result = search_file("proj", "session-metadata", &path, &params, None, None, 10);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.parse_errors, 0);
+        assert_eq!(result.metadata_parse_errors, 0);
+        assert_eq!(result.results[0].server.as_deref(), Some("mcp-chrome"));
+        assert_eq!(result.results[0].tool.as_deref(), Some("browse"));
+
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::copy(&path, project_dir.join("session-metadata.jsonl")).unwrap();
+        let config = Config {
+            projects_dir: tmp.clone(),
+        };
+        let base_params = SearchParams {
+            projects: vec!["project".to_string()],
+            types: vec!["user".to_string()],
+            subtypes: vec!["tool_result".to_string()],
+            lines: vec![Range {
+                start: Some(3),
+                end: Some(3),
+                exclude: false,
+            }],
+            ..Default::default()
+        };
+        let normal = search(&config, base_params).unwrap();
+        assert!(normal.stats.incomplete_reasons.is_empty());
+        assert_eq!(normal.results[0].server.as_deref(), Some("mcp-chrome"));
+
+        let aggregate = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["user".to_string()],
+                subtypes: vec!["tool_result".to_string()],
+                lines: vec![Range {
+                    start: Some(3),
+                    end: Some(3),
+                    exclude: false,
+                }],
+                aggregate: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(aggregate.stats.incomplete_reasons.is_empty());
+        let summary = aggregate.stats.summary.unwrap();
+        assert_eq!(summary.by_server[0].key, "mcp-chrome");
+        assert_eq!(summary.by_tool[0].key, "browse");
+
+        let output = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["user".to_string()],
+                subtypes: vec!["tool_result".to_string()],
+                lines: vec![Range {
+                    start: Some(3),
+                    end: Some(3),
+                    exclude: false,
+                }],
+                output: Some(format!("tmp:metadata-paths-{}", process::id())),
+                summary: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(output.stats.incomplete_reasons.is_empty());
+        let summary = output.stats.summary.unwrap();
+        assert_eq!(summary.by_server[0].key, "mcp-chrome");
+        assert_eq!(summary.by_tool[0].key, "browse");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn tool_result_uses_its_independent_preview_limit() {
+        let mut params = SearchParams::default();
+        params.max_content = 100;
+        params.max_content_tool_result = 7;
+        let result = SearchResult {
+            r#ref: "session:1".to_string(),
+            session: "session".to_string(),
+            line: 1,
+            uuid: "uuid".to_string(),
+            r#type: "user".to_string(),
+            subtype: "tool_result".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            content: "0123456789abcdef".to_string(),
+            content_size: 16,
+            truncated: false,
+            image_count: 0,
+            images: Vec::new(),
+            project: "project".to_string(),
+            server: None,
+            tool: None,
+            metadata_incomplete_reason: None,
+            tool_input_redacted: None,
+            tool_result_redacted: None,
+            tool_result_is_error: None,
+            tool_result_has_error_payload: None,
+            raw_available: None,
+            redacted: None,
+            matched_filters: Vec::new(),
+            match_pos: None,
+        };
+        let results = truncate_selected_results(&params, vec![result]);
+        assert!(results[0].content.chars().count() <= params.max_content_tool_result);
+        assert!(results[0].truncated);
     }
 
     #[test]

@@ -5,12 +5,12 @@ English | [中文](README_zh.md)
 A conversation history search tool for Claude Code
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
 ![Linux](https://img.shields.io/badge/Linux_x86__64-tested-success)
-![macOS](https://img.shields.io/badge/macOS-untested-yellow)
-![Windows](https://img.shields.io/badge/Windows-unsupported-red)
+![macOS](https://img.shields.io/badge/macOS-build_available-blue)
+![Windows](https://img.shields.io/badge/Windows-build_available-blue)
 
 ## Features
 
@@ -24,7 +24,14 @@ A conversation history search tool for Claude Code
 
 ### Download Binary (Recommended)
 
-Download the latest release from [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases):
+Download the latest release from [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases). Target-triple asset names remain available for existing automation.
+
+| Platform | Stable asset |
+|---|---|
+| Linux x86_64 | `mcp-claude-history-linux-x86_64.tar.gz` |
+| macOS Intel | `mcp-claude-history-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `mcp-claude-history-macos-aarch64.tar.gz` |
+| Windows x86_64 | `mcp-claude-history-windows-x86_64.zip` |
 
 ```bash
 # Download and install
@@ -68,7 +75,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 }
 ```
 
-## Available Tools (6 tools)
+## Available Tools (7 tools)
 
 | Tool               | Description                               |
 |--------------------|-------------------------------------------|
@@ -76,6 +83,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `history_get`      | Get full message content                  |
 | `history_context`  | Get surrounding messages                  |
 | `history_trace`    | Trace nearby messages and tool call pairs |
+| `history_build_info` | Show the running binary build identity  |
 | `history_projects` | List all projects                         |
 | `history_sessions` | List sessions in a project                |
 
@@ -105,8 +113,9 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `offset`              | number  | 0                      | Skip first N results, mutually exclusive with `slice`               |
 | `limit`               | number  | -                      | Max results to return, mutually exclusive with `slice`              |
 | `slice`               | string  | -                      | Python-style message slice after filtering and sorting              |
-| `max_content`         | number  | 4000                   | Max chars per result                                                |
-| `max_total`           | number  | 40000                  | Max total chars                                                     |
+| `max_content`         | number  | 4000                   | Max characters for a regular result preview (1 to 1,000,000)        |
+| `max_content_tool_result` | number | 500                  | Independent tool-result preview limit (1 to 1,000,000)              |
+| `max_total`           | number  | 40000                  | Max compact `SearchResponse` JSON bytes (512 to 10,000,000)         |
 
 Default `types` includes `summary`, which means context-compression summaries are searchable. Use `types=assistant,user`
 when you only want original conversation turns. `failed_tool_results` keeps the old harness-level meaning and only
@@ -127,6 +136,11 @@ is written next to that file.
 
 `slice` uses Python half-open semantics after all filters and timestamp sorting. `[-10:]` returns the latest 10 matching
 messages. `[-10:-1]` excludes the latest message and returns up to 9 messages.
+
+`max_total` counts the compact UTF-8 JSON text returned by `history_search`. JSON-RPC and MCP transport framing are not
+included. The response reports `serialized_bytes`, `max_total_bytes`, `limits_applied`, and `complete`. Exported JSONL
+content is not reduced by this conversation-response budget. `next_query` and export manifests retain
+`max_content_tool_result`.
 
 ### history_get
 
@@ -163,7 +177,9 @@ Large direct responses return `content_too_large` with `content_size`, `valid_ra
 | `case_sensitive` | boolean | false   | Case-sensitive pattern matching                                       |
 
 **Note**: The anchor message (specified by `ref`) is always included regardless of `types` or `pattern` filters. When
-`pattern` is set, `before`/`after` counts only messages that match the pattern.
+`pattern` is set, `before`/`after` counts only messages that match the pattern. Valid JSONL session metadata records are
+ignored without parse warnings; malformed JSON and incomplete message records still produce warnings. `history_trace`
+uses the same record handling.
 
 ### history_trace
 
@@ -189,6 +205,15 @@ Large direct responses return `content_too_large` with `content_size`, `valid_ra
 | `max_total`      | number  | 40000   | Max total chars across messages                               |
 
 `history_trace` returns the raw nearby messages plus detected tool calls and matching tool results in `tool_calls`.
+A result with `tool_use_id` only matches that exact call. Results without an ID use a matching assistant parent UUID, or
+the single pending call as a legacy fallback. Each call reports `match_method`; unmatched and ambiguous results appear in
+the bounded `association_issues` list.
+
+### history_build_info
+
+Returns the running binary's package version, commit, target, profile, UTC build timestamp, dirty state, and whether the
+identity is reproducible. A dirty local build is never marked reproducible. The CLI equivalent is
+`mcp-claude-history build-info`.
 
 ## Usage Examples
 

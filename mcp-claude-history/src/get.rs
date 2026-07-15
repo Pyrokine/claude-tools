@@ -34,7 +34,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     // 读取指定行
     let file = File::open(&path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法打开文件: {}", e),
+        message: format!("无法打开文件: {e}"),
         available: None,
     })?;
 
@@ -45,7 +45,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
         if line_num + 1 == parsed_ref.line {
             target_line = Some(line.map_err(|e| ErrorResponse {
                 error: "io_error".to_string(),
-                message: format!("读取行失败: {}", e),
+                message: format!("读取行失败: {e}"),
                 available: None,
             })?);
             break;
@@ -61,7 +61,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     // 解析消息
     let record: MessageRecord = serde_json::from_str(&line).map_err(|e| ErrorResponse {
         error: "parse_error".to_string(),
-        message: format!("解析消息失败: {}", e),
+        message: format!("解析消息失败: {e}"),
         available: None,
     })?;
 
@@ -115,10 +115,9 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
             size: selected_content_size,
             content_size: selected_content_size,
             valid_range: valid_range_label(original_content_size),
-            suggestion: format!("使用 --output 导出到文件，或用 --range 0-{} 分块获取", MAX_DIRECT_SIZE),
+            suggestion: format!("使用 --output 导出到文件，或用 --range 0-{MAX_DIRECT_SIZE} 分块获取"),
             truncation_reason: format!(
-                "content_size {} exceeds max direct response {}",
-                selected_content_size, MAX_DIRECT_SIZE
+                "content_size {selected_content_size} exceeds max direct response {MAX_DIRECT_SIZE}"
             ),
             output_suggestion: "使用 output=tmp:export 导出到受控临时目录，或 output=cwd:export 持久化到当前工作目录"
                 .to_string(),
@@ -188,7 +187,7 @@ pub fn find_session_file(
         if !dir.exists() {
             return Err(ErrorResponse {
                 error: "project_not_found".to_string(),
-                message: format!("项目不存在: {}", normalized),
+                message: format!("项目不存在: {normalized}"),
                 available: None,
             });
         }
@@ -223,11 +222,11 @@ pub fn find_session_file(
     if matches.len() > 1 {
         return Err(ErrorResponse {
             error: "session_ambiguous".to_string(),
-            message: format!("session prefix 不唯一: {}，请传 project 或完整 ref", session_prefix),
+            message: format!("session prefix 不唯一: {session_prefix}，请传 project 或完整 ref"),
             available: Some(serde_json::json!({
                 "candidates": matches
                     .iter()
-                    .map(|(project, session, _)| format!("{}:{}", project, session))
+                    .map(|(project, session, _)| format!("{project}:{session}"))
                     .collect::<Vec<_>>()
             })),
         });
@@ -235,7 +234,7 @@ pub fn find_session_file(
 
     Err(ErrorResponse {
         error: "session_not_found".to_string(),
-        message: format!("找不到 session: {}", session_prefix),
+        message: format!("找不到 session: {session_prefix}"),
         available: None,
     })
 }
@@ -373,7 +372,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
     let was_new = !output_dir.exists();
     fs::create_dir_all(&output_dir).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法创建输出目录: {}", e),
+        message: format!("无法创建输出目录: {e}"),
         available: None,
     })?;
     if was_new {
@@ -383,7 +382,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
     let mut file = open_private_output_file(&content_path)?;
     file.write_all(request.content.as_bytes()).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("写入文件失败: {}", e),
+        message: format!("写入文件失败: {e}"),
         available: None,
     })?;
 
@@ -437,7 +436,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
         .map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("写入 manifest 失败: {}", e),
+            message: format!("写入 manifest 失败: {e}"),
             available: None,
         })?;
 
@@ -477,12 +476,12 @@ pub fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
 
     let cwd_root = fs::canonicalize(env::current_dir().map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法获取当前工作目录: {}", e),
+        message: format!("无法获取当前工作目录: {e}"),
         available: None,
     })?)
     .map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("canonicalize cwd 失败: {}", e),
+        message: format!("canonicalize cwd 失败: {e}"),
         available: None,
     })?;
 
@@ -507,13 +506,13 @@ fn controlled_temp_root() -> Result<PathBuf, ErrorResponse> {
     let root = env::temp_dir().join("claude-tools").join("mcp-claude-history");
     fs::create_dir_all(&root).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法创建临时目录: {}", e),
+        message: format!("无法创建临时目录: {e}"),
         available: None,
     })?;
     set_private_permissions(&root, 0o700)?;
     fs::canonicalize(&root).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("canonicalize 临时目录失败: {}", e),
+        message: format!("canonicalize 临时目录失败: {e}"),
         available: None,
     })
 }
@@ -522,7 +521,7 @@ fn resolve_relative_output_dir(relative: &str, root: &Path, prefix: &str) -> Res
     if relative.is_empty() {
         return Err(ErrorResponse {
             error: "invalid_output_dir".to_string(),
-            message: format!("{} 后面必须跟相对路径", prefix),
+            message: format!("{prefix} 后面必须跟相对路径"),
             available: None,
         });
     }
@@ -531,14 +530,14 @@ fn resolve_relative_output_dir(relative: &str, root: &Path, prefix: &str) -> Res
     if relative_path.is_absolute() {
         return Err(ErrorResponse {
             error: "invalid_output_dir".to_string(),
-            message: format!("{} 只接受相对路径", prefix),
+            message: format!("{prefix} 只接受相对路径"),
             available: None,
         });
     }
     if relative_path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(ErrorResponse {
             error: "invalid_output_dir".to_string(),
-            message: format!("{} 路径不允许包含 `..` 组件", prefix),
+            message: format!("{prefix} 路径不允许包含 `..` 组件"),
             available: None,
         });
     }
@@ -546,7 +545,7 @@ fn resolve_relative_output_dir(relative: &str, root: &Path, prefix: &str) -> Res
     let candidate = root.join(relative_path);
     let canonical_target = canonicalize_or_ancestor(&candidate).map_err(|e| ErrorResponse {
         error: "invalid_output_dir".to_string(),
-        message: format!("canonicalize 输出路径失败: {}", e),
+        message: format!("canonicalize 输出路径失败: {e}"),
         available: None,
     })?;
 
@@ -557,7 +556,7 @@ fn resolve_relative_output_dir(relative: &str, root: &Path, prefix: &str) -> Res
 fn resolve_absolute_output_dir(absolute: &Path, cwd_root: &Path, temp_root: &Path) -> Result<PathBuf, ErrorResponse> {
     let canonical_target = canonicalize_or_ancestor(absolute).map_err(|e| ErrorResponse {
         error: "invalid_output_dir".to_string(),
-        message: format!("canonicalize 输出路径失败: {}", e),
+        message: format!("canonicalize 输出路径失败: {e}"),
         available: None,
     })?;
 

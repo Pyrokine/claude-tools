@@ -15,15 +15,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            platform: linux-x86_64
             artifact: mcp-claude-history
           - os: macos-latest
             target: x86_64-apple-darwin
+            platform: macos-x86_64
             artifact: mcp-claude-history
           - os: macos-latest
             target: aarch64-apple-darwin
+            platform: macos-aarch64
             artifact: mcp-claude-history
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
             artifact: mcp-claude-history.exe
 
     runs-on: ${{ matrix.os }}
@@ -40,6 +44,14 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Set build identity
+        shell: bash
+        run: |
+          echo "MCP_HISTORY_BUILD_COMMIT=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          commit_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          echo "MCP_HISTORY_BUILD_TIMESTAMP=$(date -u -d "@$commit_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$commit_epoch" +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "MCP_HISTORY_BUILD_DIRTY=false" >> "$GITHUB_ENV"
+
       - name: Build
         working-directory: mcp-claude-history
         run: cargo build --release --target ${{ matrix.target }}
@@ -52,15 +64,19 @@ jobs:
           cd dist
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
             7z a ../mcp-claude-history-${{ matrix.target }}.zip ${{ matrix.artifact }}
+            cp ../mcp-claude-history-${{ matrix.target }}.zip ../mcp-claude-history-${{ matrix.platform }}.zip
           else
             tar czf ../mcp-claude-history-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+            cp ../mcp-claude-history-${{ matrix.target }}.tar.gz ../mcp-claude-history-${{ matrix.platform }}.tar.gz
           fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mcp-claude-history-${{ matrix.target }}
-          path: mcp-claude-history-${{ matrix.target }}.*
+          path: |
+            mcp-claude-history-${{ matrix.target }}.*
+            mcp-claude-history-${{ matrix.platform }}.*
 
   release:
     needs: build

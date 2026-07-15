@@ -16,14 +16,26 @@ use crate::config::Config;
 use crate::context::{ContextParams, context};
 use crate::get::{GetParams, get};
 use crate::projects::list_projects;
-use crate::search::{SearchParams, search};
+use crate::search::{DEFAULT_MAX_CONTENT, DEFAULT_MAX_CONTENT_TOOL_RESULT, DEFAULT_MAX_TOTAL, SearchParams, search};
 use crate::sessions::list_sessions;
 use crate::trace::{TraceParams, trace};
-use crate::types::ErrorResponse;
+use crate::types::{BuildIdentity, ErrorResponse};
 use crate::utils::{
     parse_optional_line_ranges_param, parse_optional_message_slice_param, parse_optional_range_param,
     parse_optional_redaction_mode_param, parse_optional_time_param, split_csv_param,
 };
+
+fn default_max_content_schema() -> Option<usize> {
+    Some(DEFAULT_MAX_CONTENT)
+}
+
+fn default_max_content_tool_result_schema() -> Option<usize> {
+    Some(DEFAULT_MAX_CONTENT_TOOL_RESULT)
+}
+
+fn default_max_total_schema() -> Option<usize> {
+    Some(DEFAULT_MAX_TOTAL)
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchToolParams {
@@ -83,8 +95,25 @@ pub struct SearchToolParams {
     #[serde(default)]
     pub slice: Option<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Regular result preview limit in characters; independent from max_content_tool_result",
+        default = "default_max_content_schema",
+        range(min = 1, max = 1000000)
+    )]
     pub max_content: Option<usize>,
     #[serde(default)]
+    #[schemars(
+        description = "Tool-result preview limit in characters; independent from max_content",
+        default = "default_max_content_tool_result_schema",
+        range(min = 1, max = 1000000)
+    )]
+    pub max_content_tool_result: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Maximum compact SearchResponse JSON payload in UTF-8 bytes; excludes JSON-RPC framing",
+        default = "default_max_total_schema",
+        range(min = 512, max = 10000000)
+    )]
     pub max_total: Option<usize>,
     #[serde(default)]
     pub subagents: Option<bool>,
@@ -216,6 +245,13 @@ fn tool_text_result(result: Result<impl serde::Serialize, ErrorResponse>) -> Res
     }
 }
 
+fn compact_tool_text_result(result: Result<impl serde::Serialize, ErrorResponse>) -> Result<CallToolResult, McpError> {
+    match result {
+        Ok(value) => ok_text(serde_json::to_string(&value).unwrap_or_default()),
+        Err(error) => error_text(pretty_error(error)),
+    }
+}
+
 impl McpHistoryService {
     pub fn new() -> Self {
         Self {
@@ -276,9 +312,9 @@ impl McpHistoryService {
             offset: p.offset.unwrap_or(0),
             limit: p.limit,
             slice,
-            max_content: p.max_content.unwrap_or(4000),
-            max_content_tool_result: 500,
-            max_total: p.max_total.unwrap_or(40000),
+            max_content: p.max_content.unwrap_or(DEFAULT_MAX_CONTENT),
+            max_content_tool_result: p.max_content_tool_result.unwrap_or(DEFAULT_MAX_CONTENT_TOOL_RESULT),
+            max_total: p.max_total.unwrap_or(DEFAULT_MAX_TOTAL),
             summary: p.summary.unwrap_or(false),
             aggregate: p.aggregate.unwrap_or(false),
             failed_tool_results: p.failed_tool_results.unwrap_or(false) || p.failed_tools_only.unwrap_or(false),
@@ -293,8 +329,8 @@ impl McpHistoryService {
         };
         let result = tokio::task::spawn_blocking(move || search(&cfg, params))
             .await
-            .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
-        tool_text_result(result)
+            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
+        compact_tool_text_result(result)
     }
 
     #[tool(description = "Get full content of a message by ref")]
@@ -317,7 +353,7 @@ impl McpHistoryService {
         };
         let result = tokio::task::spawn_blocking(move || get(&cfg, params))
             .await
-            .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
+            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         tool_text_result(result)
     }
 
@@ -350,7 +386,7 @@ impl McpHistoryService {
         };
         let result = tokio::task::spawn_blocking(move || context(&cfg, params))
             .await
-            .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
+            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         tool_text_result(result)
     }
 
@@ -383,8 +419,13 @@ impl McpHistoryService {
         };
         let result = tokio::task::spawn_blocking(move || trace(&cfg, params))
             .await
-            .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
+            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         tool_text_result(result)
+    }
+
+    #[tool(description = "Get the running server build identity")]
+    async fn history_build_info(&self, _: Parameters<ProjectsToolParams>) -> Result<CallToolResult, McpError> {
+        tool_text_result(Ok::<_, ErrorResponse>(BuildIdentity::current()))
     }
 
     #[tool(description = "List all projects with conversation history")]
@@ -392,7 +433,7 @@ impl McpHistoryService {
         let cfg = self.config.clone();
         let result = tokio::task::spawn_blocking(move || list_projects(&cfg))
             .await
-            .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
+            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         tool_text_result(result)
     }
 
@@ -405,7 +446,7 @@ impl McpHistoryService {
         let project = p.project.clone();
         let result = tokio::task::spawn_blocking(move || list_sessions(&cfg, project.as_deref()))
             .await
-            .map_err(|e| McpError::internal_error(format!("join error: {}", e), None))?;
+            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         tool_text_result(result)
     }
 }

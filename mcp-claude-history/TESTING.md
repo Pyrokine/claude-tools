@@ -108,7 +108,19 @@
 
 **步骤**：`history_search(pattern="...", max_content=200, max_total=2000)`
 
-**预期**：每条 preview 不超 200 字符；总返回不超 2000 字符
+**预期**：普通消息 preview 不超 200 字符；紧凑 JSON 的实际 UTF-8 字节数不超过 2000；`serialized_bytes` 与实际序列化长度一致；返回 `max_total_bytes`、`limits_applied` 和 `complete`
+
+### search-11a: tool result 独立上限
+
+**步骤**：`history_search(pattern="", subtypes="tool_result", max_content=2000, max_content_tool_result=100, limit=5)`
+
+**预期**：tool result preview 不超 100 字符；普通消息仍使用 `max_content=2000`；`next_query` 保留 `max_content_tool_result=100`
+
+### search-11b: escaping 与首条超限
+
+**步骤**：使用含大量引号、反斜杠、中文、tool input/result 和 image metadata 的 fixture，调用 `max_total=50000`
+
+**预期**：最终紧凑 JSON 不超过 50000 字节；首条结果单独超限时返回有界 preview 和 ref，或结构化 `response_too_large`；不返回完整大正文
 
 ### search-12: pattern 为空+all=true
 
@@ -265,6 +277,12 @@
 **预期**：`.txt` 按文件路径处理；manifest 写在同目录；manifest 含 `schema="mcp-claude-history.context-output.v1"`、
 `redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`
 
+### context-09: 合法非消息 JSONL record
+
+**步骤**：使用受控 session fixture，依次写入合法 session metadata、损坏 JSON、缺少 `message` 的不完整消息 record 和正常锚点消息，再调用 `history_context`
+
+**预期**：合法 metadata 被忽略且不计入解析警告；损坏 JSON 和不完整消息各计入 1 行解析警告；锚点消息正常返回
+
 ---
 
 ## 6. trace（追踪 tool 调用）
@@ -295,16 +313,50 @@
 
 **预期**：返回 `truncated=true`，且不影响 `tool_calls` 识别
 
-### trace-05: redaction=strict 和显式文本文件路径
+### trace-05: 严格关联
+
+**步骤**：使用截断窗口 fixture，其中窗口内有两个 pending call、一个显式错误 `tool_use_id` result、一个正确 ID result，以及一个无 ID result
+
+**预期**：错误 ID result 不消费 pending call；正确 ID result 使用 `match_method="tool_use_id"`；多个 pending 且无 ID 时进入 `association_issues` 并标记 `ambiguous`；只有一个 pending 时才使用 `legacy_single_pending`
+
+### trace-06: parent UUID 关联
+
+**步骤**：result 不含 `tool_use_id`，但 `sourceToolAssistantUUID` 或 `parentUuid` 指向包含 tool use 的 assistant 消息
+
+**预期**：对应 call 返回 `match_method="parent"`
+
+### trace-07: redaction=strict 和显式文本文件路径
 
 **步骤**：`history_trace(ref="<ref>", before=2, after=2, redaction="strict", output="tmp:mcp-history-test/trace.txt")`
 
 **预期**：`.txt` 按文件路径处理；manifest 写在同目录；manifest 含 `schema="mcp-claude-history.trace-output.v1"`、
 `redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`；`tool_calls.result_preview` 不包含原始敏感值
 
+### trace-08: 合法非消息 JSONL record
+
+**步骤**：使用受控 session fixture，依次写入合法 session metadata、损坏 JSON、缺少 `message` 的不完整消息 record 和正常锚点消息，再调用 `history_trace`
+
+**预期**：合法 metadata 被忽略且不计入解析警告；损坏 JSON 和不完整消息各计入 1 行解析警告；锚点消息和 tool trace 正常返回
+
 ---
 
-## 7. 安全 / 输入校验
+## 7. build identity
+
+### build-01
+
+**步骤**：调用 `history_build_info()`，并运行 `mcp-claude-history build-info`
+
+**预期**：两者返回相同的 package version、commit、target、profile、UTC build timestamp 和 dirty 状态；release binary 的 commit 与发布 commit 一致且 `dirty=false`、`reproducible=true`；本地 dirty 构建不得返回 `reproducible=true`
+
+### build-02
+
+**步骤**：检查 GitHub Release 资产
+
+**预期**：每个平台同时存在稳定平台名和原 target triple 名，两个压缩包内容一致
+
+---
+
+## 8. 安全 / 输入校验
 
 ### project-id-01: 路径注入拦截（C.4 验证）
 
@@ -319,7 +371,7 @@
 
 ---
 
-## 8. 边界条件
+## 9. 边界条件
 
 ### empty-jsonl-01
 

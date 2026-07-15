@@ -19,7 +19,7 @@ use projects::list_projects;
 use search::{SearchParams, search};
 use sessions::list_sessions;
 use trace::{TraceParams, trace};
-use types::ErrorResponse;
+use types::{BuildIdentity, ErrorResponse};
 use utils::{
     parse_optional_line_ranges_param, parse_optional_message_slice_param, parse_optional_range_param,
     parse_optional_redaction_mode_param, parse_optional_time_param, split_csv_param,
@@ -157,12 +157,16 @@ enum Commands {
         #[arg(long)]
         slice: Option<String>,
 
-        /// Max chars per result
-        #[arg(long, default_value = "4000")]
+        /// Max chars per regular result
+        #[arg(long, default_value_t = search::DEFAULT_MAX_CONTENT)]
         max_content: usize,
 
-        /// Max total chars
-        #[arg(long, default_value = "40000")]
+        /// Max chars per tool_result preview
+        #[arg(long, default_value_t = search::DEFAULT_MAX_CONTENT_TOOL_RESULT)]
+        max_content_tool_result: usize,
+
+        /// Max compact response JSON bytes
+        #[arg(long, default_value_t = search::DEFAULT_MAX_TOTAL)]
         max_total: usize,
     },
 
@@ -331,6 +335,9 @@ enum Commands {
         redaction: Option<String>,
     },
 
+    /// Show the running binary build identity
+    BuildInfo,
+
     /// List all projects
     Projects,
 
@@ -389,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
             slice,
             max_content,
+            max_content_tool_result,
             max_total,
         } => {
             let parsed: Result<SearchParams, ErrorResponse> = (|| {
@@ -410,7 +418,7 @@ async fn main() -> anyhow::Result<()> {
                     limit,
                     slice: parse_optional_message_slice_param(slice.as_deref())?,
                     max_content,
-                    max_content_tool_result: 500,
+                    max_content_tool_result,
                     max_total,
                     summary,
                     aggregate,
@@ -544,6 +552,8 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => serialize_result::<serde_json::Value, _>(Err(e)),
         },
 
+        Commands::BuildInfo => serialize_result::<_, ErrorResponse>(Ok(BuildIdentity::current())),
+
         Commands::Projects => serialize_result(list_projects(&config)),
 
         Commands::Sessions { project } => serialize_result(list_sessions(&config, project.as_deref())),
@@ -551,11 +561,11 @@ async fn main() -> anyhow::Result<()> {
 
     match result {
         Ok(output) => {
-            println!("{}", output);
+            println!("{output}");
             Ok(())
         }
         Err(output) => {
-            eprintln!("{}", output);
+            eprintln!("{output}");
             std::process::exit(1);
         }
     }

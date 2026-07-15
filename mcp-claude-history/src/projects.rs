@@ -7,7 +7,7 @@ use std::fs;
 pub fn list_projects(config: &Config) -> Result<ProjectsResponse, ErrorResponse> {
     let entries = fs::read_dir(&config.projects_dir).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法读取项目目录: {}", e),
+        message: format!("无法读取项目目录: {e}"),
         available: None,
     })?;
 

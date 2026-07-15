@@ -34,7 +34,7 @@ pub fn parse_redaction_mode_param(value: &str) -> Result<RedactionMode, String> 
         "" | "auto" => Ok(RedactionMode::Auto),
         "off" | "none" | "raw" => Ok(RedactionMode::Off),
         "strict" => Ok(RedactionMode::Strict),
-        other => Err(format!("redaction 仅支持 auto、off、strict，收到 {}", other)),
+        other => Err(format!("redaction 仅支持 auto、off、strict，收到 {other}")),
     }
 }
 
@@ -55,7 +55,7 @@ pub struct MessageExportFilters<'a> {
 fn export_io_error(error: std::io::Error) -> ErrorResponse {
     ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("写文件失败: {}", error),
+        message: format!("写文件失败: {error}"),
         available: None,
     }
 }
@@ -64,7 +64,7 @@ fn export_io_error(error: std::io::Error) -> ErrorResponse {
 pub fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorResponse> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法设置输出路径权限: {}", e),
+        message: format!("无法设置输出路径权限: {e}"),
         available: None,
     })
 }
@@ -99,14 +99,14 @@ pub fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
     }
     let file = options.open(path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法创建输出文件: {}", e),
+        message: format!("无法创建输出文件: {e}"),
         available: None,
     })?;
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("无法设置输出文件权限: {}", e),
+            message: format!("无法设置输出文件权限: {e}"),
             available: None,
         })?;
     #[cfg(not(unix))]
@@ -114,13 +114,24 @@ pub fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
     Ok(file)
 }
 
+pub fn parse_message_record(line: &str) -> Result<Option<MessageRecord>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    let Some(object) = value.as_object() else {
+        return serde_json::from_value(value).map(Some);
+    };
+    if !object.contains_key("uuid") && !object.contains_key("message") {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some)
+}
+
 pub fn jsonl_read_warnings(read_errors: usize, parse_errors: usize) -> Vec<String> {
     let mut warnings = Vec::new();
     if read_errors > 0 {
-        warnings.push(format!("读取 JSONL 时跳过 {} 行或文件", read_errors));
+        warnings.push(format!("读取 JSONL 时跳过 {read_errors} 行或文件"));
     }
     if parse_errors > 0 {
-        warnings.push(format!("解析 JSONL 时跳过 {} 行", parse_errors));
+        warnings.push(format!("解析 JSONL 时跳过 {parse_errors} 行"));
     }
     warnings
 }
@@ -180,7 +191,7 @@ pub fn build_content_filter(
                     .build()
                     .map_err(|e| ErrorResponse {
                         error: "invalid_regex".to_string(),
-                        message: format!("无效的正则表达式: {}", e),
+                        message: format!("无效的正则表达式: {e}"),
                         available: None,
                     })?,
             )
@@ -434,7 +445,7 @@ pub fn replace_images_with_placeholders_with_mode(record: &MessageRecord, mode: 
                         .map(|d| d.len())
                         .unwrap_or(0);
                     let size_mb = size as f64 / 1024.0 / 1024.0;
-                    result.push(format!("[IMAGE:{} size={:.1}MB]", idx, size_mb));
+                    result.push(format!("[IMAGE:{idx} size={size_mb:.1}MB]"));
                 }
             }
             "tool_use" => {
@@ -443,7 +454,7 @@ pub fn replace_images_with_placeholders_with_mode(record: &MessageRecord, mode: 
                     .get("input")
                     .map(|i| value_preview(i, 200, mode))
                     .unwrap_or_default();
-                result.push(format!("[TOOL_USE:{}({})]", name, input_preview));
+                result.push(format!("[TOOL_USE:{name}({input_preview})]"));
             }
             "tool_result" => {
                 result.extend(extract_tool_result_texts(item));
@@ -487,7 +498,7 @@ pub fn extract_and_replace_images_with_mode(record: &MessageRecord, mode: Redact
                         .map(|d| d.len())
                         .unwrap_or(0);
                     let size_mb = size as f64 / 1024.0 / 1024.0;
-                    text_parts.push(format!("[IMAGE:{} size={:.1}MB]", idx, size_mb));
+                    text_parts.push(format!("[IMAGE:{idx} size={size_mb:.1}MB]"));
                     images.push(ImageInfo { index: idx, size });
                 }
             }
@@ -497,7 +508,7 @@ pub fn extract_and_replace_images_with_mode(record: &MessageRecord, mode: Redact
                     .get("input")
                     .map(|i| value_preview(i, 200, mode))
                     .unwrap_or_default();
-                text_parts.push(format!("[TOOL_USE:{}({})]", name, input_preview));
+                text_parts.push(format!("[TOOL_USE:{name}({input_preview})]"));
             }
             "tool_result" => {
                 text_parts.extend(extract_tool_result_texts(item));
@@ -519,7 +530,7 @@ fn nth_byte_or_end(s: &str, n: usize) -> usize {
 }
 
 pub fn parse_time_param(s: &str, name: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    parse_time(s).ok_or_else(|| format!("{} 必须是 RFC3339 或 YYYY-MM-DD 格式", name))
+    parse_time(s).ok_or_else(|| format!("{name} 必须是 RFC3339 或 YYYY-MM-DD 格式"))
 }
 
 pub fn parse_range_param(s: &str) -> Result<(usize, usize), String> {
@@ -527,7 +538,7 @@ pub fn parse_range_param(s: &str) -> Result<(usize, usize), String> {
         return Err("range 必须是 start-end 格式，例如 0-100000".to_string());
     };
     if start > end {
-        return Err(format!("range start({}) 大于 end({})", start, end));
+        return Err(format!("range start({start}) 大于 end({end})"));
     }
     Ok((start, end))
 }
@@ -570,7 +581,7 @@ pub fn parse_message_slice_param(s: &str) -> Result<MessageSlice, String> {
         value
             .parse::<isize>()
             .map(Some)
-            .map_err(|_| format!("slice {} 不是有效整数: {}", name, value))
+            .map_err(|_| format!("slice {name} 不是有效整数: {value}"))
     };
 
     Ok(MessageSlice {
@@ -602,7 +613,7 @@ pub fn parse_line_ranges_param(s: &str) -> Result<Vec<Range>, String> {
         let exclude = raw.starts_with('!');
         let value = if exclude { &raw[1..] } else { raw };
         if value.is_empty() {
-            return Err(format!("无效的 lines 片段: {}", raw));
+            return Err(format!("无效的 lines 片段: {raw}"));
         }
         if value.contains('-') {
             let pieces: Vec<&str> = value.splitn(2, '-').collect();
@@ -612,7 +623,7 @@ pub fn parse_line_ranges_param(s: &str) -> Result<Vec<Range>, String> {
                 Some(
                     pieces[0]
                         .parse::<usize>()
-                        .map_err(|_| format!("无效的 lines 起点: {}", raw))?,
+                        .map_err(|_| format!("无效的 lines 起点: {raw}"))?,
                 )
             };
             let end = if pieces.len() < 2 || pieces[1].is_empty() {
@@ -621,19 +632,19 @@ pub fn parse_line_ranges_param(s: &str) -> Result<Vec<Range>, String> {
                 Some(
                     pieces[1]
                         .parse::<usize>()
-                        .map_err(|_| format!("无效的 lines 终点: {}", raw))?,
+                        .map_err(|_| format!("无效的 lines 终点: {raw}"))?,
                 )
             };
             if let (Some(start), Some(end)) = (start, end)
                 && start > end
             {
-                return Err(format!("lines 起点大于终点: {}", raw));
+                return Err(format!("lines 起点大于终点: {raw}"));
             }
             ranges.push(Range { start, end, exclude });
         } else {
             let line = value
                 .parse::<usize>()
-                .map_err(|_| format!("无效的 lines 行号: {}", raw))?;
+                .map_err(|_| format!("无效的 lines 行号: {raw}"))?;
             ranges.push(Range {
                 start: Some(line),
                 end: Some(line),
@@ -739,7 +750,7 @@ pub fn truncate_around_match(content: &str, match_pos: Option<usize>, max_len: u
     let mut result = content[start_byte..end_byte].to_string();
 
     if start > 0 {
-        result = format!("...{}", result);
+        result = format!("...{result}");
     }
     if end < char_count {
         result.push_str("...");

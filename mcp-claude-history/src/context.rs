@@ -77,7 +77,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     // 读取文件
     let file = File::open(&path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法打开文件: {}", e),
+        message: format!("无法打开文件: {e}"),
         available: None,
     })?;
 
@@ -100,8 +100,9 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             }
         };
 
-        let record: MessageRecord = match serde_json::from_str(&line) {
-            Ok(r) => r,
+        let record = match parse_message_record(&line) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
             Err(_) => {
                 parse_errors += 1;
                 continue;
@@ -158,13 +159,13 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         // until_ref 模式：从 anchor 到另一个 ref 的行（含）
         let end_parsed = ParsedRef::parse(end_ref_str).ok_or_else(|| ErrorResponse {
             error: "ref_invalid".to_string(),
-            message: format!("until_ref 格式无效: {}", end_ref_str),
+            message: format!("until_ref 格式无效: {end_ref_str}"),
             available: None,
         })?;
         if !session_id.starts_with(&end_parsed.session_prefix) {
             return Err(ErrorResponse {
                 error: "ref_invalid".to_string(),
-                message: format!("until_ref 不属于当前 session: {}", end_ref_str),
+                message: format!("until_ref 不属于当前 session: {end_ref_str}"),
                 available: Some(serde_json::json!({ "session": session_id })),
             });
         }
@@ -174,7 +175,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             .position(|m| m.line_num == end_line)
             .ok_or_else(|| ErrorResponse {
                 error: "ref_not_found".to_string(),
-                message: format!("until_ref 不存在: {}", end_ref_str),
+                message: format!("until_ref 不存在: {end_ref_str}"),
                 available: None,
             })?;
         if end_pos <= anchor_idx {
@@ -281,8 +282,8 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         let safe_ref = params.r#ref.replace([':', '/'], "_");
         let output = resolve_output_files(
             &output_dir_raw,
-            &format!("{}_context.txt", safe_ref),
-            &format!("{}_context_manifest.json", safe_ref),
+            &format!("{safe_ref}_context.txt"),
+            &format!("{safe_ref}_context_manifest.json"),
         )?;
         let output_dir = output.directory;
         let out_path = output.content;
@@ -290,7 +291,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         let was_new = !output_dir.exists();
         fs::create_dir_all(&output_dir).map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("无法创建输出目录: {}", e),
+            message: format!("无法创建输出目录: {e}"),
             available: None,
         })?;
         if was_new {
@@ -326,7 +327,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         )?;
         file.flush().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("刷新 context 输出失败: {}", e),
+            message: format!("刷新 context 输出失败: {e}"),
             available: None,
         })?;
         let bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
@@ -350,7 +351,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
             .map_err(|e| ErrorResponse {
                 error: "io_error".to_string(),
-                message: format!("写入 context manifest 失败: {}", e),
+                message: format!("写入 context manifest 失败: {e}"),
                 available: None,
             })?;
         return Ok(ContextResponse {
@@ -374,4 +375,57 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     }
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::process;
+
+    #[test]
+    fn legal_non_message_records_do_not_count_as_parse_errors() {
+        let tmp = env::temp_dir().join(format!("mcp-context-record-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut file = File::create(project_dir.join("session-context.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type": "custom-title", "customTitle": "fixture"})
+        )
+        .unwrap();
+        writeln!(file, "{{").unwrap();
+        writeln!(file, "{}", serde_json::json!({"uuid": "incomplete"})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "assistant-1",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": [{"type": "text", "text": "anchor"}]}
+            })
+        )
+        .unwrap();
+
+        let response = context(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            ContextParams {
+                r#ref: "session-:4".to_string(),
+                before: Some(0),
+                after: Some(0),
+                project: Some("project".to_string()),
+                ..ContextParams::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.messages.len(), 1);
+        assert_eq!(response.warnings, ["解析 JSONL 时跳过 2 行"]);
+        fs::remove_dir_all(&tmp).ok();
+    }
 }

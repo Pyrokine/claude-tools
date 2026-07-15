@@ -22,9 +22,9 @@ MCP tools for Claude Code / Claude Code MCP 工具集
 
 ## Installation / 安装
 
-TypeScript MCP servers require Node.js 20.19 or newer. Rust history server requires Rust 1.85 or the prebuilt release binary.
+TypeScript MCP servers require Node.js 20.19 or newer. Rust history server requires Rust 1.88 or the prebuilt release binary.
 
-TypeScript MCP Server 需要 Node.js 20.19 或更新版本。Rust history server 需要 Rust 1.85，或直接使用 Release 里的预编译二进制。
+TypeScript MCP Server 需要 Node.js 20.19 或更新版本。Rust history server 需要 Rust 1.88，或直接使用 Release 里的预编译二进制。
 
 ### mcp-ssh
 

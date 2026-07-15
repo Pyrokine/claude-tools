@@ -17,6 +17,10 @@ pub struct MessageRecord {
     /// CLI 命令产生的 meta 消息
     #[serde(default)]
     pub is_meta: bool,
+    #[serde(default, rename = "parentUuid")]
+    pub parent_uuid: Option<String>,
+    #[serde(default, rename = "sourceToolAssistantUUID", alias = "sourceToolAssistantUuid")]
+    pub source_tool_assistant_uuid: Option<String>,
 }
 
 /// 搜索结果中的单条消息
@@ -40,6 +44,8 @@ pub struct SearchResult {
     pub server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_incomplete_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_input_redacted: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,6 +160,11 @@ pub struct SearchResponse {
     pub output: Option<SearchOutputInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    pub serialized_bytes: usize,
+    pub max_total_bytes: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub limits_applied: Vec<String>,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -287,6 +298,8 @@ pub struct TraceResponse {
     pub session: String,
     pub messages: Vec<TraceMessage>,
     pub tool_calls: Vec<TraceToolCall>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub association_issues: Vec<TraceAssociationIssue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -316,10 +329,48 @@ pub struct TraceToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     pub status: String,
+    pub match_method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceAssociationIssue {
+    pub result_ref: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    pub pending_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildIdentity {
+    pub package_version: String,
+    pub commit: String,
+    pub target: String,
+    pub profile: String,
+    pub build_timestamp_utc: String,
+    pub dirty: bool,
+    pub reproducible: bool,
+}
+
+impl BuildIdentity {
+    pub fn current() -> Self {
+        let commit = env!("MCP_HISTORY_BUILD_COMMIT").to_string();
+        let build_timestamp_utc = env!("MCP_HISTORY_BUILD_TIMESTAMP").to_string();
+        let dirty = env!("MCP_HISTORY_BUILD_DIRTY") == "true";
+        Self {
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            target: env!("MCP_HISTORY_BUILD_TARGET").to_string(),
+            profile: env!("MCP_HISTORY_BUILD_PROFILE").to_string(),
+            reproducible: commit != "unknown" && build_timestamp_utc != "unknown" && !dirty,
+            commit,
+            build_timestamp_utc,
+            dirty,
+        }
+    }
 }
 
 /// 项目信息

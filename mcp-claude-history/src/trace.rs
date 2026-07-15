@@ -42,12 +42,15 @@ struct TraceRecord {
 
 struct ToolUseRef {
     id: Option<String>,
+    assistant_uuid: String,
     server: Option<String>,
     tool: Option<String>,
 }
 
 struct ToolResultRef {
     id: Option<String>,
+    source_tool_assistant_uuid: Option<String>,
+    parent_uuid: Option<String>,
     preview: String,
 }
 
@@ -64,7 +67,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
     let file = File::open(&path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("无法打开文件: {}", e),
+        message: format!("无法打开文件: {e}"),
         available: None,
     })?;
 
@@ -83,8 +86,9 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
                 continue;
             }
         };
-        let record: MessageRecord = match serde_json::from_str(&line) {
-            Ok(r) => r,
+        let record = match parse_message_record(&line) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
             Err(_) => {
                 parse_errors += 1;
                 continue;
@@ -138,13 +142,13 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
     } else if let Some(ref end_ref_str) = params.until_ref {
         let end_parsed = ParsedRef::parse(end_ref_str).ok_or_else(|| ErrorResponse {
             error: "ref_invalid".to_string(),
-            message: format!("until_ref 格式无效: {}", end_ref_str),
+            message: format!("until_ref 格式无效: {end_ref_str}"),
             available: None,
         })?;
         if !session_id.starts_with(&end_parsed.session_prefix) {
             return Err(ErrorResponse {
                 error: "ref_invalid".to_string(),
-                message: format!("until_ref 不属于当前 session: {}", end_ref_str),
+                message: format!("until_ref 不属于当前 session: {end_ref_str}"),
                 available: Some(serde_json::json!({ "session": session_id })),
             });
         }
@@ -154,7 +158,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             .position(|m| m.line_num == end_line)
             .ok_or_else(|| ErrorResponse {
                 error: "ref_not_found".to_string(),
-                message: format!("until_ref 不存在: {}", end_ref_str),
+                message: format!("until_ref 不存在: {end_ref_str}"),
                 available: None,
             })?;
         if end_pos <= anchor_idx {
@@ -235,7 +239,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         }
     }
 
-    let mut tool_calls = build_tool_calls(&records[start..end], &prefix, params.redaction);
+    let (mut tool_calls, association_issues) = build_tool_calls(&records[start..end], &prefix, params.redaction);
     // servers/tools 过滤
     if !params.servers.is_empty() || !params.tools.is_empty() {
         tool_calls.retain(|tc| {
@@ -262,6 +266,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         session: session_id,
         messages,
         tool_calls,
+        association_issues,
         truncated: truncated.then_some(true),
         warnings,
         output_path: None,
@@ -272,8 +277,8 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         let safe_ref = params.r#ref.replace([':', '/'], "_");
         let output = resolve_output_files(
             &output_dir_raw,
-            &format!("{}_trace.txt", safe_ref),
-            &format!("{}_trace_manifest.json", safe_ref),
+            &format!("{safe_ref}_trace.txt"),
+            &format!("{safe_ref}_trace_manifest.json"),
         )?;
         let output_dir = output.directory;
         let out_path = output.content;
@@ -281,7 +286,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         let was_new = !output_dir.exists();
         fs::create_dir_all(&output_dir).map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("无法创建输出目录: {}", e),
+            message: format!("无法创建输出目录: {e}"),
             available: None,
         })?;
         if was_new {
@@ -313,24 +318,24 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         if !response.tool_calls.is_empty() {
             writeln!(file, "=== tool_calls ===").map_err(|e| ErrorResponse {
                 error: "io_error".to_string(),
-                message: format!("写文件失败: {}", e),
+                message: format!("写文件失败: {e}"),
                 available: None,
             })?;
             for tc in &response.tool_calls {
                 let server_tool = match (&tc.server, &tc.tool) {
-                    (Some(s), Some(t)) => format!("{}::{}", s, t),
+                    (Some(s), Some(t)) => format!("{s}::{t}"),
                     (None, Some(t)) => t.clone(),
                     _ => "(unknown)".to_string(),
                 };
                 writeln!(file, "[{}] {} status={}", tc.r#ref, server_tool, tc.status).map_err(|e| ErrorResponse {
                     error: "io_error".to_string(),
-                    message: format!("写文件失败: {}", e),
+                    message: format!("写文件失败: {e}"),
                     available: None,
                 })?;
                 if let Some(ref preview) = tc.result_preview {
-                    writeln!(file, "  result: {}", preview).map_err(|e| ErrorResponse {
+                    writeln!(file, "  result: {preview}").map_err(|e| ErrorResponse {
                         error: "io_error".to_string(),
-                        message: format!("写文件失败: {}", e),
+                        message: format!("写文件失败: {e}"),
                         available: None,
                     })?;
                 }
@@ -338,7 +343,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         }
         file.flush().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
-            message: format!("刷新 trace 输出失败: {}", e),
+            message: format!("刷新 trace 输出失败: {e}"),
             available: None,
         })?;
         let bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
@@ -364,7 +369,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
             .map_err(|e| ErrorResponse {
                 error: "io_error".to_string(),
-                message: format!("写入 trace manifest 失败: {}", e),
+                message: format!("写入 trace manifest 失败: {e}"),
                 available: None,
             })?;
         return Ok(TraceResponse {
@@ -373,6 +378,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             session: response.session,
             messages: response.messages,
             tool_calls: response.tool_calls,
+            association_issues: response.association_issues,
             truncated: response.truncated,
             warnings: response.warnings,
             output_path: Some(out_path.clone()),
@@ -393,18 +399,35 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
     Ok(response)
 }
 
-fn build_tool_calls(records: &[TraceRecord], prefix: &str, redaction: RedactionMode) -> Vec<TraceToolCall> {
-    let mut calls = Vec::new();
-    let mut pending = Vec::new();
+const ASSOCIATION_ISSUE_CAP: usize = 20;
+
+type PendingToolCall = (usize, Option<String>, String);
+
+fn build_tool_calls(
+    records: &[TraceRecord],
+    prefix: &str,
+    redaction: RedactionMode,
+) -> (Vec<TraceToolCall>, Vec<TraceAssociationIssue>) {
+    let mut calls: Vec<TraceToolCall> = Vec::new();
+    let mut pending: Vec<PendingToolCall> = Vec::new();
+    let mut issues = Vec::new();
 
     for record in records {
-        let result_refs = extract_tool_results(&record.record, redaction);
-        for result in result_refs {
-            if let Some(pos) = pending_tool_call_position(&calls, &pending, result.id.as_deref()) {
-                let (call_idx, _) = pending.remove(pos);
+        for result in extract_tool_results(&record.record, redaction) {
+            let association = pending_tool_call_position(&pending, &result);
+            if let Some((pos, match_method)) = association.position.zip(association.match_method) {
+                let (call_idx, _, _) = pending.remove(pos);
                 calls[call_idx].status = "completed".to_string();
+                calls[call_idx].match_method = match_method;
                 calls[call_idx].result_ref = Some(format!("{}:{}", prefix, record.line_num));
                 calls[call_idx].result_preview = Some(result.preview);
+            } else if issues.len() < ASSOCIATION_ISSUE_CAP {
+                issues.push(TraceAssociationIssue {
+                    result_ref: format!("{}:{}", prefix, record.line_num),
+                    kind: association.issue.unwrap_or_else(|| "unmatched".to_string()),
+                    tool_use_id: result.id,
+                    pending_count: pending.len(),
+                });
             }
         }
 
@@ -415,27 +438,76 @@ fn build_tool_calls(records: &[TraceRecord], prefix: &str, redaction: RedactionM
                 server: tool_use.server,
                 tool: tool_use.tool,
                 status: "pending".to_string(),
+                match_method: "unmatched".to_string(),
                 result_ref: None,
                 result_preview: None,
             });
-            pending.push((call_idx, tool_use.id));
+            pending.push((call_idx, tool_use.id, tool_use.assistant_uuid));
         }
     }
 
-    calls
+    (calls, issues)
 }
 
-fn pending_tool_call_position(
-    calls: &[TraceToolCall],
-    pending: &[(usize, Option<String>)],
-    result_id: Option<&str>,
-) -> Option<usize> {
-    if let Some(result_id) = result_id
-        && let Some(pos) = pending.iter().position(|(_, id)| id.as_deref() == Some(result_id))
-    {
-        return Some(pos);
+struct ToolAssociation {
+    position: Option<usize>,
+    match_method: Option<String>,
+    issue: Option<String>,
+}
+
+fn pending_tool_call_position(pending: &[PendingToolCall], result: &ToolResultRef) -> ToolAssociation {
+    if let Some(result_id) = result.id.as_deref() {
+        return pending
+            .iter()
+            .position(|(_, id, _)| id.as_deref() == Some(result_id))
+            .map_or(
+                ToolAssociation {
+                    position: None,
+                    match_method: None,
+                    issue: Some("unmatched".to_string()),
+                },
+                |position| ToolAssociation {
+                    position: Some(position),
+                    match_method: Some("tool_use_id".to_string()),
+                    issue: None,
+                },
+            );
     }
-    pending.iter().position(|(idx, _)| calls[*idx].result_ref.is_none())
+
+    for parent in [
+        result.source_tool_assistant_uuid.as_deref(),
+        result.parent_uuid.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let matches = pending
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, assistant_uuid))| assistant_uuid == parent)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return ToolAssociation {
+                position: matches.first().copied(),
+                match_method: Some("parent".to_string()),
+                issue: None,
+            };
+        }
+    }
+
+    if pending.len() == 1 {
+        return ToolAssociation {
+            position: Some(0),
+            match_method: Some("legacy_single_pending".to_string()),
+            issue: None,
+        };
+    }
+    ToolAssociation {
+        position: None,
+        match_method: None,
+        issue: Some(if pending.len() > 1 { "ambiguous" } else { "unmatched" }.to_string()),
+    }
 }
 
 fn extract_tool_uses(record: &MessageRecord) -> Vec<ToolUseRef> {
@@ -456,7 +528,12 @@ fn extract_tool_uses(record: &MessageRecord) -> Vec<ToolUseRef> {
         let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
         let id = item.get("id").and_then(|id| id.as_str()).map(ToString::to_string);
         let (server, tool) = split_tool_name(name);
-        result.push(ToolUseRef { id, server, tool });
+        result.push(ToolUseRef {
+            id,
+            assistant_uuid: record.uuid.clone(),
+            server,
+            tool,
+        });
     }
     result
 }
@@ -490,7 +567,12 @@ fn extract_tool_results(record: &MessageRecord, redaction: RedactionMode) -> Vec
                     .unwrap_or_default()
             });
         let (preview, _) = truncate_content(&redact_text_with_mode(&preview_source, redaction).text, 500);
-        results.push(ToolResultRef { id, preview });
+        results.push(ToolResultRef {
+            id,
+            source_tool_assistant_uuid: record.source_tool_assistant_uuid.clone(),
+            parent_uuid: record.parent_uuid.clone(),
+            preview,
+        });
     }
     results
 }
@@ -504,4 +586,177 @@ fn split_tool_name(name: &str) -> (Option<String>, Option<String>) {
         return (Some(server.to_string()), Some(tool.to_string()));
     }
     (None, Some(name.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(line_num: usize, json: serde_json::Value) -> TraceRecord {
+        let record: MessageRecord = serde_json::from_value(json).unwrap();
+        TraceRecord {
+            line_num,
+            record,
+            effective_type: "assistant",
+            subtype: "tool_use",
+            content: String::new(),
+            redacted_count: 0,
+        }
+    }
+
+    #[test]
+    fn explicit_mismatched_id_does_not_consume_pending_call() {
+        let records = vec![
+            record(
+                1,
+                serde_json::json!({
+                    "uuid": "assistant-1",
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": [{"type": "tool_use", "id": "call-1", "name": "Bash"}]}
+                }),
+            ),
+            record(
+                2,
+                serde_json::json!({
+                    "uuid": "user-1",
+                    "type": "user",
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "outside-call", "content": "wrong"}]}
+                }),
+            ),
+            record(
+                3,
+                serde_json::json!({
+                    "uuid": "user-2",
+                    "type": "user",
+                    "timestamp": "2026-01-01T00:00:02Z",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "right"}]}
+                }),
+            ),
+        ];
+        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].result_ref.as_deref(), Some("session:3"));
+        assert_eq!(calls[0].match_method, "tool_use_id");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, "unmatched");
+    }
+
+    #[test]
+    fn missing_id_is_ambiguous_with_multiple_pending_calls() {
+        let records = vec![
+            record(
+                1,
+                serde_json::json!({
+                    "uuid": "assistant-1",
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": [
+                        {"type": "tool_use", "id": "call-1", "name": "Bash"},
+                        {"type": "tool_use", "id": "call-2", "name": "Read"}
+                    ]}
+                }),
+            ),
+            record(
+                2,
+                serde_json::json!({
+                    "uuid": "user-1",
+                    "type": "user",
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "message": {"content": [{"type": "tool_result", "content": "unknown"}]}
+                }),
+            ),
+        ];
+        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        assert!(calls.iter().all(|call| call.status == "pending"));
+        assert_eq!(issues[0].kind, "ambiguous");
+    }
+
+    #[test]
+    fn missing_id_uses_parent_uuid_before_legacy_fallback() {
+        let records = vec![
+            record(
+                1,
+                serde_json::json!({
+                    "uuid": "assistant-1",
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": [{"type": "tool_use", "id": "call-1", "name": "Bash"}]}
+                }),
+            ),
+            record(
+                2,
+                serde_json::json!({
+                    "uuid": "user-1",
+                    "type": "user",
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "sourceToolAssistantUUID": "assistant-1",
+                    "message": {"content": [{"type": "tool_result", "content": "ok"}]}
+                }),
+            ),
+        ];
+        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        assert!(issues.is_empty());
+        assert_eq!(calls[0].match_method, "parent");
+    }
+
+    #[test]
+    fn legal_non_message_records_do_not_count_as_parse_errors() {
+        let tmp = std::env::temp_dir().join(format!("mcp-trace-record-test-{}", std::process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut file = File::create(project_dir.join("session-trace.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type": "custom-title", "customTitle": "fixture"})
+        )
+        .unwrap();
+        writeln!(file, "{{").unwrap();
+        writeln!(file, "{}", serde_json::json!({"uuid": "incomplete"})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "assistant-1",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": [{"type": "text", "text": "anchor"}]}
+            })
+        )
+        .unwrap();
+
+        let response = trace(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            TraceParams {
+                r#ref: "session-:4".to_string(),
+                before: 0,
+                after: 0,
+                project: Some("project".to_string()),
+                max_content: 4000,
+                max_total: 40000,
+                types: Vec::new(),
+                subtypes: Vec::new(),
+                pattern: None,
+                regex: false,
+                case_sensitive: false,
+                servers: Vec::new(),
+                tools: Vec::new(),
+                until_type: None,
+                until_ref: None,
+                direction: "forward".to_string(),
+                output: None,
+                redaction: RedactionMode::Auto,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.messages.len(), 1);
+        assert_eq!(response.warnings, ["解析 JSONL 时跳过 2 行"]);
+        fs::remove_dir_all(&tmp).ok();
+    }
 }

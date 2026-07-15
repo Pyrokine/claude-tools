@@ -80,10 +80,7 @@ impl Config {
 
         Err(ErrorResponse {
             error: "invalid_project_id".to_string(),
-            message: format!(
-                "project 参数既不是有效 project id，也不能唯一映射到已存在 project: {}",
-                raw
-            ),
+            message: format!("project 参数既不是有效 project id，也不能唯一映射到已存在 project: {raw}"),
             available: Some(serde_json::Value::Object(available)),
         })
     }
@@ -127,7 +124,7 @@ fn validate_project_id(project_id: &str) -> Result<(), ErrorResponse> {
     if project_id.starts_with('.') {
         return Err(ErrorResponse {
             error: "invalid_project_id".to_string(),
-            message: format!("project_id 不允许以 `.` 开头: {}", project_id),
+            message: format!("project_id 不允许以 `.` 开头: {project_id}"),
             available: None,
         });
     }
@@ -135,7 +132,7 @@ fn validate_project_id(project_id: &str) -> Result<(), ErrorResponse> {
     if !project_id.chars().all(allowed) {
         return Err(ErrorResponse {
             error: "invalid_project_id".to_string(),
-            message: format!("project_id 仅允许字母、数字、`-`、`_`,实际值: {}", project_id),
+            message: format!("project_id 仅允许字母、数字、`-`、`_`,实际值: {project_id}"),
             available: None,
         });
     }
