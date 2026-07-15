@@ -17,6 +17,8 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
+import type { InputMode } from '../core/unified-session.js'
+import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
 
 /**
@@ -71,39 +73,6 @@ const evaluateSchema = z.object({
 /**
  * evaluate 工具处理器
  */
-interface DiagnosticsStart {
-    consoleCount: number
-    networkCount: number
-}
-
-async function captureDiagnosticsStart(
-    unifiedSession: ReturnType<typeof getUnifiedSession>
-): Promise<DiagnosticsStart> {
-    await unifiedSession.enableConsole()
-    await unifiedSession.enableNetwork()
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return { consoleCount: consoleLogs.length, networkCount: network.length }
-}
-
-async function captureDiagnosticsDelta(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    start: DiagnosticsStart
-): Promise<Record<string, unknown>> {
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return {
-        console: consoleLogs
-            .slice(start.consoleCount)
-            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
-            .slice(-20),
-        failedRequests: network
-            .slice(start.networkCount)
-            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
-            .slice(-20),
-    }
-}
-
 type ToolResponse = {
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
@@ -127,42 +96,56 @@ function cspErrorResponse(): ToolResponse {
     }
 }
 
-function appendDiagnostics(response: ToolResponse, diagnostics: Record<string, unknown>): ToolResponse {
-    const text = response.content[0]?.text
-    if (!text) {
-        return response
-    }
-    try {
-        const parsed = JSON.parse(text) as Record<string, unknown>
-        parsed.diagnostics = diagnostics
-        return {
-            ...response,
-            content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }],
-        }
-    } catch {
-        return response
+function formatEvaluateErrorResponse(error: unknown): ToolResponse {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    return errorMessage.includes('CSP') ||
+        errorMessage.includes('Content Security Policy') ||
+        errorMessage.includes('unsafe-eval')
+        ? cspErrorResponse()
+        : formatErrorResponse(error)
+}
+
+export function resolveEvaluateMode(mode: InputMode | undefined): InputMode {
+    return mode ?? 'precise'
+}
+
+export function classifyEvaluateActionError(error: unknown): {
+    actionExecuted: boolean
+    actionStatus: 'failed' | 'unknown'
+    retryable: boolean
+} {
+    const message = error instanceof Error ? error.message : String(error)
+    const preActionTimeout = /tim(?:eout|ed out) before/i.test(message)
+    const timedOut = !preActionTimeout && /Request timeout|timed out|timeout|超时/i.test(message)
+    const pageEvaluationStarted =
+        /Evaluation failed|exception|ReferenceError|TypeError|SyntaxError|RangeError|URIError/i.test(message)
+    return {
+        actionExecuted: timedOut || pageEvaluationStarted,
+        actionStatus: timedOut ? 'unknown' : 'failed',
+        retryable: /timeout|timed out|超时|disconnect|未连接|context|debugger|attach/i.test(message),
     }
 }
 
-async function formatEvaluateErrorResponse(
+function appendEvaluateFailureMetadata(
+    response: ToolResponse,
     error: unknown,
-    unifiedSession?: ReturnType<typeof getUnifiedSession>,
-    diagnosticsStart?: DiagnosticsStart
-): Promise<ToolResponse> {
-    const errorMessage = error instanceof Error ? error.message : String(error)
-    const response =
-        errorMessage.includes('CSP') ||
-        errorMessage.includes('Content Security Policy') ||
-        errorMessage.includes('unsafe-eval')
-            ? cspErrorResponse()
-            : formatErrorResponse(error)
-    if (!unifiedSession || !diagnosticsStart) {
-        return response
-    }
+    verificationRequested: boolean,
+    overrides: Record<string, unknown> = {}
+): Record<string, unknown> | undefined {
+    const text = response.content[0]?.text
+    if (!text) return undefined
     try {
-        return appendDiagnostics(response, await captureDiagnosticsDelta(unifiedSession, diagnosticsStart))
+        const payload = JSON.parse(text) as Record<string, unknown>
+        const status = classifyEvaluateActionError(error)
+        Object.assign(payload, status, {
+            verificationRequested,
+            verificationStatus: 'unavailable',
+            failureStage: 'action',
+            ...overrides,
+        })
+        return payload
     } catch {
-        return response
+        return undefined
     }
 }
 
@@ -197,71 +180,101 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
-                const diagnosticsStart = args.diagnostics ? await captureDiagnosticsStart(unifiedSession) : undefined
+                const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
+                const evaluationMode = resolveEvaluateMode(args.mode)
+                let result: unknown
+                let evaluationMetadata: ReturnType<typeof unifiedSession.consumeLastEvaluationMetadata>
                 try {
-                    const result = await unifiedSession.evaluate(
-                        script,
-                        args.mode,
-                        args.timeout,
-                        args.args as unknown[]
-                    )
-                    const normalizedResult = result === undefined ? null : result
-                    const postCondition = args.postCondition
-                        ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate')
-                        : undefined
-                    const diagnostics = diagnosticsStart
-                        ? await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
-                        : undefined
+                    result = await unifiedSession.evaluate(script, evaluationMode, args.timeout, args.args as unknown[])
+                    evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
+                } catch (error) {
+                    evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
+                    const response = formatEvaluateErrorResponse(error)
+                    const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition), {
+                        ...(evaluationMetadata ?? {}),
+                    })
+                    if (payload) {
+                        appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                        response.content[0].text = JSON.stringify(payload, null, 2)
+                    }
+                    return response
+                }
 
+                const normalizedResult = result === undefined ? null : result
+                const postCondition = args.postCondition
+                    ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate', evaluationMode)
+                    : undefined
+                const payload: Record<string, unknown> = {
+                    success: postCondition ? postCondition.verificationStatus === 'matched' : true,
+                    actionExecuted: true,
+                    actionStatus: 'completed',
+                    verificationRequested: Boolean(postCondition),
+                    verificationStatus: postCondition?.verificationStatus ?? 'unavailable',
+                    failureStage:
+                        postCondition && postCondition.verificationStatus !== 'matched' ? 'verification' : undefined,
+                    retryable: postCondition?.retryable ?? false,
+                    ...(evaluationMetadata ?? {}),
+                    ...(postCondition ? { postCondition } : {}),
+                }
+
+                try {
                     if (outputPath) {
-                        // string 类型直接写入原始文本，其他类型 JSON 序列化
                         const content = typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
                         await writePrivateFile(outputPath, content, 'utf-8')
-                        return formatResponse({
-                            success: true,
-                            output: outputPath,
-                            ...(diagnostics ? { diagnostics } : {}),
-                            ...(postCondition ? { postCondition } : {}),
-                        })
+                        payload.output = outputPath
+                    } else {
+                        const serialized = JSON.stringify(normalizedResult, null, 2)
+                        if (serialized.length > 100_000) {
+                            const suffix = typeof result === 'string' ? 'txt' : 'json'
+                            const autoSavedPath = (
+                                await resolveScopedOutputPath(
+                                    `${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`,
+                                    'mcp-chrome'
+                                )
+                            ).absolutePath
+                            const fileContent = typeof result === 'string' ? result : serialized
+                            await writePrivateFile(autoSavedPath, fileContent, 'utf-8')
+                            Object.assign(payload, {
+                                autoSaved: true,
+                                path: autoSavedPath,
+                                size: fileContent.length,
+                                hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
+                            })
+                        } else {
+                            payload.result = normalizedResult
+                        }
                     }
-
-                    const serialized = JSON.stringify({ success: true, result: normalizedResult }, null, 2)
-                    // 检测结果大小，超过 100KB 自动保存到受控临时目录
-                    if (serialized.length > 100_000) {
-                        const suffix = typeof result === 'string' ? 'txt' : 'json'
-                        const autoSavedPath = (
-                            await resolveScopedOutputPath(
-                                `${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`,
-                                'mcp-chrome'
-                            )
-                        ).absolutePath
-                        const fileContent =
-                            typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                        await writePrivateFile(autoSavedPath, fileContent, 'utf-8')
-                        return formatResponse({
-                            success: true,
-                            autoSaved: true,
-                            path: autoSavedPath,
-                            size: fileContent.length,
-                            hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
-                            ...(diagnostics ? { diagnostics } : {}),
-                            ...(postCondition ? { postCondition } : {}),
-                        })
-                    }
-
-                    return formatResponse({
-                        success: true,
-                        result: normalizedResult,
-                        ...(diagnostics ? { diagnostics } : {}),
+                } catch (error) {
+                    const response = formatEvaluateErrorResponse(error)
+                    const failurePayload = appendEvaluateFailureMetadata(response, error, Boolean(postCondition), {
+                        actionExecuted: true,
+                        actionStatus: 'completed',
+                        verificationStatus: postCondition?.verificationStatus ?? 'unavailable',
+                        failureStage: 'output',
+                        retryable: false,
                         ...(postCondition ? { postCondition } : {}),
                     })
-                } catch (error) {
-                    return await formatEvaluateErrorResponse(error, unifiedSession, diagnosticsStart)
+                    if (failurePayload) {
+                        appendDiagnostics(failurePayload, await finishDiagnostics(unifiedSession, diagnostics))
+                        response.content[0].text = JSON.stringify(failurePayload, null, 2)
+                    }
+                    return response
                 }
+                appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                return formatResponse(payload)
             })
         }) // withTabId
     } catch (error) {
-        return await formatEvaluateErrorResponse(error)
+        const response = formatEvaluateErrorResponse(error)
+        const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition))
+        if (payload) {
+            payload.diagnosticsStatus = args.diagnostics ? 'unavailable' : 'disabled'
+            if (args.diagnostics) {
+                payload.diagnosticsError = 'diagnostics 未能在 tab/frame 初始化失败前启动'
+            }
+            response.content[0].text = JSON.stringify(payload, null, 2)
+        }
+        return response
     }
 }
 

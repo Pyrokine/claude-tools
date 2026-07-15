@@ -42,6 +42,45 @@ const logsSchema = z.object({
 })
 
 const DEFAULT_LOG_LIMIT = 100
+const INLINE_NETWORK_URL_MAX_LENGTH = 2048
+
+type PublicConsoleLevel = 'error' | 'warning' | 'info' | 'debug'
+
+export function normalizeConsoleLogLevel(level: string): PublicConsoleLevel {
+    switch (level.toLowerCase()) {
+        case 'error':
+        case 'assert':
+            return 'error'
+        case 'warning':
+        case 'warn':
+            return 'warning'
+        case 'debug':
+        case 'trace':
+            return 'debug'
+        default:
+            return 'info'
+    }
+}
+
+export function normalizeConsoleLog<T extends { level: string }>(
+    log: T
+): Omit<T, 'level'> & { level: PublicConsoleLevel } {
+    return { ...log, level: normalizeConsoleLogLevel(log.level) }
+}
+
+export function boundInlineNetworkRequest<T extends { url: string }>(
+    request: T
+): T | (T & { urlLength: number; urlTruncated: true }) {
+    if (request.url.length <= INLINE_NETWORK_URL_MAX_LENGTH) {
+        return request
+    }
+    return {
+        ...request,
+        url: request.url.slice(0, INLINE_NETWORK_URL_MAX_LENGTH),
+        urlLength: request.url.length,
+        urlTruncated: true,
+    }
+}
 
 function latestItems<T>(items: T[], limit: number): T[] {
     return items.slice(-limit)
@@ -111,17 +150,16 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     if (mode === 'extension') {
                         // Extension 模式：使用 debugger API 获取控制台日志
                         await unifiedSession.enableConsole()
-                        logs = await unifiedSession.getConsoleLogs({
-                            level: args.level === 'all' ? undefined : args.level,
-                            clear: args.clear,
-                        })
+                        logs = await unifiedSession.getConsoleLogs({ clear: args.clear })
                     } else {
                         // CDP 模式
                         const session = getSession()
-                        logs = await session.getConsoleLogs({
-                            level: args.level === 'all' ? undefined : args.level,
-                            clear: args.clear,
-                        })
+                        logs = await session.getConsoleLogs({ clear: args.clear })
+                    }
+
+                    logs = logs.map(normalizeConsoleLog)
+                    if (args.level && args.level !== 'all') {
+                        logs = logs.filter((log) => log.level === args.level)
                     }
 
                     const hasExplicitLimit = args.limit !== undefined
@@ -214,7 +252,7 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                     return formatResponse({
                         success: true,
                         type: 'network',
-                        requests: selectedRequests,
+                        requests: selectedRequests.map(boundInlineNetworkRequest),
                         count: selectedRequests.length,
                         totalBuffered: requests.length,
                         sample_kind: kind,

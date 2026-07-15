@@ -14,10 +14,29 @@ import { z } from 'zod'
 import { generateBezierPath, getMouseMoveDelay, getTypingDelay, randomDelay } from '../anti-detection/index.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import type { InputEvent, Target } from '../core/types.js'
+import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
+import { buildTargetDiagnostics } from './target-diagnostics.js'
 
 const INPUT_WAIT_MAX_MS = 60_000
+const TEXT_SELECTION_INPUT_TYPES = new Set(['text', 'search', 'tel', 'url', 'password'])
+
+export function supportsTextSelection(tag: string, inputType?: string): boolean {
+    return (
+        tag.toLowerCase() === 'textarea' ||
+        (tag.toLowerCase() === 'input' && TEXT_SELECTION_INPUT_TYPES.has((inputType ?? 'text').toLowerCase()))
+    )
+}
+
+export function replaceNthOccurrence(value: string, find: string, replacement: string, nth = 0): string | null {
+    let index = -1
+    for (let occurrence = 0; occurrence <= nth; occurrence++) {
+        index = value.indexOf(find, index + (occurrence > 0 ? 1 : 0))
+        if (index === -1) return null
+    }
+    return value.slice(0, index) + replacement + value.slice(index + find.length)
+}
 
 /**
  * InputEvent schema
@@ -162,34 +181,70 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
-                const diagnosticsStart = args.diagnostics ? await captureDiagnosticsStart(unifiedSession) : undefined
+                const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
                 const warnings: string[] = []
                 const eventResults: unknown[] = []
                 const session = mode === 'extension' ? undefined : getSession()
                 const inputStartedAt = Date.now()
-                for (const event of args.events) {
-                    const eventTimeout =
-                        args.timeout === undefined
-                            ? undefined
-                            : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
-                    if (eventTimeout !== undefined && eventTimeout <= 0) {
-                        throw new Error(`input 超时 (${args.timeout}ms)`)
+                let eventsExecuted = 0
+
+                try {
+                    for (const event of args.events) {
+                        const eventTimeout =
+                            args.timeout === undefined
+                                ? undefined
+                                : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
+                        if (eventTimeout !== undefined && eventTimeout <= 0) {
+                            throw new Error(`input timeout before event dispatch (${args.timeout}ms)`)
+                        }
+                        const result = await executeInputEvent(
+                            { unifiedSession, session, mode, humanize, timeout: eventTimeout, frame: args.frame },
+                            event as InputEvent
+                        )
+                        ++eventsExecuted
+                        if (typeof result === 'string') {
+                            warnings.push(result)
+                        } else if (result) {
+                            eventResults.push(result)
+                        }
                     }
-                    const result = await executeInputEvent(
-                        { unifiedSession, session, mode, humanize, timeout: eventTimeout },
-                        event as InputEvent
-                    )
-                    if (typeof result === 'string') {
-                        warnings.push(result)
-                    } else if (result) {
-                        eventResults.push(result)
+                } catch (error) {
+                    const response = formatErrorResponse(error)
+                    const text = response.content[0]?.text
+                    if (text) {
+                        try {
+                            const payload = JSON.parse(text) as Record<string, unknown>
+                            const message = error instanceof Error ? error.message : String(error)
+                            const timedOut = /timeout|超时/i.test(message)
+                            const preActionTimeout = /timeout before event dispatch|超过 input 剩余 timeout/i.test(
+                                message
+                            )
+                            const actionMayHaveExecuted = timedOut && !preActionTimeout
+                            payload.eventsExecuted = eventsExecuted
+                            payload.actionExecuted = eventsExecuted > 0 || actionMayHaveExecuted
+                            payload.actionStatus = actionMayHaveExecuted ? 'unknown' : 'failed'
+                            payload.verificationRequested = Boolean(args.postCondition)
+                            payload.verificationStatus = 'unavailable'
+                            payload.failureStage = 'action'
+                            payload.retryable = /timeout|超时|disconnect|未连接|context|debugger/i.test(message)
+                            appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                            response.content[0].text = JSON.stringify(payload, null, 2)
+                        } catch {
+                            // 保留原始错误响应
+                        }
                     }
+                    return response
                 }
 
                 const result: Record<string, unknown> = {
                     success: true,
-                    eventsExecuted: args.events.length,
+                    eventsExecuted,
                     mode,
+                    actionExecuted: true,
+                    actionStatus: 'completed',
+                    verificationRequested: Boolean(args.postCondition),
+                    verificationStatus: 'unavailable',
+                    retryable: false,
                 }
                 if (warnings.length > 0) {
                     result.warnings = warnings
@@ -198,16 +253,44 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
                     result.eventResults = eventResults
                 }
                 if (args.postCondition) {
-                    result.postCondition = await waitForPostCondition(unifiedSession, args.postCondition, 'input')
+                    const postCondition = await waitForPostCondition(unifiedSession, args.postCondition, 'input')
+                    result.postCondition = postCondition
+                    result.verificationStatus = postCondition.verificationStatus
+                    result.retryable = postCondition.retryable
+                    if (postCondition.verificationStatus !== 'matched') {
+                        result.success = false
+                        result.failureStage = 'verification'
+                    }
                 }
-                if (diagnosticsStart) {
-                    result.diagnostics = await captureDiagnosticsDelta(unifiedSession, diagnosticsStart)
-                }
+                appendDiagnostics(result, await finishDiagnostics(unifiedSession, diagnostics))
                 return formatResponse(result)
             }) // withFrame
         }) // withTabId
     } catch (error) {
-        return formatErrorResponse(error)
+        const response = formatErrorResponse(error)
+        const text = response.content[0]?.text
+        if (text) {
+            try {
+                const payload = JSON.parse(text) as Record<string, unknown>
+                const message = error instanceof Error ? error.message : String(error)
+                Object.assign(payload, {
+                    actionExecuted: false,
+                    actionStatus: 'failed',
+                    verificationRequested: Boolean(args.postCondition),
+                    verificationStatus: 'unavailable',
+                    failureStage: 'action',
+                    retryable: /timeout|超时|disconnect|未连接|context|debugger|attach/i.test(message),
+                    diagnosticsStatus: args.diagnostics ? 'unavailable' : 'disabled',
+                })
+                if (args.diagnostics) {
+                    payload.diagnosticsError = 'diagnostics 未能在 tab/frame 初始化失败前启动'
+                }
+                response.content[0].text = JSON.stringify(payload, null, 2)
+            } catch {
+                // 保留原始错误响应
+            }
+        }
+        return response
     }
 }
 
@@ -240,11 +323,6 @@ interface TextSelectionDiagnostics {
     candidates: Array<Record<string, unknown>>
 }
 
-interface DiagnosticsStart {
-    consoleCount: number
-    networkCount: number
-}
-
 type InputEventResult = string | Record<string, unknown> | undefined
 
 interface InputExecutionContext {
@@ -253,6 +331,7 @@ interface InputExecutionContext {
     mode: ReturnType<ReturnType<typeof getUnifiedSession>['getMode']>
     humanize: boolean
     timeout?: number
+    frame?: string | number
 }
 
 const unifiedOnlyEventTypes = new Set<InputEvent['type']>([
@@ -265,41 +344,13 @@ const unifiedOnlyEventTypes = new Set<InputEvent['type']>([
 
 async function executeInputEvent(context: InputExecutionContext, event: InputEvent): Promise<InputEventResult> {
     if (context.mode === 'extension' || unifiedOnlyEventTypes.has(event.type)) {
-        return executeUnifiedEvent(context.unifiedSession, event, context.humanize, context.timeout)
+        return executeUnifiedEvent(context.unifiedSession, event, context.humanize, context.timeout, context.frame)
     }
     if (!context.session) {
         throw new Error('CDP 输入事件缺少 session')
     }
     await executeCdpEvent(context.session, event, context.humanize, context.timeout)
     return undefined
-}
-
-async function captureDiagnosticsStart(
-    unifiedSession: ReturnType<typeof getUnifiedSession>
-): Promise<DiagnosticsStart> {
-    await unifiedSession.enableConsole()
-    await unifiedSession.enableNetwork()
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return { consoleCount: consoleLogs.length, networkCount: network.length }
-}
-
-async function captureDiagnosticsDelta(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    start: DiagnosticsStart
-): Promise<Record<string, unknown>> {
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return {
-        console: consoleLogs
-            .slice(start.consoleCount)
-            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
-            .slice(-20),
-        failedRequests: network
-            .slice(start.networkCount)
-            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
-            .slice(-20),
-    }
 }
 
 /**
@@ -318,16 +369,35 @@ async function captureDiagnosticsDelta(
 async function focusTargetForCommands(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
-    timeout?: number
-): Promise<boolean> {
+    timeout?: number,
+    frame?: string | number
+): Promise<void> {
     if ('x' in target || 'y' in target) {
-        return true
+        const point = await getTargetPointExtension(unifiedSession, target, timeout, frame)
+        await unifiedSession.mouseMove(point.x, point.y)
+        await unifiedSession.mouseClick('left')
+        return
     }
     const params = targetToFindParams(target as Target & { nth?: number })
     const els = await unifiedSession.find(params.selector, params.text, params.xpath, timeout)
     const nth0 = params.nth ?? 0
     if (els.length <= nth0) {
-        return false
+        throw new StructuredToolError(
+            els.length === 0 ? 'TARGET_NOT_FOUND' : 'TARGET_INDEX_OUT_OF_RANGE',
+            els.length === 0
+                ? `未找到命令目标: ${JSON.stringify(target)}`
+                : `第 ${nth0} 个命令目标不存在（共 ${els.length} 个）`,
+            '请检查 target、frame 和 target.nth，或先用 extract type=state 查看当前候选元素',
+            await buildTargetDiagnosticContext(
+                unifiedSession,
+                target,
+                els.length,
+                nth0,
+                timeout,
+                '命令目标未找到',
+                frame
+            )
+        )
     }
     const focused = await unifiedSession.evaluate(
         `(() => {
@@ -342,28 +412,79 @@ async function focusTargetForCommands(
         undefined,
         timeout
     )
-    return focused === true
+    if (focused !== true) {
+        throw new StructuredToolError(
+            'TARGET_FOCUS_FAILED',
+            '命令目标未成功聚焦',
+            '请检查目标是否可编辑、未 disabled 并处于正确 frame',
+            await buildTargetDiagnosticContext(
+                unifiedSession,
+                target,
+                els.length,
+                nth0,
+                timeout,
+                '命令目标聚焦失败',
+                frame
+            )
+        )
+    }
 }
 
 async function focusTargetIfNeeded(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target | undefined,
-    nth: number | undefined,
-    timeout?: number
+    timeout?: number,
+    frame?: string | number
 ): Promise<void> {
-    if (!target || 'x' in target || 'y' in target) {
+    if (!target) {
+        return
+    }
+    if ('x' in target || 'y' in target) {
+        const point = await getTargetPointExtension(unifiedSession, target, timeout, frame)
+        await unifiedSession.mouseMove(point.x, point.y)
+        await unifiedSession.mouseClick('left')
         return
     }
     const params = targetToFindParams(target as Target & { nth?: number })
     const els = await unifiedSession.find(params.selector, params.text, params.xpath, timeout)
-    const nth0 = params.nth ?? nth ?? 0
-    if (els.length > nth0) {
-        try {
-            await unifiedSession.actionableClick(els[nth0].refId)
-        } catch (err) {
-            // 失败时不中断（可能是 contenteditable 不接受 click focus），但记录 warning
-            console.warn('[MCP] focusTargetIfNeeded 聚焦失败，select/replace 将回退到 mouseClick 聚焦:', err)
-        }
+    const nth0 = params.nth ?? 0
+    if (els.length <= nth0) {
+        throw new StructuredToolError(
+            els.length === 0 ? 'TARGET_NOT_FOUND' : 'TARGET_INDEX_OUT_OF_RANGE',
+            els.length === 0
+                ? `未找到目标元素: ${JSON.stringify(target)}`
+                : `第 ${nth0} 个匹配元素不存在（共 ${els.length} 个）`,
+            '请检查 target、frame 和 target.nth，或先用 extract type=state 查看当前候选元素',
+            await buildTargetDiagnosticContext(
+                unifiedSession,
+                target,
+                els.length,
+                nth0,
+                timeout,
+                '聚焦目标未找到',
+                frame
+            )
+        )
+    }
+    const result = await unifiedSession.actionableClick(els[nth0].refId)
+    if (!result.success) {
+        throw new StructuredToolError(
+            'ACTIONABILITY_FAILED',
+            result.error || '目标元素无法聚焦',
+            result.suggestions?.[0] ?? '请检查元素是否可见、未被遮挡并处于正确 frame',
+            {
+                ...result,
+                ...(await buildTargetDiagnosticContext(
+                    unifiedSession,
+                    target,
+                    els.length,
+                    nth0,
+                    timeout,
+                    result.error || '目标元素无法聚焦',
+                    frame
+                )),
+            }
+        )
     }
 }
 
@@ -371,14 +492,15 @@ async function collectTextSelectionDiagnostics(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     findText: string,
     scopeTarget: Target | undefined,
-    nth: number,
+    occurrenceNth: number,
+    scopeNth: number,
     scopeSelector: string | null,
     scopeText: string | null,
     scopeXpath: string | null,
     timeout?: number
 ): Promise<TextSelectionDiagnostics> {
     return await unifiedSession.evaluate<TextSelectionDiagnostics>(
-        `function(findText, nth, scopeTarget, scopeSelector, scopeText, scopeXpath) {
+        `function(findText, occurrenceNth, scopeNth, scopeTarget, scopeSelector, scopeText, scopeXpath) {
         function selectorFor(el) {
             if (!(el instanceof Element)) return null;
             if (el.id) return '#' + CSS.escape(el.id);
@@ -419,22 +541,21 @@ async function collectTextSelectionDiagnostics(
         }
         var root = document.body;
         if (scopeXpath) {
-            var xr = document.evaluate(scopeXpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-            root = xr.singleNodeValue;
+            var xr = document.evaluate(scopeXpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            root = xr.snapshotItem(scopeNth);
         } else if (scopeSelector) {
-            var candidates = document.querySelectorAll(scopeSelector);
+            var candidates = Array.from(document.querySelectorAll(scopeSelector));
             if (scopeText) {
-                for (var ci = 0; ci < candidates.length; ci++) {
-                    if ((candidates[ci].textContent || '').includes(scopeText)) { root = candidates[ci]; break; }
-                }
-            } else {
-                root = candidates[0];
+                candidates = candidates.filter(function(candidate) {
+                    return (candidate.textContent || '').includes(scopeText);
+                });
             }
+            root = candidates[scopeNth];
         } else if (scopeText) {
-            var all = document.querySelectorAll('*');
-            for (var ai = 0; ai < all.length; ai++) {
-                if ((all[ai].textContent || '').includes(scopeText)) { root = all[ai]; break; }
-            }
+            var all = Array.from(document.querySelectorAll('*')).filter(function(candidate) {
+                return (candidate.textContent || '').includes(scopeText);
+            });
+            root = all[scopeNth];
         }
         var candidateElements = [];
         if (root instanceof Element) {
@@ -446,7 +567,8 @@ async function collectTextSelectionDiagnostics(
         return {
             scope: {
                 target: scopeTarget,
-                nth: nth,
+                targetNth: scopeNth,
+                occurrenceNth: occurrenceNth,
                 findText: findText,
                 selector: scopeSelector,
                 text: scopeText,
@@ -470,7 +592,7 @@ async function collectTextSelectionDiagnostics(
     }`,
         undefined,
         timeout,
-        [findText, nth, scopeTarget ?? null, scopeSelector, scopeText, scopeXpath]
+        [findText, occurrenceNth, scopeNth, scopeTarget ?? null, scopeSelector, scopeText, scopeXpath]
     )
 }
 
@@ -485,11 +607,13 @@ async function selectText(
     let scopeSelector: string | null = null
     let scopeText: string | null = null
     let scopeXpath: string | null = null
+    let scopeNth = 0
     if (scopeTarget && !('x' in scopeTarget) && !('y' in scopeTarget)) {
         const params = targetToFindParams(scopeTarget as Target & { nth?: number })
         scopeSelector = params.selector ?? null
         scopeText = params.text ?? null
         scopeXpath = params.xpath ?? null
+        scopeNth = params.nth ?? 0
     }
 
     // Step 1: 注入脚本定位文本
@@ -497,31 +621,31 @@ async function selectText(
         | TextLocateResult
         | InputLocateResult
         | { type: 'notfound' }
+        | { type: 'unsupported'; tag: string; inputType: string; currentValue: string }
         | {
               type: 'noscope'
           }
         | null
     >(
-        `function(findText, nth, scopeSelector, scopeText, scopeXpath) {
+        `function(findText, nth, scopeNth, scopeSelector, scopeText, scopeXpath) {
         // 确定搜索根节点
         var root = document.body;
         if (scopeXpath) {
-            var xr = document.evaluate(scopeXpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-            root = xr.singleNodeValue;
+            var xr = document.evaluate(scopeXpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            root = xr.snapshotItem(scopeNth);
         } else if (scopeSelector) {
-            var candidates = document.querySelectorAll(scopeSelector);
+            var candidates = Array.from(document.querySelectorAll(scopeSelector));
             if (scopeText) {
-                for (var ci = 0; ci < candidates.length; ci++) {
-                    if ((candidates[ci].textContent || '').includes(scopeText)) { root = candidates[ci]; break; }
-                }
-            } else {
-                root = candidates[0];
+                candidates = candidates.filter(function(candidate) {
+                    return (candidate.textContent || '').includes(scopeText);
+                });
             }
+            root = candidates[scopeNth];
         } else if (scopeText) {
-            var all = document.querySelectorAll('*');
-            for (var ai = 0; ai < all.length; ai++) {
-                if ((all[ai].textContent || '').includes(scopeText)) { root = all[ai]; break; }
-            }
+            var all = Array.from(document.querySelectorAll('*')).filter(function(candidate) {
+                return (candidate.textContent || '').includes(scopeText);
+            });
+            root = all[scopeNth];
         }
         if (!root) return {type: 'noscope'};
 
@@ -529,6 +653,11 @@ async function selectText(
         var tag = root.tagName;
         if (tag === 'INPUT' || tag === 'TEXTAREA') {
             var val = root.value || '';
+            var inputType = tag === 'INPUT' ? (root.type || 'text').toLowerCase() : 'textarea';
+            var selectionCapable = tag === 'TEXTAREA' || ['text', 'search', 'tel', 'url', 'password'].indexOf(inputType) !== -1;
+            if (!selectionCapable) {
+                return {type: 'unsupported', tag: tag.toLowerCase(), inputType: inputType, currentValue: String(val).slice(0, 160)};
+            }
             var pos = -1;
             for (var n = 0; n <= nth; n++) {
                 pos = val.indexOf(findText, pos + (n > 0 ? 1 : 0));
@@ -536,9 +665,7 @@ async function selectText(
             }
             // 原子化：定位到 input 同时完成 focus + setSelectionRange，避免外层 mouseClick 聚焦不可靠
             root.focus();
-            if (typeof root.setSelectionRange === 'function') {
-                root.setSelectionRange(pos, pos + findText.length);
-            }
+            root.setSelectionRange(pos, pos + findText.length);
             return {type: 'input', selectionStart: pos, selectionEnd: pos + findText.length};
         }
 
@@ -547,16 +674,19 @@ async function selectText(
         for (var k = 0; k < inputs.length; k++) {
             var inp = inputs[k];
             var v = inp.value || '';
+            var childType = inp.tagName === 'INPUT' ? (inp.type || 'text').toLowerCase() : 'textarea';
+            var childSelectionCapable = inp.tagName === 'TEXTAREA' || ['text', 'search', 'tel', 'url', 'password'].indexOf(childType) !== -1;
             var ip = -1;
             for (var n2 = 0; n2 <= nth; n2++) {
                 ip = v.indexOf(findText, ip + (n2 > 0 ? 1 : 0));
                 if (ip === -1) break;
             }
+            if (ip !== -1 && !childSelectionCapable) {
+                return {type: 'unsupported', tag: inp.tagName.toLowerCase(), inputType: childType, currentValue: String(v).slice(0, 160)};
+            }
             if (ip !== -1) {
                 inp.focus();
-                if (typeof inp.setSelectionRange === 'function') {
-                    inp.setSelectionRange(ip, ip + findText.length);
-                }
+                inp.setSelectionRange(ip, ip + findText.length);
                 return {type: 'input', selectionStart: ip, selectionEnd: ip + findText.length};
             }
         }
@@ -624,7 +754,7 @@ async function selectText(
     }`,
         undefined,
         timeout,
-        [findText, nth, scopeSelector, scopeText, scopeXpath]
+        [findText, nth, scopeNth, scopeSelector, scopeText, scopeXpath]
     )
 
     if (!result || result.type === 'noscope') {
@@ -633,6 +763,7 @@ async function selectText(
             findText,
             scopeTarget,
             nth,
+            scopeNth,
             scopeSelector,
             scopeText,
             scopeXpath,
@@ -645,12 +776,27 @@ async function selectText(
             diagnostics as unknown as Record<string, unknown>
         )
     }
+    if (result.type === 'unsupported') {
+        throw new StructuredToolError(
+            'UNSUPPORTED_SELECTION',
+            `${result.tag}[type=${result.inputType}] 不支持文本 selection`,
+            'select 只支持 textarea 和 text/search/tel/url/password input；请使用 type mode="controlled" 设置完整 value',
+            {
+                elementTag: result.tag,
+                inputType: result.inputType,
+                currentValue: result.currentValue,
+                requestedFind: findText,
+                recommendedMode: 'controlled',
+            }
+        )
+    }
     if (result.type === 'notfound') {
         const diagnostics = await collectTextSelectionDiagnostics(
             unifiedSession,
             findText,
             scopeTarget,
             nth,
+            scopeNth,
             scopeSelector,
             scopeText,
             scopeXpath,
@@ -845,6 +991,7 @@ interface UnifiedInputContext {
     unifiedSession: ReturnType<typeof getUnifiedSession>
     humanize: boolean
     timeout?: number
+    frame?: string | number
 }
 
 type UnifiedInputHandler = (context: UnifiedInputContext, event: InputEvent) => Promise<InputEventResult>
@@ -853,14 +1000,15 @@ async function executeUnifiedEvent(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     event: InputEvent,
     humanize: boolean,
-    timeout?: number
+    timeout?: number,
+    frame?: string | number
 ): Promise<InputEventResult> {
     validateEvent(event)
     const handler = unifiedInputHandlers[event.type]
     if (!handler) {
         throw new Error(`未知事件类型: ${(event as { type: string }).type}`)
     }
-    return handler({ unifiedSession, humanize, timeout }, event)
+    return handler({ unifiedSession, humanize, timeout, frame }, event)
 }
 
 const unifiedInputHandlers: Record<InputEvent['type'], UnifiedInputHandler> = {
@@ -885,7 +1033,7 @@ const unifiedInputHandlers: Record<InputEvent['type'], UnifiedInputHandler> = {
 }
 
 async function handleUnifiedKeyDown(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
     if (unifiedSession.getInputMode() === 'stealth' && event.commands && event.commands.length > 0) {
@@ -894,10 +1042,7 @@ async function handleUnifiedKeyDown(
         )
     }
     if (event.commands && event.commands.length > 0 && event.target) {
-        const focused = await focusTargetForCommands(unifiedSession, event.target, timeout)
-        if (!focused) {
-            throw new Error('commands 目标未找到或未成功聚焦')
-        }
+        await focusTargetForCommands(unifiedSession, event.target, timeout, frame)
     }
     await unifiedSession.keyDown(event.key!, event.commands)
     if (event.commands && event.commands.length > 0) {
@@ -915,7 +1060,7 @@ async function handleUnifiedKeyUp(
 }
 
 async function handleUnifiedClick(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
     const button = event.button ?? 'left'
@@ -926,7 +1071,7 @@ async function handleUnifiedClick(
     }
 
     if ('x' in event.target && 'y' in event.target) {
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
         await unifiedSession.mouseMove(point.x, point.y)
         await unifiedSession.mouseClick(button, clickCount)
         return undefined
@@ -956,18 +1101,18 @@ async function handleUnifiedClick(
         }
     }
 
-    const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+    const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
     await unifiedSession.mouseMove(point.x, point.y)
     await unifiedSession.mouseClick(button, clickCount, typeof point.refId === 'string' ? point.refId : undefined)
     return undefined
 }
 
 async function handleUnifiedMouseDown(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
     if (event.target) {
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
         await unifiedSession.mouseMove(point.x, point.y)
     }
     await unifiedSession.mouseDown(event.button ?? 'left')
@@ -983,10 +1128,10 @@ async function handleUnifiedMouseUp(
 }
 
 async function handleUnifiedMouseMove(
-    { unifiedSession, humanize, timeout }: UnifiedInputContext,
+    { unifiedSession, humanize, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout)
+    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout, frame)
 
     if (humanize && event.steps && event.steps > 1) {
         const path = generateBezierPath(unifiedSession.getMousePosition(), point, event.steps)
@@ -1001,7 +1146,7 @@ async function handleUnifiedMouseMove(
 }
 
 async function handleUnifiedWheel(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
     if (event.target) {
@@ -1012,7 +1157,7 @@ async function handleUnifiedWheel(
             await unifiedSession.scroll(event.deltaX ?? 0, event.deltaY ?? 0, elements[nth].refId)
             return undefined
         }
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
         await unifiedSession.mouseMove(point.x, point.y)
     }
     await unifiedSession.mouseWheel(event.deltaX ?? 0, event.deltaY ?? 0)
@@ -1020,19 +1165,19 @@ async function handleUnifiedWheel(
 }
 
 async function handleUnifiedTouchStart(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout)
+    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout, frame)
     await unifiedSession.touchStart(point.x, point.y)
     return undefined
 }
 
 async function handleUnifiedTouchMove(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout)
+    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout, frame)
     await unifiedSession.touchMove(point.x, point.y)
     return undefined
 }
@@ -1043,16 +1188,16 @@ async function handleUnifiedTouchEnd({ unifiedSession }: UnifiedInputContext): P
 }
 
 async function handleUnifiedType(
-    { unifiedSession, humanize, timeout }: UnifiedInputContext,
+    { unifiedSession, humanize, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
     if (event.mode === 'controlled' || event.dispatch) {
-        await inputControlled(unifiedSession, event, timeout)
+        await inputControlled(unifiedSession, event, timeout, frame)
         return undefined
     }
 
     if (event.target) {
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout)
+        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
         await unifiedSession.mouseMove(point.x, point.y)
         await unifiedSession.mouseClick('left')
     } else {
@@ -1091,19 +1236,114 @@ async function handleUnifiedWait({ timeout }: UnifiedInputContext, event: InputE
 }
 
 async function handleUnifiedSelect(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await focusTargetIfNeeded(unifiedSession, event.target, event.nth, timeout)
+    await focusTargetIfNeeded(unifiedSession, event.target, timeout, frame)
+    const selectionTarget = await unifiedSession.evaluate<{ tag: string; inputType?: string; value?: string } | null>(
+        `(() => {
+            const el = document.activeElement;
+            if (!(el instanceof HTMLInputElement)) return null;
+            return {tag: 'input', inputType: (el.type || 'text').toLowerCase(), value: String(el.value || '').slice(0, 160)};
+        })()`,
+        undefined,
+        timeout
+    )
+    if (selectionTarget && !supportsTextSelection(selectionTarget.tag, selectionTarget.inputType)) {
+        throw new StructuredToolError(
+            'UNSUPPORTED_SELECTION',
+            `input[type=${selectionTarget.inputType}] 不支持文本 selection`,
+            '请改用 type mode="controlled" 设置完整 value，replace 事件会对这类 input 使用完整 value 更新路径',
+            {
+                elementTag: selectionTarget.tag,
+                inputType: selectionTarget.inputType,
+                currentValue: selectionTarget.value,
+                requestedFind: event.find,
+                recommendedMode: 'controlled',
+            }
+        )
+    }
     await selectText(unifiedSession, event.find!, event.target, event.nth, timeout)
     return undefined
 }
 
 async function handleUnifiedReplace(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await focusTargetIfNeeded(unifiedSession, event.target, event.nth, timeout)
+    await focusTargetIfNeeded(unifiedSession, event.target, timeout, frame)
+    const directResult = await unifiedSession.evaluate<{
+        handled: boolean
+        success?: boolean
+        tag?: string
+        inputType?: string
+        currentValue?: string
+        requestedValue?: string
+        actualValue?: string
+        reason?: string
+    }>(
+        `function(findText, replacementText, nth) {
+            var el = document.activeElement;
+            if (!(el instanceof HTMLInputElement)) return {handled: false};
+            var type = (el.type || 'text').toLowerCase();
+            if (['text', 'search', 'tel', 'url', 'password'].indexOf(type) !== -1) return {handled: false};
+            var current = String(el.value || '');
+            var pos = -1;
+            for (var i = 0; i <= nth; i++) {
+                pos = current.indexOf(findText, pos + (i > 0 ? 1 : 0));
+                if (pos === -1) return {handled: true, success: false, tag: 'input', inputType: type, currentValue: current.slice(0, 160), reason: 'text_not_found'};
+            }
+            if (el.disabled || el.readOnly) return {handled: true, success: false, tag: 'input', inputType: type, currentValue: current.slice(0, 160), reason: 'not_editable'};
+            var requested = current.slice(0, pos) + replacementText + current.slice(pos + findText.length);
+            var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (!setter) return {handled: true, success: false, tag: 'input', inputType: type, currentValue: current.slice(0, 160), requestedValue: requested.slice(0, 160), reason: 'no_native_setter'};
+            setter.call(el, requested);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            var actual = String(el.value || '');
+            return {handled: true, success: actual === requested, tag: 'input', inputType: type, currentValue: current.slice(0, 160), requestedValue: requested.slice(0, 160), actualValue: actual.slice(0, 160), reason: actual === requested ? undefined : 'value_not_applied'};
+        }`,
+        undefined,
+        timeout,
+        [event.find, event.text, event.nth ?? 0]
+    )
+    if (directResult.handled) {
+        if (!directResult.success) {
+            const valueNotApplied = directResult.reason === 'value_not_applied'
+            throw new StructuredToolError(
+                directResult.reason === 'text_not_found'
+                    ? 'TEXT_NOT_FOUND'
+                    : valueNotApplied
+                      ? 'VALUE_NOT_APPLIED'
+                      : 'UNSUPPORTED_SELECTION',
+                directResult.reason === 'text_not_found'
+                    ? `目标元素内未找到文本 "${event.find}"`
+                    : valueNotApplied
+                      ? '浏览器没有接受 replace 计算出的完整 value'
+                      : '目标 input 不支持文本 selection，且无法安全更新完整 value',
+                valueNotApplied
+                    ? '请根据 actualValue 提供该 input type 接受的完整值，或使用 controlled type 设置合法值'
+                    : '请使用 mode="controlled" 的 type 事件设置完整 value，或改用支持文本 selection 的 input 类型',
+                {
+                    elementTag: directResult.tag,
+                    inputType: directResult.inputType,
+                    currentValue: directResult.currentValue,
+                    requestedFind: event.find,
+                    requestedValue: directResult.requestedValue,
+                    actualValue: directResult.actualValue,
+                    recommendedMode: 'controlled',
+                    reason: directResult.reason,
+                }
+            )
+        }
+        return {
+            elementTag: directResult.tag,
+            inputType: directResult.inputType,
+            requestedValue: directResult.requestedValue,
+            actualValue: directResult.actualValue,
+            normalized: directResult.actualValue !== directResult.requestedValue,
+        }
+    }
     const formatted = await selectText(unifiedSession, event.find!, event.target, event.nth, timeout)
     let selectionConfirmed = false
     for (let i = 0; i < 25; i++) {
@@ -1164,30 +1404,30 @@ async function handleUnifiedReplace(
 }
 
 async function handleUnifiedEditorContext(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    return (await editorAction(unifiedSession, 'context', event, timeout)) as Record<string, unknown>
+    return (await editorAction(unifiedSession, 'context', event, timeout, frame)) as Record<string, unknown>
 }
 
 async function handleUnifiedEditorInsert(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await editorAction(unifiedSession, 'insert', event, timeout)
+    await editorAction(unifiedSession, 'insert', event, timeout, frame)
     return undefined
 }
 
 async function handleUnifiedEditorCommand(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await editorAction(unifiedSession, 'command', event, timeout)
+    await editorAction(unifiedSession, 'command', event, timeout, frame)
     return undefined
 }
 
 async function handleUnifiedDrag(
-    { unifiedSession, timeout }: UnifiedInputContext,
+    { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
     if (!event.target) {
@@ -1212,10 +1452,36 @@ async function handleUnifiedDrag(
         const srcEls = await unifiedSession.find(srcParams.selector, srcParams.text, srcParams.xpath, timeout)
         const dstEls = await unifiedSession.find(dstParams.selector, dstParams.text, dstParams.xpath, timeout)
         if (srcEls.length <= srcNth) {
-            throw new Error(`drag 源元素未找到: ${JSON.stringify(event.target)}`)
+            throw new StructuredToolError(
+                srcEls.length === 0 ? 'TARGET_NOT_FOUND' : 'TARGET_INDEX_OUT_OF_RANGE',
+                `drag 源元素未找到: ${JSON.stringify(event.target)}`,
+                '请检查 drag 源 target、frame 和 nth',
+                await buildTargetDiagnosticContext(
+                    unifiedSession,
+                    event.target!,
+                    srcEls.length,
+                    srcNth,
+                    timeout,
+                    'drag 源元素未找到',
+                    frame
+                )
+            )
         }
         if (dstEls.length <= dstNth) {
-            throw new Error(`drag 目标元素未找到: ${JSON.stringify(event.to)}`)
+            throw new StructuredToolError(
+                dstEls.length === 0 ? 'TARGET_NOT_FOUND' : 'TARGET_INDEX_OUT_OF_RANGE',
+                `drag 目标元素未找到: ${JSON.stringify(event.to)}`,
+                '请检查 drag 目标 to、frame 和 nth',
+                await buildTargetDiagnosticContext(
+                    unifiedSession,
+                    event.to!,
+                    dstEls.length,
+                    dstNth,
+                    timeout,
+                    'drag 目标元素未找到',
+                    frame
+                )
+            )
         }
         return unifiedSession.dragAndDrop(srcEls[srcNth].refId, dstEls[dstNth].refId)
     }
@@ -1247,7 +1513,8 @@ async function handleUnifiedDrag(
 async function inputControlled(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     event: InputEvent,
-    timeout?: number
+    timeout?: number,
+    frame?: string | number
 ): Promise<void> {
     if (!event.target) {
         throw new Error('controlled 输入需要 target 参数定位输入元素')
@@ -1268,7 +1535,15 @@ async function inputControlled(
             'TARGET_NOT_FOUND',
             `controlled 输入目标未找到: ${JSON.stringify(event.target)}`,
             '请检查 target 是否能定位到 input、textarea、select 或 contenteditable 元素；context.candidates 提供当前页面候选元素',
-            await buildTargetDiagnosticContext(unifiedSession, event.target, elements.length, nth, timeout)
+            await buildTargetDiagnosticContext(
+                unifiedSession,
+                event.target,
+                elements.length,
+                nth,
+                timeout,
+                'controlled 输入目标未找到',
+                frame
+            )
         )
     }
     const result = await unifiedSession.dispatchInput(elements[nth].refId, event.text ?? '')
@@ -1283,7 +1558,8 @@ async function inputControlled(
                 elements.length,
                 nth,
                 timeout,
-                result.error || 'controlled 输入失败'
+                result.error || 'controlled 输入失败',
+                frame
             )
         )
     }
@@ -1295,65 +1571,27 @@ async function buildTargetDiagnosticContext(
     matchCount: number,
     nth: number,
     timeout?: number,
-    reason = '目标元素未找到'
+    reason = '目标元素未找到',
+    frame?: string | number
 ): Promise<Record<string, unknown>> {
-    let page: unknown
-    try {
-        page = await unifiedSession.evaluate(
-            `(() => {
-                const active = document.activeElement;
-                const selection = window.getSelection();
-                const candidates = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable="true"], button, a, [role="button"], [role="textbox"], [role="combobox"]')).slice(0, 20);
-                return {
-                    activeElement: active ? {
-                        tag: active.tagName.toLowerCase(),
-                        id: active.id || undefined,
-                        className: typeof active.className === 'string' ? active.className : undefined,
-                        text: (active.textContent || '').trim().slice(0, 80),
-                        value: 'value' in active ? active.value : undefined,
-                        selectionStart: 'selectionStart' in active ? active.selectionStart : undefined,
-                        selectionEnd: 'selectionEnd' in active ? active.selectionEnd : undefined
-                    } : null,
-                    selection: {
-                        text: selection ? selection.toString().slice(0, 160) : '',
-                        collapsed: selection ? selection.isCollapsed : true,
-                        anchorNode: selection && selection.anchorNode ? selection.anchorNode.nodeName : null,
-                        focusNode: selection && selection.focusNode ? selection.focusNode.nodeName : null
-                    },
-                    candidates: candidates.map(function(el) {
-                        const rect = el.getBoundingClientRect();
-                        return {
-                            tag: el.tagName.toLowerCase(),
-                            id: el.id || undefined,
-                            role: el.getAttribute('role') || undefined,
-                            text: (el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 80),
-                            visible: rect.width > 0 && rect.height > 0,
-                            disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
-                            bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
-                        };
-                    })
-                };
-            })()`,
-            undefined,
-            timeout
-        )
-    } catch (err) {
-        page = { diagnosticError: err instanceof Error ? err.message : String(err) }
-    }
-    return { reason, target, matchCount, nth, page }
+    return buildTargetDiagnostics(unifiedSession, target, {
+        nth,
+        timeout,
+        frame,
+        matchCount,
+        lastState: reason,
+    })
 }
 
 async function editorAction(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     action: 'context' | 'insert' | 'command',
     event: InputEvent,
-    timeout?: number
+    timeout?: number,
+    frame?: string | number
 ): Promise<unknown> {
     if (event.target) {
-        const focused = await focusTargetForCommands(unifiedSession, event.target, timeout)
-        if (!focused) {
-            throw new Error('editor 目标未找到或未成功聚焦')
-        }
+        await focusTargetForCommands(unifiedSession, event.target, timeout, frame)
     }
 
     return unifiedSession.evaluate(
@@ -1426,7 +1664,8 @@ async function editorAction(
 async function getTargetPointExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
-    timeout?: number
+    timeout?: number,
+    frame?: string | number
 ): Promise<{ x: number; y: number; refId?: string }> {
     const frameOffset = unifiedSession.getFrameOffset()
     const isStealth = unifiedSession.getInputMode() === 'stealth'
@@ -1448,7 +1687,15 @@ async function getTargetPointExtension(
             'TARGET_NOT_FOUND',
             `未找到目标元素: ${JSON.stringify(target)}`,
             '请检查 target 是否正确，或先用 extract type=state 查看 interactiveElements 候选',
-            await buildTargetDiagnosticContext(unifiedSession, target, elements.length, nth, timeout)
+            await buildTargetDiagnosticContext(
+                unifiedSession,
+                target,
+                elements.length,
+                nth,
+                timeout,
+                '目标元素未找到',
+                frame
+            )
         )
     }
 
@@ -1463,7 +1710,8 @@ async function getTargetPointExtension(
                 elements.length,
                 nth,
                 timeout,
-                '目标元素序号越界'
+                '目标元素序号越界',
+                frame
             )
         )
     }

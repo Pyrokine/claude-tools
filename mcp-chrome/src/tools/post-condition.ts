@@ -1,5 +1,7 @@
 import { z } from 'zod'
+import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
 import { getUnifiedSession } from '../core/index.js'
+import type { InputMode } from '../core/unified-session.js'
 
 const POST_CONDITION_DEFAULT_TIMEOUT_MS = 3000
 const POST_CONDITION_MAX_TIMEOUT_MS = 60_000
@@ -34,6 +36,7 @@ export const postConditionSchema = z
     })
 
 export type PostCondition = z.infer<typeof postConditionSchema>
+export type VerificationStatus = 'matched' | 'not_matched' | 'unavailable' | 'error'
 
 interface CheckResult {
     name: string
@@ -41,32 +44,14 @@ interface CheckResult {
     actual?: unknown
 }
 
-interface TextCheckResult {
+export interface PostConditionResult extends Record<string, unknown> {
     matched: boolean
-    actual: string
-    truncated: boolean
-}
-
-class PostConditionError extends Error {
-    readonly code = 'POST_CONDITION_FAILED'
-    readonly suggestion =
-        '工具动作已执行，但 postCondition 未满足。请检查页面状态、异步业务流程或放宽 postCondition 条件'
-
-    constructor(readonly context: Record<string, unknown>) {
-        super('postCondition 未满足，工具动作不能证明业务目标已经达成')
-        this.name = 'PostConditionError'
-    }
-
-    toJSON(): object {
-        return {
-            error: {
-                code: this.code,
-                message: this.message,
-                suggestion: this.suggestion,
-                context: this.context,
-            },
-        }
-    }
+    verificationStatus: VerificationStatus
+    operation: string
+    elapsedMs: number
+    checks: CheckResult[]
+    retryable: boolean
+    error?: string
 }
 
 function sleep(ms: number): Promise<void> {
@@ -77,146 +62,115 @@ function remainingMs(timeout: number, startedAt: number): number {
     return Math.max(0, timeout - (Date.now() - startedAt))
 }
 
-function nextCheckTimeout(timeout: number, startedAt: number): number {
-    const remaining = remainingMs(timeout, startedAt)
-    if (remaining <= 0) {
-        throw new Error('postCondition 检查超时')
-    }
-    return Math.max(1, remaining)
+function isUnavailableError(message: string): boolean {
+    return /frame|execution context|debugger|extension.*(?:disconnect|未连接)|not connected|cannot resolve cdp|failed to attach|restricted|cannot access/i.test(
+        message
+    )
+}
+
+function boundedError(error: unknown): string {
+    return sanitizeErrorMessage(error instanceof Error ? error.message : String(error)).slice(0, 500)
 }
 
 async function checkPostCondition(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     condition: PostCondition,
-    remainingTimeout: number
+    timeout: number,
+    mode?: InputMode
 ): Promise<CheckResult[]> {
     const checks: CheckResult[] = []
-    const checkStartedAt = Date.now()
+    const startedAt = Date.now()
+    const nextTimeout = (): number => Math.max(1, remainingMs(timeout, startedAt))
 
     if (condition.text !== undefined) {
-        const result = await unifiedSession.evaluate<TextCheckResult>(
+        const result = await unifiedSession.evaluate<{ matched: boolean; actual: string }>(
             `(expected, exact) => {
                 const body = document.body
-                const sampleLimit = 500
-                const appendSample = (sample, value) =>
-                    sample.length >= sampleLimit ? sample : sample + value.slice(0, sampleLimit - sample.length)
-                const formatSample = (text) => ({
-                    actual: text.length > sampleLimit ? text.slice(0, sampleLimit) + '...' : text,
-                    truncated: text.length > sampleLimit,
-                })
-                if (!body) {
-                    return { matched: false, actual: '', truncated: false }
-                }
-
-                const values = Array.from(body.querySelectorAll('input, textarea, select')).map((element) => {
-                    if (element instanceof HTMLSelectElement) {
-                        return Array.from(element.selectedOptions)
-                            .map((option) => option.value || option.textContent || '')
-                            .join(' ')
-                    }
-                    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-                        return element.value || ''
-                    }
-                    return ''
-                })
-                const bodyText = body.textContent || ''
-                if (exact) {
-                    const matched = bodyText === expected || values.some((value) => value === expected)
-                    return { matched, ...formatSample([bodyText, ...values].join('\\n')) }
-                }
-
-                const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT)
-                const segments = []
-                let node = walker.nextNode()
-                while (node) {
-                    segments.push(node.nodeValue || '')
-                    node = walker.nextNode()
-                }
-                segments.push(...values)
-                const text = segments.join('\\n')
-                return { matched: text.includes(expected), ...formatSample(text) }
+                if (!body) return { matched: false, actual: '' }
+                const values = Array.from(body.querySelectorAll('input, textarea, select')).map((element) =>
+                    element instanceof HTMLSelectElement
+                        ? Array.from(element.selectedOptions).map((option) => option.value || option.textContent || '').join(' ')
+                        : element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value || '' : '')
+                const text = [body.textContent || '', ...values].join('\\n')
+                return { matched: exact ? [body.textContent || '', ...values].some((value) => value === expected) : text.includes(expected), actual: text.slice(0, 500) }
             }`,
-            undefined,
-            nextCheckTimeout(remainingTimeout, checkStartedAt),
+            mode,
+            nextTimeout(),
             [condition.text, condition.exact === true]
         )
-        checks.push({
-            name: 'text',
-            matched: result.matched,
-            actual: result.actual,
-        })
+        checks.push({ name: 'text', matched: result.matched, actual: result.actual })
     }
-
     if (condition.selector !== undefined) {
         const count = await unifiedSession.evaluate<number>(
             '(selector) => document.querySelectorAll(selector).length',
-            undefined,
-            nextCheckTimeout(remainingTimeout, checkStartedAt),
+            mode,
+            nextTimeout(),
             [condition.selector]
         )
         checks.push({ name: 'selector', matched: count > 0, actual: { count } })
     }
-
     if (condition.urlIncludes !== undefined) {
-        const url = await unifiedSession.evaluate<string>(
-            'location.href',
-            undefined,
-            nextCheckTimeout(remainingTimeout, checkStartedAt)
-        )
-        checks.push({ name: 'urlIncludes', matched: url.includes(condition.urlIncludes), actual: url })
+        const url = await unifiedSession.evaluate<string>('location.href', mode, nextTimeout())
+        checks.push({ name: 'urlIncludes', matched: url.includes(condition.urlIncludes), actual: url.slice(0, 500) })
     }
-
     if (condition.script !== undefined) {
-        const value = await unifiedSession.evaluate<unknown>(
-            condition.script,
-            undefined,
-            nextCheckTimeout(remainingTimeout, checkStartedAt)
-        )
+        const value = await unifiedSession.evaluate<unknown>(condition.script, mode, nextTimeout())
         checks.push({ name: 'script', matched: Boolean(value), actual: value })
     }
-
     return checks
 }
 
 export async function waitForPostCondition(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     condition: PostCondition,
-    operation: string
-): Promise<Record<string, unknown>> {
+    operation: string,
+    mode?: InputMode
+): Promise<PostConditionResult> {
     const timeout = condition.timeout ?? POST_CONDITION_DEFAULT_TIMEOUT_MS
     const interval = condition.interval ?? POST_CONDITION_DEFAULT_INTERVAL_MS
     const startedAt = Date.now()
-    let lastChecks: CheckResult[] = []
-    let lastError: string | undefined
+    let checks: CheckResult[] = []
 
     while (remainingMs(timeout, startedAt) > 0) {
         try {
-            const checkTimeout = Math.max(1, Math.min(interval, remainingMs(timeout, startedAt)))
-            lastChecks = await checkPostCondition(unifiedSession, condition, checkTimeout)
-            lastError = undefined
-            if (lastChecks.every((check) => check.matched)) {
+            checks = await checkPostCondition(
+                unifiedSession,
+                condition,
+                Math.max(1, remainingMs(timeout, startedAt)),
+                mode
+            )
+            if (checks.every((check) => check.matched)) {
                 return {
                     matched: true,
+                    verificationStatus: 'matched',
                     operation,
                     elapsedMs: Date.now() - startedAt,
-                    checks: lastChecks,
+                    checks,
+                    retryable: false,
                 }
             }
         } catch (error) {
-            lastError = error instanceof Error ? error.message : String(error)
+            const message = boundedError(error)
+            return {
+                matched: false,
+                verificationStatus: isUnavailableError(message) ? 'unavailable' : 'error',
+                operation,
+                elapsedMs: Date.now() - startedAt,
+                checks,
+                retryable: isUnavailableError(message),
+                error: message,
+            }
         }
-
         const waitMs = Math.min(interval, remainingMs(timeout, startedAt))
-        if (waitMs <= 0) {
-            break
-        }
-        await sleep(waitMs)
+        if (waitMs > 0) await sleep(waitMs)
     }
 
-    throw new PostConditionError({
+    return {
+        matched: false,
+        verificationStatus: 'not_matched',
         operation,
-        timeout,
-        checks: lastChecks,
-        lastError,
-    })
+        elapsedMs: Date.now() - startedAt,
+        checks,
+        retryable: true,
+    }
 }

@@ -1,6 +1,6 @@
 {
     "name": "mcp-chrome-extension",
-    "version": "2.3.2",
+    "version": "2.4.0",
     "private": true,
     "type": "module",
     "scripts": {
@@ -16,11 +16,11 @@
         "node": ">=20.19.0"
     },
     "devDependencies": {
-        "@crxjs/vite-plugin": "^2.6.1",
-        "@types/chrome": "^0.1.43",
-        "stylelint": "^17.13.0",
+        "@crxjs/vite-plugin": "^2.7.1",
+        "@types/chrome": "^0.2.2",
+        "stylelint": "^17.14.0",
         "stylelint-config-standard": "^40.0.0",
-        "typescript": "^6.0.3",
-        "vite": "^8.0.16"
+        "typescript": "^7.0.2",
+        "vite": "^8.1.4"
     }
 }

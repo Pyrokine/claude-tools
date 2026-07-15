@@ -255,6 +255,10 @@ async function run() {
         reporter.fail('input replace', e);
     }
 
+    // 3.6 non-selection input replace（本地 test-page.html）
+    // 手工回归时对 #edit-number 执行 find="23", text="99"，确认不调用 selection API，
+    // 返回 requestedValue/actualValue，并且 input/change 各触发一次
+
     // ==================== 4. evaluate ====================
 
     console.log('\n4. evaluate');

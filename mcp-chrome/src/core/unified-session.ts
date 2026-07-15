@@ -35,6 +35,12 @@ export type ConnectionMode = 'extension' | 'cdp' | 'none'
 type ActiveConnectionMode = Exclude<ConnectionMode, 'none'>
 export type InputMode = 'stealth' | 'precise' // stealth=JS模拟, precise=debugger API
 
+export interface EvaluationMetadata {
+    retryAttempted: boolean
+    retryReason?: string
+    frameContext: Record<string, unknown>
+}
+
 interface CdpPropertyDescriptor {
     name: string
     value?: CdpResultObject
@@ -72,6 +78,7 @@ class UnifiedSessionManager {
     private tabSwitchLock: Promise<void> = Promise.resolve() // 串行化 tab 切换，防止并发竞态
     private requireExtension = false // 指定 tabId 或 frame 时为 true，禁止 CDP 回退
     private currentFrameOffset: { x: number; y: number } | null = null // iframe 在主页面的偏移量（withFrame 期间有效）
+    private lastEvaluationMetadata: EvaluationMetadata | undefined
 
     private constructor() {}
 
@@ -150,6 +157,12 @@ class UnifiedSessionManager {
      */
     getFrameOffset(): { x: number; y: number } | null {
         return this.currentFrameOffset
+    }
+
+    consumeLastEvaluationMetadata(): EvaluationMetadata | undefined {
+        const metadata = this.lastEvaluationMetadata
+        this.lastEvaluationMetadata = undefined
+        return metadata
     }
 
     /**
@@ -509,6 +522,7 @@ class UnifiedSessionManager {
         _retried?: boolean
     ): Promise<T> {
         const entryStart = Date.now()
+        this.lastEvaluationMetadata = undefined
         const effectiveMode = mode ?? this.inputMode
         const hasArgs = args && args.length > 0
 
@@ -1201,6 +1215,16 @@ class UnifiedSessionManager {
             const result = (await this.extensionBridge!.evaluateInFrame(currentFrameId, iframeExpression, timeout)) as {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+                retryAttempted?: boolean
+                retryReason?: string
+                frameContext?: Record<string, unknown>
+            }
+            if (result.frameContext) {
+                this.lastEvaluationMetadata = {
+                    retryAttempted: result.retryAttempted === true,
+                    retryReason: result.retryReason,
+                    frameContext: result.frameContext,
+                }
             }
             return this.checkCdpResult<T>(result)
         }

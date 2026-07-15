@@ -353,6 +353,13 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：文件存在，内容为 `hello world`（不带引号）
 - 载体：任意
 
+### evaluate-default-precise-01
+
+- 前置：`manage inputMode stealth`
+- 操作：`evaluate { script: "const value = 41; value + 1", postCondition: { script: "const ready = true; ready" } }`
+- 断言：未显式传 `mode` 时仍返回 `result === 42`，`postCondition.verificationStatus === "matched"`
+- 载体：任意
+
 ### evaluate-stealth-01
 
 - 前置：`manage inputMode stealth`（注：evaluate 的 mode 与 inputMode 无关，这里仅验证 evaluate 自身的 stealth 模式）
@@ -808,6 +815,12 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：`input { events: [{type:"select", target:{css:"#edit-textarea"}, find:"a", nth:1}] }`
 - 断言：选中第 2 个 "a"
 
+### input-select-04-target-nth
+
+- 前置：注入两个 `.mcp-nth-target` textarea，第二个 value 为 `"a a a"`
+- 操作：`input { events: [{type:"select", target:{css:".mcp-nth-target", nth:1}, find:"a", nth:1}] }`
+- 断言：聚焦第二个 textarea，并选中其中第 2 个 `"a"`，事件级 `nth` 没有覆盖 `target.nth`
+
 ### input-replace-01-input
 
 - 前置：`#text-input.value="hello world"`
@@ -960,10 +973,16 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：`logs { type: "console" }`
 - 断言：返回数组包含 `{level:"info", text:"[MCP-TEST] Info message"}`
 
-### logs-console-02-level-filter
+### logs-console-02-error-filter
 
 - 操作：`logs { type: "console", level: "error" }`
 - 断言：只返回 error 级别
+
+### logs-console-02-info-filter
+
+- 前置：触发 `console.log("mcp_info_filter")`
+- 操作：`logs { type: "console", level: "info" }`
+- 断言：结果包含 `{level:"info", text:"mcp_info_filter"}`，不返回原始 `level:"log"`
 
 ### logs-console-03-limit
 
@@ -994,6 +1013,14 @@ FAIL 时只需报 ID + 失败断言即可
   `browse/evaluate diagnostics=true` 触发失败请求
 - 操作：`logs { type:"network" }`
 - 断言：返回数组含失败请求或 4xx/5xx 请求，字段含 `url/method/status/errorText/timestamp/duration` 中可由当前浏览器提供的值
+
+### logs-network-04-inline-url-limit
+
+- 前置：通过 image 或 fetch 触发长度超过 2048 的 data URL 网络记录
+- 操作：`logs { type:"network" }`
+- 断言：对应记录 `url.length === 2048`，`urlLength` 等于原始长度，`urlTruncated === true`
+- 操作：`logs { type:"network", output:"tmp:mcp-network-logs.json" }`
+- 断言：输出文件中的对应记录保留完整 URL，不含内联截断
 
 ### logs-output-01
 
@@ -1304,3 +1331,21 @@ test-page.html 现有 region（供用例引用）：
   （Chromium 限制 [crbug.com/40232842](https://issues.chromium.org/40232842)）；
   走 scripting 路径的 `input click` 在 srcdoc iframe 内找不到元素，`evaluate frame=...` 走 CDP 不受影响；
   有 `src` 属性的真实 iframe 不受影响
+
+
+## CH-01 至 CH-07 聚焦回归
+
+- `ch-input-01`: 对 `#edit-number` 执行 replace，确认不调用 selection API，返回 `requestedValue`、`actualValue`，并派发 `input` 与 `change`
+- `ch-input-02`: 对 `#edit-date` 执行 select，确认返回 `UNSUPPORTED_SELECTION` 及 tag、input type、current value、requested find、推荐模式
+- `ch-postcondition-01`: 已完成动作后的 false selector 返回 `actionStatus=completed`、`verificationStatus=not_matched`、`failureStage=verification`
+- `ch-postcondition-02`: frame/context/debugger 不可用返回 `verificationStatus=unavailable`，不伪装为 `not_matched`
+- `ch-timeout-01`: 1ms debugger timeout 返回 `actionStatus=unknown`，不宣称页面脚本未执行
+- `ch-target-01`: input、extract、wait 的 target timeout 返回 locator、target type、nth、URL、tabId、managed、frame、match count、最多 10 个候选和 last state
+- `ch-port-01`: 无 server 时 Extension 只输出聚合 debug 摘要，不为每个候选端口输出 warning/error
+- `ch-port-02`: 已识别 MCP server 的 token/proof 不匹配或认证协议不完整时，输出一条限量 warning；同一摘要重连时不重复刷屏
+- `ch-frame-01`: iframe 导航销毁 context 后 precise evaluate 仅重试一次，并返回 retry 和最终 frame/context 摘要
+- `ch-frame-02`: 两个相同 URL iframe 返回 bounded candidates 并拒绝选择任一 frame
+- `ch-diagnostics-01`: restricted URL 导航到普通 URL 且 `diagnostics=true`，主导航成功，返回 `diagnosticsStatus=unavailable` 与原始摘要
+- `ch-diagnostics-02`: browse 或 wait 主动作失败且 `diagnostics=true` 时，错误响应保留 `diagnosticsStatus`、新增 console/network 摘要或采集错误
+
+无需浏览器的聚焦测试执行 `npm test`，真实 MCP runtime 回归仍需按本文件用例顺序在受控测试 tab 中执行

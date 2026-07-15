@@ -28,6 +28,7 @@ import {
 import type { Target } from '../core/types.js'
 import { comparePngImages, MAX_COMPARE_PIXELS, MAX_COMPARE_PNG_BYTES, readPngHeader } from './png.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
+import { buildTargetDiagnostics, TargetTimeoutError } from './target-diagnostics.js'
 
 /** 图片元信息 */
 interface ImageInfo {
@@ -153,7 +154,7 @@ async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
             return await unifiedSession.withFrame(args.frame, async () => {
                 // Extension 路径：等待目标元素出现（如果指定了 target + timeout）
                 if (useExtension && args.target && args.timeout !== undefined) {
-                    await waitForTargetExtension(unifiedSession, args.target, args.timeout)
+                    await waitForTargetExtension(unifiedSession, args.target, args.timeout, args.frame)
                 }
 
                 return handleExtractInFrame({ unifiedSession, session, useExtension }, args)
@@ -1392,7 +1393,8 @@ async function extractComputedStyleExtension(
 async function waitForTargetExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
-    timeout: number
+    timeout: number,
+    frame?: string | number
 ): Promise<void> {
     if ('x' in target && 'y' in target) {
         return
@@ -1403,23 +1405,40 @@ async function waitForTargetExtension(
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
     const nth = nthParam ?? 0
     let lastError: Error | null = null
+    let matchCount = 0
+    let candidates: Array<{
+        tag: string
+        text: string
+        rect: { x: number; y: number; width: number; height: number }
+    }> = []
 
     while (true) {
         const elapsed = Date.now() - startTime
         if (elapsed >= timeout) {
-            const msg = `等待目标元素超时 (${timeout}ms)`
-            throw new Error(lastError ? `${msg}: ${lastError.message}` : msg)
+            throw new TargetTimeoutError(
+                await buildTargetDiagnostics(unifiedSession, target, {
+                    nth,
+                    timeout,
+                    frame,
+                    matchCount,
+                    lastState: 'attached',
+                    lastError,
+                    candidates,
+                })
+            )
         }
 
+        const remaining = timeout - elapsed
         if (!unifiedSession.isExtensionConnected()) {
             lastError = new Error('Extension 未连接')
-            await new Promise((r) => setTimeout(r, retryDelay))
+            await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelay, remaining)))
             continue
         }
 
         try {
-            const remaining = timeout - elapsed
             const elements = await unifiedSession.find(selector, text, xpath, remaining)
+            matchCount = elements.length
+            candidates = elements
             if (elements.length > nth) {
                 return
             }
@@ -1430,13 +1449,19 @@ async function waitForTargetExtension(
                 /Request timeout|Failed to send|disconnect|未连接|stopped|replaced/i.test(err.message)
             ) {
                 lastError = err
-                await new Promise((r) => setTimeout(r, retryDelay))
+                const retryRemaining = timeout - (Date.now() - startTime)
+                if (retryRemaining > 0) {
+                    await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelay, retryRemaining)))
+                }
                 continue
             }
             throw err
         }
 
-        await new Promise((r) => setTimeout(r, retryDelay))
+        const retryRemaining = timeout - (Date.now() - startTime)
+        if (retryRemaining > 0) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelay, retryRemaining)))
+        }
     }
 }
 

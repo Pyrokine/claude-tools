@@ -10,58 +10,21 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { formatErrorResponse, formatResponse, getSession, getUnifiedSession, TimeoutError } from '../core/index.js'
+import { formatErrorResponse, getSession, getUnifiedSession, TimeoutError } from '../core/index.js'
 import { DEFAULT_TIMEOUT, type ElementState, type Target } from '../core/types.js'
+import { withDiagnosticsResponse } from './diagnostics.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
+import { buildTargetDiagnostics, TargetTimeoutError, type TargetCandidate } from './target-diagnostics.js'
 
 /** 轮询间隔（毫秒） */
 const POLL_INTERVAL = 100
 const NAVIGATION_SNAPSHOT_TIMEOUT = 1000
 
-interface DiagnosticsStart {
-    consoleCount: number
-    networkCount: number
-}
-
-async function captureDiagnosticsStart(
-    unifiedSession: ReturnType<typeof getUnifiedSession>
-): Promise<DiagnosticsStart> {
-    await unifiedSession.enableConsole()
-    await unifiedSession.enableNetwork()
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return { consoleCount: consoleLogs.length, networkCount: network.length }
-}
-
-async function captureDiagnosticsDelta(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    start: DiagnosticsStart
-): Promise<Record<string, unknown>> {
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return {
-        console: consoleLogs
-            .slice(start.consoleCount)
-            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
-            .slice(-20),
-        failedRequests: network
-            .slice(start.networkCount)
-            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
-            .slice(-20),
+async function sleepWithinBudget(startedAt: number, timeout: number, interval: number): Promise<void> {
+    const remaining = timeout - (Date.now() - startedAt)
+    if (remaining > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(interval, remaining)))
     }
-}
-
-async function withDiagnostics<T extends Record<string, unknown>>(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    enabled: boolean | undefined,
-    action: () => Promise<T>
-): Promise<T & { diagnostics?: Record<string, unknown> }> {
-    const start = enabled ? await captureDiagnosticsStart(unifiedSession) : undefined
-    const result: T & { diagnostics?: Record<string, unknown> } = await action()
-    if (start) {
-        result.diagnostics = await captureDiagnosticsDelta(unifiedSession, start)
-    }
-    return result
 }
 
 async function getExtensionNavigationSnapshot(
@@ -157,119 +120,109 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                         }
                         const state = args.state ?? 'visible'
 
-                        return formatResponse(
-                            await withDiagnostics(unifiedSession, args.diagnostics, async () => {
-                                if (mode === 'extension') {
-                                    await waitForElementExtension(unifiedSession, args.target!, state, timeout)
-                                } else {
-                                    const session = getSession()
-                                    await waitForElement(session, args.target!, state, timeout)
-                                }
-                                return {
-                                    success: true,
-                                    waited: 'element',
-                                    state,
-                                    mode,
-                                }
-                            })
-                        )
+                        return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                            if (mode === 'extension') {
+                                await waitForElementExtension(unifiedSession, args.target!, state, timeout, args.frame)
+                            } else {
+                                const session = getSession()
+                                await waitForElement(session, args.target!, state, timeout)
+                            }
+                            return {
+                                success: true,
+                                waited: 'element',
+                                state,
+                                mode,
+                            }
+                        })
                     }
 
                     case 'navigation': {
-                        const diagnosticsStart = args.diagnostics
-                            ? await captureDiagnosticsStart(unifiedSession)
-                            : undefined
-                        if (mode === 'extension') {
-                            const navStart = Date.now()
-                            let navCompleted = false
-                            let navLastError: Error | null = null
-                            let initialUrl: string | null = null
-                            let initialTitle: string | null = null
-                            let sawLoading = false
-                            let navUrl: string | null = null
-                            let navTitle: string | null = null
+                        return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                            if (mode === 'extension') {
+                                const navStart = Date.now()
+                                let navCompleted = false
+                                let navLastError: Error | null = null
+                                let initialUrl: string | null = null
+                                let initialTitle: string | null = null
+                                let sawLoading = false
+                                let navUrl: string | null = null
+                                let navTitle: string | null = null
 
-                            try {
-                                const initial = await getExtensionNavigationSnapshot(
-                                    unifiedSession,
-                                    Math.min(timeout, NAVIGATION_SNAPSHOT_TIMEOUT)
-                                )
-                                if (unifiedSession.isExtensionConnected()) {
-                                    initialUrl = initial.url
-                                    initialTitle = initial.title
-                                    sawLoading = initial.readyState !== 'complete'
-                                }
-                            } catch (err) {
-                                sawLoading = true
-                                navLastError = err instanceof Error ? err : new Error(String(err))
-                            }
-
-                            while (!navCompleted && Date.now() - navStart < timeout) {
-                                if (!unifiedSession.isExtensionConnected()) {
-                                    navLastError = new Error('Extension 未连接')
-                                    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
-                                    continue
-                                }
                                 try {
-                                    const remaining = timeout - (Date.now() - navStart)
-                                    const pageInfo = await getExtensionNavigationSnapshot(
+                                    const initial = await getExtensionNavigationSnapshot(
                                         unifiedSession,
-                                        Math.min(remaining, NAVIGATION_SNAPSHOT_TIMEOUT)
+                                        Math.min(timeout, NAVIGATION_SNAPSHOT_TIMEOUT)
                                     )
-                                    if (!unifiedSession.isExtensionConnected()) {
-                                        navLastError = new Error('Extension 在查询导航状态期间断开')
-                                        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
-                                        continue
-                                    }
-
-                                    if (pageInfo.readyState !== 'complete') {
-                                        sawLoading = true
-                                    } else {
-                                        const changed =
-                                            (initialUrl !== null && pageInfo.url !== initialUrl) ||
-                                            (initialTitle !== null && pageInfo.title !== initialTitle)
-                                        if (sawLoading || changed || initialUrl === null) {
-                                            navUrl = pageInfo.url
-                                            navTitle = pageInfo.title
-                                            navCompleted = true
-                                            break
-                                        }
+                                    if (unifiedSession.isExtensionConnected()) {
+                                        initialUrl = initial.url
+                                        initialTitle = initial.title
+                                        sawLoading = initial.readyState !== 'complete'
                                     }
                                 } catch (err) {
+                                    sawLoading = true
                                     navLastError = err instanceof Error ? err : new Error(String(err))
                                 }
-                                await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
-                            }
-                            if (!navCompleted) {
-                                const msg = `等待导航完成超时 (${timeout}ms)`
-                                throw new TimeoutError(navLastError ? `${msg}: ${navLastError.message}` : msg)
+
+                                while (!navCompleted && Date.now() - navStart < timeout) {
+                                    if (!unifiedSession.isExtensionConnected()) {
+                                        navLastError = new Error('Extension 未连接')
+                                        await sleepWithinBudget(navStart, timeout, POLL_INTERVAL)
+                                        continue
+                                    }
+                                    try {
+                                        const remaining = timeout - (Date.now() - navStart)
+                                        const pageInfo = await getExtensionNavigationSnapshot(
+                                            unifiedSession,
+                                            Math.min(remaining, NAVIGATION_SNAPSHOT_TIMEOUT)
+                                        )
+                                        if (!unifiedSession.isExtensionConnected()) {
+                                            navLastError = new Error('Extension 在查询导航状态期间断开')
+                                            await sleepWithinBudget(navStart, timeout, POLL_INTERVAL)
+                                            continue
+                                        }
+
+                                        if (pageInfo.readyState !== 'complete') {
+                                            sawLoading = true
+                                        } else {
+                                            const changed =
+                                                (initialUrl !== null && pageInfo.url !== initialUrl) ||
+                                                (initialTitle !== null && pageInfo.title !== initialTitle)
+                                            if (sawLoading || changed || initialUrl === null) {
+                                                navUrl = pageInfo.url
+                                                navTitle = pageInfo.title
+                                                navCompleted = true
+                                                break
+                                            }
+                                        }
+                                    } catch (err) {
+                                        navLastError = err instanceof Error ? err : new Error(String(err))
+                                    }
+                                    await sleepWithinBudget(navStart, timeout, POLL_INTERVAL)
+                                }
+                                if (!navCompleted) {
+                                    const msg = `等待导航完成超时 (${timeout}ms)`
+                                    throw new TimeoutError(navLastError ? `${msg}: ${navLastError.message}` : msg)
+                                }
+
+                                return {
+                                    success: true,
+                                    waited: 'navigation',
+                                    url: navUrl,
+                                    title: navTitle,
+                                    mode,
+                                }
                             }
 
-                            return formatResponse({
+                            const session = getSession()
+                            await waitForNavigation(session, timeout)
+                            const sessionState = session.getState()
+                            return {
                                 success: true,
                                 waited: 'navigation',
-                                url: navUrl,
-                                title: navTitle,
+                                url: sessionState?.url,
+                                title: sessionState?.title,
                                 mode,
-                                ...(diagnosticsStart
-                                    ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
-                                    : {}),
-                            })
-                        }
-
-                        // CDP 模式
-                        const session = getSession()
-                        await waitForNavigation(session, timeout)
-                        const sessionState = session.getState()
-                        return formatResponse({
-                            success: true,
-                            waited: 'navigation',
-                            url: sessionState?.url,
-                            title: sessionState?.title,
-                            mode,
-                            ...(diagnosticsStart
-                                ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
-                                : {}),
+                            }
                         })
                     }
 
@@ -290,74 +243,74 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 isError: true,
                             }
                         }
-                        await new Promise((resolve) => setTimeout(resolve, args.ms))
-                        return formatResponse({
-                            success: true,
-                            waited: 'time',
-                            ms: args.ms,
+                        return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                            await new Promise((resolve) => setTimeout(resolve, args.ms))
+                            return {
+                                success: true,
+                                waited: 'time',
+                                ms: args.ms,
+                            }
                         })
                     }
 
                     case 'idle': {
-                        const diagnosticsStart = args.diagnostics
-                            ? await captureDiagnosticsStart(unifiedSession)
-                            : undefined
-                        if (mode === 'extension') {
-                            // Extension 模式：readyState complete + DOM mutation 静默检测
-                            const idleStart = Date.now()
-                            const quietPeriod = args.ms ?? 500
-                            let idleCompleted = false
-                            let idleLastError: Error | null = null
+                        return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                            if (mode === 'extension') {
+                                // Extension 模式：readyState complete + DOM mutation 静默检测
+                                const idleStart = Date.now()
+                                const quietPeriod = args.ms ?? 500
+                                let idleCompleted = false
+                                let idleLastError: Error | null = null
 
-                            // Phase 1: 等待 readyState === 'complete'
-                            while (Date.now() - idleStart < timeout) {
-                                if (!unifiedSession.isExtensionConnected()) {
-                                    idleLastError = new Error('Extension 未连接')
-                                    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
-                                    continue
-                                }
-                                try {
-                                    const remaining = timeout - (Date.now() - idleStart)
-                                    const readyState = await unifiedSession.evaluate<string>(
-                                        'document.readyState',
-                                        undefined,
-                                        remaining
-                                    )
+                                // Phase 1: 等待 readyState === 'complete'
+                                while (Date.now() - idleStart < timeout) {
                                     if (!unifiedSession.isExtensionConnected()) {
-                                        idleLastError = new Error('Extension 在 evaluate 期间断开')
-                                        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
+                                        idleLastError = new Error('Extension 未连接')
+                                        await sleepWithinBudget(idleStart, timeout, POLL_INTERVAL)
                                         continue
                                     }
-                                    if (readyState === 'complete') {
-                                        idleCompleted = true
-                                        break
+                                    try {
+                                        const remaining = timeout - (Date.now() - idleStart)
+                                        const readyState = await unifiedSession.evaluate<string>(
+                                            'document.readyState',
+                                            undefined,
+                                            remaining
+                                        )
+                                        if (!unifiedSession.isExtensionConnected()) {
+                                            idleLastError = new Error('Extension 在 evaluate 期间断开')
+                                            await sleepWithinBudget(idleStart, timeout, POLL_INTERVAL)
+                                            continue
+                                        }
+                                        if (readyState === 'complete') {
+                                            idleCompleted = true
+                                            break
+                                        }
+                                    } catch (err) {
+                                        idleLastError = err instanceof Error ? err : new Error(String(err))
                                     }
-                                } catch (err) {
-                                    idleLastError = err instanceof Error ? err : new Error(String(err))
+                                    await sleepWithinBudget(idleStart, timeout, POLL_INTERVAL)
                                 }
-                                await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
-                            }
-                            if (!idleCompleted) {
-                                const msg = `等待页面加载超时 (${timeout}ms)`
-                                throw new TimeoutError(idleLastError ? `${msg}: ${idleLastError.message}` : msg)
-                            }
+                                if (!idleCompleted) {
+                                    const msg = `等待页面加载超时 (${timeout}ms)`
+                                    throw new TimeoutError(idleLastError ? `${msg}: ${idleLastError.message}` : msg)
+                                }
 
-                            // Phase 2: DOM mutation 静默检测
-                            // 注入 MutationObserver，等待 quietPeriod 毫秒内无 DOM 变更
-                            const mutationRemaining = timeout - (Date.now() - idleStart)
-                            const scriptTimeout = mutationRemaining - POLL_INTERVAL
-                            if (scriptTimeout > quietPeriod) {
-                                try {
-                                    const domStable = await new Promise<boolean>((resolve, reject) => {
-                                        let settled = false
-                                        const timer = setTimeout(() => {
-                                            settled = true
-                                            resolve(false)
-                                        }, scriptTimeout)
+                                // Phase 2: DOM mutation 静默检测
+                                // 注入 MutationObserver，等待 quietPeriod 毫秒内无 DOM 变更
+                                const mutationRemaining = timeout - (Date.now() - idleStart)
+                                const scriptTimeout = mutationRemaining - POLL_INTERVAL
+                                if (scriptTimeout > quietPeriod) {
+                                    try {
+                                        const domStable = await new Promise<boolean>((resolve, reject) => {
+                                            let settled = false
+                                            const timer = setTimeout(() => {
+                                                settled = true
+                                                resolve(false)
+                                            }, scriptTimeout)
 
-                                        unifiedSession
-                                            .evaluate<boolean>(
-                                                `(function(quietMs, timeoutMs) {
+                                            unifiedSession
+                                                .evaluate<boolean>(
+                                                    `(function(quietMs, timeoutMs) {
                                                     return new Promise(function(resolve) {
                                                         var target = document.documentElement || document.body;
                                                         if (!target) {
@@ -402,70 +355,59 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                                         setTimeout(check, quietMs);
                                                     });
                                                 })`,
-                                                undefined,
-                                                mutationRemaining,
-                                                [quietPeriod, scriptTimeout]
+                                                    undefined,
+                                                    mutationRemaining,
+                                                    [quietPeriod, scriptTimeout]
+                                                )
+                                                .then((value) => {
+                                                    if (settled) {
+                                                        return
+                                                    }
+                                                    settled = true
+                                                    clearTimeout(timer)
+                                                    resolve(value)
+                                                })
+                                                .catch((err: unknown) => {
+                                                    if (settled) {
+                                                        return
+                                                    }
+                                                    settled = true
+                                                    clearTimeout(timer)
+                                                    reject(err)
+                                                })
+                                        })
+                                        if (!domStable) {
+                                            throw new TimeoutError(
+                                                `等待页面 idle 超时 (${timeout}ms): DOM 未达到 ${quietPeriod}ms 静默`
                                             )
-                                            .then((value) => {
-                                                if (settled) {
-                                                    return
-                                                }
-                                                settled = true
-                                                clearTimeout(timer)
-                                                resolve(value)
-                                            })
-                                            .catch((err: unknown) => {
-                                                if (settled) {
-                                                    return
-                                                }
-                                                settled = true
-                                                clearTimeout(timer)
-                                                reject(err)
-                                            })
-                                    })
-                                    if (!domStable) {
-                                        throw new TimeoutError(
-                                            `等待页面 idle 超时 (${timeout}ms): DOM 未达到 ${quietPeriod}ms 静默`
-                                        )
+                                        }
+                                        return {
+                                            success: true,
+                                            waited: 'idle',
+                                            domStable,
+                                            mode,
+                                        }
+                                    } catch (err) {
+                                        if (err instanceof TimeoutError) {
+                                            throw err
+                                        }
+                                        const message = err instanceof Error ? err.message : String(err)
+                                        throw new TimeoutError(`等待页面 idle 超时 (${timeout}ms): ${message}`)
                                     }
-                                    return formatResponse({
-                                        success: true,
-                                        waited: 'idle',
-                                        domStable,
-                                        mode,
-                                        ...(diagnosticsStart
-                                            ? {
-                                                  diagnostics: await captureDiagnosticsDelta(
-                                                      unifiedSession,
-                                                      diagnosticsStart
-                                                  ),
-                                              }
-                                            : {}),
-                                    })
-                                } catch (err) {
-                                    if (err instanceof TimeoutError) {
-                                        throw err
-                                    }
-                                    const message = err instanceof Error ? err.message : String(err)
-                                    throw new TimeoutError(`等待页面 idle 超时 (${timeout}ms): ${message}`)
                                 }
+
+                                throw new TimeoutError(
+                                    `等待页面 idle 超时 (${timeout}ms): 剩余时间不足以完成 ${quietPeriod}ms DOM 静默检测`
+                                )
                             }
 
-                            throw new TimeoutError(
-                                `等待页面 idle 超时 (${timeout}ms): 剩余时间不足以完成 ${quietPeriod}ms DOM 静默检测`
-                            )
-                        }
-
-                        // CDP 模式
-                        const session = getSession()
-                        await waitForNetworkIdle(session, timeout)
-                        return formatResponse({
-                            success: true,
-                            waited: 'idle',
-                            mode,
-                            ...(diagnosticsStart
-                                ? { diagnostics: await captureDiagnosticsDelta(unifiedSession, diagnosticsStart) }
-                                : {}),
+                            const session = getSession()
+                            await waitForNetworkIdle(session, timeout)
+                            return {
+                                success: true,
+                                waited: 'idle',
+                                mode,
+                            }
                         })
                     }
 
@@ -499,31 +441,45 @@ async function waitForElementExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
     state: ElementState,
-    timeout: number
+    timeout: number,
+    frame?: string | number
 ): Promise<void> {
     const startTime = Date.now()
     const retryDelay = POLL_INTERVAL
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
     const nth = nthParam ?? 0
     let lastError: Error | null = null
+    let matchCount = 0
+    let candidates: TargetCandidate[] = []
 
     while (true) {
         const elapsed = Date.now() - startTime
         if (elapsed >= timeout) {
-            const msg = `等待元素 ${JSON.stringify(target)} 状态 ${state} 超时 (${timeout}ms)`
-            throw new TimeoutError(lastError ? `${msg}: ${lastError.message}` : msg)
+            throw new TargetTimeoutError(
+                await buildTargetDiagnostics(unifiedSession, target, {
+                    nth,
+                    timeout,
+                    frame,
+                    matchCount,
+                    lastState: state,
+                    lastError,
+                    candidates,
+                })
+            )
         }
 
         // 未连接时跳过 find()，避免阻塞超出用户 timeout
         if (!unifiedSession.isExtensionConnected()) {
             lastError = new Error('Extension 未连接')
-            await new Promise((resolve) => setTimeout(resolve, retryDelay))
+            await sleepWithinBudget(startTime, timeout, retryDelay)
             continue
         }
 
         try {
             const remaining = timeout - elapsed
             const elements = await unifiedSession.find(selector, text, xpath, remaining)
+            matchCount = elements.length
+            candidates = elements
             const found = elements.length > nth
 
             switch (state) {
@@ -564,13 +520,13 @@ async function waitForElementExtension(
                 /Request timeout|Failed to send|disconnect|未连接|stopped|replaced/i.test(err.message)
             ) {
                 lastError = err
-                await new Promise((resolve) => setTimeout(resolve, retryDelay))
+                await sleepWithinBudget(startTime, timeout, retryDelay)
                 continue
             }
             throw err
         }
 
-        await new Promise((resolve) => setTimeout(resolve, retryDelay))
+        await sleepWithinBudget(startTime, timeout, retryDelay)
     }
 }
 
@@ -636,7 +592,7 @@ async function waitForElement(
             // 继续等待
         }
 
-        await new Promise((resolve) => setTimeout(resolve, retryDelay))
+        await sleepWithinBudget(startTime, timeout, retryDelay)
     }
 
     throw new TimeoutError(`等待元素 ${JSON.stringify(target)} 状态 ${state} 超时 (${timeout}ms)`)

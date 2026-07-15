@@ -1,18 +1,21 @@
 {
     "name": "@pyrokine/mcp-chrome",
-    "version": "2.3.2",
+    "version": "2.4.0",
     "description": "Chrome browser automation MCP Server using Chrome DevTools Protocol",
     "main": "dist/index.js",
     "type": "module",
     "scripts": {
-        "build": "tsc",
+        "build": "node node_modules/typescript7/bin/tsc",
+        "build:extension": "npm --prefix extension ci --include=optional && npm --prefix extension run build",
         "start": "node dist/index.js",
-        "dev": "tsc -w",
+        "dev": "node node_modules/typescript7/bin/tsc -w",
         "prepare": "npm run build",
+        "prepack": "npm run build && npm run build:extension",
         "lint": "eslint \"src/**/*.ts\" \"extension/src/**/*.ts\"",
         "lint:fix": "eslint \"src/**/*.ts\" \"extension/src/**/*.ts\" --fix",
         "format": "prettier --write src/",
-        "format:check": "prettier --check src/"
+        "format:check": "prettier --check src/",
+        "test": "npm run build && node --test test/ch-regressions.test.js"
     },
     "keywords": [
         "mcp",
@@ -26,17 +29,18 @@
     "license": "MIT",
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
-        "ws": "^8.21.0",
+        "ws": "^8.21.1",
         "zod": "^4.4.3"
     },
     "devDependencies": {
         "@eslint/js": "^10.0.1",
-        "@types/node": "^25.9.3",
+        "@types/node": "^26.1.1",
         "@types/ws": "^8.18.1",
-        "eslint": "^10.5.0",
-        "prettier": "^3.8.4",
-        "typescript": "^6.0.3",
-        "typescript-eslint": "^8.61.0"
+        "eslint": "^10.7.0",
+        "prettier": "^3.9.5",
+        "typescript": "npm:@typescript/typescript6@^6.0.2",
+        "typescript-eslint": "^8.64.0",
+        "typescript7": "npm:typescript@^7.0.2"
     },
     "engines": {
         "node": ">=20.19.0"

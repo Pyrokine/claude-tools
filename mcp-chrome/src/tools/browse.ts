@@ -16,6 +16,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import { DEFAULT_TIMEOUT, type WaitUntil } from '../core/types.js'
+import { withDiagnosticsResponse } from './diagnostics.js'
 
 /**
  * browse 参数 schema
@@ -51,39 +52,6 @@ const browseSchema = z.object({
 /**
  * browse 工具处理器
  */
-interface DiagnosticsStart {
-    consoleCount: number
-    networkCount: number
-}
-
-async function captureDiagnosticsStart(
-    unifiedSession: ReturnType<typeof getUnifiedSession>
-): Promise<DiagnosticsStart> {
-    await unifiedSession.enableConsole()
-    await unifiedSession.enableNetwork()
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return { consoleCount: consoleLogs.length, networkCount: network.length }
-}
-
-async function captureDiagnosticsDelta(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    start: DiagnosticsStart
-): Promise<Record<string, unknown>> {
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const network = await unifiedSession.getNetworkRequests()
-    return {
-        console: consoleLogs
-            .slice(start.consoleCount)
-            .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
-            .slice(-20),
-        failedRequests: network
-            .slice(start.networkCount)
-            .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
-            .slice(-20),
-    }
-}
-
 function pageStateMetadata(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     background: boolean
@@ -95,19 +63,6 @@ function pageStateMetadata(
         managed: state?.managed ?? false,
         background,
     }
-}
-
-async function runWithDiagnostics<T extends Record<string, unknown>>(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    enabled: boolean | undefined,
-    action: () => Promise<T>
-): Promise<T & { diagnostics?: Record<string, unknown> }> {
-    const start = enabled ? await captureDiagnosticsStart(unifiedSession) : undefined
-    const result: T & { diagnostics?: Record<string, unknown> } = await action()
-    if (start) {
-        result.diagnostics = await captureDiagnosticsDelta(unifiedSession, start)
-    }
-    return result
 }
 
 async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
@@ -357,70 +312,62 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                 if (currentState === null) {
                     await unifiedSession.newPage()
                 }
-                return formatResponse(
-                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
-                        await unifiedSession.navigate(args.url!, {
-                            wait: args.wait as WaitUntil,
-                            timeout: args.timeout ?? DEFAULT_TIMEOUT,
-                        })
-                        return {
-                            success: true,
-                            action: 'open',
-                            mode: unifiedSession.getMode(),
-                            ...pageStateMetadata(unifiedSession, true),
-                        }
+                return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                    await unifiedSession.navigate(args.url!, {
+                        wait: args.wait as WaitUntil,
+                        timeout: args.timeout ?? DEFAULT_TIMEOUT,
                     })
-                )
+                    return {
+                        success: true,
+                        action: 'open',
+                        mode: unifiedSession.getMode(),
+                        ...pageStateMetadata(unifiedSession, true),
+                    }
+                })
             }
 
             case 'back': {
-                return formatResponse(
-                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
-                        const result = await unifiedSession.goBack(args.timeout)
-                        return {
-                            success: true,
-                            action: 'back',
-                            mode: unifiedSession.getMode(),
-                            navigated: result.navigated,
-                            ...pageStateMetadata(unifiedSession, true),
-                            ...(result.navigated ? {} : { note: '无后退历史' }),
-                        }
-                    })
-                )
+                return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                    const result = await unifiedSession.goBack(args.timeout)
+                    return {
+                        success: true,
+                        action: 'back',
+                        mode: unifiedSession.getMode(),
+                        navigated: result.navigated,
+                        ...pageStateMetadata(unifiedSession, true),
+                        ...(result.navigated ? {} : { note: '无后退历史' }),
+                    }
+                })
             }
 
             case 'forward': {
-                return formatResponse(
-                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
-                        const result = await unifiedSession.goForward(args.timeout)
-                        return {
-                            success: true,
-                            action: 'forward',
-                            mode: unifiedSession.getMode(),
-                            navigated: result.navigated,
-                            ...pageStateMetadata(unifiedSession, true),
-                            ...(result.navigated ? {} : { note: '无前进历史' }),
-                        }
-                    })
-                )
+                return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                    const result = await unifiedSession.goForward(args.timeout)
+                    return {
+                        success: true,
+                        action: 'forward',
+                        mode: unifiedSession.getMode(),
+                        navigated: result.navigated,
+                        ...pageStateMetadata(unifiedSession, true),
+                        ...(result.navigated ? {} : { note: '无前进历史' }),
+                    }
+                })
             }
 
             case 'refresh': {
-                return formatResponse(
-                    await runWithDiagnostics(unifiedSession, args.diagnostics, async () => {
-                        await unifiedSession.reload({
-                            ignoreCache: args.ignoreCache ?? false,
-                            waitUntil: args.wait,
-                            timeout: args.timeout ?? DEFAULT_TIMEOUT,
-                        })
-                        return {
-                            success: true,
-                            action: 'refresh',
-                            mode: unifiedSession.getMode(),
-                            ...pageStateMetadata(unifiedSession, true),
-                        }
+                return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                    await unifiedSession.reload({
+                        ignoreCache: args.ignoreCache ?? false,
+                        waitUntil: args.wait,
+                        timeout: args.timeout ?? DEFAULT_TIMEOUT,
                     })
-                )
+                    return {
+                        success: true,
+                        action: 'refresh',
+                        mode: unifiedSession.getMode(),
+                        ...pageStateMetadata(unifiedSession, true),
+                    }
+                })
             }
 
             case 'close': {

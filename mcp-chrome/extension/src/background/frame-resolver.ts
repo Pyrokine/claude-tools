@@ -217,77 +217,202 @@ export class FrameResolver {
      */
     async evaluateInFrame(params: unknown, context: ActionContext): Promise<unknown> {
         const p = EvaluateInFrameSchema.parse(params)
-        const returnByValue = (params as { returnByValue?: boolean })?.returnByValue
-        const awaitPromise = (params as { awaitPromise?: boolean })?.awaitPromise
-
+        const options = params as { returnByValue?: boolean; awaitPromise?: boolean }
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'evaluate_in_frame')
         await this.debuggerManager.ensureAttached(tabId)
+        const startedAt = Date.now()
+        const originalFrame = await this.getExtensionFrameIdentity(tabId, p.frameId)
+        let retryAttempted = false
+        let retryReason: string | undefined
 
-        // 获取 Extension frameId 对应的 URL
-        const extFrames = await chrome.webNavigation.getAllFrames({ tabId })
-        if (!extFrames) {
-            throw new Error('Failed to enumerate frames')
-        }
-        const targetFrame = extFrames.find((f) => f.frameId === p.frameId)
-        if (!targetFrame) {
-            throw new ExpectedOperationError(`Frame ${p.frameId} not found`)
-        }
-
-        // 获取 CDP frame tree，通过 URL 匹配找到 CDP frameId
-        const treeResult = (await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree')) as {
-            frameTree: { frame: { id: string; url: string }; childFrames?: Array<unknown> }
-        }
-        const cdpFrameIds = this.findCdpFrameIds(treeResult.frameTree, targetFrame.url)
-        if (cdpFrameIds.length === 0) {
-            throw new Error(`Cannot resolve CDP frame for URL: ${targetFrame.url}`)
-        }
-        if (cdpFrameIds.length > 1) {
-            throw new ExpectedOperationError(
-                `Multiple CDP frames (${cdpFrameIds.length}) match URL "${targetFrame.url}". ` +
-                    'Cannot uniquely identify target iframe for precise evaluate. ' +
-                    'Use stealth mode or ensure iframes have distinct URLs.'
-            )
-        }
-        const cdpFrameId = cdpFrameIds[0]
-
-        // 确保 Runtime 域已启用以收集执行上下文
-        // 首次调用时 enable 会触发所有已存在上下文的事件；
-        // 后续调用复用缓存（由 onEvent 持久监听保持一致性）
-        let contexts = this.debuggerManager.getExecutionContexts(tabId)
-        if (contexts.length === 0) {
-            await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
-        }
-
-        // 轮询等待目标 frame 的主世界上下文（无论 contexts 是否已有其他 frame 的条目）
-        let targetCtx = contexts.find((c) => c.frameId === cdpFrameId && c.isDefault)
-        if (!targetCtx) {
-            const maxAttempts = Math.ceil((p.timeout ?? 2000) / 100)
-            for (let i = 0; i < maxAttempts; i++) {
-                await new Promise((resolve) => setTimeout(resolve, 100))
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const remaining = p.timeout === undefined ? undefined : p.timeout - (Date.now() - startedAt)
+            if (remaining !== undefined && remaining <= 0) {
+                throw this.frameEvaluationError(
+                    'FRAME_EVALUATION_TIMEOUT',
+                    'Frame evaluation timed out before resolution',
+                    {
+                        tabId,
+                        extensionFrameId: p.frameId,
+                        timeout: p.timeout,
+                        retryAttempted,
+                        retryReason,
+                    }
+                )
+            }
+            const identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
+            if (identity.parentFrameId !== originalFrame.parentFrameId || identity.frameId !== originalFrame.frameId) {
+                throw this.frameEvaluationError(
+                    'FRAME_IDENTITY_CHANGED',
+                    'Frame identity changed before stale-context retry; refusing to guess target',
+                    {
+                        tabId,
+                        retryAttempted,
+                        retryReason,
+                        originalFrame: this.frameIdentitySummary(originalFrame),
+                        currentFrame: this.frameIdentitySummary(identity),
+                    }
+                )
+            }
+            const resolved = await this.resolveCdpFrame(tabId, identity.url)
+            let contexts = this.debuggerManager.getExecutionContexts(tabId)
+            if (contexts.length === 0 || attempt > 0) await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
+            let targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
+            const deadline = p.timeout === undefined ? Date.now() + 2000 : startedAt + p.timeout
+            while (!targetCtx && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
                 contexts = this.debuggerManager.getExecutionContexts(tabId)
-                targetCtx = contexts.find((c) => c.frameId === cdpFrameId && c.isDefault)
-                if (targetCtx) {
-                    break
+                targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
+            }
+            if (!targetCtx) {
+                throw this.frameEvaluationError('FRAME_CONTEXT_UNAVAILABLE', 'No execution context for frame', {
+                    tabId,
+                    ...this.frameIdentitySummary(identity),
+                    cdpFrameId: resolved.cdpFrameId,
+                    contextCount: contexts.length,
+                    retryAttempted,
+                    retryReason,
+                })
+            }
+            const evaluationTimeout = p.timeout === undefined ? undefined : p.timeout - (Date.now() - startedAt)
+            if (evaluationTimeout !== undefined && evaluationTimeout <= 0) {
+                throw this.frameEvaluationError(
+                    'FRAME_EVALUATION_TIMEOUT',
+                    'Frame evaluation timed out before Runtime.evaluate',
+                    {
+                        tabId,
+                        ...this.frameIdentitySummary(identity),
+                        cdpFrameId: resolved.cdpFrameId,
+                        executionContextId: targetCtx.id,
+                        timeout: p.timeout,
+                        retryAttempted,
+                        retryReason,
+                    }
+                )
+            }
+            const evalParams: Record<string, unknown> = {
+                contextId: targetCtx.id,
+                expression: p.expression,
+                returnByValue: options.returnByValue ?? true,
+                awaitPromise: options.awaitPromise ?? true,
+                ...(evaluationTimeout !== undefined ? { timeout: evaluationTimeout } : {}),
+            }
+            try {
+                const result = (await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', evalParams)) as Record<
+                    string,
+                    unknown
+                >
+                return {
+                    ...result,
+                    retryAttempted,
+                    retryReason,
+                    frameContext: {
+                        tabId,
+                        extensionFrameId: identity.frameId,
+                        parentFrameId: identity.parentFrameId,
+                        url: identity.url.slice(0, 500),
+                        originalUrl: originalFrame.url.slice(0, 500),
+                        urlChanged: identity.url !== originalFrame.url,
+                        cdpFrameId: resolved.cdpFrameId,
+                        executionContextId: targetCtx.id,
+                    },
+                }
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                const staleContext =
+                    /context.*(?:destroyed|not found|invalid)|Cannot find context|Execution context/i.test(message)
+                if (attempt > 0) {
+                    throw this.frameEvaluationError('FRAME_EVALUATION_FAILED', message.slice(0, 500), {
+                        tabId,
+                        ...this.frameIdentitySummary(identity),
+                        cdpFrameId: resolved.cdpFrameId,
+                        executionContextId: targetCtx.id,
+                        retryAttempted,
+                        retryReason,
+                    })
+                }
+                if (!staleContext) {
+                    throw error
+                }
+                retryAttempted = true
+                retryReason = message.slice(0, 500)
+                this.debuggerManager.invalidateExecutionContext(tabId, targetCtx.id)
+                if (p.timeout !== undefined && Date.now() - startedAt >= p.timeout) {
+                    throw this.frameEvaluationError('FRAME_EVALUATION_TIMEOUT', message.slice(0, 500), {
+                        tabId,
+                        ...this.frameIdentitySummary(identity),
+                        cdpFrameId: resolved.cdpFrameId,
+                        executionContextId: targetCtx.id,
+                        timeout: p.timeout,
+                        retryAttempted,
+                        retryReason,
+                    })
                 }
             }
         }
+        throw new Error('Stale execution context retry exhausted')
+    }
 
-        if (!targetCtx) {
-            throw new Error(`No execution context for frame (CDP: ${cdpFrameId}, contexts: ${contexts.length})`)
+    private frameIdentitySummary(frame: chrome.webNavigation.GetAllFrameResultDetails): Record<string, unknown> {
+        return {
+            extensionFrameId: frame.frameId,
+            parentFrameId: frame.parentFrameId,
+            url: frame.url.slice(0, 500),
         }
+    }
 
-        // 在目标上下文中执行
-        const evalParams: Record<string, unknown> = {
-            contextId: targetCtx.id,
-            expression: p.expression,
-            returnByValue: returnByValue ?? true,
-            awaitPromise: awaitPromise ?? true,
-        }
-        if (p.timeout !== undefined) {
-            evalParams.timeout = p.timeout
-        }
+    private frameEvaluationError(
+        code: string,
+        message: string,
+        context: Record<string, unknown>
+    ): ExpectedOperationError {
+        return new ExpectedOperationError(
+            JSON.stringify({
+                error: {
+                    code,
+                    message,
+                    suggestion: '请重新读取 frame 列表和页面状态；若 frame 候选不唯一，请改用唯一 URL 或 selector',
+                    context,
+                },
+            })
+        )
+    }
 
-        return await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', evalParams)
+    private async getExtensionFrameIdentity(
+        tabId: number,
+        frameId: number
+    ): Promise<chrome.webNavigation.GetAllFrameResultDetails> {
+        const frames = await chrome.webNavigation.getAllFrames({ tabId })
+        const frame = frames?.find((candidate) => candidate.frameId === frameId)
+        if (!frame) throw new ExpectedOperationError(`Frame ${frameId} not found`)
+        return frame
+    }
+
+    private async resolveCdpFrame(tabId: number, targetUrl: string): Promise<{ cdpFrameId: string }> {
+        const treeResult = (await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree')) as {
+            frameTree: { frame: { id: string; url: string }; childFrames?: Array<unknown> }
+        }
+        const candidates = this.findCdpFrameIds(treeResult.frameTree, targetUrl)
+        if (candidates.length === 0) {
+            throw this.frameEvaluationError('FRAME_CDP_UNAVAILABLE', 'Cannot resolve CDP frame for URL', {
+                tabId,
+                url: targetUrl.slice(0, 500),
+                candidateCount: 0,
+            })
+        }
+        if (candidates.length > 1) {
+            throw this.frameEvaluationError(
+                'FRAME_AMBIGUOUS',
+                'Multiple CDP frames match the same URL; refusing to guess target',
+                {
+                    tabId,
+                    url: targetUrl.slice(0, 500),
+                    candidateCount: candidates.length,
+                    candidates: candidates.slice(0, 10),
+                }
+            )
+        }
+        return { cdpFrameId: candidates[0] }
     }
 
     private async getManagedScriptableTabId(

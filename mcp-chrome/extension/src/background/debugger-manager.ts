@@ -61,6 +61,14 @@ export class DebuggerManager {
         return this.executionContexts.get(tabId) ?? []
     }
 
+    invalidateExecutionContext(tabId: number, contextId: number): void {
+        const contexts = this.executionContexts.get(tabId)
+        if (!contexts) return
+        const next = contexts.filter((context) => context.id !== contextId)
+        if (next.length > 0) this.executionContexts.set(tabId, next)
+        else this.executionContexts.delete(tabId)
+    }
+
     setupListeners(): void {
         if (this.listenersBound) {
             return

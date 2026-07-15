@@ -38,6 +38,14 @@ interface HealthResponse {
     }
 }
 
+type PortFailureKind = 'authentication' | 'protocol'
+
+interface PortCheckResult {
+    healthy: boolean
+    failureKind?: PortFailureKind
+    reason?: string
+}
+
 type MessageHandler = (message: { id: string; action: string; params: unknown }, port: number) => void
 type StatusHandler = (status: 'connected' | 'disconnected' | 'connecting', connectedCount: number) => void
 
@@ -74,6 +82,7 @@ export class HttpClient {
     private pairingToken: string | null = null
     private pairingTokenLoaded = false
     private allowInsecureNoToken: boolean | null = null
+    private lastServerFailureSummary = ''
 
     onMessage(handler: MessageHandler): void {
         this.messageHandler = handler
@@ -142,6 +151,16 @@ export class HttpClient {
             const results = await Promise.allSettled(newPorts.map((port) => this.connectToPort(port)))
 
             const successCount = results.filter((r) => r.status === 'fulfilled' && r.value).length
+            const failedPorts = newPorts.filter(
+                (_, index) => results[index].status !== 'fulfilled' || !results[index].value
+            )
+            if (failedPorts.length > 0) {
+                console.debug(
+                    `[HTTP] ${failedPorts.length} candidate WebSocket connection(s) rejected before open: ${failedPorts
+                        .slice(0, 10)
+                        .join(', ')}${failedPorts.length > 10 ? ', ...' : ''}`
+                )
+            }
 
             if (successCount > 0) {
                 this.reconnectAttempts = 0
@@ -232,20 +251,30 @@ export class HttpClient {
                     : ''
                 const url = `ws://127.0.0.1:${port}/${authQuery}`
                 const ws = new WebSocket(url)
+                let opened = false
                 let resolved = false
+
+                const rejectCandidate = (): void => {
+                    if (!resolved) {
+                        resolved = true
+                        resolve(false)
+                    }
+                }
 
                 const connectionTimeout = setTimeout(() => {
                     if (ws.readyState !== WebSocket.OPEN) {
+                        rejectCandidate()
                         ws.close()
-                        if (!resolved) {
-                            resolved = true
-                            resolve(false)
-                        }
                     }
                 }, 5000)
 
                 ws.onopen = () => {
                     clearTimeout(connectionTimeout)
+                    if (resolved) {
+                        ws.close()
+                        return
+                    }
+                    opened = true
                     resolved = true
 
                     const conn: ServerConnection = {
@@ -269,20 +298,23 @@ export class HttpClient {
                 }
 
                 ws.onclose = () => {
+                    clearTimeout(connectionTimeout)
+                    if (!opened) {
+                        rejectCandidate()
+                        return
+                    }
                     console.log(`[HTTP] WebSocket closed for port ${port}`)
                     this.removeConnection(port)
                 }
 
                 ws.onerror = (error) => {
                     clearTimeout(connectionTimeout)
-                    console.error(`[HTTP] WebSocket error for port ${port}:`, error)
-                    if (resolved) {
-                        // onopen 已触发后再 onerror：连接进入异常状态，清理资源
+                    if (opened) {
+                        console.error(`[HTTP] Established WebSocket error for port ${port}:`, error)
                         this.removeConnection(port)
-                    } else {
-                        resolved = true
-                        resolve(false)
+                        return
                     }
+                    rejectCandidate()
                 }
             } catch {
                 resolve(false)
@@ -319,18 +351,24 @@ export class HttpClient {
      * 完整扫描整段范围，保证多 CC 并存时新启动的 server 能被发现
      */
     private async discoverServers(): Promise<number[]> {
-        const healthyPorts: number[] = []
         const checks = []
         for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
-            checks.push(
-                this.checkPort(port).then((ok) => {
-                    if (ok) {
-                        healthyPorts.push(port)
-                    }
-                })
+            checks.push(this.checkPort(port).then((result) => ({ port, result })))
+        }
+        const results = await Promise.all(checks)
+        const healthyPorts = results.filter(({ result }) => result.healthy).map(({ port }) => port)
+        const selectedFailures = results.filter(({ result }) => result.failureKind)
+
+        const failureSummary = selectedFailures
+            .slice(0, 10)
+            .map(({ port, result }) => `${port} (${result.failureKind}: ${result.reason})`)
+            .join(', ')
+        if (failureSummary && failureSummary !== this.lastServerFailureSummary) {
+            console.warn(
+                `[HTTP] ${selectedFailures.length} MCP Server candidate(s) rejected after health identification: ${failureSummary}${selectedFailures.length > 10 ? ', ...' : ''}`
             )
         }
-        await Promise.all(checks)
+        this.lastServerFailureSummary = failureSummary
 
         if (healthyPorts.length > 0) {
             console.log(
@@ -345,46 +383,61 @@ export class HttpClient {
         return healthyPorts.sort((a, b) => a - b)
     }
 
-    private async checkPort(port: number): Promise<boolean> {
+    private async checkPort(port: number): Promise<PortCheckResult> {
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT)
         try {
             const token = await this.getPairingToken()
             const clientNonce = randomHex()
-            const controller = new AbortController()
-            const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT)
-
             const response = await fetch(`http://127.0.0.1:${port}/api/health?clientNonce=${clientNonce}`, {
                 signal: controller.signal,
             })
 
-            clearTimeout(timeoutId)
             if (!response.ok) {
-                return false
+                return { healthy: false }
             }
 
             const health = (await response.json().catch(() => null)) as HealthResponse | null
-            if (health?.authRequired) {
-                if (!token || !health.auth?.serverNonce || !health.auth.serverProof) {
-                    return false
+            if (!health || typeof health.authRequired !== 'boolean') {
+                return { healthy: false }
+            }
+            if (health.authRequired) {
+                if (!token) {
+                    return { healthy: false, failureKind: 'authentication', reason: 'pairing token missing' }
+                }
+                if (!health.auth?.serverNonce || !health.auth.serverProof) {
+                    return { healthy: false, failureKind: 'protocol', reason: 'authentication challenge incomplete' }
                 }
                 const expected = await hmacHex(token, `server:${clientNonce}:${health.auth.serverNonce}`)
                 if (expected !== health.auth.serverProof) {
-                    return false
+                    return { healthy: false, failureKind: 'authentication', reason: 'server proof mismatch' }
                 }
                 this.verifiedAuth.set(port, {
                     clientNonce,
                     serverNonce: health.auth.serverNonce,
                     clientProof: await hmacHex(token, `client:${clientNonce}:${health.auth.serverNonce}`),
                 })
-                return true
+                return { healthy: true }
             }
 
-            if (token || !(await this.getAllowInsecureNoToken())) {
-                return false
+            if (token) {
+                return {
+                    healthy: false,
+                    failureKind: 'authentication',
+                    reason: 'client token configured for no-token server',
+                }
+            }
+            if (!(await this.getAllowInsecureNoToken())) {
+                return { healthy: false, failureKind: 'authentication', reason: 'local no-token policy disabled' }
             }
             this.verifiedAuth.delete(port)
-            return health?.status === 'ok'
+            return health.status === 'ok'
+                ? { healthy: true }
+                : { healthy: false, failureKind: 'protocol', reason: 'health status is not ok' }
         } catch {
-            return false
+            return { healthy: false }
+        } finally {
+            clearTimeout(timeoutId)
         }
     }
 

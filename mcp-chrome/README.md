@@ -207,7 +207,8 @@ suggestions.
 **`type`-specific**: `mode="controlled"` or `dispatch: true` sets `.value` directly and fires `input`/`change` events —
 use for React/Vue controlled inputs where keyboard events don't update state. Requires a non-coordinate `target`.
 Extension mode only. Controlled input and target lookup failures return structured context with `target`, `matchCount`,
-`nth`, `activeElement`, `selection`, and candidate controls.
+`nth`, `activeElement`, `selection`, and candidate controls. For `select` and `replace`, event-level `nth` selects the Nth
+text occurrence while nested `target.nth` selects the Nth matching element; both are zero-based and may be used together.
 
 ### extract - Content Extraction
 
@@ -279,9 +280,10 @@ streams.
 
 Results >100KB are auto-saved to the controlled OS temp directory with a structured hint returned. DOM nodes,
 `NodeList`, and `HTMLCollection` results return `NON_SERIALIZABLE_EVALUATE_RESULT` with a hint to return simple fields
-such as `textContent` or `outerHTML`. `postCondition` is optional; when it is not provided, `success=true` only means
-the script executed and returned. When it is provided and does not match before timeout, the tool returns
-`POST_CONDITION_FAILED` with the last observed checks.
+such as `textContent` or `outerHTML`. Evaluate defaults to `precise` even when global `inputMode` is `stealth`, and its
+`postCondition` checks use the same evaluate mode as the action. `postCondition` is optional; when it is not provided,
+`success=true` only means the script executed and returned. When it is provided and does not match before timeout, the
+tool returns `POST_CONDITION_FAILED` with the last observed checks.
 
 ### manage - Page & Environment Management
 
@@ -326,10 +328,12 @@ unmanaged tabs and returns `WINDOW_HAS_UNMANAGED_TABS`.
 | `console` | Console logs (with level filter)       |
 | `network` | Network request logs (with URL filter) |
 
-Parameters: `output` saves result to file. Network logs include completed requests, HTTP 4xx/5xx responses, and failed
-loads with `errorText`, `method`, `url`, `status`, `timestamp`, and `duration` when available. `urlPattern` supports
-`*` for any number of characters and `?` for one character. `tabId` targets a specific tab (Extension mode). `frame` is
-not applicable for logs.
+Parameters: `output` saves result to file. Console entries use the public levels `error`, `warning`, `info`, and `debug`;
+raw browser levels such as `warn` and `log` are normalized before filtering and return. Network logs include completed
+requests, HTTP 4xx/5xx responses, and failed loads with `errorText`, `method`, `url`, `status`, `timestamp`, and `duration`
+when available. Inline network results limit each URL to 2048 characters and add `urlLength` plus `urlTruncated: true`
+when shortened; explicit `output` keeps the complete URL. `urlPattern` supports `*` for any number of characters and `?`
+for one character. `tabId` targets a specific tab (Extension mode). `frame` is not applicable for logs.
 
 ### cookies - Cookie Management
 
@@ -618,3 +622,10 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - [Model Context Protocol](https://modelcontextprotocol.io/) - MCP specification
 - [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) - CDP documentation
+
+
+## Operation status and diagnostics
+
+Input and evaluate responses append `actionExecuted`, `actionStatus`, `verificationStatus`, `failureStage`, and `retryable`. Verification uses `matched`, `not_matched`, `unavailable`, or `error`; debugger timeouts report the action as `unknown` when completion cannot be proven. Diagnostics are best-effort and return `diagnosticsStatus` without replacing the main action result. Browse and wait errors also retain any diagnostics collected before the action failed.
+
+`replace` uses text selection only for `textarea` and input types `text`, `search`, `tel`, `url`, and `password`. Other input types use a native full-value update and return the requested and actual browser-normalized values. A standalone `select` on unsupported types returns `UNSUPPORTED_SELECTION`. Target timeouts include bounded locator, tab, frame, match, and candidate context. Precise iframe evaluation retries one stale execution context once and refuses ambiguous same-URL frames. Its response includes `retryAttempted`, bounded `retryReason`, and the final `frameContext` with the Extension frame, parent frame, URL, CDP frame, and execution context IDs. Port scanning aggregates ordinary pre-open failures at debug level; authentication and protocol rejections from identified MCP servers produce one bounded warning when the rejection summary changes.
