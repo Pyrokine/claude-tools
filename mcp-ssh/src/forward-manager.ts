@@ -6,7 +6,7 @@
 
 import * as net from 'net'
 import type { Client, ClientChannel } from 'ssh2'
-import type { PortForwardInfo } from './types.js'
+import type { ForwardCloseOptions, ForwardCloseResult, PortForwardInfo } from './types.js'
 
 /** 端口转发所需的外部依赖 */
 export interface ForwardDependencies {
@@ -29,6 +29,10 @@ interface ForwardSession {
     activeConnections: number
     /** 上次有连接活动的时间 */
     lastActivityAt: number
+    connections: Set<{ destroy(): void }>
+    listenerReleased: boolean
+    remoteUnforwarded: boolean
+    closePromise?: Promise<void>
 }
 
 // tcp connection 事件处理函数类型
@@ -77,8 +81,12 @@ export class ForwardManager {
                     fwd.activeConnections += 1
                     fwd.lastActivityAt = Date.now()
                 }
+                if (fwd) {
+                    fwd.connections.add(socket)
+                }
                 const onClose = () => {
                     if (fwd) {
+                        fwd.connections.delete(socket)
                         fwd.activeConnections = Math.max(0, fwd.activeConnections - 1)
                         fwd.lastActivityAt = Date.now()
                     }
@@ -120,6 +128,9 @@ export class ForwardManager {
                     active: true,
                     activeConnections: 0,
                     lastActivityAt: Date.now(),
+                    connections: new Set(),
+                    listenerReleased: false,
+                    remoteUnforwarded: false,
                 }
                 this.sessions.set(forwardId, session)
                 fwdState.ref = session
@@ -159,6 +170,9 @@ export class ForwardManager {
                     active: true,
                     activeConnections: 0,
                     lastActivityAt: Date.now(),
+                    connections: new Set(),
+                    listenerReleased: false,
+                    remoteUnforwarded: false,
                 })
 
                 this.ensureTcpDispatcher(alias, client)
@@ -167,32 +181,70 @@ export class ForwardManager {
         })
     }
 
-    close(forwardId: string, deps?: ForwardDependencies): boolean {
+    async close(
+        forwardId: string,
+        deps?: ForwardDependencies,
+        options: ForwardCloseOptions = {}
+    ): Promise<ForwardCloseResult> {
+        const mode = options.mode ?? 'graceful'
+        const timeoutMs = options.timeoutMs ?? 5000
         const fwd = this.sessions.get(forwardId)
         if (!fwd) {
-            return false
+            return {
+                success: false,
+                forwardId,
+                closeMode: mode,
+                listenerReleased: false,
+                remoteUnforwarded: false,
+                activeConnections: 0,
+                retryable: false,
+                error: 'Forward not found',
+            }
         }
 
-        fwd.active = false
-
-        if (fwd.type === 'local' && fwd.server) {
-            try {
-                fwd.server.close()
-            } catch (e) {
-                console.warn(`Forward ${forwardId} server close failed:`, (e as Error).message)
+        if (mode === 'force') {
+            for (const connection of fwd.connections) {
+                connection.destroy()
             }
-        } else if (fwd.type === 'remote' && deps) {
-            try {
-                const client = deps.getClient(fwd.alias)
-                client.unforwardIn(fwd.remoteHost, fwd.remotePort)
-            } catch {
-                /* session 可能已断开 */
-            }
-            this.removeTcpDispatcherIfEmpty(fwd.alias)
         }
 
-        this.sessions.delete(forwardId)
-        return true
+        try {
+            if (!fwd.closePromise) {
+                fwd.closePromise =
+                    fwd.type === 'local' ? this.closeLocalListener(fwd) : this.closeRemoteListener(fwd, deps)
+                fwd.closePromise.catch(() => {
+                    fwd.closePromise = undefined
+                })
+            }
+            await this.withTimeout(fwd.closePromise, timeoutMs)
+            fwd.active = false
+            this.sessions.delete(forwardId)
+            if (fwd.type === 'remote') {
+                this.removeTcpDispatcherIfEmpty(fwd.alias)
+            }
+            return {
+                success: true,
+                forwardId,
+                type: fwd.type,
+                closeMode: mode,
+                listenerReleased: fwd.listenerReleased,
+                remoteUnforwarded: fwd.remoteUnforwarded,
+                activeConnections: fwd.activeConnections,
+                retryable: false,
+            }
+        } catch (error) {
+            return {
+                success: false,
+                forwardId,
+                type: fwd.type,
+                closeMode: mode,
+                listenerReleased: fwd.listenerReleased,
+                remoteUnforwarded: fwd.remoteUnforwarded,
+                activeConnections: fwd.activeConnections,
+                retryable: true,
+                error: error instanceof Error ? error.message : String(error),
+            }
+        }
     }
 
     /** 关闭指定 alias 的所有转发（disconnect 时调用，不需要 unforwardIn） */
@@ -200,9 +252,13 @@ export class ForwardManager {
         for (const [id, fwd] of this.sessions) {
             if (fwd.alias === alias) {
                 fwd.active = false
+                for (const connection of fwd.connections) {
+                    connection.destroy()
+                }
                 if (fwd.type === 'local' && fwd.server) {
                     try {
                         fwd.server.close()
+                        fwd.listenerReleased = !fwd.server.listening
                     } catch (e) {
                         console.warn(`Forward ${id} server close failed:`, (e as Error).message)
                     }
@@ -240,6 +296,67 @@ export class ForwardManager {
         return result
     }
 
+    private closeLocalListener(fwd: ForwardSession): Promise<void> {
+        const server = fwd.server
+        if (!server) {
+            return Promise.reject(new Error('Local forward listener is unavailable'))
+        }
+        return new Promise((resolve, reject) => {
+            try {
+                server.close((error) => {
+                    if (error) {
+                        reject(error)
+                    } else {
+                        resolve()
+                    }
+                })
+                fwd.listenerReleased = !server.listening
+            } catch (error) {
+                fwd.listenerReleased = !server.listening
+                reject(error)
+            }
+        })
+    }
+
+    private closeRemoteListener(fwd: ForwardSession, deps?: ForwardDependencies): Promise<void> {
+        if (!deps) {
+            return Promise.reject(new Error('SSH session is unavailable for remote unforward'))
+        }
+        return new Promise((resolve, reject) => {
+            let client: Client
+            try {
+                client = deps.getClient(fwd.alias)
+            } catch (error) {
+                reject(error)
+                return
+            }
+            client.unforwardIn(fwd.remoteHost, fwd.remotePort, (error) => {
+                if (error) {
+                    reject(error)
+                } else {
+                    fwd.remoteUnforwarded = true
+                    resolve()
+                }
+            })
+        })
+    }
+
+    private withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`Forward close timed out after ${timeoutMs}ms`)), timeoutMs)
+            promise.then(
+                (value) => {
+                    clearTimeout(timer)
+                    resolve(value)
+                },
+                (error) => {
+                    clearTimeout(timer)
+                    reject(error)
+                }
+            )
+        })
+    }
+
     private startIdleSweeper(): void {
         if (this.idleSweeper) {
             return
@@ -262,7 +379,11 @@ export class ForwardManager {
                         (now - fwd.lastActivityAt) / 1000
                     )}s with 0 connections > ${Math.round(this.idleTimeoutMs / 1000)}s, auto-closing`
                 )
-                this.close(id, this.dependencies ?? undefined)
+                void this.close(id, this.dependencies ?? undefined).then((result) => {
+                    if (!result.success) {
+                        console.warn(`[mcp-ssh] Forward ${id} auto-close failed: ${result.error}`)
+                    }
+                })
             }
         }
     }
@@ -287,6 +408,8 @@ export class ForwardManager {
                 ) {
                     const stream = accept()
                     const socket = net.createConnection(fwd.localPort, fwd.localHost)
+                    fwd.connections.add(stream)
+                    fwd.connections.add(socket)
                     fwd.activeConnections += 1
                     fwd.lastActivityAt = Date.now()
                     let closed = false
@@ -295,6 +418,8 @@ export class ForwardManager {
                             return
                         }
                         closed = true
+                        fwd.connections.delete(stream)
+                        fwd.connections.delete(socket)
                         fwd.activeConnections = Math.max(0, fwd.activeConnections - 1)
                         fwd.lastActivityAt = Date.now()
                     }

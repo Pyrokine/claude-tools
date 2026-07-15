@@ -5,5 +5,6 @@
 export { registerConnectionTools } from './connection.js'
 export { registerExecTools } from './exec.js'
 export { registerFileTools } from './file.js'
+export { registerOperationTools } from './operation.js'
 export { registerPtyTools } from './pty.js'
 export { registerForwardTools } from './forward.js'

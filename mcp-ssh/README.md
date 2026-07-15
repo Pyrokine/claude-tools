@@ -96,7 +96,7 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 }
 ```
 
-## Available Tools (30 tools)
+## Available Tools (35 tools)
 
 ### Connection Management
 
@@ -104,9 +104,11 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 |---------------------|---------------------------------------------------|
 | `ssh_connect`       | Establish SSH connection (supports ~/.ssh/config) |
 | `ssh_disconnect`    | Close connection                                  |
-| `ssh_list_sessions` | List active sessions                              |
+| `ssh_list_sessions` | List brief sessions; optional detail/field selection |
 | `ssh_reconnect`     | Reconnect a disconnected session                  |
 | `ssh_config_list`   | List hosts from ~/.ssh/config                     |
+
+`ssh_list_sessions()` returns only `alias`, canonical `identity`, `runAs`, `connected`, and `lastUsedAt`. Use `detail=true` for connection details or `fields=[...]` to select fields. Neither mode returns `keyPath`.
 
 ### Command Execution
 
@@ -119,6 +121,16 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 | `ssh_exec_parallel` | Execute command on multiple hosts in parallel |
 | `ssh_quick_exec`    | One-shot: connect, execute, disconnect        |
 | `ssh_exec_script`   | Upload and run a temporary remote script      |
+
+### Tracked operations
+
+| Tool                   | Description                                      |
+|------------------------|--------------------------------------------------|
+| `ssh_operation_start`  | Start a tracked long-running remote command      |
+| `ssh_operation_status` | Read status, PID, exit code, and output counters |
+| `ssh_operation_read`   | Read bounded stdout and stderr by byte offset     |
+| `ssh_operation_cancel` | Verify the operation marker, then send TERM       |
+| `ssh_operation_list`   | List unexpired operations, optionally by alias    |
 
 ### File Operations
 
@@ -283,6 +295,24 @@ Timeout errors include the same head/tail fields from output produced before the
 process-control, service-control, credential-bearing, unbounded `find`, recursive `grep`, long pipelines, background
 tasks, direct `su - user -c`, or long-running patterns return a `commandRisk` block with `categories` and `signals`.
 
+### Tracked long-running commands
+
+Use tracked operations when a command must continue beyond one synchronous tool call:
+
+```
+ssh_operation_start(alias="server", command="long-running-job", maxOutputBytes=1048576)
+ssh_operation_status(operationId="op_xxx")
+ssh_operation_read(operationId="op_xxx", stdoutOffset=0, stderrOffset=0, maxBytes=65536)
+ssh_operation_cancel(operationId="op_xxx")
+```
+
+The start call returns an unpredictable `operationId`. The server keeps bounded stdout and stderr buffers, records the
+remote PID after verifying a per-operation marker, and expires completed records after `retentionMs`. `maxOutputBytes`
+defaults to 1 MiB and accepts up to 8 MiB. `retentionMs` defaults to 1 hour and accepts up to 24 hours.
+`ssh_operation_read.maxBytes` defaults to 64 KiB and accepts up to 1 MiB. Cancellation is refused until the marker and
+PID are verified. If the SSH session disconnects while the command is active, its status becomes `unknown`; the server
+does not claim that the remote process stopped. `ssh_exec` keeps its existing synchronous timeout behavior.
+
 ### Interactive Commands (PTY mode)
 
 For commands that need a terminal:
@@ -353,8 +383,9 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180"
 ```
 
 `ssh_upload` returns local path policy diagnostics, remote parent probing, remote target metadata, and optional
-verification checks. `atomic=true` uploads to a same-directory temporary file, then renames it to the target path.
-`verifySize`, `verifyMd5`, `verifyMode`, `verifyOwner`, and `verifyMtime` add explicit post-transfer checks.
+verification checks. `atomic=true` uploads to a same-directory temporary file, returns `diagnostics.tempRemotePath`,
+then renames it to the target path. `verifySize`, `verifyMd5`, `verifyMode`, `verifyOwner`, and `verifyMtime` add explicit
+post-transfer checks.
 Command execution results include `emptyOutputFailure=true` when the remote command exits non-zero without
 stdout/stderr,
 with the effective user, cwd, and a suggested follow-up read command when available.
@@ -362,9 +393,9 @@ with the effective user, cwd, and a suggested follow-up read command when availa
 `read_offset`, `read_bytes`, `remaining_bytes`, `sample_kind`, and `truncated` so callers can distinguish a full read
 from a head, tail, byte range, or line range sample.
 
-### Directory Sync (with rsync)
+### Directory sync with rsync or SFTP
 
-Smart sync automatically detects rsync availability and uses it for efficient incremental transfer:
+Smart sync selects rsync only for a direct connection with a validated key path or usable SSH agent. Password, inline-key, jump-host, and other routes that cannot be passed safely to OpenSSH use SFTP directly:
 
 ```
 // Sync local directory to remote (upload)
@@ -374,7 +405,7 @@ ssh_sync(
   remotePath="/remote/project",
   direction="upload"
 )
-// Returns: { method: "rsync", filesTransferred: 42, ... }
+// Returns selectedTransport, decisionReason, stage durations, and transfer counters
 
 // Sync with exclude patterns
 ssh_sync(
@@ -398,16 +429,44 @@ ssh_sync(..., dryRun=true)
 
 // Upload one file and verify remote owner/mode after transfer
 ssh_sync(..., direction="upload", verifyOwner="appuser", verifyMode="0644")
+
+// Verify a directory with bounded manifests
+ssh_sync(
+  ...,
+  verify={count: true, sha256: true, owner: true, mode: true, staleFiles: true}
+)
+
+// Verify that entries present before --delete were removed
+ssh_sync(..., delete=true, verify={deletions: true})
 ```
 
-If rsync is not available on remote or local, it automatically falls back to SFTP. Sync responses include `transport`,
-`duration`, `dryRun`, `stats`, and `commandSummary`. SFTP single-file transfers include a `verification` object with
-local and remote size, mode or permissions, mtime, owner/group, and SHA-256 comparison when the remote has `sha256sum`.
-For upload single-file sync, `verifyOwner` and `verifyMode` add an `ownerMode` verification block based on remote file
-metadata. Directory sync does not recursively scan owner/mode; it returns a skipped verification note instead.
+A directory source always means “copy the source directory contents into the destination root” in both rsync and SFTP
+mode. Directory sources reject `recursive=false`. Relative exclude patterns are evaluated against the path below the
+source root; patterns without `/` match each basename.
 
-**Note**: rsync mode uses SSH key/agent authentication and sets `StrictHostKeyChecking=accept-new`.
-If you require strict host key verification and management, use SFTP mode instead.
+Directory verification builds bounded local and remote manifests. It can compare entry count, a SHA-256 root manifest,
+owner, mode, stale entries, and deletion results. `verify.deletions=true` requires `delete=true`; it records the destination
+before transfer and only checks whether those deletion candidates disappeared. `staleFiles` independently checks every
+extra destination entry. The response contains summaries and at most 20 mismatch samples, not the full manifest. The
+default limits are 10,000 entries, 256 MiB per hashed file, and 1 GiB total hashed bytes. Set `verify.maxEntries`,
+`verify.maxFileBytes`, and `verify.maxTotalBytes` to raise them, up to 50,000 entries, 4 GiB per file, and 16 GiB total.
+Symlinks or unsupported filesystem entries that were skipped make verification explicitly `skipped` instead of
+reporting a partial match.
+
+If verification is requested, a mismatch, skipped check, or verification error sets top-level `success=false` while
+`transferSuccess` still reports whether transfer completed. `verificationStatus`, `verificationSuccess`, and
+`failedChecks` describe the verification outcome. SFTP single-file transfers also include local and remote size,
+mode or permissions, mtime, owner/group, and SHA-256 comparison when the remote has `sha256sum`. `verifyOwner` and
+`verifyMode` apply to upload single-file sync; use `verify.owner` and `verify.mode` for directory manifests.
+
+Rsync is selected only for a direct connection with a validated key path or usable SSH agent. Password, inline-key, and
+jump-host sessions use SFTP because their route or credentials cannot be passed safely to a separate OpenSSH process.
+`preflightTimeout`, `connectTimeout`, and `operationTimeout` independently bound capability probing, rsync SSH setup, and
+the overall transfer; their defaults are 10 seconds, 30 seconds, and 10 minutes. When the session is not eligible for
+rsync, the response returns `rsyncProbe.status="skipped"` with the route decision reason instead of omitting the probe.
+Rsync mode sets
+`StrictHostKeyChecking=accept-new`. SFTP does not support `delete=true`; such a request fails explicitly instead of
+claiming deletion. If you require strict host key verification and management, use SFTP mode.
 
 ### Persistent PTY Sessions (top, tmux, etc.)
 
@@ -447,6 +506,8 @@ ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 
 `ssh_pty_read` and `ssh_pty_list` expose `lastInputAt`, `lastOutputAt`, `lastReadAt`, `unreadRawBytes`,
 `rawBufferLimit`, and `foregroundProcess` so long-running sessions can be monitored without reading the full raw stream.
+When a finite command exits naturally, its final screen remains readable with `active=false` until explicit close or the
+closed-session retention expires (5 minutes by default, configurable with `SSH_MCP_PTY_CLOSED_RETENTION_MS`).
 
 Common control sequences:
 
@@ -471,9 +532,17 @@ ssh_forward_remote(alias="server", remotePort=8080, localHost="127.0.0.1", local
 // List all forwards
 ssh_forward_list()
 
-// Close forward
-ssh_forward_close(forwardId="fwd_1_xxx")
+// Close after the listener is released
+ssh_forward_close(forwardId="fwd_1_xxx", mode="graceful", timeoutMs=5000)
+
+// Destroy active connections, then release the listener
+ssh_forward_close(forwardId="fwd_1_xxx", mode="force", timeoutMs=5000)
 ```
+
+A successful close means the local `server.close` or remote `unforwardIn` callback completed. The result includes
+`listenerReleased`, `remoteUnforwarded`, `activeConnections`, `closeMode`, and `retryable`. Timeout or callback failure
+keeps the forward in `ssh_forward_list`, so the same `forwardId` can be retried. After a successful local close, the port
+can be rebound immediately.
 
 ## Configuration Options
 
@@ -492,6 +561,10 @@ ssh_forward_close(forwardId="fwd_1_xxx")
 | `defaultEnv`        | object | -              | Default env for this session   |
 | `runAs`             | string | -              | Default execution user         |
 | `keepaliveInterval` | number | 30000          | Keepalive interval in ms       |
+| `readyTimeout`      | number | 30000          | Wait for SSH ready in ms, max 600000 |
+| `jumpHost.readyTimeout` | number | top-level value | Jump-host ready timeout, max 600000 |
+
+Connection failures return `failureStage`, `retryable`, and a bounded suggestion. `failureStage` is one of `preflight`, `authentication`, `ready_timeout`, `transport_or_handshake`, or `unknown`; multi-hop failures may also include `connectionStep` as `key_read`, `jump_connect`, `jump_forward`, or `target_connect`.
 
 ### Exec Options
 
@@ -550,11 +623,12 @@ Files exceeding these limits are rejected before being read.
 
 | `followSymlinks`  | SFTP path                                                  | rsync path                                                                  |
 |-------------------|------------------------------------------------------------|-----------------------------------------------------------------------------|
-| `false` (default) | Skipped, returned in `skippedSymlinks`, printed as warning | Copied as-is (rsync default: preserves the symlink without dereferencing)   |
+| `false` (default) | Skipped, returned in `skippedSymlinks`, printed as warning | Skipped via `--no-links`                                                     |
 | `true`            | Followed: link target contents are uploaded                | Followed via rsync `-L` / `--copy-links`: link target contents are uploaded |
 
-Both default modes are safe (neither uploads link target contents). The divergence is whether the destination keeps the
-symlink: SFTP omits it entirely, rsync preserves it as a symlink.
+Both transports skip device and special filesystem entries. SFTP returns `skippedUnsupported` and up to 10 sample paths;
+rsync uses `--no-devices --no-specials`. Directory verification also reports skipped symlinks and unsupported entries and
+does not treat an incomplete manifest as a match.
 
 ## Project Structure
 

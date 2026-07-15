@@ -29,18 +29,47 @@ export interface SSHConnectionConfig {
     jumpHost?: SSHConnectionConfig
 }
 
-export interface SSHSessionInfo {
+export interface SSHSessionBrief {
+    alias: string
+    identity: string
+    runAs?: string
+    connected: boolean
+    lastUsedAt: number
+}
+
+export interface SSHSessionDetail extends SSHSessionBrief {
+    host: string
+    port: number
+    username: string
+    authMethod: 'key' | 'password' | 'agent' | 'inline-key'
+    connectedAt: number
+    hasJumpHost: boolean
+}
+
+export interface ExternalTransferCapability {
     alias: string
     identity: string
     host: string
     port: number
     username: string
-    runAs?: string
+    authMethod: 'key-path' | 'password' | 'agent' | 'inline-key'
     keyPath?: string
-    authMethod: 'key' | 'password' | 'agent'
-    connected: boolean
-    connectedAt: number
-    lastUsedAt: number
+    hasJumpHost: boolean
+    routeSafeForOpenSsh: boolean
+    rsyncEligible: boolean
+    decisionReason: string
+}
+
+export type ConnectionFailureStage =
+    'preflight' | 'authentication' | 'ready_timeout' | 'transport_or_handshake' | 'unknown'
+
+export type ConnectionStep = 'key_read' | 'jump_connect' | 'jump_forward' | 'target_connect'
+
+export interface ConnectionFailureDetails {
+    failureStage: ConnectionFailureStage
+    connectionStep?: ConnectionStep
+    retryable: boolean
+    suggestion?: string
 }
 
 export interface ExecOptions {
@@ -88,6 +117,60 @@ export interface ExecResult {
     profileLoaded?: boolean
     envInjectedKeys?: string[]
     timedOut?: boolean
+}
+
+export type OperationStatus = 'starting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown'
+
+export interface OperationStartOptions {
+    cwd?: string
+    env?: Record<string, string>
+    runAs?: string
+    useLoginUser?: boolean
+    loadProfile?: boolean
+    maxOutputBytes?: number
+    retentionMs?: number
+}
+
+export interface OperationInfo {
+    operationId: string
+    alias: string
+    status: OperationStatus
+    pid: number | null
+    processGroup: boolean
+    markerVerified: boolean
+    cancelRequested: boolean
+    startedAt: number
+    finishedAt: number | null
+    expiresAt: number | null
+    retentionMs: number
+    exitCode: number | null
+    signal: string | null
+    stdoutBytes: number
+    stderrBytes: number
+    stdoutStoredBytes: number
+    stderrStoredBytes: number
+    stdoutTruncated: boolean
+    stderrTruncated: boolean
+    maxOutputBytes: number
+    error?: string
+}
+
+export interface OperationReadResult extends OperationInfo {
+    stdout: string
+    stderr: string
+    stdoutOffset: number
+    stderrOffset: number
+    nextStdoutOffset: number
+    nextStderrOffset: number
+    readBytes: number
+    maxReadBytes: number
+}
+
+export interface OperationCancelResult extends OperationInfo {
+    success: boolean
+    cancelRequested: boolean
+    retryable: boolean
+    verificationError?: string
 }
 
 export interface FileInfo {
@@ -162,4 +245,23 @@ export interface PortForwardInfo {
     remotePort: number
     createdAt: number
     active: boolean
+}
+
+export type ForwardCloseMode = 'graceful' | 'force'
+
+export interface ForwardCloseOptions {
+    mode?: ForwardCloseMode
+    timeoutMs?: number
+}
+
+export interface ForwardCloseResult {
+    success: boolean
+    forwardId: string
+    type?: ForwardType
+    closeMode: ForwardCloseMode
+    listenerReleased: boolean
+    remoteUnforwarded: boolean
+    activeConnections: number
+    retryable: boolean
+    error?: string
 }

@@ -14,20 +14,30 @@ import * as path from 'path'
 import { Client, ClientChannel, ConnectConfig, ExecOptions as Ssh2ExecOptions, SFTPWrapper } from 'ssh2'
 import { clearRsyncCache } from './file-ops.js'
 import { ForwardManager } from './forward-manager.js'
+import { OperationManager } from './operation-manager.js'
 import { PtyManager } from './pty-manager.js'
 import { sanitizeKeyError, validateKeyFile } from './security.js'
 import { escapeShellArg, expandTilde } from './tools/utils.js'
 import {
+    ConnectionFailureDetails,
     DEFAULT_EXEC_MAX_OUTPUT_SIZE,
     ExecOptions,
     ExecResult,
+    ExternalTransferCapability,
     HARD_EXEC_MAX_OUTPUT_SIZE,
+    ForwardCloseOptions,
+    ForwardCloseResult,
+    OperationCancelResult,
+    OperationInfo,
+    OperationReadResult,
+    OperationStartOptions,
     PersistedSession,
     PortForwardInfo,
     PtyOptions,
     PtySessionInfo,
     SSHConnectionConfig,
-    SSHSessionInfo,
+    SSHSessionBrief,
+    SSHSessionDetail,
 } from './types.js'
 
 interface SSHSession {
@@ -73,12 +83,23 @@ class CommandError extends Error {
     }
 }
 
+class ConnectionError extends Error {
+    constructor(
+        message: string,
+        readonly details: ConnectionFailureDetails
+    ) {
+        super(message)
+        this.name = 'ConnectionError'
+    }
+}
+
 export class SessionManager {
     private sessions: Map<string, SSHSession> = new Map()
     /** per-alias connect 进行中的 Promise,防止并发 connect 同一 alias 时重复建连 */
     private connectInFlight: Map<string, Promise<string>> = new Map()
     private readonly ptyManager = new PtyManager()
     private readonly forwardManager = new ForwardManager()
+    private readonly operationManager: OperationManager
     private readonly persistPath: string
     private defaultKeepaliveInterval = 30000 // 30秒
     private defaultKeepaliveCountMax = 3
@@ -89,6 +110,11 @@ export class SessionManager {
 
     constructor(persistPath?: string) {
         this.persistPath = persistPath || path.join(os.homedir(), '.ssh-mcp-pro', 'sessions.json')
+        this.operationManager = new OperationManager({
+            openStream: (alias, command, marker, options) => this.openOperationStream(alias, command, marker, options),
+            cancelRemote: (alias, pid, marker, processGroup, options) =>
+                this.cancelRemoteOperation(alias, pid, marker, processGroup, options),
+        })
         this.ensurePersistDir()
     }
 
@@ -144,7 +170,8 @@ export class SessionManager {
                 clearTimeout(session.reconnectTimer)
                 session.reconnectTimer = undefined
             }
-            // 清理关联的 PTY 和 forward 资源
+            // 清理关联资源；tracked operation 的远端状态在连接断开后无法继续证明
+            this.operationManager.markAliasDisconnected(alias)
             this.ptyManager.closeByAlias(alias)
             this.forwardManager.closeByAlias(alias)
             // 清理 file-ops 中的 rsync 可用性缓存,防止重连到不同主机后读到旧判断
@@ -184,33 +211,80 @@ export class SessionManager {
         return session
     }
 
-    /**
-     * 列出所有会话
-     */
-    listSessions(): SSHSessionInfo[] {
-        const result: SSHSessionInfo[] = []
-        for (const [alias, session] of this.sessions) {
-            const authMethod = session.config.privateKeyPath
-                ? ('key' as const)
-                : session.config.password
-                  ? ('password' as const)
-                  : ('agent' as const)
-            const port = session.config.port || 22
-            result.push({
-                alias,
-                identity: this.sessionIdentity(session),
-                host: session.config.host,
-                port,
-                username: session.config.username,
-                runAs: session.config.runAs,
-                keyPath: session.config.privateKeyPath,
-                authMethod,
-                connected: this.isAlive(session),
-                connectedAt: session.connectedAt,
-                lastUsedAt: session.lastUsedAt,
-            })
+    listSessions(): SSHSessionBrief[] {
+        return Array.from(this.sessions, ([alias, session]) => ({
+            alias,
+            identity: this.sessionIdentity(session),
+            runAs: session.config.runAs,
+            connected: this.isAlive(session),
+            lastUsedAt: session.lastUsedAt,
+        }))
+    }
+
+    listSessionDetails(): SSHSessionDetail[] {
+        return Array.from(this.sessions, ([alias, session]) => ({
+            alias,
+            identity: this.sessionIdentity(session),
+            host: session.config.host,
+            port: session.config.port || 22,
+            username: session.config.username,
+            runAs: session.config.runAs,
+            authMethod: session.config.privateKeyPath
+                ? 'key'
+                : session.config.privateKey
+                  ? 'inline-key'
+                  : session.config.password
+                    ? 'password'
+                    : 'agent',
+            connected: this.isAlive(session),
+            connectedAt: session.connectedAt,
+            lastUsedAt: session.lastUsedAt,
+            hasJumpHost: Boolean(session.config.jumpHost),
+        }))
+    }
+
+    getExternalTransferCapability(alias: string): ExternalTransferCapability {
+        const session = this.getSession(alias)
+        const config = session.config
+        const authMethod = config.privateKeyPath
+            ? ('key-path' as const)
+            : config.privateKey
+              ? ('inline-key' as const)
+              : config.password
+                ? ('password' as const)
+                : ('agent' as const)
+        const hasJumpHost = Boolean(config.jumpHost)
+        const routeSafeForOpenSsh = !hasJumpHost
+        const expandedKeyPath = config.privateKeyPath ? expandTilde(config.privateKeyPath) : undefined
+        const keyPathUsable = authMethod === 'key-path' && this.isOpenSshKeyPathUsable(expandedKeyPath!)
+        const agentAvailable = authMethod === 'agent' && this.isSshAgentAvailable()
+        const rsyncEligible = routeSafeForOpenSsh && (keyPathUsable || agentAvailable)
+        const decisionReason = hasJumpHost
+            ? 'jump_host_route_requires_live_ssh_session'
+            : authMethod === 'password'
+              ? 'password_not_forwarded_to_openssh'
+              : authMethod === 'inline-key'
+                ? 'inline_private_key_not_written_to_disk'
+                : authMethod === 'key-path'
+                  ? keyPathUsable
+                      ? 'direct_openssh_compatible_key_path'
+                      : 'key_path_not_openssh_compatible'
+                  : agentAvailable
+                    ? 'direct_ssh_agent_socket'
+                    : 'ssh_agent_socket_unavailable'
+        return {
+            alias,
+            identity: this.sessionIdentity(session),
+            host: config.host,
+            port: config.port || 22,
+            username: config.username,
+            authMethod,
+            keyPath: keyPathUsable ? expandedKeyPath : undefined,
+            hasJumpHost,
+            routeSafeForOpenSsh,
+            rsyncEligible,
+            decisionReason,
         }
-        return result
     }
 
     /**
@@ -223,6 +297,29 @@ export class SessionManager {
             return this.execAsUser(alias, command, runAs, options)
         }
         return this.execDirect(alias, command, options, { cwd: options.cwd })
+    }
+
+    operationStart(alias: string, command: string, options: OperationStartOptions = {}): Promise<OperationInfo> {
+        return this.operationManager.start(alias, command, options)
+    }
+
+    operationStatus(operationId: string): OperationInfo {
+        return this.operationManager.status(operationId)
+    }
+
+    operationRead(
+        operationId: string,
+        options: { stdoutOffset?: number; stderrOffset?: number; maxBytes?: number } = {}
+    ): OperationReadResult {
+        return this.operationManager.read(operationId, options)
+    }
+
+    operationCancel(operationId: string): Promise<OperationCancelResult> {
+        return this.operationManager.cancel(operationId)
+    }
+
+    operationList(alias?: string): OperationInfo[] {
+        return this.operationManager.list(alias)
     }
 
     /**
@@ -484,14 +581,49 @@ export class SessionManager {
         )
     }
 
-    forwardClose(forwardId: string): boolean {
-        return this.forwardManager.close(forwardId, {
-            getClient: (a) => this.getSession(a).client,
-        })
+    forwardClose(forwardId: string, options: ForwardCloseOptions = {}): Promise<ForwardCloseResult> {
+        return this.forwardManager.close(
+            forwardId,
+            {
+                getClient: (a) => this.getSession(a).client,
+            },
+            options
+        )
     }
 
     forwardList(): PortForwardInfo[] {
         return this.forwardManager.list()
+    }
+
+    private isSshAgentAvailable(): boolean {
+        const socketPath = process.env.SSH_AUTH_SOCK
+        if (!socketPath) {
+            return false
+        }
+        if (process.platform === 'win32') {
+            return true
+        }
+        try {
+            return fs.statSync(socketPath).isSocket()
+        } catch {
+            return false
+        }
+    }
+
+    private isOpenSshKeyPathUsable(keyPath: string): boolean {
+        try {
+            const stats = fs.statSync(keyPath)
+            if (!stats.isFile()) {
+                return false
+            }
+            if (process.platform !== 'win32' && (stats.mode & 0o077) !== 0) {
+                return false
+            }
+            const currentUid = process.getuid?.()
+            return currentUid === undefined || stats.uid === currentUid
+        } catch {
+            return false
+        }
     }
 
     private sessionIdentity(session: SSHSession): string {
@@ -572,6 +704,82 @@ export class SessionManager {
             })
         }
         return maxOutputSize
+    }
+
+    private async openOperationStream(
+        alias: string,
+        command: string,
+        marker: string,
+        options: OperationStartOptions
+    ): Promise<ClientChannel> {
+        const session = this.getSession(alias)
+        const markerEnv = `MCP_SSH_OPERATION_MARKER=${this.escapeShellArg(marker)}`
+        const markerLine = `__MCP_SSH_OPERATION__:${marker}:%s:%s\\n`
+        const operationScript = this.escapeShellArg(
+            `printf ${this.escapeShellArg(markerLine)} "$$" "$1" >&2; exec sh -c ${this.escapeShellArg(command)}`
+        )
+        const wrappedCommand =
+            `if command -v setsid >/dev/null 2>&1; then ` +
+            `exec env ${markerEnv} setsid sh -c ${operationScript} sh 1; ` +
+            `else exec env ${markerEnv} sh -c ${operationScript} sh 0; fi`
+        const runAs = options.useLoginUser ? undefined : (options.runAs ?? session.config.runAs)
+        let fullCommand: string
+        if (runAs) {
+            if (!this.isValidUsername(runAs)) {
+                throw new Error(`Invalid username: ${runAs}`)
+            }
+            const loadProfile = options.loadProfile ?? true
+            const targetCommand = this.buildCommand(
+                `${loadProfile ? this.getLoadProfileCommand() : ''}${wrappedCommand}`,
+                session,
+                options
+            )
+            fullCommand = `su - ${runAs} -c ${this.escapeShellArg(targetCommand)}`
+        } else {
+            fullCommand = this.buildCommand(wrappedCommand, session, options)
+        }
+
+        return new Promise((resolve, reject) => {
+            session.client.exec(fullCommand, {}, (error, stream) => {
+                if (error) {
+                    reject(new Error(`Operation start failed: ${error.message}`))
+                } else {
+                    resolve(stream)
+                }
+            })
+        })
+    }
+
+    private async cancelRemoteOperation(
+        alias: string,
+        pid: number,
+        marker: string,
+        processGroup: boolean,
+        options: OperationStartOptions
+    ): Promise<{ success: boolean; error?: string }> {
+        const expectedMarker = `MCP_SSH_OPERATION_MARKER=${marker}`
+        const signalTarget = processGroup ? `-${pid}` : `${pid}`
+        const command = [
+            `pid=${pid}`,
+            `expected=${this.escapeShellArg(expectedMarker)}`,
+            'if [ ! -r "/proc/$pid/environ" ]; then printf "operation marker unavailable" >&2; exit 3; fi',
+            'if ! tr "\\000" "\\n" < "/proc/$pid/environ" | grep -Fqx -- "$expected"; then printf "operation marker mismatch" >&2; exit 4; fi',
+            `kill -TERM -- ${signalTarget}`,
+        ].join('; ')
+        try {
+            const result = await this.exec(alias, command, {
+                runAs: options.runAs,
+                useLoginUser: options.useLoginUser,
+                loadProfile: false,
+                timeout: 5000,
+                maxOutputSize: 4096,
+            })
+            return result.success
+                ? { success: true }
+                : { success: false, error: result.stderr || `Remote cancel exited with code ${result.exitCode}` }
+        } catch (error) {
+            return { success: false, error: error instanceof Error ? error.message : String(error) }
+        }
     }
 
     private async execDirect(
@@ -725,46 +933,86 @@ export class SessionManager {
         }
 
         const client = new Client()
-
-        // 构建连接配置
+        const readyTimeout = config.readyTimeout ?? this.defaultTimeout
         const connectConfig: ConnectConfig = {
             host: config.host,
             port: config.port ?? 22,
             username: config.username,
-            readyTimeout: config.readyTimeout ?? this.defaultTimeout,
+            readyTimeout,
             keepaliveInterval: config.keepaliveInterval ?? this.defaultKeepaliveInterval,
             keepaliveCountMax: config.keepaliveCountMax ?? this.defaultKeepaliveCountMax,
         }
 
-        // 认证方式
-        if (config.password) {
-            connectConfig.password = config.password
-        }
-        if (config.privateKeyPath) {
-            const keyPath = expandTilde(config.privateKeyPath)
-            // 路径白名单 + 大小上限校验，避免任意文件读取
-            validateKeyFile(keyPath)
-            connectConfig.privateKey = fs.readFileSync(keyPath)
-        }
-        if (config.privateKey) {
-            connectConfig.privateKey = config.privateKey
-        }
-        if (config.passphrase) {
-            connectConfig.passphrase = config.passphrase
+        try {
+            if (config.password) {
+                connectConfig.password = config.password
+            }
+            if (config.privateKeyPath) {
+                const keyPath = expandTilde(config.privateKeyPath)
+                // 路径白名单 + 大小上限校验，避免任意文件读取
+                validateKeyFile(keyPath)
+                connectConfig.privateKey = fs.readFileSync(keyPath)
+            }
+            if (config.privateKey) {
+                connectConfig.privateKey = config.privateKey
+            }
+            if (config.passphrase) {
+                connectConfig.passphrase = config.passphrase
+            }
+        } catch (error) {
+            throw this.createConnectionError(error, config, readyTimeout, 'key_read')
         }
 
-        // 跳板机支持
         if (config.jumpHost) {
-            const jumpAlias = await this.connect(config.jumpHost)
-            const jumpSession = this.sessions.get(jumpAlias)
-            if (jumpSession) {
-                // 通过跳板机建立连接
-                connectConfig.sock = await this.forwardConnection(jumpSession.client, config.host, config.port || 22)
+            const jumpConfig: SSHConnectionConfig = {
+                ...config.jumpHost,
+                readyTimeout: config.jumpHost.readyTimeout ?? readyTimeout,
             }
+            let jumpAlias: string
+            try {
+                jumpAlias = await this.connect(jumpConfig)
+            } catch (error) {
+                if (error instanceof ConnectionError) {
+                    throw new ConnectionError(error.message, {
+                        ...error.details,
+                        connectionStep: 'jump_connect',
+                    })
+                }
+                throw this.createConnectionError(error, jumpConfig, jumpConfig.readyTimeout!, 'jump_connect')
+            }
+            const jumpSession = this.sessions.get(jumpAlias)
+            if (!jumpSession || !this.isAlive(jumpSession)) {
+                throw new ConnectionError(`Jump host session '${jumpAlias}' is unavailable`, {
+                    failureStage: 'transport_or_handshake',
+                    connectionStep: 'jump_connect',
+                    retryable: true,
+                    suggestion: '重新连接跳板机，或检查 jumpHost 配置和网络路径',
+                })
+            }
+            connectConfig.sock = await this.forwardConnection(
+                jumpSession.client,
+                config.host,
+                config.port || 22,
+                readyTimeout
+            )
         }
 
         return new Promise((resolve, reject) => {
+            let settled = false
+            const rejectConnection = (error: unknown): void => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                reject(this.createConnectionError(error, config, readyTimeout, 'target_connect'))
+            }
+
             client.on('ready', () => {
+                if (settled) {
+                    client.end()
+                    return
+                }
+                settled = true
                 const session: SSHSession = {
                     client,
                     config,
@@ -779,26 +1027,20 @@ export class SessionManager {
                 resolve(alias)
             })
 
-            client.on('error', (err) => {
+            client.on('error', (error) => {
                 const session = this.sessions.get(alias)
                 if (session && session.client === client) {
                     session.connected = false
                 }
-                const target = `${connectConfig.username}@${connectConfig.host}:${connectConfig.port}`
-                const safeMessage = sanitizeKeyError(err.message)
-                const suggestion = this.diagnoseConnectionError(err)
-                reject(
-                    new Error(
-                        `SSH connection to ${target} failed: ${safeMessage}${suggestion ? ` (${suggestion})` : ''}`
-                    )
-                )
+                rejectConnection(error)
             })
 
             client.on('close', () => {
                 const session = this.sessions.get(alias)
                 if (session && session.client === client) {
                     session.connected = false
-                    // 清理绑定旧 client 的 forward/PTY 资源
+                    // 清理绑定旧 client 的资源；tracked operation 状态已无法继续证明
+                    this.operationManager.markAliasDisconnected(alias)
                     this.forwardManager.closeByAlias(alias)
                     this.ptyManager.closeByAlias(alias)
                     if (!session.manualClose) {
@@ -807,7 +1049,11 @@ export class SessionManager {
                 }
             })
 
-            client.connect(connectConfig)
+            try {
+                client.connect(connectConfig)
+            } catch (error) {
+                rejectConnection(error)
+            }
         })
     }
 
@@ -856,11 +1102,45 @@ export class SessionManager {
     /**
      * 通过跳板机转发连接
      */
-    private forwardConnection(jumpClient: Client, targetHost: string, targetPort: number): Promise<ClientChannel> {
+    private forwardConnection(
+        jumpClient: Client,
+        targetHost: string,
+        targetPort: number,
+        timeout: number
+    ): Promise<ClientChannel> {
         return new Promise((resolve, reject) => {
-            jumpClient.forwardOut('127.0.0.1', 0, targetHost, targetPort, (err, stream) => {
-                if (err) {
-                    reject(err)
+            let settled = false
+            const timer = setTimeout(() => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                reject(
+                    new ConnectionError(`Jump host forwarding to ${targetHost}:${targetPort} timed out`, {
+                        failureStage: 'ready_timeout',
+                        connectionStep: 'jump_forward',
+                        retryable: true,
+                        suggestion: '检查跳板机到目标地址的网络路径，必要时提高 readyTimeout',
+                    })
+                )
+            }, timeout)
+
+            jumpClient.forwardOut('127.0.0.1', 0, targetHost, targetPort, (error, stream) => {
+                if (settled) {
+                    stream?.close()
+                    return
+                }
+                settled = true
+                clearTimeout(timer)
+                if (error) {
+                    reject(
+                        new ConnectionError(`Jump host forwarding to ${targetHost}:${targetPort} failed`, {
+                            failureStage: 'transport_or_handshake',
+                            connectionStep: 'jump_forward',
+                            retryable: true,
+                            suggestion: '检查跳板机到目标地址的网络路径、目标端口和防火墙',
+                        })
+                    )
                 } else {
                     resolve(stream)
                 }
@@ -946,29 +1226,66 @@ export class SessionManager {
         })
     }
 
-    /**
-     * 根据错误类型生成排查建议
-     */
-    private diagnoseConnectionError(err: Error & { code?: string }): string {
-        const msg = err.message || ''
-        const code = err.code || ''
+    private createConnectionError(
+        error: unknown,
+        config: SSHConnectionConfig,
+        readyTimeout: number,
+        connectionStep: ConnectionFailureDetails['connectionStep']
+    ): ConnectionError {
+        if (error instanceof ConnectionError) {
+            return new ConnectionError(error.message, {
+                ...error.details,
+                connectionStep: error.details.connectionStep ?? connectionStep,
+            })
+        }
+        const err = error instanceof Error ? error : new Error(String(error))
+        const target = `${config.username}@${config.host}:${config.port || 22}`
+        return new ConnectionError(`SSH connection to ${target} failed: ${sanitizeKeyError(err.message)}`, {
+            ...this.classifyConnectionError(err, readyTimeout),
+            connectionStep,
+        })
+    }
 
-        if (code === 'ECONNREFUSED' || msg.includes('ECONNREFUSED')) {
-            return 'check if SSH service is running on the target host'
+    private classifyConnectionError(
+        err: Error & { code?: string; level?: string },
+        readyTimeout: number
+    ): ConnectionFailureDetails {
+        const message = err.message || ''
+        const code = err.code || ''
+        if (message.includes('All configured authentication methods failed') || err.level === 'client-authentication') {
+            return {
+                failureStage: 'authentication',
+                retryable: false,
+                suggestion: '检查用户名、密码、keyPath、passphrase 和远端 authorized_keys',
+            }
         }
-        if (code === 'ETIMEDOUT' || msg.includes('ETIMEDOUT') || msg.includes('Timed out')) {
-            return 'check host reachability, firewall rules, or try a jump host'
+        if (
+            message.includes('Timed out while waiting for handshake') ||
+            message.includes(`Timed out after ${readyTimeout}`)
+        ) {
+            return {
+                failureStage: 'ready_timeout',
+                retryable: true,
+                suggestion: '检查网络路径、跳板机和服务端握手延迟，必要时提高 readyTimeout',
+            }
         }
-        if (code === 'ENOTFOUND' || msg.includes('ENOTFOUND') || msg.includes('getaddrinfo')) {
-            return 'hostname cannot be resolved, check DNS or use IP address'
+        if (code === 'ENOTFOUND' || message.includes('getaddrinfo')) {
+            return { failureStage: 'preflight', retryable: false, suggestion: '检查 host 或 DNS 配置' }
         }
-        if (msg.includes('All configured authentication methods failed')) {
-            return 'check password, key path, or key permissions (chmod 600)'
+        if (
+            code === 'ECONNREFUSED' ||
+            code === 'ECONNRESET' ||
+            code === 'ETIMEDOUT' ||
+            message.includes('handshake') ||
+            message.includes('ECONN')
+        ) {
+            return {
+                failureStage: 'transport_or_handshake',
+                retryable: code !== 'ECONNREFUSED',
+                suggestion: '检查目标端口、防火墙、ProxyJump 和 SSH 服务状态',
+            }
         }
-        if (msg.includes('ECONNRESET') || msg.includes('Connection reset')) {
-            return 'connection was reset by the remote host'
-        }
-        return ''
+        return { failureStage: 'unknown', retryable: false }
     }
 
     /**

@@ -27,6 +27,7 @@ type ConnectionTemplate = {
     defaultEnv?: Record<string, string>
     runAs?: string
     keepaliveInterval?: number
+    readyTimeout?: number
 }
 
 function loadTemplates(): Record<string, ConnectionTemplate> {
@@ -81,7 +82,14 @@ const connectSchema = z.object({
     env: z.record(z.string(), z.string()).optional().describe('环境变量'),
     defaultEnv: z.record(z.string(), z.string()).optional().describe('连接级默认环境变量'),
     runAs: z.string().optional().describe('连接级默认执行用户，后续 ssh_exec 默认以该用户执行'),
-    keepaliveInterval: z.number().optional().describe('心跳间隔（毫秒），默认 30000'),
+    keepaliveInterval: z.number().int().positive().optional().describe('心跳间隔（毫秒），默认 30000'),
+    readyTimeout: z
+        .number()
+        .int()
+        .positive()
+        .max(600000)
+        .optional()
+        .describe('等待 SSH ready 的超时（毫秒），默认 30000'),
     jumpHost: z
         .object({
             host: z.string().describe('跳板机地址'),
@@ -89,6 +97,13 @@ const connectSchema = z.object({
             password: z.string().optional().describe('跳板机密码'),
             keyPath: z.string().optional().describe('跳板机私钥路径'),
             port: z.number().optional().describe('跳板机端口，默认 22'),
+            readyTimeout: z
+                .number()
+                .int()
+                .positive()
+                .max(600000)
+                .optional()
+                .describe('跳板机等待 SSH ready 的超时（毫秒），默认继承顶层 readyTimeout'),
         })
         .optional()
         .describe('跳板机配置'),
@@ -98,7 +113,24 @@ const disconnectSchema = z.object({
     alias: z.string().describe('连接别名'),
 })
 
-const listSessionsSchema = z.object({})
+const sessionFieldSchema = z.enum([
+    'alias',
+    'identity',
+    'runAs',
+    'connected',
+    'lastUsedAt',
+    'host',
+    'port',
+    'username',
+    'authMethod',
+    'connectedAt',
+    'hasJumpHost',
+])
+
+const listSessionsSchema = z.object({
+    detail: z.boolean().optional().describe('返回不含 keyPath 的连接详情'),
+    fields: z.array(sessionFieldSchema).max(12).optional().describe('只返回指定字段；任何模式都不返回 keyPath'),
+})
 
 const reconnectSchema = z.object({
     alias: z.string().describe('连接别名'),
@@ -124,6 +156,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
         const defaultEnv = mergeEnv(template.defaultEnv, args.defaultEnv)
         const env = mergeEnv(template.env, args.env)
         const keepaliveInterval = args.keepaliveInterval ?? template.keepaliveInterval
+        const readyTimeout = args.readyTimeout ?? template.readyTimeout
         let jumpHostResolved:
             | {
                   host: string
@@ -207,13 +240,14 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                   username: args.jumpHost.user,
                   password: args.jumpHost.password,
                   privateKeyPath: args.jumpHost.keyPath,
+                  readyTimeout: args.jumpHost.readyTimeout ?? readyTimeout,
               }
             : jumpHostResolved
 
         const finalPort = port || 22
         const finalAlias = requestedAlias || `${user}@${host}:${finalPort}`
         const identity = `${user}@${host}:${finalPort}`
-        const sessionsBeforeConnect = sessionManager.listSessions()
+        const sessionsBeforeConnect = sessionManager.listSessionDetails()
         const reused = sessionsBeforeConnect.some((session) => session.alias === finalAlias && session.connected)
         const reusableSessions = sessionsBeforeConnect
             .filter((session) => session.identity === identity && session.alias !== finalAlias && session.connected)
@@ -230,6 +264,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             defaultEnv,
             env,
             keepaliveInterval,
+            readyTimeout,
             jumpHost,
         })
         return formatResult({
@@ -267,13 +302,23 @@ async function handleDisconnect(args: z.infer<typeof disconnectSchema>) {
     }
 }
 
-async function handleListSessions() {
+async function handleListSessions(args: z.infer<typeof listSessionsSchema>) {
     try {
-        const sessions = sessionManager.listSessions()
+        const sessions =
+            args.detail || args.fields ? sessionManager.listSessionDetails() : sessionManager.listSessions()
+        const selected = args.fields
+            ? sessions.map((session) => {
+                  const record = session as unknown as Record<string, unknown>
+                  return Object.fromEntries(
+                      args.fields!.filter((field) => field in record).map((field) => [field, record[field]])
+                  )
+              })
+            : sessions
         return formatResult({
             success: true,
-            count: sessions.length,
-            sessions,
+            count: selected.length,
+            detail: args.detail === true || args.fields !== undefined,
+            sessions: selected,
         })
     } catch (error) {
         return formatError(error)
@@ -346,7 +391,7 @@ export function registerConnectionTools(server: McpServer): void {
             description: '列出所有活跃的 SSH 会话',
             inputSchema: listSessionsSchema,
         },
-        () => handleListSessions()
+        (args) => handleListSessions(args)
     )
 
     server.registerTool(

@@ -58,9 +58,15 @@
 
 ### connect-03: 错误密钥路径
 
-**步骤**：`ssh_connect(host=..., user=..., keyPath="/nonexistent")`
+**步骤**：`ssh_connect(host=..., user=..., keyPath="~/.ssh/mcp-nonexistent-key")`
 
-**预期**：明确错误信息（包含路径不存在），不挂死
+**预期**：白名单内不存在的路径返回明确的 `ENOENT`/`no such file` 错误，不挂死，错误中的 `connectionStep="key_read"`；白名单外路径单独返回安全校验错误，不要求回显原始路径
+
+### connect-ready-timeout-01
+
+**步骤**：连接一个可建立 TCP 但不完成 SSH ready 的受控目标，设置 `readyTimeout=1000`
+
+**预期**：在有界时间内失败，返回 `failureStage="ready_timeout"`、`connectionStep="target_connect"` 和提高 `readyTimeout` 的 suggestion；jumpHost 未单独设置 `readyTimeout` 时继承顶层值
 
 ### reconnect-01
 
@@ -191,6 +197,37 @@ long-running、process-control、service-control、credential-bearing、user-swi
 **预期**：`ssh_exec_script` 成功，`ssh_read_file` 返回内容包含 ERROR 行，并带 `read_offset`、`read_bytes`、`sample_kind`、
 `remaining_bytes` 元数据
 
+### operation-lifecycle-01
+
+**步骤**：
+
+1. `ssh_operation_start(alias=..., command="printf start; sleep 30; printf done")`
+2. `ssh_operation_status(operationId=...)`
+3. `ssh_operation_read(operationId=..., maxBytes=65536)`
+4. `ssh_operation_cancel(operationId=...)`
+5. 再次读取 status 和 output
+
+**预期**：start 返回不可预测的 `operationId`，状态从 `starting/running` 进入 `cancelled`；status 返回已校验的 PID 和
+marker 状态；read 返回字节偏移及有上限的 stdout/stderr；cancel 只在 marker 校验后执行
+
+### operation-utf8-read-01
+
+**步骤**：启动分块输出多字节 UTF-8 字符的 operation，多次调用 `ssh_operation_read`，让 `maxBytes` 落在字符中间，再使用 continuation byte 作为 offset 调用一次
+
+**预期**：正常读取不会返回替换字符，`nextStdoutOffset` 停在完整字符边界；过小 `maxBytes` 或 continuation-byte offset 返回明确 UTF-8 boundary 错误
+
+### operation-disconnect-01
+
+**步骤**：启动 `sleep 60` operation 后调用 `ssh_disconnect(alias=...)`，再查询 operation status
+
+**预期**：状态为 `unknown`，结果明确说明远端进程状态无法确认，不报告任务已经停止
+
+### operation-output-limit-01
+
+**步骤**：启动持续输出命令，设置 `maxOutputBytes=1024`，完成后分块调用 `ssh_operation_read`
+
+**预期**：实际输出计数继续增长，保存输出不超过 1024 字节，返回 truncation 字段；单次 read 受 `maxBytes` 限制
+
 ---
 
 ## 4. PTY 会话（pty_*）
@@ -216,7 +253,7 @@ long-running、process-control、service-control、credential-bearing、user-swi
 2. 1s 后 `ssh_pty_read(ptyId=..., mode="screen")`
 3. close
 
-**预期**：screen 模式返回当前 viewport（不含历史滚屏），含 PID/CPU 列头
+**预期**：命令自然结束后仍可读取最终 screen viewport（不含历史滚屏），含 PID/CPU 列头，返回 `active=false`；显式 close 后 ptyId 失效
 
 ### pty-03: raw 模式
 
@@ -272,6 +309,26 @@ long-running、process-control、service-control、credential-bearing、user-swi
 **步骤**：建 2 个转发后 `ssh_forward_list`
 
 **预期**：返回数组含两条记录
+
+### forward-close-graceful-01
+
+**步骤**：创建 local forward，记录实际端口，调用
+`ssh_forward_close(forwardId=..., mode="graceful", timeoutMs=5000)`，返回后立即在本地 bind 同一端口
+
+**预期**：返回 `success=true`、`listenerReleased=true`、`closeMode="graceful"`，同一端口可立即 bind，forward 已从 list 删除
+
+### forward-close-force-01
+
+**步骤**：创建 local forward 并保持一个活跃连接，先用极短 timeout 执行 graceful close，再用同一 forwardId 执行
+`ssh_forward_close(..., mode="force")`
+
+**预期**：graceful timeout 返回 `success=false`、`retryable=true`，forward 仍在 list；force 销毁活跃连接并等待 listener 释放，成功后删除状态
+
+### forward-close-remote-failure-01
+
+**步骤**：创建 remote forward，模拟 `unforwardIn` callback 失败或超时，再调用 list
+
+**预期**：返回 `remoteUnforwarded=false`、`retryable=true`，forward 状态保留，可使用同一 ID 重试；callback 完成后重试成功
 
 ### forward-idle-timeout-01: idle-timeout 主动回收（C.7 验证）
 
@@ -371,14 +428,45 @@ long-running、process-control、service-control、credential-bearing、user-swi
 ；远端验证树形结构
 
 **预期**：远端文件全部存在；sync 应优先用 rsync（如可用）回退 SFTP；返回 `transport`、`duration`、`dryRun`、`stats`、
-`diagnostics.local`、`diagnostics.remoteParent`，stats 含 added/updated/deleted/skipped/failed；SFTP 单文件同步返回
-`verification`，包含 size、mode/permissions、mtime 和 SHA-256 对比
+`diagnostics.localBefore`、`diagnostics.localAfter`、`diagnostics.remoteParent`，stats 含 added/updated/deleted/skipped/failed；SFTP
+单文件同步的底层 size、mode/permissions、mtime 和 SHA-256 对比位于 `transportVerification`，用户请求的 `verifyOwner`、
+`verifyMode` 或目录 `verify` 结果位于顶层 `verification`
 
 ### sync-exclude-01
 
-**步骤**：sync with `exclude=["*.log", "node_modules"]`
+**步骤**：建立 `sub/cache/ignored.log` 和 `other/cache/kept.log`，调用 `ssh_sync(..., exclude=["sub/cache/**"])`
 
-**预期**：被 exclude 的文件未传输
+**预期**：排除模式按源目录下相对路径解释，`sub/cache/ignored.log` 不传输，`other/cache/kept.log` 保留；不含 `/` 的模式继续按 basename 匹配
+
+### sync-directory-root-01
+
+**步骤**：分别触发 rsync 和 SFTP，把本地目录 `/tmp/mcp-sync` 同步到目标 `/tmp/mcp-sync-r`
+
+**预期**：两种 transport 都把源目录内容放到目标根目录，不额外生成 `/tmp/mcp-sync-r/mcp-sync`；目录源传 `recursive=false` 时明确拒绝
+
+### sync-directory-verify-01
+
+**步骤**：对含子目录和文件的目录调用 `ssh_sync(..., verify={count:true, sha256:true, owner:true, mode:true, staleFiles:true})`
+
+**预期**：登录用户与本地 owner 一致时返回 `transferSuccess=true`、`verificationStatus="matched"` 和目录 summary；owner 不一致时应明确返回 `mismatched` 和限量样本，不能自动 chown；完整 manifest 不进入响应，mismatch 样本不超过 20 个
+
+### sync-directory-delete-verify-01
+
+**步骤**：使用 direct key path 或 SSH agent 的 rsync eligible session，目标目录先放入源目录没有的 `stale.txt`，调用 `ssh_sync(..., delete=true, verify={deletions:true})`；另用 password/SFTP session 验证拒绝路径
+
+**预期**：rsync 路径在传输前采集目标 baseline，传输后 `checks.deletions=true`、`summary.deletionCandidates=1`、`summary.deletedEntries=1`；SFTP 路径明确返回不支持 `delete=true`；只传 `verify.deletions=true` 而未传 `delete=true` 时返回 `DELETION_VERIFICATION_REQUIRES_DELETE`
+
+### sync-directory-skipped-verify-01
+
+**步骤**：目录中放入 symlink 和 FIFO，使用默认 `followSymlinks=false` 调用带 `verify` 的 `ssh_sync`
+
+**预期**：传输返回 symlink/unsupported 的 skipped 数量和限量样本；校验返回 `skipped`，顶层 `success=false`，同时保留实际 `transferSuccess`
+
+### sync-transport-selection-01
+
+**步骤**：分别使用 direct key path、SSH agent、password、inline key 和 jumpHost session 调用 `ssh_sync`
+
+**预期**：direct 已校验 key path 或可用 agent 可选择 rsync；password、inline key、jumpHost 选择 SFTP；响应包含 `selectedTransport`、`decisionReason`、`rsyncProbe` 和阶段耗时，未进入 rsync 探测时 `rsyncProbe.status="skipped"` 并返回 reason，probe timeout/transport error 不缓存为“rsync 不存在”
 
 ### sync-shared-sftp-01: listDir sharedSftp 复用（D.1 验证）
 

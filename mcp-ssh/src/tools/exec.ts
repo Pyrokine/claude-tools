@@ -7,6 +7,7 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import { classifyCommandRisk, type CommandRisk } from '../command-risk.js'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
 import { type ExecResult, HARD_EXEC_MAX_OUTPUT_SIZE } from '../types.js'
@@ -110,76 +111,6 @@ const execScriptSchema = z.object({
 
 // ========== Handlers ==========
 
-type CommandRisk = {
-    level: 'medium' | 'high'
-    categories: string[]
-    signals: string[]
-    suggestion: string
-}
-
-function pushRisk(categories: Set<string>, signals: string[], category: string, signal: string): void {
-    categories.add(category)
-    signals.push(signal)
-}
-
-function classifyCommandRisk(command: string): CommandRisk | undefined {
-    const signals: string[] = []
-    const categories = new Set<string>()
-    const pipeCount = (command.match(/\|/g) ?? []).length
-    const lowerCommand = command.toLowerCase()
-    if (command.length > 500) {
-        pushRisk(categories, signals, 'long-running', 'long_command')
-    }
-    if (/\bgrep\s+(?:-\S*R|--recursive)\b/.test(command)) {
-        pushRisk(categories, signals, 'long-running', 'recursive_grep')
-    }
-    if (/\bfind\b/.test(command) && !/\s-maxdepth\s+\d+/.test(command)) {
-        pushRisk(categories, signals, 'long-running', 'unbounded_find')
-    }
-    if (/\b(?:python|python3|node|perl|ruby)\b/.test(command)) {
-        pushRisk(categories, signals, 'script-execution', 'interpreter_script')
-    }
-    if (/\bsleep\s+\d{2,}\b/.test(command) || /\b(?:tail\s+-f|journalctl\s+-f|watch|top|htop)\b/.test(command)) {
-        pushRisk(categories, signals, 'long-running', 'long_running')
-    }
-    if (pipeCount >= 3) {
-        pushRisk(categories, signals, 'long-running', 'long_pipeline')
-    }
-    if (/(?:^|[^&])&(?!&)/.test(command)) {
-        pushRisk(categories, signals, 'process-control', 'background_task')
-    }
-    if (/\b(?:rm\s+-[a-zA-Z]*r|dd\s+if=|mkfs|fdisk|parted|shutdown|reboot)\b/.test(lowerCommand)) {
-        pushRisk(categories, signals, 'destructive', 'destructive_command')
-    }
-    if (/\b(?:kill|pkill|killall)\b/.test(lowerCommand)) {
-        pushRisk(categories, signals, 'process-control', 'process_control')
-    }
-    if (/\b(?:systemctl|service|docker|kubectl)\s+(?:restart|stop|kill|delete|rm|down)\b/.test(lowerCommand)) {
-        pushRisk(categories, signals, 'service-control', 'service_control')
-    }
-    if (/\b(?:password|passwd|token|authorization|cookie|secret|private[_-]?key)\b/i.test(command)) {
-        pushRisk(categories, signals, 'credential-bearing', 'credential_bearing')
-    }
-    if (/\bsu\s+-?\s*[a-zA-Z_][a-zA-Z0-9_-]*\s+-c\b/.test(command)) {
-        pushRisk(categories, signals, 'user-switch', 'direct_su_command')
-    }
-    if (signals.length === 0) {
-        return undefined
-    }
-    const highCategories = new Set(['destructive', 'process-control', 'service-control', 'long-running'])
-    const level = Array.from(categories).some((category) => highCategories.has(category)) ? 'high' : 'medium'
-    return {
-        level,
-        categories: Array.from(categories),
-        signals,
-        suggestion: signals.includes('direct_su_command')
-            ? '建议使用 ssh_exec 的 runAs 参数或 ssh_exec_as_user，避免手写 su 命令造成引用和环境加载差异'
-            : level === 'high'
-              ? '考虑用 ssh_exec_script、ssh_pty_start，或把输出重定向到远端文件后用 ssh_read_file 分块读取'
-              : '如输出较大，请设置 maxOutputSize 或重定向到远端文件后分块读取',
-    }
-}
-
 async function handleExec(args: z.infer<typeof execSchema>) {
     try {
         const result = await sessionManager.exec(args.alias, args.command, {
@@ -192,7 +123,7 @@ async function handleExec(args: z.infer<typeof execSchema>) {
             useLoginUser: args.useLoginUser,
             loadProfile: args.loadProfile,
         })
-        return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command) })
+        return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command, args.timeout) })
     } catch (error) {
         return formatError(error)
     }
@@ -208,7 +139,7 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
                 maxOutputSize: args.maxOutputSize,
                 loadProfile: args.loadProfile,
             })
-            return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command) })
+            return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command, args.timeout) })
         }
         const result = await sessionManager.exec(args.alias, args.command, {
             timeout: args.timeout,
@@ -217,7 +148,7 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
             maxOutputSize: args.maxOutputSize,
             loadProfile: args.loadProfile,
         })
-        return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command) })
+        return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command, args.timeout) })
     } catch (error) {
         return formatError(error)
     }
@@ -244,7 +175,7 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
         const results: BatchEntry[] = []
 
         for (let i = 0; i < args.commands.length; i++) {
-            const commandRisk = classifyCommandRisk(args.commands[i])
+            const commandRisk = classifyCommandRisk(args.commands[i], args.timeout)
             try {
                 const execResult = await sessionManager.exec(args.alias, args.commands[i], { timeout: args.timeout })
                 results.push({
@@ -374,7 +305,7 @@ function validateScriptUser(username: string | undefined): void {
 }
 
 function resolveScriptUsers(args: z.infer<typeof execScriptSchema>): { effectiveUser?: string; loginUser?: string } {
-    const session = sessionManager.listSessions().find((item) => item.alias === args.alias)
+    const session = sessionManager.listSessionDetails().find((item) => item.alias === args.alias)
     return {
         effectiveUser: args.targetUser ?? args.runAs ?? session?.runAs,
         loginUser: session?.username,

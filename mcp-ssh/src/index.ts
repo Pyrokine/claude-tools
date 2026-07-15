@@ -23,6 +23,7 @@ import {
     registerExecTools,
     registerFileTools,
     registerForwardTools,
+    registerOperationTools,
     registerPtyTools,
 } from './tools/index.js'
 
@@ -33,6 +34,7 @@ const server = new McpServer({ name: 'mcp-ssh', version: pkg.version }, { capabi
 registerConnectionTools(server)
 registerExecTools(server)
 registerFileTools(server)
+registerOperationTools(server)
 registerPtyTools(server)
 registerForwardTools(server)
 

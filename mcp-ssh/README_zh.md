@@ -96,7 +96,7 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 }
 ```
 
-## 可用工具（30 个）
+## 可用工具（35 个）
 
 ### 连接管理
 
@@ -104,9 +104,11 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 |---------------------|-----------------------------|
 | `ssh_connect`       | 建立 SSH 连接（支持 ~/.ssh/config） |
 | `ssh_disconnect`    | 关闭连接                        |
-| `ssh_list_sessions` | 列出活跃会话                      |
+| `ssh_list_sessions` | 列出精简会话，可选详情或字段筛选             |
 | `ssh_reconnect`     | 重新连接断开的会话                   |
 | `ssh_config_list`   | 列出 ~/.ssh/config 中的 Host    |
+
+`ssh_list_sessions()` 默认只返回 `alias`、规范化 `identity`、`runAs`、`connected` 和 `lastUsedAt`，使用 `detail=true` 获取连接详情，或通过 `fields=[...]` 选择字段，任何模式都不返回 `keyPath`
 
 ### 命令执行
 
@@ -119,6 +121,16 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_exec_parallel` | 在多台主机上并行执行命令       |
 | `ssh_quick_exec`    | 一次性执行：连接、执行、断开     |
 | `ssh_exec_script`   | 上传并执行远端临时脚本        |
+
+### 可跟踪任务
+
+| 工具                     | 描述                           |
+|------------------------|------------------------------|
+| `ssh_operation_start`  | 启动可跟踪的长时间远端命令               |
+| `ssh_operation_status` | 读取状态、PID、退出码和输出计数            |
+| `ssh_operation_read`   | 按字节偏移读取有上限的 stdout 和 stderr   |
+| `ssh_operation_cancel` | 校验任务 marker 后发送 TERM            |
+| `ssh_operation_list`   | 列出未过期任务，可按 alias 过滤           |
 
 ### 文件操作
 
@@ -279,6 +291,19 @@ ssh_connect(
 destructive、process-control、service-control、credential-bearing、未限制 `find`、递归 `grep`、长管道、后台任务、直接
 `su - user -c` 或长运行模式的命令会返回带 `categories` 和 `signals` 的 `commandRisk`
 
+### 可跟踪的长时间命令
+
+需要命令跨越一次同步工具调用继续执行时，使用 operation 工具组：
+
+```
+ssh_operation_start(alias="server", command="long-running-job", maxOutputBytes=1048576)
+ssh_operation_status(operationId="op_xxx")
+ssh_operation_read(operationId="op_xxx", stdoutOffset=0, stderrOffset=0, maxBytes=65536)
+ssh_operation_cancel(operationId="op_xxx")
+```
+
+start 返回不可预测的 `operationId`，服务端保存有硬上限的 stdout 和 stderr，在校验每个任务独立的 marker 后记录远端 PID，`maxOutputBytes` 默认 1 MiB、最大 8 MiB，`retentionMs` 默认 1 小时、最大 24 小时，`ssh_operation_read.maxBytes` 默认 64 KiB、最大 1 MiB，marker 和 PID 未完成校验时拒绝取消，SSH 会话在任务运行期间断开后状态变为 `unknown`，不会声称远端进程已经停止，`ssh_exec` 保持原有同步 timeout 行为
+
 ### 交互式命令（PTY 模式）
 
 用于需要终端的命令：
@@ -348,16 +373,16 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", offset=1048576, max
 ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180")
 ```
 
-`ssh_upload` 返回本地路径策略诊断、远端父目录探测、远端目标元数据和可选校验结果，`atomic=true` 会先上传到同目录临时文件，再
-rename 到目标路径，`verifySize`、`verifyMd5`、`verifyMode`、`verifyOwner`、`verifyMtime` 会追加显式传输后校验，命令执行结果在远端命令非零退出且没有
+`ssh_upload` 返回本地路径策略诊断、远端父目录探测、远端目标元数据和可选校验结果，`atomic=true` 会先上传到同目录临时文件，返回
+`diagnostics.tempRemotePath` 后再 rename 到目标路径，`verifySize`、`verifyMd5`、`verifyMode`、`verifyOwner`、`verifyMtime` 会追加显式传输后校验，命令执行结果在远端命令非零退出且没有
 stdout/stderr 时返回
 `emptyOutputFailure=true`，同时给出 effective user、cwd 和可用的后续读取建议，`ssh_read_file` 默认读取 1 MiB，`maxBytes` 超过
 16 MiB 时会在远端传输前拒绝，返回 `total_size`、`read_offset`、`read_bytes`、
 `remaining_bytes`、`sample_kind` 和 `truncated`，调用方可以区分完整读取、头部样本、尾部样本、字节范围和行范围
 
-### 目录同步（rsync）
+### 使用 rsync 或 SFTP 同步目录
 
-智能同步会自动检测 rsync 可用性，使用 rsync 进行高效增量传输：
+智能同步只在直连且存在已校验 key path 或可用 SSH agent 时选择 rsync，password、inline key、jump host 和其他无法安全交给 OpenSSH 的路由直接使用 SFTP：
 
 ```
 // 同步本地目录到远程（上传）
@@ -367,7 +392,7 @@ ssh_sync(
   remotePath="/remote/project",
   direction="upload"
 )
-// 返回: { method: "rsync", filesTransferred: 42, ... }
+// 返回 selectedTransport、decisionReason、各阶段耗时和传输计数
 
 // 带排除模式
 ssh_sync(
@@ -391,16 +416,24 @@ ssh_sync(..., dryRun=true)
 
 // 上传单文件后校验远端 owner/mode
 ssh_sync(..., direction="upload", verifyOwner="appuser", verifyMode="0644")
+
+// 使用有界 manifest 校验目录
+ssh_sync(
+  ...,
+  verify={count: true, sha256: true, owner: true, mode: true, staleFiles: true}
+)
+
+// 校验传输前存在且应由 --delete 删除的条目已经消失
+ssh_sync(..., delete=true, verify={deletions: true})
 ```
 
-如果远程或本地没有 rsync，会自动回退到 SFTP，同步响应包含 `transport`、`duration`、`dryRun`、`stats`、`commandSummary` 和
-`diagnostics`，其中 `diagnostics` 包含本地路径策略和远端父目录探测结果，SFTP 单文件传输会返回 `verification`，包含本地和远端的
-size、mode 或 permissions、mtime、owner/group，以及远端支持 `sha256sum` 时的 SHA-256 对比，upload 单文件同步可用
-`verifyOwner` 和 `verifyMode` 追加基于远端元数据的 `ownerMode` 校验，目录同步不递归扫描 owner/mode，会返回 skipped
-verification 说明
+目录源路径在 rsync 和 SFTP 模式下都表示“把源目录内容同步到目标根目录”，目录源使用 `recursive=false` 会被明确拒绝，相对排除模式按源目录下的相对路径匹配，不含 `/` 的模式匹配每一级 basename
 
-**注意**：rsync 模式使用 SSH 密钥/代理认证，并设置 `StrictHostKeyChecking=accept-new`（首次连接会自动接受主机密钥），
-如需严格的主机密钥验证与管理，请使用 SFTP 模式
+目录校验会生成有界的本地和远端 manifest，可比较条目数、SHA-256 root manifest、owner、mode、旧文件和删除结果，`verify.deletions=true` 必须同时设置 `delete=true`，工具会在传输前记录目标目录，只检查这些删除候选是否消失，`staleFiles` 则独立检查目标端全部额外条目，响应只返回摘要和最多 20 个 mismatch 样本，不返回完整 manifest，默认上限为 10000 个条目、单文件 256 MiB、总哈希字节 1 GiB，可通过 `verify.maxEntries`、`verify.maxFileBytes` 和 `verify.maxTotalBytes` 提高到最多 50000 个条目、单文件 4 GiB、总哈希字节 16 GiB，遇到被跳过的 symlink 或不支持的文件系统条目时，校验会明确返回 `skipped`，不会报告部分匹配成功
+
+请求校验后，mismatch、skipped 或校验错误都会令顶层 `success=false`，`transferSuccess` 仍单独表示传输是否完成，`verificationStatus`、`verificationSuccess` 和 `failedChecks` 描述校验结果，SFTP 单文件同步还会返回本地和远端的 size、mode 或 permissions、mtime、owner/group，以及远端支持 `sha256sum` 时的 SHA-256 对比，upload 单文件使用 `verifyOwner` 和 `verifyMode`，目录逐项校验使用 `verify.owner` 和 `verify.mode`
+
+只有直连且存在已校验 key path 或可用 SSH agent 时才选择 rsync，password、inline key 和 jump host 会使用 SFTP，因为独立 OpenSSH 进程无法安全继承对应路由或认证材料，`preflightTimeout`、`connectTimeout` 和 `operationTimeout` 分别限制能力预检、rsync SSH 建连和完整传输，默认值为 10 秒、30 秒和 10 分钟，不具备 rsync 条件的 session 会返回 `rsyncProbe.status="skipped"` 和路由判定原因，不再省略 probe，rsync 模式设置 `StrictHostKeyChecking=accept-new`，SFTP 不支持 `delete=true`，此类请求会明确失败，不会报告已经删除，如需严格的主机密钥验证与管理，请使用 SFTP 模式
 
 ### 持久化 PTY 会话（top、tmux 等）
 
@@ -439,7 +472,8 @@ ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 ```
 
 `ssh_pty_read` 和 `ssh_pty_list` 返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`unreadRawBytes`、`rawBufferLimit`、
-`foregroundProcess`，便于观察长时间运行的会话，无需读取完整 raw 流
+`foregroundProcess`，便于观察长时间运行的会话，无需读取完整 raw 流，有限命令自然结束后仍可读取最终 screen，返回 `active=false`，
+直到显式 close 或 closed session 保留期结束，默认 5 分钟，可通过 `SSH_MCP_PTY_CLOSED_RETENTION_MS` 调整
 
 常用控制序列：
 
@@ -464,9 +498,16 @@ ssh_forward_remote(alias="server", remotePort=8080, localHost="127.0.0.1", local
 // 列出所有转发
 ssh_forward_list()
 
-// 关闭转发
-ssh_forward_close(forwardId="fwd_1_xxx")
+// listener 释放后返回成功
+ssh_forward_close(forwardId="fwd_1_xxx", mode="graceful", timeoutMs=5000)
+
+// 销毁活跃连接后释放 listener
+ssh_forward_close(forwardId="fwd_1_xxx", mode="force", timeoutMs=5000)
 ```
+
+关闭成功表示本地 `server.close` 或远端 `unforwardIn` callback 已完成，结果包含 `listenerReleased`、
+`remoteUnforwarded`、`activeConnections`、`closeMode` 和 `retryable`，超时或 callback 失败时 forward 仍保留在
+`ssh_forward_list`，可以使用同一 `forwardId` 重试，本地转发关闭成功后端口可立即重新 bind
 
 ## 配置选项
 
@@ -485,6 +526,10 @@ ssh_forward_close(forwardId="fwd_1_xxx")
 | `defaultEnv`        | object | -     | 连接级默认环境变量   |
 | `runAs`             | string | -     | 默认执行用户      |
 | `keepaliveInterval` | number | 30000 | 心跳间隔（毫秒）    |
+| `readyTimeout`      | number | 30000 | 等待 SSH ready 的超时，最大 600000 毫秒 |
+| `jumpHost.readyTimeout` | number | 继承顶层值 | 跳板机等待 SSH ready 的超时，最大 600000 毫秒 |
+
+连接失败返回 `failureStage`、`retryable` 和限量建议，`failureStage` 为 `preflight`、`authentication`、`ready_timeout`、`transport_or_handshake` 或 `unknown`，多跳连接还可能返回 `connectionStep`，取值为 `key_read`、`jump_connect`、`jump_forward` 或 `target_connect`
 
 ### 执行选项
 
@@ -540,10 +585,10 @@ export SSH_MCP_FILE_OPS_ALLOW_DIRS=/tmp:/home/me/work
 
 | `followSymlinks` | SFTP 路径                                | rsync 路径                                   |
 |------------------|----------------------------------------|--------------------------------------------|
-| `false`（默认）      | 跳过，写入 `skippedSymlinks` 字段，warning 中提示 | 按 symlink 本身复制（rsync 默认：保留链接，不上传目标内容）      |
+| `false`（默认）      | 跳过，写入 `skippedSymlinks` 字段，warning 中提示 | 通过 `--no-links` 跳过                        |
 | `true`           | 跟随：上传链接目标内容                            | 通过 rsync `-L` / `--copy-links` 跟随：上传链接目标内容 |
 
-两个默认模式都安全（都不会上传链接目标内容），差异仅在于目标端是否保留 symlink：SFTP 完全跳过不传，rsync 保留为 symlink
+两种传输都会跳过 device 和特殊文件系统条目，SFTP 返回 `skippedUnsupported` 和最多 10 个样本路径，rsync 使用 `--no-devices --no-specials`，目录校验也会报告被跳过的 symlink 和不支持条目，不会把不完整 manifest 当成匹配成功
 
 ## 项目结构
 

@@ -35,6 +35,7 @@ interface PtySession {
     unreadRawBytes: number
     maxBufferSize: number
     active: boolean
+    closedAt: number | null
 }
 
 export class PtyManager {
@@ -43,6 +44,7 @@ export class PtyManager {
     private readonly defaultBufferSize = 1024 * 1024 // 1MB
     // 默认 idle timeout 1 小时,超时未读的 pty 自动回收
     private readonly idleTimeoutMs = Number(process.env.SSH_MCP_PTY_IDLE_TIMEOUT_MS) || 3600_000
+    private readonly closedRetentionMs = Number(process.env.SSH_MCP_PTY_CLOSED_RETENTION_MS) || 300_000
     private idleSweeper: NodeJS.Timeout | null = null
 
     constructor() {
@@ -76,6 +78,7 @@ export class PtyManager {
             unreadRawBytes: 0,
             maxBufferSize,
             active: true,
+            closedAt: null,
         }
 
         // 监听输出数据
@@ -100,17 +103,16 @@ export class PtyManager {
         })
 
         stream.on('close', () => {
-            ptySession.active = false
-            this.sessions.delete(ptyId)
-            try {
-                terminal.dispose()
-            } catch (e) {
-                console.warn(`PTY ${ptyId} terminal dispose failed:`, (e as Error).message)
+            if (!this.sessions.has(ptyId)) {
+                return
             }
+            ptySession.active = false
+            ptySession.closedAt = Date.now()
         })
 
         stream.on('error', (err: Error) => {
             ptySession.active = false
+            ptySession.closedAt = Date.now()
             terminal.write(`\n[PTY Error: ${err.message}]`)
         })
 
@@ -261,6 +263,10 @@ export class PtyManager {
         const now = Date.now()
         for (const [id, session] of this.sessions) {
             if (!session.active) {
+                const closedAt = session.closedAt ?? session.lastOutputAt ?? session.createdAt
+                if (now - Math.max(closedAt, session.lastReadAt) > this.closedRetentionMs) {
+                    this.close(id)
+                }
                 continue
             }
             if (now - session.lastReadAt > this.idleTimeoutMs) {

@@ -10,8 +10,21 @@ import { createHash } from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { z } from 'zod'
+import {
+    buildRemoteDirectoryManifestCommand,
+    compareDirectoryManifests,
+    createEmptyDirectoryManifest,
+    createLocalDirectoryManifest,
+    DIRECTORY_VERIFY_MAX_ENTRIES,
+    DIRECTORY_VERIFY_MAX_FILE_BYTES,
+    DIRECTORY_VERIFY_MAX_TOTAL_BYTES,
+    parseRemoteDirectoryManifest,
+    type DirectoryManifest,
+    type DirectoryVerifyRequest,
+} from '../directory-verification.js'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
+import { buildTransferOutcome } from '../transfer-outcome.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js'
 
 // ========== Schemas ==========
@@ -86,8 +99,43 @@ const syncSchema = z.object({
         .boolean()
         .optional()
         .describe('upload 时是否跟随本地 symlink，默认 false（跳过 symlink 并 warn，避免上传链接目标内容）'),
+    preflightTimeout: z.number().int().positive().max(60000).optional().describe('传输能力预检超时，默认 10000ms'),
+    connectTimeout: z.number().int().positive().max(120000).optional().describe('rsync SSH 连接超时，默认 30000ms'),
+    operationTimeout: z.number().int().positive().max(3600000).optional().describe('同步操作超时，默认 600000ms'),
     verifyOwner: z.union([z.string(), z.number()]).optional().describe('upload 后校验远端 owner（用户名或 uid）'),
     verifyMode: z.string().optional().describe('upload 后校验远端权限，例如 0644 或 -rw-r--r--'),
+    verify: z
+        .object({
+            count: z.boolean().optional().describe('校验目录条目数'),
+            sha256: z.boolean().optional().describe('校验 SHA-256 root manifest'),
+            owner: z.boolean().optional().describe('逐项校验 owner'),
+            mode: z.boolean().optional().describe('逐项校验 mode'),
+            deletions: z.boolean().optional().describe('校验请求删除后没有额外条目'),
+            staleFiles: z.boolean().optional().describe('校验没有旧文件残留'),
+            maxEntries: z
+                .number()
+                .int()
+                .positive()
+                .max(DIRECTORY_VERIFY_MAX_ENTRIES)
+                .optional()
+                .describe('目录校验最大条目数，默认 10000，最大 50000'),
+            maxFileBytes: z
+                .number()
+                .int()
+                .positive()
+                .max(DIRECTORY_VERIFY_MAX_FILE_BYTES)
+                .optional()
+                .describe('SHA-256 校验的单文件字节上限，默认 256MB，最大 4GB'),
+            maxTotalBytes: z
+                .number()
+                .int()
+                .positive()
+                .max(DIRECTORY_VERIFY_MAX_TOTAL_BYTES)
+                .optional()
+                .describe('SHA-256 校验的总字节上限，默认 1GB，最大 16GB'),
+        })
+        .optional()
+        .describe('有界目录校验；未传时不执行额外远端扫描'),
 })
 
 // ========== Handlers ==========
@@ -95,6 +143,43 @@ const syncSchema = z.object({
 const LARGE_UPLOAD_THRESHOLD = 100 * 1024 * 1024
 
 type LocalPathProbe = ReturnType<typeof fileOps.probeLocalPath>
+type VerificationFailureStage =
+    | 'verification_timeout'
+    | 'remote_probe'
+    | 'remote_manifest_command'
+    | 'remote_manifest_output'
+    | 'remote_manifest_parse'
+    | 'local_manifest'
+
+class VerificationStageError extends Error {
+    constructor(
+        readonly failureStage: VerificationFailureStage,
+        message: string,
+        readonly retryable: boolean,
+        readonly details?: Record<string, unknown>
+    ) {
+        super(message)
+        this.name = 'VerificationStageError'
+    }
+}
+
+function verificationErrorDetails(error: unknown): Record<string, unknown> {
+    if (error instanceof VerificationStageError) {
+        return {
+            kind: 'error',
+            failureStage: error.failureStage,
+            error: error.message,
+            retryable: error.retryable,
+            ...error.details,
+        }
+    }
+    return {
+        kind: 'error',
+        failureStage: 'remote_probe',
+        error: error instanceof Error ? error.message : String(error),
+        retryable: false,
+    }
+}
 
 function summarizeLocalPathProbe(probe: LocalPathProbe): Record<string, unknown> {
     const summary: Record<string, unknown> = {
@@ -162,14 +247,58 @@ function hashLocalFileMd5(filePath: string): Promise<string> {
     })
 }
 
-async function hashRemoteFileMd5(alias: string, remotePath: string): Promise<string | undefined> {
+function boundedDiagnostic(
+    value: string,
+    maxBytes: number = 2048
+): { text: string; bytes: number; truncated: boolean } {
+    const buffer = Buffer.from(value, 'utf8')
+    if (buffer.length <= maxBytes) {
+        return { text: value, bytes: buffer.length, truncated: false }
+    }
+    return {
+        text: buffer.subarray(0, maxBytes).toString('utf8'),
+        bytes: buffer.length,
+        truncated: true,
+    }
+}
+
+function commandFailureDetails(result: Awaited<ReturnType<typeof sessionManager.exec>>): Record<string, unknown> {
+    const stderr = boundedDiagnostic(result.stderr)
+    const stdout = boundedDiagnostic(result.stdout)
+    return {
+        exitCode: result.exitCode,
+        failureKind: result.failureKind,
+        timedOut: result.timedOut,
+        stdout: stdout.text || undefined,
+        stdoutBytes: result.stdoutBytes ?? stdout.bytes,
+        stdoutTruncated: result.stdoutTruncated || stdout.truncated || undefined,
+        stderr: stderr.text || undefined,
+        stderrBytes: result.stderrBytes ?? stderr.bytes,
+        stderrTruncated: result.stderrTruncated || stderr.truncated || undefined,
+    }
+}
+
+async function hashRemoteFileMd5(alias: string, remotePath: string): Promise<string> {
     const result = await sessionManager.exec(alias, `md5sum ${escapeShellArg(remotePath)} | awk '{print $1}'`, {
         timeout: 30000,
         useLoginUser: true,
         maxOutputSize: 4096,
     })
+    if (!result.success) {
+        const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`
+        throw new VerificationStageError('remote_probe', `Remote MD5 command failed: ${detail}`, true, {
+            operation: 'md5',
+            ...commandFailureDetails(result),
+        })
+    }
     const digest = result.stdout.trim().split(/\s+/)[0]
-    return /^[a-fA-F0-9]{32}$/.test(digest) ? digest : undefined
+    if (!/^[a-fA-F0-9]{32}$/.test(digest)) {
+        throw new VerificationStageError('remote_probe', 'Remote MD5 command returned an invalid digest', false, {
+            operation: 'md5',
+            ...commandFailureDetails(result),
+        })
+    }
+    return digest
 }
 
 function permissionStringToOctal(permissions: string): string | undefined {
@@ -193,54 +322,69 @@ function permissionStringToOctal(permissions: string): string | undefined {
     return `0${values.join('')}`
 }
 
-async function probeRemoteFile(alias: string, remotePath: string) {
+async function probeRemoteFile(alias: string, remotePath: string, timeout: number = 10000) {
     const escapedRemotePath = escapeShellArg(remotePath)
     const command = [
         `if [ -e ${escapedRemotePath} ]; then`,
         `stat -c '%U\t%u\t%G\t%g\t%a\t%s\t%Y\t%F' ${escapedRemotePath};`,
         'else printf missing; fi',
     ].join(' ')
-    try {
-        const result = await sessionManager.exec(alias, command, {
-            timeout: 10000,
-            useLoginUser: true,
-            maxOutputSize: 4096,
+    const result = await sessionManager.exec(alias, command, {
+        timeout,
+        useLoginUser: true,
+        maxOutputSize: 4096,
+    })
+    if (!result.success) {
+        const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`
+        throw new VerificationStageError('remote_probe', `Remote stat command failed: ${detail}`, true, {
+            operation: 'stat',
+            ...commandFailureDetails(result),
         })
-        if (result.stdout.trim() === 'missing') {
-            return { exists: false, remotePath }
-        }
-        const [ownerName, ownerId, groupName, groupId, mode, size, mtimeSeconds, fileType] = result.stdout
-            .trim()
-            .split('\t')
-        return {
-            exists: true,
-            remotePath,
-            ownerName,
-            ownerId: Number(ownerId),
-            groupName,
-            groupId: Number(groupId),
-            mode: mode ? `0${mode}` : undefined,
-            size: Number(size),
-            mtimeMs: Number(mtimeSeconds) * 1000,
-            fileType,
-            isDirectory: fileType === 'directory',
-            isFile: fileType?.startsWith('regular ') ?? false,
-        }
-    } catch {
-        const info = await fileOps.getFileInfo(alias, remotePath)
-        return {
-            exists: true,
-            remotePath,
-            ownerId: info.owner,
-            groupId: info.group,
-            mode: permissionStringToOctal(info.permissions),
-            permissions: info.permissions,
-            size: info.size,
-            mtimeMs: info.mtime.getTime(),
-            isDirectory: info.isDirectory,
-            isFile: info.isFile,
-            isSymlink: info.isSymlink,
-        }
+    }
+    if (result.stdout.trim() === 'missing') {
+        return { exists: false, remotePath, probeMethod: 'stat' as const }
+    }
+    const fields = result.stdout.trim().split('\t')
+    if (fields.length !== 8) {
+        throw new VerificationStageError('remote_probe', 'Remote stat command returned malformed output', false, {
+            operation: 'stat',
+            ...commandFailureDetails(result),
+        })
+    }
+    const [ownerName, ownerId, groupName, groupId, mode, size, mtimeSeconds, fileType] = fields
+    const ownerIdValue = Number(ownerId)
+    const groupIdValue = Number(groupId)
+    const sizeValue = Number(size)
+    const mtimeValue = Number(mtimeSeconds)
+    if (
+        !Number.isSafeInteger(ownerIdValue) ||
+        ownerIdValue < 0 ||
+        !Number.isSafeInteger(groupIdValue) ||
+        groupIdValue < 0 ||
+        !Number.isSafeInteger(sizeValue) ||
+        sizeValue < 0 ||
+        !Number.isFinite(mtimeValue) ||
+        !/^[0-7]{3,4}$/.test(mode)
+    ) {
+        throw new VerificationStageError('remote_probe', 'Remote stat command returned invalid metadata', false, {
+            operation: 'stat',
+            ...commandFailureDetails(result),
+        })
+    }
+    return {
+        exists: true,
+        remotePath,
+        probeMethod: 'stat' as const,
+        ownerName,
+        ownerId: ownerIdValue,
+        groupName,
+        groupId: groupIdValue,
+        mode: mode.length === 3 ? `0${mode}` : mode,
+        size: sizeValue,
+        mtimeMs: mtimeValue * 1000,
+        fileType,
+        isDirectory: fileType === 'directory',
+        isFile: fileType.startsWith('regular '),
     }
 }
 
@@ -258,13 +402,13 @@ async function buildUploadVerification(
             local.exists && remote.exists ? Math.abs((local.mtimeMs ?? 0) - (remote.mtimeMs ?? 0)) : undefined
         checks.mtime = mtimeDelta !== undefined ? mtimeDelta < 2000 : false
     }
-    if (args.verifyMode && remote.exists) {
+    if (args.verifyMode) {
         const expectedMode = normalizeExpectedMode(args.verifyMode)
-        checks.mode = expectedMode !== undefined && remote.mode === expectedMode
+        checks.mode = remote.exists && expectedMode !== undefined && remote.mode === expectedMode
     }
-    if (args.verifyOwner !== undefined && remote.exists) {
+    if (args.verifyOwner !== undefined) {
         const expectedOwner = String(args.verifyOwner)
-        checks.owner = String(remote.ownerId) === expectedOwner || remote.ownerName === expectedOwner
+        checks.owner = remote.exists && (String(remote.ownerId) === expectedOwner || remote.ownerName === expectedOwner)
     }
     if (args.verifyMd5 && local.exists) {
         const [localMd5, remoteMd5] = await Promise.all([
@@ -273,12 +417,31 @@ async function buildUploadVerification(
         ])
         checks.md5 = remoteMd5 ? localMd5 === remoteMd5 : undefined
         return {
+            expected: {
+                owner: args.verifyOwner,
+                mode: args.verifyMode ? normalizeExpectedMode(args.verifyMode) : undefined,
+                size: args.verifySize && local.exists ? local.size : undefined,
+                mtimeMs: args.verifyMtime && local.exists ? local.mtimeMs : undefined,
+                md5: localMd5,
+            },
+            actual: { ...remote, md5: remoteMd5 },
             local: { ...summarizeLocalPathProbe(local), md5: localMd5 },
             remote: { ...remote, md5: remoteMd5 },
             checks,
         }
     }
-    return { local: summarizeLocalPathProbe(local), remote, checks }
+    return {
+        expected: {
+            owner: args.verifyOwner,
+            mode: args.verifyMode ? normalizeExpectedMode(args.verifyMode) : undefined,
+            size: args.verifySize && local.exists ? local.size : undefined,
+            mtimeMs: args.verifyMtime && local.exists ? local.mtimeMs : undefined,
+        },
+        actual: remote,
+        local: summarizeLocalPathProbe(local),
+        remote,
+        checks,
+    }
 }
 
 function normalizeExpectedMode(mode: string): string | undefined {
@@ -307,9 +470,10 @@ function buildSyncVerificationChecks(
 
 async function resolveSyncUploadVerificationPath(
     args: z.infer<typeof syncSchema>,
-    local: ReturnType<typeof fileOps.probeLocalPath>
+    local: ReturnType<typeof fileOps.probeLocalPath>,
+    timeout: number
 ): Promise<string> {
-    const requestedRemote = await probeRemoteFile(args.alias, args.remotePath)
+    const requestedRemote = await probeRemoteFile(args.alias, args.remotePath, timeout)
     if (requestedRemote.exists && requestedRemote.isDirectory) {
         return path.posix.join(args.remotePath, path.basename(local.resolvedPath))
     }
@@ -321,7 +485,8 @@ async function resolveSyncUploadVerificationPath(
 
 async function buildSyncUploadVerification(
     args: z.infer<typeof syncSchema>,
-    local: ReturnType<typeof fileOps.probeLocalPath>
+    local: ReturnType<typeof fileOps.probeLocalPath>,
+    timeout: number
 ): Promise<Record<string, unknown> | undefined> {
     if (args.verifyOwner === undefined && args.verifyMode === undefined) {
         return undefined
@@ -338,12 +503,19 @@ async function buildSyncUploadVerification(
             kind: 'owner_mode',
             skipped: true,
             reason: 'verifyOwner/verifyMode 只对单文件 upload 做后置校验，目录同步不会递归扫描远端权限',
-            suggestion: '如需目录权限校验，请同步完成后对目标文件调用 ssh_file_info 或用 ssh_exec 执行显式检查',
+            suggestion: '目录权限校验请使用 verify.owner 或 verify.mode',
         }
     }
+    if (timeout <= 0) {
+        throw new VerificationStageError(
+            'verification_timeout',
+            'sync operation timeout was exhausted before owner/mode verification started',
+            true
+        )
+    }
 
-    const verificationRemotePath = await resolveSyncUploadVerificationPath(args, local)
-    const remote = await probeRemoteFile(args.alias, verificationRemotePath)
+    const verificationRemotePath = await resolveSyncUploadVerificationPath(args, local, timeout)
+    const remote = await probeRemoteFile(args.alias, verificationRemotePath, timeout)
     const checks = buildSyncVerificationChecks(args, remote)
     const matched = Object.values(checks).every(Boolean)
     return {
@@ -363,38 +535,238 @@ async function buildSyncUploadVerification(
     }
 }
 
+async function captureRemoteDirectoryManifest(
+    alias: string,
+    remotePath: string,
+    request: DirectoryVerifyRequest,
+    exclude: string[] | undefined,
+    followSymlinks: boolean | undefined,
+    timeout: number
+): Promise<DirectoryManifest> {
+    const remoteCommand = buildRemoteDirectoryManifestCommand(remotePath, request, exclude, followSymlinks)
+    let remoteResult: Awaited<ReturnType<typeof sessionManager.exec>>
+    try {
+        remoteResult = await sessionManager.exec(alias, remoteCommand, {
+            timeout,
+            useLoginUser: true,
+            maxOutputSize: 16 * 1024 * 1024,
+        })
+    } catch (error) {
+        const details =
+            error && typeof error === 'object' && 'details' in error
+                ? (error as { details?: Record<string, unknown> }).details
+                : undefined
+        throw new VerificationStageError(
+            'remote_manifest_command',
+            boundedDiagnostic(error instanceof Error ? error.message : String(error)).text,
+            true,
+            { timeout, ...details }
+        )
+    }
+    if (!remoteResult.success) {
+        const detail = boundedDiagnostic(
+            remoteResult.stderr || remoteResult.stdout || 'remote directory manifest failed'
+        )
+        throw new VerificationStageError(
+            'remote_manifest_command',
+            detail.text,
+            remoteResult.failureKind !== 'remote_command',
+            {
+                ...commandFailureDetails(remoteResult),
+                diagnosticBytes: detail.bytes,
+                diagnosticTruncated: detail.truncated || undefined,
+            }
+        )
+    }
+    if (remoteResult.stdoutTruncated) {
+        throw new VerificationStageError(
+            'remote_manifest_output',
+            'remote directory manifest output exceeded the 16MB response limit',
+            false,
+            { maxOutputSize: 16 * 1024 * 1024 }
+        )
+    }
+    try {
+        return parseRemoteDirectoryManifest(remoteResult.stdout)
+    } catch (error) {
+        throw new VerificationStageError(
+            'remote_manifest_parse',
+            error instanceof Error ? error.message : String(error),
+            false
+        )
+    }
+}
+
+function directoryVerificationFollowsSymlinks(args: z.infer<typeof syncSchema>): boolean {
+    return args.direction === 'upload' && args.followSymlinks === true
+}
+
+function deletionManifestRequest(request: DirectoryVerifyRequest): DirectoryVerifyRequest {
+    return {
+        ...request,
+        count: false,
+        sha256: false,
+        owner: false,
+        mode: false,
+        deletions: false,
+        staleFiles: false,
+    }
+}
+
+async function captureDeletionBaseline(
+    args: z.infer<typeof syncSchema>,
+    remainingTimeout: () => number
+): Promise<DirectoryManifest | undefined> {
+    if (!args.verify?.deletions || args.dryRun) {
+        return undefined
+    }
+    const request = deletionManifestRequest(args.verify)
+    if (args.direction === 'upload') {
+        const probeTimeout = remainingTimeout()
+        if (probeTimeout <= 0) {
+            throw new VerificationStageError(
+                'verification_timeout',
+                'sync operation timeout was exhausted before deletion baseline capture started',
+                true
+            )
+        }
+        const remote = await probeRemoteFile(args.alias, args.remotePath, probeTimeout)
+        if (!remote.exists) {
+            return createEmptyDirectoryManifest()
+        }
+        if (!remote.isDirectory) {
+            throw new VerificationStageError(
+                'remote_probe',
+                'deletion verification requires the remote destination to be a directory',
+                false,
+                { remotePath: args.remotePath, fileType: remote.fileType }
+            )
+        }
+        const manifestTimeout = remainingTimeout()
+        if (manifestTimeout <= 0) {
+            throw new VerificationStageError(
+                'verification_timeout',
+                'sync operation timeout was exhausted before deletion baseline manifest started',
+                true
+            )
+        }
+        return captureRemoteDirectoryManifest(
+            args.alias,
+            args.remotePath,
+            request,
+            args.exclude,
+            directoryVerificationFollowsSymlinks(args),
+            manifestTimeout
+        )
+    }
+
+    const local = fileOps.probeLocalPath(args.localPath)
+    if (!local.exists) {
+        return createEmptyDirectoryManifest()
+    }
+    if (!local.isDirectory) {
+        throw new VerificationStageError(
+            'local_manifest',
+            'deletion verification requires the local destination to be a directory',
+            false,
+            { localPath: args.localPath }
+        )
+    }
+    try {
+        return await createLocalDirectoryManifest(
+            local.resolvedPath,
+            request,
+            args.exclude,
+            directoryVerificationFollowsSymlinks(args)
+        )
+    } catch (error) {
+        throw new VerificationStageError(
+            'local_manifest',
+            error instanceof Error ? error.message : String(error),
+            false
+        )
+    }
+}
+
+async function buildDirectorySyncVerification(
+    args: z.infer<typeof syncSchema>,
+    local: ReturnType<typeof fileOps.probeLocalPath>,
+    timeout: number,
+    deletionBaseline?: DirectoryManifest
+): Promise<Record<string, unknown> | undefined> {
+    if (!args.verify) {
+        return undefined
+    }
+    if (args.dryRun) {
+        return { kind: 'directory', skipped: true, reason: 'directory verification is not executed during dryRun' }
+    }
+    if (!local.exists || !local.isDirectory) {
+        return { kind: 'directory', skipped: true, reason: 'bounded directory verification requires a local directory' }
+    }
+    if (timeout <= 0) {
+        throw new VerificationStageError(
+            'verification_timeout',
+            'sync operation timeout was exhausted before directory verification started',
+            true
+        )
+    }
+    const request: DirectoryVerifyRequest = args.verify
+    const remoteManifest = await captureRemoteDirectoryManifest(
+        args.alias,
+        args.remotePath,
+        request,
+        args.exclude,
+        directoryVerificationFollowsSymlinks(args),
+        timeout
+    )
+    let localManifest: Awaited<ReturnType<typeof createLocalDirectoryManifest>>
+    try {
+        localManifest = await createLocalDirectoryManifest(
+            local.resolvedPath,
+            request,
+            args.exclude,
+            directoryVerificationFollowsSymlinks(args)
+        )
+    } catch (error) {
+        throw new VerificationStageError(
+            'local_manifest',
+            error instanceof Error ? error.message : String(error),
+            false
+        )
+    }
+    return args.direction === 'upload'
+        ? compareDirectoryManifests(localManifest, remoteManifest, request, deletionBaseline)
+        : compareDirectoryManifests(remoteManifest, localManifest, request, deletionBaseline)
+}
+
 function mergeSyncVerification(
     existing: Record<string, unknown> | undefined,
-    ownerMode: Record<string, unknown> | undefined
+    ownerMode: Record<string, unknown> | undefined,
+    directory: Record<string, unknown> | undefined
 ): Record<string, unknown> | undefined {
-    if (!ownerMode) {
-        return existing
+    const parts = [existing, ownerMode, directory].filter((part): part is Record<string, unknown> => Boolean(part))
+    if (parts.length === 0) {
+        return undefined
     }
-    if (!existing) {
-        return ownerMode
+    if (parts.length === 1) {
+        return parts[0]
     }
     return {
-        ...existing,
+        transport: existing,
         ownerMode,
+        directory,
     }
 }
 
 async function cleanupRemotePath(alias: string, remotePath: string): Promise<void> {
-    await sessionManager.exec(alias, `rm -f ${escapeShellArg(remotePath)}`, {
-        timeout: 10000,
-        useLoginUser: true,
-        maxOutputSize: 4096,
-    })
-}
-
-async function applyRemoteMode(alias: string, remotePath: string, mode: string): Promise<void> {
-    const result = await sessionManager.exec(alias, `chmod ${escapeShellArg(mode)} ${escapeShellArg(remotePath)}`, {
+    const result = await sessionManager.exec(alias, `rm -f ${escapeShellArg(remotePath)}`, {
         timeout: 10000,
         useLoginUser: true,
         maxOutputSize: 4096,
     })
     if (!result.success) {
-        throw new Error(result.stderr || result.stdout || `chmod failed with exit code ${result.exitCode}`)
+        const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`
+        throw new Error(`Temporary remote file cleanup failed: ${detail}`)
     }
 }
 
@@ -421,15 +793,41 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
               ].join(', ')
             : undefined
     const remoteParent = await probeRemoteParent(args.alias, args.remotePath)
+    let remoteBefore: Awaited<ReturnType<typeof probeRemoteFile>>
+    try {
+        remoteBefore = await probeRemoteFile(args.alias, args.remotePath)
+    } catch (error) {
+        return formatResult({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            diagnostics: {
+                local: summarizeLocalPathProbe(local),
+                remoteParent,
+                remoteProbe: verificationErrorDetails(error),
+                atomic: args.atomic === true,
+            },
+        })
+    }
+    const sourceMode =
+        local.exists && 'mode' in local && typeof local.mode === 'string'
+            ? Number.parseInt(local.mode, 8) & 0o777
+            : undefined
+    const existingMode =
+        remoteBefore.exists && remoteBefore.mode ? Number.parseInt(remoteBefore.mode, 8) & 0o777 : undefined
+    const createMode = args.atomic && existingMode !== undefined ? existingMode : sourceMode
     const tempRemotePath = args.atomic
         ? `${args.remotePath}.mcp-tmp-${process.pid}-${Date.now().toString(36)}`
         : args.remotePath
 
     try {
-        const uploadResult = await fileOps.uploadFile(args.alias, args.localPath, tempRemotePath)
-        if (local.exists && 'mode' in local && typeof local.mode === 'string') {
-            await applyRemoteMode(args.alias, tempRemotePath, local.mode)
-        }
+        const uploadResult = await fileOps.uploadFile(
+            args.alias,
+            args.localPath,
+            tempRemotePath,
+            undefined,
+            undefined,
+            createMode
+        )
         if (args.atomic) {
             const rename = await sessionManager.exec(
                 args.alias,
@@ -439,42 +837,90 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             if (!rename.success) {
                 const renameError =
                     rename.stderr || rename.stdout || `atomic rename failed with exit code ${rename.exitCode}`
-                await cleanupRemotePath(args.alias, tempRemotePath).catch(() => undefined)
+                let cleanupWarning: string | undefined
+                try {
+                    await cleanupRemotePath(args.alias, tempRemotePath)
+                } catch (error) {
+                    cleanupWarning = error instanceof Error ? error.message : String(error)
+                }
                 return formatResult({
                     success: false,
                     error: renameError,
+                    cleanupWarning,
                     diagnostics: {
                         local: summarizeLocalPathProbe(local),
                         remoteParent,
                         atomic: true,
+                        tempRemotePath,
                     },
                 })
             }
         }
+        const verificationRequested = Boolean(
+            args.verifyOwner !== undefined ||
+            args.verifyMode !== undefined ||
+            args.verifyMd5 ||
+            args.verifySize ||
+            args.verifyMtime
+        )
+        let verification: Record<string, unknown> | undefined
+        let verificationError: unknown
+        if (verificationRequested) {
+            try {
+                verification = await buildUploadVerification(args, local)
+            } catch (error) {
+                verificationError = error
+                verification = verificationErrorDetails(error)
+            }
+        }
+        const outcome = buildTransferOutcome(
+            uploadResult.success,
+            verificationRequested,
+            verification,
+            verificationError
+        )
         return formatResult({
             ...uploadResult,
-            message: `Uploaded to ${args.remotePath}`,
+            ...outcome,
+            message: outcome.success
+                ? `Uploaded to ${args.remotePath}`
+                : `Uploaded but verification failed: ${args.remotePath}`,
+            error:
+                verificationError === undefined
+                    ? undefined
+                    : `Upload completed, but verification failed: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
             atomic: args.atomic === true,
+            createMode: uploadResult.createMode,
+            existingTargetModePreserved: remoteBefore.exists,
             suggestion: largeFileSuggestion,
             recommendedSync,
             diagnostics: {
                 local: summarizeLocalPathProbe(local),
                 remoteParent,
                 atomic: args.atomic === true,
+                tempRemotePath: args.atomic ? tempRemotePath : undefined,
             },
-            verification: await buildUploadVerification(args, local),
+            verification,
         })
     } catch (error) {
+        let cleanupWarning: string | undefined
         if (args.atomic) {
-            await cleanupRemotePath(args.alias, tempRemotePath).catch(() => undefined)
+            try {
+                await cleanupRemotePath(args.alias, tempRemotePath)
+            } catch (cleanupError) {
+                cleanupWarning = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            }
         }
         return formatResult({
             success: false,
             error: error instanceof Error ? error.message : String(error),
+            cleanupWarning,
             diagnostics: {
                 local: summarizeLocalPathProbe(local),
                 remoteParent,
+                remoteBefore,
                 atomic: args.atomic === true,
+                tempRemotePath: args.atomic ? tempRemotePath : undefined,
             },
         })
     }
@@ -553,23 +999,110 @@ async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
 }
 
 async function handleSync(args: z.infer<typeof syncSchema>) {
-    const local = fileOps.probeLocalPath(args.localPath)
-    const diagnostics = {
-        local: summarizeLocalPathProbe(local),
+    const startedAt = Date.now()
+    if (args.verify?.deletions && args.delete !== true) {
+        return formatResult({
+            success: false,
+            code: 'DELETION_VERIFICATION_REQUIRES_DELETE',
+            error: 'verify.deletions=true requires delete=true',
+        })
+    }
+    const operationTimeout = args.operationTimeout ?? 600_000
+    const remainingTimeout = (): number => operationTimeout - (Date.now() - startedAt)
+    const localBefore = fileOps.probeLocalPath(
+        args.localPath,
+        args.direction === 'upload' && args.followSymlinks === true
+    )
+    const diagnostics: Record<string, unknown> = {
+        localBefore: summarizeLocalPathProbe(localBefore),
         remoteParent: await probeRemoteParent(args.alias, args.remotePath),
     }
     try {
+        let deletionBaseline: DirectoryManifest | undefined
+        try {
+            deletionBaseline = await captureDeletionBaseline(args, remainingTimeout)
+            if (deletionBaseline) {
+                diagnostics.deletionBaseline = {
+                    count: deletionBaseline.count,
+                    limited: deletionBaseline.limited,
+                    limitReason: deletionBaseline.limitReason,
+                    skippedSymlinks: deletionBaseline.skippedSymlinks,
+                    skippedUnsupported: deletionBaseline.skippedUnsupported,
+                    unsupportedSamples: deletionBaseline.unsupportedSamples,
+                }
+            }
+        } catch (error) {
+            const verification = verificationErrorDetails(error)
+            return formatResult({
+                success: false,
+                transferSuccess: false,
+                verificationRequested: true,
+                verificationSuccess: false,
+                verificationStatus: 'error',
+                failedChecks: ['deletions'],
+                error: `Deletion baseline capture failed: ${error instanceof Error ? error.message : String(error)}`,
+                verification,
+                diagnostics,
+            })
+        }
+
+        const transferTimeout = remainingTimeout()
+        if (transferTimeout <= 0) {
+            throw new VerificationStageError(
+                'verification_timeout',
+                'sync operation timeout was exhausted before transfer started',
+                true
+            )
+        }
         const syncResult = await fileOps.syncFiles(args.alias, args.localPath, args.remotePath, args.direction, {
             delete: args.delete,
             dryRun: args.dryRun,
             exclude: args.exclude,
             recursive: args.recursive,
             followSymlinks: args.followSymlinks,
+            preflightTimeout: args.preflightTimeout,
+            connectTimeout: args.connectTimeout,
+            operationTimeout: transferTimeout,
         })
-        const ownerModeVerification = syncResult.success ? await buildSyncUploadVerification(args, local) : undefined
+        const localAfter = fileOps.probeLocalPath(
+            args.localPath,
+            args.direction === 'upload' && args.followSymlinks === true
+        )
+        diagnostics.localAfter = summarizeLocalPathProbe(localAfter)
+        const verificationRequested = Boolean(
+            args.verifyOwner !== undefined || args.verifyMode !== undefined || args.verify !== undefined
+        )
+        let verification: Record<string, unknown> | undefined
+        let verificationError: unknown
+        if (verificationRequested && syncResult.success) {
+            try {
+                const ownerModeVerification = await buildSyncUploadVerification(
+                    args,
+                    args.direction === 'upload' ? localBefore : localAfter,
+                    remainingTimeout()
+                )
+                const directoryVerification = await buildDirectorySyncVerification(
+                    args,
+                    args.direction === 'upload' ? localBefore : localAfter,
+                    remainingTimeout(),
+                    deletionBaseline
+                )
+                verification = mergeSyncVerification(undefined, ownerModeVerification, directoryVerification)
+            } catch (error) {
+                verificationError = error
+                verification = mergeSyncVerification(undefined, verificationErrorDetails(error), undefined)
+            }
+        }
+        const outcome = buildTransferOutcome(syncResult.success, verificationRequested, verification, verificationError)
         return formatResult({
             ...syncResult,
-            verification: mergeSyncVerification(syncResult.verification, ownerModeVerification),
+            ...outcome,
+            error:
+                verificationError === undefined
+                    ? undefined
+                    : `Sync completed, but verification failed: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
+            transportVerification: syncResult.verification,
+            verification,
             direction: args.direction,
             localPath: args.localPath,
             remotePath: args.remotePath,
@@ -655,7 +1188,8 @@ export function registerFileTools(server: McpServer): void {
         {
             description: `智能文件同步（支持目录递归）
 
-优先使用 rsync（如果本地和远程都安装了），否则回退到 SFTP
+只有直连且使用已校验 key path 或可用 SSH agent 的 session 才探测 rsync；password、inline key 和 jump host session 使用 SFTP
+满足 rsync 条件且本地、远端均可用 rsync 时使用 rsync，否则使用 SFTP
 rsync 可实现增量传输，对大目录同步效率更高
 
 用途：
