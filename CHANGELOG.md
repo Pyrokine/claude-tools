@@ -1,5 +1,75 @@
 # Changelog
 
+## v1.16.0 - 2026-07-16
+
+## Versions
+
+- mcp-claude-history: 1.8.1 → 1.9.0
+- mcp-chrome: 2.3.2 → 2.4.0
+- mcp-ssh: 2.3.2 → 2.4.0
+
+## What's Changed
+
+### mcp-claude-history
+
+- feat: Add `history_build_info` with package, commit, target, profile, timestamp, dirty-state, and reproducibility metadata
+- feat: Add strict tool call/result association, independent tool-result preview limits, and compact UTF-8 response budgeting
+- fix: Ignore valid session metadata records without warnings while retaining warnings for malformed and incomplete message records
+- fix: Apply redaction and canonical output manifests consistently across search, get, context, and trace
+- chore: Upgrade Rust dependencies, raise the MSRV to 1.88, and publish stable platform asset names alongside target-triple names
+
+### mcp-chrome
+
+- feat: Add bounded target diagnostics and explicit action, verification, failure-stage, and retry state fields
+- fix: Separate text occurrence indexes from target-element indexes, support replace on non-selection inputs, and recover stale iframe contexts once
+- fix: Keep `evaluate` in precise mode by default and use the same mode for its post-condition
+- fix: Normalize public console levels, bound inline network URLs, and aggregate candidate-port failures without changing zero-configuration reconnect
+- chore: Upgrade the TypeScript compiler path, Vite, ESLint, Prettier, and related dependencies
+
+### mcp-ssh
+
+- feat: Add tracked operation start, status, read, cancel, and list tools with bounded output and retention
+- feat: Select rsync or SFTP from route and credential capabilities, and return the selected transport with its decision reason
+- feat: Add bounded file and directory verification with explicit top-level failure when a requested check does not match
+- fix: Retain completed PTY output, wait for forward closure, report atomic upload temporary paths, and tighten line-range and command-risk handling
+- chore: Upgrade the TypeScript compiler path, ESLint, Prettier, and related dependencies
+
+---
+
+## 版本
+
+- mcp-claude-history: 1.8.1 → 1.9.0
+- mcp-chrome: 2.3.2 → 2.4.0
+- mcp-ssh: 2.3.2 → 2.4.0
+
+## 更新内容
+
+### mcp-claude-history
+
+- feat: 新增 `history_build_info`，返回包版本、commit、target、profile、构建时间、dirty 状态和可复现标记
+- feat: 严格关联 tool call 与 result，新增独立 tool-result 预览限制和紧凑 UTF-8 响应预算
+- fix: 合法 session metadata record 不再产生警告，损坏 JSON 和不完整消息 record 仍会报告警告
+- fix: search、get、context 和 trace 统一应用脱敏与 canonical output manifest
+- chore: 升级 Rust 依赖，将 MSRV 提升到 1.88，并同时发布稳定平台名和 target triple 资产名
+
+### mcp-chrome
+
+- feat: 新增有界 target diagnostics，以及明确的动作、验证、失败阶段和重试状态字段
+- fix: 分离文本 occurrence index 与目标元素 index，支持非 selection input replace，并对 stale iframe context 重试一次
+- fix: `evaluate` 默认使用 precise mode，post-condition 使用同一 mode
+- fix: 统一公开 console level，限制内联 network URL，并聚合候选端口失败且不改变零配置自动重连
+- chore: 升级 TypeScript compiler path、Vite、ESLint、Prettier 及相关依赖
+
+### mcp-ssh
+
+- feat: 新增 tracked operation 的 start、status、read、cancel 和 list 工具，输出与保留时间均有上限
+- feat: 根据连接路径和凭证能力选择 rsync 或 SFTP，并返回 transport 与选择原因
+- feat: 新增有界文件和目录校验，请求的校验不匹配时顶层明确返回失败
+- fix: 保留自然结束的 PTY 输出，等待端口转发关闭，返回 atomic upload 临时路径，并收紧 line range 和命令风险处理
+- chore: 升级 TypeScript compiler path、ESLint、Prettier 及相关依赖
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.15.2...v1.16.0
+
 ## v1.15.2 - 2026-07-07
 
 ## Versions
