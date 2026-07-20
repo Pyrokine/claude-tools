@@ -1,5 +1,71 @@
 # Changelog
 
+## v1.16.1 - 2026-07-21
+
+## Versions
+
+- mcp-claude-history: 1.9.0 → 1.9.1
+- mcp-chrome: 2.4.0 → 2.4.1
+- mcp-chrome Extension: 2.4.0 → 2.4.1
+- mcp-ssh: 2.4.0 → 2.4.1
+
+## What's Changed
+
+### mcp-claude-history
+
+- fix: Keep paginated search continuations within the original slice
+- fix: Return `response_too_large` when a byte-limited response cannot advance
+- fix: Tighten trace association and range handling
+
+### mcp-chrome
+
+- fix: Verify the active Extension bundle and resolve iframe identity without relying on frame ordering
+- fix: Prevent implicit replay of side-effecting scripts after stale execution contexts
+- fix: Report action, output, verification, and target diagnostic states accurately
+- fix: Redact credential query parameters from logs, diagnostics, and output files
+- fix: Dispatch native editing commands once and verify page results separately
+
+### mcp-ssh
+
+- fix: Harden tracked operation and session lifecycle handling
+- fix: Improve forward close and reconnect state reporting
+- fix: Distinguish atomic upload final paths from temporary verification paths
+- fix: Strengthen SFTP, rsync, transfer, and directory verification semantics
+
+---
+
+## 版本
+
+- mcp-claude-history: 1.9.0 → 1.9.1
+- mcp-chrome: 2.4.0 → 2.4.1
+- mcp-chrome Extension: 2.4.0 → 2.4.1
+- mcp-ssh: 2.4.0 → 2.4.1
+
+## 更新内容
+
+### mcp-claude-history
+
+- fix: 保证分页续查不离开原始 slice 范围
+- fix: 字节预算无法容纳结果且游标不能推进时返回 `response_too_large`
+- fix: 加强 trace 关联和范围处理
+
+### mcp-chrome
+
+- fix: 校验活动 Extension bundle，并按真实 frame identity 定位 iframe
+- fix: stale execution context 后不再隐式重放有副作用的脚本
+- fix: 准确报告动作、输出、验证和目标诊断状态
+- fix: 脱敏日志、diagnostics 和输出文件中的认证 query 参数
+- fix: 原生编辑命令只分发一次，页面结果单独验证
+
+### mcp-ssh
+
+- fix: 加强 tracked operation 和会话生命周期管理
+- fix: 改进端口转发关闭及重连状态
+- fix: 区分 atomic upload 最终路径与临时校验路径
+- fix: 加强 SFTP、rsync、文件传输和目录校验语义
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.16.0...v1.16.1
+
 ## v1.16.0 - 2026-07-16
 
 ## Versions
