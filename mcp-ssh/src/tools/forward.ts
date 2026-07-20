@@ -31,7 +31,7 @@ const forwardLocalSchema = z.object({
 
 const forwardRemoteSchema = z.object({
     alias: z.string().describe('连接别名'),
-    remotePort: z.number().describe('远程监听端口'),
+    remotePort: z.number().int().min(0).max(65535).describe('远程监听端口，传 0 时由服务器动态分配'),
     localHost: z.string().describe('本地目标地址'),
     localPort: z.number().describe('本地目标端口'),
     remoteHost: loopbackHostSchema.describe(
@@ -72,7 +72,7 @@ async function handleForwardLocal(args: z.infer<typeof forwardLocalSchema>) {
 
 async function handleForwardRemote(args: z.infer<typeof forwardRemoteSchema>) {
     try {
-        const forwardId = await sessionManager.forwardRemote(
+        const { forwardId, remotePort } = await sessionManager.forwardRemote(
             args.alias,
             args.remotePort,
             args.localHost,
@@ -83,7 +83,8 @@ async function handleForwardRemote(args: z.infer<typeof forwardRemoteSchema>) {
             success: true,
             forwardId,
             type: 'remote',
-            message: `Remote forward: ${args.remoteHost}:${args.remotePort} -> ${args.localHost}:${args.localPort}`,
+            remotePort,
+            message: `Remote forward: ${args.remoteHost}:${remotePort} -> ${args.localHost}:${args.localPort}`,
         })
     } catch (error) {
         return formatError(error)
@@ -145,7 +146,8 @@ export function registerForwardTools(server: McpServer): void {
 
 用途：将本地服务暴露到远程
 示例：ssh_forward_remote(alias="server", remotePort=8080, localHost="127.0.0.1", localPort=3000)
-效果：远程访问 localhost:8080 会转发到本地的 127.0.0.1:3000`,
+效果：远程访问 localhost:8080 会转发到本地的 127.0.0.1:3000
+传 remotePort=0 时由服务器动态分配端口，返回结果中的 remotePort 是实际监听端口`,
             inputSchema: forwardRemoteSchema,
         },
         (args) => handleForwardRemote(args)

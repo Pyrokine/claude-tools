@@ -14,12 +14,30 @@ export const DEFAULT_OPERATION_READ_BYTES = 64 * 1024
 export const HARD_OPERATION_READ_BYTES = 1024 * 1024
 export const DEFAULT_OPERATION_RETENTION_MS = 60 * 60_000
 export const MAX_OPERATION_RETENTION_MS = 24 * 60 * 60_000
+export const DEFAULT_OPERATION_START_TIMEOUT_MS = 30_000
+export const MAX_OPERATION_START_TIMEOUT_MS = 600_000
+
+export class OperationStartError extends Error {
+    constructor(
+        message: string,
+        readonly details: Record<string, unknown>
+    ) {
+        super(message)
+        this.name = 'OperationStartError'
+    }
+}
 
 const MARKER_PREFIX = '__MCP_SSH_OPERATION__'
 const MARKER_LINE_LIMIT = 512
 
 export interface OperationDependencies {
-    openStream(alias: string, command: string, marker: string, options: OperationStartOptions): Promise<ClientChannel>
+    openStream(
+        alias: string,
+        command: string,
+        marker: string,
+        options: OperationStartOptions,
+        adopt: (stream: ClientChannel) => void
+    ): Promise<void>
     cancelRemote(
         alias: string,
         pid: number,
@@ -58,13 +76,14 @@ interface OperationRecord {
     stderrTruncated: boolean
     maxOutputBytes: number
     markerBuffer: Buffer
-    stream: ClientChannel
+    stream?: ClientChannel
     options: OperationStartOptions
     error?: string
 }
 
 export class OperationManager {
     private readonly operations = new Map<string, OperationRecord>()
+    private readonly pendingStarts = new Map<string, string>()
     private readonly sweeper: NodeJS.Timeout
 
     constructor(
@@ -76,11 +95,24 @@ export class OperationManager {
     }
 
     async start(alias: string, command: string, options: OperationStartOptions = {}): Promise<OperationInfo> {
+        const pendingOperationId = this.pendingStarts.get(alias)
+        if (pendingOperationId) {
+            throw new OperationStartError(
+                `Alias '${alias}' already has an operation start awaiting SSH channel setup`,
+                {
+                    alias,
+                    operationId: pendingOperationId,
+                    retryable: true,
+                    suggestion: '等待当前 operation start 完成，或断开该 alias 以释放未完成的 SSH channel request',
+                }
+            )
+        }
+
         const operationId = `op_${randomUUID()}`
         const marker = randomBytes(32).toString('hex')
         const maxOutputBytes = this.normalizeMaxOutputBytes(options.maxOutputBytes)
         const retentionMs = this.normalizeRetentionMs(options.retentionMs)
-        const stream = await this.dependencies.openStream(alias, command, marker, options)
+        const startTimeoutMs = this.normalizeStartTimeoutMs(options.startTimeoutMs)
         const record: OperationRecord = {
             operationId,
             alias,
@@ -107,12 +139,81 @@ export class OperationManager {
             stderrTruncated: false,
             maxOutputBytes,
             markerBuffer: Buffer.alloc(0),
-            stream,
-            options: { ...options, maxOutputBytes, retentionMs },
+            options: { ...options, maxOutputBytes, retentionMs, startTimeoutMs },
+        }
+        this.operations.set(operationId, record)
+        this.pendingStarts.set(alias, operationId)
+
+        const opening = this.dependencies.openStream(alias, command, marker, record.options, (stream) => {
+            if (record.stream) {
+                stream.destroy()
+                throw new Error('Operation stream was adopted more than once')
+            }
+            if (record.finishedAt !== null) {
+                stream.destroy()
+                throw new Error('Operation stream arrived after operation start finished')
+            }
+            record.stream = stream
+            this.attachStream(record, stream)
+        })
+        void opening.then(
+            () => this.clearPendingStart(alias, operationId),
+            () => this.clearPendingStart(alias, operationId)
+        )
+
+        let timer: NodeJS.Timeout | undefined
+        try {
+            await Promise.race([
+                opening,
+                new Promise<never>((_resolve, reject) => {
+                    timer = setTimeout(() => {
+                        reject(
+                            new OperationStartError(`Operation start timed out after ${startTimeoutMs}ms`, {
+                                alias,
+                                operationId,
+                                startTimeoutMs,
+                                status: 'unknown',
+                                retryable: false,
+                                suggestion:
+                                    'SSH channel request 状态无法确认；使用 ssh_operation_status 查询记录，必要时 ssh_disconnect 释放底层 pending channel',
+                            })
+                        )
+                    }, startTimeoutMs)
+                }),
+            ])
+        } catch (error) {
+            if (record.finishedAt === null) {
+                record.status = error instanceof OperationStartError ? 'unknown' : 'failed'
+                record.error = error instanceof Error ? error.message : String(error)
+                this.finish(record)
+            }
+            record.stream?.destroy()
+            if (error instanceof OperationStartError) {
+                throw error
+            }
+            throw new OperationStartError(record.error ?? 'Operation start failed', {
+                alias,
+                operationId,
+                status: record.status,
+                retryable: false,
+            })
+        } finally {
+            if (timer) {
+                clearTimeout(timer)
+            }
         }
 
-        this.operations.set(operationId, record)
-        this.attachStream(record)
+        if (!record.stream) {
+            record.status = 'failed'
+            record.error = 'Operation stream was not adopted'
+            this.finish(record)
+            throw new OperationStartError(record.error, {
+                alias,
+                operationId,
+                status: record.status,
+                retryable: false,
+            })
+        }
         return this.info(record)
     }
 
@@ -227,6 +328,7 @@ export class OperationManager {
     }
 
     markAliasDisconnected(alias: string): void {
+        this.pendingStarts.delete(alias)
         for (const record of this.operations.values()) {
             if (record.alias === alias && (record.status === 'starting' || record.status === 'running')) {
                 record.status = 'unknown'
@@ -249,22 +351,22 @@ export class OperationManager {
         clearInterval(this.sweeper)
     }
 
-    private attachStream(record: OperationRecord): void {
-        record.stream.on('data', (data: Buffer) => {
+    private attachStream(record: OperationRecord, stream: ClientChannel): void {
+        stream.on('data', (data: Buffer) => {
             record.stdoutBytes += data.length
             this.appendOutput(record, 'stdout', data)
         })
-        record.stream.stderr.on('data', (data: Buffer) => {
+        stream.stderr.on('data', (data: Buffer) => {
             this.consumeMarker(record, data)
         })
-        record.stream.on('error', (error: Error) => {
+        stream.on('error', (error: Error) => {
             if (record.cancelInFlight) {
                 record.pendingTermination ??= { type: 'error', error }
                 return
             }
             this.finishStreamError(record, error)
         })
-        record.stream.on('close', (code: number | null, signal?: string) => {
+        stream.on('close', (code: number | null, signal?: string) => {
             const close = { type: 'close' as const, code, signal: signal ?? null }
             if (record.cancelInFlight) {
                 record.pendingTermination ??= close
@@ -291,6 +393,7 @@ export class OperationManager {
         if (record.status === 'unknown' || record.finishedAt !== null) {
             return
         }
+        this.flushMarkerBuffer(record)
         record.status = 'failed'
         record.error = error.message
         this.finish(record)
@@ -302,11 +405,12 @@ export class OperationManager {
         }
         record.exitCode = code
         record.signal = signal
+        this.flushMarkerBuffer(record)
         if (record.cancelRequested) {
             record.status = 'cancelled'
         } else if (!record.markerVerified) {
             record.status = 'failed'
-            record.error = 'Remote operation exited before its marker was verified'
+            record.error ??= 'Remote operation exited before its marker was verified'
         } else {
             record.status = code === 0 ? 'completed' : 'failed'
         }
@@ -314,51 +418,102 @@ export class OperationManager {
     }
 
     private consumeMarker(record: OperationRecord, data: Buffer): void {
-        if (record.markerVerified) {
-            record.stderrBytes += data.length
-            this.appendOutput(record, 'stderr', data)
+        if (record.markerVerified || record.status !== 'starting') {
+            this.appendStderr(record, data)
             return
         }
+
+        const markerPrefix = Buffer.from(MARKER_PREFIX)
         record.markerBuffer = Buffer.concat([record.markerBuffer, data])
-        const newline = record.markerBuffer.indexOf(0x0a)
-        if (newline < 0) {
-            if (record.markerBuffer.length > MARKER_LINE_LIMIT) {
-                record.status = 'failed'
-                record.error = 'Remote operation marker exceeded the allowed length'
-                record.stderrBytes += record.markerBuffer.length
-                this.appendOutput(record, 'stderr', record.markerBuffer)
-                record.markerBuffer = Buffer.alloc(0)
+        while (!record.markerVerified) {
+            const markerIndex = record.markerBuffer.indexOf(markerPrefix)
+            if (markerIndex > 0) {
+                this.appendStderr(record, record.markerBuffer.subarray(0, markerIndex))
+                record.markerBuffer = record.markerBuffer.subarray(markerIndex)
+                continue
             }
+            if (markerIndex < 0) {
+                const newline = record.markerBuffer.indexOf(0x0a)
+                if (newline >= 0) {
+                    this.appendStderr(record, record.markerBuffer.subarray(0, newline + 1))
+                    record.markerBuffer = record.markerBuffer.subarray(newline + 1)
+                    continue
+                }
+                const retainedBytes = Math.min(record.markerBuffer.length, markerPrefix.length - 1)
+                const streamedBytes = record.markerBuffer.length - retainedBytes
+                if (streamedBytes > 0) {
+                    this.appendStderr(record, record.markerBuffer.subarray(0, streamedBytes))
+                    record.markerBuffer = record.markerBuffer.subarray(streamedBytes)
+                }
+                return
+            }
+
+            const newline = record.markerBuffer.indexOf(0x0a)
+            if (newline < 0) {
+                if (record.markerBuffer.length > MARKER_LINE_LIMIT) {
+                    this.appendStderr(record, record.markerBuffer)
+                    record.markerBuffer = Buffer.alloc(0)
+                    this.failMarker(record, 'Remote operation marker exceeded the allowed length')
+                }
+                return
+            }
+
+            const lineBytes = record.markerBuffer.subarray(0, newline + 1)
+            const line = record.markerBuffer.subarray(0, newline).toString('utf8').trim()
+            record.markerBuffer = record.markerBuffer.subarray(newline + 1)
+            if (newline > MARKER_LINE_LIMIT) {
+                this.appendStderr(record, lineBytes)
+                this.appendStderr(record, record.markerBuffer)
+                record.markerBuffer = Buffer.alloc(0)
+                this.failMarker(record, 'Remote operation marker exceeded the allowed length')
+                return
+            }
+
+            const expectedPrefix = `${MARKER_PREFIX}:${record.marker}:`
+            if (!line.startsWith(expectedPrefix)) {
+                this.appendStderr(record, lineBytes)
+                this.appendStderr(record, record.markerBuffer)
+                record.markerBuffer = Buffer.alloc(0)
+                this.failMarker(record, 'Remote operation marker did not match the local operation')
+                return
+            }
+
+            const metadata = line.slice(expectedPrefix.length).match(/^([1-9]\d*):(0|1)$/)
+            const pid = metadata ? Number(metadata[1]) : Number.NaN
+            if (!metadata || !Number.isSafeInteger(pid)) {
+                this.appendStderr(record, lineBytes)
+                this.appendStderr(record, record.markerBuffer)
+                record.markerBuffer = Buffer.alloc(0)
+                this.failMarker(record, 'Remote operation marker contained invalid process metadata')
+                return
+            }
+            record.pid = pid
+            record.processGroup = metadata[2] === '1'
+            record.markerVerified = true
+            record.status = 'running'
+            this.appendStderr(record, record.markerBuffer)
+            record.markerBuffer = Buffer.alloc(0)
+        }
+    }
+
+    private failMarker(record: OperationRecord, error: string): void {
+        record.status = 'failed'
+        record.error = error
+        this.finish(record)
+        record.stream?.destroy()
+    }
+
+    private flushMarkerBuffer(record: OperationRecord): void {
+        if (record.markerBuffer.length === 0) {
             return
         }
-
-        const line = record.markerBuffer.subarray(0, newline).toString('utf8').trim()
-        const remainder = record.markerBuffer.subarray(newline + 1)
+        this.appendStderr(record, record.markerBuffer)
         record.markerBuffer = Buffer.alloc(0)
-        const expectedPrefix = `${MARKER_PREFIX}:${record.marker}:`
-        if (!line.startsWith(expectedPrefix)) {
-            record.status = 'failed'
-            record.error = 'Remote operation marker did not match the local operation'
-            const invalidMarker = Buffer.from(`${line}\n`)
-            record.stderrBytes += invalidMarker.length + remainder.length
-            this.appendOutput(record, 'stderr', invalidMarker)
-            this.appendOutput(record, 'stderr', remainder)
-            return
-        }
+    }
 
-        const [pidText, groupText] = line.slice(expectedPrefix.length).split(':')
-        const pid = Number(pidText)
-        if (!Number.isSafeInteger(pid) || pid <= 0 || (groupText !== '0' && groupText !== '1')) {
-            record.status = 'failed'
-            record.error = 'Remote operation marker contained invalid process metadata'
-            return
-        }
-        record.pid = pid
-        record.processGroup = groupText === '1'
-        record.markerVerified = true
-        record.status = 'running'
-        record.stderrBytes += remainder.length
-        this.appendOutput(record, 'stderr', remainder)
+    private appendStderr(record: OperationRecord, data: Buffer): void {
+        record.stderrBytes += data.length
+        this.appendOutput(record, 'stderr', data)
     }
 
     private appendOutput(record: OperationRecord, stream: 'stdout' | 'stderr', data: Buffer): void {
@@ -409,6 +564,12 @@ export class OperationManager {
         }
     }
 
+    private clearPendingStart(alias: string, operationId: string): void {
+        if (this.pendingStarts.get(alias) === operationId) {
+            this.pendingStarts.delete(alias)
+        }
+    }
+
     private requireOperation(operationId: string): OperationRecord {
         this.sweepExpired()
         const record = this.operations.get(operationId)
@@ -438,6 +599,14 @@ export class OperationManager {
         const normalized = value ?? DEFAULT_OPERATION_RETENTION_MS
         if (!Number.isSafeInteger(normalized) || normalized <= 0 || normalized > MAX_OPERATION_RETENTION_MS) {
             throw new Error(`retentionMs must be between 1 and ${MAX_OPERATION_RETENTION_MS}`)
+        }
+        return normalized
+    }
+
+    private normalizeStartTimeoutMs(value: number | undefined): number {
+        const normalized = value ?? DEFAULT_OPERATION_START_TIMEOUT_MS
+        if (!Number.isSafeInteger(normalized) || normalized <= 0 || normalized > MAX_OPERATION_START_TIMEOUT_MS) {
+            throw new Error(`startTimeoutMs must be between 1 and ${MAX_OPERATION_START_TIMEOUT_MS}`)
         }
         return normalized
     }

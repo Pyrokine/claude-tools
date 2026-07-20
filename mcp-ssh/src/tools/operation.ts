@@ -4,9 +4,11 @@ import {
     DEFAULT_OPERATION_MAX_OUTPUT_BYTES,
     DEFAULT_OPERATION_READ_BYTES,
     DEFAULT_OPERATION_RETENTION_MS,
+    DEFAULT_OPERATION_START_TIMEOUT_MS,
     HARD_OPERATION_MAX_OUTPUT_BYTES,
     HARD_OPERATION_READ_BYTES,
     MAX_OPERATION_RETENTION_MS,
+    MAX_OPERATION_START_TIMEOUT_MS,
 } from '../operation-manager.js'
 import { sessionManager } from '../session-manager.js'
 import { formatError, formatResult } from './utils.js'
@@ -36,6 +38,15 @@ const operationStartSchema = z.object({
         .optional()
         .describe(
             `完成后的状态保留时间，默认 ${DEFAULT_OPERATION_RETENTION_MS}ms，最大 ${MAX_OPERATION_RETENTION_MS}ms`
+        ),
+    startTimeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_OPERATION_START_TIMEOUT_MS)
+        .optional()
+        .describe(
+            `等待 SSH operation channel 建立的超时，默认 ${DEFAULT_OPERATION_START_TIMEOUT_MS}ms，最大 ${MAX_OPERATION_START_TIMEOUT_MS}ms`
         ),
 })
 
@@ -69,6 +80,7 @@ async function handleOperationStart(args: z.infer<typeof operationStartSchema>) 
             loadProfile: args.loadProfile,
             maxOutputBytes: args.maxOutputBytes,
             retentionMs: args.retentionMs,
+            startTimeoutMs: args.startTimeoutMs,
         })
         return formatResult({ success: true, ...operation })
     } catch (error) {
@@ -122,8 +134,8 @@ export function registerOperationTools(server: McpServer): void {
         {
             description: `启动可跟踪的长时间远端命令
 
-返回不可预测的 operationId。输出保存在有硬上限的内存缓冲区中，完成后按 retentionMs 自动过期。
-普通 ssh_exec 的同步和 timeout 行为不变。`,
+返回不可预测的 operationId。channel 建立受 startTimeoutMs 限制，等待期间 record 可通过 list 查询；超时 details 返回 operationId。
+输出保存在有硬上限的内存缓冲区中，完成后按 retentionMs 自动过期。普通 ssh_exec 的同步和 timeout 行为不变。`,
             inputSchema: operationStartSchema,
         },
         (args) => handleOperationStart(args)

@@ -6,7 +6,7 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { createHash } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { z } from 'zod'
@@ -218,22 +218,15 @@ function uploadPathError(code: string, message: string, diagnostics: Record<stri
 
 async function probeRemoteParent(alias: string, remotePath: string) {
     const parent = path.posix.dirname(remotePath)
-    const escapedParent = escapeShellArg(parent)
-    const command = [
-        `if [ -d ${escapedParent} ]; then`,
-        `if [ -w ${escapedParent} ]; then printf writable; else printf not-writable; fi;`,
-        'else printf missing; fi',
-    ].join(' ')
     try {
-        const result = await sessionManager.exec(alias, command, {
-            timeout: 10000,
-            useLoginUser: true,
-            maxOutputSize: 4096,
-        })
-        const status = result.stdout.trim()
-        return { exists: status !== 'missing', writable: status === 'writable' }
+        const result = await probeRemoteFile(alias, parent)
+        return {
+            exists: result.exists,
+            isDirectory: result.exists ? result.isDirectory : false,
+            probeMethod: 'sftp' as const,
+        }
     } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error) }
+        return { error: error instanceof Error ? error.message : String(error), probeMethod: 'sftp' as const }
     }
 }
 
@@ -279,26 +272,37 @@ function commandFailureDetails(result: Awaited<ReturnType<typeof sessionManager.
 }
 
 async function hashRemoteFileMd5(alias: string, remotePath: string): Promise<string> {
-    const result = await sessionManager.exec(alias, `md5sum ${escapeShellArg(remotePath)} | awk '{print $1}'`, {
-        timeout: 30000,
+    try {
+        return await fileOps.hashRemoteFileDigest(alias, remotePath, 'md5')
+    } catch (error) {
+        throw new VerificationStageError(
+            'remote_probe',
+            `Remote SFTP MD5 read failed: ${error instanceof Error ? error.message : String(error)}`,
+            true,
+            { operation: 'md5', probeMethod: 'sftp' }
+        )
+    }
+}
+
+async function resolveExpectedOwnerId(alias: string, owner: string | number): Promise<string> {
+    const ownerText = String(owner)
+    if (/^\d+$/.test(ownerText)) {
+        return ownerText
+    }
+    const result = await sessionManager.exec(alias, `id -u ${escapeShellArg(ownerText)}`, {
+        timeout: 10000,
         useLoginUser: true,
         maxOutputSize: 4096,
     })
-    if (!result.success) {
+    const ownerId = result.stdout.trim()
+    if (!result.success || !/^\d+$/.test(ownerId)) {
         const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`
-        throw new VerificationStageError('remote_probe', `Remote MD5 command failed: ${detail}`, true, {
-            operation: 'md5',
+        throw new VerificationStageError('remote_probe', `Remote owner lookup failed: ${detail}`, true, {
+            operation: 'owner_lookup',
             ...commandFailureDetails(result),
         })
     }
-    const digest = result.stdout.trim().split(/\s+/)[0]
-    if (!/^[a-fA-F0-9]{32}$/.test(digest)) {
-        throw new VerificationStageError('remote_probe', 'Remote MD5 command returned an invalid digest', false, {
-            operation: 'md5',
-            ...commandFailureDetails(result),
-        })
-    }
-    return digest
+    return ownerId
 }
 
 function permissionStringToOctal(permissions: string): string | undefined {
@@ -322,77 +326,68 @@ function permissionStringToOctal(permissions: string): string | undefined {
     return `0${values.join('')}`
 }
 
-async function probeRemoteFile(alias: string, remotePath: string, timeout: number = 10000) {
-    const escapedRemotePath = escapeShellArg(remotePath)
-    const command = [
-        `if [ -e ${escapedRemotePath} ]; then`,
-        `stat -c '%U\t%u\t%G\t%g\t%a\t%s\t%Y\t%F' ${escapedRemotePath};`,
-        'else printf missing; fi',
-    ].join(' ')
-    const result = await sessionManager.exec(alias, command, {
-        timeout,
-        useLoginUser: true,
-        maxOutputSize: 4096,
-    })
-    if (!result.success) {
-        const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`
-        throw new VerificationStageError('remote_probe', `Remote stat command failed: ${detail}`, true, {
-            operation: 'stat',
-            ...commandFailureDetails(result),
-        })
+function isRemoteMissingError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+        return false
     }
-    if (result.stdout.trim() === 'missing') {
-        return { exists: false, remotePath, probeMethod: 'stat' as const }
-    }
-    const fields = result.stdout.trim().split('\t')
-    if (fields.length !== 8) {
-        throw new VerificationStageError('remote_probe', 'Remote stat command returned malformed output', false, {
-            operation: 'stat',
-            ...commandFailureDetails(result),
-        })
-    }
-    const [ownerName, ownerId, groupName, groupId, mode, size, mtimeSeconds, fileType] = fields
-    const ownerIdValue = Number(ownerId)
-    const groupIdValue = Number(groupId)
-    const sizeValue = Number(size)
-    const mtimeValue = Number(mtimeSeconds)
-    if (
-        !Number.isSafeInteger(ownerIdValue) ||
-        ownerIdValue < 0 ||
-        !Number.isSafeInteger(groupIdValue) ||
-        groupIdValue < 0 ||
-        !Number.isSafeInteger(sizeValue) ||
-        sizeValue < 0 ||
-        !Number.isFinite(mtimeValue) ||
-        !/^[0-7]{3,4}$/.test(mode)
-    ) {
-        throw new VerificationStageError('remote_probe', 'Remote stat command returned invalid metadata', false, {
-            operation: 'stat',
-            ...commandFailureDetails(result),
-        })
-    }
-    return {
-        exists: true,
-        remotePath,
-        probeMethod: 'stat' as const,
-        ownerName,
-        ownerId: ownerIdValue,
-        groupName,
-        groupId: groupIdValue,
-        mode: mode.length === 3 ? `0${mode}` : mode,
-        size: sizeValue,
-        mtimeMs: mtimeValue * 1000,
-        fileType,
-        isDirectory: fileType === 'directory',
-        isFile: fileType.startsWith('regular '),
+    const code = 'code' in error ? (error as { code?: unknown }).code : undefined
+    const message = error instanceof Error ? error.message : String(error)
+    return code === 2 || code === 'ENOENT' || /no such file|not found/i.test(message)
+}
+
+async function probeRemoteFile(alias: string, remotePath: string, _timeout: number = 10000) {
+    try {
+        const info = await fileOps.getFileInfo(alias, remotePath)
+        const mode = permissionStringToOctal(info.permissions)
+        if (!mode) {
+            throw new VerificationStageError('remote_probe', 'Remote SFTP stat returned invalid mode metadata', false, {
+                operation: 'stat',
+                probeMethod: 'sftp',
+            })
+        }
+        return {
+            exists: true as const,
+            remotePath,
+            probeMethod: 'sftp' as const,
+            ownerName: undefined,
+            ownerId: info.owner,
+            groupName: undefined,
+            groupId: info.group,
+            mode,
+            size: info.size,
+            mtimeMs: info.mtime.getTime(),
+            fileType: info.isDirectory
+                ? 'directory'
+                : info.isFile
+                  ? 'regular file'
+                  : info.isSymlink
+                    ? 'symbolic link'
+                    : 'other',
+            isDirectory: info.isDirectory,
+            isFile: info.isFile,
+        }
+    } catch (error) {
+        if (isRemoteMissingError(error)) {
+            return { exists: false as const, remotePath, probeMethod: 'sftp' as const }
+        }
+        if (error instanceof VerificationStageError) {
+            throw error
+        }
+        throw new VerificationStageError(
+            'remote_probe',
+            `Remote SFTP stat failed: ${error instanceof Error ? error.message : String(error)}`,
+            true,
+            { operation: 'stat', probeMethod: 'sftp' }
+        )
     }
 }
 
 async function buildUploadVerification(
     args: z.infer<typeof uploadSchema>,
-    local: ReturnType<typeof fileOps.probeLocalPath>
+    local: ReturnType<typeof fileOps.probeLocalPath>,
+    verificationRemotePath: string = args.remotePath
 ): Promise<Record<string, unknown>> {
-    const remote = await probeRemoteFile(args.alias, args.remotePath)
+    const remote = await probeRemoteFile(args.alias, verificationRemotePath)
     const checks: Record<string, unknown> = {}
     if (args.verifySize) {
         checks.size = local.exists && remote.exists ? local.size === remote.size : false
@@ -407,13 +402,13 @@ async function buildUploadVerification(
         checks.mode = remote.exists && expectedMode !== undefined && remote.mode === expectedMode
     }
     if (args.verifyOwner !== undefined) {
-        const expectedOwner = String(args.verifyOwner)
-        checks.owner = remote.exists && (String(remote.ownerId) === expectedOwner || remote.ownerName === expectedOwner)
+        const expectedOwnerId = await resolveExpectedOwnerId(args.alias, args.verifyOwner)
+        checks.owner = remote.exists && String(remote.ownerId) === expectedOwnerId
     }
     if (args.verifyMd5 && local.exists) {
         const [localMd5, remoteMd5] = await Promise.all([
             hashLocalFileMd5(local.resolvedPath),
-            hashRemoteFileMd5(args.alias, args.remotePath),
+            hashRemoteFileMd5(args.alias, verificationRemotePath),
         ])
         checks.md5 = remoteMd5 ? localMd5 === remoteMd5 : undefined
         return {
@@ -452,14 +447,14 @@ function normalizeExpectedMode(mode: string): string | undefined {
     return permissionStringToOctal(trimmed)
 }
 
-function buildSyncVerificationChecks(
+async function buildSyncVerificationChecks(
     args: z.infer<typeof syncSchema>,
     remote: Awaited<ReturnType<typeof probeRemoteFile>>
-): Record<string, boolean> {
+): Promise<Record<string, boolean>> {
     const checks: Record<string, boolean> = {}
     if (args.verifyOwner !== undefined) {
-        const expectedOwner = String(args.verifyOwner)
-        checks.owner = remote.exists && (String(remote.ownerId) === expectedOwner || remote.ownerName === expectedOwner)
+        const expectedOwnerId = await resolveExpectedOwnerId(args.alias, args.verifyOwner)
+        checks.owner = remote.exists && String(remote.ownerId) === expectedOwnerId
     }
     if (args.verifyMode !== undefined) {
         const expectedMode = normalizeExpectedMode(args.verifyMode)
@@ -516,7 +511,7 @@ async function buildSyncUploadVerification(
 
     const verificationRemotePath = await resolveSyncUploadVerificationPath(args, local, timeout)
     const remote = await probeRemoteFile(args.alias, verificationRemotePath, timeout)
-    const checks = buildSyncVerificationChecks(args, remote)
+    const checks = await buildSyncVerificationChecks(args, remote)
     const matched = Object.values(checks).every(Boolean)
     return {
         kind: 'owner_mode',
@@ -759,23 +754,65 @@ function mergeSyncVerification(
 }
 
 async function cleanupRemotePath(alias: string, remotePath: string): Promise<void> {
-    const result = await sessionManager.exec(alias, `rm -f ${escapeShellArg(remotePath)}`, {
-        timeout: 10000,
-        useLoginUser: true,
-        maxOutputSize: 4096,
-    })
-    if (!result.success) {
-        const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`
-        throw new Error(`Temporary remote file cleanup failed: ${detail}`)
+    try {
+        await fileOps.removeRemoteFile(alias, remotePath)
+    } catch (error) {
+        throw new Error(
+            `Temporary remote file cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+            {
+                cause: error,
+            }
+        )
+    }
+}
+
+export function createAtomicUploadPath(remotePath: string): string {
+    return `${remotePath}.mcp-tmp-${process.pid}-${randomBytes(12).toString('hex')}`
+}
+
+function uploadPathDetails(
+    args: z.infer<typeof uploadSchema>,
+    verificationRemotePath: string,
+    verification?: Record<string, unknown>
+): Record<string, unknown> {
+    return {
+        finalRemotePath: args.remotePath,
+        verifiedRemotePath: verification ? verificationRemotePath : undefined,
+        verifiedTempRemotePath: verification && args.atomic ? verificationRemotePath : undefined,
+    }
+}
+
+function addUploadVerificationPaths(
+    verification: Record<string, unknown> | undefined,
+    args: z.infer<typeof uploadSchema>,
+    verificationRemotePath: string
+): Record<string, unknown> | undefined {
+    if (!verification) {
+        return undefined
+    }
+    return {
+        ...verification,
+        ...uploadPathDetails(args, verificationRemotePath, verification),
     }
 }
 
 async function handleUpload(args: z.infer<typeof uploadSchema>) {
-    const local = fileOps.probeLocalPath(args.localPath)
-    if (local.exists && local.isDirectory) {
-        return uploadPathError('UPLOAD_PATH_IS_DIRECTORY', 'localPath is a directory', {
-            local: summarizeLocalPathProbe(local),
-            suggestion: '使用 ssh_sync 上传目录，或把 localPath 指向具体文件',
+    let local: LocalPathProbe
+    try {
+        fileOps.validateUploadFileSource(args.localPath)
+        local = fileOps.probeLocalPath(args.localPath)
+    } catch (error) {
+        local = fileOps.probeLocalPath(args.localPath)
+        if (local.exists && local.isDirectory) {
+            return uploadPathError('UPLOAD_PATH_IS_DIRECTORY', 'localPath is a directory', {
+                local: summarizeLocalPathProbe(local),
+                suggestion: '使用 ssh_sync 上传目录，或把 localPath 指向具体文件',
+            })
+        }
+        return formatResult({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            diagnostics: { local: summarizeLocalPathProbe(local) },
         })
     }
 
@@ -815,9 +852,14 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
     const existingMode =
         remoteBefore.exists && remoteBefore.mode ? Number.parseInt(remoteBefore.mode, 8) & 0o777 : undefined
     const createMode = args.atomic && existingMode !== undefined ? existingMode : sourceMode
-    const tempRemotePath = args.atomic
-        ? `${args.remotePath}.mcp-tmp-${process.pid}-${Date.now().toString(36)}`
-        : args.remotePath
+    const tempRemotePath = args.atomic ? createAtomicUploadPath(args.remotePath) : args.remotePath
+    const verificationRequested = Boolean(
+        args.verifyOwner !== undefined ||
+        args.verifyMode !== undefined ||
+        args.verifyMd5 ||
+        args.verifySize ||
+        args.verifyMtime
+    )
 
     try {
         const uploadResult = await fileOps.uploadFile(
@@ -826,59 +868,99 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             tempRemotePath,
             undefined,
             undefined,
-            createMode
-        )
-        if (args.atomic) {
-            const rename = await sessionManager.exec(
-                args.alias,
-                `mv -f -- ${escapeShellArg(tempRemotePath)} ${escapeShellArg(args.remotePath)}`,
-                { timeout: 30000, useLoginUser: true, maxOutputSize: 4096 }
-            )
-            if (!rename.success) {
-                const renameError =
-                    rename.stderr || rename.stdout || `atomic rename failed with exit code ${rename.exitCode}`
-                let cleanupWarning: string | undefined
-                try {
-                    await cleanupRemotePath(args.alias, tempRemotePath)
-                } catch (error) {
-                    cleanupWarning = error instanceof Error ? error.message : String(error)
-                }
-                return formatResult({
-                    success: false,
-                    error: renameError,
-                    cleanupWarning,
-                    diagnostics: {
-                        local: summarizeLocalPathProbe(local),
-                        remoteParent,
-                        atomic: true,
-                        tempRemotePath,
-                    },
-                })
-            }
-        }
-        const verificationRequested = Boolean(
-            args.verifyOwner !== undefined ||
-            args.verifyMode !== undefined ||
-            args.verifyMd5 ||
-            args.verifySize ||
-            args.verifyMtime
+            createMode,
+            undefined,
+            false,
+            args.atomic === true
         )
         let verification: Record<string, unknown> | undefined
         let verificationError: unknown
         if (verificationRequested) {
             try {
-                verification = await buildUploadVerification(args, local)
+                verification = await buildUploadVerification(args, local, tempRemotePath)
             } catch (error) {
                 verificationError = error
                 verification = verificationErrorDetails(error)
             }
         }
+        verification = addUploadVerificationPaths(verification, args, tempRemotePath)
         const outcome = buildTransferOutcome(
             uploadResult.success,
             verificationRequested,
             verification,
             verificationError
         )
+        const pathDetails = uploadPathDetails(args, tempRemotePath, verification)
+
+        if (args.atomic && !outcome.success) {
+            let cleanupWarning: string | undefined
+            try {
+                await cleanupRemotePath(args.alias, tempRemotePath)
+            } catch (cleanupError) {
+                cleanupWarning = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            }
+            return formatResult({
+                ...uploadResult,
+                ...outcome,
+                message: `Atomic upload verification failed; existing target preserved: ${args.remotePath}`,
+                error:
+                    verificationError === undefined
+                        ? `Atomic upload verification failed: ${args.remotePath}`
+                        : `Atomic upload verification failed: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
+                cleanupWarning,
+                atomic: true,
+                targetReplaced: false,
+                ...pathDetails,
+                createMode: uploadResult.createMode,
+                existingTargetModePreserved: remoteBefore.exists,
+                suggestion: largeFileSuggestion,
+                recommendedSync,
+                diagnostics: {
+                    local: summarizeLocalPathProbe(local),
+                    remoteParent,
+                    atomic: true,
+                    tempRemotePath,
+                },
+                verification,
+            })
+        }
+
+        if (args.atomic) {
+            try {
+                await fileOps.renameRemoteFile(args.alias, tempRemotePath, args.remotePath, remoteBefore.exists)
+            } catch (error) {
+                const renameNotStarted = error instanceof fileOps.RemoteRenameNotStartedError
+                const renameError = error instanceof Error ? error.message : String(error)
+                let cleanupWarning: string | undefined
+                try {
+                    await cleanupRemotePath(args.alias, tempRemotePath)
+                } catch (cleanupError) {
+                    cleanupWarning = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+                }
+                return formatResult({
+                    success: false,
+                    transferSuccess: true,
+                    operationStatus: renameNotStarted ? 'failed' : 'unknown',
+                    retryable: true,
+                    error: renameNotStarted
+                        ? `Atomic SFTP rename request was not sent; target was not replaced: ${renameError}`
+                        : `Atomic SFTP rename response failed; target replacement state is unknown: ${renameError}`,
+                    cleanupWarning,
+                    atomic: true,
+                    targetReplaced: renameNotStarted ? false : null,
+                    targetReplacementStatus: renameNotStarted ? 'not_replaced' : 'unknown',
+                    ...pathDetails,
+                    diagnostics: {
+                        local: summarizeLocalPathProbe(local),
+                        remoteParent,
+                        atomic: true,
+                        tempRemotePath,
+                    },
+                    verification,
+                })
+            }
+        }
+
         return formatResult({
             ...uploadResult,
             ...outcome,
@@ -890,6 +972,8 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                     ? undefined
                     : `Upload completed, but verification failed: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
             atomic: args.atomic === true,
+            targetReplaced: args.atomic ? true : undefined,
+            ...pathDetails,
             createMode: uploadResult.createMode,
             existingTargetModePreserved: remoteBefore.exists,
             suggestion: largeFileSuggestion,
@@ -904,7 +988,9 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
         })
     } catch (error) {
         let cleanupWarning: string | undefined
-        if (args.atomic) {
+        const shouldCleanupTemporaryUpload =
+            args.atomic && (!(error instanceof fileOps.UploadFileError) || error.remoteCreated)
+        if (shouldCleanupTemporaryUpload) {
             try {
                 await cleanupRemotePath(args.alias, tempRemotePath)
             } catch (cleanupError) {
@@ -915,6 +1001,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             success: false,
             error: error instanceof Error ? error.message : String(error),
             cleanupWarning,
+            finalRemotePath: args.remotePath,
             diagnostics: {
                 local: summarizeLocalPathProbe(local),
                 remoteParent,
@@ -1009,6 +1096,23 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
     }
     const operationTimeout = args.operationTimeout ?? 600_000
     const remainingTimeout = (): number => operationTimeout - (Date.now() - startedAt)
+    try {
+        if (args.direction === 'upload') {
+            fileOps.validateSyncUploadSource(args.localPath, args.followSymlinks === true, args.exclude)
+        } else {
+            fileOps.validateLocalPathPolicy(args.localPath)
+        }
+    } catch (error) {
+        return formatResult({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            diagnostics: {
+                localBefore: summarizeLocalPathProbe(
+                    fileOps.probeLocalPath(args.localPath, args.direction === 'upload' && args.followSymlinks === true)
+                ),
+            },
+        })
+    }
     const localBefore = fileOps.probeLocalPath(
         args.localPath,
         args.direction === 'upload' && args.followSymlinks === true

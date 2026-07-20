@@ -129,6 +129,7 @@ export interface OperationStartOptions {
     loadProfile?: boolean
     maxOutputBytes?: number
     retentionMs?: number
+    startTimeoutMs?: number
 }
 
 export interface OperationInfo {

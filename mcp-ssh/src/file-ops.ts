@@ -3,7 +3,7 @@
  */
 
 import { spawn } from 'child_process'
-import { createHash } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
@@ -36,6 +36,13 @@ type RsyncProbeResult = {
 }
 
 const rsyncCache = new Map<string, { value: RsyncProbeResult; expiresAt: number }>()
+const rsyncAliasGenerations = new Map<string, number>()
+let rsyncGlobalGeneration = 0
+
+type RsyncGeneration = {
+    global: number
+    alias: number
+}
 
 type LocalProcessResult = {
     status: number | null
@@ -96,12 +103,32 @@ function runLocalProcess(command: string, args: string[], timeout: number): Prom
     })
 }
 
+function getRsyncGeneration(alias: string): RsyncGeneration {
+    return {
+        global: rsyncGlobalGeneration,
+        alias: rsyncAliasGenerations.get(alias) ?? 0,
+    }
+}
+
+function isCurrentRsyncGeneration(alias: string, generation: RsyncGeneration): boolean {
+    const current = getRsyncGeneration(alias)
+    return current.global === generation.global && current.alias === generation.alias
+}
+
+function assertCurrentRsyncGeneration(alias: string, generation: RsyncGeneration): void {
+    if (!isCurrentRsyncGeneration(alias, generation)) {
+        throw new Error(`SSH session '${alias}' changed during rsync setup; retry the sync on the current session`)
+    }
+}
+
 /** 由 SessionManager.disconnect 调用,防止 alias 重连后读到旧主机的判断 */
 export function clearRsyncCache(alias?: string): void {
     if (alias === undefined) {
         rsyncCache.clear()
+        ++rsyncGlobalGeneration
     } else {
         rsyncCache.delete(alias)
+        rsyncAliasGenerations.set(alias, (rsyncAliasGenerations.get(alias) ?? 0) + 1)
     }
 }
 
@@ -205,23 +232,36 @@ function quoteRsyncSshArg(value: string | number): string {
     return escapeShellArg(String(value))
 }
 
-function getAllowListStatus(localPath: string): { configured: boolean; matched?: boolean } {
+function configuredAllowDirectories(): { configured: boolean; directories: string[] } {
     const allowEnv = process.env.SSH_MCP_FILE_OPS_ALLOW_DIRS
-    const allowDirs = allowEnv?.split(path.delimiter).filter((item) => item.trim().length > 0) ?? []
-    if (allowDirs.length === 0) {
+    const configuredPaths = allowEnv?.split(path.delimiter).filter((item) => item.trim().length > 0) ?? []
+    return {
+        configured: configuredPaths.length > 0,
+        directories: configuredPaths.flatMap((directory) => {
+            try {
+                return [fs.realpathSync(directory)]
+            } catch {
+                return []
+            }
+        }),
+    }
+}
+
+function isPathInsideDirectory(directory: string, targetPath: string): boolean {
+    const relative = path.relative(directory, targetPath)
+    return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+}
+
+function getAllowListStatus(localPath: string): { configured: boolean; matched?: boolean } {
+    const allowList = configuredAllowDirectories()
+    if (!allowList.configured) {
         return { configured: false }
     }
     const resolvedLocal = resolvePathOrAncestor(localPath)
-    const matched = allowDirs.some((dir) => {
-        try {
-            const resolvedDir = fs.realpathSync(dir)
-            const rel = path.relative(resolvedDir, resolvedLocal)
-            return !rel.startsWith('..') && !path.isAbsolute(rel)
-        } catch {
-            return false
-        }
-    })
-    return { configured: true, matched }
+    return {
+        configured: true,
+        matched: allowList.directories.some((directory) => isPathInsideDirectory(directory, resolvedLocal)),
+    }
 }
 
 function validateLocalPathAgainstAllowList(localPath: string): void {
@@ -229,6 +269,10 @@ function validateLocalPathAgainstAllowList(localPath: string): void {
     if (allowList.configured && !allowList.matched) {
         throw new Error('localPath 不在 SSH_MCP_FILE_OPS_ALLOW_DIRS 允许目录内')
     }
+}
+
+export function validateLocalPathPolicy(localPath: string): void {
+    validateLocalPathAgainstAllowList(expandTilde(localPath))
 }
 
 function resolvePathOrAncestor(p: string): string {
@@ -249,6 +293,65 @@ function resolvePathOrAncestor(p: string): string {
         }
         return absolute
     }
+}
+
+type ValidatedLocalUploadSource = {
+    expandedPath: string
+    linkStats: fs.Stats
+    stats: fs.Stats
+}
+
+function validateLocalUploadSource(
+    localPath: string,
+    followSymlinks: boolean,
+    symlinkError: string
+): ValidatedLocalUploadSource {
+    const expandedPath = expandTilde(localPath)
+    validateLocalPathAgainstAllowList(expandedPath)
+    if (!fs.existsSync(expandedPath)) {
+        throw new Error(`Local source does not exist: ${expandedPath}`)
+    }
+    const linkStats = fs.lstatSync(expandedPath)
+    if (linkStats.isSymbolicLink() && !followSymlinks) {
+        throw new Error(symlinkError)
+    }
+    if (followSymlinks && getAllowListStatus(expandedPath).configured) {
+        throw new Error(
+            'followSymlinks=true cannot be combined with SSH_MCP_FILE_OPS_ALLOW_DIRS because symlink targets can change during transfer'
+        )
+    }
+    return {
+        expandedPath,
+        linkStats,
+        stats: linkStats.isSymbolicLink() ? fs.statSync(expandedPath) : linkStats,
+    }
+}
+
+export function validateUploadFileSource(localPath: string): ValidatedLocalUploadSource {
+    const source = validateLocalUploadSource(
+        localPath,
+        false,
+        'Refusing to upload symlink at top level (use ssh_sync with followSymlinks=true to traverse)'
+    )
+    if (source.stats.isDirectory()) {
+        throw new Error('UPLOAD_PATH_IS_DIRECTORY: localPath is a directory, use ssh_sync for directory upload')
+    }
+    if (!source.stats.isFile()) {
+        throw new Error('UPLOAD_PATH_IS_NOT_FILE: localPath is not a regular file')
+    }
+    return source
+}
+
+export function validateSyncUploadSource(
+    localPath: string,
+    followSymlinks: boolean = false,
+    _exclude?: string[]
+): ValidatedLocalUploadSource {
+    return validateLocalUploadSource(
+        localPath,
+        followSymlinks,
+        'Refusing to sync a top-level symlink; set followSymlinks=true to traverse its target'
+    )
 }
 
 export function probeLocalPath(localPath: string, followSymlinks: boolean = false) {
@@ -302,6 +405,10 @@ function isSftpMissingError(error: unknown): boolean {
     return /no such file|not found/i.test(message)
 }
 
+function isLocalMissingError(error: unknown): boolean {
+    return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+}
+
 async function sftpExists(sftp: SFTPWrapper, remotePath: string): Promise<boolean> {
     try {
         await sftpStat(sftp, remotePath)
@@ -321,6 +428,88 @@ async function remoteExists(alias: string, remotePath: string): Promise<boolean>
     } finally {
         sftp.end()
     }
+}
+
+export async function hashRemoteFileDigest(
+    alias: string,
+    remotePath: string,
+    algorithm: 'md5' | 'sha256'
+): Promise<string> {
+    const sftp = await sessionManager.getSftp(alias)
+    return new Promise((resolve, reject) => {
+        const hash = createHash(algorithm)
+        const stream = sftp.createReadStream(remotePath)
+        let settled = false
+        const finish = (error?: Error): void => {
+            if (settled) {
+                return
+            }
+            settled = true
+            sftp.end()
+            if (error) {
+                reject(error)
+            } else {
+                resolve(hash.digest('hex'))
+            }
+        }
+        stream.on('data', (chunk: Buffer) => hash.update(chunk))
+        stream.once('error', finish)
+        stream.once('end', () => finish())
+    })
+}
+
+export class RemoteRenameNotStartedError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'RemoteRenameNotStartedError'
+    }
+}
+
+export async function renameRemoteFile(
+    alias: string,
+    sourcePath: string,
+    targetPath: string,
+    replaceExisting: boolean = false
+): Promise<void> {
+    const sftp = await sessionManager.getSftp(alias)
+    return new Promise((resolve, reject) => {
+        const callback = (error?: Error | null): void => {
+            sftp.end()
+            if (error) {
+                reject(error)
+            } else {
+                resolve()
+            }
+        }
+        try {
+            if (replaceExisting) {
+                sftp.ext_openssh_rename(sourcePath, targetPath, callback)
+            } else {
+                sftp.rename(sourcePath, targetPath, callback)
+            }
+        } catch (error) {
+            sftp.end()
+            reject(
+                new RemoteRenameNotStartedError(
+                    `SFTP rename request was not sent: ${error instanceof Error ? error.message : String(error)}`
+                )
+            )
+        }
+    })
+}
+
+export async function removeRemoteFile(alias: string, remotePath: string): Promise<void> {
+    const sftp = await sessionManager.getSftp(alias)
+    return new Promise((resolve, reject) => {
+        sftp.unlink(remotePath, (error) => {
+            sftp.end()
+            if (error && !isSftpMissingError(error)) {
+                reject(error)
+            } else {
+                resolve()
+            }
+        })
+    })
 }
 
 /**
@@ -385,14 +574,19 @@ function pipeWithProgress(
         writeStream.on('error', (err: Error) => cleanup(err))
 
         writeStream.on('close', () => {
-            if (!settled) {
-                settled = true
-                detachAbort()
-                if (closeSftp) {
-                    sftp.end()
-                }
-                resolve({ success: true, size: totalSize })
+            if (settled) {
+                return
             }
+            if (transferred !== totalSize) {
+                cleanup(new Error(`Transfer size mismatch: expected ${totalSize} bytes, received ${transferred}`))
+                return
+            }
+            settled = true
+            detachAbort()
+            if (closeSftp) {
+                sftp.end()
+            }
+            resolve({ success: true, size: totalSize })
         })
 
         if (signal?.aborted) {
@@ -402,6 +596,17 @@ function pipeWithProgress(
         signal?.addEventListener('abort', onAbort, { once: true })
         readStream.pipe(writeStream)
     })
+}
+
+export class UploadFileError extends Error {
+    constructor(
+        message: string,
+        readonly remoteCreated: boolean,
+        options?: ErrorOptions
+    ) {
+        super(message, options)
+        this.name = 'UploadFileError'
+    }
 }
 
 /**
@@ -414,42 +619,52 @@ export async function uploadFile(
     onProgress?: (progress: TransferProgress) => void,
     sharedSftp?: SFTPWrapper,
     createMode?: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    followSymlinks: boolean = false,
+    exclusive: boolean = false
 ): Promise<{ success: boolean; size: number; createMode: string }> {
     throwIfAborted(signal)
-    localPath = expandTilde(localPath)
-    validateLocalPathAgainstAllowList(localPath)
-    if (!fs.existsSync(localPath)) {
-        throw new Error('Local file not found')
-    }
-
-    // 用 lstat 拒绝顶层 symlink，与 ssh_sync 顶层 followSymlinks=false 行为一致；
-    // 单文件接口不引入 followSymlinks 选项，需走 symlink 请用 ssh_sync
-    const lstats = fs.lstatSync(localPath)
-    if (lstats.isSymbolicLink()) {
-        throw new Error('Refusing to upload symlink at top level (use ssh_sync with followSymlinks=true to traverse)')
-    }
-    if (lstats.isDirectory()) {
+    const source = followSymlinks
+        ? validateLocalUploadSource(
+              localPath,
+              true,
+              'Refusing to upload symlink at top level (use ssh_sync with followSymlinks=true to traverse)'
+          )
+        : validateUploadFileSource(localPath)
+    localPath = source.expandedPath
+    const stats = source.stats
+    if (stats.isDirectory()) {
         throw new Error('UPLOAD_PATH_IS_DIRECTORY: localPath is a directory, use ssh_sync for directory upload')
     }
-    if (!lstats.isFile()) {
+    if (!stats.isFile()) {
         throw new Error('UPLOAD_PATH_IS_NOT_FILE: localPath is not a regular file')
     }
 
     const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
-    const totalSize = lstats.size
+    const totalSize = stats.size
 
-    const safeCreateMode = (createMode ?? lstats.mode) & 0o777
-    const result = await pipeWithProgress(
-        fs.createReadStream(localPath),
-        sftp.createWriteStream(remotePath, { mode: safeCreateMode }),
-        sftp,
-        totalSize,
-        onProgress,
-        !sharedSftp,
-        signal
-    )
-    return { ...result, createMode: safeCreateMode.toString(8).padStart(4, '0') }
+    const safeCreateMode = (createMode ?? stats.mode) & 0o777
+    const writeStream = sftp.createWriteStream(remotePath, { mode: safeCreateMode, flags: exclusive ? 'wx' : 'w' })
+    let remoteCreated = false
+    writeStream.once('open', () => {
+        remoteCreated = true
+    })
+    try {
+        const result = await pipeWithProgress(
+            fs.createReadStream(localPath),
+            writeStream,
+            sftp,
+            totalSize,
+            onProgress,
+            !sharedSftp,
+            signal
+        )
+        return { ...result, createMode: safeCreateMode.toString(8).padStart(4, '0') }
+    } catch (error) {
+        throw new UploadFileError(error instanceof Error ? error.message : String(error), remoteCreated, {
+            cause: error,
+        })
+    }
 }
 
 /**
@@ -462,32 +677,48 @@ export async function downloadFile(
     onProgress?: (progress: TransferProgress) => void,
     sharedSftp?: SFTPWrapper,
     signal?: AbortSignal
-): Promise<{ success: boolean; size: number }> {
+): Promise<{ success: boolean; size: number; atomic: true }> {
     throwIfAborted(signal)
     localPath = expandTilde(localPath)
     validateLocalPathAgainstAllowList(localPath)
     const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
+    const localDir = path.dirname(localPath)
+    const temporaryPath = path.join(
+        localDir,
+        `.${path.basename(localPath)}.mcp-tmp-${process.pid}-${randomBytes(8).toString('hex')}`
+    )
+    let transferStarted = false
     try {
         const totalSize = (await sftpStat(sftp, remotePath)).size
 
-        // 确保本地目录存在
-        const localDir = path.dirname(localPath)
         if (!fs.existsSync(localDir)) {
             fs.mkdirSync(localDir, { recursive: true })
         }
 
-        return await pipeWithProgress(
+        transferStarted = true
+        const result = await pipeWithProgress(
             sftp.createReadStream(remotePath),
-            fs.createWriteStream(localPath),
+            fs.createWriteStream(temporaryPath, { flags: 'wx' }),
             sftp,
             totalSize,
             onProgress,
             !sharedSftp,
             signal
         )
+        await fs.promises.rename(temporaryPath, localPath)
+        return { ...result, atomic: true }
     } catch (error) {
-        if (!sharedSftp) {
+        if (!sharedSftp && !transferStarted) {
             sftp.end()
+        }
+        try {
+            await fs.promises.unlink(temporaryPath)
+        } catch (cleanupError) {
+            if (!isLocalMissingError(cleanupError)) {
+                throw new AggregateError([error, cleanupError], 'Download failed and temporary file cleanup failed', {
+                    cause: cleanupError,
+                })
+            }
         }
         throw error
     }
@@ -785,6 +1016,19 @@ export async function writeFile(
     })
 }
 
+function validateSftpEntryName(filename: string): void {
+    if (
+        filename.length === 0 ||
+        filename === '.' ||
+        filename === '..' ||
+        filename.includes('\0') ||
+        filename.includes('/') ||
+        filename.includes('\\')
+    ) {
+        throw new Error('SFTP directory listing returned an unsafe entry name')
+    }
+}
+
 /**
  * 列出目录内容
  */
@@ -804,6 +1048,18 @@ export async function listDir(
                     sftp.end()
                 }
                 reject(err)
+                return
+            }
+
+            try {
+                for (const item of list) {
+                    validateSftpEntryName(item.filename)
+                }
+            } catch (error) {
+                if (closeWhenDone) {
+                    sftp.end()
+                }
+                reject(error)
                 return
             }
 
@@ -870,37 +1126,83 @@ export async function getFileInfo(alias: string, remotePath: string): Promise<Fi
     })
 }
 
-/**
- * 创建目录
- */
-export async function mkdir(alias: string, remotePath: string, recursive: boolean = false): Promise<boolean> {
-    if (recursive) {
-        // 通过 exec 实现递归创建
-        const result = await sessionManager.exec(alias, `mkdir -p ${escapeShellArg(remotePath)}`)
-        if (!result.success || result.exitCode !== 0) {
-            const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`
-            throw new Error(`Remote mkdir failed for ${remotePath}: ${detail}`)
-        }
-        return true
-    }
-
-    const sftp = await sessionManager.getSftp(alias)
+function sftpMkdir(sftp: SFTPWrapper, remotePath: string): Promise<void> {
     return new Promise((resolve, reject) => {
-        sftp.mkdir(remotePath, (err) => {
-            sftp.end()
-            if (err) {
-                reject(err)
+        sftp.mkdir(remotePath, (error) => {
+            if (error) {
+                reject(error)
             } else {
-                resolve(true)
+                resolve()
             }
         })
     })
+}
+
+async function ensureSftpDirectory(sftp: SFTPWrapper, remotePath: string): Promise<void> {
+    const normalizedPath = path.posix.normalize(remotePath)
+    if (normalizedPath === '/' || normalizedPath === '.') {
+        return
+    }
+    try {
+        const stats = await sftpStat(sftp, normalizedPath)
+        if ((stats.mode & S_IFMT) !== S_IFDIR) {
+            throw new Error(`Remote path exists and is not a directory: ${normalizedPath}`)
+        }
+        return
+    } catch (error) {
+        if (!isSftpMissingError(error)) {
+            throw error
+        }
+    }
+
+    const parent = path.posix.dirname(normalizedPath)
+    if (parent !== normalizedPath) {
+        await ensureSftpDirectory(sftp, parent)
+    }
+    try {
+        await sftpMkdir(sftp, normalizedPath)
+    } catch (error) {
+        try {
+            const stats = await sftpStat(sftp, normalizedPath)
+            if ((stats.mode & S_IFMT) === S_IFDIR) {
+                return
+            }
+        } catch {
+            // 保留原 mkdir 错误
+        }
+        throw error
+    }
+}
+
+/**
+ * 创建目录
+ */
+export async function mkdir(
+    alias: string,
+    remotePath: string,
+    recursive: boolean = false,
+    sharedSftp?: SFTPWrapper
+): Promise<boolean> {
+    const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
+    try {
+        if (recursive) {
+            await ensureSftpDirectory(sftp, remotePath)
+        } else {
+            await sftpMkdir(sftp, remotePath)
+        }
+        return true
+    } finally {
+        if (!sharedSftp) {
+            sftp.end()
+        }
+    }
 }
 
 /**
  * 检查远程是否安装 rsync
  */
 export async function checkRsync(alias: string, timeout: number = 10_000): Promise<RsyncProbeResult> {
+    const generation = getRsyncGeneration(alias)
     const cached = rsyncCache.get(alias)
     if (cached !== undefined && cached.expiresAt > Date.now()) {
         return cached.value
@@ -914,6 +1216,15 @@ export async function checkRsync(alias: string, timeout: number = 10_000): Promi
             maxOutputSize: 4096,
         })
         const duration = Date.now() - startedAt
+        if (!isCurrentRsyncGeneration(alias, generation)) {
+            return {
+                available: false,
+                status: 'error',
+                duration,
+                retryable: true,
+                error: `SSH session '${alias}' changed during rsync probe`,
+            }
+        }
         if (result.success && result.exitCode === 0 && result.stdout.trim().length > 0) {
             const probe: RsyncProbeResult = {
                 available: true,
@@ -1015,18 +1326,11 @@ export async function syncFiles(
         throw new Error('remotePath must be absolute or relative to the SSH working directory; ~ is not supported')
     }
 
-    const capabilityStartedAt = Date.now()
-    const capability = sessionManager.getExternalTransferCapability(alias)
     let sourceIsDirectory: boolean
     if (direction === 'upload') {
-        if (!fs.existsSync(localPath)) {
-            throw new Error(`Local source does not exist: ${localPath}`)
-        }
-        const linkStats = fs.lstatSync(localPath)
-        if (linkStats.isSymbolicLink() && !options.followSymlinks) {
-            throw new Error('Refusing to sync a top-level symlink; set followSymlinks=true to traverse its target')
-        }
-        sourceIsDirectory = (options.followSymlinks ? fs.statSync(localPath) : linkStats).isDirectory()
+        const source = validateSyncUploadSource(localPath, options.followSymlinks === true, options.exclude)
+        localPath = source.expandedPath
+        sourceIsDirectory = source.stats.isDirectory()
     } else {
         sourceIsDirectory = (await getFileInfo(alias, remotePath)).isDirectory
     }
@@ -1034,6 +1338,9 @@ export async function syncFiles(
         throw new Error('recursive=false is not supported for directory sources; use a file source or enable recursion')
     }
 
+    const capabilityStartedAt = Date.now()
+    const rsyncGeneration = getRsyncGeneration(alias)
+    const capability = sessionManager.getExternalTransferCapability(alias)
     const preflightTimeout = options.preflightTimeout ?? 10_000
     const rsyncProbe: RsyncProbeResult = capability.rsyncEligible
         ? await checkRsync(alias, preflightTimeout)
@@ -1044,6 +1351,7 @@ export async function syncFiles(
               retryable: false,
               reason: capability.decisionReason,
           }
+    assertCurrentRsyncGeneration(alias, rsyncGeneration)
     const resolvedOptions: SyncOptions = { ...options, sourceIsDirectory }
     const capabilityDuration = Date.now() - capabilityStartedAt
     const selectedTransport = capability.rsyncEligible && rsyncProbe?.available ? 'rsync' : 'sftp'
@@ -1059,7 +1367,7 @@ export async function syncFiles(
     const operationStartedAt = Date.now()
     const result =
         selectedTransport === 'rsync'
-            ? await syncWithRsync(alias, localPath, remotePath, direction, resolvedOptions, capability)
+            ? await syncWithRsync(alias, localPath, remotePath, direction, resolvedOptions, capability, rsyncGeneration)
             : await syncWithSftpWithTimeout(alias, localPath, remotePath, direction, resolvedOptions)
     const operationDuration = Date.now() - operationStartedAt
     const operationStatus = result.operationStatus ?? (result.success ? 'completed' : 'failed')
@@ -1100,10 +1408,13 @@ async function syncWithRsync(
     remotePath: string,
     direction: 'upload' | 'download',
     options: SyncOptions,
-    capability: ExternalTransferCapability
+    capability: ExternalTransferCapability,
+    generation: RsyncGeneration
 ): Promise<SyncResult> {
+    assertCurrentRsyncGeneration(alias, generation)
     const checkCommand = os.platform() === 'win32' ? 'where' : 'which'
     const checkResult = await runLocalProcess(checkCommand, ['rsync'], options.preflightTimeout ?? 10_000)
+    assertCurrentRsyncGeneration(alias, generation)
     if (checkResult.status !== 0) {
         const fallback = await syncWithSftpWithTimeout(alias, localPath, remotePath, direction, options)
         return {
@@ -1169,9 +1480,11 @@ async function syncWithRsync(
         sshOptions.push('-i', capability.keyPath)
     }
     const destination = `${capability.username}@${capability.host}`
+    assertCurrentRsyncGeneration(alias, generation)
     const connectStartedAt = Date.now()
     const connectResult = await runLocalProcess('ssh', [...sshOptions, destination, 'true'], connectTimeout)
     const connectDuration = Date.now() - connectStartedAt
+    assertCurrentRsyncGeneration(alias, generation)
     if (connectResult.error || connectResult.status !== 0) {
         const fallback = await syncWithSftpWithTimeout(alias, localPath, remotePath, direction, options)
         const fallbackReason = connectResult.timedOut ? 'rsync_connect_timeout' : 'rsync_connect_failed'
@@ -1205,8 +1518,21 @@ async function syncWithRsync(
             : [...args, '-e', sshCmd, '--', remoteSpec, localPath]
 
     try {
+        assertCurrentRsyncGeneration(alias, generation)
         const operationTimeout = options.operationTimeout ?? 600_000
         const result = await runLocalProcess('rsync', rsyncArgs, operationTimeout)
+        if (!isCurrentRsyncGeneration(alias, generation)) {
+            return {
+                success: false,
+                method: 'rsync',
+                connectDuration,
+                connectStatus: 'completed',
+                operationStatus: 'unknown',
+                retryable: true,
+                fallbackReason: 'ssh_session_changed',
+                output: `SSH session '${alias}' changed during rsync; remote transfer state is unknown`,
+            }
+        }
 
         if (result.error || result.status !== 0) {
             const stderr = result.stderr.trim()
@@ -1262,6 +1588,9 @@ async function syncWithRsync(
             output,
         }
     } catch (e) {
+        if (!isCurrentRsyncGeneration(alias, generation)) {
+            throw e
+        }
         // rsync 启动异常发生在传输进程建立前，可安全改用 SFTP
         const fallback = await syncWithSftpWithTimeout(alias, localPath, remotePath, direction, options)
         const warning = `rsync 异常: ${e instanceof Error ? e.message : String(e)} | 已 fallback 到 SFTP（性能可能较差）`
@@ -1468,36 +1797,19 @@ async function hashRemoteFile(
 ): Promise<{
     status: 'available' | 'error'
     digest?: string
-    exitCode?: number
-    failureKind?: string
     retryable: boolean
     error?: string
 }> {
-    const result = await sessionManager.exec(alias, `sha256sum ${escapeShellArg(remotePath)} | awk '{print $1}'`, {
-        timeout: 30000,
-        useLoginUser: true,
-        maxOutputSize: 4096,
-    })
-    if (!result.success) {
+    try {
+        const digest = await hashRemoteFileDigest(alias, remotePath, 'sha256')
+        return { status: 'available', digest, retryable: false }
+    } catch (error) {
         return {
             status: 'error',
-            exitCode: result.exitCode,
-            failureKind: result.failureKind,
-            retryable: result.failureKind !== 'remote_command',
-            error: result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`,
+            retryable: true,
+            error: error instanceof Error ? error.message : String(error),
         }
     }
-    const digest = result.stdout.trim().split(/\s+/)[0]
-    if (!/^[a-fA-F0-9]{64}$/.test(digest)) {
-        return {
-            status: 'error',
-            exitCode: result.exitCode,
-            failureKind: result.failureKind,
-            retryable: false,
-            error: 'remote SHA-256 command returned an invalid digest',
-        }
-    }
-    return { status: 'available', digest, retryable: false }
 }
 
 async function buildSingleFileVerification(
@@ -1520,8 +1832,6 @@ async function buildSingleFileVerification(
             failureStage: remoteHash.status === 'error' ? 'remote_hash' : undefined,
             retryable: remoteHash.retryable,
             error: remoteHash.error,
-            exitCode: remoteHash.exitCode,
-            failureKind: remoteHash.failureKind,
             hashAlgorithm: 'sha256',
             hashMatch: remoteHash.digest ? localSha256 === remoteHash.digest : undefined,
             local: {
@@ -1702,7 +2012,8 @@ async function syncWithSftp(
                 undefined,
                 undefined,
                 undefined,
-                options.signal
+                options.signal,
+                options.followSymlinks === true
             )
             return {
                 ...buildSyncResult(1, size, warnings, 0, { added: existed ? 0 : 1, updated: existed ? 1 : 0 }),
@@ -1796,7 +2107,8 @@ async function uploadDirectory(
     activeDirectories.add(realPath)
 
     try {
-        await mkdir(alias, remotePath, true)
+        validateLocalPathAgainstAllowList(localPath)
+        await mkdir(alias, remotePath, true, sftp)
         throwIfAborted(signal)
 
         const items = fs.readdirSync(localPath)
@@ -1831,7 +2143,16 @@ async function uploadDirectory(
             const itemRemotePath = path.posix.join(remotePath, name)
             const existed = await sftpExists(sftp, itemRemotePath)
             try {
-                await uploadFile(alias, itemLocalPath, itemRemotePath, undefined, sftp, undefined, signal)
+                await uploadFile(
+                    alias,
+                    itemLocalPath,
+                    itemRemotePath,
+                    undefined,
+                    sftp,
+                    undefined,
+                    signal,
+                    followSymlinks
+                )
                 accumulator.addFile(stats.size, existed)
             } catch (error) {
                 accumulator.addFailed()

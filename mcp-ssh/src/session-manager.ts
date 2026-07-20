@@ -8,6 +8,7 @@
  * - 会话持久化
  */
 
+import { createHash } from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
@@ -50,6 +51,31 @@ interface SSHSession {
     manualClose: boolean // 标记主动关闭，阻止 close 事件触发自动重连
     /** 当前正在等待的重连定时器,disconnect 时需要清除以防 zombie 重连 */
     reconnectTimer?: NodeJS.Timeout
+}
+
+interface PendingConnection {
+    client?: Client
+    generation: number
+    fingerprint: string
+    cancel(error: Error): void
+}
+
+interface InFlightConnection {
+    identity: string
+    fingerprint: string
+    promise: Promise<string>
+}
+
+interface SessionConnectionInfo {
+    alias: string
+    identity: string
+    loginUser: string
+    runAs?: string
+    host: string
+    port: number
+    defaultEnvKeys: string[]
+    envKeys: string[]
+    hasJumpHost: boolean
 }
 
 interface CommandContext {
@@ -96,7 +122,9 @@ class ConnectionError extends Error {
 export class SessionManager {
     private sessions: Map<string, SSHSession> = new Map()
     /** per-alias connect 进行中的 Promise,防止并发 connect 同一 alias 时重复建连 */
-    private connectInFlight: Map<string, Promise<string>> = new Map()
+    private connectInFlight: Map<string, InFlightConnection> = new Map()
+    private pendingConnections: Map<string, PendingConnection> = new Map()
+    private connectionGenerations: Map<string, number> = new Map()
     private readonly ptyManager = new PtyManager()
     private readonly forwardManager = new ForwardManager()
     private readonly operationManager: OperationManager
@@ -111,7 +139,8 @@ export class SessionManager {
     constructor(persistPath?: string) {
         this.persistPath = persistPath || path.join(os.homedir(), '.ssh-mcp-pro', 'sessions.json')
         this.operationManager = new OperationManager({
-            openStream: (alias, command, marker, options) => this.openOperationStream(alias, command, marker, options),
+            openStream: (alias, command, marker, options, adopt) =>
+                this.openOperationStream(alias, command, marker, options, adopt),
             cancelRemote: (alias, pid, marker, processGroup, options) =>
                 this.cancelRemoteOperation(alias, pid, marker, processGroup, options),
         })
@@ -124,16 +153,54 @@ export class SessionManager {
     async connect(config: SSHConnectionConfig): Promise<string> {
         const alias = this.generateAlias(config)
 
-        // 复用同 alias 的 in-flight connect Promise
+        const fingerprint = this.connectionFingerprint(config)
+        const requestedIdentity = this.configIdentity(config)
         const inFlight = this.connectInFlight.get(alias)
         if (inFlight) {
-            return inFlight
+            if (inFlight.fingerprint !== fingerprint) {
+                throw new CommandError(`Alias '${alias}' already has a different connection attempt in progress`, {
+                    alias,
+                    existingIdentity: inFlight.identity,
+                    requestedIdentity,
+                    suggestion: '请等待当前连接完成、换一个 alias，或先 ssh_disconnect 取消当前连接',
+                })
+            }
+            return inFlight.promise
         }
 
-        const promise = this.connectInternal(config, alias).finally(() => {
-            this.connectInFlight.delete(alias)
+        const generation = this.getConnectionGeneration(alias)
+        let rejectCancellation: (error: Error) => void = () => undefined
+        let cancelled = false
+        const cancellation = new Promise<never>((_resolve, reject) => {
+            rejectCancellation = reject
         })
-        this.connectInFlight.set(alias, promise)
+        const pendingConnection: PendingConnection = {
+            generation,
+            fingerprint,
+            cancel: (error) => {
+                if (cancelled) {
+                    return
+                }
+                cancelled = true
+                try {
+                    pendingConnection.client?.end()
+                } catch {
+                    /* client 可能尚未开始连接或已经关闭 */
+                }
+                rejectCancellation(error)
+            },
+        }
+        this.pendingConnections.set(alias, pendingConnection)
+        const connectAttempt = Promise.race([this.connectInternal(config, alias, pendingConnection), cancellation])
+        const promise = connectAttempt.finally(() => {
+            if (this.connectInFlight.get(alias)?.promise === promise) {
+                this.connectInFlight.delete(alias)
+            }
+            if (this.pendingConnections.get(alias) === pendingConnection) {
+                this.pendingConnections.delete(alias)
+            }
+        })
+        this.connectInFlight.set(alias, { identity: requestedIdentity, fingerprint, promise })
         return promise
     }
 
@@ -146,8 +213,14 @@ export class SessionManager {
             throw new Error(`Session ${alias} not found`)
         }
 
+        this.cancelPendingConnection(alias)
         session.manualClose = true
         session.connected = false
+        if (session.reconnectTimer) {
+            clearTimeout(session.reconnectTimer)
+            session.reconnectTimer = undefined
+        }
+        this.invalidateAliasResources(alias)
 
         try {
             session.client.end()
@@ -162,6 +235,7 @@ export class SessionManager {
      * 断开连接
      */
     disconnect(alias: string): boolean {
+        const pendingCancelled = this.cancelPendingConnection(alias)
         const session = this.sessions.get(alias)
         if (session) {
             session.manualClose = true
@@ -170,12 +244,7 @@ export class SessionManager {
                 clearTimeout(session.reconnectTimer)
                 session.reconnectTimer = undefined
             }
-            // 清理关联资源；tracked operation 的远端状态在连接断开后无法继续证明
-            this.operationManager.markAliasDisconnected(alias)
-            this.ptyManager.closeByAlias(alias)
-            this.forwardManager.closeByAlias(alias)
-            // 清理 file-ops 中的 rsync 可用性缓存,防止重连到不同主机后读到旧判断
-            clearRsyncCache(alias)
+            this.invalidateAliasResources(alias)
             try {
                 session.client.end()
             } catch {
@@ -185,12 +254,12 @@ export class SessionManager {
             this.persistSessions()
             return true
         }
-        return false
+        return pendingCancelled
     }
 
     /** 断开所有活跃会话（SIGINT/SIGTERM 时调用） */
     async disconnectAll(): Promise<void> {
-        const aliases = Array.from(this.sessions.keys())
+        const aliases = new Set([...this.sessions.keys(), ...this.pendingConnections.keys()])
         for (const alias of aliases) {
             this.disconnect(alias)
         }
@@ -241,6 +310,22 @@ export class SessionManager {
             lastUsedAt: session.lastUsedAt,
             hasJumpHost: Boolean(session.config.jumpHost),
         }))
+    }
+
+    getSessionConnectionInfo(alias: string): SessionConnectionInfo {
+        const session = this.getSession(alias)
+        const config = session.config
+        return {
+            alias,
+            identity: this.sessionIdentity(session),
+            loginUser: config.username,
+            runAs: config.runAs,
+            host: config.host,
+            port: config.port || 22,
+            defaultEnvKeys: config.defaultEnv ? Object.keys(config.defaultEnv) : [],
+            envKeys: config.env ? Object.keys(config.env) : [],
+            hasJumpHost: Boolean(config.jumpHost),
+        }
     }
 
     getExternalTransferCapability(alias: string): ExternalTransferCapability {
@@ -417,10 +502,25 @@ export class SessionManager {
             }, timeout)
 
             session.client.exec(fullCommand, {}, (err, stream) => {
+                if (!this.isCurrentSession(alias, session)) {
+                    clearTimeout(timeoutId)
+                    this.closeClientChannel(stream)
+                    if (!settled) {
+                        settled = true
+                        reject(new Error('Sudo exec was cancelled because the SSH session changed'))
+                    }
+                    return
+                }
                 if (err) {
                     clearTimeout(timeoutId)
-                    settled = true
-                    reject(new Error(`Exec failed: ${err.message}`))
+                    if (!settled) {
+                        settled = true
+                        reject(new Error(`Exec failed: ${err.message}`))
+                    }
+                    return
+                }
+                if (settled) {
+                    this.closeClientChannel(stream)
                     return
                 }
 
@@ -489,11 +589,16 @@ export class SessionManager {
         const session = this.getSession(alias)
         return new Promise((resolve, reject) => {
             session.client.sftp((err, sftp) => {
+                if (!this.isCurrentSession(alias, session)) {
+                    this.destroySftp(sftp)
+                    reject(new Error('SFTP request was cancelled because the SSH session changed'))
+                    return
+                }
                 if (err) {
                     reject(err)
-                } else {
-                    resolve(sftp)
+                    return
                 }
+                resolve(sftp)
             })
         })
     }
@@ -570,7 +675,7 @@ export class SessionManager {
         localHost: string,
         localPort: number,
         remoteHost: string = '127.0.0.1'
-    ): Promise<string> {
+    ): Promise<{ forwardId: string; remotePort: number }> {
         return this.forwardManager.forwardRemote(
             { getClient: (a) => this.getSession(a).client },
             alias,
@@ -632,6 +737,38 @@ export class SessionManager {
 
     private configIdentity(config: SSHConnectionConfig): string {
         return `${config.username}@${config.host}:${config.port || 22}`
+    }
+
+    private connectionFingerprint(config: SSHConnectionConfig): string {
+        const secretHash = (value: string | undefined): string | undefined =>
+            value === undefined ? undefined : createHash('sha256').update(value).digest('hex')
+        const sortedEntries = (values: Record<string, string> | undefined): [string, string][] | undefined =>
+            values === undefined
+                ? undefined
+                : Object.entries(values).sort(([left], [right]) => left.localeCompare(right))
+        const payload = (value: SSHConnectionConfig): Record<string, unknown> => ({
+            host: value.host,
+            port: value.port || 22,
+            username: value.username,
+            alias: value.alias,
+            template: value.template,
+            runAs: value.runAs,
+            defaultEnv: sortedEntries(value.defaultEnv),
+            env: sortedEntries(value.env),
+            keepaliveInterval: value.keepaliveInterval,
+            keepaliveCountMax: value.keepaliveCountMax,
+            readyTimeout: value.readyTimeout,
+            lang: value.lang,
+            shell: value.shell,
+            password: secretHash(value.password),
+            privateKeyPath: value.privateKeyPath ? path.resolve(expandTilde(value.privateKeyPath)) : undefined,
+            privateKey: secretHash(value.privateKey),
+            passphrase: secretHash(value.passphrase),
+            jumpHost: value.jumpHost ? payload(value.jumpHost) : undefined,
+        })
+        return createHash('sha256')
+            .update(JSON.stringify(payload(config)))
+            .digest('hex')
     }
 
     private resultMetadata(
@@ -710,8 +847,9 @@ export class SessionManager {
         alias: string,
         command: string,
         marker: string,
-        options: OperationStartOptions
-    ): Promise<ClientChannel> {
+        options: OperationStartOptions,
+        adopt: (stream: ClientChannel) => void
+    ): Promise<void> {
         const session = this.getSession(alias)
         const markerEnv = `MCP_SSH_OPERATION_MARKER=${this.escapeShellArg(marker)}`
         const markerLine = `__MCP_SSH_OPERATION__:${marker}:%s:%s\\n`
@@ -741,10 +879,21 @@ export class SessionManager {
 
         return new Promise((resolve, reject) => {
             session.client.exec(fullCommand, {}, (error, stream) => {
+                if (!this.isCurrentSession(alias, session)) {
+                    this.closeClientChannel(stream)
+                    reject(new Error('Operation start was cancelled because the SSH session changed'))
+                    return
+                }
                 if (error) {
                     reject(new Error(`Operation start failed: ${error.message}`))
-                } else {
-                    resolve(stream)
+                    return
+                }
+                try {
+                    adopt(stream)
+                    resolve()
+                } catch (adoptionError) {
+                    this.closeClientChannel(stream)
+                    reject(adoptionError)
                 }
             })
         })
@@ -851,12 +1000,17 @@ export class SessionManager {
             }, timeout)
 
             session.client.exec(fullCommand, execOptions, (err, stream) => {
+                if (!this.isCurrentSession(alias, session)) {
+                    this.closeClientChannel(stream)
+                    rejectOnce(new Error('Exec was cancelled because the SSH session changed'))
+                    return
+                }
                 if (err) {
                     rejectOnce(new Error(`Exec failed: ${err.message}`))
                     return
                 }
                 if (settled) {
-                    stream.close()
+                    this.closeClientChannel(stream)
                     return
                 }
 
@@ -914,14 +1068,18 @@ export class SessionManager {
         })
     }
 
-    private async connectInternal(config: SSHConnectionConfig, alias: string): Promise<string> {
+    private async connectInternal(
+        config: SSHConnectionConfig,
+        alias: string,
+        pendingConnection: PendingConnection
+    ): Promise<string> {
         // 检查是否已有活跃连接
         const existing = this.sessions.get(alias)
         if (existing && this.isAlive(existing)) {
             const existingIdentity = this.sessionIdentity(existing)
             const requestedIdentity = this.configIdentity(config)
-            if (existingIdentity !== requestedIdentity) {
-                throw new CommandError(`Alias '${alias}' is already connected to ${existingIdentity}`, {
+            if (this.connectionFingerprint(existing.config) !== pendingConnection.fingerprint) {
+                throw new CommandError(`Alias '${alias}' is already connected with different session configuration`, {
                     alias,
                     existingIdentity,
                     requestedIdentity,
@@ -933,6 +1091,7 @@ export class SessionManager {
         }
 
         const client = new Client()
+        pendingConnection.client = client
         const readyTimeout = config.readyTimeout ?? this.defaultTimeout
         const connectConfig: ConnectConfig = {
             host: config.host,
@@ -997,22 +1156,47 @@ export class SessionManager {
             )
         }
 
+        if (!this.isCurrentPendingConnection(alias, pendingConnection)) {
+            client.end()
+            this.closeClientChannel(connectConfig.sock as ClientChannel | undefined)
+            throw new Error(`Connection for alias '${alias}' was cancelled before SSH setup started`)
+        }
+
         return new Promise((resolve, reject) => {
             let settled = false
+            const clearPendingConnection = (): void => {
+                if (this.pendingConnections.get(alias) === pendingConnection) {
+                    this.pendingConnections.delete(alias)
+                }
+            }
             const rejectConnection = (error: unknown): void => {
                 if (settled) {
                     return
                 }
                 settled = true
+                clearPendingConnection()
                 reject(this.createConnectionError(error, config, readyTimeout, 'target_connect'))
             }
 
             client.on('ready', () => {
-                if (settled) {
+                if (settled || !this.isCurrentPendingConnection(alias, pendingConnection)) {
+                    clearPendingConnection()
                     client.end()
+                    if (!settled) {
+                        settled = true
+                        reject(
+                            this.createConnectionError(
+                                new Error(`Connection for alias '${alias}' was cancelled before ready`),
+                                config,
+                                readyTimeout,
+                                'target_connect'
+                            )
+                        )
+                    }
                     return
                 }
                 settled = true
+                clearPendingConnection()
                 const session: SSHSession = {
                     client,
                     config,
@@ -1039,13 +1223,12 @@ export class SessionManager {
                 const session = this.sessions.get(alias)
                 if (session && session.client === client) {
                     session.connected = false
-                    // 清理绑定旧 client 的资源；tracked operation 状态已无法继续证明
-                    this.operationManager.markAliasDisconnected(alias)
-                    this.forwardManager.closeByAlias(alias)
-                    this.ptyManager.closeByAlias(alias)
+                    this.invalidateAliasResources(alias)
                     if (!session.manualClose) {
                         this.scheduleReconnect(alias)
                     }
+                } else if (!settled) {
+                    rejectConnection(new Error(`Connection for alias '${alias}' closed before ready`))
                 }
             })
 
@@ -1075,11 +1258,16 @@ export class SessionManager {
                     },
                 },
                 (err, stream) => {
+                    if (!this.isCurrentSession(alias, session)) {
+                        this.closeClientChannel(stream)
+                        reject(new Error('PTY start was cancelled because the SSH session changed'))
+                        return
+                    }
                     if (err) {
                         reject(new Error(`PTY exec failed: ${err.message}`))
-                    } else {
-                        resolve(stream)
+                        return
                     }
+                    resolve(stream)
                 }
             )
         })
@@ -1127,7 +1315,7 @@ export class SessionManager {
 
             jumpClient.forwardOut('127.0.0.1', 0, targetHost, targetPort, (error, stream) => {
                 if (settled) {
-                    stream?.close()
+                    this.closeClientChannel(stream)
                     return
                 }
                 settled = true
@@ -1148,11 +1336,67 @@ export class SessionManager {
         })
     }
 
+    private getConnectionGeneration(alias: string): number {
+        return this.connectionGenerations.get(alias) ?? 0
+    }
+
+    private isCurrentPendingConnection(alias: string, pending: PendingConnection): boolean {
+        return (
+            this.pendingConnections.get(alias) === pending && this.getConnectionGeneration(alias) === pending.generation
+        )
+    }
+
+    private cancelPendingConnection(alias: string): boolean {
+        this.connectionGenerations.set(alias, this.getConnectionGeneration(alias) + 1)
+        const pending = this.pendingConnections.get(alias)
+        const inFlight = this.connectInFlight.delete(alias)
+        if (!pending) {
+            return inFlight
+        }
+        this.pendingConnections.delete(alias)
+        pending.cancel(new Error(`Connection for alias '${alias}' was cancelled`))
+        return true
+    }
+
+    private invalidateAliasResources(alias: string): void {
+        // 连接身份变化后，旧 client 上的 operation、PTY、forward 和传输能力缓存均不再有效
+        this.operationManager.markAliasDisconnected(alias)
+        this.ptyManager.closeByAlias(alias)
+        this.forwardManager.closeByAlias(alias)
+        clearRsyncCache(alias)
+    }
+
     /**
      * 检查连接是否存活
      */
     private isAlive(session: SSHSession): boolean {
         return session.connected
+    }
+
+    private isCurrentSession(alias: string, session: SSHSession): boolean {
+        const currentSession = this.sessions.get(alias)
+        return currentSession === session && currentSession.client === session.client && currentSession.connected
+    }
+
+    private closeClientChannel(stream: ClientChannel | undefined): void {
+        try {
+            stream?.destroy()
+        } catch {
+            // ignore
+        }
+        try {
+            stream?.close()
+        } catch {
+            // ignore
+        }
+    }
+
+    private destroySftp(sftp: SFTPWrapper | undefined): void {
+        try {
+            sftp?.destroy()
+        } catch {
+            // ignore
+        }
     }
 
     /**
@@ -1174,11 +1418,10 @@ export class SessionManager {
 
         session.reconnectTimer = setTimeout(async () => {
             const current = this.sessions.get(alias)
-            if (!current) {
-                // disconnect 已经把 session 移除,不再重连
+            if (current !== session || current.client !== session.client) {
                 return
             }
-            current.reconnectTimer = undefined
+            session.reconnectTimer = undefined
             try {
                 await this.reconnect(alias)
             } catch (err) {
@@ -1186,8 +1429,9 @@ export class SessionManager {
                     `Auto-reconnect failed for ${alias} (${attempt}/${this.maxReconnectAttempts}):`,
                     (err as Error).message
                 )
-                // reconnect 失败后继续调度下一次尝试
-                this.scheduleReconnect(alias)
+                if (this.sessions.get(alias) === session) {
+                    this.scheduleReconnect(alias)
+                }
             }
         }, this.reconnectDelay)
     }
@@ -1318,23 +1562,24 @@ export class SessionManager {
         session: SSHSession,
         options: { env?: Record<string, string>; cwd?: string; skipSessionEnv?: boolean }
     ): string {
-        let fullCommand = command
+        const segments: string[] = []
         const env = options.skipSessionEnv
             ? { ...options.env }
             : { ...session.config.defaultEnv, ...session.config.env, ...options.env }
 
-        if (Object.keys(env).length > 0) {
-            const validEntries = Object.entries(env).filter(([k]) => this.isValidEnvKey(k))
-            if (validEntries.length > 0) {
-                const envStr = validEntries.map(([k, v]) => `export ${k}=${this.escapeShellArg(v)}`).join('; ')
-                fullCommand = `${envStr}; ${command}`
+        if (options.cwd) {
+            segments.push(`cd ${this.escapeShellArg(options.cwd)}`)
+        }
+        for (const [key, value] of Object.entries(env)) {
+            if (this.isValidEnvKey(key)) {
+                segments.push(`export ${key}=${this.escapeShellArg(value)}`)
             }
         }
-
-        if (options.cwd) {
-            fullCommand = `cd ${this.escapeShellArg(options.cwd)} && ${fullCommand}`
+        if (segments.length === 0) {
+            return command
         }
-        return fullCommand
+        segments.push(`eval ${this.escapeShellArg(command)}`)
+        return segments.join(' && ')
     }
 
     /**

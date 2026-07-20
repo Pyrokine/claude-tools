@@ -14,6 +14,10 @@ export interface ForwardDependencies {
     getClient(alias: string): Client
 }
 
+type ForwardLifecycle = 'pending' | 'active' | 'closing' | 'closed'
+
+const MAX_PENDING_CHANNEL_OPENS_PER_ALIAS = 32
+
 interface ForwardSession {
     id: string
     alias: string
@@ -23,15 +27,23 @@ interface ForwardSession {
     remoteHost: string
     remotePort: number
     server?: net.Server
+    client: Client
     createdAt: number
     active: boolean
+    lifecycle: ForwardLifecycle
     /** 当前活跃 socket 数（仅 local forward 跟踪） */
     activeConnections: number
     /** 上次有连接活动的时间 */
     lastActivityAt: number
     connections: Set<{ destroy(): void }>
+    connectionDrainWaiters: Set<() => void>
+    pendingChannelOpens: number
+    channelOpenDrainWaiters: Set<() => void>
     listenerReleased: boolean
     remoteUnforwarded: boolean
+    rejectCreation?: (error: Error) => void
+    resolvePendingClose?: () => void
+    rejectPendingClose?: (error: Error) => void
     closePromise?: Promise<void>
 }
 
@@ -70,72 +82,155 @@ export class ForwardManager {
         localHost: string = '127.0.0.1'
     ): Promise<{ forwardId: string; localPort: number }> {
         this.dependencies = deps
+        for (const existing of this.sessions.values()) {
+            if (
+                existing.alias === alias &&
+                existing.type === 'local' &&
+                existing.lifecycle === 'closing' &&
+                existing.pendingChannelOpens > 0
+            ) {
+                throw new Error(
+                    `Alias '${alias}' still has an unresolved SSH channel open; retry closing the existing forward or disconnect the alias`
+                )
+            }
+        }
         const client = deps.getClient(alias)
         const forwardId = this.generateId()
+        const server = net.createServer()
+        const session: ForwardSession = {
+            id: forwardId,
+            alias,
+            type: 'local',
+            localHost,
+            localPort,
+            remoteHost,
+            remotePort,
+            server,
+            client,
+            createdAt: Date.now(),
+            active: false,
+            lifecycle: 'pending',
+            activeConnections: 0,
+            lastActivityAt: Date.now(),
+            connections: new Set(),
+            connectionDrainWaiters: new Set(),
+            pendingChannelOpens: 0,
+            channelOpenDrainWaiters: new Set(),
+            listenerReleased: false,
+            remoteUnforwarded: false,
+        }
+        this.sessions.set(forwardId, session)
 
-        return new Promise((resolve, reject) => {
-            const fwdState: { ref: ForwardSession | null } = { ref: null }
-            const server = net.createServer((socket) => {
-                const fwd = fwdState.ref
-                if (fwd) {
-                    fwd.activeConnections += 1
-                    fwd.lastActivityAt = Date.now()
+        server.on('connection', (socket) => {
+            if (!this.isCurrent(session) || session.lifecycle !== 'active' || !session.active) {
+                socket.destroy()
+                return
+            }
+            if (this.pendingChannelOpensForAlias(alias) >= MAX_PENDING_CHANNEL_OPENS_PER_ALIAS) {
+                console.warn(
+                    `Local forward ${session.id} rejected a connection because alias '${alias}' already has ${MAX_PENDING_CHANNEL_OPENS_PER_ALIAS} pending SSH channel opens`
+                )
+                socket.destroy()
+                return
+            }
+            session.activeConnections += 1
+            session.lastActivityAt = Date.now()
+            session.connections.add(socket)
+            let stream: ClientChannel | undefined
+            let closed = false
+            const closeConnection = (): void => {
+                if (closed) {
+                    return
                 }
-                if (fwd) {
-                    fwd.connections.add(socket)
-                }
-                const onClose = () => {
-                    if (fwd) {
-                        fwd.connections.delete(socket)
-                        fwd.activeConnections = Math.max(0, fwd.activeConnections - 1)
-                        fwd.lastActivityAt = Date.now()
+                closed = true
+                session.connections.delete(socket)
+                if (stream) {
+                    session.connections.delete(stream)
+                    if (!stream.destroyed) {
+                        stream.destroy()
                     }
                 }
-                socket.once('close', onClose)
+                if (!socket.destroyed) {
+                    socket.destroy()
+                }
+                session.activeConnections = Math.max(0, session.activeConnections - 1)
+                session.lastActivityAt = Date.now()
+                if (session.activeConnections === 0) {
+                    for (const resolve of session.connectionDrainWaiters) {
+                        resolve()
+                    }
+                    session.connectionDrainWaiters.clear()
+                }
+            }
+            socket.once('close', closeConnection)
+            socket.once('error', closeConnection)
+            const settleChannelOpen = (): void => {
+                session.pendingChannelOpens = Math.max(0, session.pendingChannelOpens - 1)
+                if (session.pendingChannelOpens === 0) {
+                    for (const resolve of session.channelOpenDrainWaiters) {
+                        resolve()
+                    }
+                    session.channelOpenDrainWaiters.clear()
+                }
+            }
+            session.pendingChannelOpens += 1
+            try {
                 client.forwardOut(
                     socket.remoteAddress || '127.0.0.1',
                     socket.remotePort || 0,
                     remoteHost,
                     remotePort,
-                    (err, stream) => {
-                        if (err) {
-                            socket.end()
+                    (err, connectedStream) => {
+                        settleChannelOpen()
+                        if (err || !this.isCurrent(session) || session.lifecycle !== 'active' || !session.active) {
+                            connectedStream?.destroy()
+                            closeConnection()
                             return
                         }
+                        stream = connectedStream
+                        session.connections.add(stream)
+                        stream.once('close', closeConnection)
+                        stream.once('error', closeConnection)
                         socket.pipe(stream).pipe(socket)
                     }
                 )
-            })
+            } catch {
+                settleChannelOpen()
+                closeConnection()
+            }
+        })
 
+        return new Promise((resolve, reject) => {
+            session.rejectCreation = reject
             server.on('error', (err) => {
-                reject(new Error(`Local forward failed: ${err.message}`))
+                if (!this.isCurrent(session)) {
+                    return
+                }
+                if (session.lifecycle === 'pending') {
+                    this.failPendingCreation(session, new Error(`Local forward failed: ${err.message}`))
+                } else if (session.lifecycle !== 'closed') {
+                    console.warn(`Local forward ${session.id} listener error: ${err.message}`)
+                }
             })
 
-            server.listen(localPort, localHost, () => {
-                const addr = server.address()
-                const actualPort =
-                    addr && typeof addr === 'object' && typeof addr.port === 'number' ? addr.port : localPort
-                const session: ForwardSession = {
-                    id: forwardId,
-                    alias,
-                    type: 'local',
-                    localHost,
-                    localPort: actualPort,
-                    remoteHost,
-                    remotePort,
-                    server,
-                    createdAt: Date.now(),
-                    active: true,
-                    activeConnections: 0,
-                    lastActivityAt: Date.now(),
-                    connections: new Set(),
-                    listenerReleased: false,
-                    remoteUnforwarded: false,
-                }
-                this.sessions.set(forwardId, session)
-                fwdState.ref = session
-                resolve({ forwardId, localPort: actualPort })
-            })
+            try {
+                server.listen(localPort, localHost, () => {
+                    if (!this.isCurrent(session) || session.lifecycle !== 'pending') {
+                        this.closeServerAfterCancelledCreation(server)
+                        return
+                    }
+                    const addr = server.address()
+                    const actualPort =
+                        addr && typeof addr === 'object' && typeof addr.port === 'number' ? addr.port : localPort
+                    session.localPort = actualPort
+                    session.lifecycle = 'active'
+                    session.active = true
+                    session.rejectCreation = undefined
+                    resolve({ forwardId, localPort: actualPort })
+                })
+            } catch (error) {
+                this.failPendingCreation(session, error instanceof Error ? error : new Error(String(error)))
+            }
         })
     }
 
@@ -146,37 +241,77 @@ export class ForwardManager {
         localHost: string,
         localPort: number,
         remoteHost: string = '127.0.0.1'
-    ): Promise<string> {
+    ): Promise<{ forwardId: string; remotePort: number }> {
         this.dependencies = deps
         const client = deps.getClient(alias)
         const forwardId = this.generateId()
+        const session: ForwardSession = {
+            id: forwardId,
+            alias,
+            type: 'remote',
+            localHost,
+            localPort,
+            remoteHost,
+            remotePort,
+            client,
+            createdAt: Date.now(),
+            active: false,
+            lifecycle: 'pending',
+            activeConnections: 0,
+            lastActivityAt: Date.now(),
+            connections: new Set(),
+            connectionDrainWaiters: new Set(),
+            pendingChannelOpens: 0,
+            channelOpenDrainWaiters: new Set(),
+            listenerReleased: false,
+            remoteUnforwarded: false,
+        }
+        this.sessions.set(forwardId, session)
 
         return new Promise((resolve, reject) => {
-            client.forwardIn(remoteHost, remotePort, (err) => {
+            session.rejectCreation = reject
+            client.forwardIn(remoteHost, remotePort, (err, allocatedPort) => {
                 if (err) {
-                    reject(new Error(`Remote forward failed: ${err.message}`))
+                    if (this.isCurrent(session) && session.lifecycle === 'pending') {
+                        this.failPendingCreation(session, new Error(`Remote forward failed: ${err.message}`))
+                    } else if (this.isCurrent(session) && session.lifecycle === 'closing') {
+                        this.completePendingRemoteCloseWithoutListener(session)
+                    }
                     return
                 }
 
-                this.sessions.set(forwardId, {
-                    id: forwardId,
-                    alias,
-                    type: 'remote',
-                    localHost,
-                    localPort,
-                    remoteHost,
-                    remotePort,
-                    createdAt: Date.now(),
-                    active: true,
-                    activeConnections: 0,
-                    lastActivityAt: Date.now(),
-                    connections: new Set(),
-                    listenerReleased: false,
-                    remoteUnforwarded: false,
-                })
+                const actualPort =
+                    Number.isSafeInteger(allocatedPort) && allocatedPort > 0
+                        ? allocatedPort
+                        : remotePort > 0
+                          ? remotePort
+                          : undefined
+                if (actualPort === undefined) {
+                    const error = new Error('Remote forward did not return the dynamically allocated port')
+                    if (this.isCurrent(session) && session.lifecycle === 'pending') {
+                        this.failPendingCreation(session, error)
+                    } else if (this.isCurrent(session) && session.lifecycle === 'closing') {
+                        this.failPendingRemoteClose(session, error)
+                    }
+                    return
+                }
 
+                if (this.isCurrent(session) && session.lifecycle === 'closing') {
+                    session.remotePort = actualPort
+                    this.unforwardPendingRemoteClose(session, actualPort)
+                    return
+                }
+                if (!this.isCurrent(session) || session.lifecycle !== 'pending') {
+                    this.unforwardCancelledCreation(session, actualPort)
+                    return
+                }
+
+                session.remotePort = actualPort
+                session.lifecycle = 'active'
+                session.active = true
+                session.rejectCreation = undefined
                 this.ensureTcpDispatcher(alias, client)
-                resolve(forwardId)
+                resolve({ forwardId, remotePort: actualPort })
             })
         })
     }
@@ -202,6 +337,23 @@ export class ForwardManager {
             }
         }
 
+        if (fwd.lifecycle === 'pending') {
+            if (fwd.type === 'local') {
+                this.cancelPendingCreation(fwd, 'Forward closed before listener creation completed')
+                return {
+                    success: true,
+                    forwardId,
+                    type: fwd.type,
+                    closeMode: mode,
+                    listenerReleased: true,
+                    remoteUnforwarded: false,
+                    activeConnections: 0,
+                    retryable: false,
+                }
+            }
+            this.beginPendingRemoteClose(fwd, 'Forward closed before listener creation completed')
+        }
+
         if (mode === 'force') {
             for (const connection of fwd.connections) {
                 connection.destroy()
@@ -210,17 +362,33 @@ export class ForwardManager {
 
         try {
             if (!fwd.closePromise) {
+                fwd.lifecycle = 'closing'
                 fwd.closePromise =
                     fwd.type === 'local' ? this.closeLocalListener(fwd) : this.closeRemoteListener(fwd, deps)
                 fwd.closePromise.catch(() => {
-                    fwd.closePromise = undefined
+                    if (this.isCurrent(fwd) && fwd.lifecycle === 'closing') {
+                        if (fwd.active) {
+                            fwd.lifecycle = 'active'
+                        }
+                        fwd.closePromise = undefined
+                    }
                 })
             }
-            await this.withTimeout(fwd.closePromise, timeoutMs)
-            fwd.active = false
-            this.sessions.delete(forwardId)
-            if (fwd.type === 'remote') {
-                this.removeTcpDispatcherIfEmpty(fwd.alias)
+            const channelOpenDrain = fwd.type === 'local' ? this.waitForChannelOpenDrain(fwd) : Promise.resolve()
+            const closeCompletion =
+                mode === 'force'
+                    ? Promise.all([fwd.closePromise, this.waitForConnectionDrain(fwd), channelOpenDrain]).then(
+                          () => undefined
+                      )
+                    : Promise.all([fwd.closePromise, channelOpenDrain]).then(() => undefined)
+            await this.withTimeout(closeCompletion, timeoutMs)
+            if (this.isCurrent(fwd) && fwd.lifecycle !== 'closed') {
+                fwd.active = false
+                fwd.lifecycle = 'closed'
+                this.sessions.delete(forwardId)
+                if (fwd.type === 'remote') {
+                    this.removeTcpDispatcherIfEmpty(fwd.alias)
+                }
             }
             return {
                 success: true,
@@ -233,6 +401,18 @@ export class ForwardManager {
                 retryable: false,
             }
         } catch (error) {
+            if (!this.isCurrent(fwd) || fwd.lifecycle === 'closed') {
+                return {
+                    success: true,
+                    forwardId,
+                    type: fwd.type,
+                    closeMode: mode,
+                    listenerReleased: fwd.type === 'local' ? !fwd.server?.listening : fwd.listenerReleased,
+                    remoteUnforwarded: fwd.remoteUnforwarded,
+                    activeConnections: fwd.activeConnections,
+                    retryable: false,
+                }
+            }
             return {
                 success: false,
                 forwardId,
@@ -249,21 +429,26 @@ export class ForwardManager {
 
     /** 关闭指定 alias 的所有转发（disconnect 时调用，不需要 unforwardIn） */
     closeByAlias(alias: string): void {
-        for (const [id, fwd] of this.sessions) {
-            if (fwd.alias === alias) {
-                fwd.active = false
-                for (const connection of fwd.connections) {
-                    connection.destroy()
-                }
-                if (fwd.type === 'local' && fwd.server) {
-                    try {
-                        fwd.server.close()
-                        fwd.listenerReleased = !fwd.server.listening
-                    } catch (e) {
-                        console.warn(`Forward ${id} server close failed:`, (e as Error).message)
-                    }
-                }
-                this.sessions.delete(id)
+        for (const fwd of this.sessions.values()) {
+            if (fwd.alias !== alias) {
+                continue
+            }
+            if (fwd.lifecycle === 'pending') {
+                this.cancelPendingCreation(fwd, `SSH session '${alias}' disconnected during forward creation`)
+                continue
+            }
+
+            fwd.active = false
+            fwd.lifecycle = 'closed'
+            for (const connection of fwd.connections) {
+                connection.destroy()
+            }
+            this.sessions.delete(fwd.id)
+            if (fwd.type === 'local' && fwd.server && !fwd.closePromise) {
+                this.closeServerAfterCancelledCreation(fwd.server)
+            }
+            if (fwd.type === 'local' && fwd.server) {
+                fwd.listenerReleased = !fwd.server.listening
             }
         }
         // 清理该 alias 的 dispatcher
@@ -281,6 +466,9 @@ export class ForwardManager {
     list(): PortForwardInfo[] {
         const result: PortForwardInfo[] = []
         for (const [id, fwd] of this.sessions) {
+            if (!fwd.active || (fwd.lifecycle !== 'active' && fwd.lifecycle !== 'closing')) {
+                continue
+            }
             result.push({
                 id,
                 alias: fwd.alias,
@@ -296,6 +484,34 @@ export class ForwardManager {
         return result
     }
 
+    private pendingChannelOpensForAlias(alias: string): number {
+        let pending = 0
+        for (const session of this.sessions.values()) {
+            if (session.alias === alias && session.type === 'local' && session.lifecycle !== 'closed') {
+                pending += session.pendingChannelOpens
+            }
+        }
+        return pending
+    }
+
+    private waitForConnectionDrain(fwd: ForwardSession): Promise<void> {
+        if (fwd.activeConnections === 0) {
+            return Promise.resolve()
+        }
+        return new Promise((resolve) => {
+            fwd.connectionDrainWaiters.add(resolve)
+        })
+    }
+
+    private waitForChannelOpenDrain(fwd: ForwardSession): Promise<void> {
+        if (fwd.pendingChannelOpens === 0) {
+            return Promise.resolve()
+        }
+        return new Promise((resolve) => {
+            fwd.channelOpenDrainWaiters.add(resolve)
+        })
+    }
+
     private closeLocalListener(fwd: ForwardSession): Promise<void> {
         const server = fwd.server
         if (!server) {
@@ -304,15 +520,22 @@ export class ForwardManager {
         return new Promise((resolve, reject) => {
             try {
                 server.close((error) => {
+                    if (this.isCurrent(fwd) && fwd.lifecycle === 'closing') {
+                        fwd.listenerReleased = !server.listening
+                    }
                     if (error) {
                         reject(error)
                     } else {
                         resolve()
                     }
                 })
-                fwd.listenerReleased = !server.listening
+                if (this.isCurrent(fwd) && fwd.lifecycle === 'closing') {
+                    fwd.listenerReleased = !server.listening
+                }
             } catch (error) {
-                fwd.listenerReleased = !server.listening
+                if (this.isCurrent(fwd) && fwd.lifecycle === 'closing') {
+                    fwd.listenerReleased = !server.listening
+                }
                 reject(error)
             }
         })
@@ -334,11 +557,121 @@ export class ForwardManager {
                 if (error) {
                     reject(error)
                 } else {
-                    fwd.remoteUnforwarded = true
+                    if (this.isCurrent(fwd) && fwd.lifecycle === 'closing') {
+                        fwd.remoteUnforwarded = true
+                    }
                     resolve()
                 }
             })
         })
+    }
+
+    private isCurrent(fwd: ForwardSession): boolean {
+        return this.sessions.get(fwd.id) === fwd
+    }
+
+    private failPendingCreation(fwd: ForwardSession, error: Error): void {
+        if (!this.isCurrent(fwd) || fwd.lifecycle !== 'pending') {
+            return
+        }
+        fwd.active = false
+        fwd.lifecycle = 'closed'
+        this.sessions.delete(fwd.id)
+        if (fwd.type === 'local' && fwd.server) {
+            this.closeServerAfterCancelledCreation(fwd.server)
+        }
+        const reject = fwd.rejectCreation
+        fwd.rejectCreation = undefined
+        reject?.(error)
+    }
+
+    private beginPendingRemoteClose(fwd: ForwardSession, message: string): void {
+        if (!this.isCurrent(fwd) || fwd.type !== 'remote' || fwd.lifecycle !== 'pending') {
+            return
+        }
+        fwd.active = false
+        fwd.lifecycle = 'closing'
+        const rejectCreation = fwd.rejectCreation
+        fwd.rejectCreation = undefined
+        rejectCreation?.(new Error(message))
+        fwd.closePromise = new Promise<void>((resolve, reject) => {
+            fwd.resolvePendingClose = resolve
+            fwd.rejectPendingClose = reject
+        })
+    }
+
+    private completePendingRemoteCloseWithoutListener(fwd: ForwardSession): void {
+        if (!this.isCurrent(fwd) || fwd.lifecycle !== 'closing') {
+            return
+        }
+        fwd.remoteUnforwarded = true
+        this.finishPendingRemoteClose(fwd)
+    }
+
+    private finishPendingRemoteClose(fwd: ForwardSession): void {
+        const resolve = fwd.resolvePendingClose
+        fwd.resolvePendingClose = undefined
+        fwd.rejectPendingClose = undefined
+        fwd.active = false
+        fwd.lifecycle = 'closed'
+        this.sessions.delete(fwd.id)
+        this.removeTcpDispatcherIfEmpty(fwd.alias)
+        resolve?.()
+    }
+
+    private failPendingRemoteClose(fwd: ForwardSession, error: Error): void {
+        if (!this.isCurrent(fwd) || fwd.lifecycle !== 'closing') {
+            return
+        }
+        fwd.closePromise = undefined
+        const reject = fwd.rejectPendingClose
+        fwd.resolvePendingClose = undefined
+        fwd.rejectPendingClose = undefined
+        reject?.(error)
+    }
+
+    private unforwardPendingRemoteClose(fwd: ForwardSession, actualPort: number): void {
+        try {
+            fwd.client.unforwardIn(fwd.remoteHost, actualPort, (error) => {
+                if (!this.isCurrent(fwd) || fwd.lifecycle !== 'closing') {
+                    return
+                }
+                if (error) {
+                    this.failPendingRemoteClose(fwd, error)
+                    return
+                }
+                fwd.remoteUnforwarded = true
+                this.finishPendingRemoteClose(fwd)
+            })
+        } catch (error) {
+            this.failPendingRemoteClose(fwd, error instanceof Error ? error : new Error(String(error)))
+        }
+    }
+
+    private cancelPendingCreation(fwd: ForwardSession, message: string): void {
+        this.failPendingCreation(fwd, new Error(message))
+    }
+
+    private closeServerAfterCancelledCreation(server: net.Server): void {
+        try {
+            server.close(() => undefined)
+        } catch {
+            /* listener 尚未创建或已关闭 */
+        }
+    }
+
+    private unforwardCancelledCreation(fwd: ForwardSession, actualPort: number): void {
+        try {
+            fwd.client.unforwardIn(fwd.remoteHost, actualPort, (error) => {
+                if (error) {
+                    console.warn(`Cancelled remote forward ${fwd.id} cleanup failed: ${error.message}`)
+                }
+            })
+        } catch (error) {
+            console.warn(
+                `Cancelled remote forward ${fwd.id} cleanup failed: ${error instanceof Error ? error.message : String(error)}`
+            )
+        }
     }
 
     private withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -401,6 +734,7 @@ export class ForwardManager {
             for (const fwd of this.sessions.values()) {
                 if (
                     fwd.type === 'remote' &&
+                    fwd.lifecycle === 'active' &&
                     fwd.active &&
                     fwd.alias === alias &&
                     fwd.remoteHost === info.destIP &&

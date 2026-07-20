@@ -267,23 +267,24 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             readyTimeout,
             jumpHost,
         })
+        const connected = sessionManager.getSessionConnectionInfo(alias)
         return formatResult({
             success: true,
-            alias,
+            alias: connected.alias,
             reused,
-            identity,
-            loginUser: user,
-            runAs,
-            host,
-            port: finalPort,
-            defaultEnvKeys: defaultEnv ? Object.keys(defaultEnv) : [],
-            envKeys: env ? Object.keys(env) : [],
+            identity: connected.identity,
+            loginUser: connected.loginUser,
+            runAs: connected.runAs,
+            host: connected.host,
+            port: connected.port,
+            defaultEnvKeys: connected.defaultEnvKeys,
+            envKeys: connected.envKeys,
             reusableSessions,
             suggestion:
                 reusableSessions.length > 0
                     ? '已有同 identity 的连接，可直接复用 reusableSessions 中的 alias'
                     : undefined,
-            message: `Connected to ${identity}${jumpHost ? ' via jump host' : ''}`,
+            message: `Connected to ${connected.identity}${connected.hasJumpHost ? ' via jump host' : ''}`,
         })
     } catch (error) {
         return formatError(error)

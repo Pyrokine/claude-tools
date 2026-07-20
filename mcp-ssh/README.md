@@ -110,6 +110,8 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 
 `ssh_list_sessions()` returns only `alias`, canonical `identity`, `runAs`, `connected`, and `lastUsedAt`. Use `detail=true` for connection details or `fields=[...]` to select fields. Neither mode returns `keyPath`.
 
+`ssh_reconnect` invalidates operations, PTYs, forwards, and cached transfer capability bound to the old client before the replacement connection is published. Automatic reconnect timers are bound to the session and client that scheduled them, so an old timer cannot disconnect a newer session with the same alias. A delayed `close` from the old client cannot leave stale resources attached to the alias. If a target connection is cancelled while a jump-host `forwardOut` is pending, a channel returned by the delayed callback is destroyed before the connection attempt fails.
+
 ### Command Execution
 
 | Tool                | Description                                   |
@@ -252,9 +254,11 @@ ssh_exec(alias="app-dev", command="whoami", useLoginUser=true)
 ```
 
 `ssh_connect` returns `identity`, `loginUser`, `runAs`, `reused`, `defaultEnvKeys`, `envKeys`, and `reusableSessions`
-for already connected aliases with the same `user@host:port` identity. Reusing an alias for a different identity is
-rejected with the existing and requested identities. Missing templates include available template names when they can be
-loaded. Missing `configHost` returns SSH config candidates and suggests `ssh_config_list`.
+from the session that was actually published. Concurrent calls reuse an alias only when the complete session configuration
+matches, including endpoint, authentication, `runAs`, environment, jump host, keepalive, and timeout settings. A conflicting
+pending or active connection is rejected even when its `user@host:port` identity is unchanged. Missing templates include
+available template names when they can be loaded. Missing `configHost` returns SSH config candidates and suggests
+`ssh_config_list`.
 
 ### Jump Host (Bastion)
 
@@ -300,18 +304,20 @@ tasks, direct `su - user -c`, or long-running patterns return a `commandRisk` bl
 Use tracked operations when a command must continue beyond one synchronous tool call:
 
 ```
-ssh_operation_start(alias="server", command="long-running-job", maxOutputBytes=1048576)
+ssh_operation_start(alias="server", command="long-running-job", maxOutputBytes=1048576, startTimeoutMs=30000)
 ssh_operation_status(operationId="op_xxx")
 ssh_operation_read(operationId="op_xxx", stdoutOffset=0, stderrOffset=0, maxBytes=65536)
 ssh_operation_cancel(operationId="op_xxx")
 ```
 
-The start call returns an unpredictable `operationId`. The server keeps bounded stdout and stderr buffers, records the
-remote PID after verifying a per-operation marker, and expires completed records after `retentionMs`. `maxOutputBytes`
-defaults to 1 MiB and accepts up to 8 MiB. `retentionMs` defaults to 1 hour and accepts up to 24 hours.
-`ssh_operation_read.maxBytes` defaults to 64 KiB and accepts up to 1 MiB. Cancellation is refused until the marker and
-PID are verified. If the SSH session disconnects while the command is active, its status becomes `unknown`; the server
-does not claim that the remote process stopped. `ssh_exec` keeps its existing synchronous timeout behavior.
+The start call returns an unpredictable `operationId`. The server creates the record before requesting the SSH channel, keeps bounded stdout and stderr buffers, records the remote PID after verifying a per-operation marker, and expires terminal records after `retentionMs`. `startTimeoutMs` bounds channel setup, defaults to 30 seconds, and accepts up to 10 minutes. A timeout returns the `operationId` in error details, keeps a queryable `unknown` record, and blocks another pending start on that alias until the original channel request settles or the alias is disconnected. `maxOutputBytes` defaults to 1 MiB and accepts up to 8 MiB. `retentionMs` defaults to 1 hour and accepts up to 24 hours. `ssh_operation_read.maxBytes` defaults to 64 KiB and accepts up to 1 MiB. Cancellation is refused until the marker and PID are verified. Stderr written by a shell profile before the marker is retained as operation output, including an unterminated preamble immediately followed by the marker. A line that uses the operation marker prefix with the wrong token or invalid process metadata ends the
+record as `failed`, closes its channel, and starts the configured retention period. Delayed exec, sudo, SFTP, PTY-start,
+and operation-start callbacks from a disconnected or replaced SSH session are rejected and their channels are destroyed.
+A sudo callback that arrives after timeout is also closed before any password is written. Operation listeners are installed
+inside the SSH exec callback before it returns, so a short command that emits its marker and closes immediately still enters
+a terminal state with `finishedAt` and `expiresAt` set. If the SSH session disconnects while a tracked command is active,
+its status becomes `unknown`; the server does not claim that the remote process stopped. `ssh_exec` keeps its existing
+synchronous timeout behavior.
 
 ### Interactive Commands (PTY mode)
 
@@ -383,12 +389,29 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180"
 ```
 
 `ssh_upload` returns local path policy diagnostics, remote parent probing, remote target metadata, and optional
-verification checks. `atomic=true` uploads to a same-directory temporary file, returns `diagnostics.tempRemotePath`,
-then renames it to the target path. `verifySize`, `verifyMd5`, `verifyMode`, `verifyOwner`, and `verifyMtime` add explicit
-post-transfer checks.
+verification checks. `atomic=true` writes an unpredictable same-directory temporary path with exclusive SFTP creation,
+returns `diagnostics.tempRemotePath`, verifies the temporary file, and renames it only after every requested check passes.
+Responses distinguish `finalRemotePath` from the actual verification target: `verifiedRemotePath` identifies the path that
+was probed, and atomic verification also returns `verifiedTempRemotePath`. `verification.actual.remotePath` continues to
+describe the file that was actually verified, even after that temporary path has been renamed. Interpret the final state
+with `targetReplaced` and `targetReplacementStatus`. An existing target is replaced with the OpenSSH
+`posix-rename@openssh.com` extension; a new target uses standard SFTP
+rename. If the client cannot send the rename request, the response reports `operationStatus="failed"`,
+`targetReplaced=false`, and `targetReplacementStatus="not_replaced"`. An error returned after the request was sent cannot
+prove whether the server committed it, so the response reports `operationStatus="unknown"`, `targetReplaced=null`, and
+`targetReplacementStatus="unknown"`; inspect the target before retrying. Temporary-file cleanup is attempted in both
+cases. `verifySize`, `verifyMd5`, `verifyMode`, `verifyOwner`, and `verifyMtime` add explicit transfer checks. Parent and
+target probes, recursive directory creation, file hashing, rename, and temporary-file cleanup use SFTP. The standard
+upload path works on SFTP-only servers and does not require GNU `stat`, `md5sum`, `sha256sum`, `mkdir`, `mv`, or `rm`
+commands. Explicit directory manifest verification still runs remote shell commands.
+
+`ssh_download` writes to a same-directory temporary file and renames it over the requested local path after the SFTP
+stream closes and the transferred byte count matches the size reported by SFTP `stat`. A failed, truncated, or aborted
+download removes the temporary file and leaves an existing local target unchanged. SFTP directory listings reject empty
+names, `.` and `..`, NUL bytes, and path separators before constructing child paths.
+
 Command execution results include `emptyOutputFailure=true` when the remote command exits non-zero without
-stdout/stderr,
-with the effective user, cwd, and a suggested follow-up read command when available.
+stdout/stderr, with the effective user, cwd, and a suggested follow-up read command when available.
 `ssh_read_file` defaults to 1 MiB and rejects `maxBytes` above 16 MiB before remote transfer. It returns `total_size`,
 `read_offset`, `read_bytes`, `remaining_bytes`, `sample_kind`, and `truncated` so callers can distinguish a full read
 from a head, tail, byte range, or line range sample.
@@ -456,8 +479,8 @@ reporting a partial match.
 If verification is requested, a mismatch, skipped check, or verification error sets top-level `success=false` while
 `transferSuccess` still reports whether transfer completed. `verificationStatus`, `verificationSuccess`, and
 `failedChecks` describe the verification outcome. SFTP single-file transfers also include local and remote size,
-mode or permissions, mtime, owner/group, and SHA-256 comparison when the remote has `sha256sum`. `verifyOwner` and
-`verifyMode` apply to upload single-file sync; use `verify.owner` and `verify.mode` for directory manifests.
+mode or permissions, mtime, owner/group, and a streamed SFTP SHA-256 comparison. `verifyOwner` and `verifyMode` apply
+to upload single-file sync; use `verify.owner` and `verify.mode` for directory manifests.
 
 Rsync is selected only for a direct connection with a validated key path or usable SSH agent. Password, inline-key, and
 jump-host sessions use SFTP because their route or credentials cannot be passed safely to a separate OpenSSH process.
@@ -529,6 +552,9 @@ ssh_forward_local(alias="server", localPort=13306, remoteHost="<service-host>", 
 // Remote forward: expose local dev server (3000) to remote port 8080
 ssh_forward_remote(alias="server", remotePort=8080, localHost="127.0.0.1", localPort=3000)
 
+// Ask the SSH server to allocate a remote port; use remotePort from the result
+ssh_forward_remote(alias="server", remotePort=0, localHost="127.0.0.1", localPort=3000)
+
 // List all forwards
 ssh_forward_list()
 
@@ -542,7 +568,14 @@ ssh_forward_close(forwardId="fwd_1_xxx", mode="force", timeoutMs=5000)
 A successful close means the local `server.close` or remote `unforwardIn` callback completed. The result includes
 `listenerReleased`, `remoteUnforwarded`, `activeConnections`, `closeMode`, and `retryable`. Timeout or callback failure
 keeps the forward in `ssh_forward_list`, so the same `forwardId` can be retried. After a successful local close, the port
-can be rebound immediately.
+can be rebound immediately. `remotePort=0` returns the actual allocated port and uses that port for incoming connection
+routing and `unforwardIn`.
+
+Forward creation is tracked before `listen` or `forwardIn` completes. Disconnect cancels pending creation, closes a local
+listener if it appears later, and removes a remotely allocated listener returned by a delayed callback. A forward stops
+accepting new local or remote connections as soon as close begins. Delayed `forwardOut`, close, and unforward callbacks
+check the same lifecycle record before changing state, so a closed forward cannot reappear in `ssh_forward_list`. Each local
+connection tracks both the local socket and the SSH `forwardOut` channel. Closing or failing either side destroys the other, and force close returns only after both sides are destroyed and `activeConnections` reaches zero. Pending `forwardOut` requests are limited to 32 per alias, and a close waits for every callback. If the SSH server never answers a channel-open request, close times out, keeps the forward retryable, and rejects another local forward on the same alias so pending ssh2 channels cannot accumulate. Disconnect the alias to release a channel request that never completes.
 
 ## Configuration Options
 
@@ -579,6 +612,11 @@ Connection failures return `failureStage`, `retryable`, and a bounded suggestion
 | `useLoginUser`  | boolean | false         | Skip session-level runAs                   |
 | `loadProfile`   | boolean | true          | Load target user's shell profile for runAs |
 
+When `cwd` or `env` is set, the generated shell command chains `cd` and each validated `export` with `&&`, then runs the
+entire requested command as one escaped `eval` argument in the active login shell. A failed directory change or export
+prevents every part of the requested command from running, including text after `;`, newlines, or `||`, while Bash/Zsh
+syntax keeps the same interpreter semantics as a direct SSH command.
+
 ## Security
 
 ### Path Whitelist for Key/Config Files
@@ -607,8 +645,10 @@ directories (recommended for shared environments), set `SSH_MCP_FILE_OPS_ALLOW_D
 export SSH_MCP_FILE_OPS_ALLOW_DIRS=/tmp:/home/me/work
 ```
 
-When set, any local path outside the whitelist is rejected. Symlinks are resolved via `realpath` to prevent escape.
-When unset, no restriction is applied (preserves flexibility).
+When set, any local path outside the whitelist is rejected and symlinks are resolved via `realpath`.
+`ssh_sync(direction="upload", followSymlinks=true)` is rejected before transport selection while the whitelist is active.
+A symlink can change between validation and transfer, and rsync cannot bind the validated target to the later `-L` read.
+Keep `followSymlinks=false`, or copy regular files into an allowed directory before syncing.
 
 ### File Size Limits
 
