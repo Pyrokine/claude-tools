@@ -34,6 +34,7 @@ import {
     type ReadPageResult,
     type ScreenshotResult,
     type SetCookieParams,
+    type StaleContextRetryPolicy,
 } from './browser-driver.js'
 import { NavigationError, NavigationTimeoutError, SessionNotFoundError, TargetNotFoundError } from './errors.js'
 import { Locator } from './locator.js'
@@ -1282,7 +1283,8 @@ class SessionManager implements IBrowserDriver {
     evaluateInFrame(
         _frameId: number,
         _expression: string,
-        _timeout?: number
+        _timeout?: number,
+        _staleContextRetry?: StaleContextRetryPolicy
     ): Promise<{
         result?: { value?: unknown }
         exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }

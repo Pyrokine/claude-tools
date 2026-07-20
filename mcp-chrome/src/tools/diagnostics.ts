@@ -1,5 +1,6 @@
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
 import { formatErrorResponse, formatResponse, getUnifiedSession } from '../core/index.js'
+import { sanitizeUrlRecords } from './network-sanitizer.js'
 
 export type DiagnosticsStatus = 'disabled' | 'collected' | 'unavailable' | 'error'
 
@@ -57,14 +58,18 @@ export async function finishDiagnostics(
         return {
             diagnosticsStatus: 'collected',
             diagnostics: {
-                console: consoleLogs
-                    .slice(started.start.consoleCount)
-                    .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
-                    .slice(-20),
-                failedRequests: network
-                    .slice(started.start.networkCount)
-                    .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
-                    .slice(-20),
+                console: sanitizeUrlRecords(
+                    consoleLogs
+                        .slice(started.start.consoleCount)
+                        .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
+                        .slice(-20)
+                ),
+                failedRequests: sanitizeUrlRecords(
+                    network
+                        .slice(started.start.networkCount)
+                        .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
+                        .slice(-20)
+                ),
             },
         }
     } catch (error) {

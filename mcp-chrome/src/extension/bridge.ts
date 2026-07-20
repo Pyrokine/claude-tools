@@ -20,9 +20,10 @@ import {
     type ResizeWindowOptions,
     type ScreenshotResult,
     type SetCookieParams,
+    type StaleContextRetryPolicy,
 } from '../core/browser-driver.js'
 import type { ConsoleLogEntry, NetworkRequestEntry } from '../core/types.js'
-import { ExtensionHttpServer } from './http-server.js'
+import { ExtensionHttpServer, type ExtensionConnectionInfo } from './http-server.js'
 
 /** RPC 传输余量（毫秒）：给网络往返和 Extension 处理留出的额外时间 */
 const RPC_MARGIN = 5000
@@ -114,6 +115,10 @@ export class ExtensionBridge implements IBrowserDriver {
 
     getPort(): number {
         return this.httpServer.getPort()
+    }
+
+    getConnectionInfo(): ExtensionConnectionInfo {
+        return this.httpServer.getConnectionInfo()
     }
 
     // ==================== Tab 操作 ====================
@@ -1018,10 +1023,15 @@ export class ExtensionBridge implements IBrowserDriver {
     async evaluateInFrame(
         frameId: number,
         expression: string,
-        timeout?: number
+        timeout?: number,
+        staleContextRetry: StaleContextRetryPolicy = 'never'
     ): Promise<{
         result?: { value?: unknown }
         exceptionDetails?: { text: string }
+        retryAttempted?: boolean
+        retryReason?: string
+        staleContextRetry?: StaleContextRetryPolicy
+        frameContext?: Record<string, unknown>
     }> {
         return (await this.httpServer.sendCommand(
             'evaluate_in_frame',
@@ -1032,9 +1042,17 @@ export class ExtensionBridge implements IBrowserDriver {
                 returnByValue: true,
                 awaitPromise: true,
                 timeout,
+                staleContextRetry,
             },
             timeout
-        )) as { result?: { value?: unknown }; exceptionDetails?: { text: string } }
+        )) as {
+            result?: { value?: unknown }
+            exceptionDetails?: { text: string }
+            retryAttempted?: boolean
+            retryReason?: string
+            staleContextRetry?: StaleContextRetryPolicy
+            frameContext?: Record<string, unknown>
+        }
     }
 
     /**

@@ -17,6 +17,8 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
+import type { StaleContextRetryPolicy } from '../core/browser-driver.js'
+import { EvaluateResultTooLargeError, NonSerializableEvaluateResultError } from '../core/types.js'
 import type { InputMode } from '../core/unified-session.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
@@ -51,6 +53,12 @@ const evaluateSchema = z.object({
         .optional()
         .describe(
             '执行模式，precise（默认）使用 debugger API，可绕过 CSP；stealth 使用 JS 注入，不触发调试提示但受 CSP 限制'
+        ),
+    staleContextRetry: z
+        .enum(['never', 'readOnly'])
+        .optional()
+        .describe(
+            'iframe precise 执行遇到 stale execution context 时的重试契约；默认 never 不重放，readOnly 表示脚本无副作用并允许重新解析 context 后重放一次'
         ),
     diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
     postCondition: postConditionSchema
@@ -109,6 +117,10 @@ export function resolveEvaluateMode(mode: InputMode | undefined): InputMode {
     return mode ?? 'precise'
 }
 
+export function resolveStaleContextRetryPolicy(policy: StaleContextRetryPolicy | undefined): StaleContextRetryPolicy {
+    return policy ?? 'never'
+}
+
 export function classifyEvaluateActionError(error: unknown): {
     actionExecuted: boolean
     actionStatus: 'failed' | 'unknown'
@@ -118,11 +130,35 @@ export function classifyEvaluateActionError(error: unknown): {
     const preActionTimeout = /tim(?:eout|ed out) before/i.test(message)
     const timedOut = !preActionTimeout && /Request timeout|timed out|timeout|超时/i.test(message)
     const pageEvaluationStarted =
-        /Evaluation failed|exception|ReferenceError|TypeError|SyntaxError|RangeError|URIError/i.test(message)
+        /Evaluation failed|exception|ReferenceError|TypeError|SyntaxError|RangeError|URIError|(?:^|\n)Error:/i.test(
+            message
+        )
+    const executionStatusUnknown =
+        timedOut || /FRAME_STALE_CONTEXT|FRAME_EVALUATION_FAILED|Execution context became stale/i.test(message)
     return {
-        actionExecuted: timedOut || pageEvaluationStarted,
-        actionStatus: timedOut ? 'unknown' : 'failed',
+        actionExecuted: executionStatusUnknown || pageEvaluationStarted,
+        actionStatus: executionStatusUnknown ? 'unknown' : 'failed',
         retryable: /timeout|timed out|超时|disconnect|未连接|context|debugger|attach/i.test(message),
+    }
+}
+
+export function classifyEvaluateFailure(error: unknown): {
+    actionExecuted: boolean
+    actionStatus: 'completed' | 'failed' | 'unknown'
+    failureStage: 'action' | 'output'
+    retryable: boolean
+} {
+    if (error instanceof NonSerializableEvaluateResultError || error instanceof EvaluateResultTooLargeError) {
+        return {
+            actionExecuted: true,
+            actionStatus: 'completed',
+            failureStage: 'output',
+            retryable: false,
+        }
+    }
+    return {
+        ...classifyEvaluateActionError(error),
+        failureStage: 'action',
     }
 }
 
@@ -136,11 +172,9 @@ function appendEvaluateFailureMetadata(
     if (!text) return undefined
     try {
         const payload = JSON.parse(text) as Record<string, unknown>
-        const status = classifyEvaluateActionError(error)
-        Object.assign(payload, status, {
+        Object.assign(payload, classifyEvaluateFailure(error), {
             verificationRequested,
             verificationStatus: 'unavailable',
-            failureStage: 'action',
             ...overrides,
         })
         return payload
@@ -182,15 +216,25 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
             return await unifiedSession.withFrame(args.frame, async () => {
                 const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
                 const evaluationMode = resolveEvaluateMode(args.mode)
+                const staleContextRetry = resolveStaleContextRetryPolicy(args.staleContextRetry)
                 let result: unknown
                 let evaluationMetadata: ReturnType<typeof unifiedSession.consumeLastEvaluationMetadata>
                 try {
-                    result = await unifiedSession.evaluate(script, evaluationMode, args.timeout, args.args as unknown[])
+                    result = await unifiedSession.evaluate(
+                        script,
+                        evaluationMode,
+                        args.timeout,
+                        args.args as unknown[],
+                        {
+                            staleContextRetry,
+                        }
+                    )
                     evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
                 } catch (error) {
                     evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
                     const response = formatEvaluateErrorResponse(error)
                     const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition), {
+                        staleContextRetry,
                         ...(evaluationMetadata ?? {}),
                     })
                     if (payload) {
@@ -213,6 +257,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                     failureStage:
                         postCondition && postCondition.verificationStatus !== 'matched' ? 'verification' : undefined,
                     retryable: postCondition?.retryable ?? false,
+                    ...(args.frame !== undefined ? { staleContextRetry } : {}),
                     ...(evaluationMetadata ?? {}),
                     ...(postCondition ? { postCondition } : {}),
                 }

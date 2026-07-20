@@ -19,6 +19,7 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
+import { sanitizeUrlRecord, sanitizeUrlRecords } from './network-sanitizer.js'
 
 /**
  * logs 参数 schema
@@ -70,13 +71,20 @@ export function normalizeConsoleLog<T extends { level: string }>(
 
 export function boundInlineNetworkRequest<T extends { url: string }>(
     request: T
-): T | (T & { urlLength: number; urlTruncated: true }) {
-    if (request.url.length <= INLINE_NETWORK_URL_MAX_LENGTH) {
-        return request
+): T & {
+    urlRedacted?: true
+    urlOriginalLength?: number
+    redactedQueryParameters?: string[]
+    urlLength?: number
+    urlTruncated?: true
+} {
+    const sanitized = sanitizeUrlRecord(request)
+    if (sanitized.url.length <= INLINE_NETWORK_URL_MAX_LENGTH) {
+        return sanitized
     }
     return {
-        ...request,
-        url: request.url.slice(0, INLINE_NETWORK_URL_MAX_LENGTH),
+        ...sanitized,
+        url: sanitized.url.slice(0, INLINE_NETWORK_URL_MAX_LENGTH),
         urlLength: request.url.length,
         urlTruncated: true,
     }
@@ -132,10 +140,10 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
 }> {
     try {
         const unifiedSession = getUnifiedSession()
-        const mode = unifiedSession.getMode()
         const responseLimit = args.limit ?? DEFAULT_LOG_LIMIT
 
         return await unifiedSession.withTabId(args.tabId, async () => {
+            const mode = unifiedSession.getMode()
             switch (args.type) {
                 case 'console': {
                     let logs: Array<{
@@ -157,7 +165,7 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                         logs = await session.getConsoleLogs({ clear: args.clear })
                     }
 
-                    logs = logs.map(normalizeConsoleLog)
+                    logs = sanitizeUrlRecords(logs.map(normalizeConsoleLog))
                     if (args.level && args.level !== 'all') {
                         logs = logs.filter((log) => log.level === args.level)
                     }
@@ -224,6 +232,7 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                         })
                     }
 
+                    requests = sanitizeUrlRecords(requests)
                     const hasExplicitLimit = args.limit !== undefined
                     const selectedRequests =
                         args.output && !hasExplicitLimit ? requests : latestItems(requests, responseLimit)

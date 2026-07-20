@@ -13,7 +13,7 @@
 **执行总纲**：按本清单用例顺序跑，全部 PASS 才放行，跑的过程中严守"不污染用户环境"——禁止操作用户已有
 tab，禁止清全局缓存/cookies，只能动测试 tab 和测试创建的 `mcp_test_*` 前缀数据，任何与此冲突的用例就地标 SKIP
 
-- Chrome Extension 已在 `chrome://extensions/` 刷新为最新 dist，popup 显示 **已连接**
+- Chrome Extension 已在 `chrome://extensions/` 刷新为最新 dist，popup 显示 **已连接**；调用 `browse(action="connect")`，确认 `extension.bundleStatus="match"`，活动 `extensionBackgroundBundleHash` 与 `expectedBackgroundBundleHash` 相同，不能只比较 manifest version
 - CC 重启后 Extension 应自动连接本地 MCP Server；除非测试强制 token 或手动连接流程，否则“需要点连接”不能作为发版前置条件
 - MCP server 已加载最新 dist（src 有任何改动 → `npm run build` → 重启 CC，否则跑到的是旧进程）
 - 全程使用 `manage action=newPage` 创建的测试 tab，**严禁操作用户已有 tab**
@@ -109,9 +109,9 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：Chrome 已开启且有 debug 端口
 - 操作：`browse { action: "connect" }`（不带 port 参数自动探测；带 port=9222 精确）
-- 断言：`success=true`，响应 `mode` 字段为 `cdp` 或 `extension`
+- 断言：`success=true`，响应 `mode` 字段为 `cdp` 或 `extension`；Extension 模式还需返回 `extension.helloReceived=true`、`extension.bundleStatus="match"`，且活动 hash 与预期 hash 相同
 - 载体：N/A
-- 备注：CC 常态由 Extension 模式接管，`connect` 是 CDP 模式入口
+- 备注：CC 常态由 Extension 模式接管，`connect` 是 CDP 模式入口；`legacy` 表示旧 Extension 未上报 hash，`stale` 表示浏览器仍在运行旧 bundle，这两种状态都不阻断自动连接
 
 ### browse-list-01
 
@@ -340,14 +340,35 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：与 frame:"iframe#test-frame" 返回结果一致
 - 载体：test-page
 
-### evaluate-precise-08-scriptFile
+### evaluate-precise-07a-frame-identity
+
+- 前置：attach 到含 `iframe#test-frame` 的 managed HTTP tab，页面同时存在其他 iframe，记录 `iframe#test-frame` 在 `document.querySelectorAll('iframe, frame')` 中的索引
+- 操作：分别以 `frame:"iframe#test-frame"` 和上一步得到的数字索引读取 `#frame-btn` 文本
+- 断言：两次都返回 `Frame Button`，不会命中其他 frame；所选 DOM iframe 无法映射到唯一 frameId 时返回 `FRAME_IDENTITY_UNAVAILABLE`，不得按 `webNavigation` 顺序选择 frame
+- 载体：独立 managed test tab
+
+### evaluate-precise-08-stale-default-no-replay
+
+- 前置：attach 到 test-page，执行主框架脚本设置 `window.__mcp_stale_side_effect=0`，保存 `iframe#test-frame.srcdoc`，并在 300ms 后把同一 srcdoc 重新赋给 iframe 触发 context 销毁
+- 操作：立即执行 `evaluate { frame:"iframe#test-frame", timeout:4000, script:"(async()=>{parent.__mcp_stale_side_effect++; await new Promise(r=>setTimeout(r,1000)); return parent.__mcp_stale_side_effect})()" }`，不传 `staleContextRetry`
+- 断言：返回 `FRAME_STALE_CONTEXT`，`staleContextRetry === "never"`，`retryAttempted === false`、`actionExecuted === true`、`actionStatus === "unknown"`；在主框架读取 `window.__mcp_stale_side_effect === 1`，证明有副作用脚本没有自动重放
+- 载体：test-page
+
+### evaluate-precise-09-stale-readonly-retry
+
+- 前置：重新载入 test-page，执行主框架脚本保存 `iframe#test-frame.srcdoc`，并在 300ms 后重新赋值触发 context 销毁
+- 操作：立即执行 `evaluate { frame:"iframe#test-frame", timeout:5000, staleContextRetry:"readOnly", script:"(async()=>{await new Promise(r=>setTimeout(r,1000)); return document.getElementById('frame-btn').textContent})()" }`
+- 断言：`success=true`，`result === "Frame Button"`，`staleContextRetry === "readOnly"`，`retryAttempted === true`，`frameContext.executionContextId` 非空；脚本本身不写页面状态
+- 载体：test-page
+
+### evaluate-precise-10-scriptFile
 
 - 前置：在受控临时目录准备 `mcp-eval.js`
 - 操作：`evaluate { scriptFile: "tmp:mcp-eval.js" }`
 - 断言：`result === 42`
 - 载体：任意
 
-### evaluate-precise-09-output
+### evaluate-precise-11-output
 
 - 操作：`evaluate { script: "'hello world'", output: "tmp:mcp-eval-out.txt" }`
 - 断言：文件存在，内容为 `hello world`（不带引号）
@@ -384,6 +405,18 @@ FAIL 时只需报 ID + 失败断言即可
 - 载体：test-page
 - 备注：双 tab 对比可选（需自建第二个 managed test tab，Phase 1 环境可 SKIP）
 
+### scope-tabId-01-backend-consistency
+
+- 前置：创建两个 managed test tab T1 和 T2，当前 attach 保持在 T1；T1、T2 的 title 和 `#text-input` 初始值不同，在 T2 触发一条唯一 console warning
+- 操作：分别对 T2 的 `tabId` 调用：
+  1. `input` 给 `#text-input` 输入唯一值，并用 `postCondition.script` 检查同一值
+  2. `wait for=element` 等待 T2 独有 selector
+  3. `logs type=console` 读取 T2 的唯一 warning
+  4. `extract type=text` 读取 T2 独有文本
+- 断言：input 返回 `mode === "extension"` 且 post-condition matched，wait、logs、extract 都命中 T2；T1 的 title、输入值和页面文本不变；每项操作后分别对 T1、T2 提取目标元素并截图，确认没有切换或写错 tab
+- 载体：两个 test-page managed tab
+- 清理：关闭 T1、T2
+
 ### evaluate-diagnostics-01
 
 - 操作：`evaluate { script: "console.warn('mcp_diag_warn'); fetch('/mcp_diag_404')", diagnostics: true }`
@@ -394,7 +427,8 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 操作：`evaluate { script: "document.body" }`
 - 断言：返回 `isError=true`，`error.code === "NON_SERIALIZABLE_EVALUATE_RESULT"`，`error.suggestion` 含 `outerHTML` 或
-  `textContent`
+  `textContent`，并返回 `actionExecuted === true`、`actionStatus === "completed"`、`failureStage === "output"`、
+  `retryable === false`
 - 载体：test-page
 
 ---
@@ -832,6 +866,27 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：replace 目标 #textarea
 - 断言：value 文本被替换
 
+### input-select-05-cdp-locator-matrix
+
+- 前置：在独立 CDP 测试会话中启动或连接专用 Chrome，确保 Extension 未接管该会话；打开 test-page，并给 `#edit-input`、`#edit-textarea`、`#edit-contenteditable` 写入各自唯一文本
+- 操作：对三个元素分别执行 locator target 的 `select`，每次使用唯一 `find` 文本
+- 断言：每次 input 响应的 `mode === "cdp"`；input/textarea 的 `selectionStart`、`selectionEnd` 匹配目标文本，contenteditable 的 `window.getSelection().toString()` 等于目标文本；错误或响应中不出现 Extension refId 依赖
+- 载体：test-page，CDP 模式
+
+### input-replace-03-cdp-locator-matrix
+
+- 前置：延续 `input-select-05-cdp-locator-matrix`，重置三个元素的内容
+- 操作：对 `#edit-input`、`#edit-textarea`、`#edit-contenteditable` 分别执行 locator target 的 `replace`
+- 断言：每次 input 响应的 `mode === "cdp"`；input/textarea 的 value 和 contenteditable 的 textContent 都只替换指定 occurrence；用 `extract` 读取三个目标，并截图确认页面显示值一致
+- 载体：test-page，CDP 模式
+
+### input-password-01-failure-redaction
+
+- 前置：在 managed test tab 注入 `input[type=password]#mcp-password`，value 设为 `password-value-sentinel`，页面和 console 中不写这些 sentinel
+- 操作：`input { events:[{type:"replace", target:{css:"#mcp-password"}, find:"password-find-sentinel", text:"password-replacement-sentinel"}], diagnostics:true }`，其中 find 不存在以触发失败
+- 断言：响应为失败；序列化后的完整响应不包含 `password-value-sentinel`、`password-find-sentinel`、`password-replacement-sentinel`，包含 `redacted` 标记或 `[REDACTED]`；随后提取 password 元素和截图，确认页面仍存在且 value 未被修改
+- 载体：test-page
+
 ### 5.6 drag
 
 ### input-drag-01
@@ -879,8 +934,8 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：`#text-input` 已全选 "hello"
 - 操作：`[{keydown, key:"c", commands:["copy"]}, {keyup, key:"c"}]`，随后切到 #textarea 再 `commands:["paste"]`
-- 断言：`#textarea.value === "hello"`
-- 备注：需要剪贴板权限；无权限时可跳过此条
+- 断言：copy 和 paste 调用均返回成功，不出现二次 `document.execCommand` 导致的 `EDIT_COMMAND_FAILED`；`#textarea.value === "hello"`
+- 备注：命令成功只表示浏览器接受分发，页面结果以读取 `#textarea.value` 为准；无剪贴板权限时可跳过此条
 
 ### input-keydown-06-rawkeydown-autorepeat
 
@@ -1021,6 +1076,14 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：对应记录 `url.length === 2048`，`urlLength` 等于原始长度，`urlTruncated === true`
 - 操作：`logs { type:"network", output:"tmp:mcp-network-logs.json" }`
 - 断言：输出文件中的对应记录保留完整 URL，不含内联截断
+
+### logs-network-05-credential-redaction
+
+- 前置：通过 fetch 触发 URL query 含 `authorization=mcp-auth-sentinel`、`access_token=mcp-token-sentinel` 的请求
+- 操作：分别调用 `logs { type:"network" }`、`logs { type:"network", output:"tmp:mcp-network-redacted.json" }`，并读取
+  diagnostics 中的 failed request
+- 断言：内联响应、output 文件和 diagnostics 均不包含两个 sentinel，URL 对应值为 `[REDACTED]`，并返回
+  `urlRedacted === true`、原始 URL 长度和 `redactedQueryParameters`
 
 ### logs-output-01
 
@@ -1203,9 +1266,9 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### wait-navigation-01
 
-- 前置：attach 到 test-page，先执行 `evaluate { script:"(() => { document.title = 'mcp-nav-start'; setTimeout(() => { document.title = 'mcp-nav-done'; location.hash = 'mcp-nav-' + Date.now(); }, 100); return true; })()" }`
-- 操作：`wait { for:"navigation", timeout:3000 }`
-- 断言：wait 返回，新 title 为 `mcp-nav-done`，URL hash 包含 `mcp-nav-`
+- 前置：attach 到 test-page，执行 evaluate 创建 Web Worker，每 500ms 更新一次 title 和 URL hash，连续更新 20 次
+- 操作：`wait { for:"navigation", timeout:5000 }`
+- 断言：wait 返回，title 和 URL hash 均含 `mcp-nav-`
 - 载体：test-page
 
 ### wait-timeout-01
@@ -1343,8 +1406,12 @@ test-page.html 现有 region（供用例引用）：
 - `ch-target-01`: input、extract、wait 的 target timeout 返回 locator、target type、nth、URL、tabId、managed、frame、match count、最多 10 个候选和 last state
 - `ch-port-01`: 无 server 时 Extension 只输出聚合 debug 摘要，不为每个候选端口输出 warning/error
 - `ch-port-02`: 已识别 MCP server 的 token/proof 不匹配或认证协议不完整时，输出一条限量 warning；同一摘要重连时不重复刷屏
-- `ch-frame-01`: iframe 导航销毁 context 后 precise evaluate 仅重试一次，并返回 retry 和最终 frame/context 摘要
+- `ch-frame-01`: iframe 导航销毁 context 后，默认 `staleContextRetry=never` 不重放有副作用脚本；显式 `readOnly` 时最多重放一次，并返回策略、retry 和最终 frame/context 摘要
 - `ch-frame-02`: 两个相同 URL iframe 返回 bounded candidates 并拒绝选择任一 frame
+- `ch-frame-03`: 页面 DOM iframe 与 `webNavigation` 额外 frame 同时存在时，selector 和 index 都按 DOM 元素身份命中目标，无法建立唯一映射时返回 `FRAME_IDENTITY_UNAVAILABLE`
+- `ch-password-01`: password value、input `find` 和替换 `text` sentinel 不得出现在失败响应、diagnostics 或 post-condition 观测值中
+- `ch-backend-01`: 显式 `tabId` 的 input、wait、logs、extract 在目标作用域内选择 backend，动作、诊断和验证都命中同一个 managed tab
+- `ch-cdp-selection-01`: CDP 模式对 input、textarea、contenteditable 的 locator `select` 和 `replace` 成功，不调用 Extension refId 或 `actionableClick`
 - `ch-diagnostics-01`: restricted URL 导航到普通 URL 且 `diagnostics=true`，主导航成功，返回 `diagnosticsStatus=unavailable` 与原始摘要
 - `ch-diagnostics-02`: browse 或 wait 主动作失败且 `diagnostics=true` 时，错误响应保留 `diagnosticsStatus`、新增 console/network 摘要或采集错误
 

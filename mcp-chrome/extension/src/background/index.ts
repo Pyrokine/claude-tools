@@ -9,6 +9,7 @@
 
 import type { InternalMessage } from '../types'
 import { isExpectedOperationError } from '../types/expected-errors'
+import { recordDomFrameProbe } from './action-utils'
 import { ActionHandler } from './actions'
 import { HttpClient } from './http-client'
 import {
@@ -72,12 +73,12 @@ httpClient.onStatusChange((status, count) => {
 
 // ==================== 内部消息处理 ====================
 
-chrome.runtime.onMessage.addListener((message: InternalMessage, _sender, sendResponse) => {
-    handleInternalMessage(message).then(sendResponse)
+chrome.runtime.onMessage.addListener((message: InternalMessage, sender, sendResponse) => {
+    handleInternalMessage(message, sender).then(sendResponse)
     return true // 异步响应
 })
 
-async function handleInternalMessage(message: InternalMessage): Promise<unknown> {
+async function handleInternalMessage(message: InternalMessage, sender: chrome.runtime.MessageSender): Promise<unknown> {
     switch (message.type) {
         case 'CONNECT':
             return httpClient.connect()
@@ -101,6 +102,9 @@ async function handleInternalMessage(message: InternalMessage): Promise<unknown>
                 pairingTokenConfigured: await httpClient.hasPairingToken(),
                 allowInsecureNoToken: await httpClient.isAllowInsecureNoToken(),
             }
+
+        case 'MCP_FRAME_PROBE':
+            return recordDomFrameProbe(message, sender)
 
         default:
             return { error: 'Unknown message type' }

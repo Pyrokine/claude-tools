@@ -185,6 +185,8 @@ export interface InputTouchPoint {
     id?: number
 }
 
+export type StaleContextRetryPolicy = 'never' | 'readOnly'
+
 export interface FrameResolveResult {
     frameId: number
     offset: { x: number; y: number } | null
@@ -401,10 +403,15 @@ export interface IBrowserDriver {
     evaluateInFrame(
         frameId: number,
         expression: string,
-        timeout?: number
+        timeout?: number,
+        staleContextRetry?: StaleContextRetryPolicy
     ): Promise<{
         result?: { value?: unknown }
         exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+        retryAttempted?: boolean
+        retryReason?: string
+        staleContextRetry?: StaleContextRetryPolicy
+        frameContext?: Record<string, unknown>
     }>
 
     // ---- CDP 命令直通 ----

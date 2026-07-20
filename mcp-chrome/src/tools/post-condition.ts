@@ -90,7 +90,11 @@ async function checkPostCondition(
                 const values = Array.from(body.querySelectorAll('input, textarea, select')).map((element) =>
                     element instanceof HTMLSelectElement
                         ? Array.from(element.selectedOptions).map((option) => option.value || option.textContent || '').join(' ')
-                        : element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value || '' : '')
+                        : element instanceof HTMLInputElement && element.type === 'password'
+                          ? ''
+                          : element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+                            ? element.value || ''
+                            : '')
                 const text = [body.textContent || '', ...values].join('\\n')
                 return { matched: exact ? [body.textContent || '', ...values].some((value) => value === expected) : text.includes(expected), actual: text.slice(0, 500) }
             }`,

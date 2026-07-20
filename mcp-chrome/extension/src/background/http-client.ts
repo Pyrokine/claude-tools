@@ -61,6 +61,31 @@ function randomHex(bytes = 16): string {
     return bytesToHex(data)
 }
 
+let backgroundBundleHashPromise: Promise<string | undefined> | undefined
+
+async function loadBackgroundBundleHash(): Promise<string | undefined> {
+    try {
+        const response = await fetch(chrome.runtime.getURL('service-worker-loader.js'), { cache: 'no-store' })
+        if (!response.ok) {
+            console.warn(`[HTTP] Cannot read Extension service worker loader: HTTP ${response.status}`)
+            return undefined
+        }
+        const digest = await crypto.subtle.digest('SHA-256', await response.arrayBuffer())
+        return `sha256:${bytesToHex(new Uint8Array(digest))}`
+    } catch (error) {
+        console.warn(
+            '[HTTP] Cannot compute Extension background bundle hash:',
+            error instanceof Error ? error.message : String(error)
+        )
+        return undefined
+    }
+}
+
+function getBackgroundBundleHash(): Promise<string | undefined> {
+    backgroundBundleHashPromise ??= loadBackgroundBundleHash()
+    return backgroundBundleHashPromise
+}
+
 async function hmacHex(token: string, payload: string): Promise<string> {
     const encoder = new TextEncoder()
     const key = await crypto.subtle.importKey('raw', encoder.encode(token), { name: 'HMAC', hash: 'SHA-256' }, false, [
@@ -284,8 +309,19 @@ export class HttpClient {
                     this.connections.set(port, conn)
                     this.resetHeartbeat(port)
 
-                    // 版本握手
-                    ws.send(JSON.stringify({ type: 'hello', version: chrome.runtime.getManifest().version }))
+                    // 版本与活动后台 bundle 握手；hash 读取失败时保持旧版 version-only 协议
+                    void getBackgroundBundleHash().then((backgroundBundleHash) => {
+                        if (ws.readyState !== WebSocket.OPEN) {
+                            return
+                        }
+                        ws.send(
+                            JSON.stringify({
+                                type: 'hello',
+                                version: chrome.runtime.getManifest().version,
+                                ...(backgroundBundleHash ? { backgroundBundleHash } : {}),
+                            })
+                        )
+                    })
 
                     console.log(`[HTTP] Connected to MCP Server at port ${port} (total: ${this.connections.size})`)
                     this.statusHandler?.('connected', this.connections.size)

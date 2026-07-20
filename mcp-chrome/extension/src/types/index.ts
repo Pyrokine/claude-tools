@@ -379,6 +379,12 @@ export interface SetAllowInsecureNoTokenMessage {
     allow: boolean
 }
 
+export interface FrameProbeMessage {
+    type: 'MCP_FRAME_PROBE'
+    token: string
+    index: number
+}
+
 export type InternalMessage =
     | StatusUpdateMessage
     | ConnectMessage
@@ -386,6 +392,7 @@ export type InternalMessage =
     | GetStatusMessage
     | SetPairingTokenMessage
     | SetAllowInsecureNoTokenMessage
+    | FrameProbeMessage
 
 // ==================== Debugger (CDP) 操作 ====================
 

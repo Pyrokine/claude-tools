@@ -95,7 +95,12 @@ export async function buildTargetDiagnostics(
         candidates?: TargetCandidate[]
     }
 ): Promise<Record<string, unknown>> {
-    const state = unifiedSession.getState()
+    let state: Awaited<ReturnType<typeof unifiedSession.getLiveState>>
+    try {
+        state = await unifiedSession.getLiveState()
+    } catch {
+        state = null
+    }
     const knownCandidates = options.candidates ? summarizeTargetCandidates(options.candidates) : []
     const pageCandidates =
         knownCandidates.length > 0

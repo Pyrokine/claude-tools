@@ -28,6 +28,7 @@ import {
 import type { Target } from '../core/types.js'
 import { comparePngImages, MAX_COMPARE_PIXELS, MAX_COMPARE_PNG_BYTES, readPngHeader } from './png.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
+import { sanitizeUrlRecords } from './network-sanitizer.js'
 import { buildTargetDiagnostics, TargetTimeoutError } from './target-diagnostics.js'
 
 /** 图片元信息 */
@@ -141,17 +142,17 @@ interface ExtractContext {
 async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
     try {
         const unifiedSession = getUnifiedSession()
-        const useExtension = unifiedSession.isExtensionConnected()
-        const session = getSession()
-
-        const frameHtmlError = validateFrameHtmlArgs(args, useExtension)
-        if (frameHtmlError) {
-            return frameHtmlError
-        }
 
         // 多 tab 并行：临时切换到指定 tab
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
+                const useExtension = unifiedSession.getMode() === 'extension'
+                const frameHtmlError = validateFrameHtmlArgs(args, useExtension)
+                if (frameHtmlError) {
+                    return frameHtmlError
+                }
+                const session = getSession()
+
                 // Extension 路径：等待目标元素出现（如果指定了 target + timeout）
                 if (useExtension && args.target && args.timeout !== undefined) {
                     await waitForTargetExtension(unifiedSession, args.target, args.timeout, args.frame)
@@ -438,13 +439,13 @@ async function handleDiagnosticBundleExtract(
     { unifiedSession, useExtension }: ExtractContext,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
-    const state = unifiedSession.getState()
+    const state = await unifiedSession.getLiveState().catch(() => null)
     const metadata = await unifiedSession.getMetadata()
     const frames = useExtension ? await unifiedSession.getFrames() : { frames: [] }
     await unifiedSession.enableConsole()
     await unifiedSession.enableNetwork()
-    const consoleLogs = await unifiedSession.getConsoleLogs()
-    const networkRequests = await unifiedSession.getNetworkRequests()
+    const consoleLogs = sanitizeUrlRecords(await unifiedSession.getConsoleLogs())
+    const networkRequests = sanitizeUrlRecords(await unifiedSession.getNetworkRequests())
     const bundle = {
         schema: 'mcp-chrome.diagnosticBundle.v1',
         url: state?.url,

@@ -8,7 +8,7 @@
  * - 心跳检测：定期 ping 检测 Extension 存活
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from 'crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto'
 import { EventEmitter } from 'events'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { readFileSync } from 'node:fs'
@@ -20,6 +20,18 @@ import { DEFAULT_TIMEOUT } from '../core/types.js'
 const SERVER_VERSION = (
     JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as { version: string }
 ).version
+
+function loadExpectedExtensionBackgroundBundleHash(): string | null {
+    try {
+        const loader = readFileSync(new URL('../../extension/dist/service-worker-loader.js', import.meta.url))
+        return `sha256:${createHash('sha256').update(loader).digest('hex')}`
+    } catch {
+        return null
+    }
+}
+
+const EXPECTED_EXTENSION_BACKGROUND_BUNDLE_HASH = loadExpectedExtensionBackgroundBundleHash()
+const BACKGROUND_BUNDLE_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/
 const DEFAULT_PORT = 19222
 const MAX_PORT = 19299
 const REQUEST_TIMEOUT = DEFAULT_TIMEOUT
@@ -27,9 +39,40 @@ const HEARTBEAT_INTERVAL = 15000 // 每 15 秒发送一次 ping，下次 ping �
 const AUTH_CHALLENGE_TTL_MS = 60_000
 const AUTH_CHALLENGE_MAX_ENTRIES = 1024
 
+export type ExtensionBundleStatus = 'pending' | 'match' | 'stale' | 'legacy' | 'unknown'
+
+export interface ExtensionConnectionInfo {
+    serverVersion: string
+    extensionVersion: string | null
+    expectedBackgroundBundleHash: string | null
+    extensionBackgroundBundleHash: string | null
+    bundleStatus: ExtensionBundleStatus
+    helloReceived: boolean
+    port: number
+    connected: boolean
+}
+
 export interface HttpServerOptions {
     port?: number
     autoPort?: boolean
+    expectedExtensionBackgroundBundleHash?: string | null
+}
+
+export function resolveExtensionBundleStatus(
+    expectedHash: string | null,
+    extensionHash: string | null,
+    helloReceived: boolean
+): ExtensionBundleStatus {
+    if (!helloReceived) {
+        return 'pending'
+    }
+    if (extensionHash === null) {
+        return expectedHash === null ? 'unknown' : 'legacy'
+    }
+    if (expectedHash === null) {
+        return 'unknown'
+    }
+    return extensionHash === expectedHash ? 'match' : 'stale'
 }
 
 interface MessageHandler {
@@ -89,6 +132,9 @@ export class ExtensionHttpServer extends EventEmitter {
     private port = 0
     private messageHandlers = new Map<string, MessageHandler>()
     private extensionVersion: string | null = null
+    private extensionBackgroundBundleHash: string | null = null
+    private helloReceived = false
+    private readonly expectedExtensionBackgroundBundleHash: string | null
     private heartbeatInterval: NodeJS.Timeout | null = null
     private pongReceived = false
     private readonly pairingToken = process.env.MCP_CHROME_PAIRING_TOKEN?.trim() ?? ''
@@ -98,6 +144,10 @@ export class ExtensionHttpServer extends EventEmitter {
 
     constructor(private options: HttpServerOptions = {}) {
         super()
+        this.expectedExtensionBackgroundBundleHash =
+            options.expectedExtensionBackgroundBundleHash === undefined
+                ? EXPECTED_EXTENSION_BACKGROUND_BUNDLE_HASH
+                : options.expectedExtensionBackgroundBundleHash
     }
 
     async start(): Promise<void> {
@@ -207,6 +257,23 @@ export class ExtensionHttpServer extends EventEmitter {
         return this.port
     }
 
+    getConnectionInfo(): ExtensionConnectionInfo {
+        return {
+            serverVersion: SERVER_VERSION,
+            extensionVersion: this.extensionVersion,
+            expectedBackgroundBundleHash: this.expectedExtensionBackgroundBundleHash,
+            extensionBackgroundBundleHash: this.extensionBackgroundBundleHash,
+            bundleStatus: resolveExtensionBundleStatus(
+                this.expectedExtensionBackgroundBundleHash,
+                this.extensionBackgroundBundleHash,
+                this.helloReceived
+            ),
+            helloReceived: this.helloReceived,
+            port: this.port,
+            connected: this.isConnected(),
+        }
+    }
+
     async stop(): Promise<void> {
         this.stopHeartbeat()
         this.rejectPendingHandlers('Server stopped')
@@ -264,6 +331,9 @@ export class ExtensionHttpServer extends EventEmitter {
             }
 
             this.clientSocket = ws
+            this.extensionVersion = null
+            this.extensionBackgroundBundleHash = null
+            this.helloReceived = false
             this.startHeartbeat()
             this.emit('connected')
 
@@ -276,6 +346,8 @@ export class ExtensionHttpServer extends EventEmitter {
                 if (this.clientSocket === ws) {
                     this.clientSocket = null
                     this.extensionVersion = null
+                    this.extensionBackgroundBundleHash = null
+                    this.helloReceived = false
                     this.stopHeartbeat()
                     // 立即 reject 所有 pending 请求，而非等待个别超时
                     this.rejectPendingHandlers('Extension disconnected')
@@ -428,14 +500,7 @@ export class ExtensionHttpServer extends EventEmitter {
 
         if (url.pathname === '/api/info') {
             res.writeHead(200)
-            res.end(
-                JSON.stringify({
-                    serverVersion: SERVER_VERSION,
-                    extensionVersion: this.extensionVersion,
-                    port: this.port,
-                    connected: this.isConnected(),
-                })
-            )
+            res.end(JSON.stringify(this.getConnectionInfo()))
             return
         }
 
@@ -452,6 +517,7 @@ export class ExtensionHttpServer extends EventEmitter {
                 error?: string
                 type?: string
                 version?: string
+                backgroundBundleHash?: unknown
             }
 
             // 心跳响应
@@ -460,9 +526,15 @@ export class ExtensionHttpServer extends EventEmitter {
                 return
             }
 
-            // 版本握手
+            // 版本与活动后台 bundle 握手
             if (message.type === 'hello') {
+                this.helloReceived = true
                 this.extensionVersion = message.version ?? null
+                this.extensionBackgroundBundleHash =
+                    typeof message.backgroundBundleHash === 'string' &&
+                    BACKGROUND_BUNDLE_HASH_PATTERN.test(message.backgroundBundleHash)
+                        ? message.backgroundBundleHash
+                        : null
                 const [serverMajor] = SERVER_VERSION.split('.').map(Number)
                 const [extMajor] = (message.version ?? '0.0').split('.').map(Number)
                 if (serverMajor !== extMajor) {
@@ -472,6 +544,20 @@ export class ExtensionHttpServer extends EventEmitter {
                     )
                 } else {
                     console.error(`[HTTP] Extension version: ${message.version}`)
+                }
+                const bundleStatus = resolveExtensionBundleStatus(
+                    this.expectedExtensionBackgroundBundleHash,
+                    this.extensionBackgroundBundleHash,
+                    this.helloReceived
+                )
+                if (bundleStatus === 'stale') {
+                    console.error(
+                        '[HTTP] Extension background bundle does not match this server package; reload the Extension'
+                    )
+                } else if (bundleStatus === 'legacy') {
+                    console.error(
+                        '[HTTP] Extension did not report a background bundle hash; build identity is unavailable'
+                    )
                 }
                 return
             }

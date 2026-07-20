@@ -38,6 +38,24 @@ export function replaceNthOccurrence(value: string, find: string, replacement: s
     return value.slice(0, index) + replacement + value.slice(index + find.length)
 }
 
+export function redactSensitiveInputData(value: unknown, sensitiveValues: readonly string[]): unknown {
+    const secrets = [...new Set(sensitiveValues.filter((item) => item.length > 0))].sort(
+        (left, right) => right.length - left.length
+    )
+    if (typeof value === 'string') {
+        return secrets.reduce((text, secret) => text.replaceAll(secret, '[REDACTED]'), value)
+    }
+    if (Array.isArray(value)) {
+        return value.map((item) => redactSensitiveInputData(item, secrets))
+    }
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(
+            Object.entries(value).map(([key, item]) => [key, redactSensitiveInputData(item, secrets)])
+        )
+    }
+    return value
+}
+
 /**
  * InputEvent schema
  */
@@ -69,7 +87,7 @@ const inputEventSchema = z.object({
         .array(z.string())
         .optional()
         .describe(
-            '浏览器编辑命令（keydown 专用），如 ["selectAll"]、["copy"]、["paste"]、["cut"]、["undo"]、["redo"]，触发原生编辑命令，优先于纯键盘事件'
+            '浏览器编辑命令（keydown 专用），如 ["selectAll"]、["copy"]、["paste"]、["cut"]、["undo"]、["redo"]；成功表示命令已分发，页面结果需用 postCondition 或 extract 验证'
         )
         .describe('用于跨平台快捷键场景，需要 inputMode=precise'),
     button: z.enum(['left', 'middle', 'right', 'back', 'forward']).optional().describe('鼠标按钮'),
@@ -167,24 +185,46 @@ class StructuredToolError extends Error {
     }
 }
 
+type InputToolResponse = {
+    content: Array<{ type: 'text'; text: string }>
+    isError?: boolean
+}
+
+function sanitizeInputFailureResponse(
+    response: InputToolResponse,
+    events: ReadonlyArray<{ find?: string; text?: string }>
+): InputToolResponse {
+    const sensitiveValues = events
+        .flatMap((event) => [event.find, event.text])
+        .filter((value): value is string => !!value)
+    if (sensitiveValues.length === 0) {
+        return response
+    }
+    for (const item of response.content) {
+        try {
+            item.text = JSON.stringify(redactSensitiveInputData(JSON.parse(item.text), sensitiveValues), null, 2)
+        } catch {
+            item.text = redactSensitiveInputData(item.text, sensitiveValues) as string
+        }
+    }
+    return response
+}
+
 /**
  * input 工具处理器
  */
-async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
-    content: Array<{ type: 'text'; text: string }>
-    isError?: boolean
-}> {
+async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputToolResponse> {
     try {
         const unifiedSession = getUnifiedSession()
-        const mode = unifiedSession.getMode()
         const humanize = args.humanize ?? false
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
+                const mode = unifiedSession.getMode()
                 const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
                 const warnings: string[] = []
                 const eventResults: unknown[] = []
-                const session = mode === 'extension' ? undefined : getSession()
+                const session = mode === 'cdp' ? getSession() : undefined
                 const inputStartedAt = Date.now()
                 let eventsExecuted = 0
 
@@ -233,7 +273,7 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
                             // 保留原始错误响应
                         }
                     }
-                    return response
+                    return sanitizeInputFailureResponse(response, args.events)
                 }
 
                 const result: Record<string, unknown> = {
@@ -290,7 +330,7 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
                 // 保留原始错误响应
             }
         }
-        return response
+        return sanitizeInputFailureResponse(response, args.events)
     }
 }
 
@@ -300,15 +340,20 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<{
  * DOM 文本节点返回字符坐标（用于鼠标选择）；
  * input/textarea 返回 selectionRange 索引（用于 setSelectionRange）
  */
-interface TextLocateResult {
-    type: 'coords'
-    startX: number
-    startY: number
-    endX: number
-    endY: number
-    /** 被替换文本是否被格式化标签包裹（如 <code>、<strong>） */
-    formatted?: string
-}
+type TextLocateResult =
+    | {
+          type: 'coords'
+          startX: number
+          startY: number
+          endX: number
+          endY: number
+          /** 被替换文本是否被格式化标签包裹（如 <code>、<strong>） */
+          formatted?: string
+      }
+    | {
+          type: 'range'
+          formatted?: string
+      }
 
 interface InputLocateResult {
     type: 'input'
@@ -344,7 +389,17 @@ const unifiedOnlyEventTypes = new Set<InputEvent['type']>([
 
 async function executeInputEvent(context: InputExecutionContext, event: InputEvent): Promise<InputEventResult> {
     if (context.mode === 'extension' || unifiedOnlyEventTypes.has(event.type)) {
-        return executeUnifiedEvent(context.unifiedSession, event, context.humanize, context.timeout, context.frame)
+        return executeUnifiedEvent(
+            {
+                unifiedSession: context.unifiedSession,
+                session: context.session,
+                mode: context.mode,
+                humanize: context.humanize,
+                timeout: context.timeout,
+                frame: context.frame,
+            },
+            event
+        )
     }
     if (!context.session) {
         throw new Error('CDP 输入事件缺少 session')
@@ -430,8 +485,31 @@ async function focusTargetForCommands(
     }
 }
 
+export async function focusCdpTarget(
+    session: ReturnType<typeof getSession>,
+    target: Target,
+    timeout?: number
+): Promise<void> {
+    const locator = session.createLocator(target, timeout !== undefined ? { timeout } : undefined)
+    const focused = await locator.evaluateOn<boolean>(`function() {
+        if (!(this instanceof HTMLElement)) return false;
+        this.focus({preventScroll: true});
+        return document.activeElement === this;
+    }`)
+    if (!focused) {
+        throw new StructuredToolError(
+            'TARGET_FOCUS_FAILED',
+            '目标元素未成功聚焦',
+            '请检查目标是否可编辑、未 disabled，并确认 locator 指向 input、textarea 或 contenteditable 元素',
+            { target }
+        )
+    }
+}
+
 async function focusTargetIfNeeded(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
+    session: ReturnType<typeof getSession> | undefined,
+    mode: InputExecutionContext['mode'],
     target: Target | undefined,
     timeout?: number,
     frame?: string | number
@@ -443,6 +521,13 @@ async function focusTargetIfNeeded(
         const point = await getTargetPointExtension(unifiedSession, target, timeout, frame)
         await unifiedSession.mouseMove(point.x, point.y)
         await unifiedSession.mouseClick('left')
+        return
+    }
+    if (mode === 'cdp') {
+        if (!session) {
+            throw new Error('CDP locator 聚焦缺少 session')
+        }
+        await focusCdpTarget(session, target, timeout)
         return
     }
     const params = targetToFindParams(target as Target & { nth?: number })
@@ -525,13 +610,20 @@ async function collectTextSelectionDiagnostics(
             if (!(el instanceof Element)) return null;
             var rect = el.getBoundingClientRect();
             var value = 'value' in el ? String(el.value || '') : '';
-            var text = (el.innerText || el.textContent || value || '').replace(new RegExp('\\\\s+', 'g'), ' ').trim();
+            var inputType = el instanceof HTMLInputElement ? (el.type || 'text').toLowerCase() : undefined;
+            var sensitive = inputType === 'password';
+            var text = sensitive ? (el.innerText || el.textContent || '') : (el.innerText || el.textContent || value || '');
+            text = text.replace(new RegExp('\\\\s+', 'g'), ' ').trim();
             return {
                 tag: el.tagName.toLowerCase(),
                 id: el.id || undefined,
                 selector: selectorFor(el),
-                text: text.slice(0, 160),
-                valuePreview: value ? value.slice(0, 160) : undefined,
+                inputType: inputType,
+                text: text ? text.slice(0, 160) : undefined,
+                valuePreview: !sensitive && value ? value.slice(0, 160) : undefined,
+                valueLength: value.length,
+                hasValue: value.length > 0,
+                redacted: sensitive || undefined,
                 visible: rect.width > 0 && rect.height > 0,
                 disabled: Boolean(el.disabled),
                 readOnly: Boolean(el.readOnly),
@@ -563,13 +655,14 @@ async function collectTextSelectionDiagnostics(
             candidateElements = candidateElements.concat(Array.from(root.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"], button, a')).slice(0, 12));
         }
         var active = document.activeElement;
+        var activeIsPassword = active instanceof HTMLInputElement && (active.type || 'text').toLowerCase() === 'password';
         var selection = window.getSelection();
         return {
             scope: {
                 target: scopeTarget,
                 targetNth: scopeNth,
                 occurrenceNth: occurrenceNth,
-                findText: findText,
+                findLength: findText.length,
                 selector: scopeSelector,
                 text: scopeText,
                 xpath: scopeXpath,
@@ -577,14 +670,18 @@ async function collectTextSelectionDiagnostics(
             },
             activeElement: summarizeElement(active),
             selection: {
-                text: selection ? selection.toString().slice(0, 160) : '',
+                text: activeIsPassword ? undefined : (selection ? selection.toString().slice(0, 160) : ''),
+                textLength: selection ? selection.toString().length : 0,
+                redacted: activeIsPassword || undefined,
                 collapsed: selection ? selection.isCollapsed : true,
                 anchorNode: selection && selection.anchorNode ? selection.anchorNode.nodeName : null,
                 focusNode: selection && selection.focusNode ? selection.focusNode.nodeName : null,
                 inputSelection: active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA') ? {
                     selectionStart: active.selectionStart,
                     selectionEnd: active.selectionEnd,
-                    valuePreview: String(active.value || '').slice(0, 160)
+                    valuePreview: activeIsPassword ? undefined : String(active.value || '').slice(0, 160),
+                    valueLength: String(active.value || '').length,
+                    redacted: activeIsPassword || undefined
                 } : undefined
             },
             candidates: candidateElements.map(summarizeElement).filter(Boolean)
@@ -743,6 +840,19 @@ async function selectText(
             formatted = startNode.tagName.toLowerCase();
         }
 
+        // contenteditable 使用 DOM Range 建立精确选区；CDP 的 Shift+Click 会把整个编辑区选中。
+        if (root instanceof HTMLElement && root.isContentEditable) {
+            var selection = window.getSelection();
+            if (!selection) return {type: 'notfound'};
+            var selectionRange = document.createRange();
+            selectionRange.setStart(s.node, s.offset);
+            selectionRange.setEnd(e.node, Math.min(e.offset + 1, e.node.textContent.length));
+            root.focus();
+            selection.removeAllRanges();
+            selection.addRange(selectionRange);
+            return {type: 'range', formatted: formatted || undefined};
+        }
+
         return {
             type: 'coords',
             startX: sr.x + 1,
@@ -816,9 +926,12 @@ async function selectText(
         // 注入脚本已完成 focus + setSelectionRange（原子化，避免外层 mouseClick 聚焦不可靠）
         return undefined
     }
+    if (result.type === 'range') {
+        return result.formatted
+    }
 
     // DOM 文本节点：鼠标选择
-    const coords = result as TextLocateResult
+    const coords = result
 
     // iframe 坐标修正（precise 模式需要视口绝对坐标）
     const frameOffset = unifiedSession.getFrameOffset()
@@ -839,78 +952,6 @@ async function selectText(
     await unifiedSession.keyUp('Shift')
 
     return coords.formatted
-}
-
-async function executeEditingCommands(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    commands: string[],
-    timeout?: number
-): Promise<Record<string, unknown>> {
-    const result = await unifiedSession.evaluate<{
-        success: boolean
-        executed: Array<{ command: string; success: boolean }>
-        selection?: Record<string, unknown>
-    }>(
-        `function(commands) {
-            function summarizeSelection() {
-                var active = document.activeElement;
-                if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
-                    return {
-                        type: active.tagName.toLowerCase(),
-                        selectionStart: active.selectionStart,
-                        selectionEnd: active.selectionEnd,
-                        selectedText: String(active.value || '').slice(active.selectionStart || 0, active.selectionEnd || 0)
-                    };
-                }
-                var selection = window.getSelection();
-                return {
-                    type: 'document',
-                    text: selection ? selection.toString() : '',
-                    collapsed: selection ? selection.isCollapsed : true
-                };
-            }
-            function commandSelectAll() {
-                var active = document.activeElement;
-                if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA') && typeof active.select === 'function') {
-                    active.select();
-                    active.dispatchEvent(new Event('select', {bubbles: true}));
-                    return true;
-                }
-                if (active && active.isContentEditable) {
-                    var range = document.createRange();
-                    range.selectNodeContents(active);
-                    var selection = window.getSelection();
-                    if (!selection) return false;
-                    selection.removeAllRanges();
-                    selection.addRange(range);
-                    return true;
-                }
-                return document.execCommand('selectAll');
-            }
-            var executed = commands.map(function(command) {
-                if (command === 'selectAll') {
-                    return {command: command, success: commandSelectAll()};
-                }
-                if (['copy', 'cut', 'paste', 'undo', 'redo'].indexOf(command) !== -1) {
-                    return {command: command, success: document.execCommand(command)};
-                }
-                return {command: command, success: false};
-            });
-            return {success: executed.every(function(item) { return item.success; }), executed: executed, selection: summarizeSelection()};
-        }`,
-        undefined,
-        timeout,
-        [commands]
-    )
-    if (!result.success) {
-        throw new StructuredToolError(
-            'EDIT_COMMAND_FAILED',
-            `编辑命令执行失败: ${commands.join(', ')}`,
-            '请确认当前页面已有可编辑焦点，或给 keydown 事件提供 target 参数',
-            result as unknown as Record<string, unknown>
-        )
-    }
-    return result as unknown as Record<string, unknown>
 }
 
 /**
@@ -989,6 +1030,8 @@ function validateEvent(event: InputEvent): void {
 
 interface UnifiedInputContext {
     unifiedSession: ReturnType<typeof getUnifiedSession>
+    session?: ReturnType<typeof getSession>
+    mode: InputExecutionContext['mode']
     humanize: boolean
     timeout?: number
     frame?: string | number
@@ -996,19 +1039,13 @@ interface UnifiedInputContext {
 
 type UnifiedInputHandler = (context: UnifiedInputContext, event: InputEvent) => Promise<InputEventResult>
 
-async function executeUnifiedEvent(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    event: InputEvent,
-    humanize: boolean,
-    timeout?: number,
-    frame?: string | number
-): Promise<InputEventResult> {
+async function executeUnifiedEvent(context: UnifiedInputContext, event: InputEvent): Promise<InputEventResult> {
     validateEvent(event)
     const handler = unifiedInputHandlers[event.type]
     if (!handler) {
         throw new Error(`未知事件类型: ${(event as { type: string }).type}`)
     }
-    return handler({ unifiedSession, humanize, timeout, frame }, event)
+    return handler(context, event)
 }
 
 const unifiedInputHandlers: Record<InputEvent['type'], UnifiedInputHandler> = {
@@ -1045,9 +1082,6 @@ async function handleUnifiedKeyDown(
         await focusTargetForCommands(unifiedSession, event.target, timeout, frame)
     }
     await unifiedSession.keyDown(event.key!, event.commands)
-    if (event.commands && event.commands.length > 0) {
-        return await executeEditingCommands(unifiedSession, event.commands, timeout)
-    }
     return undefined
 }
 
@@ -1236,10 +1270,10 @@ async function handleUnifiedWait({ timeout }: UnifiedInputContext, event: InputE
 }
 
 async function handleUnifiedSelect(
-    { unifiedSession, timeout, frame }: UnifiedInputContext,
+    { unifiedSession, session, mode, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await focusTargetIfNeeded(unifiedSession, event.target, timeout, frame)
+    await focusTargetIfNeeded(unifiedSession, session, mode, event.target, timeout, frame)
     const selectionTarget = await unifiedSession.evaluate<{ tag: string; inputType?: string; value?: string } | null>(
         `(() => {
             const el = document.activeElement;
@@ -1268,10 +1302,10 @@ async function handleUnifiedSelect(
 }
 
 async function handleUnifiedReplace(
-    { unifiedSession, timeout, frame }: UnifiedInputContext,
+    { unifiedSession, session, mode, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await focusTargetIfNeeded(unifiedSession, event.target, timeout, frame)
+    await focusTargetIfNeeded(unifiedSession, session, mode, event.target, timeout, frame)
     const directResult = await unifiedSession.evaluate<{
         handled: boolean
         success?: boolean
@@ -2019,6 +2053,7 @@ export function registerInputTool(server: McpServer): void {
   replace: {events:[{type:"replace",target:{css:"textarea"},find:"old",text:"new"}]}
 注意：纯键盘事件（不带 commands）仅保证 JS keyboard event 可被监听，不保证触发浏览器原生编辑行为；
       全选/复制/粘贴等语义用 commands；"全选并替换文本"用 select/replace 事件更简洁；
+      commands 成功表示浏览器已接受命令分发，页面结果需用 postCondition 或 extract 验证；
       commands 仅支持 inputMode=precise，stealth 模式下会报错`,
             inputSchema: inputSchema,
         },

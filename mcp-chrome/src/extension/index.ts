@@ -3,5 +3,6 @@
  */
 
 export { ExtensionHttpServer } from './http-server.js'
+export type { ExtensionConnectionInfo } from './http-server.js'
 export { ExtensionBridge } from './bridge.js'
 export type { ExtensionBridgeOptions } from './bridge.js'

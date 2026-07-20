@@ -503,4 +503,5 @@ export const EvaluateInFrameSchema = z.object({
     frameId: z.number().int().nonnegative(),
     expression: z.string().min(1),
     timeout: z.number().nonnegative().optional(),
+    staleContextRetry: z.enum(['never', 'readOnly']).default('never'),
 })

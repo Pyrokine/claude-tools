@@ -138,6 +138,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         action: 'connect',
                         mode: 'extension',
                         connected,
+                        extension: unifiedSession.getExtensionConnectionInfo(),
                         note: connected
                             ? 'Extension 模式已连接，无需 connect'
                             : 'Extension 服务器已启动但未连接，请确保 Chrome 已运行且安装了 MCP Chrome 扩展',

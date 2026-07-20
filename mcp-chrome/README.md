@@ -103,7 +103,10 @@ Claude Desktop / Other Clients:
 **Step 3: Connect**
 
 The Extension auto-connects to the MCP Server via HTTP/WebSocket (port 19222-19299). Click the toolbar icon to verify
-connection status.
+connection status. `browse(action="connect")` and the local `/api/info` endpoint report the active Extension background
+bundle hash and compare it with the bundle shipped beside the server. `bundleStatus="stale"` means Chrome is still running
+an older unpacked Extension bundle; reload the Extension in `chrome://extensions/`. Legacy Extensions without a bundle hash
+remain compatible, and bundle identity never disables zero-config auto-connect.
 
 ```
 browse(action="list")          // List all tabs
@@ -191,15 +194,17 @@ Event sequence model supporting arbitrary combinations:
 Special-case parameters:
 
 - `keydown` accepts `commands` (e.g. `["selectAll"]`, `["copy"]`, `["paste"]`, `["cut"]`, `["undo"]`, `["redo"]`) to
-  trigger native browser editing commands. `commands` is precise-mode only — stealth mode will throw because the
-  CDP commands API has no JS-event equivalent.
+  trigger native browser editing commands. A successful response means the browser accepted the command dispatch; use
+  `postCondition` or `extract` to verify the page result. `commands` is precise-mode only; stealth mode throws because
+  the CDP commands API has no JS-event equivalent.
 - `keydown` on a key already held emits `rawKeyDown` with `autoRepeat: true` (Puppeteer-compatible long-press).
 
 Parameters: `humanize` enables Bézier curve movement and random delays. `diagnostics=true` returns new console
 warnings/errors and failed network requests after the action. `postCondition` waits for a page state after the events so
 callers can distinguish dispatched input from completed page behavior. `postCondition.timeout` defaults to 3000 ms and
 is capped at 60000 ms; `postCondition.interval` defaults to 100 ms and accepts 50-5000 ms. `tabId` targets a specific
-tab. `frame` targets an iframe (CSS selector or index). Both Extension mode only.
+tab. `frame` targets an iframe (CSS selector or index). Both are Extension-mode only. When either scope is provided, the
+action, diagnostics, and post-condition use the backend selected for that target scope.
 
 **`click`-specific**: `force: true` skips actionability checks (useful for testing or hidden elements). Actionability
 failures return `ACTIONABILITY_FAILED` with `rect`, `clickPoint`, covering element details, candidate blockers, and
@@ -207,8 +212,10 @@ suggestions.
 **`type`-specific**: `mode="controlled"` or `dispatch: true` sets `.value` directly and fires `input`/`change` events —
 use for React/Vue controlled inputs where keyboard events don't update state. Requires a non-coordinate `target`.
 Extension mode only. Controlled input and target lookup failures return structured context with `target`, `matchCount`,
-`nth`, `activeElement`, `selection`, and candidate controls. For `select` and `replace`, event-level `nth` selects the Nth
-text occurrence while nested `target.nth` selects the Nth matching element; both are zero-based and may be used together.
+`nth`, `activeElement`, `selection`, and candidate controls. Password input values are omitted from failure diagnostics,
+and input `find` or replacement `text` values are redacted from failed responses. For `select` and `replace`, event-level
+`nth` selects the Nth text occurrence while nested `target.nth` selects the Nth matching element; both are zero-based and
+may be used together. Locator targets for `select` and `replace` work in CDP mode without Extension ref IDs.
 
 ### extract - Content Extraction
 
@@ -266,6 +273,7 @@ Execute JavaScript in page context.
 | `scriptFile`    | Read script from a local file (alternative to `script`, relative paths default to controlled temp dir, use `cwd:` for repo files) |
 | `args`          | Arguments passed to script (script must be a function expression)                                                                 |
 | `mode`          | `precise` (default, debugger API) or `stealth` (JS injection)                                                                     |
+| `staleContextRetry` | iframe stale-context policy: `never` (default) or `readOnly`                                                                   |
 | `output`        | Save result to file (relative paths default to controlled temp dir, use `cwd:` to persist in repo)                                |
 | `tabId`         | Target a specific tab (Extension mode)                                                                                            |
 | `frame`         | Target an iframe by CSS selector or index (Extension mode)                                                                        |
@@ -280,10 +288,14 @@ streams.
 
 Results >100KB are auto-saved to the controlled OS temp directory with a structured hint returned. DOM nodes,
 `NodeList`, and `HTMLCollection` results return `NON_SERIALIZABLE_EVALUATE_RESULT` with a hint to return simple fields
-such as `textContent` or `outerHTML`. Evaluate defaults to `precise` even when global `inputMode` is `stealth`, and its
+such as `textContent` or `outerHTML`. Result materialization and serialization failures report `actionExecuted=true`,
+`actionStatus="completed"`, and `failureStage="output"` because the page script has already finished. Evaluate defaults
+to `precise` even when global `inputMode` is `stealth`, and its
 `postCondition` checks use the same evaluate mode as the action. `postCondition` is optional; when it is not provided,
 `success=true` only means the script executed and returned. When it is provided and does not match before timeout, the
-tool returns `POST_CONDITION_FAILED` with the last observed checks.
+tool returns `POST_CONDITION_FAILED` with the last observed checks. Precise iframe evaluation does not replay a script
+after a stale execution context by default. Set `staleContextRetry="readOnly"` only when the script has no side effects;
+the Extension may then resolve a new context and replay it once within the remaining timeout budget. A stale-context error after `Runtime.evaluate` reports `actionExecuted=true` and `actionStatus="unknown"`, because earlier side effects may already have happened even though the final result is unavailable.
 
 ### manage - Page & Environment Management
 
@@ -331,8 +343,10 @@ unmanaged tabs and returns `WINDOW_HAS_UNMANAGED_TABS`.
 Parameters: `output` saves result to file. Console entries use the public levels `error`, `warning`, `info`, and `debug`;
 raw browser levels such as `warn` and `log` are normalized before filtering and return. Network logs include completed
 requests, HTTP 4xx/5xx responses, and failed loads with `errorText`, `method`, `url`, `status`, `timestamp`, and `duration`
-when available. Inline network results limit each URL to 2048 characters and add `urlLength` plus `urlTruncated: true`
-when shortened; explicit `output` keeps the complete URL. `urlPattern` supports `*` for any number of characters and `?`
+when available. URL query parameters commonly used for credentials, signatures, passwords, and tokens are replaced with
+`[REDACTED]` in inline responses, diagnostics, and explicit `output` files. Redacted entries include `urlRedacted`,
+`urlOriginalLength`, and `redactedQueryParameters`. Inline network results limit each sanitized URL to 2048 characters and
+add `urlLength` plus `urlTruncated: true` when shortened. `urlPattern` supports `*` for any number of characters and `?`
 for one character. `tabId` targets a specific tab (Extension mode). `frame` is not applicable for logs.
 
 ### cookies - Cookie Management
@@ -497,6 +511,8 @@ input(events=[
 ], frame="iframe.login-frame")
 ```
 
+Selectors and numeric indices follow the parent document's DOM iframe order. Subframes absent from that DOM, including frames added by other extensions, cannot shift the index or become fallback targets. If the selected element cannot be tied to exactly one Chrome frame, the operation returns `FRAME_IDENTITY_UNAVAILABLE` instead of choosing another frame.
+
 ### Wait for Element
 
 ```
@@ -594,7 +610,7 @@ mcp-chrome/
 - Default ports bind to 127.0.0.1 only (localhost)
 - The `evaluate` tool can execute arbitrary JavaScript
 - The `manage cdp` action can send arbitrary CDP commands
-- Network logs may contain sensitive information
+- Network URL credential parameters are redacted by default, but console text and nonstandard parameter names may still contain sensitive information
 
 ### Anti-detection (stealth) — what it actually does
 
@@ -626,6 +642,6 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Operation status and diagnostics
 
-Input and evaluate responses append `actionExecuted`, `actionStatus`, `verificationStatus`, `failureStage`, and `retryable`. Verification uses `matched`, `not_matched`, `unavailable`, or `error`; debugger timeouts report the action as `unknown` when completion cannot be proven. Diagnostics are best-effort and return `diagnosticsStatus` without replacing the main action result. Browse and wait errors also retain any diagnostics collected before the action failed.
+Input and evaluate responses append `actionExecuted`, `actionStatus`, `verificationStatus`, `failureStage`, and `retryable`. Verification uses `matched`, `not_matched`, `unavailable`, or `error`; debugger timeouts report the action as `unknown` when completion cannot be proven. Page-thrown exceptions report `actionExecuted=true` with `actionStatus="failed"`; result materialization or serialization errors report `actionStatus="completed"` and `failureStage="output"`. Diagnostics are best-effort and return `diagnosticsStatus` without replacing the main action result. Browse and wait errors also retain any diagnostics collected before the action failed. Target diagnostics query the current tab state instead of relying on cached attach metadata.
 
-`replace` uses text selection only for `textarea` and input types `text`, `search`, `tel`, `url`, and `password`. Other input types use a native full-value update and return the requested and actual browser-normalized values. A standalone `select` on unsupported types returns `UNSUPPORTED_SELECTION`. Target timeouts include bounded locator, tab, frame, match, and candidate context. Precise iframe evaluation retries one stale execution context once and refuses ambiguous same-URL frames. Its response includes `retryAttempted`, bounded `retryReason`, and the final `frameContext` with the Extension frame, parent frame, URL, CDP frame, and execution context IDs. Port scanning aggregates ordinary pre-open failures at debug level; authentication and protocol rejections from identified MCP servers produce one bounded warning when the rejection summary changes.
+`replace` uses text selection only for `textarea` and input types `text`, `search`, `tel`, `url`, and `password`. Other input types use a native full-value update and return the requested and actual browser-normalized values. A standalone `select` on unsupported types returns `UNSUPPORTED_SELECTION`. CDP locator targets for `select` and `replace` are focused through the CDP locator instead of Extension-only ref IDs. Password values are omitted from input failure context and text post-condition observations; failed input responses also redact supplied `find` and replacement `text` values. Target timeouts include bounded locator, tab, frame, match, and candidate context. Explicit `tabId` and `frame` scopes resolve the active backend before input, wait, logs, or extract work begins, so actions and verification use the same target backend. Precise iframe evaluation defaults to `staleContextRetry="never"` and does not replay stale scripts. `readOnly` permits one replay after the Extension verifies the frame identity and resolves a new execution context. Responses include the policy, `retryAttempted`, bounded `retryReason`, and the final `frameContext` with the Extension frame, parent frame, URL, CDP frame, and execution context IDs. Ambiguous same-URL frames are rejected. Port scanning aggregates ordinary pre-open failures at debug level; authentication and protocol rejections from identified MCP servers produce one bounded warning when the rejection summary changes.

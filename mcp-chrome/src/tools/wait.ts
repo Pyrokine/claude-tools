@@ -95,11 +95,11 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
 }> {
     try {
         const unifiedSession = getUnifiedSession()
-        const mode = unifiedSession.getMode()
         const timeout = args.timeout ?? DEFAULT_TIMEOUT
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
+                const mode = unifiedSession.getMode()
                 switch (args.for) {
                     case 'element': {
                         if (!args.target) {

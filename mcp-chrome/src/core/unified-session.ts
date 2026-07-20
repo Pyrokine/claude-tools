@@ -6,7 +6,7 @@
  * 2. CDP 模式：通过 Chrome DevTools Protocol 操作（Fallback）
  */
 
-import { ExtensionBridge } from '../extension/index.js'
+import { ExtensionBridge, type ExtensionConnectionInfo } from '../extension/index.js'
 import {
     type ActionableClickResult,
     type BrowserTopology,
@@ -18,6 +18,7 @@ import {
     type PageManagementResult,
     type ResizeWindowOptions,
     type SetCookieParams,
+    type StaleContextRetryPolicy,
 } from './browser-driver.js'
 import { isExtensionDisconnected } from './extension-errors.js'
 import { getKeyDefinition, getSession as getCdpSession } from './session.js'
@@ -35,9 +36,14 @@ export type ConnectionMode = 'extension' | 'cdp' | 'none'
 type ActiveConnectionMode = Exclude<ConnectionMode, 'none'>
 export type InputMode = 'stealth' | 'precise' // stealth=JS模拟, precise=debugger API
 
+export interface EvaluateOptions {
+    staleContextRetry?: StaleContextRetryPolicy
+}
+
 export interface EvaluationMetadata {
     retryAttempted: boolean
     retryReason?: string
+    staleContextRetry: StaleContextRetryPolicy
     frameContext: Record<string, unknown>
 }
 
@@ -191,6 +197,10 @@ class UnifiedSessionManager {
 
     isExtensionAvailable(): boolean {
         return this.extensionBridge?.isConnected() ?? false
+    }
+
+    getExtensionConnectionInfo(): ExtensionConnectionInfo | undefined {
+        return this.extensionBridge?.getConnectionInfo()
     }
 
     /**
@@ -512,6 +522,7 @@ class UnifiedSessionManager {
      * @param mode 执行模式（stealth/precise）
      * @param timeout 端到端预算（毫秒），同时作为脚本执行超时和 sendCommand 的端到端预算
      * @param args 传递给函数的参数
+     * @param options iframe stale context 重试策略，默认 never
      * @param _retried 内部重试标记，外部不应传入
      */
     async evaluate<T>(
@@ -519,7 +530,8 @@ class UnifiedSessionManager {
         mode?: InputMode,
         timeout?: number,
         args?: unknown[],
-        _retried?: boolean
+        options: EvaluateOptions = {},
+        _retried = false
     ): Promise<T> {
         const entryStart = Date.now()
         this.lastEvaluationMetadata = undefined
@@ -551,7 +563,13 @@ class UnifiedSessionManager {
 
             // Extension 路径
             if (effectiveMode === 'precise') {
-                return this.evaluateViaExtensionPrecise<T>(code, expression, args, timeout)
+                return this.evaluateViaExtensionPrecise<T>(
+                    code,
+                    expression,
+                    args,
+                    timeout,
+                    options.staleContextRetry ?? 'never'
+                )
             }
             return this.evaluateViaExtensionStealth<T>(expression, timeout)
         } catch (err) {
@@ -566,7 +584,7 @@ class UnifiedSessionManager {
                 }
                 await new Promise((r) => setTimeout(r, 2000))
                 if (this.isExtensionConnected()) {
-                    return this.evaluate<T>(code, mode, remainingTimeout, args, true)
+                    return this.evaluate<T>(code, mode, remainingTimeout, args, options, true)
                 }
                 // Extension 重连失败，尝试 CDP fallback
                 if (!this.requireExtension) {
@@ -577,7 +595,7 @@ class UnifiedSessionManager {
             if (!_retried && !hasArgs) {
                 if (/Illegal return statement|'return' not inside function|Unexpected token 'return'/.test(msg)) {
                     const wrapped = `(() => { ${code} })()`
-                    return this.evaluate<T>(wrapped, mode, timeout, undefined, true)
+                    return this.evaluate<T>(wrapped, mode, timeout, undefined, options, true)
                 }
             }
             throw err
@@ -929,6 +947,26 @@ class UnifiedSessionManager {
         return getCdpSession().getState()
     }
 
+    async getLiveState(): Promise<UnifiedSessionState | null> {
+        if (this.getMode() !== 'extension') {
+            return getCdpSession().getState()
+        }
+        const targetId = this.extensionBridge!.getCurrentTargetId()
+        if (!targetId) {
+            return null
+        }
+        const targets = await this.extensionBridge!.listTargets()
+        const target = targets.find((item) => item.targetId === targetId)
+        if (!target) {
+            return null
+        }
+        return {
+            url: target.url,
+            title: target.title,
+            managed: target.managed,
+        }
+    }
+
     /**
      * 关闭所有连接
      */
@@ -1195,7 +1233,8 @@ class UnifiedSessionManager {
         code: string,
         expression: string,
         args: unknown[] | undefined,
-        timeout?: number
+        timeout?: number,
+        staleContextRetry: StaleContextRetryPolicy = 'never'
     ): Promise<T> {
         const hasArgs = args !== undefined && args.length > 0
         const currentFrameId = this.extensionBridge!.getCurrentFrameId()
@@ -1212,17 +1251,24 @@ class UnifiedSessionManager {
                 const argsStr = args!.map((a) => JSON.stringify(a)).join(', ')
                 iframeExpression = `(${code})(${argsStr})`
             }
-            const result = (await this.extensionBridge!.evaluateInFrame(currentFrameId, iframeExpression, timeout)) as {
+            const result = (await this.extensionBridge!.evaluateInFrame(
+                currentFrameId,
+                iframeExpression,
+                timeout,
+                staleContextRetry
+            )) as {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
                 retryAttempted?: boolean
                 retryReason?: string
+                staleContextRetry?: StaleContextRetryPolicy
                 frameContext?: Record<string, unknown>
             }
             if (result.frameContext) {
                 this.lastEvaluationMetadata = {
                     retryAttempted: result.retryAttempted === true,
                     retryReason: result.retryReason,
+                    staleContextRetry: result.staleContextRetry ?? staleContextRetry,
                     frameContext: result.frameContext,
                 }
             }
