@@ -52,6 +52,7 @@ struct ToolResultRef {
     source_tool_assistant_uuid: Option<String>,
     parent_uuid: Option<String>,
     preview: String,
+    redacted_count: usize,
 }
 
 pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, ErrorResponse> {
@@ -239,7 +240,8 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         }
     }
 
-    let (mut tool_calls, association_issues) = build_tool_calls(&records[start..end], &prefix, params.redaction);
+    let (mut tool_calls, association_issues, tool_call_redacted_count) =
+        build_tool_calls(&records[start..end], &prefix, params.redaction);
     // servers/tools 过滤
     if !params.servers.is_empty() || !params.tools.is_empty() {
         tool_calls.retain(|tc| {
@@ -347,6 +349,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             available: None,
         })?;
         let bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        let redacted_count = redacted_count.saturating_add(tool_call_redacted_count);
         let redaction = redaction_info(
             params.redaction,
             redacted_count,
@@ -407,10 +410,11 @@ fn build_tool_calls(
     records: &[TraceRecord],
     prefix: &str,
     redaction: RedactionMode,
-) -> (Vec<TraceToolCall>, Vec<TraceAssociationIssue>) {
+) -> (Vec<TraceToolCall>, Vec<TraceAssociationIssue>, usize) {
     let mut calls: Vec<TraceToolCall> = Vec::new();
     let mut pending: Vec<PendingToolCall> = Vec::new();
     let mut issues = Vec::new();
+    let mut redacted_count = 0usize;
 
     for record in records {
         for result in extract_tool_results(&record.record, redaction) {
@@ -421,6 +425,7 @@ fn build_tool_calls(
                 calls[call_idx].match_method = match_method;
                 calls[call_idx].result_ref = Some(format!("{}:{}", prefix, record.line_num));
                 calls[call_idx].result_preview = Some(result.preview);
+                redacted_count = redacted_count.saturating_add(result.redacted_count);
             } else if issues.len() < ASSOCIATION_ISSUE_CAP {
                 issues.push(TraceAssociationIssue {
                     result_ref: format!("{}:{}", prefix, record.line_num),
@@ -446,7 +451,7 @@ fn build_tool_calls(
         }
     }
 
-    (calls, issues)
+    (calls, issues, redacted_count)
 }
 
 struct ToolAssociation {
@@ -566,12 +571,14 @@ fn extract_tool_results(record: &MessageRecord, redaction: RedactionMode) -> Vec
                     .map(|content| content.to_string())
                     .unwrap_or_default()
             });
-        let (preview, _) = truncate_content(&redact_text_with_mode(&preview_source, redaction).text, 500);
+        let redaction = redact_text_with_mode(&preview_source, redaction);
+        let (preview, _) = truncate_content(&redaction.text, 500);
         results.push(ToolResultRef {
             id,
             source_tool_assistant_uuid: record.source_tool_assistant_uuid.clone(),
             parent_uuid: record.parent_uuid.clone(),
             preview,
+            redacted_count: redaction.count,
         });
     }
     results
@@ -635,7 +642,7 @@ mod tests {
                 }),
             ),
         ];
-        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        let (calls, issues, _) = build_tool_calls(&records, "session", RedactionMode::Auto);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].result_ref.as_deref(), Some("session:3"));
         assert_eq!(calls[0].match_method, "tool_use_id");
@@ -668,7 +675,7 @@ mod tests {
                 }),
             ),
         ];
-        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        let (calls, issues, _) = build_tool_calls(&records, "session", RedactionMode::Auto);
         assert!(calls.iter().all(|call| call.status == "pending"));
         assert_eq!(issues[0].kind, "ambiguous");
     }
@@ -696,9 +703,106 @@ mod tests {
                 }),
             ),
         ];
-        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        let (calls, issues, _) = build_tool_calls(&records, "session", RedactionMode::Auto);
         assert!(issues.is_empty());
         assert_eq!(calls[0].match_method, "parent");
+    }
+
+    #[test]
+    fn strict_redaction_covers_structured_tool_results_and_exports() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-trace-redaction-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut file = File::create(project_dir.join("session-redaction.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "assistant-1",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": [{"type": "tool_use", "id": "call-1", "name": "Bash"}]}
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "user-1",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"token":"SUPERSECRET","nested":{"accessToken":"ACCESSSECRET"},"host":"192.168.x.x"}"#
+                    }]
+                }]}
+            })
+        )
+        .unwrap();
+
+        let output_name = format!(
+            "tmp:mcp-trace-redaction-output-{}-{}/trace.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let response = trace(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            TraceParams {
+                r#ref: "session-:1".to_string(),
+                before: 0,
+                after: 1,
+                project: Some("project".to_string()),
+                max_content: 4000,
+                max_total: 40000,
+                types: Vec::new(),
+                subtypes: Vec::new(),
+                pattern: None,
+                regex: false,
+                case_sensitive: false,
+                servers: Vec::new(),
+                tools: Vec::new(),
+                until_type: None,
+                until_ref: None,
+                direction: "forward".to_string(),
+                output: Some(output_name),
+                redaction: RedactionMode::Strict,
+            },
+        )
+        .unwrap();
+
+        let preview = response.tool_calls[0].result_preview.as_deref().unwrap();
+        assert!(!preview.contains("SUPERSECRET"));
+        assert!(!preview.contains("ACCESSSECRET"));
+        assert!(!preview.contains("192.168.x.x"));
+        assert!(preview.contains("[redacted]"));
+
+        let output = response.output.as_ref().unwrap();
+        let exported = fs::read_to_string(&output.content).unwrap();
+        assert!(!exported.contains("SUPERSECRET"));
+        assert!(!exported.contains("ACCESSSECRET"));
+        assert!(!exported.contains("192.168.x.x"));
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&output.manifest).unwrap()).unwrap();
+        assert!(manifest["redaction"]["redacted_count"].as_u64().unwrap() >= 3);
+        assert_eq!(manifest["redaction"]["raw_available"], true);
+
+        fs::remove_dir_all(output.content.parent().unwrap()).ok();
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

@@ -820,13 +820,29 @@ fn shorten_last_result(response: &mut SearchResponse, max_total: usize) -> Resul
     Ok(false)
 }
 
+fn response_too_large_error(response: &SearchResponse, max_total: usize) -> ErrorResponse {
+    ErrorResponse {
+        error: "response_too_large".to_string(),
+        message: "搜索响应无法在 max_total 字节预算内返回任何结果，请缩小搜索范围或提高 max_total".to_string(),
+        available: Some(serde_json::json!({
+            "serialized_bytes": response.serialized_bytes,
+            "max_total_bytes": max_total,
+            "limits_applied": response.limits_applied,
+            "complete": false
+        })),
+    }
+}
+
 fn apply_response_budget(
     mut response: SearchResponse,
     max_total: usize,
     continuation_query: serde_json::Value,
 ) -> Result<SearchResponse, ErrorResponse> {
     let original_result_count = response.results.len();
-    let base_offset = response.next_offset.saturating_sub(original_result_count);
+    let slice_bounds = response.stats.slice.as_ref().map(|slice| (slice.start, slice.end));
+    let base_offset = slice_bounds
+        .map(|(start, _)| start)
+        .unwrap_or_else(|| response.next_offset.saturating_sub(original_result_count));
     response.max_total_bytes = max_total;
     response.complete = !response.stats.incomplete;
     if update_serialized_size(&mut response)? <= max_total {
@@ -837,17 +853,37 @@ fn apply_response_budget(
     loop {
         response.stats.returned_count = response.results.len();
         response.next_offset = base_offset.saturating_add(response.results.len());
-        response.has_more = response.has_more || response.results.len() < original_result_count;
+        let budget_removed_results = response.results.len() < original_result_count;
+        response.has_more = if let Some((_, slice_end)) = slice_bounds {
+            budget_removed_results && response.next_offset < slice_end
+        } else {
+            response.has_more || budget_removed_results
+        };
         if response.has_more {
             let next_query = response
                 .next_query
                 .get_or_insert_with(|| continuation_query.clone())
                 .as_object_mut()
                 .expect("build_next_query returns an object");
-            next_query.insert("offset".to_string(), serde_json::json!(response.next_offset));
+            if let Some((_, slice_end)) = slice_bounds {
+                next_query.remove("offset");
+                next_query.remove("limit");
+                next_query.insert(
+                    "slice".to_string(),
+                    serde_json::Value::String(format!("[{}:{slice_end}]", response.next_offset)),
+                );
+            } else {
+                next_query.remove("slice");
+                next_query.insert("offset".to_string(), serde_json::json!(response.next_offset));
+            }
             next_query.insert("max_total".to_string(), serde_json::json!(max_total));
+        } else {
+            response.next_query = None;
         }
         if update_serialized_size(&mut response)? <= max_total {
+            if response.has_more && response.results.is_empty() && response.next_offset == base_offset {
+                return Err(response_too_large_error(&response, max_total));
+            }
             return Ok(response);
         }
         if shorten_last_result(&mut response, max_total)? || trim_last_result_metadata(&mut response) {
@@ -859,16 +895,7 @@ fn apply_response_budget(
         if trim_response_metadata(&mut response) {
             continue;
         }
-        return Err(ErrorResponse {
-            error: "response_too_large".to_string(),
-            message: "搜索响应 metadata 超过 max_total 字节预算，请缩小搜索范围或提高 max_total".to_string(),
-            available: Some(serde_json::json!({
-                "serialized_bytes": response.serialized_bytes,
-                "max_total_bytes": max_total,
-                "limits_applied": response.limits_applied,
-                "complete": false
-            })),
-        });
+        return Err(response_too_large_error(&response, max_total));
     }
 }
 
@@ -2220,6 +2247,132 @@ mod tests {
             query.get("max_content_tool_result").and_then(serde_json::Value::as_u64),
             Some(123)
         );
+    }
+
+    #[test]
+    fn budgeted_slice_continuation_keeps_normalized_range() {
+        for (raw, start, end) in [("[10:20]", 10, 20), ("[-10:]", 90, 100)] {
+            let mut response = response_with_content("first".to_string());
+            let first = response.results[0].clone();
+            response.results = (0..10)
+                .map(|index| {
+                    let mut result = first.clone();
+                    result.r#ref = if index == 0 {
+                        format!("session:{}", start + index)
+                    } else {
+                        format!("{}-{index}", "r".repeat(5_000))
+                    };
+                    result.line = start + index;
+                    result
+                })
+                .collect();
+            response.stats.total_matches = 100;
+            response.stats.returned_count = 10;
+            response.stats.slice = Some(SearchSliceInfo {
+                raw: raw.to_string(),
+                start,
+                end,
+                total_before_slice: 100,
+                total_after_slice: 10,
+            });
+            response.next_offset = 0;
+
+            let params = SearchParams::default();
+            let budgeted = apply_response_budget(response, 2_000, build_next_query(&params, 0)).unwrap();
+            assert_eq!(budgeted.results.len(), 1);
+            assert_eq!(budgeted.next_offset, start + 1);
+            assert!(budgeted.has_more);
+            let next_query = budgeted.next_query.as_ref().unwrap();
+            let expected_slice = format!("[{}:{end}]", start + 1);
+            assert_eq!(
+                next_query.get("slice").and_then(serde_json::Value::as_str),
+                Some(expected_slice.as_str())
+            );
+            assert!(next_query.get("offset").is_none());
+            assert!(next_query.get("limit").is_none());
+            assert!(serde_json::to_vec(&budgeted).unwrap().len() <= 2_000);
+        }
+    }
+
+    #[test]
+    fn budgeted_slice_continuation_repeats_without_leaving_range() {
+        let end = 6usize;
+        let mut start = 2usize;
+        let mut returned_lines = Vec::new();
+
+        while start < end {
+            let mut response = response_with_content("first".to_string());
+            let first = response.results[0].clone();
+            response.results = (start..end)
+                .map(|line| {
+                    let mut result = first.clone();
+                    result.r#ref = if line == start {
+                        format!("session:{line}")
+                    } else {
+                        format!("{}-{line}", "r".repeat(5_000))
+                    };
+                    result.line = line;
+                    result
+                })
+                .collect();
+            response.stats.total_matches = 10;
+            response.stats.returned_count = response.results.len();
+            response.stats.slice = Some(SearchSliceInfo {
+                raw: format!("[{start}:{end}]"),
+                start,
+                end,
+                total_before_slice: 10,
+                total_after_slice: end - start,
+            });
+            response.next_offset = 0;
+
+            let params = SearchParams::default();
+            let budgeted = apply_response_budget(response, 2_000, build_next_query(&params, 0)).unwrap();
+            assert_eq!(budgeted.results.len(), 1);
+            returned_lines.push(budgeted.results[0].line);
+
+            let Some(next_query) = budgeted.next_query else {
+                break;
+            };
+            let next_slice = next_query
+                .get("slice")
+                .and_then(serde_json::Value::as_str)
+                .expect("slice continuation must retain its normalized range");
+            let parsed = parse_message_slice_param(next_slice).unwrap();
+            start = parsed.start.unwrap().try_into().unwrap();
+            assert_eq!(parsed.end, Some(end.try_into().unwrap()));
+        }
+
+        assert_eq!(returned_lines, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn budgeted_slice_rejects_a_continuation_that_cannot_advance() {
+        let mut response = response_with_content("first".to_string());
+        let first = response.results[0].clone();
+        response.results = (2..6)
+            .map(|line| {
+                let mut result = first.clone();
+                result.r#ref = format!("{}-{line}", "r".repeat(5_000));
+                result.line = line;
+                result
+            })
+            .collect();
+        response.stats.total_matches = 10;
+        response.stats.returned_count = response.results.len();
+        response.stats.slice = Some(SearchSliceInfo {
+            raw: "[2:6]".to_string(),
+            start: 2,
+            end: 6,
+            total_before_slice: 10,
+            total_after_slice: 4,
+        });
+        response.next_offset = 0;
+
+        let params = SearchParams::default();
+        let error = apply_response_budget(response, 1_500, build_next_query(&params, 0)).unwrap_err();
+        assert_eq!(error.error, "response_too_large");
+        assert!(error.message.contains("无法在 max_total 字节预算内返回任何结果"));
     }
 
     #[test]

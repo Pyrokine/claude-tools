@@ -135,7 +135,10 @@ temp area. Paths ending in a file extension such as `.jsonl`, `.json`, or `.txt`
 is written next to that file.
 
 `slice` uses Python half-open semantics after all filters and timestamp sorting. `[-10:]` returns the latest 10 matching
-messages. `[-10:-1]` excludes the latest message and returns up to 9 messages.
+messages. `[-10:-1]` excludes the latest message and returns up to 9 messages. If `max_total` removes part of a slice,
+`next_query` carries a normalized positive slice for the remaining half-open range. Following it repeatedly cannot leave
+the original slice. If the budget cannot fit any result while preserving a continuation cursor, the search returns
+`response_too_large` instead of repeating the same slice indefinitely.
 
 `max_total` counts the compact UTF-8 JSON text returned by `history_search`. JSON-RPC and MCP transport framing are not
 included. The response reports `serialized_bytes`, `max_total_bytes`, `limits_applied`, and `complete`. Exported JSONL
@@ -204,10 +207,11 @@ uses the same record handling.
 | `max_content`    | number  | 4000    | Max chars per message                                         |
 | `max_total`      | number  | 40000   | Max total chars across messages                               |
 
-`history_trace` returns the raw nearby messages plus detected tool calls and matching tool results in `tool_calls`.
+`history_trace` returns the nearby messages plus detected tool calls and matching tool results in `tool_calls`.
 A result with `tool_use_id` only matches that exact call. Results without an ID use a matching assistant parent UUID, or
 the single pending call as a legacy fallback. Each call reports `match_method`; unmatched and ambiguous results appear in
-the bounded `association_issues` list.
+the bounded `association_issues` list. Structured tool-result previews use recursive key-based redaction before JSON
+serialization, including JSON objects embedded in text content, and the same redacted preview is written to trace exports.
 
 ### history_build_info
 

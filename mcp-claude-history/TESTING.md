@@ -122,6 +122,12 @@
 
 **预期**：最终紧凑 JSON 不超过 50000 字节；首条结果单独超限时返回有界 preview 和 ref，或结构化 `response_too_large`；不返回完整大正文
 
+### search-11c: slice 预算续查范围
+
+**步骤**：使用至少 20 条有序匹配记录的 fixture，分别调用 `slice="[10:20]"` 和 `slice="[-10:]"`，将 `max_total` 设为只能保留切片前几条；随后执行返回的 `next_query`
+
+**预期**：首次响应 `complete=false`、`has_more=true`；`next_query` 携带从下一条绝对位置到原结束位置的归一化正数 `slice`，不含 `offset` 和 `limit`；连续执行每一页返回的 `next_query` 无重复，最终结果严格停在原切片半开区间末尾；把预算继续降低到一条结果也无法容纳时返回 `response_too_large`，不返回原地不动的 `next_query`
+
 ### search-12: pattern 为空+all=true
 
 **步骤**：`history_search(all=true, project="<project>", limit=10)`
@@ -330,7 +336,7 @@
 **步骤**：`history_trace(ref="<ref>", before=2, after=2, redaction="strict", output="tmp:mcp-history-test/trace.txt")`
 
 **预期**：`.txt` 按文件路径处理；manifest 写在同目录；manifest 含 `schema="mcp-claude-history.trace-output.v1"`、
-`redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`；`tool_calls.result_preview` 不包含原始敏感值
+`redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`；fixture 的 tool_result 同时包含结构化 object、array 和 text 内嵌 JSON，`tool_calls.result_preview` 与导出文件均不包含原始敏感值，manifest 的 `redacted_count` 计入 preview 脱敏
 
 ### trace-08: 合法非消息 JSONL record
 

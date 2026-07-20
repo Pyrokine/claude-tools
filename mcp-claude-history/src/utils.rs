@@ -1011,6 +1011,27 @@ pub struct TextRedaction {
 }
 
 pub fn redact_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
+    if mode == RedactionMode::Off {
+        return TextRedaction {
+            text: text.to_string(),
+            count: 0,
+        };
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && (value.is_object() || value.is_array())
+    {
+        let (redacted, count) = redact_value_with_count(&value, mode);
+        return TextRedaction {
+            text: redacted.to_string(),
+            count,
+        };
+    }
+
+    redact_plain_text_with_mode(text, mode)
+}
+
+fn redact_plain_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
     static AUTH_HEADER_RE: OnceLock<Regex> = OnceLock::new();
     static COOKIE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
     static SECRET_FIELD_RE: OnceLock<Regex> = OnceLock::new();
@@ -1134,28 +1155,48 @@ fn redaction_rules(mode: RedactionMode) -> Vec<String> {
 }
 
 fn redact_value_with_mode(value: &serde_json::Value, mode: RedactionMode) -> serde_json::Value {
+    redact_value_with_count(value, mode).0
+}
+
+fn redact_value_with_count(value: &serde_json::Value, mode: RedactionMode) -> (serde_json::Value, usize) {
     if mode == RedactionMode::Off {
-        return value.clone();
+        return (value.clone(), 0);
     }
 
     match value {
         serde_json::Value::Object(map) => {
             let mut redacted = serde_json::Map::new();
+            let mut count = 0;
             for (key, item) in map {
                 let lower = key.to_lowercase();
                 if is_sensitive_key(&lower, mode) {
                     redacted.insert(key.clone(), serde_json::Value::String("[redacted]".to_string()));
+                    count += 1;
                 } else {
-                    redacted.insert(key.clone(), redact_value_with_mode(item, mode));
+                    let (item, item_count) = redact_value_with_count(item, mode);
+                    redacted.insert(key.clone(), item);
+                    count += item_count;
                 }
             }
-            serde_json::Value::Object(redacted)
+            (serde_json::Value::Object(redacted), count)
         }
         serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(|item| redact_value_with_mode(item, mode)).collect())
+            let mut count = 0;
+            let items = items
+                .iter()
+                .map(|item| {
+                    let (item, item_count) = redact_value_with_count(item, mode);
+                    count += item_count;
+                    item
+                })
+                .collect();
+            (serde_json::Value::Array(items), count)
         }
-        serde_json::Value::String(text) => serde_json::Value::String(redact_text_with_mode(text, mode).text),
-        _ => value.clone(),
+        serde_json::Value::String(text) => {
+            let redaction = redact_text_with_mode(text, mode);
+            (serde_json::Value::String(redaction.text), redaction.count)
+        }
+        _ => (value.clone(), 0),
     }
 }
 

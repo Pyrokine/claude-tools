@@ -130,7 +130,7 @@ URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处
 `.jsonl`、`.json` 或 `.txt` 等扩展名结尾时按文件处理，manifest 写在该文件旁边
 
 `slice` 使用 Python 半开区间语义，在全部过滤和按时间排序后执行，`[-10:]` 返回最近 10 条匹配消息，`[-10:-1]` 排除最新消息，最多返回
-9 条
+9 条，`max_total` 删除部分切片结果时，`next_query` 会携带剩余半开区间对应的归一化正数 slice，连续续查不会离开原切片；预算无法容纳任何结果且 continuation 无法前进时返回 `response_too_large`，不会重复返回同一个 slice
 
 `max_total` 统计 `history_search` 返回的紧凑 UTF-8 JSON 文本，不包含 JSON-RPC 和 MCP transport framing，响应会返回
 `serialized_bytes`、`max_total_bytes`、`limits_applied` 和 `complete`，导出的 JSONL 内容不受对话响应预算缩减，
@@ -197,9 +197,10 @@ URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处
 | `max_content`    | number  | 4000    | 单条最大字符数                            |
 | `max_total`      | number  | 40000   | messages 总最大字符数                    |
 
-`history_trace` 返回附近原始消息，并在 `tool_calls` 中列出识别到的 tool 调用和对应 tool_result，有
+`history_trace` 返回附近消息，并在 `tool_calls` 中列出识别到的 tool 调用和对应 tool_result，有
 `tool_use_id` 的 result 只匹配相同 ID；没有 ID 时先匹配 assistant parent UUID，再在仅有一个 pending call 时使用旧版顺序兼容，
-每个 call 返回 `match_method`，未匹配和歧义 result 进入有数量上限的 `association_issues`
+每个 call 返回 `match_method`，未匹配和歧义 result 进入有数量上限的 `association_issues`，结构化 tool-result preview 在 JSON
+序列化前按 key 递归脱敏，也会处理 text 中嵌入的 JSON object，trace 导出使用同一份脱敏 preview
 
 ### history_build_info
 
