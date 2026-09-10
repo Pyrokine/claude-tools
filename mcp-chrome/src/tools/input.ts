@@ -14,6 +14,7 @@ import { z } from 'zod'
 import { generateBezierPath, getMouseMoveDelay, getTypingDelay, randomDelay } from '../anti-detection/index.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import type { InputEvent, Target } from '../core/types.js'
+import { ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
@@ -22,6 +23,10 @@ import { buildTargetDiagnostics } from './target-diagnostics.js'
 const INPUT_WAIT_MAX_MS = 60_000
 const TEXT_SELECTION_INPUT_TYPES = new Set(['text', 'search', 'tel', 'url', 'password'])
 
+function throwInputTimeoutError(timeout: number): never {
+    throw new Error(`input timeout before event dispatch (${timeout}ms)`)
+}
+
 export function supportsTextSelection(tag: string, inputType?: string): boolean {
     return (
         tag.toLowerCase() === 'textarea' ||
@@ -29,11 +34,14 @@ export function supportsTextSelection(tag: string, inputType?: string): boolean 
     )
 }
 
+// noinspection JSUnusedGlobalSymbols — 回归测试从构建产物导入该 helper
 export function replaceNthOccurrence(value: string, find: string, replacement: string, nth = 0): string | null {
     let index = -1
     for (let occurrence = 0; occurrence <= nth; occurrence++) {
         index = value.indexOf(find, index + (occurrence > 0 ? 1 : 0))
-        if (index === -1) return null
+        if (index === -1) {
+            return null
+        }
     }
     return value.slice(0, index) + replacement + value.slice(index + find.length)
 }
@@ -87,7 +95,8 @@ const inputEventSchema = z.object({
         .array(z.string())
         .optional()
         .describe(
-            '浏览器编辑命令（keydown 专用），如 ["selectAll"]、["copy"]、["paste"]、["cut"]、["undo"]、["redo"]；成功表示命令已分发，页面结果需用 postCondition 或 extract 验证'
+            '浏览器编辑命令（keydown 专用），如 selectAll、copy、paste、cut、undo、redo；' +
+                '成功表示命令已分发，页面结果需用 postCondition 或 extract 验证'
         )
         .describe('用于跨平台快捷键场景，需要 inputMode=precise'),
     button: z.enum(['left', 'middle', 'right', 'back', 'forward']).optional().describe('鼠标按钮'),
@@ -143,7 +152,12 @@ const inputEventSchema = z.object({
 const inputSchema = z.object({
     events: z.array(inputEventSchema).describe('事件序列'),
     humanize: z.boolean().optional().describe('启用人类行为模拟（贝塞尔曲线移动、随机延迟）'),
-    diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
+    diagnostics: z
+        .boolean()
+        .optional()
+        .describe(
+            '执行后返回新增 console error/warning 和失败网络请求摘要。访问 Cloudflare 页面时默认不传；开启后会启用 debugger 日志采集'
+        ),
     postCondition: postConditionSchema
         .optional()
         .describe('动作执行后要验证的页面状态；不传时 success 只表示事件已发出，不表示业务结果已达成'),
@@ -153,7 +167,7 @@ const inputSchema = z.object({
         .describe(
             '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
         ),
-    timeout: z.number().optional().describe('超时毫秒'),
+    timeout: z.number().optional().describe('超时毫秒，含 Cloudflare Challenge 等待和事件派发'),
     frame: z
         .union([z.string(), z.number()])
         .optional()
@@ -173,6 +187,7 @@ class StructuredToolError extends Error {
         this.name = 'StructuredToolError'
     }
 
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
     toJSON(): object {
         return {
             error: {
@@ -215,17 +230,36 @@ function sanitizeInputFailureResponse(
  */
 async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputToolResponse> {
     try {
+        if (args.events.length === 0) {
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: JSON.stringify({
+                            error: {
+                                code: 'INVALID_ARGUMENT',
+                                message: 'events 至少需要一个事件，未执行输入操作',
+                            },
+                            actionExecuted: false,
+                            actionStatus: 'failed',
+                        }),
+                    },
+                ],
+                isError: true,
+            }
+        }
         const unifiedSession = getUnifiedSession()
         const humanize = args.humanize ?? false
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
                 const mode = unifiedSession.getMode()
+                const inputStartedAt = Date.now()
+                await resolveChallenge(unifiedSession, 'input', 'not_started', args.timeout)
                 const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
                 const warnings: string[] = []
                 const eventResults: unknown[] = []
                 const session = mode === 'cdp' ? getSession() : undefined
-                const inputStartedAt = Date.now()
                 let eventsExecuted = 0
 
                 try {
@@ -235,7 +269,7 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                                 ? undefined
                                 : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
                         if (eventTimeout !== undefined && eventTimeout <= 0) {
-                            throw new Error(`input timeout before event dispatch (${args.timeout}ms)`)
+                            throwInputTimeoutError(args.timeout!)
                         }
                         const result = await executeInputEvent(
                             { unifiedSession, session, mode, humanize, timeout: eventTimeout, frame: args.frame },
@@ -251,6 +285,21 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                 } catch (error) {
                     const response = formatErrorResponse(error)
                     const text = response.content[0]?.text
+                    if ((error instanceof ChallengeTimeoutError || error instanceof ChallengeDeniedError) && text) {
+                        try {
+                            const payload = JSON.parse(text) as Record<string, unknown>
+                            Object.assign(payload, {
+                                eventsExecuted,
+                                remainingEventsNotExecuted: args.events.length - eventsExecuted,
+                                verificationRequested: Boolean(args.postCondition),
+                            })
+                            appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                            response.content[0].text = JSON.stringify(payload, null, 2)
+                        } catch {
+                            // 保留原始 Challenge 错误响应
+                        }
+                        return sanitizeInputFailureResponse(response, args.events)
+                    }
                     if (text) {
                         try {
                             const payload = JSON.parse(text) as Record<string, unknown>
@@ -594,11 +643,16 @@ async function collectTextSelectionDiagnostics(
             while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 4) {
                 var part = current.tagName.toLowerCase();
                 if (current.classList && current.classList.length) {
-                    part += '.' + Array.from(current.classList).slice(0, 2).map(function(cls) { return CSS.escape(cls); }).join('.');
+                    part += '.' + Array.from(current.classList)
+                        .slice(0, 2)
+                        .map(function(cls) { return CSS.escape(cls); })
+                        .join('.');
                 }
                 var parent = current.parentElement;
                 if (parent) {
-                    var siblings = Array.from(parent.children).filter(function(child) { return child.tagName === current.tagName; });
+                    var siblings = Array.from(parent.children).filter(function(child) {
+                        return child.tagName === current.tagName;
+                    });
                     if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
                 }
                 parts.unshift(part);
@@ -612,7 +666,9 @@ async function collectTextSelectionDiagnostics(
             var value = 'value' in el ? String(el.value || '') : '';
             var inputType = el instanceof HTMLInputElement ? (el.type || 'text').toLowerCase() : undefined;
             var sensitive = inputType === 'password';
-            var text = sensitive ? (el.innerText || el.textContent || '') : (el.innerText || el.textContent || value || '');
+            var text = sensitive
+                ? (el.innerText || el.textContent || '')
+                : (el.innerText || el.textContent || value || '');
             text = text.replace(new RegExp('\\\\s+', 'g'), ' ').trim();
             return {
                 tag: el.tagName.toLowerCase(),
@@ -652,10 +708,16 @@ async function collectTextSelectionDiagnostics(
         var candidateElements = [];
         if (root instanceof Element) {
             candidateElements.push(root);
-            candidateElements = candidateElements.concat(Array.from(root.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"], button, a')).slice(0, 12));
+            var candidateSelector =
+                'input, textarea, [contenteditable="true"], [role="textbox"], button, a';
+            candidateElements = candidateElements.concat(
+                Array.from(root.querySelectorAll(candidateSelector)).slice(0, 12)
+            );
         }
         var active = document.activeElement;
-        var activeIsPassword = active instanceof HTMLInputElement && (active.type || 'text').toLowerCase() === 'password';
+        var activeIsPassword =
+            active instanceof HTMLInputElement &&
+            (active.type || 'text').toLowerCase() === 'password';
         var selection = window.getSelection();
         return {
             scope: {
@@ -714,6 +776,7 @@ async function selectText(
     }
 
     // Step 1: 注入脚本定位文本
+    //noinspection SpellCheckingInspection -- 模板中的坐标字段名
     const result = await unifiedSession.evaluate<
         | TextLocateResult
         | InputLocateResult
@@ -751,9 +814,16 @@ async function selectText(
         if (tag === 'INPUT' || tag === 'TEXTAREA') {
             var val = root.value || '';
             var inputType = tag === 'INPUT' ? (root.type || 'text').toLowerCase() : 'textarea';
-            var selectionCapable = tag === 'TEXTAREA' || ['text', 'search', 'tel', 'url', 'password'].indexOf(inputType) !== -1;
+            var selectionCapable =
+                tag === 'TEXTAREA' ||
+                ['text', 'search', 'tel', 'url', 'password'].indexOf(inputType) !== -1;
             if (!selectionCapable) {
-                return {type: 'unsupported', tag: tag.toLowerCase(), inputType: inputType, currentValue: String(val).slice(0, 160)};
+                return {
+                    type: 'unsupported',
+                    tag: tag.toLowerCase(),
+                    inputType: inputType,
+                    currentValue: String(val).slice(0, 160)
+                };
             }
             var pos = -1;
             for (var n = 0; n <= nth; n++) {
@@ -772,14 +842,21 @@ async function selectText(
             var inp = inputs[k];
             var v = inp.value || '';
             var childType = inp.tagName === 'INPUT' ? (inp.type || 'text').toLowerCase() : 'textarea';
-            var childSelectionCapable = inp.tagName === 'TEXTAREA' || ['text', 'search', 'tel', 'url', 'password'].indexOf(childType) !== -1;
+            var childSelectionCapable =
+                inp.tagName === 'TEXTAREA' ||
+                ['text', 'search', 'tel', 'url', 'password'].indexOf(childType) !== -1;
             var ip = -1;
             for (var n2 = 0; n2 <= nth; n2++) {
                 ip = v.indexOf(findText, ip + (n2 > 0 ? 1 : 0));
                 if (ip === -1) break;
             }
             if (ip !== -1 && !childSelectionCapable) {
-                return {type: 'unsupported', tag: inp.tagName.toLowerCase(), inputType: childType, currentValue: String(v).slice(0, 160)};
+                return {
+                    type: 'unsupported',
+                    tag: inp.tagName.toLowerCase(),
+                    inputType: childType,
+                    currentValue: String(v).slice(0, 160)
+                };
             }
             if (ip !== -1) {
                 inp.focus();
@@ -1278,7 +1355,11 @@ async function handleUnifiedSelect(
         `(() => {
             const el = document.activeElement;
             if (!(el instanceof HTMLInputElement)) return null;
-            return {tag: 'input', inputType: (el.type || 'text').toLowerCase(), value: String(el.value || '').slice(0, 160)};
+            return {
+                tag: 'input',
+                inputType: (el.type || 'text').toLowerCase(),
+                value: String(el.value || '').slice(0, 160)
+            };
         })()`,
         undefined,
         timeout
@@ -1325,17 +1406,54 @@ async function handleUnifiedReplace(
             var pos = -1;
             for (var i = 0; i <= nth; i++) {
                 pos = current.indexOf(findText, pos + (i > 0 ? 1 : 0));
-                if (pos === -1) return {handled: true, success: false, tag: 'input', inputType: type, currentValue: current.slice(0, 160), reason: 'text_not_found'};
+                if (pos === -1) {
+                    return {
+                        handled: true,
+                        success: false,
+                        tag: 'input',
+                        inputType: type,
+                        currentValue: current.slice(0, 160),
+                        reason: 'text_not_found'
+                    };
+                }
             }
-            if (el.disabled || el.readOnly) return {handled: true, success: false, tag: 'input', inputType: type, currentValue: current.slice(0, 160), reason: 'not_editable'};
+            if (el.disabled || el.readOnly) {
+                return {
+                    handled: true,
+                    success: false,
+                    tag: 'input',
+                    inputType: type,
+                    currentValue: current.slice(0, 160),
+                    reason: 'not_editable'
+                };
+            }
             var requested = current.slice(0, pos) + replacementText + current.slice(pos + findText.length);
             var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-            if (!setter) return {handled: true, success: false, tag: 'input', inputType: type, currentValue: current.slice(0, 160), requestedValue: requested.slice(0, 160), reason: 'no_native_setter'};
+            if (!setter) {
+                return {
+                    handled: true,
+                    success: false,
+                    tag: 'input',
+                    inputType: type,
+                    currentValue: current.slice(0, 160),
+                    requestedValue: requested.slice(0, 160),
+                    reason: 'no_native_setter'
+                };
+            }
             setter.call(el, requested);
             el.dispatchEvent(new Event('input', {bubbles: true}));
             el.dispatchEvent(new Event('change', {bubbles: true}));
             var actual = String(el.value || '');
-            return {handled: true, success: actual === requested, tag: 'input', inputType: type, currentValue: current.slice(0, 160), requestedValue: requested.slice(0, 160), actualValue: actual.slice(0, 160), reason: actual === requested ? undefined : 'value_not_applied'};
+            return {
+                handled: true,
+                success: actual === requested,
+                tag: 'input',
+                inputType: type,
+                currentValue: current.slice(0, 160),
+                requestedValue: requested.slice(0, 160),
+                actualValue: actual.slice(0, 160),
+                reason: actual === requested ? undefined : 'value_not_applied'
+            };
         }`,
         undefined,
         timeout,
@@ -1667,7 +1785,9 @@ async function editorAction(
                         isContentEditable: !!editable.isContentEditable
                     } : null,
                     selectedText: selectedText,
-                    selectionCollapsed: isInput ? active.selectionStart === active.selectionEnd : !sel || sel.isCollapsed
+                    selectionCollapsed: isInput
+                        ? active.selectionStart === active.selectionEnd
+                        : !sel || sel.isCollapsed
                 };
             }
 
@@ -2025,7 +2145,17 @@ export function registerInputTool(server: McpServer): void {
     server.registerTool(
         'input',
         {
-            description: `键鼠输入：键盘、鼠标及任意组合
+            description:
+                [
+                    '键鼠输入：键盘、鼠标及任意组合。默认优先使用已连接的 Chrome Extension；',
+                    '只有 Extension 不可用或 browse(action="connect", port=…) 已显式选择 CDP 时才使用 CDP。',
+                    '访问 Cloudflare 时默认不传 diagnostics，Extension 先被动等待真实 tab 标题恢复，',
+                    '持续存在可点击 Turnstile 时才点击。同页测试按钮走页面点击；',
+                    'Extension inspect 走 isolated world，不先挂 debugger。',
+                    'Cloudflare iframe 或宿主页验证按钮只在已聚焦窗口的活动受控 tab 上用系统鼠标，',
+                    'Linux 用窗口原点加边距，沿路径移动、悬停后再按下抬起，混合窗口不会调用 focusWindow',
+                ].join('') +
+                `
 
 推荐操作顺序：
 1. 先用 extract type=state 或 type=html 了解页面结构

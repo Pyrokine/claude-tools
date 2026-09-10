@@ -4,7 +4,7 @@ import tseslint from 'typescript-eslint';
 export default tseslint.config(
     {
         extends: [eslint.configs.recommended, ...tseslint.configs.recommended],
-        ignores: ['**/*.css', '**/*.json', 'dist/', 'extension/dist/'],
+        ignores: ['dist/', 'extension/dist/', 'test-output/'],
         rules: {
             // 空行控制
             'no-multiple-empty-lines': ['warn', { max: 1, maxEOF: 0, maxBOF: 0 }],
@@ -59,7 +59,9 @@ export default tseslint.config(
                 Buffer: 'readonly',
                 console: 'readonly',
                 process: 'readonly',
+                setImmediate: 'readonly',
                 setTimeout: 'readonly',
+                URL: 'readonly',
             },
         },
     }

@@ -32,7 +32,7 @@ interface EventWaiter {
 /**
  * CDP 事件监听器
  */
-type CDPEventListener = (params: unknown) => void
+type CDPEventListener = (params: unknown, sessionId?: string) => void
 
 /**
  * CDP 客户端
@@ -182,10 +182,14 @@ export class CDPClient extends EventEmitter {
     waitForEvent<T = unknown>(
         event: string,
         predicate?: (params: T) => boolean,
-        timeout = DEFAULT_TIMEOUT
+        timeout = DEFAULT_TIMEOUT,
+        sessionId?: string
     ): Promise<T> {
         return new Promise((resolve, reject) => {
-            const listener: CDPEventListener = (params) => {
+            const listener: CDPEventListener = (params, eventSessionId) => {
+                if (sessionId !== undefined && eventSessionId !== sessionId) {
+                    return
+                }
                 if (!predicate || predicate(params as T)) {
                     cleanup()
                     resolve(params as T)
@@ -241,6 +245,7 @@ export class CDPClient extends EventEmitter {
             params?: unknown
             result?: unknown
             error?: { message: string; code?: number }
+            sessionId?: string
         }
 
         try {
@@ -270,14 +275,14 @@ export class CDPClient extends EventEmitter {
             if (listeners) {
                 for (const listener of listeners) {
                     try {
-                        listener(message.params)
+                        listener(message.params, message.sessionId)
                     } catch (error) {
                         console.error(`CDP 事件处理错误 (${message.method}):`, error)
                     }
                 }
             }
             // 也触发通用事件
-            this.emit(message.method, message.params)
+            this.emit(message.method, message.params, message.sessionId)
         }
     }
 

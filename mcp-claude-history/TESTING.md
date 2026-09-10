@@ -1,6 +1,8 @@
 # mcp-claude-history 回归测试用例
 
-每次发版前，agent 在 CC 会话内按章节顺序执行所有用例，记录 PASS/FAIL，汇总到附录 A
+每次发版前，agent 在 CC 会话内按章节顺序执行所有必跑用例，只有全部 PASS 或已登记为 KNOWN-LIMIT 才能发版
+
+本文件只维护可复用的测试指导、用例定义、验收标准和长期限制，不记录单次执行结果、日期化回归记录或发版日志
 
 **前置条件**：
 
@@ -22,7 +24,9 @@
 
 **步骤**：`history_projects()`
 
-**预期**：返回数组，每项含 name 和 session_count；至少含 `<project>`
+**预期**：返回数组，每项含 `id`、`path`、`path_approximate`、`session_count` 和 `last_activity`；至少含
+`<project>`。现存路径中的连字符、下划线、点号和空格保持原样，`path_approximate=false`；无法唯一解析的历史项目明确返回
+`path_approximate=true`
 
 ---
 
@@ -32,9 +36,18 @@
 
 **步骤**：`history_sessions(project="<project>")`
 
-**预期**：数组，每项含 prefix(8 位)、message_count、modified_time、size 等
+**预期**：返回 `project`、`sessions` 和 `redaction`；每个会话包含 `id`、`ref_prefix`、`line_count`、`start_time`、
+`end_time`、`size_bytes` 和可选 `topic`
 
-### sessions-02: 空 project
+### sessions-02: topic 脱敏
+
+**步骤**：在受控 JSONL fixture 的首条 user 内容中写入 `token=<test-value>`，依次调用
+`history_sessions(project="<project>", redaction="auto")`、`redaction="strict"` 和 `redaction="off"`
+
+**预期**：`auto` 和 `strict` 的 `topic` 不包含测试值，且 `topic_redacted_count` 和响应 `redaction.redacted_count`
+反映替换数量；`off` 保留原始 topic
+
+### sessions-03: 空 project
 
 **步骤**：`history_sessions(project="<not-exist>")`
 
@@ -68,6 +81,12 @@
 
 **预期**：仅返回 type=user 的消息
 
+### search-04a: user-shaped 消息筛选
+
+**步骤**：`history_search(pattern="...", types="user", subtypes="human")`
+
+**预期**：只返回 `type=user, subtype=human` 的普通 user-shaped record。结果和说明不得把该分类表示为可验证的真人作者来源
+
 ### search-05: subagents=true
 
 **步骤**：`history_search(pattern="...", subagents=true, project="<project>")`
@@ -84,7 +103,10 @@
 
 **步骤**：`history_search(pattern="...", since="2026-01-01", until="2026-12-31")`
 
-**预期**：仅返回该时间窗内的消息；无效日期返回参数错误，不能静默放宽范围
+**预期**：仅返回该时间窗内的消息；无效日期和 `since > until`
+返回参数错误，不能静默放宽范围。时间过滤启用后，时间戳无法解析的 fixture
+record 不返回，`stats.skipped_invalid_timestamps` 和 `incomplete_reasons`
+说明跳过数量；未启用时间过滤时该 record 仍可返回
 
 ### search-08: 分页 limit + offset
 
@@ -98,7 +120,7 @@
 
 **预期**：返回过滤后按时间排序的最近 10 条消息；stats.slice 含 raw/start/end/total_before_slice/total_after_slice
 
-### search-10: slice 半开区间
+### search-10: slice 半开范围
 
 **步骤**：`history_search(pattern="", project="<project>", slice="[-10:-1]")`
 
@@ -108,25 +130,32 @@
 
 **步骤**：`history_search(pattern="...", max_content=200, max_total=2000)`
 
-**预期**：普通消息 preview 不超 200 字符；紧凑 JSON 的实际 UTF-8 字节数不超过 2000；`serialized_bytes` 与实际序列化长度一致；返回 `max_total_bytes`、`limits_applied` 和 `complete`
+**预期**：普通消息 preview 不超 200 字符；紧凑 JSON 的实际 UTF-8 字节数不超过 2000；`serialized_bytes`
+与实际序列化长度一致；返回 `max_total_bytes`、`limits_applied` 和 `complete`
 
 ### search-11a: tool result 独立上限
 
 **步骤**：`history_search(pattern="", subtypes="tool_result", max_content=2000, max_content_tool_result=100, limit=5)`
 
-**预期**：tool result preview 不超 100 字符；普通消息仍使用 `max_content=2000`；`next_query` 保留 `max_content_tool_result=100`
+**预期**：tool result preview 不超 100 字符；普通消息仍使用 `max_content=2000`；`next_query` 保留
+`max_content_tool_result=100`
 
 ### search-11b: escaping 与首条超限
 
 **步骤**：使用含大量引号、反斜杠、中文、tool input/result 和 image metadata 的 fixture，调用 `max_total=50000`
 
-**预期**：最终紧凑 JSON 不超过 50000 字节；首条结果单独超限时返回有界 preview 和 ref，或结构化 `response_too_large`；不返回完整大正文
+**预期**：最终紧凑 JSON 不超过 50000 字节；首条结果单独超限时返回有界 preview 和 ref，或结构化 `response_too_large`
+；不返回完整大正文
 
 ### search-11c: slice 预算续查范围
 
-**步骤**：使用至少 20 条有序匹配记录的 fixture，分别调用 `slice="[10:20]"` 和 `slice="[-10:]"`，将 `max_total` 设为只能保留切片前几条；随后执行返回的 `next_query`
+**步骤**：使用至少 20 条有序匹配记录的 fixture，分别调用 `slice="[10:20]"` 和 `slice="[-10:]"`，将 `max_total`
+设为只能保留切片前几条；随后执行返回的 `next_query`
 
-**预期**：首次响应 `complete=false`、`has_more=true`；`next_query` 携带从下一条绝对位置到原结束位置的归一化正数 `slice`，不含 `offset` 和 `limit`；连续执行每一页返回的 `next_query` 无重复，最终结果严格停在原切片半开区间末尾；把预算继续降低到一条结果也无法容纳时返回 `response_too_large`，不返回原地不动的 `next_query`
+**预期**：首次响应 `complete=false`、`has_more=true`；`next_query` 携带从下一条绝对位置到原结束位置的归一化正数
+`slice`，不含 `offset` 和 `limit`；连续执行每一页返回的 `next_query`
+无重复，最终结果严格停在原切片范围末尾；把预算继续降低到一条结果也无法容纳时返回 `response_too_large`，不返回原地不动的
+`next_query`
 
 ### search-12: pattern 为空+all=true
 
@@ -143,7 +172,17 @@
 ### search-14: summary/jsonl/incomplete
 
 **步骤**：
-`history_search(pattern="", project="<project>", summary=true, output="tmp:mcp-history-test/search.jsonl", output_format="jsonl", max_total=1000)`
+
+```text
+history_search(
+    pattern="",
+    project="<project>",
+    summary=true,
+    output="tmp:mcp-history-test/search.jsonl",
+    output_format="jsonl",
+    max_total=1000
+)
+```
 
 **预期**：返回 summary、coverage、incomplete/incomplete_reasons；输出文件为 JSONL，manifest 存在
 
@@ -158,16 +197,32 @@
 **步骤**：搜索含 `Authorization`、`token`、`cookie` 或 `password` 字段的 tool_use/tool_result 记录，并导出
 `output="tmp:mcp-history-test/redaction.jsonl"`
 
-**预期**：对话返回和 JSONL 中敏感值显示为 `[redacted]`；命中的结果含 `redacted=true` 和 `raw_available=true`；manifest 含
-`redaction.enabled=true` 与规则列表
+**预期**：导出的 JSONL 中敏感值显示为 `[redacted]`，记录含 `redacted=true` 和 `raw_available=true`；工具响应的 `results`
+为空并通过 `output` 返回结果文件与 manifest，manifest 含 `redaction.enabled=true` 与规则列表
 
 ### search-17: redaction 模式和显式 JSONL 文件路径
 
 **步骤**：同一查询分别执行 `redaction="strict"` 与 `redaction="off"`，导出到
 `output="tmp:mcp-history-test/redaction-strict.jsonl"` 和 `output="tmp:mcp-history-test/redaction-off.jsonl"`
 
-**预期**：`.jsonl` 按文件路径处理，不额外创建同名目录；manifest 写在 JSONL 文件旁边；`strict` manifest 含 `mode="strict"`、
-`enabled=true`、`raw_available=true`；`off` manifest 含 `mode="off"`、`enabled=false`、`rules=[]`、`raw_available=true`
+**预期**：`.jsonl` 按文件路径处理，不额外创建同名目录；manifest 写在 JSONL 文件旁边；`strict` manifest 含
+`mode="strict"`、 `enabled=true`、`raw_available=true`；`off` manifest 含
+`mode="off"`、`enabled=false`、`rules=[]`、`raw_available=true`
+
+### search-18: 过滤参数校验
+
+**步骤**：分别调用 `history_search(types="visitor")`、`history_search(subtypes="author")`、
+`history_search(types="human")`
+
+**预期**：前两项返回 `invalid_arguments` 并列出合法值；最后一项保留兼容行为，自动作为 `subtypes="human"`
+执行并返回 warning
+
+### search-19: summary、aggregate 和 dry_run
+
+**步骤**：对同一受控 fixture 分别调用 `summary=true`、`aggregate=true` 和 `dry_run=true`
+
+**预期**：`summary` 在 `stats.summary` 返回分组计数并保留结果行；`aggregate` 不返回结果行；`dry_run`
+不读取消息正文，返回选中的项目、会话和文件
 
 ---
 
@@ -199,9 +254,9 @@
 
 ### get-05: ref 不存在
 
-**步骤**：`history_get(ref="00000000:0")`
+**步骤**：分别调用 `history_get(ref="00000000:1")` 和 `history_get(ref="00000000:0")`
 
-**预期**：错误信息明确（session 不存在或行号超限）
+**预期**：前者返回 session 不存在或行号超限；后者返回 `ref_invalid`，因为行号必须为正整数
 
 ### get-06: output 写文件 + canonicalize 校验（C.1 验证）
 
@@ -209,9 +264,8 @@
 
 1. `history_get(ref="<ref>", output="tmp:mcp-history-test/out.json")` → 应成功
 2. `history_get(ref="<ref>", output="/etc/x.json")` → 应被拒绝（不在允许根目录内）
-3. cwd 内建 symlink `mcp-history-test/escape -> /etc`，再 `output="cwd:mcp-history-test/escape/x.json"` →
-   应被拒绝（canonicalize
-   后越界）
+3. cwd 内建 symlink `mcp-history-test/escape -> /etc`，再 `output="cwd:mcp-history-test/escape/x.json"`
+   → 应被拒绝（canonicalize 后越界）
 
 **预期**：1 通过；2、3 被拒绝；canonicalize 防止 symlink escape
 
@@ -219,8 +273,8 @@
 
 **步骤**：找一条 content_size > 100000 的消息，运行 `history_get(ref="<ref>")`
 
-**预期**：返回 `content_too_large`，含 `content_size`、`valid_range`、`range_suggestion`、`output_suggestion`、`head`、`tail`
-，不需要调用方再次猜 range
+**预期**：返回 `content_too_large`，含
+`content_size`、`valid_range`、`range_suggestion`、`output_suggestion`、`head`、`tail` ，不需要调用方再次猜 range
 
 ### get-08: redaction=off 和显式文本文件路径
 
@@ -241,9 +295,9 @@
 
 ### context-02: direction=backward
 
-**步骤**：`history_context(ref="<ref>", direction="backward", before=5)`
+**步骤**：`history_context(ref="<ref>", until_type="user", direction="backward")`
 
-**预期**：仅返回锚点前 5 条
+**预期**：从锚点向前扩展，到第一条 user 消息停止
 
 ### context-03: types 过滤
 
@@ -253,7 +307,7 @@
 
 ### context-04: until_type
 
-**步骤**：`history_context(ref="<ref>", after=10, until_type="user")`
+**步骤**：`history_context(ref="<ref>", until_type="user")`
 
 **预期**：从锚点向后取，遇到第一条 user 则停止
 
@@ -268,6 +322,14 @@
 **步骤**：`history_context(ref="<ref>", until_ref="<same-session-ref>", output="tmp:mcp-history-test/context")`
 
 **预期**：只接受同一 session 的 until_ref；返回 `output_path`；跨 session until_ref 返回参数错误
+
+### context-06a: 互斥范围和参数校验
+
+**步骤**：分别调用 `history_context(ref="<ref>", before=1, until_type="user")`、
+`history_context(ref="<ref>", until_type="user", until_ref="<same-session-ref>")`、
+`history_context(ref="<ref>", direction="sideways")` 和 `history_context(ref="<prefix>:0")`
+
+**预期**：全部返回 `invalid_arguments` 或 `ref_invalid`，不忽略任一冲突参数
 
 ### context-07: max_content / max_total
 
@@ -285,7 +347,8 @@
 
 ### context-09: 合法非消息 JSONL record
 
-**步骤**：使用受控 session fixture，依次写入合法 session metadata、损坏 JSON、缺少 `message` 的不完整消息 record 和正常锚点消息，再调用 `history_context`
+**步骤**：使用受控 session fixture，依次写入合法 session metadata、损坏 JSON、缺少 `message`
+的不完整消息 record 和正常锚点消息，再调用 `history_context`
 
 **预期**：合法 metadata 被忽略且不计入解析警告；损坏 JSON 和不完整消息各计入 1 行解析警告；锚点消息正常返回
 
@@ -303,7 +366,18 @@
 ### trace-02: filters + output
 
 **步骤**：
-`history_trace(ref="<ref>", before=20, after=20, types="assistant,user", servers="mcp-chrome", tools="browse", output="tmp:mcp-history-test/trace")`
+
+```text
+history_trace(
+    ref="<ref>",
+    before=20,
+    after=20,
+    types="assistant,user",
+    servers="mcp-chrome",
+    tools="browse",
+    output="tmp:mcp-history-test/trace"
+)
+```
 
 **预期**：messages 遵守 types/subtypes/pattern 过滤；tool_calls 遵守 servers/tools 过滤；返回 `output_path`
 
@@ -313,6 +387,12 @@
 
 **预期**：同 session 成功；跨 session 返回参数错误
 
+### trace-03a: 互斥范围
+
+**步骤**：`history_trace(ref="<ref>", before=1, until_type="user")`
+
+**预期**：返回 `invalid_arguments`，不能静默忽略 `before`
+
 ### trace-04: max_total 截断
 
 **步骤**：`history_trace(ref="<ref>", before=200, after=200, max_total=1000)`
@@ -321,9 +401,12 @@
 
 ### trace-05: 严格关联
 
-**步骤**：使用截断窗口 fixture，其中窗口内有两个 pending call、一个显式错误 `tool_use_id` result、一个正确 ID result，以及一个无 ID result
+**步骤**：使用截断窗口 fixture，其中窗口内有两个 pending call、一个显式错误 `tool_use_id` result、一个正确 ID
+result，以及一个无 ID result
 
-**预期**：错误 ID result 不消费 pending call；正确 ID result 使用 `match_method="tool_use_id"`；多个 pending 且无 ID 时进入 `association_issues` 并标记 `ambiguous`；只有一个 pending 时才使用 `legacy_single_pending`
+**预期**：错误 ID result 不消费 pending call；正确 ID result 使用
+`match_method="tool_use_id"`；多个 pending 且无 ID 时进入 `association_issues` 并标记
+`ambiguous`；只有一个 pending 时才使用 `legacy_single_pending`
 
 ### trace-06: parent UUID 关联
 
@@ -336,13 +419,19 @@
 **步骤**：`history_trace(ref="<ref>", before=2, after=2, redaction="strict", output="tmp:mcp-history-test/trace.txt")`
 
 **预期**：`.txt` 按文件路径处理；manifest 写在同目录；manifest 含 `schema="mcp-claude-history.trace-output.v1"`、
-`redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`；fixture 的 tool_result 同时包含结构化 object、array 和 text 内嵌 JSON，`tool_calls.result_preview` 与导出文件均不包含原始敏感值，manifest 的 `redacted_count` 计入 preview 脱敏
+`redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`。
+
+fixture 的 tool_result 同时包含结构化 object、array 和 text 内嵌 JSON。
+
+`tool_calls.result_preview` 与导出文件均不包含原始敏感值，manifest 的 `redacted_count` 计入 preview 脱敏
 
 ### trace-08: 合法非消息 JSONL record
 
-**步骤**：使用受控 session fixture，依次写入合法 session metadata、损坏 JSON、缺少 `message` 的不完整消息 record 和正常锚点消息，再调用 `history_trace`
+**步骤**：使用受控 session fixture，依次写入合法 session metadata、损坏 JSON、缺少 `message`
+的不完整消息 record 和正常锚点消息，再调用 `history_trace`
 
-**预期**：合法 metadata 被忽略且不计入解析警告；损坏 JSON 和不完整消息各计入 1 行解析警告；锚点消息和 tool trace 正常返回
+**预期**：合法 metadata 被忽略且不计入解析警告；损坏 JSON 和不完整消息各计入 1 行解析警告；锚点消息和 tool
+trace 正常返回
 
 ---
 
@@ -352,7 +441,8 @@
 
 **步骤**：调用 `history_build_info()`，并运行 `mcp-claude-history build-info`
 
-**预期**：两者返回相同的 package version、commit、target、profile、UTC build timestamp 和 dirty 状态；release binary 的 commit 与发布 commit 一致且 `dirty=false`、`reproducible=true`；本地 dirty 构建不得返回 `reproducible=true`
+**预期**：两者返回相同的 package version、commit、target、profile、UTC build timestamp 和 dirty 状态；release
+binary 的 commit 与发布 commit 一致且 `dirty=false`、`reproducible=true`；本地 dirty 构建不得返回 `reproducible=true`
 
 ### build-02
 
@@ -393,13 +483,7 @@
 
 ---
 
-## 附录 A：执行记录
-
-| 日期         | CC session                           | 执行人             | 范围                        | 结果摘要                                                                                       |
-|------------|--------------------------------------|-----------------|---------------------------|--------------------------------------------------------------------------------------------|
-| 2026-04-28 | 2d1d0b19-1537-4722-93a2-23ac3e91b97c | claude-opus-4-7 | TESTING.md 全量（v1.4.0 首发前） | projects/sessions/search/get/context/安全/边界 全 PASS；output canonicalize + project_id 白名单验证通过 |
-
-## 附录 B：已知限制 / KNOWN-LIMIT
+## 附录 A：已知限制 / KNOWN-LIMIT
 
 - get-03 range 越界：当前实现可能返回空或部分；接受 "错误明确不 panic" 即可
 - binary-content-01：依赖测试 jsonl 是否真的有非法 UTF-8 数据，可跳过

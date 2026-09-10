@@ -21,6 +21,7 @@ function connect(port) {
     })
 }
 
+// noinspection JSUnusedGlobalSymbols — structural test double
 class FakeClient extends EventEmitter {
     constructor({ deferForwardIn = false, deferForwardOut = false, dynamicPort = 45678 } = {}) {
         super()
@@ -90,7 +91,10 @@ test('graceful local timeout reports released listener and retains state for for
     assert.equal(timedOut.success, false)
     assert.equal(timedOut.listenerReleased, true)
     assert.equal(timedOut.activeConnections, 1)
-    assert.equal(manager.list().length, 1)
+    assert.deepEqual(
+        manager.list().map(({ lifecycle, acceptingConnections }) => ({ lifecycle, acceptingConnections })),
+        [{ lifecycle: 'closing', acceptingConnections: false }]
+    )
 
     const forced = await manager.close(
         created.forwardId,
@@ -244,10 +248,7 @@ test('pending forwardOut keeps close retryable until its callback is drained', a
     assert.equal(timedOut.activeConnections, 0)
     assert.equal(timedOut.retryable, true)
     assert.equal(manager.list().length, 1)
-    await assert.rejects(
-        manager.forwardLocal(deps, 'server', 0, '127.0.0.1', 80),
-        /unresolved SSH channel open/
-    )
+    await assert.rejects(manager.forwardLocal(deps, 'server', 0, '127.0.0.1', 80), /unresolved SSH channel open/)
 
     const delayedStream = new PassThrough()
     client.forwardOutCallback(null, delayedStream)

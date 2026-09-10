@@ -14,9 +14,22 @@ const PENDING_TTL_MS = 60_000
 const PENDING_MAX_PER_TAB = 500
 const PENDING_SWEEP_INTERVAL_MS = 30_000
 
+function isCloudflareChallenge(headers: Record<string, unknown> | undefined): boolean {
+    if (!headers) {
+        return false
+    }
+
+    return Object.entries(headers).some(
+        ([name, value]) => name.toLowerCase() === 'cf-mitigated' && String(value).toLowerCase() === 'challenge'
+    )
+}
+
 export class LogManager {
     private consoleMessages = new Map<number, ConsoleMessage[]>()
     private networkRequests = new Map<number, NetworkRequest[]>()
+    private consoleSequences = new Map<number, number>()
+    private networkSequences = new Map<number, number>()
+    private challengeRequired = new Map<number, boolean>()
     private pendingRequests = new Map<number, Map<string, PendingRequest>>()
     private sweepTimer: ReturnType<typeof setInterval> | null = null
 
@@ -38,6 +51,7 @@ export class LogManager {
 
     /** 替换 console 消息列表（清理或覆盖场景） */
     setConsole(tabId: number, messages: ConsoleMessage[]): void {
+        this.assignConsoleSequences(tabId, messages)
         this.consoleMessages.set(tabId, messages)
     }
 
@@ -51,8 +65,13 @@ export class LogManager {
         return this.networkRequests.get(tabId) ?? []
     }
 
+    isChallengeRequired(tabId: number): boolean {
+        return this.challengeRequired.get(tabId) === true
+    }
+
     /** 替换 network 请求列表 */
     setNetwork(tabId: number, requests: NetworkRequest[]): void {
+        this.assignNetworkSequences(tabId, requests)
         this.networkRequests.set(tabId, requests)
     }
 
@@ -107,6 +126,7 @@ export class LogManager {
                 lineNumber: p.exceptionDetails.lineNumber,
             }
             const messages = this.consoleMessages.get(tabId) || []
+            this.assignConsoleSequences(tabId, [message])
             messages.push(message)
             if (messages.length > 1100) {
                 messages.splice(0, messages.length - 1000)
@@ -154,19 +174,26 @@ export class LogManager {
         if (method === 'Network.responseReceived') {
             const p = params as {
                 requestId: string
-                response: { status: number }
+                response: { status: number; headers?: Record<string, unknown> }
                 timestamp: number
             }
             const tabPending = this.pendingRequests.get(tabId)
             const pending = tabPending?.get(p.requestId)
             if (pending) {
                 const { _monotonic, _addedAt: _, ...requestData } = pending
+                const challenge = isCloudflareChallenge(p.response.headers)
+                if (requestData.type.toLowerCase() === 'document') {
+                    // 只有新的主文档响应可以解除已知 Challenge，清空网络日志不能解除该状态
+                    this.challengeRequired.set(tabId, challenge)
+                }
                 const requests = this.networkRequests.get(tabId) || []
                 requests.push({
                     ...requestData,
                     status: p.response.status,
+                    challenge,
                     duration: Math.round((p.timestamp - _monotonic) * 1000),
                 })
+                this.assignNetworkSequences(tabId, requests.slice(-1))
                 if (requests.length > 1100) {
                     requests.splice(0, requests.length - 1000)
                 }
@@ -187,6 +214,7 @@ export class LogManager {
                     errorText: p.errorText,
                     duration: Math.round((p.timestamp - _monotonic) * 1000),
                 })
+                this.assignNetworkSequences(tabId, requests.slice(-1))
                 if (requests.length > 1100) {
                     requests.splice(0, requests.length - 1000)
                 }
@@ -199,7 +227,34 @@ export class LogManager {
     cleanupTab(tabId: number): void {
         this.consoleMessages.delete(tabId)
         this.networkRequests.delete(tabId)
+        this.consoleSequences.delete(tabId)
+        this.networkSequences.delete(tabId)
+        this.challengeRequired.delete(tabId)
         this.pendingRequests.delete(tabId)
+    }
+
+    private assignConsoleSequences(tabId: number, messages: ConsoleMessage[]): void {
+        let sequence = this.consoleSequences.get(tabId) ?? 0
+        for (const message of messages) {
+            if (message.sequence === undefined) {
+                message.sequence = ++sequence
+            } else {
+                sequence = Math.max(sequence, message.sequence)
+            }
+        }
+        this.consoleSequences.set(tabId, sequence)
+    }
+
+    private assignNetworkSequences(tabId: number, requests: NetworkRequest[]): void {
+        let sequence = this.networkSequences.get(tabId) ?? 0
+        for (const request of requests) {
+            if (request.sequence === undefined) {
+                request.sequence = ++sequence
+            } else {
+                sequence = Math.max(sequence, request.sequence)
+            }
+        }
+        this.networkSequences.set(tabId, sequence)
     }
 
     private startSweep(): void {

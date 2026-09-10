@@ -18,13 +18,14 @@ import {
     DIRECTORY_VERIFY_MAX_ENTRIES,
     DIRECTORY_VERIFY_MAX_FILE_BYTES,
     DIRECTORY_VERIFY_MAX_TOTAL_BYTES,
-    parseRemoteDirectoryManifest,
     type DirectoryManifest,
     type DirectoryVerifyRequest,
+    parseRemoteDirectoryManifest,
 } from '../directory-verification.js'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
 import { buildTransferOutcome } from '../transfer-outcome.js'
+import { operationTimeoutSchema } from './schema.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js'
 
 // ========== Schemas ==========
@@ -39,12 +40,14 @@ const uploadSchema = z.object({
     verifyMd5: z.boolean().optional().describe('上传后比对本地和远端 MD5'),
     verifySize: z.boolean().optional().describe('上传后校验文件大小'),
     verifyMtime: z.boolean().optional().describe('上传后返回并比较本地和远端 mtime'),
+    timeout: operationTimeoutSchema.optional(),
 })
 
 const downloadSchema = z.object({
     alias: z.string().describe('连接别名'),
     remotePath: z.string().describe('远程文件路径'),
     localPath: z.string().describe('本地保存路径'),
+    timeout: operationTimeoutSchema.optional(),
 })
 
 const readFileSchema = z.object({
@@ -57,9 +60,15 @@ const readFileSchema = z.object({
         .max(fileOps.HARD_READ_FILE_MAX_BYTES)
         .optional()
         .describe('最大读取字节数，默认 1MB，最大 16MB'),
-    offset: z.number().optional().describe('从指定字节偏移开始读取，与 tail/lineRange 互斥'),
+    offset: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe('从 UTF-8 字符边界的字节偏移读取，与 tail/lineRange 互斥；使用上次返回的 next_offset'),
     tail: z.boolean().optional().describe('读取文件尾部 maxBytes 字节，与 offset/lineRange 互斥'),
     lineRange: z.string().optional().describe('按行号读取，格式为 "start-end" 或 "start"，与 offset/tail 互斥'),
+    timeout: operationTimeoutSchema.optional(),
 })
 
 const writeFileSchema = z.object({
@@ -67,23 +76,27 @@ const writeFileSchema = z.object({
     remotePath: z.string().describe('远程文件路径'),
     content: z.string().describe('要写入的内容'),
     append: z.boolean().optional().describe('是否追加模式，默认覆盖'),
+    timeout: operationTimeoutSchema.optional(),
 })
 
 const listDirSchema = z.object({
     alias: z.string().describe('连接别名'),
     remotePath: z.string().describe('远程目录路径'),
     showHidden: z.boolean().optional().describe('是否显示隐藏文件'),
+    timeout: operationTimeoutSchema.optional(),
 })
 
 const fileInfoSchema = z.object({
     alias: z.string().describe('连接别名'),
     remotePath: z.string().describe('远程路径'),
+    timeout: operationTimeoutSchema.optional(),
 })
 
 const mkdirSchema = z.object({
     alias: z.string().describe('连接别名'),
     remotePath: z.string().describe('远程目录路径'),
     recursive: z.boolean().optional().describe('是否递归创建，默认 false'),
+    timeout: operationTimeoutSchema.optional(),
 })
 
 const syncSchema = z.object({
@@ -160,6 +173,33 @@ class VerificationStageError extends Error {
     ) {
         super(message)
         this.name = 'VerificationStageError'
+    }
+}
+
+function sftpOperationOutcome(error: unknown): Record<string, unknown> {
+    if (!error || typeof error !== 'object') {
+        return {}
+    }
+    const details = 'details' in error ? (error as { details?: unknown }).details : undefined
+    if (details && typeof details === 'object' && 'operationStatus' in details) {
+        return details as Record<string, unknown>
+    }
+    const cause = 'cause' in error ? (error as { cause?: unknown }).cause : undefined
+    return sftpOperationOutcome(cause)
+}
+
+function formatFileOperationError(error: unknown) {
+    const operationOutcome = sftpOperationOutcome(error)
+    if (Object.keys(operationOutcome).length === 0) {
+        return formatError(error)
+    }
+    return {
+        ...formatResult({
+            success: false,
+            ...operationOutcome,
+            error: error instanceof Error ? error.message : String(error),
+        }),
+        isError: true,
     }
 }
 
@@ -335,43 +375,13 @@ function isRemoteMissingError(error: unknown): boolean {
     return code === 2 || code === 'ENOENT' || /no such file|not found/i.test(message)
 }
 
-async function probeRemoteFile(alias: string, remotePath: string, _timeout: number = 10000) {
+async function probeRemoteFile(alias: string, remotePath: string, timeout: number = 10000) {
+    let info: Awaited<ReturnType<typeof fileOps.getFileInfo>>
     try {
-        const info = await fileOps.getFileInfo(alias, remotePath)
-        const mode = permissionStringToOctal(info.permissions)
-        if (!mode) {
-            throw new VerificationStageError('remote_probe', 'Remote SFTP stat returned invalid mode metadata', false, {
-                operation: 'stat',
-                probeMethod: 'sftp',
-            })
-        }
-        return {
-            exists: true as const,
-            remotePath,
-            probeMethod: 'sftp' as const,
-            ownerName: undefined,
-            ownerId: info.owner,
-            groupName: undefined,
-            groupId: info.group,
-            mode,
-            size: info.size,
-            mtimeMs: info.mtime.getTime(),
-            fileType: info.isDirectory
-                ? 'directory'
-                : info.isFile
-                  ? 'regular file'
-                  : info.isSymlink
-                    ? 'symbolic link'
-                    : 'other',
-            isDirectory: info.isDirectory,
-            isFile: info.isFile,
-        }
+        info = await fileOps.getFileInfo(alias, remotePath, timeout)
     } catch (error) {
         if (isRemoteMissingError(error)) {
             return { exists: false as const, remotePath, probeMethod: 'sftp' as const }
-        }
-        if (error instanceof VerificationStageError) {
-            throw error
         }
         throw new VerificationStageError(
             'remote_probe',
@@ -379,6 +389,34 @@ async function probeRemoteFile(alias: string, remotePath: string, _timeout: numb
             true,
             { operation: 'stat', probeMethod: 'sftp' }
         )
+    }
+    const mode = permissionStringToOctal(info.permissions)
+    if (!mode) {
+        throw new VerificationStageError('remote_probe', 'Remote SFTP stat returned invalid mode metadata', false, {
+            operation: 'stat',
+            probeMethod: 'sftp',
+        })
+    }
+    return {
+        exists: true as const,
+        remotePath,
+        probeMethod: 'sftp' as const,
+        ownerName: undefined,
+        ownerId: info.owner,
+        groupName: undefined,
+        groupId: info.group,
+        mode,
+        size: info.size,
+        mtimeMs: info.mtime.getTime(),
+        fileType: info.isDirectory
+            ? 'directory'
+            : info.isFile
+              ? 'regular file'
+              : info.isSymlink
+                ? 'symbolic link'
+                : 'other',
+        isDirectory: info.isDirectory,
+        isFile: info.isFile,
     }
 }
 
@@ -871,7 +909,8 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             createMode,
             undefined,
             false,
-            args.atomic === true
+            args.atomic === true,
+            args.timeout
         )
         let verification: Record<string, unknown> | undefined
         let verificationError: unknown
@@ -899,6 +938,8 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             } catch (cleanupError) {
                 cleanupWarning = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
             }
+            const verificationMessage =
+                verificationError instanceof Error ? verificationError.message : String(verificationError)
             return formatResult({
                 ...uploadResult,
                 ...outcome,
@@ -906,7 +947,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                 error:
                     verificationError === undefined
                         ? `Atomic upload verification failed: ${args.remotePath}`
-                        : `Atomic upload verification failed: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
+                        : `Atomic upload verification failed: ${verificationMessage}`,
                 cleanupWarning,
                 atomic: true,
                 targetReplaced: false,
@@ -927,7 +968,13 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
 
         if (args.atomic) {
             try {
-                await fileOps.renameRemoteFile(args.alias, tempRemotePath, args.remotePath, remoteBefore.exists)
+                await fileOps.renameRemoteFile(
+                    args.alias,
+                    tempRemotePath,
+                    args.remotePath,
+                    remoteBefore.exists,
+                    args.timeout
+                )
             } catch (error) {
                 const renameNotStarted = error instanceof fileOps.RemoteRenameNotStartedError
                 const renameError = error instanceof Error ? error.message : String(error)
@@ -961,6 +1008,8 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             }
         }
 
+        const verificationMessage =
+            verificationError instanceof Error ? verificationError.message : String(verificationError)
         return formatResult({
             ...uploadResult,
             ...outcome,
@@ -970,7 +1019,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             error:
                 verificationError === undefined
                     ? undefined
-                    : `Upload completed, but verification failed: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
+                    : `Upload completed, but verification failed: ${verificationMessage}`,
             atomic: args.atomic === true,
             targetReplaced: args.atomic ? true : undefined,
             ...pathDetails,
@@ -999,6 +1048,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
         }
         return formatResult({
             success: false,
+            ...sftpOperationOutcome(error),
             error: error instanceof Error ? error.message : String(error),
             cleanupWarning,
             finalRemotePath: args.remotePath,
@@ -1015,11 +1065,20 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
 
 async function handleDownload(args: z.infer<typeof downloadSchema>) {
     try {
-        const downloadResult = await fileOps.downloadFile(args.alias, args.remotePath, args.localPath)
+        const downloadResult = await fileOps.downloadFile(
+            args.alias,
+            args.remotePath,
+            args.localPath,
+            undefined,
+            undefined,
+            undefined,
+            args.timeout
+        )
         return formatResult({ ...downloadResult, message: `Downloaded to ${args.localPath}` })
     } catch (error) {
         return formatResult({
             success: false,
+            ...sftpOperationOutcome(error),
             error: error instanceof Error ? error.message : String(error),
             diagnostics: {
                 local: summarizeLocalPathProbe(fileOps.probeLocalPath(args.localPath)),
@@ -1037,25 +1096,26 @@ async function handleReadFile(args: z.infer<typeof readFileSchema>) {
             offset: args.offset,
             tail: args.tail,
             lineRange: args.lineRange,
+            timeout: args.timeout,
         })
         return formatResult({ success: true, ...readResult })
     } catch (error) {
-        return formatError(error)
+        return formatFileOperationError(error)
     }
 }
 
 async function handleWriteFile(args: z.infer<typeof writeFileSchema>) {
     try {
-        const result = await fileOps.writeFile(args.alias, args.remotePath, args.content, args.append)
+        const result = await fileOps.writeFile(args.alias, args.remotePath, args.content, args.append, args.timeout)
         return formatResult(result)
     } catch (error) {
-        return formatError(error)
+        return formatFileOperationError(error)
     }
 }
 
 async function handleListDir(args: z.infer<typeof listDirSchema>) {
     try {
-        const files = await fileOps.listDir(args.alias, args.remotePath, args.showHidden)
+        const files = await fileOps.listDir(args.alias, args.remotePath, args.showHidden, undefined, args.timeout)
         return formatResult({
             success: true,
             path: args.remotePath,
@@ -1063,25 +1123,25 @@ async function handleListDir(args: z.infer<typeof listDirSchema>) {
             files,
         })
     } catch (error) {
-        return formatError(error)
+        return formatFileOperationError(error)
     }
 }
 
 async function handleFileInfo(args: z.infer<typeof fileInfoSchema>) {
     try {
-        const info = await fileOps.getFileInfo(args.alias, args.remotePath)
+        const info = await fileOps.getFileInfo(args.alias, args.remotePath, args.timeout)
         return formatResult({ success: true, ...info })
     } catch (error) {
-        return formatError(error)
+        return formatFileOperationError(error)
     }
 }
 
 async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
     try {
-        const success = await fileOps.mkdir(args.alias, args.remotePath, args.recursive)
+        const success = await fileOps.mkdir(args.alias, args.remotePath, args.recursive, undefined, args.timeout)
         return formatResult({ success, path: args.remotePath })
     } catch (error) {
-        return formatError(error)
+        return formatFileOperationError(error)
     }
 }
 
@@ -1098,7 +1158,7 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
     const remainingTimeout = (): number => operationTimeout - (Date.now() - startedAt)
     try {
         if (args.direction === 'upload') {
-            fileOps.validateSyncUploadSource(args.localPath, args.followSymlinks === true, args.exclude)
+            fileOps.validateSyncUploadSource(args.localPath, args.followSymlinks === true)
         } else {
             fileOps.validateLocalPathPolicy(args.localPath)
         }
@@ -1152,11 +1212,11 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
 
         const transferTimeout = remainingTimeout()
         if (transferTimeout <= 0) {
-            throw new VerificationStageError(
-                'verification_timeout',
-                'sync operation timeout was exhausted before transfer started',
-                true
-            )
+            return formatResult({
+                success: false,
+                error: 'sync operation timeout was exhausted before transfer started',
+                diagnostics,
+            })
         }
         const syncResult = await fileOps.syncFiles(args.alias, args.localPath, args.remotePath, args.direction, {
             delete: args.delete,
@@ -1198,13 +1258,15 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
             }
         }
         const outcome = buildTransferOutcome(syncResult.success, verificationRequested, verification, verificationError)
+        const verificationMessage =
+            verificationError instanceof Error ? verificationError.message : String(verificationError)
         return formatResult({
             ...syncResult,
             ...outcome,
             error:
                 verificationError === undefined
                     ? undefined
-                    : `Sync completed, but verification failed: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
+                    : `Sync completed, but verification failed: ${verificationMessage}`,
             transportVerification: syncResult.verification,
             verification,
             direction: args.direction,
@@ -1227,7 +1289,7 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_upload',
         {
-            description: '上传本地文件到远程服务器',
+            description: '上传本地文件到远程服务器。timeout 限制单个 SFTP 操作，超时后远端传输状态可能未知。',
             inputSchema: uploadSchema,
         },
         (args) => handleUpload(args)
@@ -1236,7 +1298,7 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_download',
         {
-            description: '从远程服务器下载文件',
+            description: '从远程服务器下载文件。timeout 限制单个 SFTP 操作，超时后远端传输状态可能未知。',
             inputSchema: downloadSchema,
         },
         (args) => handleDownload(args)
@@ -1245,7 +1307,7 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_read_file',
         {
-            description: '读取远程文件内容',
+            description: '读取远程文件内容。文本读取只返回完整 UTF-8 字符；后续读取使用响应中的 next_offset。',
             inputSchema: readFileSchema,
         },
         (args) => handleReadFile(args)
@@ -1254,7 +1316,7 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_write_file',
         {
-            description: '写入内容到远程文件',
+            description: '写入内容到远程文件。timeout 限制单个 SFTP 操作，超时后远端写入状态可能未知。',
             inputSchema: writeFileSchema,
         },
         (args) => handleWriteFile(args)

@@ -4,6 +4,7 @@
  * 处理来自 MCP Server 的所有操作请求
  */
 
+import { ExpectedOperationError } from '../types/expected-errors'
 import type { ActionContext } from './action-utils'
 import { ContentHandler } from './content-handler'
 import { CookieHandler } from './cookie-handler'
@@ -41,7 +42,14 @@ export class ActionHandler {
     async execute(action: string, params: unknown, context: ActionContext): Promise<unknown> {
         const handler = this.actions.get(action)
         if (!handler) {
-            throw new Error(`Unknown action: ${action}`)
+            throw new ExpectedOperationError(
+                JSON.stringify({
+                    error: {
+                        code: 'UNKNOWN_ACTION',
+                        message: `Unknown action: ${action}`,
+                    },
+                })
+            )
         }
         return handler(params, context)
     }
@@ -93,6 +101,8 @@ export class ActionHandler {
         this.actions.set('type', this.contentHandler.type.bind(this.contentHandler))
         this.actions.set('scroll', this.contentHandler.scroll.bind(this.contentHandler))
         this.actions.set('evaluate', this.contentHandler.evaluate.bind(this.contentHandler))
+        this.actions.set('viewport_metrics', this.contentHandler.getViewportMetrics.bind(this.contentHandler))
+        this.actions.set('challenge_inspect', this.contentHandler.inspectChallenge.bind(this.contentHandler))
         this.actions.set('find', this.contentHandler.find.bind(this.contentHandler))
 
         // 页面内容提取
@@ -132,6 +142,10 @@ export class ActionHandler {
         this.actions.set('network_enable', this.logEventHandler.networkEnable.bind(this.logEventHandler))
         this.actions.set('network_get', this.logEventHandler.networkGet.bind(this.logEventHandler))
         this.actions.set('network_clear', this.logEventHandler.networkClear.bind(this.logEventHandler))
+        this.actions.set(
+            'network_challenge_state',
+            this.logEventHandler.networkChallengeState.bind(this.logEventHandler)
+        )
 
         // 输入事件（JS 模拟）- stealth 模式
         this.actions.set('stealth_click', this.stealthHandler.stealthClick.bind(this.stealthHandler))

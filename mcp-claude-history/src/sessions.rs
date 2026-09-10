@@ -5,7 +5,11 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 
 /// 列出项目的会话
-pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<SessionsResponse, ErrorResponse> {
+pub fn list_sessions(
+    config: &Config,
+    project_id: Option<&str>,
+    redaction: RedactionMode,
+) -> Result<SessionsResponse, ErrorResponse> {
     // 确定项目
     let project_id = match project_id {
         Some(id) => config.normalize_project_id(id)?,
@@ -39,6 +43,7 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
     })?;
 
     let mut sessions = Vec::new();
+    let mut redacted_count = 0usize;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -56,7 +61,8 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
         let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
         // 统计行数并获取时间范围和主题
-        let (line_count, start_time, end_time, topic) = get_session_stats(&path);
+        let (line_count, start_time, end_time, topic, topic_redacted_count) = get_session_stats(&path, redaction);
+        redacted_count += topic_redacted_count;
 
         sessions.push(SessionInfo {
             id: session_id.clone(),
@@ -66,6 +72,7 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
             end_time,
             size_bytes,
             topic,
+            topic_redacted_count,
         });
     }
 
@@ -75,14 +82,22 @@ pub fn list_sessions(config: &Config, project_id: Option<&str>) -> Result<Sessio
     Ok(SessionsResponse {
         project: project_id,
         sessions,
+        redaction: redaction_info(
+            redaction,
+            redacted_count,
+            redaction == RedactionMode::Off || redacted_count > 0,
+        ),
     })
 }
 
 /// 获取会话统计信息
-fn get_session_stats(path: &std::path::Path) -> (usize, String, String, Option<String>) {
+fn get_session_stats(
+    path: &std::path::Path,
+    redaction_mode: RedactionMode,
+) -> (usize, String, String, Option<String>, usize) {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return (0, String::new(), String::new(), None),
+        Err(_) => return (0, String::new(), String::new(), None, 0),
     };
 
     let reader = BufReader::new(file);
@@ -90,6 +105,7 @@ fn get_session_stats(path: &std::path::Path) -> (usize, String, String, Option<S
     let mut start_time = String::new();
     let mut end_time = String::new();
     let mut topic: Option<String> = None;
+    let mut topic_redacted_count = 0usize;
 
     for line in reader.lines() {
         let line = match line {
@@ -113,8 +129,10 @@ fn get_session_stats(path: &std::path::Path) -> (usize, String, String, Option<S
                 && let Some(text) = extract_topic_text(&record)
                 && !text.is_empty()
             {
-                let preview: String = text.chars().take(100).collect();
-                topic = Some(if text.chars().count() > 100 {
+                let redaction = redact_text_with_mode(&text, redaction_mode);
+                topic_redacted_count += redaction.count;
+                let preview: String = redaction.text.chars().take(100).collect();
+                topic = Some(if redaction.text.chars().count() > 100 {
                     format!("{preview}...")
                 } else {
                     preview
@@ -123,7 +141,7 @@ fn get_session_stats(path: &std::path::Path) -> (usize, String, String, Option<S
         }
     }
 
-    (line_count, start_time, end_time, topic)
+    (line_count, start_time, end_time, topic, topic_redacted_count)
 }
 
 /// 从消息记录中提取文本内容（用于生成会话主题）
@@ -144,4 +162,63 @@ fn extract_topic_text(record: &MessageRecord) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::io::Write;
+    use std::process;
+
+    #[test]
+    fn session_topics_redact_before_truncation_for_string_and_content_block_messages() {
+        let tmp = env::temp_dir().join(format!("mcp-sessions-redaction-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let topic = "topic token=SESSION_TEST_SECRET https://session.example.test";
+        let mut file = File::create(project_dir.join("session-topic.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "user-1",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": [{"type": "text", "text": topic}]}
+            })
+        )
+        .unwrap();
+
+        let config = Config {
+            projects_dir: tmp.clone(),
+        };
+        let auto = list_sessions(&config, Some("project"), RedactionMode::Auto).unwrap();
+        let auto_topic = auto.sessions[0].topic.as_deref().unwrap();
+        assert!(!auto_topic.contains("SESSION_TEST_SECRET"));
+        assert!(auto_topic.contains("token=[redacted]"));
+        assert!(auto.sessions[0].topic_redacted_count > 0);
+        assert!(auto.redaction.redacted_count > 0);
+
+        let strict = list_sessions(&config, Some("project"), RedactionMode::Strict).unwrap();
+        assert!(
+            !strict.sessions[0]
+                .topic
+                .as_deref()
+                .unwrap()
+                .contains("session.example.test")
+        );
+
+        let off = list_sessions(&config, Some("project"), RedactionMode::Off).unwrap();
+        assert!(
+            off.sessions[0]
+                .topic
+                .as_deref()
+                .unwrap()
+                .contains("SESSION_TEST_SECRET")
+        );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
 }

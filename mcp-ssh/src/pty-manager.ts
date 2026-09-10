@@ -6,7 +6,7 @@
 
 import xterm from '@xterm/headless'
 import type { ClientChannel } from 'ssh2'
-import type { PtyOptions, PtySessionInfo } from './types.js'
+import type { PtyCloseResult, PtyOptions, PtySessionInfo, PtyWriteResult } from './types.js'
 
 const Terminal = xterm.Terminal as typeof import('@xterm/headless').Terminal
 type TerminalType = import('@xterm/headless').Terminal
@@ -53,8 +53,8 @@ export class PtyManager {
 
     async start(deps: PtyDependencies, alias: string, command: string, options: PtyOptions = {}): Promise<string> {
         const ptyId = this.generateId()
-        const rows = options.rows || 24
-        const cols = options.cols || 80
+        const rows = options.rows ?? 24
+        const cols = options.cols ?? 80
         const maxBufferSize = this.normalizeBufferSize(options.bufferSize)
 
         const stream = await deps.execPty(alias, command, options)
@@ -120,13 +120,16 @@ export class PtyManager {
         return ptyId
     }
 
-    write(ptyId: string, data: string): boolean {
+    write(ptyId: string, data: string): PtyWriteResult {
         const session = this.getSession(ptyId)
         if (!session.active) {
             throw new Error(`PTY session '${ptyId}' is closed`)
         }
         session.lastInputAt = Date.now()
-        return session.stream.write(data)
+        return {
+            accepted: true,
+            backpressured: !session.stream.write(data),
+        }
     }
 
     read(
@@ -145,7 +148,7 @@ export class PtyManager {
         foregroundProcess: string
     } {
         const session = this.getSession(ptyId)
-        const mode = options.mode || 'screen'
+        const mode = options.mode ?? 'screen'
         const clear = options.clear !== false
 
         let data: string
@@ -186,32 +189,75 @@ export class PtyManager {
         return true
     }
 
-    close(ptyId: string): boolean {
+    close(ptyId: string): PtyCloseResult {
         const session = this.sessions.get(ptyId)
         if (!session) {
-            return false
+            return {
+                success: false,
+                ptyId,
+                status: 'not_found',
+                retryable: false,
+            }
         }
-        try {
-            session.stream.close()
-        } catch (e) {
-            console.warn(`PTY ${ptyId} stream close failed:`, (e as Error).message)
+
+        if (session.active) {
+            try {
+                session.stream.close()
+            } catch (error) {
+                return {
+                    success: false,
+                    ptyId,
+                    status: 'failed',
+                    retryable: true,
+                    error: error instanceof Error ? error.message : String(error),
+                }
+            }
         }
+
         try {
             session.terminal.dispose()
-        } catch (e) {
-            console.warn(`PTY ${ptyId} terminal dispose failed:`, (e as Error).message)
+        } catch (error) {
+            return {
+                success: false,
+                ptyId,
+                status: session.active ? 'unknown' : 'failed',
+                retryable: true,
+                error: error instanceof Error ? error.message : String(error),
+            }
         }
         session.active = false
         this.sessions.delete(ptyId)
-        return true
+        return {
+            success: true,
+            ptyId,
+            status: 'closed',
+            retryable: false,
+        }
     }
 
     /** 关闭指定 alias 的所有 PTY 会话 */
     closeByAlias(alias: string): void {
         for (const [id, session] of this.sessions) {
-            if (session.alias === alias) {
-                this.close(id)
+            if (session.alias !== alias) {
+                continue
             }
+            const result = this.close(id)
+            if (result.success) {
+                continue
+            }
+            try {
+                session.stream.destroy()
+            } catch {
+                // SSH 连接已失效，继续释放本地状态
+            }
+            try {
+                session.terminal.dispose()
+            } catch {
+                // SSH 连接已失效，继续释放本地状态
+            }
+            session.active = false
+            this.sessions.delete(id)
+            console.warn(`PTY ${id} 在 SSH 连接失效时强制清理: ${result.status}`)
         }
     }
 

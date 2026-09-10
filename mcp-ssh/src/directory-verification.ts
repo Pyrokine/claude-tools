@@ -291,18 +291,43 @@ export function buildRemoteDirectoryManifestCommand(
         'excluded_dirs=()',
         'while IFS= read -r -d "" item; do',
         '  if [ "$item" = "__MCP_FIND_ERROR__" ]; then exit 4; fi',
-        '  if [ "$item" = "$root" ]; then rel=.; elif [ "$root" = / ]; then rel=${item#/}; else rel=${item#"$root"/}; fi',
+        `  if [ "$item" = "$root" ]; then
+    rel=.
+  elif [ "$root" = / ]; then
+    rel=\${item#/}
+  else
+    rel=\${item#"$root"/}
+  fi`,
         '  for excluded_dir in "${excluded_dirs[@]}"; do case "$rel" in "$excluded_dir"/*) continue 2;; esac; done',
         pathExcludeRegex
-            ? `  if [ "$rel" != . ] && printf %s "$rel" | grep -Eq -- ${pathExcludeRegex}; then [ -d "$item" ] && excluded_dirs+=("$rel"); continue; fi`
+            ? `  if [ "$rel" != . ] && printf %s "$rel" | grep -Eq -- ${pathExcludeRegex}; then
+    [ -d "$item" ] && excluded_dirs+=("$rel")
+    continue
+  fi`
             : '  :',
         basenameExcludeRegex
-            ? `  base=${'${rel##*/}'}; if [ "$rel" != . ] && printf %s "$base" | grep -Eq -- ${basenameExcludeRegex}; then [ -d "$item" ] && excluded_dirs+=("$rel"); continue; fi`
+            ? `  base=\${rel##*/}
+  if [ "$rel" != . ] && printf %s "$base" | grep -Eq -- ${basenameExcludeRegex}; then
+    [ -d "$item" ] && excluded_dirs+=("$rel")
+    continue
+  fi`
             : '  :',
         followSymlinks
             ? '  :'
             : '  if [ "$rel" != . ] && [ -L "$item" ]; then skipped_symlinks=$((skipped_symlinks + 1)); continue; fi',
-        '  if [ -d "$item" ]; then type=directory; size=0; elif [ -f "$item" ]; then type=file; size=$(stat -c %s -- "$item"); else skipped_unsupported=$((skipped_unsupported + 1)); if [ "${#unsupported_samples[@]}" -lt 10 ]; then unsupported_samples+=("$(printf %s "$rel" | base64 | tr -d "\\n")"); fi; continue; fi',
+        `  if [ -d "$item" ]; then
+    type=directory
+    size=0
+  elif [ -f "$item" ]; then
+    type=file
+    size=$(stat -c %s -- "$item")
+  else
+    skipped_unsupported=$((skipped_unsupported + 1))
+    if [ "\${#unsupported_samples[@]}" -lt 10 ]; then
+      unsupported_samples+=("$(printf %s "$rel" | base64 | tr -d "\\n")")
+    fi
+    continue
+  fi`,
         '  count=$((count + 1))',
         `  if [ "$count" -gt ${maxEntries} ]; then printf '__MCP_LIMIT__\\tentries\\n'; break; fi`,
         '  raw_mode=$(stat -c %a -- "$item")',

@@ -3,6 +3,7 @@ import {
     ConsoleClearSchema,
     ConsoleEnableSchema,
     ConsoleGetSchema,
+    NetworkChallengeStateSchema,
     NetworkClearSchema,
     NetworkEnableSchema,
     NetworkGetSchema,
@@ -171,6 +172,10 @@ export class LogEventHandler {
             console.warn('[logs] console fallback (executeScript) failed:', e)
         }
 
+        // fallback 注入日志不经过 debugger 事件，先写回缓冲区以分配稳定 sequence
+        this.logManager.setConsole(tabId, messages)
+        messages = this.logManager.getConsole(tabId)
+
         // 按级别过滤（warning/warn 统一匹配）
         if (p.level) {
             const target = p.level
@@ -315,6 +320,12 @@ export class LogEventHandler {
         this.logManager.setNetwork(tabId, [])
 
         return { success: true }
+    }
+
+    async networkChallengeState(params: unknown, context: ActionContext): Promise<{ challengeRequired: boolean }> {
+        const p = NetworkChallengeStateSchema.parse(params) ?? {}
+        const tabId = await this.getManagedTabId(p.tabId, context, 'network_challenge_state')
+        return { challengeRequired: this.logManager.isChallengeRequired(tabId) }
     }
 
     private async getManagedTabId(

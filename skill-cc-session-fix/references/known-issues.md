@@ -7,8 +7,7 @@ Session jsonl 和 /resume 的相关 issue,按场景分组，修复前先查是�
 ### [Issue #22566 — Session JSONL 截断恢复标准做法](https://github.com/anthropics/claude-code/issues/22566)
 
 在 `cd` 之后 assistant 响应停止持久化,但用户消息继续写入，`--resume` 从 cd 之后任何点都加载失败,只有截断到 cd 之前最后完整
-turn 才能恢复
-**Workaround**:`head -n <LAST_GOOD_LINE>`,即 `scripts/truncate.py` 核心逻辑
+turn 才能恢复 **Workaround**:`head -n <LAST_GOOD_LINE>`,即 `scripts/truncate.py` 核心逻辑
 
 ### [Issue #22526 — parentUuid 链包含 phantom 引用](https://github.com/anthropics/claude-code/issues/22526)
 
@@ -28,18 +27,18 @@ assistant 消息丢失)
 
 ### [Issue #21067 — 大 tool output 让 resume 卡死](https://github.com/anthropics/claude-code/issues/21067)
 
-某行 tool_result 内嵌 675KB 内容,resume 在反序列化/渲染时无限挂起
-**Workaround**:找行 `awk '{if(length>50000) print NR": "length" bytes"}' session.jsonl` 然后 Edit 截断那行内容
+某行 tool_result 内嵌 675KB 内容,resume 在反序列化/渲染时无限挂起 **Workaround**:找行
+`awk '{if(length>50000) print NR": "length" bytes"}' session.jsonl` 然后 Edit 截断那行内容
 
 ### [Issue #21022 — 访问 >50MB jsonl 文件时 CC 冻结](https://github.com/anthropics/claude-code/issues/21022)
 
-102MB session 文件直接让系统冻结(90% RAM),需强杀
+102MB session 文件直接让系统冻结 (90% RAM),需强杀
 
 ### [Issue #19036 — resume 含 1.4MB git diff 时冻结](https://github.com/anthropics/claude-code/issues/19036)
 
 ### [Issue #22204 — /resume 命令在大 session 下完全无响应](https://github.com/anthropics/claude-code/issues/22204)
 
-在 autocomplete 阶段(未 enter)就冻结,说明 session scanner 是同步加载
+在 autocomplete 阶段 (未 enter)就冻结,说明 session scanner 是同步加载
 
 ### [Issue #30302 — 多天 session + 207 subagent 文件让 resume 崩溃](https://github.com/anthropics/claude-code/issues/30302)
 
@@ -51,8 +50,7 @@ subagent 直接爆内存
 ### [Issue #25920 — 首条 user > 15KB 让 session "找不到"](https://github.com/anthropics/claude-code/issues/25920)
 
 Session metadata 解析器硬编码只读文件前 16KB，首条非 system user message >15KB 时 firstPrompt 取不到,session 过滤器返回
-null,session picker 和 `--resume <uuid>` 都找不到
-**Workaround**:在 jsonl 尾部注入 custom-title:
+null,session picker 和 `--resume <uuid>` 都找不到 **Workaround**:在 jsonl 尾部注入 custom-title:
 
 ```json
 {"type":"custom-title","customTitle":"My Title","sessionId":"<uuid>"}

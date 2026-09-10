@@ -15,8 +15,8 @@ import { formatError, formatResult } from './utils.js' // ========== Schemas ===
 const ptyStartSchema = z.object({
     alias: z.string().describe('连接别名'),
     command: z.string().describe('要执行的命令'),
-    rows: z.number().optional().describe('终端行数，默认 24'),
-    cols: z.number().optional().describe('终端列数，默认 80'),
+    rows: z.number().int().positive().optional().describe('终端行数，默认 24'),
+    cols: z.number().int().positive().optional().describe('终端列数，默认 80'),
     term: z.string().optional().describe('终端类型，默认 xterm-256color'),
     cwd: z.string().optional().describe('工作目录'),
     env: z.record(z.string(), z.string()).optional().describe('环境变量'),
@@ -42,8 +42,8 @@ const ptyReadSchema = z.object({
 
 const ptyResizeSchema = z.object({
     ptyId: z.string().describe('PTY 会话 ID'),
-    rows: z.number().describe('新的行数'),
-    cols: z.number().describe('新的列数'),
+    rows: z.number().int().positive().describe('新的行数'),
+    cols: z.number().int().positive().describe('新的列数'),
 })
 
 const ptyCloseSchema = z.object({
@@ -76,8 +76,8 @@ async function handlePtyStart(args: z.infer<typeof ptyStartSchema>) {
 
 async function handlePtyWrite(args: z.infer<typeof ptyWriteSchema>) {
     try {
-        const success = sessionManager.ptyWrite(args.ptyId, args.data)
-        return formatResult({ success, ptyId: args.ptyId })
+        const result = sessionManager.ptyWrite(args.ptyId, args.data)
+        return formatResult({ success: result.accepted, ptyId: args.ptyId, ...result })
     } catch (error) {
         return formatError(error)
     }
@@ -86,13 +86,13 @@ async function handlePtyWrite(args: z.infer<typeof ptyWriteSchema>) {
 async function handlePtyRead(args: z.infer<typeof ptyReadSchema>) {
     try {
         const readResult = sessionManager.ptyRead(args.ptyId, {
-            mode: args.mode || 'screen',
+            mode: args.mode ?? 'screen',
             clear: args.clear !== false,
         })
         return formatResult({
             success: true,
             ptyId: args.ptyId,
-            mode: args.mode || 'screen',
+            mode: args.mode ?? 'screen',
             ...readResult,
         })
     } catch (error) {
@@ -111,10 +111,12 @@ async function handlePtyResize(args: z.infer<typeof ptyResizeSchema>) {
 
 async function handlePtyClose(args: z.infer<typeof ptyCloseSchema>) {
     try {
-        const success = sessionManager.ptyClose(args.ptyId)
+        const result = sessionManager.ptyClose(args.ptyId)
         return formatResult({
-            success,
-            message: success ? `PTY session closed: ${args.ptyId}` : `PTY session not found: ${args.ptyId}`,
+            ...result,
+            message: result.success
+                ? `PTY session closed: ${args.ptyId}`
+                : `PTY session close ${result.status}: ${args.ptyId}`,
         })
     } catch (error) {
         return formatError(error)
@@ -170,7 +172,9 @@ export function registerPtyTools(server: McpServer): void {
 
 示例：
 - 发送命令: ssh_pty_write(ptyId="xxx", data="ls -la\\r")
-- 退出 top: ssh_pty_write(ptyId="xxx", data="q")`,
+- 退出 top: ssh_pty_write(ptyId="xxx", data="q")
+
+write 返回 accepted=true 表示数据已被本地 stream 接收。backpressured=true 仅表示缓冲区达到高水位，不表示数据丢失。`,
             inputSchema: ptyWriteSchema,
         },
         (args) => handlePtyWrite(args)
@@ -205,7 +209,8 @@ export function registerPtyTools(server: McpServer): void {
     server.registerTool(
         'ssh_pty_close',
         {
-            description: '关闭 PTY 会话',
+            description:
+                '关闭 PTY 会话，返回 closed、not_found、failed 或 unknown。可重试失败会保留会话供同一 ptyId 重试。',
             inputSchema: ptyCloseSchema,
         },
         (args) => handlePtyClose(args)

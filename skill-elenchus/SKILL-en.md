@@ -2,7 +2,7 @@
 name: elenchus
 description: Dialectical analysis methodology. MUST be invoked when complexity is L1 or L2 — do not self-analyze. Applies to: reviewing code changes, auditing design proposals, first-principles analysis, multi-perspective critique, abstract Socratic questioning. Internally adapts depth (L1 serial / L2 multi-expert parallel).
 argument-hint: "[analysis target: code changes / design proposal / abstract question]"
-version: 1.1.0
+version: 1.1.1
 ---
 
 # Elenchus — Dialectical Analysis Methodology
@@ -62,7 +62,7 @@ file):
 
 | Rule                                         | File                                                         | L1 |
 |----------------------------------------------|--------------------------------------------------------------|----|
-| Dialectical thinking engine                  | [prompts/elenchus-en.md](prompts/elenchus-en.md)             | ✓  |
+| Dialectical thinking engine                  | [prompts/elenchus-en.md](prompts/elenchus-en.md)             | ✓ |
 | Shared review discipline                     | [prompts/shared-rules.md](prompts/shared-rules.md)           |    |
 | Expert 1 — Logic & Correctness               | [prompts/expert-logic.md](prompts/expert-logic.md)           |    |
 | Expert 2 — Security & Robustness             | [prompts/expert-security.md](prompts/expert-security.md)     |    |

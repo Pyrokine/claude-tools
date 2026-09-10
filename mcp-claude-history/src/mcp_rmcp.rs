@@ -53,6 +53,7 @@ pub struct SearchToolParams {
     pub until: Option<String>,
     #[serde(default)]
     pub types: Option<String>,
+    /// Comma-separated classifications. `human` denotes a user-shaped record, not verified human authorship.
     #[serde(default)]
     pub subtypes: Option<String>,
     #[serde(default)]
@@ -146,10 +147,12 @@ pub struct ContextToolParams {
     /// 截止到另一个 ref（session:line），从 anchor 到该 ref（含）
     #[serde(default)]
     pub until_ref: Option<String>,
+    /// `forward` or `backward`; applies only to until_type.
     #[serde(default)]
     pub direction: Option<String>,
     #[serde(default)]
     pub types: Option<String>,
+    /// Comma-separated classifications. `human` denotes a user-shaped record, not verified human authorship.
     #[serde(default)]
     pub subtypes: Option<String>,
     #[serde(default)]
@@ -186,6 +189,7 @@ pub struct TraceToolParams {
     pub max_total: Option<usize>,
     #[serde(default)]
     pub types: Option<String>,
+    /// Comma-separated classifications. `human` denotes a user-shaped record, not verified human authorship.
     #[serde(default)]
     pub subtypes: Option<String>,
     #[serde(default)]
@@ -202,6 +206,7 @@ pub struct TraceToolParams {
     pub until_type: Option<String>,
     #[serde(default)]
     pub until_ref: Option<String>,
+    /// `forward` or `backward`; applies only to until_type.
     #[serde(default)]
     pub direction: Option<String>,
     #[serde(default)]
@@ -217,6 +222,8 @@ pub struct ProjectsToolParams {}
 pub struct SessionsToolParams {
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default)]
+    pub redaction: Option<String>,
 }
 
 #[derive(Clone)]
@@ -263,7 +270,7 @@ impl McpHistoryService {
 
 #[tool_router]
 impl McpHistoryService {
-    #[tool(description = "Search through Claude Code conversation history")]
+    #[tool(description = "Search Claude Code history. `human` means user-shaped; it does not verify human authorship.")]
     async fn history_search(&self, Parameters(p): Parameters<SearchToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
 
@@ -357,7 +364,7 @@ impl McpHistoryService {
         tool_text_result(result)
     }
 
-    #[tool(description = "Get surrounding messages for context")]
+    #[tool(description = "Get surrounding messages. Use one range mode: before/after, until_type, or until_ref.")]
     async fn history_context(&self, Parameters(p): Parameters<ContextToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let types: Vec<String> = split_csv_param(p.types.as_deref());
@@ -390,7 +397,7 @@ impl McpHistoryService {
         tool_text_result(result)
     }
 
-    #[tool(description = "Trace nearby messages and tool call/result pairs for a message ref")]
+    #[tool(description = "Trace nearby messages and tool call/result pairs. Choose one range mode.")]
     async fn history_trace(&self, Parameters(p): Parameters<TraceToolParams>) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let redaction = match parse_optional_redaction_mode_param(p.redaction.as_deref()) {
@@ -399,8 +406,8 @@ impl McpHistoryService {
         };
         let params = TraceParams {
             r#ref: p.r#ref,
-            before: p.before.unwrap_or(20),
-            after: p.after.unwrap_or(20),
+            before: p.before,
+            after: p.after,
             project: p.project,
             max_content: p.max_content.unwrap_or(4000),
             max_total: p.max_total.unwrap_or(40000),
@@ -437,14 +444,18 @@ impl McpHistoryService {
         tool_text_result(result)
     }
 
-    #[tool(description = "List sessions in a project")]
+    #[tool(description = "List project sessions. Topics are redacted before preview; redaction defaults to auto.")]
     async fn history_sessions(
         &self,
         Parameters(p): Parameters<SessionsToolParams>,
     ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let project = p.project.clone();
-        let result = tokio::task::spawn_blocking(move || list_sessions(&cfg, project.as_deref()))
+        let redaction = match parse_optional_redaction_mode_param(p.redaction.as_deref()) {
+            Ok(redaction) => redaction,
+            Err(e) => return error_text(pretty_error(e)),
+        };
+        let result = tokio::task::spawn_blocking(move || list_sessions(&cfg, project.as_deref(), redaction))
             .await
             .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         tool_text_result(result)

@@ -282,14 +282,27 @@ async function handleClearCache({ unifiedSession, mode }: ManageContext, args: M
     return unifiedSession.withTabId(undefined, async () => {
         const cacheType = (args.cacheType ?? 'all') as CacheType
         if (mode === 'extension') {
-            return formatResponse({
-                success: true,
-                action: 'clearCache',
-                cacheType,
-                mode,
-                warning:
-                    'Extension 模式不支持 clearCache，如需清除 cookies 请使用 cookies action=clear（必须带 name/domain/url 过滤），如需清除 storage/cache 请切换到 CDP 模式',
-            })
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: JSON.stringify({
+                            error: {
+                                code: 'UNSUPPORTED_MODE',
+                                message: 'Extension 模式不支持 clearCache，未执行清除操作',
+                                suggestion:
+                                    '清除 cookies 请使用 cookies action=clear（必须带 url 或 domain 过滤），' +
+                                    '清除 storage/cache 请切换到 CDP 模式',
+                            },
+                            action: 'clearCache',
+                            cacheType,
+                            mode,
+                            actionPerformed: false,
+                        }),
+                    },
+                ],
+                isError: true,
+            }
         }
         const session = getSession()
         await session.clearCache(cacheType)

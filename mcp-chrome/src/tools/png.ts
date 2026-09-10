@@ -203,18 +203,21 @@ function pngChunk(type: string, data: Buffer): Buffer {
     return Buffer.concat([length, name, data, crc])
 }
 
+const CRC_POLYNOMIAL = 3_988_292_384
+const UINT32_MASK = 4_294_967_295
+
 const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
     let c = n
     for (let k = 0; k < 8; k++) {
-        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+        c = c & 1 ? CRC_POLYNOMIAL ^ (c >>> 1) : c >>> 1
     }
     return c >>> 0
 })
 
 function crc32(buffer: Buffer): number {
-    let c = 0xffffffff
+    let c = UINT32_MASK
     for (const byte of buffer) {
         c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8)
     }
-    return (c ^ 0xffffffff) >>> 0
+    return (c ^ UINT32_MASK) >>> 0
 }

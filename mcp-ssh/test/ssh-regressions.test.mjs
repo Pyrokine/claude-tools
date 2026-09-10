@@ -19,13 +19,16 @@ import {
     checkRsync,
     clearRsyncCache,
     downloadFile,
+    getFileInfo,
     listDir,
     mkdir,
+    readFile,
     syncFiles,
     uploadFile,
 } from '../dist/file-ops.js'
 import { sessionManager, SessionManager } from '../dist/session-manager.js'
 import { createAtomicUploadPath, registerFileTools } from '../dist/tools/file.js'
+import { dynamicSshPortSchema, sshPortSchema } from '../dist/tools/schema.js'
 import { buildTransferOutcome } from '../dist/transfer-outcome.js'
 
 const exec = promisify(execCallback)
@@ -36,11 +39,20 @@ function makeTempDir(t) {
     return directory
 }
 
+test('SSH port schemas reject out-of-range and fractional values', () => {
+    for (const invalid of [-1, 0, 65536, 22.5]) {
+        assert.equal(sshPortSchema.safeParse(invalid).success, false)
+    }
+    assert.equal(sshPortSchema.safeParse(22).success, true)
+    assert.equal(dynamicSshPortSchema.safeParse(0).success, true)
+    assert.equal(dynamicSshPortSchema.safeParse(65535).success, true)
+})
+
 test('lineRange awk program keeps statements separated', () => {
     const program = buildLineRangeAwkProgram(2, 4)
     assert.match(program, /^BEGIN \{.*\}$/m)
     assert.match(program, /^NR >= 2 && NR <= 4 \{$/m)
-    assert.match(program, /^    actual_end = NR$/m)
+    assert.match(program, /^ {4}actual_end = NR$/m)
     assert.match(program, /^END \{$/m)
 })
 
@@ -135,6 +147,7 @@ test('atomic upload paths are unpredictable and exclusive SFTP writes refuse reu
 test('SFTP directory listing rejects hostile entry names before path construction', async () => {
     const attrs = { size: 0, mode: 0o100644, uid: 1, gid: 1, mtime: 0, atime: 0 }
     for (const filename of ['', '../escape', '/absolute', 'nested/name', 'nested\\name', '.', '..', 'nul\0name']) {
+        // noinspection JSUnusedGlobalSymbols — listDir 通过 SFTPWrapper 结构类型调用
         const sftp = {
             readdir(_remotePath, callback) {
                 callback(null, [{ filename, attrs }])
@@ -197,6 +210,33 @@ test('failed atomic SFTP download preserves the existing target and removes temp
     assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
 })
 
+test('synchronous SFTP read stream failure closes an owned session without temporary data', async (t) => {
+    const directory = makeTempDir(t)
+    const localPath = path.join(directory, 'target.txt')
+    fs.writeFileSync(localPath, 'original')
+    const originalGetSftp = sessionManager.getSftp
+    let endCalls = 0
+    sessionManager.getSftp = async () => ({
+        stat(_remotePath, callback) {
+            callback(null, { size: 12 })
+        },
+        createReadStream() {
+            throw new Error('injected stream construction failure')
+        },
+        end() {
+            ++endCalls
+        },
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+
+    await assert.rejects(downloadFile('owned', '/remote/target.txt', localPath), /injected stream construction failure/)
+    assert.equal(endCalls, 1)
+    assert.equal(fs.readFileSync(localPath, 'utf8'), 'original')
+    assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
+})
+
 test('clean premature SFTP EOF preserves the existing target and removes temporary data', async (t) => {
     const directory = makeTempDir(t)
     const localPath = path.join(directory, 'target.txt')
@@ -223,6 +263,7 @@ test('recursive SFTP mkdir creates missing parents without remote exec', async (
     const directories = new Set(['/'])
     const created = []
     const missing = () => Object.assign(new Error('No such file'), { code: 2 })
+    // noinspection JSUnusedGlobalSymbols — mkdir 通过 SFTPWrapper 结构类型调用
     const sftp = {
         stat(remotePath, callback) {
             if (directories.has(remotePath)) {
@@ -241,6 +282,66 @@ test('recursive SFTP mkdir creates missing parents without remote exec', async (
 
     await mkdir('unused', '/one/two/three', true, sftp)
     assert.deepEqual(created, ['/one', '/one/two', '/one/two/three'])
+})
+
+test('SFTP read pagination returns whole UTF-8 characters and next byte offsets', async (t) => {
+    const content = Buffer.from('A😀B')
+    const originalGetSftp = sessionManager.getSftp
+    sessionManager.getSftp = async () => ({
+        stat(_remotePath, callback) {
+            callback(null, { size: content.length })
+        },
+        createReadStream(_remotePath, { start, end }) {
+            return Readable.from([content.subarray(start, end + 1)])
+        },
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+
+    const first = await readFile('unused', '/remote/utf8.txt', { maxBytes: 4 })
+    assert.equal(first.content, 'A')
+    assert.equal(first.read_offset, 0)
+    assert.equal(first.read_bytes, 1)
+    assert.equal(first.next_offset, 1)
+
+    const second = await readFile('unused', '/remote/utf8.txt', { offset: first.next_offset, maxBytes: 4 })
+    assert.equal(second.content, '😀')
+    assert.equal(second.read_offset, 1)
+    assert.equal(second.next_offset, 5)
+
+    await assert.rejects(readFile('unused', '/remote/utf8.txt', { offset: 2, maxBytes: 4 }), /UTF-8 character boundary/)
+})
+
+test('SFTP timeout reports an unknown remote operation state and ignores late callbacks', async (t) => {
+    const originalGetSftp = sessionManager.getSftp
+    let ended = false
+    let statCallback
+    sessionManager.getSftp = async () => ({
+        stat(_remotePath, callback) {
+            statCallback = callback
+        },
+        end() {
+            ended = true
+        },
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+
+    await assert.rejects(getFileInfo('unused', '/remote/stalled.txt', 10), (error) => {
+        assert.equal(error.name, 'SftpOperationTimeoutError')
+        assert.deepEqual(error.details, {
+            operationStatus: 'unknown',
+            retryable: true,
+            timeout: 10,
+        })
+        return true
+    })
+    assert.equal(ended, true)
+    statCallback(null, { size: 0, mode: 0o100644, uid: 1, gid: 1, mtime: 0, atime: 0 })
+    await new Promise((resolve) => setImmediate(resolve))
 })
 
 test('followSymlinks is rejected before transport selection when the local allowlist is configured', async (t) => {
@@ -801,6 +902,7 @@ test('directory manifests stream hashes, apply excludes, and compare local with 
 
     const local = await createLocalDirectoryManifest(directory, request, exclude)
     const command = buildRemoteDirectoryManifestCommand(directory, request, exclude)
+    // noinspection JSCheckFunctionSignatures — util.promisify 保留 exec 的参数签名
     const { stdout } = await exec(command, { maxBuffer: 1024 * 1024 })
     const remote = parseRemoteDirectoryManifest(stdout)
     const comparison = compareDirectoryManifests(local, remote, request)
@@ -813,6 +915,7 @@ test('directory manifests stream hashes, apply excludes, and compare local with 
     assert.equal(comparison.summary.missing, 0)
 })
 
+// noinspection LongLine — 回归测试标题完整描述两个独立校验维度
 test('directory verification uses relative excludes and deletion baselines independently from stale checks', async (t) => {
     const root = makeTempDir(t)
     const source = path.join(root, 'source')
@@ -859,12 +962,14 @@ test('directory manifests report unsupported entries and follow a symlinked root
     const linkedRoot = path.join(root, 'linked-root')
     fs.mkdirSync(target)
     fs.writeFileSync(path.join(target, 'file.txt'), 'content')
+    // noinspection JSCheckFunctionSignatures — util.promisify 保留 exec 的参数签名
     await exec(`mkfifo ${JSON.stringify(path.join(target, 'pipe'))}`)
     fs.symlinkSync(target, linkedRoot)
 
     const request = { count: true }
     const local = await createLocalDirectoryManifest(linkedRoot, request)
     const command = buildRemoteDirectoryManifestCommand(linkedRoot, request)
+    // noinspection JSCheckFunctionSignatures — util.promisify 保留 exec 的参数签名
     const { stdout } = await exec(command, { maxBuffer: 1024 * 1024 })
     const remote = parseRemoteDirectoryManifest(stdout)
     const comparison = compareDirectoryManifests(local, remote, request)

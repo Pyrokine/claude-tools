@@ -88,7 +88,8 @@ export async function assertManagedTab(
             mcpWindowId: context.mcpWindowId,
         })
         throw new ExpectedOperationError(
-            `${operation} 拒绝操作非托管 tab, ${detail}, 请使用 browse(action="list") 选择 managed=true 的受控 tab, 或用 manage(action="newPage") 创建受控页面`
+            `${operation} 拒绝操作非托管 tab, ${detail}, ` +
+                '请从 browse(action="list") 选择 managed=true 的 tab，或用 manage(action="newPage") 创建受控页面'
         )
     }
     return tab
@@ -213,7 +214,9 @@ export async function getDomFrameSnapshot(
 
                                 let settled = false
                                 const finish = (value: boolean) => {
-                                    if (settled) return
+                                    if (settled) {
+                                        return
+                                    }
                                     settled = true
                                     window.clearTimeout(timer)
                                     window.removeEventListener('message', onMessage)

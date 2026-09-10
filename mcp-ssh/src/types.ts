@@ -232,8 +232,25 @@ export interface PtySessionInfo {
     active: boolean
 }
 
+export interface PtyWriteResult {
+    accepted: true
+    backpressured: boolean
+}
+
+export type PtyCloseStatus = 'closed' | 'not_found' | 'failed' | 'unknown'
+
+export interface PtyCloseResult {
+    success: boolean
+    ptyId: string
+    status: PtyCloseStatus
+    retryable: boolean
+    error?: string
+}
+
 // 端口转发类型
 export type ForwardType = 'local' | 'remote'
+
+export type ForwardLifecycle = 'pending' | 'active' | 'closing' | 'closed'
 
 // 端口转发信息
 export interface PortForwardInfo {
@@ -246,6 +263,8 @@ export interface PortForwardInfo {
     remotePort: number
     createdAt: number
     active: boolean
+    lifecycle: ForwardLifecycle
+    acceptingConnections: boolean
 }
 
 export type ForwardCloseMode = 'graceful' | 'force'

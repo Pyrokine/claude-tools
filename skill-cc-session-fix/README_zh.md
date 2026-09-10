@@ -8,7 +8,7 @@ Claude Code 把每次会话存成 `~/.claude/projects/<hash>/<uuid>.jsonl`，长
 
 - `/compact` 边界 — **打破时间戳单调性**(CC 会在边界之后以更早的时间戳回放摘要消息)
 - 失败的 `/resume` 尝试 — 在文件尾部追加 `system` 消息,其 parentUuid 附着在老的 leaf 上
-- 大 tool_result(单行 >500KB) — **卡死 resume 反序列化**
+- 大 tool_result (单行 >500KB) — **卡死 resume 反序列化**
 - 首条 user 消息 >15KB — session **从列表里消失
   **([Issue #25920](https://github.com/anthropics/claude-code/issues/25920))
 
@@ -18,7 +18,7 @@ Claude Code 把每次会话存成 `~/.claude/projects/<hash>/<uuid>.jsonl`，长
 
 ## 安装
 
-### 软链(推荐,随 repo 自动更新)
+### 软链 (推荐,随 repo 自动更新)
 
 ```bash
 ln -s /path/to/skill-cc-session-fix ~/.claude/skills/cc-session-fix
@@ -89,13 +89,13 @@ scripts/truncate.py <target> --line <N> --title "..." --new-session # 分叉到�
 
 ## 常见场景
 
-| 症状                  | 修复                                                                                                |
-|---------------------|---------------------------------------------------------------------------------------------------|
-| `Resume cancelled`  | 看文件大小;>100MB 就截到 1 万行左右                                                                           |
-| resume 恢复到错误历史点     | diagnose 显示 `Resume leaf` 偏离 `Dialog tail` → 截到 dialog tail                                       |
-| session 不在列表里       | [Issue #25920](https://github.com/anthropics/claude-code/issues/25920);truncate 会自动补 custom-title |
-| 想保留原文件给 MCP 历史检索    | 用 `--new-session` 分叉到新 UUID                                                                       |
-| Dangling parentUuid | diagnose 报数量;可能需要手改首行 parentUuid 为 `null`                                                         |
+| 症状                        | 修复                                                                                                  |
+|-----------------------------|-------------------------------------------------------------------------------------------------------|
+| `Resume cancelled`          | 看文件大小;>100MB 就截到 1 万行左右                                                                   |
+| resume 恢复到错误历史点     | diagnose 显示 `Resume leaf` 偏离 `Dialog tail` → 截到 dialog tail                                     |
+| session 不在列表里          | [Issue #25920](https://github.com/anthropics/claude-code/issues/25920);truncate 会自动补 custom-title |
+| 想保留原文件给 MCP 历史检索 | 用 `--new-session` 分叉到新 UUID                                                                      |
+| Dangling parentUuid         | diagnose 报数量;可能需要手改首行 parentUuid 为 `null`                                                 |
 
 ## 涵盖的 Issue
 
@@ -111,13 +111,13 @@ scripts/truncate.py <target> --line <N> --title "..." --new-session # 分叉到�
 
 行为模型见 [references/mechanism.md](references/mechanism.md):
 
-- jsonl 行号 ≠ 时间戳顺序(/compact 会重写历史)
-- CC 选 `/resume` 锚点按**文件物理末尾**,不按时间戳
+- jsonl 行号 ≠ 时间戳顺序 (/compact 会重写历史)
+- CC 选 `/resume` 锚点按 **文件物理末尾**,不按时间戳
 - custom-title 末尾注入的规则
 
 ## 致谢
 
-- [mason0510/fix-jsonl](https://github.com/mason0510/fix-jsonl) — JSONL 瘦身(聚焦点不同,互补)
+- [mason0510/fix-jsonl](https://github.com/mason0510/fix-jsonl) — JSONL 瘦身 (聚焦点不同,互补)
 - 相关 issue 下的社区 workaround 模式
 
 ## License

@@ -25,17 +25,19 @@ import {
     ExecOptions,
     ExecResult,
     ExternalTransferCapability,
-    HARD_EXEC_MAX_OUTPUT_SIZE,
     ForwardCloseOptions,
     ForwardCloseResult,
+    HARD_EXEC_MAX_OUTPUT_SIZE,
     OperationCancelResult,
     OperationInfo,
     OperationReadResult,
     OperationStartOptions,
     PersistedSession,
     PortForwardInfo,
+    PtyCloseResult,
     PtyOptions,
     PtySessionInfo,
+    PtyWriteResult,
     SSHConnectionConfig,
     SSHSessionBrief,
     SSHSessionDetail,
@@ -295,7 +297,7 @@ export class SessionManager {
             alias,
             identity: this.sessionIdentity(session),
             host: session.config.host,
-            port: session.config.port || 22,
+            port: session.config.port ?? 22,
             username: session.config.username,
             runAs: session.config.runAs,
             authMethod: session.config.privateKeyPath
@@ -321,7 +323,7 @@ export class SessionManager {
             loginUser: config.username,
             runAs: config.runAs,
             host: config.host,
-            port: config.port || 22,
+            port: config.port ?? 22,
             defaultEnvKeys: config.defaultEnv ? Object.keys(config.defaultEnv) : [],
             envKeys: config.env ? Object.keys(config.env) : [],
             hasJumpHost: Boolean(config.jumpHost),
@@ -361,7 +363,7 @@ export class SessionManager {
             alias,
             identity: this.sessionIdentity(session),
             host: config.host,
-            port: config.port || 22,
+            port: config.port ?? 22,
             username: config.username,
             authMethod,
             keyPath: keyPathUsable ? expandedKeyPath : undefined,
@@ -464,7 +466,31 @@ export class SessionManager {
         const startTime = Date.now()
         const timeout = options.timeout ?? this.defaultTimeout
         const maxOutputSize = this.normalizeMaxOutputSize(options.maxOutputSize)
-        const fullCommand = this.buildCommand(`sudo -S ${command}`, session, options)
+        const runAs = options.useLoginUser ? undefined : (options.runAs ?? session.config.runAs)
+        let fullCommand: string
+        let context: CommandContext
+        if (runAs) {
+            if (!this.isValidUsername(runAs)) {
+                throw new Error(`Invalid username: ${runAs}`)
+            }
+            const loadProfile = options.loadProfile ?? true
+            const targetCommand = this.buildCommand(
+                `${loadProfile ? this.getLoadProfileCommand() : ''}sudo -S ${command}`,
+                session,
+                options
+            )
+            const env = { ...session.config.defaultEnv, ...session.config.env, ...options.env }
+            fullCommand = `su - ${runAs} -c ${this.escapeShellArg(targetCommand)}`
+            context = {
+                runAs,
+                loadProfile,
+                cwd: options.cwd,
+                envInjectedKeys: Object.keys(env).filter((key) => this.isValidEnvKey(key)),
+            }
+        } else {
+            fullCommand = this.buildCommand(`sudo -S ${command}`, session, options)
+            context = { cwd: options.cwd }
+        }
 
         return new Promise<ExecResult>((resolve, reject) => {
             let settled = false
@@ -498,7 +524,7 @@ export class SessionManager {
                 } catch {
                     // ignore
                 }
-                reject(this.createCommandTimeoutError(alias, timeout, { cwd: options.cwd }, outputPreview()))
+                reject(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
             }, timeout)
 
             session.client.exec(fullCommand, {}, (err, stream) => {
@@ -547,7 +573,7 @@ export class SessionManager {
                         stderrTruncated: stderrTruncated || undefined,
                         ...this.outputMetadata(outputPreview()),
                         ...this.emptyOutputFailureMetadata(code, outputPreview()),
-                        ...this.resultMetadata(session, options, { cwd: options.cwd }),
+                        ...this.resultMetadata(session, options, context),
                     })
                 })
 
@@ -616,7 +642,7 @@ export class SessionManager {
 
     // ===== PTY 委托 =====
 
-    ptyWrite(ptyId: string, data: string): boolean {
+    ptyWrite(ptyId: string, data: string): PtyWriteResult {
         return this.ptyManager.write(ptyId, data)
     }
 
@@ -642,7 +668,7 @@ export class SessionManager {
         return this.ptyManager.resize(ptyId, rows, cols)
     }
 
-    ptyClose(ptyId: string): boolean {
+    ptyClose(ptyId: string): PtyCloseResult {
         return this.ptyManager.close(ptyId)
     }
 
@@ -736,7 +762,7 @@ export class SessionManager {
     }
 
     private configIdentity(config: SSHConnectionConfig): string {
-        return `${config.username}@${config.host}:${config.port || 22}`
+        return `${config.username}@${config.host}:${config.port ?? 22}`
     }
 
     private connectionFingerprint(config: SSHConnectionConfig): string {
@@ -748,7 +774,7 @@ export class SessionManager {
                 : Object.entries(values).sort(([left], [right]) => left.localeCompare(right))
         const payload = (value: SSHConnectionConfig): Record<string, unknown> => ({
             host: value.host,
-            port: value.port || 22,
+            port: value.port ?? 22,
             username: value.username,
             alias: value.alias,
             template: value.template,
@@ -797,7 +823,10 @@ export class SessionManager {
     }
 
     private recommendedReadCommand(): string {
-        return '将远端命令输出重定向到文件，例如 command > /tmp/mcp-ssh-output.txt 2>&1，然后用 ssh_read_file(remotePath="/tmp/mcp-ssh-output.txt", tail=true, maxBytes=65536) 分块读取'
+        return (
+            '将远端命令输出重定向到文件，例如 command > /tmp/mcp-ssh-output.txt 2>&1，' +
+            '再用 ssh_read_file(remotePath="/tmp/mcp-ssh-output.txt", tail=true, maxBytes=65536) 分块读取'
+        )
     }
 
     private emptyOutputFailureMetadata(exitCode: number, preview: OutputPreview): Partial<ExecResult> {
@@ -808,7 +837,8 @@ export class SessionManager {
             emptyOutputFailure: true,
             recommendedReadCommand: this.recommendedReadCommand(),
             suggestion:
-                '远端命令以非零退出码结束，但没有 stdout/stderr。请检查 cwd、effectiveUser、shell/profile，或用 set -x / 显式重定向输出到文件后再用 ssh_read_file 读取',
+                '远端命令以非零退出码结束，但没有 stdout/stderr。请检查 cwd、effectiveUser、shell/profile，' +
+                '或用 set -x / 显式重定向输出到文件后再用 ssh_read_file 读取',
         }
     }
 
@@ -912,7 +942,8 @@ export class SessionManager {
             `pid=${pid}`,
             `expected=${this.escapeShellArg(expectedMarker)}`,
             'if [ ! -r "/proc/$pid/environ" ]; then printf "operation marker unavailable" >&2; exit 3; fi',
-            'if ! tr "\\000" "\\n" < "/proc/$pid/environ" | grep -Fqx -- "$expected"; then printf "operation marker mismatch" >&2; exit 4; fi',
+            'if ! tr "\\000" "\\n" < "/proc/$pid/environ" | grep -Fqx -- "$expected"; then ' +
+                'printf "operation marker mismatch" >&2; exit 4; fi',
             `kill -TERM -- ${signalTarget}`,
         ].join('; ')
         try {
@@ -960,9 +991,9 @@ export class SessionManager {
 
             if (options.pty) {
                 execOptions.pty = {
-                    rows: options.rows || 24,
-                    cols: options.cols || 80,
-                    term: options.term || 'xterm-256color',
+                    rows: options.rows ?? 24,
+                    cols: options.cols ?? 80,
+                    term: options.term ?? 'xterm-256color',
                 }
             }
 
@@ -1151,7 +1182,7 @@ export class SessionManager {
             connectConfig.sock = await this.forwardConnection(
                 jumpSession.client,
                 config.host,
-                config.port || 22,
+                config.port ?? 22,
                 readyTimeout
             )
         }
@@ -1252,9 +1283,9 @@ export class SessionManager {
                 fullCommand,
                 {
                     pty: {
-                        rows: options.rows || 24,
-                        cols: options.cols || 80,
-                        term: options.term || 'xterm-256color',
+                        rows: options.rows ?? 24,
+                        cols: options.cols ?? 80,
+                        term: options.term ?? 'xterm-256color',
                     },
                 },
                 (err, stream) => {
@@ -1483,7 +1514,7 @@ export class SessionManager {
             })
         }
         const err = error instanceof Error ? error : new Error(String(error))
-        const target = `${config.username}@${config.host}:${config.port || 22}`
+        const target = `${config.username}@${config.host}:${config.port ?? 22}`
         return new ConnectionError(`SSH connection to ${target} failed: ${sanitizeKeyError(err.message)}`, {
             ...this.classifyConnectionError(err, readyTimeout),
             connectionStep,
@@ -1606,7 +1637,7 @@ export class SessionManager {
             data.push({
                 alias,
                 host: session.config.host,
-                port: session.config.port || 22,
+                port: session.config.port ?? 22,
                 username: session.config.username,
                 runAs: session.config.runAs,
                 connectedAt: session.connectedAt,

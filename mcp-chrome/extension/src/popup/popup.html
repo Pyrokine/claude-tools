@@ -1,50 +1,50 @@
-<!DOCTYPE html>
-<html lang='zh-CN'>
-<head>
-    <meta charset='UTF-8'>
-    <meta content='width=device-width, initial-scale=1.0' name='viewport'>
-    <title>MCP Chrome</title>
-    <link href='./popup.css' rel='stylesheet'>
-</head>
-<body>
-<div class='container'>
-    <h1>MCP Chrome</h1>
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+        <title>MCP Chrome</title>
+        <link href="./popup.css" rel="stylesheet" />
+    </head>
+    <body>
+        <div class="container">
+            <h1>MCP Chrome</h1>
 
-    <div class='status-section'>
-        <div class='status-indicator' id='statusIndicator'>
-            <span class='status-dot'></span>
-            <span class='status-text' id='statusText'>检查中...</span>
+            <div class="status-section">
+                <div class="status-indicator" id="statusIndicator">
+                    <span class="status-dot"></span>
+                    <span class="status-text" id="statusText">检查中...</span>
+                </div>
+            </div>
+
+            <div class="button-section">
+                <button class="btn btn-primary" id="connectBtn">连接</button>
+                <button class="btn btn-secondary" disabled id="disconnectBtn">断开</button>
+            </div>
+
+            <div class="auth-section">
+                <label class="auth-label" for="pairingTokenInput">Pairing token</label>
+                <input
+                    autocomplete="off"
+                    class="auth-input"
+                    id="pairingTokenInput"
+                    placeholder="可选，必须与 MCP_CHROME_PAIRING_TOKEN 一致"
+                    type="password"
+                />
+                <button class="btn btn-secondary" id="saveTokenBtn">保存 token</button>
+                <label class="auth-checkbox">
+                    <input id="allowInsecureNoTokenInput" type="checkbox" />
+                    允许无 token 本地连接
+                </label>
+                <p class="auth-help" id="authHelp">默认自动连接本地 MCP Server，可用 pairing token 加固</p>
+            </div>
+
+            <div class="info-section">
+                <p class="info-text">通过 WebSocket 与 MCP Server 通信</p>
+                <p class="info-text">服务端口范围：19222-19299</p>
+            </div>
         </div>
-    </div>
 
-    <div class='button-section'>
-        <button class='btn btn-primary' id='connectBtn'>连接</button>
-        <button class='btn btn-secondary' disabled id='disconnectBtn'>断开</button>
-    </div>
-
-    <div class='auth-section'>
-        <label class='auth-label' for='pairingTokenInput'>Pairing token</label>
-        <input autocomplete='off' class='auth-input' id='pairingTokenInput'
-               placeholder='可选，必须与 MCP_CHROME_PAIRING_TOKEN 一致'
-               type='password'>
-        <button class='btn btn-secondary' id='saveTokenBtn'>保存 token</button>
-        <label class='auth-checkbox'>
-            <input id='allowInsecureNoTokenInput' type='checkbox'>
-            允许无 token 本地连接
-        </label>
-        <p class='auth-help' id='authHelp'>默认自动连接本地 MCP Server，可用 pairing token 加固</p>
-    </div>
-
-    <div class='info-section'>
-        <p class='info-text'>
-            通过 WebSocket 与 MCP Server 通信
-        </p>
-        <p class='info-text'>
-            服务端口范围：19222-19299
-        </p>
-    </div>
-</div>
-
-<script src='./popup.ts' type='module'></script>
-</body>
+        <script src="./popup.ts" type="module"></script>
+    </body>
 </html>

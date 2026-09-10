@@ -360,8 +360,8 @@ export interface IBrowserDriver {
     setCookie(params: SetCookieParams): Promise<void>
     deleteCookie(url: string, name: string): Promise<void>
     /**
-     * 清除 cookies，合同条款：filter 必须至少含 url/domain/name 中的一项,
-     * 实现层应拒绝无过滤的全站清除（防止误清登录态）
+     * 清除 cookies，合同条款：filter 必须含 url 或 domain，name 只能进一步缩小范围,
+     * 实现层应拒绝无站点范围的清除（防止跨站误清同名登录态）
      */
     clearCookies(filter?: CookieFilter): Promise<{ count: number }>
 
@@ -370,6 +370,7 @@ export interface IBrowserDriver {
     networkEnable(): Promise<void>
     getConsoleLogs(options?: ConsoleLogOptions): Promise<ConsoleLogEntry[]>
     getNetworkRequests(options?: NetworkRequestOptions): Promise<NetworkRequestEntry[]>
+    getChallengeState(): Promise<boolean>
 
     // ---- Tab / 状态 ----
     listTargets(): Promise<ListedTarget[]>
@@ -447,6 +448,7 @@ export class DriverCapabilityError extends Error {
         this.name = 'DriverCapabilityError'
     }
 
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
     toJSON(): object {
         return {
             error: {

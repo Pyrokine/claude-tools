@@ -7,6 +7,7 @@ import type {
     OperationStartOptions,
     OperationStatus,
 } from './types.js'
+import { ensureUtf8Boundary, utf8SafeEnd } from './utf8.js'
 
 export const DEFAULT_OPERATION_MAX_OUTPUT_BYTES = 1024 * 1024
 export const HARD_OPERATION_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
@@ -175,7 +176,8 @@ export class OperationManager {
                                 status: 'unknown',
                                 retryable: false,
                                 suggestion:
-                                    'SSH channel request 状态无法确认；使用 ssh_operation_status 查询记录，必要时 ssh_disconnect 释放底层 pending channel',
+                                    'SSH channel request 状态无法确认；使用 ssh_operation_status 查询记录，' +
+                                    '必要时用 ssh_disconnect 释放底层 pending channel',
                             })
                         )
                     }, startTimeoutMs)
@@ -229,23 +231,19 @@ export class OperationManager {
         const maxReadBytes = this.normalizeReadBytes(options.maxBytes)
         const stdoutOffset = this.normalizeOffset(options.stdoutOffset, record.stdout.length, 'stdoutOffset')
         const stderrOffset = this.normalizeOffset(options.stderrOffset, record.stderr.length, 'stderrOffset')
-        this.ensureUtf8Boundary(record.stdout, stdoutOffset, 'stdoutOffset')
-        this.ensureUtf8Boundary(record.stderr, stderrOffset, 'stderrOffset')
-        const stdoutEnd = this.utf8SafeEnd(
-            record.stdout,
-            stdoutOffset,
-            Math.min(record.stdout.length, stdoutOffset + maxReadBytes),
-            'stdout'
-        )
+        ensureUtf8Boundary(record.stdout, stdoutOffset, 'stdoutOffset')
+        ensureUtf8Boundary(record.stderr, stderrOffset, 'stderrOffset')
+        const stdoutRequestedEnd = Math.min(record.stdout.length, stdoutOffset + maxReadBytes)
+        const stdoutEnd = utf8SafeEnd(record.stdout, stdoutOffset, stdoutRequestedEnd, 'stdout')
         const stdout = record.stdout.subarray(stdoutOffset, stdoutEnd)
+        const nextStdoutOffset =
+            record.stdoutTruncated && stdoutRequestedEnd === record.stdout.length ? stdoutRequestedEnd : stdoutEnd
         const remaining = maxReadBytes - stdout.length
-        const stderrEnd = this.utf8SafeEnd(
-            record.stderr,
-            stderrOffset,
-            Math.min(record.stderr.length, stderrOffset + remaining),
-            'stderr'
-        )
+        const stderrRequestedEnd = Math.min(record.stderr.length, stderrOffset + remaining)
+        const stderrEnd = utf8SafeEnd(record.stderr, stderrOffset, stderrRequestedEnd, 'stderr')
         const stderr = record.stderr.subarray(stderrOffset, stderrEnd)
+        const nextStderrOffset =
+            record.stderrTruncated && stderrRequestedEnd === record.stderr.length ? stderrRequestedEnd : stderrEnd
 
         return {
             ...this.info(record),
@@ -253,8 +251,8 @@ export class OperationManager {
             stderr: stderr.toString('utf8'),
             stdoutOffset,
             stderrOffset,
-            nextStdoutOffset: stdoutEnd,
-            nextStderrOffset: stderrEnd,
+            nextStdoutOffset,
+            nextStderrOffset,
             readBytes: stdout.length + stderr.length,
             maxReadBytes,
         }
@@ -617,58 +615,5 @@ export class OperationManager {
             throw new Error(`${field} must be between 0 and ${length}`)
         }
         return normalized
-    }
-
-    private ensureUtf8Boundary(buffer: Buffer, offset: number, field: string): void {
-        if (offset < buffer.length && this.isUtf8ContinuationByte(buffer[offset])) {
-            throw new Error(`${field} must point to a UTF-8 character boundary`)
-        }
-    }
-
-    private utf8SafeEnd(buffer: Buffer, start: number, requestedEnd: number, stream: string): number {
-        const limitedByMaxBytes = requestedEnd < buffer.length
-        let end = requestedEnd
-        if (limitedByMaxBytes) {
-            while (end > start && this.isUtf8ContinuationByte(buffer[end])) {
-                --end
-            }
-        }
-        end = this.trimIncompleteUtf8Sequence(buffer, start, end)
-        if (end === start && requestedEnd > start && limitedByMaxBytes) {
-            throw new Error(`maxBytes is too small to read the next UTF-8 character from ${stream}`)
-        }
-        return end
-    }
-
-    private trimIncompleteUtf8Sequence(buffer: Buffer, start: number, end: number): number {
-        if (end <= start) {
-            return end
-        }
-        let sequenceStart = end - 1
-        while (sequenceStart > start && this.isUtf8ContinuationByte(buffer[sequenceStart])) {
-            --sequenceStart
-        }
-        const expectedLength = this.utf8SequenceLength(buffer[sequenceStart])
-        return sequenceStart + expectedLength > end ? sequenceStart : end
-    }
-
-    private utf8SequenceLength(value: number): number {
-        if ((value & 0x80) === 0) {
-            return 1
-        }
-        if ((value & 0xe0) === 0xc0) {
-            return 2
-        }
-        if ((value & 0xf0) === 0xe0) {
-            return 3
-        }
-        if ((value & 0xf8) === 0xf0) {
-            return 4
-        }
-        return 1
-    }
-
-    private isUtf8ContinuationByte(value: number): boolean {
-        return (value & 0xc0) === 0x80
     }
 }

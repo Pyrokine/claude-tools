@@ -7,6 +7,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { readFile } from 'fs/promises'
 import { z } from 'zod'
+import type { StaleContextRetryPolicy } from '../core/browser-driver.js'
 import {
     CWD_PATH_PREFIX,
     formatErrorResponse,
@@ -17,9 +18,9 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
-import type { StaleContextRetryPolicy } from '../core/browser-driver.js'
 import { EvaluateResultTooLargeError, NonSerializableEvaluateResultError } from '../core/types.js'
 import type { InputMode } from '../core/unified-session.js'
+import { ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
 
@@ -47,7 +48,9 @@ const evaluateSchema = z.object({
     timeout: z
         .number()
         .optional()
-        .describe('超时（毫秒），Extension 模式作为端到端预算（含传输），CDP 模式作为脚本执行超时'),
+        .describe(
+            '超时（毫秒），含 Cloudflare Challenge 等待。Extension 模式作为端到端预算（含传输），CDP 模式作为脚本执行超时'
+        ),
     mode: z
         .enum(['stealth', 'precise'])
         .optional()
@@ -60,7 +63,12 @@ const evaluateSchema = z.object({
         .describe(
             'iframe precise 执行遇到 stale execution context 时的重试契约；默认 never 不重放，readOnly 表示脚本无副作用并允许重新解析 context 后重放一次'
         ),
-    diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
+    diagnostics: z
+        .boolean()
+        .optional()
+        .describe(
+            '执行后返回新增 console error/warning 和失败网络请求摘要。访问 Cloudflare 页面时默认不传；开启后会启用 debugger 日志采集'
+        ),
     postCondition: postConditionSchema
         .optional()
         .describe('脚本执行后要验证的页面状态；不传时 success 只表示脚本已执行并返回，不表示业务结果已达成'),
@@ -84,6 +92,25 @@ const evaluateSchema = z.object({
 type ToolResponse = {
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
+}
+
+function invalidEvaluateInputResponse(message: string): ToolResponse {
+    return {
+        content: [
+            {
+                type: 'text',
+                text: JSON.stringify({
+                    error: {
+                        code: 'INVALID_ARGUMENT',
+                        message,
+                    },
+                    actionExecuted: false,
+                    actionStatus: 'not_started',
+                }),
+            },
+        ],
+        isError: true,
+    }
 }
 
 function cspErrorResponse(): ToolResponse {
@@ -127,7 +154,7 @@ export function classifyEvaluateActionError(error: unknown): {
     retryable: boolean
 } {
     const message = error instanceof Error ? error.message : String(error)
-    const preActionTimeout = /tim(?:eout|ed out) before/i.test(message)
+    const preActionTimeout = /(?:timeout|timed out) before/i.test(message)
     const timedOut = !preActionTimeout && /Request timeout|timed out|timeout|超时/i.test(message)
     const pageEvaluationStarted =
         /Evaluation failed|exception|ReferenceError|TypeError|SyntaxError|RangeError|URIError|(?:^|\n)Error:/i.test(
@@ -169,12 +196,26 @@ function appendEvaluateFailureMetadata(
     overrides: Record<string, unknown> = {}
 ): Record<string, unknown> | undefined {
     const text = response.content[0]?.text
-    if (!text) return undefined
+    if (!text) {
+        return undefined
+    }
     try {
         const payload = JSON.parse(text) as Record<string, unknown>
-        Object.assign(payload, classifyEvaluateFailure(error), {
+        const failure =
+            error instanceof ChallengeTimeoutError || error instanceof ChallengeDeniedError
+                ? {
+                      actionExecuted: error.actionStatus === 'completed',
+                      actionStatus: error.actionStatus,
+                      failureStage: 'action',
+                      retryable: error instanceof ChallengeTimeoutError,
+                      verificationStatus: error instanceof ChallengeDeniedError ? 'blocked' : 'failed',
+                  }
+                : {
+                      ...classifyEvaluateFailure(error),
+                      verificationStatus: 'unavailable',
+                  }
+        Object.assign(payload, failure, {
             verificationRequested,
-            verificationStatus: 'unavailable',
             ...overrides,
         })
         return payload
@@ -188,6 +229,11 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
     isError?: boolean
 }> {
     // 输入校验：在 try 外提前返回，避免 throw-catch-in-place
+    const hasScript = args.script !== undefined && args.script.trim().length > 0
+    const hasScriptFile = args.scriptFile !== undefined && args.scriptFile.trim().length > 0
+    if (hasScript === hasScriptFile) {
+        return invalidEvaluateInputResponse('script 与 scriptFile 必须且只能提供一个')
+    }
     let script = args.script
     let outputPath: string | undefined
     if (args.scriptFile) {
@@ -206,7 +252,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
         }
     }
     if (!script) {
-        return formatErrorResponse(new Error('script 或 scriptFile 必须提供其一'))
+        return invalidEvaluateInputResponse('script 或 scriptFile 必须提供其一')
     }
 
     try {
@@ -214,6 +260,10 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
 
         return await unifiedSession.withTabId(args.tabId, async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
+                const startedAt = Date.now()
+                await resolveChallenge(unifiedSession, 'evaluate', 'not_started', args.timeout)
+                const remainingTimeout =
+                    args.timeout === undefined ? undefined : Math.max(0, args.timeout - (Date.now() - startedAt))
                 const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
                 const evaluationMode = resolveEvaluateMode(args.mode)
                 const staleContextRetry = resolveStaleContextRetryPolicy(args.staleContextRetry)
@@ -223,7 +273,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                     result = await unifiedSession.evaluate(
                         script,
                         evaluationMode,
-                        args.timeout,
+                        remainingTimeout,
                         args.args as unknown[],
                         {
                             staleContextRetry,
@@ -250,6 +300,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                     : undefined
                 const payload: Record<string, unknown> = {
                     success: postCondition ? postCondition.verificationStatus === 'matched' : true,
+                    mode: unifiedSession.getMode(),
                     actionExecuted: true,
                     actionStatus: 'completed',
                     verificationRequested: Boolean(postCondition),
@@ -330,7 +381,16 @@ export function registerEvaluateTool(server: McpServer): void {
     server.registerTool(
         'evaluate',
         {
-            description: '在页面上下文执行 JavaScript',
+            description: [
+                '在页面上下文执行 JavaScript。默认优先使用已连接的 Chrome Extension；',
+                '只有 Extension 不可用或 browse(action="connect", port=…) 已显式选择 CDP 时才使用 CDP。',
+                '访问 Cloudflare 时默认不传 diagnostics，Extension 先被动等待真实 tab 标题恢复，',
+                '持续存在可点击 Turnstile 时才点击。同页测试按钮走页面点击；',
+                'Extension inspect 走 isolated world，不先挂 debugger。',
+                'Cloudflare iframe 或宿主页验证按钮只在已聚焦窗口的活动受控 tab 上用系统鼠标，',
+                'Linux 用窗口原点加边距，沿路径移动、悬停后再按下抬起，混合窗口不会调用 focusWindow。',
+                '交互式验证码和 Access denied 无法自动完成',
+            ].join(''),
             inputSchema: evaluateSchema,
         },
         (args) => handleEvaluate(args)

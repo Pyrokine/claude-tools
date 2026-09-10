@@ -93,6 +93,7 @@ export class NonSerializableEvaluateResultError extends Error {
         }
     }
 
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
     toJSON(): object {
         return {
             error: {
@@ -139,6 +140,7 @@ export class EvaluateResultTooLargeError extends Error {
         this.suggestion = evaluateLimitSuggestion(context.exceeded)
     }
 
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
     toJSON(): object {
         return {
             error: {
@@ -329,6 +331,8 @@ export interface PageState {
  * 控制台日志条目
  */
 export interface ConsoleLogEntry {
+    /** 单个浏览器会话内单调递增，用于 diagnostics 增量读取 */
+    sequence?: number
     source?: string
     level: string
     text: string
@@ -341,6 +345,8 @@ export interface ConsoleLogEntry {
  * 网络请求条目
  */
 export interface NetworkRequestEntry {
+    /** 单个浏览器会话内单调递增，用于 diagnostics 增量读取 */
+    sequence?: number
     url: string
     method: string
     status?: number
@@ -349,6 +355,13 @@ export interface NetworkRequestEntry {
     duration?: number
     size?: number
     errorText?: string
+    /** Cloudflare 响应头 cf-mitigated: challenge 的归一化结果 */
+    challenge?: boolean
+}
+
+export interface ChallengeState {
+    state: 'pending'
+    mode: 'extension' | 'cdp'
 }
 
 /**

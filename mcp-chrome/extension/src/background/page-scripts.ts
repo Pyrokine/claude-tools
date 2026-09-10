@@ -237,9 +237,12 @@ export function generateAccessibilityTree(
 
         if (filter !== 'all' && !checkRefId) {
             const rect = element.getBoundingClientRect()
-            if (
-                !(rect.top < window.innerHeight && rect.bottom > 0 && rect.left < window.innerWidth && rect.right > 0)
-            ) {
+            if (!(
+                rect.top < window.innerHeight &&
+                rect.bottom > 0 &&
+                rect.left < window.innerWidth &&
+                rect.right > 0
+            )) {
                 return false
             }
         }
@@ -1027,12 +1030,12 @@ export async function simulateKeyboardType(text: string, delay: number): Promise
         return { success: false, error: 'No active element' }
     }
 
-    // 检查是否是可输入元素
-    const isInputable =
+    // 检查元素是否可接收输入
+    const acceptsInput =
         activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA' || activeElement.isContentEditable
 
-    if (!isInputable) {
-        return { success: false, error: `Active element is not inputable: ${activeElement.tagName}` }
+    if (!acceptsInput) {
+        return { success: false, error: `Active element does not accept keyboard input: ${activeElement.tagName}` }
     }
 
     // 通过 nativeInputValueSetter 设置 value，兼容 React/Vue 等框架的受控组件
@@ -1181,6 +1184,7 @@ export function injectStealthScripts(): void {
     // 覆盖 navigator.plugins（模拟真实浏览器）
     Object.defineProperty(navigator, 'plugins', {
         get: () => {
+            //noinspection SpellCheckingInspection -- Chrome PDF Viewer 固定插件 ID
             const plugins = [
                 { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
                 { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
@@ -1566,6 +1570,7 @@ export function performActionableClick(
             el.dispatchEvent(clickEvent)
             for (const item of reactHandlers) {
                 if (!item.wasCalled()) {
+                    // noinspection JSUnusedGlobalSymbols — React synthetic event contract
                     item.handler.call(el, {
                         type: 'click',
                         target: el,
@@ -1726,4 +1731,227 @@ export function getComputedStyleFromElement(refId: string, prop: string): string
         return JSON.stringify(obj)
     }
     return cs.getPropertyValue(prop)
+}
+
+export function inspectChallengePage(options: {
+    challengeSelectors: string[]
+    deniedSelectors: string[]
+    widgetSelectors: string[]
+    verifyButtonSelectors: string[]
+    frameSelectors: string[]
+    titleNeedles: string[]
+    textMarkers: string[]
+    originResponsePendingTextMarkers: string[]
+}): {
+    title: string
+    url: string
+    selectorHits: string[]
+    deniedHits: string[]
+    textHits: string[]
+    originResponsePending: boolean
+    turnstilePresent: boolean
+    clickPoint: { x: number; y: number } | null
+    clickTargetKind: 'verify' | 'widget' | null
+    clickSource: 'page' | 'iframe' | null
+    screenPoint: { x: number; y: number } | null
+    viewport: {
+        screenX: number
+        screenY: number
+        innerWidth: number
+        innerHeight: number
+        outerWidth: number
+        outerHeight: number
+        devicePixelRatio: number
+    }
+} {
+    const title = document.title || ''
+    const url = location.href || ''
+    const visibleBodyText = (document.body && document.body.innerText ? document.body.innerText : '').replace(
+        /\s+/g,
+        ' '
+    )
+    const isVisible = (el: Element | null): el is Element => {
+        if (!el) {
+            return false
+        }
+        const style = window.getComputedStyle(el)
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+            return false
+        }
+        const rect = el.getBoundingClientRect()
+        return rect.width > 0 && rect.height > 0
+    }
+    const bringIntoView = (el: Element | null) => {
+        if (!el || typeof el.scrollIntoView !== 'function') {
+            return
+        }
+        el.scrollIntoView({ block: 'center', inline: 'nearest' })
+    }
+    const hits = (selectors: string[]) =>
+        selectors.filter((selector) => {
+            try {
+                return Array.from(document.querySelectorAll(selector)).some(isVisible)
+            } catch {
+                return false
+            }
+        })
+    const isCloudflareFrame = (el: Element | null) => {
+        if (!el) {
+            return false
+        }
+        if (el.tagName.toUpperCase() === 'IFRAME') {
+            const src = String(el.getAttribute('src') || (el as HTMLIFrameElement).src || '')
+            return src.includes('challenges.cloudflare.com') || src.includes('turnstile')
+        }
+        return Boolean(el.closest(options.frameSelectors.join(',')))
+    }
+    const selectorHits = hits(options.challengeSelectors)
+    const deniedHits = hits(options.deniedSelectors)
+    const widgetHits = hits(options.widgetSelectors)
+    const frameHits = hits(options.frameSelectors)
+    const cloudflareFramePresent = Array.from(document.querySelectorAll('iframe')).some((el) => isCloudflareFrame(el))
+    const normalizedTitle = title.trim().toLowerCase().replace(/…/g, '...')
+    const titlePending = options.titleNeedles.some((needle) => normalizedTitle.includes(String(needle).toLowerCase()))
+    const textHits = options.textMarkers.filter((marker) =>
+        visibleBodyText.toLowerCase().includes(String(marker).toLowerCase())
+    )
+    const originResponsePending = options.originResponsePendingTextMarkers.some((marker) =>
+        visibleBodyText.toLowerCase().includes(String(marker).toLowerCase())
+    )
+    const interstitialPending = selectorHits.length > 0 || titlePending || textHits.length > 0
+    const findVisibleTurnstileBox = () => {
+        const input = document.querySelector('input[name="cf-turnstile-response"]')
+        if (!input) {
+            return null
+        }
+        const candidates: Element[] = []
+        let node = input.parentElement
+        while (node && node !== document.documentElement) {
+            if (isVisible(node)) {
+                const rect = node.getBoundingClientRect()
+                if (rect.width >= 120 && rect.height >= 40) {
+                    candidates.push(node)
+                }
+            }
+            node = node.parentElement
+        }
+        if (candidates.length === 0) {
+            return null
+        }
+        return (
+            candidates.find((el) => {
+                const rect = el.getBoundingClientRect()
+                return rect.width >= 250 && rect.width <= 340 && rect.height >= 50 && rect.height <= 85
+            }) || candidates[0]
+        )
+    }
+    const turnstileBox = findVisibleTurnstileBox()
+    const hostVerify = Array.from(document.querySelectorAll(options.verifyButtonSelectors.join(','))).find(isVisible)
+    const useIframeClick =
+        cloudflareFramePresent ||
+        (!hostVerify && interstitialPending && Boolean(document.querySelector('input[name="cf-turnstile-response"]')))
+    const turnstilePresent =
+        widgetHits.length > 0 ||
+        useIframeClick ||
+        (interstitialPending && frameHits.length > 0) ||
+        Boolean(turnstileBox)
+    const pointFromRect = (rect: DOMRect, kind: 'verify' | 'widget') => {
+        if (!rect || rect.width < 8 || rect.height < 8) {
+            return null
+        }
+        const y = Math.round(rect.top + Math.min(rect.height, 65) / 2)
+        if (kind === 'verify') {
+            return { x: Math.round(rect.left + rect.width / 2), y }
+        }
+        const widgetWidth = Math.min(rect.width, 300)
+        return { x: Math.round(rect.left + Math.min(20, Math.max(14, widgetWidth / 15))), y }
+    }
+    let clickPoint: { x: number; y: number } | null = null
+    let clickTargetKind: 'verify' | 'widget' | null = null
+    let clickSource: 'page' | 'iframe' | null = null
+    const setClickTarget = (el: Element | null | undefined, kind: 'verify' | 'widget') => {
+        if (!el) {
+            return
+        }
+        bringIntoView(el)
+        const point = pointFromRect(el.getBoundingClientRect(), kind)
+        if (!point) {
+            return
+        }
+        clickPoint = point
+        clickTargetKind = kind
+        clickSource = isCloudflareFrame(el) || useIframeClick ? 'iframe' : 'page'
+    }
+    if (hostVerify) {
+        setClickTarget(hostVerify, 'verify')
+    }
+    if (!clickPoint && turnstileBox) {
+        const boxRect = turnstileBox.getBoundingClientRect()
+        if (boxRect.width <= 340 && boxRect.height <= 85) {
+            setClickTarget(turnstileBox, 'widget')
+        }
+    }
+    if (!clickPoint && turnstilePresent) {
+        const frame = Array.from(document.querySelectorAll(options.frameSelectors.join(','))).find(isVisible)
+        if (frame) {
+            setClickTarget(frame, 'widget')
+        }
+    }
+    if (!clickPoint && turnstilePresent) {
+        const widget = Array.from(document.querySelectorAll(options.widgetSelectors.join(','))).find(isVisible)
+        if (widget) {
+            setClickTarget(widget, 'widget')
+        }
+    }
+    if (!clickPoint && turnstilePresent) {
+        const nodes = Array.from(document.querySelectorAll('div'))
+        for (const node of nodes) {
+            if (!isVisible(node)) {
+                continue
+            }
+            const rect = node.getBoundingClientRect()
+            if (rect.width >= 280 && rect.width <= 320 && rect.height >= 50 && rect.height <= 80) {
+                setClickTarget(node, 'widget')
+                break
+            }
+        }
+    }
+    if (!clickPoint && turnstileBox) {
+        setClickTarget(turnstileBox, 'widget')
+    }
+    const viewport = {
+        screenX: Number(window.screenX),
+        screenY: Number(window.screenY),
+        innerWidth: Number(window.innerWidth),
+        innerHeight: Number(window.innerHeight),
+        outerWidth: Number(window.outerWidth),
+        outerHeight: Number(window.outerHeight),
+        devicePixelRatio: Number(window.devicePixelRatio || 1),
+    }
+    const horizontal = Math.max(0, viewport.outerWidth - viewport.innerWidth)
+    const vertical = Math.max(0, viewport.outerHeight - viewport.innerHeight)
+    const chromeLeft = Math.round(horizontal / 2)
+    const chromeTop = Math.max(0, vertical - horizontal)
+    const resolvedClickPoint = clickPoint as { x: number; y: number } | null
+    const screenPoint =
+        resolvedClickPoint === null
+            ? null
+            : {
+                  x: Math.round(viewport.screenX + chromeLeft + resolvedClickPoint.x),
+                  y: Math.round(viewport.screenY + chromeTop + resolvedClickPoint.y),
+              }
+    return {
+        title,
+        url,
+        selectorHits,
+        deniedHits,
+        textHits,
+        originResponsePending,
+        turnstilePresent,
+        clickPoint: resolvedClickPoint,
+        clickTargetKind,
+        clickSource,
+        screenPoint,
+        viewport,
+    }
 }

@@ -9,13 +9,14 @@
  * - open: 打开 URL
  * - back/forward: 前进后退
  * - refresh: 刷新
- * - close: 关闭浏览器
+ * - close: 关闭指定页面
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import { DEFAULT_TIMEOUT, type WaitUntil } from '../core/types.js'
+import { challengeResultFields, resolveChallenge } from './challenge.js'
 import { withDiagnosticsResponse } from './diagnostics.js'
 
 /**
@@ -33,20 +34,34 @@ const browseSchema = z.object({
         .enum(['off', 'safe', 'aggressive'])
         .optional()
         .describe('反检测模式（launch/connect），off=关闭，safe=最小改动（默认），aggressive=完整伪装'),
-    port: z.coerce.number().optional().describe('调试端口（launch/connect），launch 时不指定则使用随机端口'),
+    port: z.coerce
+        .number()
+        .optional()
+        .describe(
+            'CDP 调试端口。只在 browse(action="connect") 中显式指定时选择 CDP；其他场景优先使用已连接的 Extension'
+        ),
     host: z.string().optional().describe('调试主机（connect）'),
     targetId: z
         .string()
         .optional()
         .describe(
-            '目标 ID（attach/close），从 list 结果中获取，Extension 模式为数字 Tab ID，CDP 模式为 WebSocket target ID，仅在当前 mode 下有效'
+            '目标 ID（attach/close），从 list 结果中获取。close 必填，只关闭该页面。' +
+                'Extension 模式为数字 Tab ID，CDP 模式为 WebSocket target ID，仅在当前 mode 下有效'
         ),
     activate: z.boolean().optional().describe('是否激活 Tab（attach），默认 false 只设置操作目标不切到前台'),
     url: z.string().optional().describe('目标 URL（open）'),
     wait: z.enum(['load', 'domcontentloaded', 'networkidle']).optional().describe('等待条件（open/refresh）'),
     ignoreCache: z.boolean().optional().describe('刷新时是否忽略缓存（refresh）'),
-    timeout: z.coerce.number().optional().describe('超时毫秒'),
-    diagnostics: z.boolean().optional().describe('open 后返回新增 console error/warning 和失败网络请求摘要'),
+    timeout: z.coerce
+        .number()
+        .optional()
+        .describe('超时毫秒，open/back/forward/refresh 含页面加载和 Cloudflare Challenge 等待'),
+    diagnostics: z
+        .boolean()
+        .optional()
+        .describe(
+            'open 后返回新增 console error/warning 和失败网络请求摘要。访问 Cloudflare 页面时默认不传；开启后会启用 debugger 日志采集'
+        ),
 })
 
 /**
@@ -168,7 +183,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     timeout: args.timeout ?? DEFAULT_TIMEOUT,
                     stealth: args.stealth as 'off' | 'safe' | 'aggressive' | undefined,
                 })
-                unifiedSession.setActiveMode('cdp')
+                unifiedSession.setActiveMode('cdp', true)
                 return formatResponse({
                     success: true,
                     action: 'connect',
@@ -294,7 +309,8 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                             code: 'UNMANAGED_TAB',
                                             message: 'open 拒绝导航非托管 tab',
                                             suggestion:
-                                                '请使用 browse(action="list") 选择 managed=true 的受控 tab，或用 manage(action="newPage") 创建受控页面',
+                                                '请从 browse(action="list") 选择 managed=true 的 tab，' +
+                                                '或用 manage(action="newPage") 创建受控页面',
                                             context: {
                                                 managed: currentState.managed ?? false,
                                                 url: currentState.url,
@@ -314,22 +330,41 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     await unifiedSession.newPage()
                 }
                 return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                    const timeout = args.timeout ?? DEFAULT_TIMEOUT
+                    const startedAt = Date.now()
                     await unifiedSession.navigate(args.url!, {
                         wait: args.wait as WaitUntil,
-                        timeout: args.timeout ?? DEFAULT_TIMEOUT,
+                        timeout,
                     })
+                    const challenge = await resolveChallenge(
+                        unifiedSession,
+                        'open',
+                        'completed',
+                        Math.max(0, timeout - (Date.now() - startedAt))
+                    )
                     return {
                         success: true,
                         action: 'open',
                         mode: unifiedSession.getMode(),
                         ...pageStateMetadata(unifiedSession, true),
+                        ...challengeResultFields(challenge),
                     }
                 })
             }
 
             case 'back': {
                 return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
-                    const result = await unifiedSession.goBack(args.timeout)
+                    const timeout = args.timeout ?? DEFAULT_TIMEOUT
+                    const startedAt = Date.now()
+                    const result = await unifiedSession.goBack(timeout)
+                    const challenge = result.navigated
+                        ? await resolveChallenge(
+                              unifiedSession,
+                              'back',
+                              'completed',
+                              Math.max(0, timeout - (Date.now() - startedAt))
+                          )
+                        : undefined
                     return {
                         success: true,
                         action: 'back',
@@ -337,13 +372,24 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         navigated: result.navigated,
                         ...pageStateMetadata(unifiedSession, true),
                         ...(result.navigated ? {} : { note: '无后退历史' }),
+                        ...(challenge ? challengeResultFields(challenge) : {}),
                     }
                 })
             }
 
             case 'forward': {
                 return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
-                    const result = await unifiedSession.goForward(args.timeout)
+                    const timeout = args.timeout ?? DEFAULT_TIMEOUT
+                    const startedAt = Date.now()
+                    const result = await unifiedSession.goForward(timeout)
+                    const challenge = result.navigated
+                        ? await resolveChallenge(
+                              unifiedSession,
+                              'forward',
+                              'completed',
+                              Math.max(0, timeout - (Date.now() - startedAt))
+                          )
+                        : undefined
                     return {
                         success: true,
                         action: 'forward',
@@ -351,29 +397,56 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         navigated: result.navigated,
                         ...pageStateMetadata(unifiedSession, true),
                         ...(result.navigated ? {} : { note: '无前进历史' }),
+                        ...(challenge ? challengeResultFields(challenge) : {}),
                     }
                 })
             }
 
             case 'refresh': {
                 return withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
+                    const timeout = args.timeout ?? DEFAULT_TIMEOUT
+                    const startedAt = Date.now()
                     await unifiedSession.reload({
                         ignoreCache: args.ignoreCache ?? false,
                         waitUntil: args.wait,
-                        timeout: args.timeout ?? DEFAULT_TIMEOUT,
+                        timeout,
                     })
+                    const challenge = await resolveChallenge(
+                        unifiedSession,
+                        'refresh',
+                        'completed',
+                        Math.max(0, timeout - (Date.now() - startedAt))
+                    )
                     return {
                         success: true,
                         action: 'refresh',
                         mode: unifiedSession.getMode(),
                         ...pageStateMetadata(unifiedSession, true),
+                        ...challengeResultFields(challenge),
                     }
                 })
             }
 
             case 'close': {
-                // Extension 模式：关闭指定或当前 attach 的 tab（与 manage closePage 行为一致）
-                // CDP 模式：关闭浏览器会话
+                if (!args.targetId) {
+                    return {
+                        content: [
+                            {
+                                type: 'text',
+                                text: JSON.stringify({
+                                    error: {
+                                        code: 'INVALID_ARGUMENT',
+                                        message: 'close 需要 targetId 参数，避免在不同模式关闭不同范围的资源',
+                                        suggestion:
+                                            '请先使用 browse(action="list") 获取页面 targetId，再指定要关闭的页面',
+                                    },
+                                }),
+                            },
+                        ],
+                        isError: true,
+                    }
+                }
+
                 const currentMode = unifiedSession.getMode()
                 if (currentMode === 'extension') {
                     const affected = await unifiedSession.closePage(args.targetId)
@@ -386,11 +459,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     })
                 }
                 if (currentMode === 'cdp') {
-                    if (args.targetId) {
-                        await cdpSession.closePage(args.targetId)
-                    } else {
-                        await cdpSession.close()
-                    }
+                    await cdpSession.closePage(args.targetId)
                     return formatResponse({
                         success: true,
                         action: 'close',
@@ -398,12 +467,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         targetId: args.targetId,
                     })
                 }
-                return formatResponse({
-                    success: true,
-                    action: 'close',
-                    mode: currentMode,
-                    note: '无活跃连接',
-                })
+                return formatErrorResponse(new Error('没有活跃浏览器连接，无法关闭指定页面'))
             }
 
             default:
@@ -434,7 +498,16 @@ export function registerBrowseTool(server: McpServer): void {
     server.registerTool(
         'browse',
         {
-            description: `浏览器管理与导航：启动、连接、列出页面、打开 URL、导航`,
+            description: [
+                '浏览器管理与导航。默认优先使用已连接的 Chrome Extension 和用户真实 Chrome；',
+                'Extension 不可用时才回退 CDP。仅 browse(action="connect", port=…) 会显式选择 CDP。',
+                '过 Cloudflare 时，Extension 先被动等待真实 tab 标题恢复，避免先附加 debugger；',
+                '只有持续出现可点击 Turnstile 时才点击。同页测试按钮走页面点击；',
+                'Extension inspect 走 isolated world，不先挂 debugger。',
+                'Cloudflare iframe 或宿主页验证按钮只在已聚焦窗口的活动受控 tab 上用系统鼠标，',
+                'Linux 用窗口原点加边距，沿路径移动、悬停后再按下抬起，混合窗口不会调用 focusWindow。',
+                'open/back/forward/refresh 的 timeout 包含等待。交互式验证码和 Access denied 无法自动完成',
+            ].join(''),
             inputSchema: browseSchema,
         },
         (args) => handleBrowse(args)

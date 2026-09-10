@@ -35,7 +35,9 @@ window.addEventListener('message', (event: MessageEvent) => {
     void chrome.runtime
         .sendMessage({ type: 'MCP_FRAME_PROBE', token: data.token, index: data.index })
         .then((response: { accepted?: boolean } | undefined) => {
-            if (!response?.accepted) return
+            if (!response?.accepted) {
+                return
+            }
             source.postMessage({ type: 'mcp-frame-probe-ack', token: data.token, index: data.index }, '*')
         })
         .catch((error) => {

@@ -7,6 +7,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { sessionManager } from '../session-manager.js'
+import { dynamicSshPortSchema, sshPortSchema } from './schema.js'
 import { formatError, formatResult } from './utils.js'
 
 // ========== Schemas ==========
@@ -21,9 +22,9 @@ const loopbackHostSchema = z
 
 const forwardLocalSchema = z.object({
     alias: z.string().describe('连接别名'),
-    localPort: z.number().describe('本地监听端口'),
+    localPort: dynamicSshPortSchema.describe('本地监听端口，传 0 时由系统动态分配'),
     remoteHost: z.string().describe('远程目标主机'),
-    remotePort: z.number().describe('远程目标端口'),
+    remotePort: sshPortSchema.describe('远程目标端口'),
     localHost: loopbackHostSchema.describe(
         '本地监听地址，仅允许 loopback（127.0.0.1 / ::1 / localhost），默认 127.0.0.1'
     ),
@@ -31,9 +32,9 @@ const forwardLocalSchema = z.object({
 
 const forwardRemoteSchema = z.object({
     alias: z.string().describe('连接别名'),
-    remotePort: z.number().int().min(0).max(65535).describe('远程监听端口，传 0 时由服务器动态分配'),
+    remotePort: dynamicSshPortSchema.describe('远程监听端口，传 0 时由服务器动态分配'),
     localHost: z.string().describe('本地目标地址'),
-    localPort: z.number().describe('本地目标端口'),
+    localPort: sshPortSchema.describe('本地目标端口'),
     remoteHost: loopbackHostSchema.describe(
         '远程监听地址，仅允许 loopback（127.0.0.1 / ::1 / localhost），默认 127.0.0.1'
     ),
@@ -168,7 +169,7 @@ export function registerForwardTools(server: McpServer): void {
     server.registerTool(
         'ssh_forward_list',
         {
-            description: '列出所有端口转发',
+            description: '列出所有端口转发，lifecycle 和 acceptingConnections 表示当前关闭与接流量状态。',
             inputSchema: forwardListSchema,
         },
         () => handleForwardList()

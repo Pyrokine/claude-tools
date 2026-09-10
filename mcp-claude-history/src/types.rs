@@ -119,11 +119,17 @@ pub struct ToolInfo {
     pub tool: Option<String>,
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// 搜索统计
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchStats {
     pub files_scanned: usize,
     pub lines_scanned: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skipped_invalid_timestamps: usize,
     pub total_matches: usize,
     pub returned_count: usize,
     pub time_ms: u64,
@@ -378,6 +384,7 @@ impl BuildIdentity {
 pub struct ProjectInfo {
     pub id: String,
     pub path: String,
+    pub path_approximate: bool,
     pub session_count: usize,
     pub last_activity: String,
 }
@@ -399,6 +406,8 @@ pub struct SessionInfo {
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub topic_redacted_count: usize,
 }
 
 /// 会话列表响应
@@ -406,6 +415,7 @@ pub struct SessionInfo {
 pub struct SessionsResponse {
     pub project: String,
     pub sessions: Vec<SessionInfo>,
+    pub redaction: RedactionInfo,
 }
 
 /// 错误响应
@@ -426,13 +436,15 @@ pub struct ParsedRef {
 
 impl ParsedRef {
     pub fn parse(s: &str) -> Option<Self> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 2 {
+        let (session_prefix, line) = s.split_once(':')?;
+        if session_prefix.is_empty() || line.is_empty() || line.contains(':') {
             return None;
         }
-        let session_prefix = parts[0].to_string();
-        let line = parts[1].parse().ok()?;
-        Some(Self { session_prefix, line })
+        let line = line.parse::<usize>().ok()?;
+        (line > 0).then(|| Self {
+            session_prefix: session_prefix.to_string(),
+            line,
+        })
     }
 }
 
@@ -480,4 +492,17 @@ pub fn line_in_ranges(line: usize, ranges: &[Range]) -> bool {
 
     // 检查是否在任一包含范围内
     include_ranges.iter().any(|r| r.in_range(line))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParsedRef;
+
+    #[test]
+    fn parsed_ref_requires_nonempty_prefix_and_positive_line() {
+        assert!(ParsedRef::parse("session:1").is_some());
+        assert!(ParsedRef::parse(":1").is_none());
+        assert!(ParsedRef::parse("session:0").is_none());
+        assert!(ParsedRef::parse("session:1:2").is_none());
+    }
 }

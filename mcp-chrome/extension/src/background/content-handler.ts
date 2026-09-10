@@ -2,6 +2,7 @@ import type { ElementInfo, ReadPageResult, ScreenshotResult } from '../types'
 import { ExpectedOperationError } from '../types/expected-errors'
 import {
     ActionableClickSchema,
+    ChallengeInspectSchema,
     CheckActionabilitySchema,
     ClickSchema,
     DispatchInputSchema,
@@ -19,6 +20,7 @@ import {
     ScreenshotSchema,
     ScrollSchema,
     TypeSchema,
+    ViewportMetricsSchema,
 } from '../types/schemas'
 import {
     type ActionContext,
@@ -42,6 +44,7 @@ import {
     findElements,
     generateAccessibilityTree,
     getComputedStyleFromElement,
+    inspectChallengePage,
     installActionabilityHelpers,
     performActionableClick,
     performClick,
@@ -124,7 +127,8 @@ export class ContentHandler {
             throw structuredOperationError(
                 'HIDDEN_TAB_SCREENSHOT',
                 'screenshot 需要 tab 可见，当前 tab 处于 hidden 状态',
-                'Extension 截图依赖可见 renderer，请显式使用 manage(action="activatePage") 或 manage(action="focusWindow")，也可在 CDP/headless 测试浏览器中截图',
+                'Extension 截图依赖可见 renderer，请用 manage 的 activatePage 或 focusWindow 动作，' +
+                    '也可在 CDP/headless 测试浏览器中截图',
                 { tabId, visibilityState: visibility.value }
             )
         }
@@ -314,6 +318,99 @@ export class ContentHandler {
         ])
     }
 
+    async getViewportMetrics(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{
+        screenX: number
+        screenY: number
+        innerWidth: number
+        innerHeight: number
+        outerWidth: number
+        outerHeight: number
+        devicePixelRatio: number
+    }> {
+        const p = ViewportMetricsSchema.parse(params)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'viewport_metrics')
+        const results = await chrome.scripting.executeScript({
+            target: { tabId, frameIds: [p.frameId ?? 0] },
+            world: 'ISOLATED',
+            func: () => ({
+                screenX: Number(window.screenX),
+                screenY: Number(window.screenY),
+                innerWidth: Number(window.innerWidth),
+                innerHeight: Number(window.innerHeight),
+                outerWidth: Number(window.outerWidth),
+                outerHeight: Number(window.outerHeight),
+                devicePixelRatio: Number(window.devicePixelRatio || 1),
+            }),
+        })
+        const injectionError = (results[0] as { error?: { message?: string } })?.error
+        if (injectionError) {
+            throw wrapInjectionError(injectionError.message || String(injectionError))
+        }
+        const metrics = results[0]?.result
+        if (!metrics) {
+            throw new Error('viewport_metrics 未返回视口')
+        }
+        return metrics
+    }
+
+    async inspectChallenge(
+        params: unknown,
+        context: ActionContext
+    ): Promise<{
+        title: string
+        url: string
+        selectorHits: string[]
+        deniedHits: string[]
+        textHits: string[]
+        originResponsePending: boolean
+        turnstilePresent: boolean
+        clickPoint: { x: number; y: number } | null
+        clickTargetKind: 'verify' | 'widget' | null
+        clickSource: 'page' | 'iframe' | null
+        screenPoint: { x: number; y: number } | null
+        viewport: {
+            screenX: number
+            screenY: number
+            innerWidth: number
+            innerHeight: number
+            outerWidth: number
+            outerHeight: number
+            devicePixelRatio: number
+        }
+    }> {
+        const p = ChallengeInspectSchema.parse(params)
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'challenge_inspect')
+        const results = await chrome.scripting.executeScript({
+            target: { tabId, frameIds: [p.frameId ?? 0] },
+            world: 'ISOLATED',
+            func: inspectChallengePage,
+            args: [
+                {
+                    challengeSelectors: p.challengeSelectors,
+                    deniedSelectors: p.deniedSelectors,
+                    widgetSelectors: p.widgetSelectors,
+                    verifyButtonSelectors: p.verifyButtonSelectors,
+                    frameSelectors: p.frameSelectors,
+                    titleNeedles: p.titleNeedles,
+                    textMarkers: p.textMarkers,
+                    originResponsePendingTextMarkers: p.originResponsePendingTextMarkers,
+                },
+            ],
+        })
+        const injectionError = (results[0] as { error?: { message?: string } })?.error
+        if (injectionError) {
+            throw wrapInjectionError(injectionError.message || String(injectionError))
+        }
+        const snapshot = results[0]?.result
+        if (!snapshot) {
+            throw new Error('challenge_inspect 未返回页面状态')
+        }
+        return snapshot
+    }
+
     async find(params: unknown, context: ActionContext): Promise<ElementInfo[]> {
         const p = FindSchema.parse(params) ?? {}
         const tabId = await this.getManagedTabId(p.tabId, context, 'find')
@@ -334,7 +431,8 @@ export class ContentHandler {
 
         if (data === undefined || data === null) {
             throw new Error(
-                `find 脚本未返回结果（selector="${p.selector ?? ''}" text="${p.text ?? ''}" xpath="${p.xpath ?? ''}"），可能是 selector 非法或 frame 不可注入`
+                `find 脚本未返回结果（selector="${p.selector ?? ''}" text="${p.text ?? ''}" ` +
+                    `xpath="${p.xpath ?? ''}"），可能是 selector 非法或 frame 不可注入`
             )
         }
         if (typeof data === 'object' && !Array.isArray(data) && 'error' in data) {

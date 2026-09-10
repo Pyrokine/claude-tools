@@ -19,7 +19,7 @@ pub fn list_projects(config: &Config) -> Result<ProjectsResponse, ErrorResponse>
         }
 
         let id = entry.file_name().to_string_lossy().to_string();
-        let path = project_id_to_display_path(&id);
+        let display = config.project_display_path(&id);
         let dir = entry.path();
 
         // 统计会话数量和最后活动时间
@@ -57,7 +57,8 @@ pub fn list_projects(config: &Config) -> Result<ProjectsResponse, ErrorResponse>
 
         projects.push(ProjectInfo {
             id,
-            path,
+            path: display.path,
+            path_approximate: display.approximate,
             session_count,
             last_activity,
         });

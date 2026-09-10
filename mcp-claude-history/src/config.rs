@@ -2,7 +2,25 @@ use crate::types::ErrorResponse;
 use crate::utils::project_id_to_display_path;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDisplayPath {
+    pub path: String,
+    pub approximate: bool,
+}
+
+pub fn project_path_to_id(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
 
 /// 配置
 #[derive(Debug, Clone)]
@@ -24,10 +42,8 @@ impl Config {
     /// 获取当前项目 ID（从 CWD 推断）
     pub fn current_project_id(&self) -> Option<String> {
         let cwd = env::current_dir().ok()?;
-        // Claude Code 的转换规则：/、\、:、_ 都变成 -
-        let project_id = cwd.to_string_lossy().replace(['\\', '/', ':', '_'], "-");
+        let project_id = project_path_to_id(&cwd.to_string_lossy());
 
-        // 检查该项目目录是否存在
         if self.projects_dir.join(&project_id).exists() {
             Some(project_id)
         } else {
@@ -46,15 +62,19 @@ impl Config {
             return Ok(raw.to_string());
         }
 
-        let normalized = raw.replace(['\\', '/', ':', '_'], "-");
+        let normalized = project_path_to_id(raw);
         let candidates: Vec<_> = self
             .list_project_dirs()
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(id, _)| {
-                let path = project_id_to_display_path(&id);
-                if id == normalized || path == raw {
-                    Some(serde_json::json!({ "id": id, "path": path }))
+                let display = self.project_display_path(&id);
+                if id == normalized || (!display.approximate && display.path == raw) {
+                    Some(serde_json::json!({
+                        "id": id,
+                        "path": display.path,
+                        "path_approximate": display.approximate,
+                    }))
                 } else {
                     None
                 }
@@ -85,6 +105,19 @@ impl Config {
         })
     }
 
+    pub fn project_display_path(&self, project_id: &str) -> ProjectDisplayPath {
+        if let Some(path) = resolve_existing_project_path(project_id) {
+            return ProjectDisplayPath {
+                path: path.to_string_lossy().to_string(),
+                approximate: false,
+            };
+        }
+        ProjectDisplayPath {
+            path: project_id_to_display_path(project_id),
+            approximate: true,
+        }
+    }
+
     /// 列出所有项目目录
     pub fn list_project_dirs(&self) -> std::io::Result<Vec<(String, PathBuf)>> {
         let mut dirs = Vec::new();
@@ -104,12 +137,82 @@ impl Config {
             .unwrap_or_default()
             .into_iter()
             .map(|(id, _)| {
-                let path = project_id_to_display_path(&id);
-                serde_json::json!({ "id": id, "path": path })
+                let display = self.project_display_path(&id);
+                serde_json::json!({
+                    "id": id,
+                    "path": display.path,
+                    "path_approximate": display.approximate,
+                })
             })
             .collect();
         serde_json::json!(projects)
     }
+}
+
+fn resolve_existing_project_path(project_id: &str) -> Option<PathBuf> {
+    let (root, remaining) = project_root_and_remaining(project_id)?;
+    if remaining.is_empty() {
+        return None;
+    }
+    let mut matches = Vec::new();
+    resolve_path_components(&root, remaining, &mut matches);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+fn resolve_path_components(current: &Path, remaining: &str, matches: &mut Vec<PathBuf>) {
+    if matches.len() > 1 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if !candidate.is_dir() {
+            continue;
+        }
+        let encoded_name = project_path_to_id(&entry.file_name().to_string_lossy());
+        if encoded_name.is_empty() {
+            continue;
+        }
+        let next_remaining = if remaining == encoded_name {
+            Some("")
+        } else {
+            remaining
+                .strip_prefix(&encoded_name)
+                .and_then(|suffix| suffix.strip_prefix('-'))
+        };
+        let Some(next_remaining) = next_remaining else {
+            continue;
+        };
+        if next_remaining.is_empty() {
+            matches.push(candidate);
+        } else {
+            resolve_path_components(&candidate, next_remaining, matches);
+        }
+        if matches.len() > 1 {
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn project_root_and_remaining(project_id: &str) -> Option<(PathBuf, &str)> {
+    Some((PathBuf::from("/"), project_id.strip_prefix('-')?))
+}
+
+#[cfg(windows)]
+fn project_root_and_remaining(project_id: &str) -> Option<(PathBuf, &str)> {
+    let bytes = project_id.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b"--" {
+        return None;
+    }
+    Some((PathBuf::from(format!("{}:\\", &project_id[..1])), &project_id[3..]))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn project_root_and_remaining(_: &str) -> Option<(PathBuf, &str)> {
+    None
 }
 
 /// 校验 project_id 字符白名单,拒绝路径注入字符
@@ -137,4 +240,44 @@ fn validate_project_id(project_id: &str) -> Result<(), ErrorResponse> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process;
+
+    #[test]
+    fn resolves_existing_project_paths_without_losing_punctuation() {
+        let temp_root = env::temp_dir().join(format!("mcp-project-path-test-{}", process::id()));
+        fs::remove_dir_all(&temp_root).ok();
+        let project_path = temp_root.join("claude-tools").join("dev_foo").join(".local");
+        fs::create_dir_all(&project_path).unwrap();
+        let project_id = project_path_to_id(&project_path.to_string_lossy());
+        let projects_dir = temp_root.join("projects");
+        fs::create_dir_all(projects_dir.join(&project_id)).unwrap();
+        let config = Config { projects_dir };
+
+        let display = config.project_display_path(&project_id);
+        assert_eq!(display.path, project_path.to_string_lossy());
+        assert!(!display.approximate);
+        assert_eq!(
+            config.normalize_project_id(&project_path.to_string_lossy()).unwrap(),
+            project_id
+        );
+        assert_eq!(project_path_to_id("/home/a_b/.cache/x y"), "-home-a-b--cache-x-y");
+
+        fs::remove_dir_all(&temp_root).ok();
+    }
+
+    #[test]
+    fn marks_nonexistent_project_paths_as_approximate() {
+        let config = Config {
+            projects_dir: env::temp_dir(),
+        };
+        let project_id = format!("-mcp-missing-project-path-{}", process::id());
+        let display = config.project_display_path(&project_id);
+        assert!(display.approximate);
+        assert_eq!(display.path, project_id_to_display_path(&project_id));
+    }
 }

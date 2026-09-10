@@ -52,16 +52,19 @@ test('operation start timeout leaves a queryable record and blocks duplicate pen
     t.after(() => manager.close())
 
     const pending = manager.start('server', 'sleep 1', { startTimeoutMs: 10, retentionMs: 60_000 })
+    let timeoutError
+    const timeoutAssertion = assert.rejects(pending, (error) => {
+        timeoutError = error
+        assert.match(error.message, /timed out/)
+        return true
+    })
     await waitForEvents()
     const [starting] = manager.list('server')
     assert.equal(starting.status, 'starting')
     await assert.rejects(manager.start('server', 'sleep 2'), /already has an operation start/)
 
-    await assert.rejects(pending, (error) => {
-        assert.match(error.message, /timed out/)
-        assert.equal(error.details.operationId, starting.operationId)
-        return true
-    })
+    await timeoutAssertion
+    assert.equal(timeoutError.details.operationId, starting.operationId)
     const timedOut = manager.status(starting.operationId)
     assert.equal(timedOut.status, 'unknown')
     assert.notEqual(timedOut.finishedAt, null)
@@ -81,6 +84,7 @@ test('tracked operation observes marker and close emitted before openStream retu
         async openStream(_alias, _command, marker, _options, adopt) {
             adopt(channel)
             channel.stderr.write(`__MCP_SSH_OPERATION__:${marker}:4321:0\n`)
+            // noinspection JSCheckFunctionSignatures — EventEmitter close 事件允许 code 与 signal 参数
             channel.emit('close', 0)
         },
         async cancelRemote() {
@@ -116,6 +120,7 @@ test('tracked operation verifies marker, bounds output, reads offsets, and cance
     assert.equal(started.status, 'starting')
 
     channel.stderr.write(`__MCP_SSH_OPERATION__:${channel.marker}:4321:1\nerr`)
+    // noinspection SpellCheckingInspection — 固定长度的截断测试载荷
     channel.write('abcdefghijk')
     await waitForEvents()
 
@@ -133,6 +138,7 @@ test('tracked operation verifies marker, bounds output, reads offsets, and cance
     assert.equal(firstRead.stdout, 'abcd')
     assert.equal(firstRead.nextStdoutOffset, 4)
     const secondRead = manager.read(started.operationId, { stdoutOffset: 4, maxBytes: 4 })
+    // noinspection SpellCheckingInspection — 固定长度的分页测试载荷
     assert.equal(secondRead.stdout, 'efgh')
 
     const cancelled = await manager.cancel(started.operationId)
@@ -144,6 +150,7 @@ test('tracked operation verifies marker, bounds output, reads offsets, and cance
         processGroup: true,
     })
 
+    // noinspection JSCheckFunctionSignatures — EventEmitter close 事件允许 code 与 signal 参数
     channel.emit('close', null, 'TERM')
     assert.equal(manager.status(started.operationId).status, 'cancelled')
 })
@@ -168,6 +175,7 @@ test('tracked operation defers stream close until cancellation succeeds', async 
 
     const cancelPromise = manager.cancel(started.operationId)
     await waitForEvents()
+    // noinspection JSCheckFunctionSignatures — EventEmitter close 事件允许 code 与 signal 参数
     channel.emit('close', 0, 'TERM')
     assert.equal(manager.status(started.operationId).status, 'running')
 
@@ -199,6 +207,7 @@ test('tracked operation preserves natural completion when cancellation verificat
 
     const cancelPromise = manager.cancel(started.operationId)
     await waitForEvents()
+    // noinspection JSCheckFunctionSignatures — EventEmitter close 事件允许 code 与 signal 参数
     channel.emit('close', 0)
     assert.equal(manager.status(started.operationId).status, 'running')
 
@@ -240,6 +249,31 @@ test('tracked operation reads UTF-8 output without splitting characters', async 
     assert.equal(second.nextStdoutOffset, 5)
 
     assert.throws(() => manager.read(started.operationId, { stdoutOffset: 2, maxBytes: 4 }), /UTF-8 character boundary/)
+})
+
+test('tracked operation advances past a partial UTF-8 character at the storage limit', async (t) => {
+    const channel = createChannel()
+    const manager = new OperationManager({
+        async openStream(_alias, _command, marker, _options, adopt) {
+            channel.marker = marker
+            adopt(channel)
+        },
+        async cancelRemote() {
+            return { success: true }
+        },
+    })
+    t.after(() => manager.close())
+
+    const started = await manager.start('server', 'printf "😀"', { maxOutputBytes: 3 })
+    channel.stderr.write(`__MCP_SSH_OPERATION__:${channel.marker}:4321:0\n`)
+    channel.write(Buffer.from('😀'))
+    await waitForEvents()
+
+    const result = manager.read(started.operationId, { maxBytes: 3 })
+    assert.equal(result.stdout, '')
+    assert.equal(result.stdoutTruncated, true)
+    assert.equal(result.stdoutStoredBytes, 3)
+    assert.equal(result.nextStdoutOffset, 3)
 })
 
 test('tracked operation refuses cancel before marker verification and becomes unknown on disconnect', async (t) => {
@@ -417,6 +451,7 @@ test('tracked operation retains a partial stderr preamble when the stream closes
     const started = await manager.start('server', 'exit 1')
     channel.stderr.write('profile warning without newline')
     await waitForEvents()
+    // noinspection JSCheckFunctionSignatures — EventEmitter close 事件允许 code 与 signal 参数
     channel.emit('close', 1)
 
     const status = manager.status(started.operationId)

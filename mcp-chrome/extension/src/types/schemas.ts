@@ -245,6 +245,24 @@ export const EvaluateSchema = z.object({
     code: z.string().min(1),
 })
 
+export const ViewportMetricsSchema = z.object({
+    tabId: tabIdOpt,
+    frameId: frameIdOpt,
+})
+
+export const ChallengeInspectSchema = z.object({
+    tabId: tabIdOpt,
+    frameId: frameIdOpt,
+    challengeSelectors: z.array(z.string()),
+    deniedSelectors: z.array(z.string()),
+    widgetSelectors: z.array(z.string()),
+    verifyButtonSelectors: z.array(z.string()),
+    frameSelectors: z.array(z.string()),
+    titleNeedles: z.array(z.string()),
+    textMarkers: z.array(z.string()),
+    originResponsePendingTextMarkers: z.array(z.string()),
+})
+
 export const FindSchema = z
     .object({
         tabId: tabIdOpt,
@@ -333,6 +351,15 @@ export const CookiesClearSchema = z
         name: z.string().optional(),
     })
     .partial()
+    .superRefine((value, ctx) => {
+        if (!value.url && !value.domain) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['url'],
+                message: 'cookies action=clear 必须带 url 或 domain 过滤参数',
+            })
+        }
+    })
     .optional()
 
 // ==================== Debugger ====================
@@ -425,6 +452,7 @@ export const ConsoleEnableSchema = TabIdOnly
 export const ConsoleClearSchema = TabIdOnly
 export const NetworkEnableSchema = TabIdOnly
 export const NetworkClearSchema = TabIdOnly
+export const NetworkChallengeStateSchema = TabIdOnly
 
 export const ConsoleGetSchema = z
     .object({

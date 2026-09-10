@@ -62,6 +62,21 @@ struct ClassifiedMessage {
 
 /// 获取上下文
 pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse, ErrorResponse> {
+    let mut params = params;
+    let filters = normalize_message_filters(&params.types, &params.subtypes, None)?;
+    let mut parameter_warnings = filters.warnings;
+    params.types = filters.types;
+    params.subtypes = filters.subtypes;
+    params.direction = parse_context_direction(&params.direction)?;
+    validate_context_range_selectors(
+        params.before,
+        params.after,
+        params.until_type.as_deref(),
+        params.until_ref.as_deref(),
+    )?;
+    if params.until_type.is_none() && params.direction == "backward" {
+        return Err(invalid_arguments("direction=backward 仅能与 until_type 一起使用"));
+    }
     let content_filter = build_content_filter(&params.pattern, params.regex, params.case_sensitive)?;
     // 解析 ref
     let parsed_ref = ParsedRef::parse(&params.r#ref).ok_or_else(|| ErrorResponse {
@@ -267,12 +282,12 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         });
     }
 
-    let warnings = jsonl_read_warnings(read_errors, parse_errors);
+    parameter_warnings.extend(jsonl_read_warnings(read_errors, parse_errors));
     let response = ContextResponse {
         anchor_ref: params.r#ref.clone(),
         messages,
         truncated: if truncated_by_total { Some(true) } else { None },
-        warnings,
+        warnings: parameter_warnings,
         output_path: None,
         output: None,
     };
@@ -427,5 +442,23 @@ mod tests {
         assert_eq!(response.messages.len(), 1);
         assert_eq!(response.warnings, ["解析 JSONL 时跳过 2 行"]);
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn conflicting_context_selectors_fail_before_ref_resolution() {
+        let error = context(
+            &Config {
+                projects_dir: env::temp_dir(),
+            },
+            ContextParams {
+                r#ref: "invalid".to_string(),
+                before: Some(0),
+                until_type: Some("user".to_string()),
+                ..ContextParams::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "invalid_arguments");
+        assert!(error.message.contains("不能和 before/after 同时传入"));
     }
 }

@@ -28,7 +28,7 @@ const logsSchema = z.object({
     type: z.enum(['console', 'network']).describe('日志类型'),
     level: z.enum(['all', 'error', 'warning', 'info', 'debug']).optional().describe('日志级别过滤（console）'),
     urlPattern: z.string().optional().describe('URL 模式过滤（network），支持通配符'),
-    limit: z.number().optional().describe('最大返回条数'),
+    limit: z.number().int().positive().max(1000).optional().describe('最大返回条数，1 至 1000'),
     clear: z.boolean().optional().describe('获取后清除日志'),
     output: z
         .string()
@@ -155,9 +155,9 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
                         lineNumber?: number
                     }>
 
+                    await unifiedSession.enableConsole()
                     if (mode === 'extension') {
                         // Extension 模式：使用 debugger API 获取控制台日志
-                        await unifiedSession.enableConsole()
                         logs = await unifiedSession.getConsoleLogs({ clear: args.clear })
                     } else {
                         // CDP 模式

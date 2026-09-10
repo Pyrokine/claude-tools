@@ -36,7 +36,7 @@ scripts/truncate.py <target> --line <N> --new-session --title "..."
    tail
 3. **session 列表里消失** — 可能是 [Issue #25920](https://github.com/anthropics/claude-code/issues/25920) 首条 user >
    15KB 触发 head-read bug，truncate 会自动补 custom-title 绕过
-4. **文件太大打开慢** — 截断到最近 1 万行以内(经验上限,更多会再触发 /compact)
+4. **文件太大打开慢** — 截断到最近 1 万行以内 (经验上限,更多会再触发 /compact)
 5. **/compact 报 `Invalid signature in thinking block`** — 两种情况：
     - 签名为空字符串：CPA 等代理将 GPT 接入 CC，GPT 返回的 thinking block 没有有效签名
     - 签名存在但无效：oneapi/Bedrock 代理的 API key 和生成 thinking 时的 key 不一致，签名校验失败

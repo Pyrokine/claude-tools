@@ -1,8 +1,13 @@
 # mcp-chrome 发版前回归清单
 
-本清单用于在 Claude Code 会话内由 agent 按用例 ID 顺序跑一遍，**全部 PASS 才能执行 `npm publish`**
+本清单用于在 Claude
+Code 会话内由 agent 按用例 ID 顺序执行；所有必跑用例 PASS，条件用例 PASS 或按明确前置条件记录 SKIP，KNOWN-LIMIT 已登记到附录 A，才能执行
+`npm publish`
 
-`test/run-all.js` 是独立冷启动 smoke（跑 demoqa），**定位为可选补充**——覆盖 smoke-level 的工具调用，不做行为级断言，真正回归以本清单为准
+本文件只维护可复用的测试指导、用例定义、验收标准和长期限制，不记录单次执行结果、日期化回归记录或发版日志
+
+`test/run-all.js`
+是独立冷启动 smoke（运行 demoqa），定位为可选补充，仅覆盖 smoke-level 的工具调用，不做行为级断言，真正回归以本清单为准
 
 ---
 
@@ -10,39 +15,44 @@
 
 ### 0.1 前置条件
 
-**执行总纲**：按本清单用例顺序跑，全部 PASS 才放行，跑的过程中严守"不污染用户环境"——禁止操作用户已有
-tab，禁止清全局缓存/cookies，只能动测试 tab 和测试创建的 `mcp_test_*` 前缀数据，任何与此冲突的用例就地标 SKIP
+**执行总纲**：按本清单用例顺序执行，默认状态为必跑；禁止操作用户已有 tab，禁止清除全局缓存或 cookies，只能操作 agent 创建的 managed 测试 tab 和测试创建的
+`mcp_test_*` 前缀数据；需要激活页面、聚焦窗口、创建窗口或启动浏览器的用例只能在独立测试浏览器中作为条件用例执行
 
-- Chrome Extension 已在 `chrome://extensions/` 刷新为最新 dist，popup 显示 **已连接**；调用 `browse(action="connect")`，确认 `extension.bundleStatus="match"`，活动 `extensionBackgroundBundleHash` 与 `expectedBackgroundBundleHash` 相同，不能只比较 manifest version
+- Chrome Extension 已在 `chrome://extensions/` 刷新为最新 dist，popup 显示 **已连接**；调用
+  `browse(action="connect")`，确认 `extension.bundleStatus="match"`，活动 `extensionBackgroundBundleHash` 与
+  `expectedBackgroundBundleHash` 相同，不能只比较manifest version
 - CC 重启后 Extension 应自动连接本地 MCP Server；除非测试强制 token 或手动连接流程，否则“需要点连接”不能作为发版前置条件
 - MCP server 已加载最新 dist（src 有任何改动 → `npm run build` → 重启 CC，否则跑到的是旧进程）
-- 全程使用 `manage action=newPage` 创建的测试 tab，**严禁操作用户已有 tab**
-- 所有浏览操作默认 `activated=false`（后台）；只有截图 compare 等需要可见 renderer 的用例可临时 `manage activatePage`
-  ，且目标必须是 agent 自己创建的 managed 测试 tab
+- 全程使用 `manage action=newPage` 创建的测试 tab， **严禁操作用户已有 tab**
+- 所有浏览操作保持 `activated=false` 并在后台执行；常规回归不调用
+  `browse activate=true`、`manage activatePage`、`manage focusWindow` 或 `manage newWindow`
 - 清理只针对测试 tab 和 `mcp_test_*` 前缀的 cookie，严禁 `cookies clear` 无过滤
 - output 相对路径默认写入 mcp-chrome 受控临时目录；需要保留在仓库内时使用 `cwd:test-output/...`，跑前确认 `test-output`
   存在，跑后可清空
 
 ### 0.2 测试载体
 
-| 载体            | 位置                                                   | 作用                                   |
-|---------------|------------------------------------------------------|--------------------------------------|
-| **test-page** | `file:///<repo>/mcp-chrome/extension/test-page.html` | 受控页面，13 region，可注入 evaluate 监听器做行为断言 |
-| **demoqa**    | `https://demoqa.com/`                                | 可选真实站点补充；外部网络不可达时不得阻塞发版门禁 |
+| 载体              | 位置                                                     | 作用                                   |
+| ----------------- | -------------------------------------------------------- | -------------------------------------- |
+| **test-page**     | `file:///<repo>/mcp-chrome/extension/test-page.html`     | 受控页面，覆盖 14 个 region 和行为断言 |
+| **test-csp-page** | `file:///<repo>/mcp-chrome/extension/test-csp-page.html` | 受控严格 CSP 页面                      |
+| **demoqa**        | `https://demoqa.com/`                                    | 可选外部站点，网络不可达时跳过         |
 
-每个用例在字段 `载体` 里标注 `test-page` / `demoqa` / `任意` / `N/A`。发版门禁优先使用 `test-page` 和 `about:blank` 受控页面；外部站点只作补充观察，导航超时或网络不可达时记录 SKIP，并执行对应受控页面用例
+每个用例在字段 `载体` 里标注 `test-page` / `test-csp-page` / `demoqa` / `任意` / `N/A`；发版门禁优先使用本地受控页面和
+`about:blank`，外部站点只作补充观察，导航超时或网络不可达时记录 SKIP，并执行对应受控页面用例
 
 ### 0.3 执行流程
 
 ```
 for each tool chapter:
     for each case (按 ID 顺序):
-        前置步骤
-        执行"操作"里的 mcp 调用
+        判断必跑、条件或 KNOWN-LIMIT 状态
+        条件用例的前置条件不具备 → 标记 SKIP 并记录原因
+        否则执行"操作"里的 MCP 调用
         按"断言"逐条验证
         失败 → 标记 FAIL 并记录证据；不阻断其他用例（非 fail-fast）
-    输出本章 PASS / FAIL 清单
-最后汇总全部 FAIL 用例 ID
+    输出本章 PASS / FAIL / SKIP 清单
+最后汇总全部 FAIL 和 SKIP 用例 ID
 ```
 
 ### 0.4 清理
@@ -55,10 +65,14 @@ for each tool chapter:
 
 ## 0.5 通过标准总则
 
-- **成功用例** —— 返回 `success=true` + 关键字段非空 + 页面 DOM 符合断言中具体值
-- **错误用例** —— 抛 Error 或响应带 `error`，错误消息 **必须包含用例指定的关键词子串**
-- **行为断言** —— 形如 "注入监听器读取 event.buttons=2"，必须是具体位置具体值，禁止 "差不多" "能跑就行"
-- **快照式断言** —— 截图/html 的用例可接受 "文件生成 + 大小 > 0 + 格式正确"，不做像素 diff
+- 未标注状态的用例是必跑用例，必须 PASS
+- 标注 `状态：条件` 的用例仅在列出的前置条件不具备时允许 SKIP，并在当前会话或临时结果中记录缺失条件
+- 标注 `状态：KNOWN-LIMIT` 的用例必须在附录 A 登记，按登记条件验收
+- 任意 FAIL、未声明的 SKIP 或缺少明确理由的 SKIP 都阻止发版
+- **成功用例**：返回 `success=true`、关键字段非空、页面 DOM 符合断言中的具体值
+- **错误用例**：抛 Error 或响应带 `error`，错误消息必须包含用例指定的关键词子串
+- **行为断言**：形如“注入监听器读取 event.buttons=2”，必须验证具体位置和具体值
+- **快照式断言**：截图或 HTML 用例可接受“文件生成、大小 > 0、格式正确”，不做像素 diff
 
 ---
 
@@ -73,7 +87,7 @@ for each tool chapter:
 - `browse-list-01`
 - `input-click-03-actionable`
 - `input-keydown-05-modifier-commands`
-- `extract-screenshot-02-fullpage`
+- `extract-screenshot-02-full-page`
 - `err-stealth-commands-01`
 
 FAIL 时只需报 ID + 失败断言即可
@@ -92,6 +106,7 @@ FAIL 时只需报 ID + 失败断言即可
 8. [wait](#8-wait) — 4 types
 9. [错误分支 / 边界](#9-错误分支--边界)
 10. [test-page region 索引](#10-test-page-region-索引)
+11. [npm 发布包](#11-npm-发布包)
 
 ---
 
@@ -99,19 +114,23 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### browse-launch-01
 
-- 前置：无（假设已由用户 launch；CC 内通常用 connect，不实际触发 launch）
-- 操作：跳过（launch 一般由用户手动，CC 不主动 launch 以免开新窗口）
-- 断言：N/A
+- 状态：条件，仅在独立测试浏览器环境中且当前没有可复用浏览器时执行
+- 前置：该环境不包含用户窗口、tab 或登录态
+- 操作：`browse { action: "launch" }`
+- 断言：`success=true`，并返回新浏览器的连接模式
 - 载体：N/A
-- 备注：CC 场景下 launch 不在 agent 回归范围，可选手工跑 `browse launch` 并检查返回 `success=true`
+- 清理：关闭本用例启动的独立测试浏览器
 
 ### browse-connect-01
 
-- 前置：Chrome 已开启且有 debug 端口
-- 操作：`browse { action: "connect" }`（不带 port 参数自动探测；带 port=9222 精确）
-- 断言：`success=true`，响应 `mode` 字段为 `cdp` 或 `extension`；Extension 模式还需返回 `extension.helloReceived=true`、`extension.bundleStatus="match"`，且活动 hash 与预期 hash 相同
+- 前置：Chrome 已开启且 Extension 自动连接，CDP 精确连接只在另有独立调试实例时测试
+- 操作：`browse { action: "connect" }`；需要验证 CDP 时另行调用 `browse { action: "connect", port: 9222 }`
+- 断言：不带 `port` 时 `mode="extension"`，并返回
+  `extension.helloReceived=true`、`extension.bundleStatus="match"`，活动 hash 与预期 hash 相同；带 `port` 时
+  `mode="cdp"`
 - 载体：N/A
-- 备注：CC 常态由 Extension 模式接管，`connect` 是 CDP 模式入口；`legacy` 表示旧 Extension 未上报 hash，`stale` 表示浏览器仍在运行旧 bundle，这两种状态都不阻断自动连接
+- 备注：不带 `port` 的 `connect` 回到 Extension。只有显式传 `port` 才选择 CDP；`legacy`
+  表示旧 Extension 未上报 hash，`stale` 表示浏览器仍在运行旧 bundle，这两种状态都不阻断自动连接
 
 ### browse-list-01
 
@@ -127,19 +146,20 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### browse-attach-01-background
 
-- 前置：已 list 得到目标 targetId
-- 操作：`browse { action: "attach", targetId: <id>, activate: false }`
+- 前置：用 `manage newPage` 创建 managed 测试 tab T，并从 browse list 取得 T 的 targetId
+- 操作：`browse { action: "attach", targetId: <T>, activate: false }`
 - 断言：`success=true`，`activated=false`，后续工具 `manage newPage` 仍可工作
-- 载体：任意
+- 载体：test-page
+- 清理：关闭 T
 
 ### browse-attach-02-activate
 
-- 状态：**SKIP**（与 MEMORY 全局 "禁止 activate=true" 规则冲突，测试流程不走 activate）
-- 前置：agent 自己先 newPage 创建一个 test tab（不要用用户 tab）
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：agent 在该环境中用 newPage 创建测试 tab，不存在用户窗口、tab 或登录态
 - 操作：`browse { action: "attach", targetId: <testTabId>, activate: true }`
-- 断言：`success=true`，`activated=true`，该 test tab 被带到前台
+- 断言：`success=true`，`activated=true`，该测试 tab 成为活动页面
 - 载体：test-page
-- 清理：关闭 test tab
+- 清理：关闭测试 tab
 
 ### browse-open-01
 
@@ -152,20 +172,31 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：当前没有 attach 页面，或 attach 状态为空
 - 操作：`browse { action: "open", url: "about:blank", wait: "load", diagnostics: true }`
-- 断言：`success=true`，响应含 `diagnostics.console` 和 `diagnostics.failedRequests` 数组，首次自动创建页面时也返回
-  diagnostics
+- 断言：`success=true`，响应含 `diagnostics.console` 和 `diagnostics.failedRequests`
+  数组，首次自动创建页面时也返回diagnostics
 - 载体：N/A
 
 ### browse-open-02-wait-networkidle
 
 - 前置：attach 到 test tab
-- 操作：`browse { action: "open", url: "file:///<repo>/mcp-chrome/extension/test-page.html#networkidle", wait: "networkidle" }`
+
+- 操作：
+
+    ```text
+    browse {
+        action: "open",
+        url: "file:///<repo>/mcp-chrome/extension/test-page.html#networkidle",
+        wait: "networkidle"
+    }
+    ```
+
 - 断言：`success=true`，`url` 以 `file:///` 开头且包含 `#networkidle`，返回耗时包含 networkidle 静默等待
 - 载体：test-page
 
 ### browse-back-01
 
-- 前置：测试 tab open 到 `file:///<repo>/mcp-chrome/extension/test-page.html#page-a` → 再 open 到 `file:///<repo>/mcp-chrome/extension/test-page.html#page-b`，形成两页历史
+- 前置：测试 tab open 到 `file:///<repo>/mcp-chrome/extension/test-page.html#page-a` → 再 open 到
+  `file:///<repo>/mcp-chrome/extension/test-page.html#page-b`，形成两页历史
 - 操作：`browse { action: "back" }`
 - 断言：`success=true`，当前 URL 回到 `#page-a`
 - 载体：test-page
@@ -195,17 +226,26 @@ FAIL 时只需报 ID + 失败断言即可
 ### browse-close-01
 
 - 前置：agent 自己 newPage 创建 test tab T
-- 操作：`browse { action: "close" }`（extension 模式下等价于 `manage closePage targetId=T`）
+- 操作：`browse { action: "close", targetId: <T> }`
 - 断言：`success=true`，再 `browse list` 找不到该 targetId
 - 载体：test-page
-- 备注：extension 模式下 `browse close` 实际关的是当前 attach 的 tab，CDP 模式下关闭浏览器会话
+- 备注：Extension 和 CDP 模式都只关闭 `targetId` 指定的页面
+
+### browse-close-02-target-required
+
+- 前置：已连接
+- 操作：`browse { action: "close" }`
+- 断言：返回 `INVALID_ARGUMENT`，消息包含 `targetId`
+- 载体：N/A
 
 ### browse-managed-guard-01
 
-- 前置：`browse list` 找到 managed=false 的用户 tab，但只 attach activate=false，不导航不关闭
+- 前置：用 `manage newPage` 创建测试 tab T，记录原 URL，再执行 `manage releasePage targetId=<T>` 并确认
+  `managed=false`，最后 `browse attach targetId=<T> activate=false`
 - 操作：`browse { action:"open", url:"about:blank" }`
-- 断言：返回 `UNMANAGED_TAB`，建议使用 managed=true 测试 tab 或 manage newPage
-- 载体：N/A
+- 断言：返回 `UNMANAGED_TAB`，T 的 URL 保持原值，建议使用 managed=true 测试 tab 或 manage newPage
+- 载体：test-page
+- 清理：执行 `manage adoptPage targetId=<T>` 后关闭 T
 
 ### browse-list-02-mode-field
 
@@ -271,7 +311,20 @@ FAIL 时只需报 ID + 失败断言即可
 ### cookies-set-02-with-attrs
 
 - 操作：
-  `cookies { action: "set", name: "mcp_test_b", value: "2", url: "https://mcp-chrome.test/", secure: true, httpOnly: true, sameSite: "Lax", expirationDate: <Math.floor(Date.now()/1000)+3600> }`
+
+    ```text
+    cookies {
+        action: "set",
+        name: "mcp_test_b",
+        value: "2",
+        url: "https://mcp-chrome.test/",
+        secure: true,
+        httpOnly: true,
+        sameSite: "Lax",
+        expirationDate: <Math.floor(Date.now() / 1000) + 3600>
+    }
+    ```
+
 - 断言：读回后 value、secure、httpOnly、sameSite、expirationDate 一致；`expirationDate` 必须是 Unix 秒级时间戳
 - 清理：`cookies delete name=mcp_test_b url=https://mcp-chrome.test/`
 
@@ -282,15 +335,20 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：`success=true`，再 get 找不到
 - 载体：任意
 
-### cookies-clear-01-domain
+### cookies-clear-01-domain-name
 
-- 状态：**SKIP**（与 MEMORY "只删 mcp_test_* 前缀" 冲突，clear 无 name 过滤，domain=mcp-chrome.test 会清同域非测试 cookie）
-- 前置：先 set mcp_test_d 到 mcp-chrome.test
-- 操作：`cookies { action: "clear", domain: "mcp-chrome.test" }`
-- 断言：`success=true`，之后 `cookies get domain=mcp-chrome.test` 不含 mcp_test_d
+- 前置：先 set `mcp_test_d` 到 `https://mcp-chrome.test/`
+- 操作：`cookies { action: "clear", domain: "mcp-chrome.test", name: "mcp_test_d" }`
+- 断言：`success=true`，之后 `cookies get domain=mcp-chrome.test name=mcp_test_d` 不含该 cookie
 - 载体：任意
-- 注意：**不得运行无参数的 clear**，会清所有 cookie；手工跑时用独立 Chrome profile
-- 替代验证：用 `cookies delete name=mcp_test_d url=https://mcp-chrome.test/` 清理测试 cookie
+- 清理：无
+
+### cookies-clear-02-scope-required
+
+- 前置：任意 managed test tab
+- 操作：`cookies { action: "clear", name: "mcp_test_d" }`
+- 断言：返回 `INVALID_ARGUMENT`，消息包含 `url 或 domain`
+- 载体：任意
 
 ---
 
@@ -342,23 +400,57 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### evaluate-precise-07a-frame-identity
 
-- 前置：attach 到含 `iframe#test-frame` 的 managed HTTP tab，页面同时存在其他 iframe，记录 `iframe#test-frame` 在 `document.querySelectorAll('iframe, frame')` 中的索引
+- 前置：attach 到含 `iframe#test-frame` 的 managed HTTP tab，页面同时存在其他 iframe，记录 `iframe#test-frame` 在
+  `document.querySelectorAll('iframe, frame')` 中的索引
 - 操作：分别以 `frame:"iframe#test-frame"` 和上一步得到的数字索引读取 `#frame-btn` 文本
-- 断言：两次都返回 `Frame Button`，不会命中其他 frame；所选 DOM iframe 无法映射到唯一 frameId 时返回 `FRAME_IDENTITY_UNAVAILABLE`，不得按 `webNavigation` 顺序选择 frame
+- 断言：两次都返回 `Frame Button`，不会命中其他 frame；所选 DOM iframe 无法映射到唯一 frameId 时返回
+  `FRAME_IDENTITY_UNAVAILABLE`，不得按 `webNavigation` 顺序选择 frame
 - 载体：独立 managed test tab
 
 ### evaluate-precise-08-stale-default-no-replay
 
-- 前置：attach 到 test-page，执行主框架脚本设置 `window.__mcp_stale_side_effect=0`，保存 `iframe#test-frame.srcdoc`，并在 300ms 后把同一 srcdoc 重新赋给 iframe 触发 context 销毁
-- 操作：立即执行 `evaluate { frame:"iframe#test-frame", timeout:4000, script:"(async()=>{parent.__mcp_stale_side_effect++; await new Promise(r=>setTimeout(r,1000)); return parent.__mcp_stale_side_effect})()" }`，不传 `staleContextRetry`
-- 断言：返回 `FRAME_STALE_CONTEXT`，`staleContextRetry === "never"`，`retryAttempted === false`、`actionExecuted === true`、`actionStatus === "unknown"`；在主框架读取 `window.__mcp_stale_side_effect === 1`，证明有副作用脚本没有自动重放
+- 前置：attach 到 test-page，执行主框架脚本设置 `window.__mcp_stale_side_effect=0`，保存
+  `iframe#test-frame.srcdoc`，并在 300ms 后把同一 srcdoc 重新赋给 iframe 触发 context 销毁
+
+- 操作：立即执行以下调用，不传 `staleContextRetry`
+
+    ```text
+    evaluate {
+        frame: "iframe#test-frame",
+        timeout: 4000,
+        script: `(async () => {
+            parent.__mcp_stale_side_effect++;
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return parent.__mcp_stale_side_effect;
+        })()`
+    }
+    ```
+
+- 断言：返回
+  `FRAME_STALE_CONTEXT`，`staleContextRetry === "never"`，`retryAttempted === false`、`actionExecuted === true`、
+  `actionStatus === "unknown"`；在主框架读取 `window.__mcp_stale_side_effect === 1`，证明有副作用脚本没有自动重放
 - 载体：test-page
 
 ### evaluate-precise-09-stale-readonly-retry
 
 - 前置：重新载入 test-page，执行主框架脚本保存 `iframe#test-frame.srcdoc`，并在 300ms 后重新赋值触发 context 销毁
-- 操作：立即执行 `evaluate { frame:"iframe#test-frame", timeout:5000, staleContextRetry:"readOnly", script:"(async()=>{await new Promise(r=>setTimeout(r,1000)); return document.getElementById('frame-btn').textContent})()" }`
-- 断言：`success=true`，`result === "Frame Button"`，`staleContextRetry === "readOnly"`，`retryAttempted === true`，`frameContext.executionContextId` 非空；脚本本身不写页面状态
+
+- 操作：立即执行
+
+    ```text
+    evaluate {
+        frame: "iframe#test-frame",
+        timeout: 5000,
+        staleContextRetry: "readOnly",
+        script: `(async () => {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return document.getElementById("frame-btn").textContent;
+        })()`
+    }
+    ```
+
+- 断言：`success=true`，`result === "Frame Button"`，`staleContextRetry === "readOnly"`，`retryAttempted === true`，
+  `frameContext.executionContextId` 非空；脚本本身不写页面状态
 - 载体：test-page
 
 ### evaluate-precise-10-scriptFile
@@ -390,30 +482,31 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### evaluate-stealth-02-csp-limit
 
-- 状态：**可选**（需要用户已有带严格 CSP 的 tab；MEMORY 禁止 agent 抢用户 tab，无法自建严格 CSP 的测试环境，Phase 1 环境下
-  SKIP）
-- 前置：attach 到带严格 CSP 的页面（如 github.com）
+- 前置：用 `manage newPage` 创建 `test-csp-page`，提取 `#csp-marker` 并确认页面载入完成
 - 操作：`evaluate { script: "1+1", mode: "stealth" }`
-- 断言：允许两种结果：① `success=true`（CSP 允许）② 错误消息包含 "CSP" 或 "blocked"
-- 载体：github.com 或任何带严格 CSP 的站点
+- 断言：返回错误，消息包含 `Content Security Policy`、`CSP`、`blocked` 或 `Cannot access`，不得返回 `result === 2`
+- 载体：test-csp-page
+- 清理：关闭测试 tab
 
 ### evaluate-tabId-01
 
-- 前置：attach 到 T1（test-page），tabId=T1 已知
-- 操作：`evaluate { script: "document.title", tabId: "<T1>" }`
-- 断言：`result === "MCP Chrome 测试页面"`
+- 前置：用 `manage newPage` 创建 managed 测试 tab T1 和 T2，保持 attach 在 T1，并把两个页面标题设为不同值
+- 操作：`evaluate { script: "document.title", tabId: "<T2>" }`
+- 断言：`result` 等于 T2 的标题，T1 的标题保持不变
 - 载体：test-page
-- 备注：双 tab 对比可选（需自建第二个 managed test tab，Phase 1 环境可 SKIP）
+- 清理：关闭 T1 和 T2
 
 ### scope-tabId-01-backend-consistency
 
-- 前置：创建两个 managed test tab T1 和 T2，当前 attach 保持在 T1；T1、T2 的 title 和 `#text-input` 初始值不同，在 T2 触发一条唯一 console warning
+- 前置：创建两个 managed test tab T1 和 T2，当前 attach 保持在 T1；T1、T2 的 title 和 `#text-input`
+  初始值不同，在 T2 触发一条唯一 console warning
 - 操作：分别对 T2 的 `tabId` 调用：
-  1. `input` 给 `#text-input` 输入唯一值，并用 `postCondition.script` 检查同一值
-  2. `wait for=element` 等待 T2 独有 selector
-  3. `logs type=console` 读取 T2 的唯一 warning
-  4. `extract type=text` 读取 T2 独有文本
-- 断言：input 返回 `mode === "extension"` 且 post-condition matched，wait、logs、extract 都命中 T2；T1 的 title、输入值和页面文本不变；每项操作后分别对 T1、T2 提取目标元素并截图，确认没有切换或写错 tab
+    1. `input` 给 `#text-input` 输入唯一值，并用 `postCondition.script` 检查同一值
+    2. `wait for=element` 等待 T2 独有 selector
+    3. `logs type=console` 读取 T2 的唯一 warning
+    4. `extract type=text` 读取 T2 独有文本
+- 断言：input 返回 `mode === "extension"` 且 post-condition
+  matched，wait、logs、extract 都命中 T2；T1 的 title、输入值和页面文本不变；每项操作后分别对 T1、T2 提取目标元素并截图，确认没有切换或写错 tab
 - 载体：两个 test-page managed tab
 - 清理：关闭 T1、T2
 
@@ -423,7 +516,7 @@ FAIL 时只需报 ID + 失败断言即可
 - 断言：返回 `diagnostics.console` 含 warning，`diagnostics.failedRequests` 含失败请求摘要
 - 载体：test-page
 
-### evaluate-nonserializable-01-dom-node
+### evaluate-non-serializable-01-dom-node
 
 - 操作：`evaluate { script: "document.body" }`
 - 断言：返回 `isError=true`，`error.code === "NON_SERIALIZABLE_EVALUATE_RESULT"`，`error.suggestion` 含 `outerHTML` 或
@@ -502,7 +595,7 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：test-page 有多个 `<button>`
 - 操作：`extract { type: "text", target: { css: "button", nth: 1 } }`
-- 断言：定位到**全文档第 2 个** button（nth 是 `document.querySelectorAll(css)` 的索引，不是 section 内的索引）
+- 断言：定位到 **全文档第 2 个** button（nth 是 `document.querySelectorAll(css)` 的索引，不是 section 内的索引）
 - 载体：test-page
 
 ### extract-text-12-css-text-combo
@@ -513,8 +606,18 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### extract-text-13-coords
 
-- 前置：用 `evaluate` 获取 #btn-id 的中心坐标：
-  `(() => { const r = document.getElementById('btn-id').getBoundingClientRect(); return {x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)} })()`
+- 前置：用 `evaluate` 执行以下脚本，获取 `#btn-id` 的中心坐标
+
+    ```js
+    ;(() => {
+        const rect = document.getElementById('btn-id').getBoundingClientRect()
+        return {
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+        }
+    })()
+    ```
+
 - 操作：`extract { type: "text", target: { x: <X>, y: <Y> } }`
 - 断言：`result === "ID 定位按钮"`
 - 载体：test-page
@@ -535,7 +638,7 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：test-page region 8 有 #test-image
 - 操作：`extract { type: "html", target: { css: "body" }, images: "info" }`
-- 断言：返回的 `images` 数组含 `#test-image` 的 src/alt/尺寸，**不含 base64 data**
+- 断言：返回的 `images` 数组含 `#test-image` 的 src/alt/尺寸， **不含 base64 data**
 - 载体：test-page
 
 ### extract-html-04-images-data
@@ -560,53 +663,80 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### extract-screenshot-01-viewport
 
-- 前置：测试 tab 处于可见状态（其窗口 focused 且 tab active）；对 managed 测试 tab 执行 `manage activatePage` 后等待约 800ms 再截图
+- 状态：条件，仅在独立 CDP/headless 测试浏览器，或不含用户资产的独立 Extension 测试窗口中执行
+- 前置：CDP/headless 模式可保持后台；Extension 模式需要测试 tab 是独立测试窗口内的活动 tab，页面载入后等待约 800ms
 - 操作：`extract { type: "screenshot", output: "cwd:test-output/mcp-shot.png" }`
 - 断言：
     - `success=true`
     - `./test-output/mcp-shot.png` 存在，`file` 命令识别为 PNG，尺寸 > 10KB
 - 载体：test-page
 - 清理：`rm ./test-output/mcp-shot.png`
-- 备注：hidden tab 下返回 `error.code === "HIDDEN_TAB_SCREENSHOT"`，不会自动切前台
+- 备注：Extension 的隐藏 tab 没有可用 compositor frame 时会返回
+  `HIDDEN_TAB_SCREENSHOT`，不得通过激活用户窗口或用户 tab 规避
 
-### extract-screenshot-02-fullpage
+### extract-screenshot-02-full-page
 
+- 状态：条件，与 `extract-screenshot-01-viewport` 使用相同的独立测试环境
 - 操作：`extract { type: "screenshot", fullPage: true, output: "cwd:test-output/mcp-fs.png" }`
 - 断言：文件尺寸 > viewport-only 截图（test-page 总高明显大于视口）
 - 载体：test-page
 
 ### extract-screenshot-03-jpeg
 
+- 状态：条件，与 `extract-screenshot-01-viewport` 使用相同的独立测试环境
 - 操作：`extract { type: "screenshot", format: "jpeg", quality: 80, output: "cwd:test-output/mcp-s.jpg" }`
 - 断言：`file ./test-output/mcp-s.jpg` 识别为 JPEG
 - 清理：`rm ./test-output/mcp-s.jpg`
 
 ### extract-screenshot-04-element
 
+- 状态：条件，与 `extract-screenshot-01-viewport` 使用相同的独立测试环境
 - 操作：`extract { type: "screenshot", target: { css: "#btn-id" }, output: "cwd:test-output/mcp-el.png" }`
 - 断言：文件存在，尺寸 < 全页截图（仅包含按钮）；目标元素滚动后仍应截到元素本身，不应返回空白区域
 - 清理：`rm ./test-output/mcp-el.png`
 
 ### extract-screenshot-05-scale
 
+- 状态：条件，与 `extract-screenshot-01-viewport` 使用相同的独立测试环境
 - 操作：`extract { type: "screenshot", fullPage: true, scale: 0.5, output: "cwd:test-output/mcp-half.png" }`
-- 断言：文件尺寸显著小于 scale=1 的 fullpage 截图
+- 断言：文件尺寸显著小于 scale=1 的 full-page 截图
 - 清理：`rm ./test-output/mcp-half.png`
 
 ### extract-screenshot-06-clip
 
+- 状态：条件，与 `extract-screenshot-01-viewport` 使用相同的独立测试环境
 - 操作：
-  `extract { type: "screenshot", clip: { x: 0, y: 0, width: 200, height: 120 }, output: "cwd:test-output/mcp-clip.png" }`
+
+    ```text
+    extract {
+        type: "screenshot",
+        clip: { x: 0, y: 0, width: 200, height: 120 },
+        output: "cwd:test-output/mcp-clip.png"
+    }
+    ```
+
 - 断言：返回 `metadata.clip` 与入参一致，`metadata.width/height/byteSize/format/dimensionSource/capabilities`
   存在，文件存在且尺寸小于全页截图
 - 清理：`rm ./test-output/mcp-clip.png`
 
 ### extract-screenshot-07-compare
 
-- 前置：attach test-page，必要时对 managed 测试 tab 执行 `manage activatePage`；点击 `#compare-reset-btn` 后调用
+- 状态：条件，与 `extract-screenshot-01-viewport` 使用相同的独立测试环境
+- 前置：attach 到 managed test-page，点击 `#compare-reset-btn` 后调用
   `extract { type: "screenshot", target: { css: "#compare-box" }, output: "cwd:test-output/mcp-before.png" }`
+
 - 操作：点击 `#compare-toggle-btn` 后调用
-  `extract { type: "screenshot", target: { css: "#compare-box" }, compareWith: "cwd:test-output/mcp-before.png", diffOutput: "cwd:test-output/mcp-diff.png", output: "cwd:test-output/mcp-after.png" }`
+
+    ```text
+    extract {
+        type: "screenshot",
+        target: { css: "#compare-box" },
+        compareWith: "cwd:test-output/mcp-before.png",
+        diffOutput: "cwd:test-output/mcp-diff.png",
+        output: "cwd:test-output/mcp-after.png"
+    }
+    ```
+
 - 断言：返回 `metadata.comparison.pixelDiffRatio > 0`、`differentPixels > 0`、`totalPixels > 0`，差异图文件存在
 - 边界：使用超过 25 MiB 或 12,000,000 像素的 PNG 作为 `compareWith` 时返回明确错误，提示使用 `clip` 或 `scale`
 - 清理：`rm ./test-output/mcp-before.png ./test-output/mcp-after.png ./test-output/mcp-diff.png`
@@ -615,7 +745,8 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 操作：`extract { type: "state" }`
 - 断言：返回结构 `{ state: { pageContent, viewport, interactiveElements } }`，`pageContent` 非空字符串（含 accessibility
-  tree 文本），`viewport.width/height` 为数字，`interactiveElements` 含 role/name/selector/visible/disabled/bounds/covered
+  tree 文本），`viewport.width/height` 为数字，`interactiveElements`
+  含 role/name/selector/visible/disabled/bounds/covered
 - 载体：test-page
 
 ### extract-state-02-target
@@ -634,7 +765,8 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：跑前需 CDP 模式（不在 Extension 模式下测试）
 - 操作：`extract { type: "state", mode: "domsnapshot" }`
-- 断言：返回 `snapshot.documents` 数组（CDP `DOMSnapshot.captureSnapshot` 原始结果），含 `nodes` / `layout` / `textBoxes`
+- 断言：返回 `snapshot.documents` 数组（CDP `DOMSnapshot.captureSnapshot` 原始结果），含 `nodes` / `layout` /
+  `textBoxes`
 - 载体：test-page
 - KNOWN-LIMIT：Extension 模式下抛 INVALID_ARGUMENT（仅 CDP 支持）
 
@@ -648,8 +780,8 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 操作：`extract { type: "metadata" }`
 - 断言：返回含 `url / title / description / charset / viewport / og / twitter / jsonLd / alternates / feeds / frames`
-  （部分字段可 null/undefined），`frames` 含 index/frameId/parentFrameId/url/title/name/selector/rect，Extension 和 CDP
-  模式都应返回 frames 数组
+  （部分字段可 null/undefined），`frames`
+  含 index/frameId/parentFrameId/url/title/name/selector/rect，Extension 和 CDP 模式都应返回 frames 数组
 - 载体：test-page
 
 ### extract-frame-01
@@ -711,7 +843,7 @@ FAIL 时只需报 ID + 失败断言即可
 ### input-click-07-triple
 
 - 操作：`input { events: [{type:"click", ..., clickCount:3}] }`
-- 断言：detail 序列 [1,1,1,2,2,2,3,3,3] + dblclick(detail=2)
+- 断言：detail 序列 [1,1,1,2,2,2,3,3,3] + dblclick (detail=2)
 
 ### input-click-08-force
 
@@ -791,7 +923,7 @@ FAIL 时只需报 ID + 失败断言即可
 ### input-type-02-textarea
 
 - 操作：`type` target=#textarea，`text:"line1\nline2"`
-- 断言：`#textarea.value` 包含换行，split('\n').length === 2
+- 断言：`#textarea.value` 包含换行，split ('\n').length === 2
 
 ### input-type-03-contenteditable
 
@@ -807,20 +939,22 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：attach 到 test-page，清空 `#controlled-input`，并把 `data-input-events/data-change-events` 置为 `0`
 - 操作：`input { events: [{type:"type", target:{css:"#controlled-input"}, text:"abc", dispatch:true}] }`
-- 断言：`#controlled-input.value === "abc"`，`#controlled-result.textContent` 包含 `controlled input: abc`，`data-input-events` 大于 0
+- 断言：`#controlled-input.value === "abc"`，`#controlled-result.textContent` 包含 `controlled input: abc`，
+  `data-input-events` 大于 0
 - 载体：test-page
 
 ### input-type-05-controlled
 
 - 前置：attach 到 test-page，清空 `#controlled-input`，并把 `data-input-events/data-change-events` 置为 `0`
-- 操作：`input { events: [{type:"type", target:{css:"#controlled-input"}, text:"abc", mode:"controlled"}], diagnostics:true }`
+- 操作：
+  `input { events: [{type:"type", target:{css:"#controlled-input"}, text:"abc", mode:"controlled"}], diagnostics:true }`
 - 断言：value 更新并触发 input/change；失败时错误包含 matchCount、activeElement、candidates；diagnostics 字段存在
 - 载体：test-page
 
 ### input-type-06-crlf-normalize
 
-- 操作：`type { text: "line1\r\nline2" }` 到 #textarea
-- 断言：textarea.value 为 "line1\nline2"（\r\n 被归一化）
+- 操作：把包含 `line1`、CRLF 和 `line2` 的文本输入 `#textarea`
+- 断言：`textarea.value` 依次包含 `line1`、LF 和 `line2`（CRLF 被归一化为 LF）
 - 载体：test-page
 
 ### 5.4 wait（event 内的 wait）
@@ -868,23 +1002,45 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### input-select-05-cdp-locator-matrix
 
-- 前置：在独立 CDP 测试会话中启动或连接专用 Chrome，确保 Extension 未接管该会话；打开 test-page，并给 `#edit-input`、`#edit-textarea`、`#edit-contenteditable` 写入各自唯一文本
+- 前置：在独立 CDP 测试会话中启动或连接专用 Chrome，确保 Extension 未接管该会话；打开 test-page，并给 `#edit-input`、
+  `#edit-textarea`、`#edit-contenteditable` 写入各自唯一文本
 - 操作：对三个元素分别执行 locator target 的 `select`，每次使用唯一 `find` 文本
-- 断言：每次 input 响应的 `mode === "cdp"`；input/textarea 的 `selectionStart`、`selectionEnd` 匹配目标文本，contenteditable 的 `window.getSelection().toString()` 等于目标文本；错误或响应中不出现 Extension refId 依赖
+- 断言：每次 input 响应的 `mode === "cdp"`；input/textarea 的 `selectionStart`、`selectionEnd`
+  匹配目标文本，contenteditable的 `window.getSelection().toString()` 等于目标文本；错误或响应中不出现 Extension
+  refId 依赖
 - 载体：test-page，CDP 模式
 
 ### input-replace-03-cdp-locator-matrix
 
 - 前置：延续 `input-select-05-cdp-locator-matrix`，重置三个元素的内容
 - 操作：对 `#edit-input`、`#edit-textarea`、`#edit-contenteditable` 分别执行 locator target 的 `replace`
-- 断言：每次 input 响应的 `mode === "cdp"`；input/textarea 的 value 和 contenteditable 的 textContent 都只替换指定 occurrence；用 `extract` 读取三个目标，并截图确认页面显示值一致
+- 断言：每次 input 响应的
+  `mode === "cdp"`；input/textarea 的 value 和 contenteditable 的 textContent 都只替换指定 occurrence；用 `extract`
+  读取三个目标，并截图确认页面显示值一致
 - 载体：test-page，CDP 模式
 
 ### input-password-01-failure-redaction
 
-- 前置：在 managed test tab 注入 `input[type=password]#mcp-password`，value 设为 `password-value-sentinel`，页面和 console 中不写这些 sentinel
-- 操作：`input { events:[{type:"replace", target:{css:"#mcp-password"}, find:"password-find-sentinel", text:"password-replacement-sentinel"}], diagnostics:true }`，其中 find 不存在以触发失败
-- 断言：响应为失败；序列化后的完整响应不包含 `password-value-sentinel`、`password-find-sentinel`、`password-replacement-sentinel`，包含 `redacted` 标记或 `[REDACTED]`；随后提取 password 元素和截图，确认页面仍存在且 value 未被修改
+- 前置：在 managed test tab 注入 `input[type=password]#mcp-password`，value 设为
+  `password-value-sentinel`，页面和 console 中不写这些 sentinel
+
+- 操作：执行以下调用，其中 `find` 不存在以触发失败
+
+    ```text
+    input {
+        events: [{
+            type: "replace",
+            target: { css: "#mcp-password" },
+            find: "password-find-sentinel",
+            text: "password-replacement-sentinel"
+        }],
+        diagnostics: true
+    }
+    ```
+
+- 断言：响应为失败；序列化后的完整响应不包含 `password-value-sentinel`、`password-find-sentinel`、
+  `password-replacement-sentinel`，包含 `redacted` 标记或
+  `[REDACTED]`；随后提取 password 元素和截图，确认页面仍存在且 value 未被修改
 - 载体：test-page
 
 ### 5.6 drag
@@ -932,10 +1088,12 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### input-keydown-05-commands-copy-paste
 
-- 前置：`#text-input` 已全选 "hello"
+- 状态：KNOWN-LIMIT，见附录 A
+- 前置：浏览器已授予剪贴板权限，`#text-input` 已全选 "hello"
 - 操作：`[{keydown, key:"c", commands:["copy"]}, {keyup, key:"c"}]`，随后切到 #textarea 再 `commands:["paste"]`
-- 断言：copy 和 paste 调用均返回成功，不出现二次 `document.execCommand` 导致的 `EDIT_COMMAND_FAILED`；`#textarea.value === "hello"`
-- 备注：命令成功只表示浏览器接受分发，页面结果以读取 `#textarea.value` 为准；无剪贴板权限时可跳过此条
+- 断言：copy 和 paste 调用均返回成功，不出现二次 `document.execCommand` 导致的 `EDIT_COMMAND_FAILED`；
+  `#textarea.value === "hello"`
+- 备注：命令成功只表示浏览器接受分发，页面结果以读取 `#textarea.value` 为准；无剪贴板权限时按附录 A 的 KNOWN-LIMIT 验收
 
 ### input-keydown-06-rawkeydown-autorepeat
 
@@ -988,8 +1146,8 @@ FAIL 时只需报 ID + 失败断言即可
 ### input-stealth-click-04-doubleclick-detail
 
 - 操作：`clickCount:2` 到 #dblclick-test
-- 断言：监听器记录序列：mousedown detail=1, mouseup detail=1, click detail=1, mousedown detail=2, mouseup detail=2, click
-  detail=2, dblclick detail=2
+- 断言：监听器记录序列：mousedown detail=1, mouseup detail=1, click detail=1, mousedown detail=2, mouseup detail=2,
+  click detail=2, dblclick detail=2
 
 ### input-stealth-type-01
 
@@ -1067,7 +1225,8 @@ FAIL 时只需报 ID + 失败断言即可
 - 前置：attach 到 test-page，执行 `evaluate { script:"fetch('/mcp_missing_resource').catch(()=>{})" }` 或
   `browse/evaluate diagnostics=true` 触发失败请求
 - 操作：`logs { type:"network" }`
-- 断言：返回数组含失败请求或 4xx/5xx 请求，字段含 `url/method/status/errorText/timestamp/duration` 中可由当前浏览器提供的值
+- 断言：返回数组含失败请求或 4xx/5xx 请求，字段含 `url/method/status/errorText/timestamp/duration`
+  中可由当前浏览器提供的值
 
 ### logs-network-04-inline-url-limit
 
@@ -1080,8 +1239,9 @@ FAIL 时只需报 ID + 失败断言即可
 ### logs-network-05-credential-redaction
 
 - 前置：通过 fetch 触发 URL query 含 `authorization=mcp-auth-sentinel`、`access_token=mcp-token-sentinel` 的请求
-- 操作：分别调用 `logs { type:"network" }`、`logs { type:"network", output:"tmp:mcp-network-redacted.json" }`，并读取
-  diagnostics 中的 failed request
+- 操作：分别调用
+  `logs { type:"network" }`、`logs { type:"network", output:"tmp:mcp-network-redacted.json" }`，并读取 diagnostics 中的 failed
+  request
 - 断言：内联响应、output 文件和 diagnostics 均不包含两个 sentinel，URL 对应值为 `[REDACTED]`，并返回
   `urlRedacted === true`、原始 URL 长度和 `redactedQueryParameters`
 
@@ -1109,10 +1269,10 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### manage-adoptPage-01
 
-- 前置：`browse list` 找到一个 `managed=false` 的目标 T，只读取列表，不导航不激活
+- 前置：用 `manage newPage` 创建测试 tab T，再执行 `manage releasePage targetId=<T>` 并确认 `managed=false`
 - 操作：`manage { action:"adoptPage", targetId:<T> }`
 - 断言：`success=true`，`managedBefore=false`，`managedAfter=true`，再次 `browse list` 中 T 为 `managed=true`
-- 清理：执行 `manage releasePage targetId=<T>`，不要关闭用户已有 tab
+- 清理：关闭 T
 
 ### manage-releasePage-01
 
@@ -1123,69 +1283,79 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### manage-movePage-01
 
-- 前置：先 newWindow 创建测试窗口 W，再 newPage 创建受控 tab T
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：在该环境中先 newWindow 创建测试窗口 W，再 newPage 创建受控 tab T
 - 操作：`manage { action:"movePage", targetId:<T>, windowId:<W>, index:0 }`
 - 断言：`success=true`，返回 `affected.before/after`，`affected.after.windowId=<W>` 且 `affected.after.index=0`
 - 清理：关闭测试窗口或测试 tab
 
 ### manage-reorderPage-01
 
-- 前置：同一测试窗口内创建两个受控 tab T1/T2
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：在该环境的同一测试窗口内创建两个受控 tab T1/T2
 - 操作：`manage { action:"reorderPage", targetId:<T2>, index:0 }`
 - 断言：`success=true`，`affected.before.index != affected.after.index`，再次 `browse list` 中 T2 排在 index 0
 
 ### manage-pinPage-01
 
-- 前置：先 newPage 创建 T
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：在该环境中先 newPage 创建 T
 - 操作：`manage { action:"pinPage", targetId:<T> }`
 - 断言：`success=true`，`affected.before.pinned=false`，`affected.after.pinned=true`
 - 清理：`manage unpinPage targetId=<T>` 后关闭 T
 
 ### manage-unpinPage-01
 
-- 前置：先将测试 tab T 执行 `pinPage`
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：在该环境中先将测试 tab T 执行 `pinPage`
 - 操作：`manage { action:"unpinPage", targetId:<T> }`
 - 断言：`success=true`，`affected.before.pinned=true`，`affected.after.pinned=false`
 
 ### manage-activatePage-01
 
-- 状态：只在需要可见 renderer 的用例或本地手动发版验证中执行，目标必须是 agent 自己创建的 managed 测试 tab T
-- 前置：只使用 agent 自己创建的测试 tab T
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：agent 在该环境中创建 managed 测试 tab T，不存在用户窗口、tab 或登录态
 - 操作：`manage { action:"activatePage", targetId:<T> }`
 - 断言：`success=true`，`affected.after.active=true`
 
 ### manage-focusWindow-01
 
-- 状态：**SKIP**（会抢占前台，常规回归不执行）
-- 前置：只使用 agent 自己创建的测试窗口 W
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：agent 在该环境中创建测试窗口 W，不存在用户窗口、tab 或登录态
 - 操作：`manage { action:"focusWindow", windowId:<W> }`
 - 断言：`success=true`，`affected.after.focused=true`
 
 ### manage-resizeWindow-01
 
-- 前置：先 newWindow 创建测试窗口 W，不使用用户窗口
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：在该环境中先 newWindow 创建测试窗口 W
 - 操作：`manage { action:"resizeWindow", windowId:<W>, width:900, height:700 }`
 - 断言：`success=true`，`affected.before/after` 存在，`affected.after.width` 和 `affected.after.height` 接近设置值
 - 清理：`manage closeWindow windowId=<W>`
 
 ### manage-newWindow-01
 
-- 前置：仅在独立测试窗口场景执行
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：该环境不包含用户窗口、tab 或登录态
 - 操作：`manage { action:"newWindow", url:"about:blank", focused:false }`
 - 断言：`success=true`，返回 `affected.windowId` 和 `affected.targetId`，`affected.after.tabs[]` 全部 `managed=true`
 - 清理：`manage closeWindow windowId=<affected.windowId>`
 
 ### manage-closeWindow-01
 
-- 前置：先 newWindow 创建测试窗口 W，确认窗口内全是 managed tab
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：在该环境中先 newWindow 创建测试窗口 W，确认窗口内全是 managed tab
 - 操作：`manage { action:"closeWindow", windowId:<W> }`
 - 断言：`success=true`，`affected.before.windowId=<W>`，`affected.after=null`，再次 `browse list` 找不到 W
 
 ### manage-closeWindow-02-unmanaged-guard
 
-- 前置：`browse list` 找到含 `managed=false` tab 的用户窗口 W，只读取列表，不聚焦不导航
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：在该环境中用 `manage newWindow` 创建窗口 W 和测试 tab T，再执行 `manage releasePage targetId=<T>` 并确认 W 含
+  `managed=false` tab
 - 操作：`manage { action:"closeWindow", windowId:<W> }`
 - 断言：返回 `WINDOW_HAS_UNMANAGED_TABS`，窗口仍存在
+- 清理：重新 adopt T，再关闭 W
 
 ### manage-viewport-01
 
@@ -1236,7 +1406,8 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：attach 全新 test-page，执行 evaluate 创建 Web Worker，每 50ms 更新一次 `#burst-mutation-target`，1s 后停止
 - 操作：`wait { for:"idle", ms:500, timeout:8000 }`
-- 断言：`success=true`，随后读取 `#burst-mutation-target.dataset.workerTick` 大于 0，返回时间在 mutation 结束并达到 500ms DOM 静默后
+- 断言：`success=true`，随后读取 `#burst-mutation-target.dataset.workerTick`
+  大于 0，返回时间在 mutation 结束并达到 500ms DOM 静默后
 - 载体：test-page
 
 ### wait-idle-02-timeout
@@ -1266,10 +1437,11 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### wait-navigation-01
 
-- 前置：attach 到 test-page，执行 evaluate 创建 Web Worker，每 500ms 更新一次 title 和 URL hash，连续更新 20 次
+- 前置：attach 到 test-page，执行 evaluate 创建 Web Worker，每 500ms 更新一次 title 和 URL hash，连续更新 120 次
 - 操作：`wait { for:"navigation", timeout:5000 }`
 - 断言：wait 返回，title 和 URL hash 均含 `mcp-nav-`
 - 载体：test-page
+- 清理：终止 Web Worker 并刷新测试 tab
 
 ### wait-timeout-01
 
@@ -1279,6 +1451,105 @@ FAIL 时只需报 ID + 失败断言即可
 ---
 
 ## 9. 错误分支 / 边界
+
+### Cloudflare 实测约束
+
+真实站点只作补充观察，不加入发版门禁。进入 Cloudflare 站点前，先用 `browse { action: "list" }` 确认
+`mode="extension"`，不传 `port`，也不传
+`diagnostics=true`。CDP 模式超时只能记录为 CDP 路径未完成，不能写成网站或用户真实 Chrome 无法通过。
+
+### browse-challenge-01-js-wait
+
+- 前置：attach 到 test-page，点击 `#challenge-js-btn`
+- 操作：`evaluate { script:"document.title" }`
+- 断言：约 1.2s 后 `success=true`，`mode="extension"`，`result === "MCP Chrome 测试页面"`，`#challenge-status` 为
+  `js-resolved`。恢复发生在八秒被动等待内时不得启用 debugger 或执行 page evaluate
+- 载体：test-page
+
+### browse-challenge-02-turnstile-click
+
+- 前置：attach 到 test-page，点击 `#challenge-turnstile-btn`
+- 操作：`evaluate { script:"document.getElementById('challenge-status').textContent" }`
+
+- 断言：
+    - 八秒被动等待后返回 `turnstile-resolved`，`#challenge-verify` 被点击，标题恢复为 `MCP Chrome 测试页面`
+    - 八秒前不得启用 debugger 或点击控件；第一次 inspect 未看到控件时，仍须继续检查 Turnstile
+    - 同一坐标连续两次 inspect 后才点击；同一等待内，同一类控件持续可见时只点击一次
+    - checkbox 被换成可见的 `Verify you are human` / `请验证您是真人` 按钮后，inspect 判成 `verify` 再点一次
+    - test-page 假按钮走页面点击；真实 Cloudflare iframe 只在已聚焦窗口的活动受控 tab 上用系统鼠标
+    - 系统鼠标沿路径移动、悬停后再按下抬起；widget 点击 compact Turnstile 卡片左侧 checkbox
+    - 宿主 wrapper 比卡片宽时也只点左侧卡片；Linux 使用当前 X11 活动窗口原点加窗口边距，并校验窗口标题
+    - Linux 不使用 Chrome `screenX`，也不把 `outerHeight - innerHeight` 当作顶栏高度
+    - Extension inspect 走 isolated world，检查前卸掉 debugger；点击前再次卸掉 debugger 并读取视口
+    - DOM 已有 Cloudflare iframe 时，即使尺寸为 0 也走系统鼠标；后续宿主页验证按钮也走系统鼠标
+    - 混合窗口不调用 `focusWindow`
+- 载体：test-page
+
+### browse-challenge-03-denied
+
+- 前置：attach 到 test-page，点击 `#challenge-denied-btn`
+- 操作：`evaluate { script:"1+1" }`
+- 断言：返回 `CHALLENGE_DENIED`，`challengeKind="denied"`，`retryable=false`，脚本未执行
+- 载体：test-page
+
+### browse-challenge-04-timeout
+
+- 前置：attach 到 test-page，点击 `#challenge-turnstile-btn` 后立即把 `#challenge-verify` 设为 `display:none` 并保持标题
+  `Just a moment...`
+- 操作：`evaluate { script:"1+1", timeout:800 }`
+- 断言：返回 `CHALLENGE_TIMEOUT`，`retryable=true`，`autoRetry=false`，`clickedTurnstile`
+  与实际是否点击一致；点过 checkbox 后超时 `challengeKind="turnstile"`，不得因未 inspect 的标题快照报成 `js`
+- 载体：test-page
+
+### browse-challenge-05-leftover-iframe
+
+- 前置：`npm test` 中 CH-08 leftover host：标题已不是 `Just a moment...`，主文档无
+  `#cf-please-wait`，header 仍标 pending
+- 操作：`waitForChallenge({ action: "open" })`
+- 断言：视为已过，`challengeKind="none"`，不点击残留 iframe，不因残留 iframe 返回 `CHALLENGE_TIMEOUT`
+- 载体：N/A
+
+### browse-challenge-06-origin-pending
+
+- 前置：`npm test` 中 CH-08 origin-pending
+  host：Cloudflare 页面可见文案为“验证成功。正在等待 example.com 响应”，无可见 Turnstile 勾选框
+- 操作：`waitForChallenge({ action: "open" })`
+- 断言：返回成功和 `challengeResolved=true`、`challengeKind="js"`、`originResponsePending=true`，不得返回
+  `CHALLENGE_TIMEOUT`，也不得把目标页写成已加载
+- 载体：N/A
+
+### err-empty-input-events-01
+
+- 操作：`input { events: [] }`
+- 断言：返回 `INVALID_ARGUMENT`，消息包含 `events 至少需要一个事件`，且 `actionExecuted=false`
+- 载体：任意
+
+### err-evaluate-script-xor-01
+
+- 操作：`evaluate { script:"1+1", scriptFile:"tmp:script.js" }`，以及 `evaluate {}`
+- 断言：两次都返回 `INVALID_ARGUMENT`，消息包含 `script 与 scriptFile 必须且只能提供一个`
+- 载体：任意
+
+### err-screenshot-target-01
+
+- 前置：attach 到 test-page
+- 操作：`extract { type:"screenshot", target:{ css:"#does-not-exist" } }`
+- 断言：返回 `TARGET_NOT_FOUND`，不返回成功截图或视口图片
+- 载体：test-page
+
+### err-screenshot-diff-output-01
+
+- 前置：attach 到 test-page
+- 操作：`extract { type:"screenshot", diffOutput:"tmp:diff.png" }`
+- 断言：返回 `INVALID_ARGUMENT`，消息包含 `diffOutput 需要 compareWith`
+- 载体：test-page
+
+### manage-clearCache-extension-01
+
+- 前置：Extension 模式已连接
+- 操作：`manage { action:"clearCache", cacheType:"cache" }`
+- 断言：返回 `UNSUPPORTED_MODE`、`actionPerformed=false`，不返回 `success=true`
+- 载体：任意
 
 ### err-stealth-commands-01
 
@@ -1296,12 +1567,12 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：`inputMode=stealth`，注入 keydown 监听器
 - 操作：
-  ```
-  1. input { events: [{keydown, key:"Control", commands:["selectAll"]}] }  // 应抛错
-  2. manage inputMode precise
-  3. input { events: [{keydown, key:"b"}, {keyup, key:"b"}] }
-  ```
-- 断言：第 3 步监听器收到的 keydown `ctrlKey=false`（UnifiedSession.modifiers 未被第 1 步污染）
+    ```
+    1. input { events: [{keydown, key:"Control", commands:["selectAll"]}] }  // 应抛错
+    2. manage inputMode precise
+    3. input { events: [{keydown, key:"b"}, {keyup, key:"b"}] }
+    ```
+- 断言：最后一次 keydown 的监听结果为 `ctrlKey=false`；第一条失败命令未改变 UnifiedSession.modifiers
 
 ### err-drag-refId-stale-01
 
@@ -1363,56 +1634,128 @@ FAIL 时只需报 ID + 失败断言即可
 
 test-page.html 现有 region（供用例引用）：
 
-| Region                | 用途                         | 关键 id                                                                                               |
-|-----------------------|----------------------------|-----------------------------------------------------------------------------------------------------|
-| 1 定位                  | 各种 locator 测试              | #btn-id, #input-placeholder, #input-title, #link-test, [data-testid='test-button']                  |
-| 2 输入                  | input/textarea 输入          | #text-input, #textarea, #input-result                                                               |
-| 3 键盘                  | 键盘事件日志                     | #key-display, #key-log                                                                              |
-| 4 鼠标                  | click/dblclick/contextmenu | #click-test, #dblclick-test, #contextmenu-test, #mouse-log                                          |
-| 5 拖拽                  | drag-source / drop-target  | #drag-source, #drop-target, #drag-log                                                               |
-| 6 滚动                  | 内容溢出容器（纵向 + 横向）            | #scroll-container, #scroll-middle, #scroll-bottom, #scroll-container-x, #scroll-x-left/middle/right |
-| 7 日志                  | 触发不同级别 console             | #log-info, #log-warn, #log-error, #log-custom                                                       |
-| 8 媒体                  | 图片 / 链接                    | #test-image, #test-link                                                                             |
-| 9 select/replace      | 三种场景                       | #edit-input, #edit-textarea, #edit-contenteditable                                                  |
-| 10 iframe             | 跨框架交互                      | #test-frame, #frame-btn, #frame-input, #frame-result                                                |
-| 11 wait               | 延迟/哈希/burst mutation       | #show-later-btn, #show-later-target, #hashnav-btn, #burst-mutation-btn, #burst-mutation-target      |
-| 12 force + combo keys | 覆盖层 + 组合键输入                | #covered-btn, #combo-input                                                                          |
-| 13 screenshot compare | 固定截图差异区域                   | #compare-box, #compare-toggle-btn, #compare-reset-btn                                               |
+| Region                | 用途                        |
+| --------------------- | --------------------------- |
+| 1 定位                | 各种 locator 测试           |
+| 2 输入                | input/textarea 输入         |
+| 3 键盘                | 键盘事件日志                |
+| 4 鼠标                | click/dblclick/contextmenu  |
+| 5 拖拽                | drag-source / drop-target   |
+| 6 滚动                | 内容溢出容器（纵向 + 横向） |
+| 7 日志                | 触发不同级别 console        |
+| 8 媒体                | 图片 / 链接                 |
+| 9 select/replace      | 三种场景                    |
+| 10 iframe             | 跨框架交互                  |
+| 11 wait               | 延迟/哈希/burst mutation    |
+| 12 force + combo keys | 覆盖层 + 组合键输入         |
+| 13 screenshot compare | 固定截图差异区域            |
+| 14 challenge wait     | JS / Turnstile / denied     |
 
-**本清单引用但 test-page 尚未覆盖的元素**（待补区）：
+关键 id：
+
+- 1：`#btn-id`、`#input-placeholder`、`#input-title`、`#link-test`、`[data-testid='test-button']`
+- 2：`#text-input`、`#textarea`、`#input-result`
+- 3：`#key-display`、`#key-log`
+- 4：`#click-test`、`#dblclick-test`、`#contextmenu-test`、`#mouse-log`
+- 5：`#drag-source`、`#drop-target`、`#drag-log`
+- 6：`#scroll-container`、`#scroll-middle`、`#scroll-bottom`、`#scroll-container-x`、 `#scroll-x-left/middle/right`
+- 7：`#log-info`、`#log-warn`、`#log-error`、`#log-custom`
+- 8：`#test-image`、`#test-link`
+- 9：`#edit-input`、`#edit-textarea`、`#edit-contenteditable`
+- 10：`#test-frame`、`#frame-btn`、`#frame-input`、`#frame-result`
+- 11：`#show-later-btn`、`#show-later-target`、`#hashnav-btn`、`#burst-mutation-btn`、 `#burst-mutation-target`
+- 12：`#covered-btn`、`#combo-input`
+- 13：`#compare-box`、`#compare-toggle-btn`、`#compare-reset-btn`
+- 14：`#challenge-js-btn`、`#challenge-turnstile-btn`、`#challenge-denied-btn`、`#challenge-status`
+
+**本清单引用但 test-page 尚未覆盖的元素**（待补充）：
 
 - 无（横向滚动容器 `#scroll-container-x` 和截图差异区域 `#compare-box` 已补）
 
 ---
 
+## 11. npm 发布包
+
+### package-clean-build-01
+
+- 操作：先在 `dist/__stale-package-probe__.js` 写入测试内容，再执行 `npm pack --dry-run --json`
+- 断言：发包生命周期重新构建 server，输出文件清单不含测试文件；不含已删除的
+  `dist/extension/native-host-installer.*`、`dist/extension/socket-server.*`、`dist/extension/ws-server.*` 或
+  `dist/native-host/`
+- 载体：N/A
+- 清理：构建失败时删除测试文件；构建成功后测试文件应已被自动删除
+
+### package-content-01
+
+- 操作：把 `npm pack --json` 生成的 tarball 解压到仓库外临时目录，检查文件清单和文本内容
+- 断言：包内不含 `TESTING.md`、`test-csp-page.html`、仓库外绝对路径或本机用户目录；package version、Extension version 和
+  `extension/dist/manifest.json` version 完全一致
+- 载体：N/A
+- 清理：删除解压目录和 tarball
+
+---
+
 ## 附录 A：已知限制 / KNOWN-LIMIT
 
-- `err-drag-refId-stale-01` — 需要 V8 GC 才能让 WeakRef deref 失败，从外部 mcp 工具无法稳定构造，
-  靠静态代码 review + `dist` 字面量 + 正常 drag 端到端 smoke 保证
+- `err-drag-refId-stale-01` — 需要 V8 GC 才能让 WeakRef deref 失败，从外部 mcp 工具无法稳定构造， 靠静态代码 review +
+  `dist` 字面量 + 正常 drag 端到端 smoke 保证
 - `input-keydown-05-commands-copy-paste` — 依赖剪贴板权限，无权限或 headless 下跳过
-- `err-iframe-offset-01` srcdoc iframe — `chrome.scripting.executeScript` 不能注入 `about:srcdoc` frame
-  （Chromium 限制 [crbug.com/40232842](https://issues.chromium.org/40232842)）；
-  走 scripting 路径的 `input click` 在 srcdoc iframe 内找不到元素，`evaluate frame=...` 走 CDP 不受影响；
-  有 `src` 属性的真实 iframe 不受影响
 
+## CH 专项回归
 
-## CH-01 至 CH-07 聚焦回归
-
-- `ch-input-01`: 对 `#edit-number` 执行 replace，确认不调用 selection API，返回 `requestedValue`、`actualValue`，并派发 `input` 与 `change`
-- `ch-input-02`: 对 `#edit-date` 执行 select，确认返回 `UNSUPPORTED_SELECTION` 及 tag、input type、current value、requested find、推荐模式
-- `ch-postcondition-01`: 已完成动作后的 false selector 返回 `actionStatus=completed`、`verificationStatus=not_matched`、`failureStage=verification`
+- `ch-input-01`: 对 `#edit-number` 执行 replace，确认不调用 selection API，返回 `requestedValue`、`actualValue`，并派发
+  `input` 与 `change`
+- `ch-input-02`: 对 `#edit-date` 执行 select，确认返回 `UNSUPPORTED_SELECTION` 及 tag、input type、current
+  value、requested find、推荐模式
+- `ch-postcondition-01`: 已完成动作后的 false selector 返回 `actionStatus=completed`、`verificationStatus=not_matched`、
+  `failureStage=verification`
 - `ch-postcondition-02`: frame/context/debugger 不可用返回 `verificationStatus=unavailable`，不伪装为 `not_matched`
 - `ch-timeout-01`: 1ms debugger timeout 返回 `actionStatus=unknown`，不宣称页面脚本未执行
-- `ch-target-01`: input、extract、wait 的 target timeout 返回 locator、target type、nth、URL、tabId、managed、frame、match count、最多 10 个候选和 last state
+- `ch-target-01`: input、extract、wait 的 target timeout 返回 locator、target
+  type、nth、URL、tabId、managed、frame、match count、最多 10 个候选和 last state
 - `ch-port-01`: 无 server 时 Extension 只输出聚合 debug 摘要，不为每个候选端口输出 warning/error
-- `ch-port-02`: 已识别 MCP server 的 token/proof 不匹配或认证协议不完整时，输出一条限量 warning；同一摘要重连时不重复刷屏
-- `ch-frame-01`: iframe 导航销毁 context 后，默认 `staleContextRetry=never` 不重放有副作用脚本；显式 `readOnly` 时最多重放一次，并返回策略、retry 和最终 frame/context 摘要
+- `ch-port-02`: 已识别 MCP
+  server 的 token/proof 不匹配或认证协议不完整时，输出一条限量 warning；同一摘要重连时不重复刷屏
+- `ch-frame-01`: iframe 导航销毁 context 后，默认 `staleContextRetry=never` 不重放有副作用脚本；显式 `readOnly`
+  时最多重放一次，并返回策略、retry 和最终 frame/context 摘要
 - `ch-frame-02`: 两个相同 URL iframe 返回 bounded candidates 并拒绝选择任一 frame
-- `ch-frame-03`: 页面 DOM iframe 与 `webNavigation` 额外 frame 同时存在时，selector 和 index 都按 DOM 元素身份命中目标，无法建立唯一映射时返回 `FRAME_IDENTITY_UNAVAILABLE`
-- `ch-password-01`: password value、input `find` 和替换 `text` sentinel 不得出现在失败响应、diagnostics 或 post-condition 观测值中
-- `ch-backend-01`: 显式 `tabId` 的 input、wait、logs、extract 在目标作用域内选择 backend，动作、诊断和验证都命中同一个 managed tab
-- `ch-cdp-selection-01`: CDP 模式对 input、textarea、contenteditable 的 locator `select` 和 `replace` 成功，不调用 Extension refId 或 `actionableClick`
-- `ch-diagnostics-01`: restricted URL 导航到普通 URL 且 `diagnostics=true`，主导航成功，返回 `diagnosticsStatus=unavailable` 与原始摘要
-- `ch-diagnostics-02`: browse 或 wait 主动作失败且 `diagnostics=true` 时，错误响应保留 `diagnosticsStatus`、新增 console/network 摘要或采集错误
+- `ch-frame-03`: 页面 DOM iframe 与 `webNavigation`
+  额外 frame 同时存在时，selector 和 index 都按 DOM 元素身份命中目标，无法建立唯一映射时返回
+  `FRAME_IDENTITY_UNAVAILABLE`
+- `ch-password-01`: password value、input `find` 和替换 `text`
+  sentinel 不得出现在失败响应、diagnostics 或 post-condition 观测值中
+- `ch-backend-01`: 显式 `tabId`
+  的 input、wait、logs、extract 在目标作用域内选择 backend，动作、诊断和验证都命中同一个 managed tab
+- `ch-cdp-selection-01`: CDP 模式对 input、textarea、contenteditable 的 locator `select` 和 `replace`
+  成功，不调用 Extension refId 或 `actionableClick`
+- `ch-diagnostics-01`: restricted URL 导航到普通 URL 且 `diagnostics=true`，主导航成功，返回
+  `diagnosticsStatus=unavailable` 与原始摘要
+- `ch-diagnostics-02`: browse 或 wait 主动作失败且 `diagnostics=true` 时，错误响应保留
+  `diagnosticsStatus`、新增 console/network 摘要或采集错误
+- `ch-challenge-01`: JS Challenge 等待标题和 DOM 标记消失后返回成功，不返回交接错误
+- `ch-challenge-02`: Turnstile checkbox 在真实浏览器中被点击后页面恢复
+- `ch-challenge-03`: Access denied 返回 `CHALLENGE_DENIED`
+- `ch-challenge-04`: 超时返回 `CHALLENGE_TIMEOUT`，`retryable=true`，响应不包含 cookie 值；点过 checkbox 时
+  `challengeKind="turnstile"` 且 `clickedTurnstile=true`，未 inspect 的标题快照不得覆盖该类型
+- `ch-challenge-05`: 目标页已恢复后，残留 Cloudflare iframe 不继续判 pending
+- `ch-challenge-06`: 中文标题 `请稍候…` 或正文“正在进行安全验证”仍判为 JS Challenge
+- `ch-challenge-07`: CDP 用 `Target.getTargetInfo` 读标题，启动时不启用 `Runtime.enable`
+- `ch-challenge-08`: Extension 在前八秒只读真实 tab 标题，不附加 debugger；标题恢复后直接返回
+- `ch-challenge-09`:
+  Extension 八秒后仍出现可见 Turnstile 才检查并点击；同一类 checkbox/widget 在同一次等待里只点一次，换成可见的
+  `Verify you are human` / `请验证您是真人` 按钮后 inspect 判成 `verify`
+  再点一次；第一次 inspect 未看到控件时继续查，Extension inspect 走 isolated
+  world 且不先挂 debugger，旧 Extension 才回退 stealth/precise，不立刻当纯 JS
+  Challenge；同一坐标连续两次 inspect 后才点击；test-page 假按钮走页面点击，Cloudflare
+  iframe 只在已聚焦窗口的活动受控 tab 上用系统鼠标，沿路径移动、悬停后再按下抬起，widget 点 compact
+  Turnstile 卡片左侧 checkbox，宿主 wrapper 比卡片宽时也只点左侧卡片，Linux 用当前 X11 活动窗口原点加窗口边距且窗口标题必须对应该测试页，不用 Chrome
+  `screenX`，也不用 `outerHeight - innerHeight` 当顶栏，点击前卸掉 debugger 再读视口，DOM 里已有 Cloudflare
+  iframe 时即使尺寸为 0 也走系统鼠标，后续宿主页验证按钮同样走系统鼠标，混合窗口不调用
+  `focusWindow`；缺少系统鼠标工具或窗口未聚焦返回可见错误，不静默改用 CDP 点击；`diagnostics=true`
+  不用于 Cloudflare 实测
+- `ch-challenge-10`: 旧 Extension 返回 `Unknown action: network_challenge_state` 时记录 server
+  warning，回退到标题和 DOM 检测，不中断导航
+- `ch-challenge-11`: Cloudflare 可见文案明示验证成功但源站未响应时返回
+  `originResponsePending=true`；隐藏成功文案和仍显示的 Turnstile 勾选框不算过盾，也不把目标页写成已加载
 
 无需浏览器的聚焦测试执行 `npm test`，真实 MCP runtime 回归仍需按本文件用例顺序在受控测试 tab 中执行

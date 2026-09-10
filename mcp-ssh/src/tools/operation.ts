@@ -46,7 +46,8 @@ const operationStartSchema = z.object({
         .max(MAX_OPERATION_START_TIMEOUT_MS)
         .optional()
         .describe(
-            `等待 SSH operation channel 建立的超时，默认 ${DEFAULT_OPERATION_START_TIMEOUT_MS}ms，最大 ${MAX_OPERATION_START_TIMEOUT_MS}ms`
+            `等待 SSH operation channel 建立的超时，默认 ${DEFAULT_OPERATION_START_TIMEOUT_MS}ms，` +
+                `最大 ${MAX_OPERATION_START_TIMEOUT_MS}ms`
         ),
 })
 

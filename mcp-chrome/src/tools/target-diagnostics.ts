@@ -23,6 +23,22 @@ export class TargetTimeoutError extends Error {
         this.name = 'TargetTimeoutError'
     }
 
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
+    toJSON(): object {
+        return { error: { code: this.code, message: this.message, suggestion: this.suggestion, context: this.context } }
+    }
+}
+
+export class TargetNotFoundError extends Error {
+    readonly code = 'TARGET_NOT_FOUND'
+    readonly suggestion = '请检查 locator、frame 和 nth，或根据候选摘要调整目标'
+
+    constructor(readonly context: Record<string, unknown>) {
+        super('未找到可用于当前操作的目标元素')
+        this.name = 'TargetNotFoundError'
+    }
+
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
     toJSON(): object {
         return { error: { code: this.code, message: this.message, suggestion: this.suggestion, context: this.context } }
     }
@@ -55,7 +71,9 @@ async function collectPageCandidates(
 ): Promise<{ candidates: unknown[]; diagnosticError?: string }> {
     try {
         const candidates = await unifiedSession.evaluate<unknown[]>(
-            `(() => Array.from(document.querySelectorAll('input, textarea, select, button, a, [role], [contenteditable="true"]'))
+            `(() => Array.from(document.querySelectorAll(
+                    'input, textarea, select, button, a, [role], [contenteditable="true"]'
+                ))
                 .slice(0, ${MAX_CANDIDATES})
                 .map((el) => {
                     const rect = el.getBoundingClientRect();

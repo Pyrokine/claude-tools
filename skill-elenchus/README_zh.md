@@ -98,15 +98,15 @@ mv SKILL-en.md SKILL.md
 
 编辑 `prompts/` 中的文件：
 
-| 文件                               | 用途              |
-|----------------------------------|-----------------|
-| `elenchus.md` / `elenchus-en.md` | 辩证循环规则          |
-| `shared-rules.md`                | 共享审查纪律          |
-| `expert-logic.md`                | 逻辑与正确性（opus）    |
-| `expert-security.md`             | 安全与健壮性（opus）    |
+| 文件                             | 用途                     |
+|----------------------------------|--------------------------|
+| `elenchus.md` / `elenchus-en.md` | 辩证循环规则             |
+| `shared-rules.md`                | 共享审查纪律             |
+| `expert-logic.md`                | 逻辑与正确性（opus）     |
+| `expert-security.md`             | 安全与健壮性（opus）     |
 | `expert-design.md`               | 架构与代码质量（sonnet） |
 | `expert-perf.md`                 | 性能与资源管理（sonnet） |
-| `expert-convention.md`           | 项目规范合规（sonnet）  |
+| `expert-convention.md`           | 项目规范合规（sonnet）   |
 
 ## 致谢
 

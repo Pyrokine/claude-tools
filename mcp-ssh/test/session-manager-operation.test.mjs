@@ -29,7 +29,11 @@ function createManager(t) {
 function createSession(client) {
     return {
         client,
-        config: {},
+        config: {
+            host: 'example.com',
+            port: 22,
+            username: 'tester',
+        },
         connectedAt: 1,
         lastUsedAt: 1,
         reconnectAttempts: 0,
@@ -57,7 +61,7 @@ async function createBlackholeServer(t) {
     })
     await new Promise((resolve, reject) => {
         server.once('error', reject)
-        server.listen(0, '127.0.0.1', resolve)
+        server.listen(0, '127.0.0.1', () => resolve())
     })
     t.after(() => {
         for (const socket of sockets) {
@@ -94,16 +98,13 @@ test('buildCommand gates shell operators behind successful cwd and env setup', a
 
     for (const [name, command] of cases) {
         const outputPath = path.join(directory, `${name}.txt`)
-        const fullCommand = manager.buildCommand(
-            command(outputPath),
-            { config: {} },
-            {
-                cwd: missingCwd,
-                env: { MCP_TEST_VALUE: 'injected' },
-            }
-        )
+        const fullCommand = manager.buildCommand(command(outputPath), createSession({}), {
+            cwd: missingCwd,
+            env: { MCP_TEST_VALUE: 'injected' },
+        })
 
         assert.match(fullCommand, /^cd .* && export MCP_TEST_VALUE=.* && eval /)
+        // noinspection JSCheckFunctionSignatures — util.promisify 保留 exec 的参数签名
         await assert.rejects(exec(fullCommand))
         assert.equal(fs.existsSync(outputPath), false, `${name} command escaped the cwd guard`)
     }
@@ -117,13 +118,14 @@ test('buildCommand preserves the active shell syntax while keeping prerequisite 
 
     const { manager } = createManager(t)
     const directCommand = '[[ -n $BASH_VERSION ]] && printf direct-ok'
-    assert.equal(manager.buildCommand(directCommand, { config: {} }, {}), directCommand)
+    assert.equal(manager.buildCommand(directCommand, createSession({}), {}), directCommand)
 
     const fullCommand = manager.buildCommand(
         'set -o pipefail; values=(alpha beta); [[ ${values[1]} == beta ]] && printf bash-ok',
-        { config: {} },
+        createSession({}),
         { env: { MCP_TEST_VALUE: 'injected' } }
     )
+    // noinspection JSCheckFunctionSignatures — util.promisify 保留 execFile 的参数签名
     const { stdout } = await execFile('bash', ['-c', fullCommand])
 
     assert.equal(stdout, 'bash-ok')
@@ -447,6 +449,34 @@ test('execSudo closes a delayed callback without writing the password after time
     assert.equal(wrotePassword, false)
     assert.equal(channel.destroyed, true)
     assert.equal(closeCalled(), true)
+})
+
+test('execSudo applies the same effective-user precedence as ssh_exec', async (t) => {
+    const { manager } = createManager(t)
+    const commands = []
+    let currentChannel
+    const client = {
+        exec(command, _options, callback) {
+            commands.push(command)
+            currentChannel = createChannel().channel
+            callback(null, currentChannel)
+        },
+        end() {},
+    }
+    manager.sessions.set('server', {
+        ...createSession(client),
+        config: { username: 'login-user', runAs: 'application-user' },
+    })
+
+    const asConfiguredUser = manager.execSudo('server', 'id', 'password')
+    assert.match(commands[0], /^su - application-user -c /)
+    currentChannel.emit('close', 0)
+    assert.equal((await asConfiguredUser).effectiveUser, 'application-user')
+
+    const asLoginUser = manager.execSudo('server', 'id', 'password', { useLoginUser: true })
+    assert.doesNotMatch(commands[1], /^su - /)
+    currentChannel.emit('close', 0)
+    assert.equal((await asLoginUser).effectiveUser, 'login-user')
 })
 
 test('ptyStart rejects a delayed callback after disconnect and reconnect', async (t) => {

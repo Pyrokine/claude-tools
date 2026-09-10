@@ -24,14 +24,15 @@ A conversation history search tool for Claude Code
 
 ### Download Binary (Recommended)
 
-Download the latest release from [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases). Target-triple asset names remain available for existing automation.
+Download the latest release from [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases). Target-triple
+asset names remain available for existing automation.
 
-| Platform | Stable asset |
-|---|---|
-| Linux x86_64 | `mcp-claude-history-linux-x86_64.tar.gz` |
-| macOS Intel | `mcp-claude-history-macos-x86_64.tar.gz` |
+| Platform            | Stable asset                              |
+| ------------------- | ----------------------------------------- |
+| Linux x86_64        | `mcp-claude-history-linux-x86_64.tar.gz`  |
+| macOS Intel         | `mcp-claude-history-macos-x86_64.tar.gz`  |
 | macOS Apple Silicon | `mcp-claude-history-macos-aarch64.tar.gz` |
-| Windows x86_64 | `mcp-claude-history-windows-x86_64.zip` |
+| Windows x86_64      | `mcp-claude-history-windows-x86_64.zip`   |
 
 ```bash
 # Download and install
@@ -64,69 +65,94 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ```json
 {
-  "mcpServers": {
-    "mcp-claude-history": {
-      "command": "mcp-claude-history",
-      "args": [
-        "--mcp"
-      ]
+    "mcpServers": {
+        "mcp-claude-history": {
+            "command": "mcp-claude-history",
+            "args": ["--mcp"]
+        }
     }
-  }
 }
 ```
 
 ## Available Tools (7 tools)
 
-| Tool               | Description                               |
-|--------------------|-------------------------------------------|
-| `history_search`   | Search conversation history               |
-| `history_get`      | Get full message content                  |
-| `history_context`  | Get surrounding messages                  |
-| `history_trace`    | Trace nearby messages and tool call pairs |
-| `history_build_info` | Show the running binary build identity  |
-| `history_projects` | List all projects                         |
-| `history_sessions` | List sessions in a project                |
+| Tool                 | Description                               |
+| -------------------- | ----------------------------------------- |
+| `history_search`     | Search conversation history               |
+| `history_get`        | Get full message content                  |
+| `history_context`    | Get surrounding messages                  |
+| `history_trace`      | Trace nearby messages and tool call pairs |
+| `history_build_info` | Show the running binary build identity    |
+| `history_projects`   | List all projects                         |
+| `history_sessions`   | List sessions in a project                |
+
+### history_projects
+
+Each project includes its authoritative `id`, display `path`, `path_approximate`, session count, and last activity time.
+Existing local paths are reconstructed against the filesystem so hyphens, underscores, dots, and spaces remain intact.
+If no unique existing path can be resolved, `path` is a readable fallback and `path_approximate=true`; use `id` for tool
+calls.
+
+### history_sessions
+
+| Parameter   | Type   | Default | Description                                   |
+| ----------- | ------ | ------- | --------------------------------------------- |
+| `project`   | string | current | Project ID                                    |
+| `redaction` | string | auto    | `auto`, `strict`, or `off` for session topics |
+
+Session topics are redacted before their 100-character preview is created. The response includes aggregate `redaction`
+metadata and `topic_redacted_count` when a session topic had replacements.
 
 ### history_search
 
-| Parameter             | Type    | Default                | Description                                                         |
-|-----------------------|---------|------------------------|---------------------------------------------------------------------|
-| `pattern`             | string  | ""                     | Search pattern (empty returns all)                                  |
-| `project`             | string  | current                | Project ID (comma-separated)                                        |
-| `all`                 | boolean | false                  | Search all projects                                                 |
-| `sessions`            | string  | -                      | Session IDs (comma-separated)                                       |
-| `since`               | string  | -                      | Start time, RFC3339 or YYYY-MM-DD                                   |
-| `until`               | string  | -                      | End time, RFC3339 or YYYY-MM-DD                                     |
-| `types`               | string  | assistant,user,summary | Message types                                                       |
-| `servers`             | string  | -                      | MCP server filter, comma-separated                                  |
-| `tools`               | string  | -                      | MCP tool filter, comma-separated                                    |
-| `lines`               | string  | -                      | Line ranges (e.g., 100-200, !300-400)                               |
-| `regex`               | boolean | false                  | Use regex                                                           |
-| `case_sensitive`      | boolean | false                  | Case sensitive                                                      |
-| `subagents`           | boolean | false                  | Include sidechain transcripts under `subagents` and `remote-agents` |
-| `summary`             | boolean | false                  | Return grouped summary instead of full result content               |
-| `failed_tool_results` | boolean | false                  | Only return tool results where the harness marked `is_error=true`   |
-| `tool_payload_errors` | boolean | false                  | Only return tool results whose JSON payload reports an error        |
-| `output`              | string  | -                      | Write result file, relative paths use controlled temp               |
-| `output_format`       | string  | jsonl                  | `jsonl`                                                             |
-| `redaction`           | string  | auto                   | `auto`, `strict`, or `off`                                          |
-| `offset`              | number  | 0                      | Skip first N results, mutually exclusive with `slice`               |
-| `limit`               | number  | -                      | Max results to return, mutually exclusive with `slice`              |
-| `slice`               | string  | -                      | Python-style message slice after filtering and sorting              |
-| `max_content`         | number  | 4000                   | Max characters for a regular result preview (1 to 1,000,000)        |
-| `max_content_tool_result` | number | 500                  | Independent tool-result preview limit (1 to 1,000,000)              |
-| `max_total`           | number  | 40000                  | Max compact `SearchResponse` JSON bytes (512 to 10,000,000)         |
+| Parameter                 | Type    | Default                | Description                                          |
+| ------------------------- | ------- | ---------------------- | ---------------------------------------------------- |
+| `pattern`                 | string  | ""                     | Search pattern; empty returns all                    |
+| `project`                 | string  | current                | Project IDs, comma-separated                         |
+| `all`                     | boolean | false                  | Search all projects                                  |
+| `sessions`                | string  | -                      | Session IDs, comma-separated                         |
+| `since`                   | string  | -                      | Start time, RFC3339 or YYYY-MM-DD                    |
+| `until`                   | string  | -                      | End time, RFC3339 or YYYY-MM-DD                      |
+| `types`                   | string  | assistant,user,summary | Message types, comma-separated                       |
+| `subtypes`                | string  | -                      | Message subtypes, comma-separated                    |
+| `servers`                 | string  | -                      | MCP server filter, comma-separated                   |
+| `tools`                   | string  | -                      | MCP tool filter, comma-separated                     |
+| `lines`                   | string  | -                      | Line ranges, e.g. 100-200, !300-400                  |
+| `regex`                   | boolean | false                  | Use regex                                            |
+| `case_sensitive`          | boolean | false                  | Use case-sensitive matching                          |
+| `subagents`               | boolean | false                  | Include sidechain and remote-agent transcripts       |
+| `summary`                 | boolean | false                  | Include grouped counts in `stats.summary`            |
+| `aggregate`               | boolean | false                  | Return grouped counts without result rows            |
+| `dry_run`                 | boolean | false                  | Preview selected files without reading content       |
+| `failed_tool_results`     | boolean | false                  | Require harness-level `is_error=true`                |
+| `tool_payload_errors`     | boolean | false                  | Require an error in the tool JSON payload            |
+| `output`                  | string  | -                      | Write a result file; relative paths use temp storage |
+| `output_format`           | string  | jsonl                  | `jsonl`                                              |
+| `redaction`               | string  | auto                   | `auto`, `strict`, or `off`                           |
+| `offset`                  | number  | 0                      | Skip N results; incompatible with `slice`            |
+| `limit`                   | number  | -                      | Max results; incompatible with `slice`               |
+| `slice`                   | string  | -                      | Slice messages after filtering and sorting           |
+| `max_content`             | number  | 4000                   | Regular preview limit (1 to 1,000,000)               |
+| `max_content_tool_result` | number  | 500                    | Tool-result preview limit (1 to 1,000,000)           |
+| `max_total`               | number  | 40000                  | Compact response limit (512 to 10,000,000 bytes)     |
 
 Default `types` includes `summary`, which means context-compression summaries are searchable. Use `types=assistant,user`
-when you only want original conversation turns. `failed_tool_results` keeps the old harness-level meaning and only
-checks
-`tool_result.is_error`; `tool_payload_errors` is for tools that returned `success=false` or an `error` JSON payload
-inside a successful tool result.
+when you only want original conversation turns. Valid types are `assistant`, `user`, `summary`, `system`, and `other`.
+Valid subtypes are `human`, `tool_result`, `meta`, `text`, `tool_use`, `thinking`, `empty`, `summary`, `system`, and
+`other`. `types=user,subtypes=human` selects ordinary user-shaped records. It is a classification heuristic, not proof
+that a person authored the message. A known subtype supplied through `types` is accepted for compatibility and moved to
+`subtypes`; unknown types and subtypes return `invalid_arguments`.
+
+`failed_tool_results` keeps the old harness-level meaning and only checks `tool_result.is_error`; `tool_payload_errors`
+is for tools that returned `success=false` or an `error` JSON payload inside a successful tool result. Non-regex
+`pattern` terms are AND conditions, `a|b` is an OR group, and `!term` excludes matches. `regex=true` treats `pattern` as
+one regular expression. When `since` or `until` is set, an unparseable record timestamp is excluded and reported by
+`stats.skipped_invalid_timestamps` and `incomplete_reasons`. `since` cannot be later than `until`.
 
 Search output uses `redaction=auto` by default for message content, `tool_use` previews, and structured tool fields.
 `auto` covers Authorization headers plus common password, token, cookie, API key, secret, private key, and key path
 fields. `strict` also redacts private key blocks, private host names, and URLs. `off` returns raw content and records
-`enabled=false` in the manifest. Redacted results include `redacted=true` and `raw_available=true`; JSONL manifests
+`enabled=false` in the manifest. Redacted results include `redacted=true` and `raw_available=true`; export manifests
 include redaction metadata.
 
 `output` accepts a file path or a directory. Use `tmp:relative/path` for the controlled temp area and
@@ -141,19 +167,19 @@ the original slice. If the budget cannot fit any result while preserving a conti
 `response_too_large` instead of repeating the same slice indefinitely.
 
 `max_total` counts the compact UTF-8 JSON text returned by `history_search`. JSON-RPC and MCP transport framing are not
-included. The response reports `serialized_bytes`, `max_total_bytes`, `limits_applied`, and `complete`. Exported JSONL
-content is not reduced by this conversation-response budget. `next_query` and export manifests retain
+included. The response reports `serialized_bytes`, `max_total_bytes`, `limits_applied`, and `complete`. Exported
+`.jsonl` content is not reduced by this conversation-response budget. `next_query` and export manifests retain
 `max_content_tool_result`.
 
 ### history_get
 
-| Parameter   | Type   | Description                                                                                                          |
-|-------------|--------|----------------------------------------------------------------------------------------------------------------------|
-| `ref`       | string | Required. Message ref (session_prefix:line)                                                                          |
-| `range`     | string | Character range (e.g., 0-100000)                                                                                     |
-| `output`    | string | Output file or directory (auto-extract images, relative paths default to controlled temp dir, use `cwd:` to persist) |
-| `project`   | string | Project ID                                                                                                           |
-| `redaction` | string | `auto`, `strict`, or `off`; default is `auto`                                                                        |
+| Parameter   | Type   | Description                                      |
+| ----------- | ------ | ------------------------------------------------ |
+| `ref`       | string | Required message ref (`session_prefix:line`)     |
+| `range`     | string | Half-open Unicode range, e.g. `0-100000`         |
+| `output`    | string | File or directory; extracts images automatically |
+| `project`   | string | Project ID                                       |
+| `redaction` | string | `auto`, `strict`, or `off`; default is `auto`    |
 
 Large direct responses return `content_too_large` with `content_size`, `valid_range`, `parsed_range`, `head`, `tail`,
 `range_suggestion`, and `output_suggestion`.
@@ -161,7 +187,7 @@ Large direct responses return `content_too_large` with `content_size`, `valid_ra
 ### history_context
 
 | Parameter        | Type    | Default | Description                                                           |
-|------------------|---------|---------|-----------------------------------------------------------------------|
+| ---------------- | ------- | ------- | --------------------------------------------------------------------- |
 | `ref`            | string  | -       | Required. Message ref                                                 |
 | `before`         | number  | -       | Messages before (counts only messages matching `types` AND `pattern`) |
 | `after`          | number  | -       | Messages after (counts only messages matching `types` AND `pattern`)  |
@@ -180,14 +206,19 @@ Large direct responses return `content_too_large` with `content_size`, `valid_ra
 | `case_sensitive` | boolean | false   | Case-sensitive pattern matching                                       |
 
 **Note**: The anchor message (specified by `ref`) is always included regardless of `types` or `pattern` filters. When
-`pattern` is set, `before`/`after` counts only messages that match the pattern. Valid JSONL session metadata records are
-ignored without parse warnings; malformed JSON and incomplete message records still produce warnings. `history_trace`
-uses the same record handling.
+`pattern` is set, `before`/`after` counts only messages that match the pattern. Valid `.jsonl` session metadata records
+are ignored without parse warnings; malformed JSON and incomplete message records still produce warnings.
+`history_trace` uses the same record handling.
+
+A ref requires a nonempty session prefix and a positive line number, such as `c86bc677:1234`. `direction` accepts only
+`forward` or `backward` and applies to `until_type`. `until_type` accepts an effective message type only. Choose exactly
+one range mode: `before`/`after`, `until_type`, or `until_ref`. `until_type` and `until_ref` cannot be combined with
+each other or with `before`/`after`.
 
 ### history_trace
 
 | Parameter        | Type    | Default | Description                                                   |
-|------------------|---------|---------|---------------------------------------------------------------|
+| ---------------- | ------- | ------- | ------------------------------------------------------------- |
 | `ref`            | string  | -       | Required. Message ref                                         |
 | `before`         | number  | 20      | Messages before anchor, counted after type/pattern filters    |
 | `after`          | number  | 20      | Messages after anchor, counted after type/pattern filters     |
@@ -207,11 +238,13 @@ uses the same record handling.
 | `max_content`    | number  | 4000    | Max chars per message                                         |
 | `max_total`      | number  | 40000   | Max total chars across messages                               |
 
-`history_trace` returns the nearby messages plus detected tool calls and matching tool results in `tool_calls`.
-A result with `tool_use_id` only matches that exact call. Results without an ID use a matching assistant parent UUID, or
-the single pending call as a legacy fallback. Each call reports `match_method`; unmatched and ambiguous results appear in
+`history_trace` returns the nearby messages plus detected tool calls and matching tool results in `tool_calls`. A result
+with `tool_use_id` only matches that exact call. Results without an ID use a matching assistant parent UUID, or the
+single pending call as a legacy fallback. Each call reports `match_method`; unmatched and ambiguous results appear in
 the bounded `association_issues` list. Structured tool-result previews use recursive key-based redaction before JSON
-serialization, including JSON objects embedded in text content, and the same redacted preview is written to trace exports.
+serialization, including JSON objects embedded in text content, and the same redacted preview is written to trace
+exports. `before` and `after` default to 20 only when neither `until_type` nor `until_ref` is set. The same ref,
+direction, type, subtype, and mutually exclusive range-mode rules as `history_context` apply.
 
 ### history_build_info
 

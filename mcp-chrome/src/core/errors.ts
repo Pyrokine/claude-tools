@@ -208,6 +208,27 @@ export class CDPError extends BrowserError {
 }
 
 /**
+ * 系统鼠标不可用，或 Turnstile 点击前置条件不成立
+ */
+export class OsMouseError extends BrowserError {
+    readonly code: 'OS_MOUSE_UNAVAILABLE' | 'TURNSTILE_OS_CLICK_UNAVAILABLE'
+    readonly suggestion: string
+    override readonly context: ErrorContext
+
+    constructor(
+        code: 'OS_MOUSE_UNAVAILABLE' | 'TURNSTILE_OS_CLICK_UNAVAILABLE',
+        message: string,
+        suggestion: string,
+        context: ErrorContext = {}
+    ) {
+        super(message)
+        this.code = code
+        this.suggestion = suggestion
+        this.context = context
+    }
+}
+
+/**
  * ZodError issue 类型
  */
 interface ZodIssue {
@@ -246,7 +267,10 @@ function detectVisibilityHint(errorMessage: string): string | null {
         'capturevisibletab',
     ]
     if (keywords.some((kw) => msg.includes(kw))) {
-        return '此操作需要 tab 可见时，请先确认目标是 managed 测试页，再显式使用 manage(action="activatePage", targetId="<id>") 或 manage(action="focusWindow", windowId=<id>)'
+        return (
+            '此操作需要可见 tab，请确认目标是 managed 测试页，再使用 manage 的 activatePage 动作激活页面，' +
+            '或使用 focusWindow 动作聚焦窗口'
+        )
     }
     return null
 }

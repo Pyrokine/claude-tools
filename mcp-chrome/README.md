@@ -15,7 +15,7 @@ existing browser, **CDP mode** (fallback) launches a dedicated instance.
 - **8 Unified Tools**: Action-based design covering browse, input, extract, wait, evaluate, manage, cookies, logs
 - **Multi-Tab Parallel**: `tabId` parameter enables operations on any tab without switching focus
 - **iframe Penetration**: `frame` parameter targets elements inside iframes (CSS selector or index, Extension mode)
-- **Semantic Targeting**: 11 ways to locate elements (role, text, label, css, css+text combo, xpath, coordinates, etc.)
+- **Semantic Targeting**: 11 ways to locate elements (role, text, label, CSS, CSS+text combo, XPath, coordinates, etc.)
 - **Auto-Wait**: Built-in clickability and input-ready detection with deadline-based timeout budget
 - **Dual Input Mode**: `precise` (debugger API, bypasses CSP) or `stealth` (JS injection, no debug banner)
 - **Smart Output**: Bare `return` auto-wrapped in IIFE; large results (>100KB) auto-saved to file; `output` writes raw
@@ -27,12 +27,12 @@ existing browser, **CDP mode** (fallback) launches a dedicated instance.
 ## Compatible Clients
 
 | Client                    | Status |
-|---------------------------|--------|
-| Claude Code               | ✅      |
-| Claude Desktop            | ✅      |
-| Cursor                    | ✅      |
-| Windsurf                  | ✅      |
-| Any MCP-compatible client | ✅      |
+| ------------------------- | ------ |
+| Claude Code               | ✅     |
+| Claude Desktop            | ✅     |
+| Cursor                    | ✅     |
+| Windsurf                  | ✅     |
+| Any MCP-compatible client | ✅     |
 
 ## Installation
 
@@ -46,7 +46,8 @@ claude mcp add chrome -- mcp-chrome
 npm root -g
 ```
 
-For Extension mode, open `chrome://extensions/`, enable Developer mode, click "Load unpacked", and select `<npm-root>/@pyrokine/mcp-chrome/extension/dist`.
+For Extension mode, open `chrome://extensions/`, enable Developer mode, click "Load unpacked", and select
+`<npm-root>/@pyrokine/mcp-chrome/extension/dist`.
 
 ### From source
 
@@ -89,14 +90,12 @@ Claude Desktop / Other Clients:
 
 ```json
 {
-  "mcpServers": {
-    "chrome": {
-      "command": "node",
-      "args": [
-        "/path/to/mcp-chrome/dist/index.js"
-      ]
+    "mcpServers": {
+        "chrome": {
+            "command": "node",
+            "args": ["/path/to/mcp-chrome/dist/index.js"]
+        }
     }
-  }
 }
 ```
 
@@ -104,9 +103,10 @@ Claude Desktop / Other Clients:
 
 The Extension auto-connects to the MCP Server via HTTP/WebSocket (port 19222-19299). Click the toolbar icon to verify
 connection status. `browse(action="connect")` and the local `/api/info` endpoint report the active Extension background
-bundle hash and compare it with the bundle shipped beside the server. `bundleStatus="stale"` means Chrome is still running
-an older unpacked Extension bundle; reload the Extension in `chrome://extensions/`. Legacy Extensions without a bundle hash
-remain compatible, and bundle identity never disables zero-config auto-connect.
+bundle hash and compare it with the bundle shipped beside the server. `bundleStatus="stale"` means Chrome is still
+running an older unpacked Extension bundle; reload the Extension in `chrome://extensions/`. A legacy Extension that
+lacks `network_challenge_state` falls back to tab-title and DOM challenge detection. Bundle identity never disables
+zero-config auto-connect.
 
 ```
 browse(action="list")          // List all tabs
@@ -117,15 +117,15 @@ extract(type="screenshot")
 **Pairing token**
 
 Extension mode keeps zero-config local auto-connect by default. On shared machines, CI runners, or containers where
-untrusted local processes can reach `127.0.0.1:19222-19299`, set `MCP_CHROME_PAIRING_TOKEN` on the MCP server and enter the
-same token in the Extension popup:
+untrusted local processes can reach `127.0.0.1:19222-19299`, set `MCP_CHROME_PAIRING_TOKEN` on the MCP server and enter
+the same token in the Extension popup:
 
 ```bash
 MCP_CHROME_PAIRING_TOKEN="your-token" node /path/to/mcp-chrome/dist/index.js
 ```
 
-To require a pairing token instead of zero-config local use, set `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0` on the server and
-disable "Allow no-token local connection" in the Extension popup.
+To require a pairing token instead of zero-config local use, set `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0` on the server
+and disable "Allow no-token local connection" in the Extension popup.
 
 ### Mode 2: CDP Mode (Fallback)
 
@@ -142,54 +142,94 @@ browse(action="connect", port=9222)
 browse(action="open", url="https://example.com")
 ```
 
-> When the Extension is connected, all tools use Extension mode automatically. CDP mode activates only when the
-> Extension is unavailable.
+> A connected Extension is the default for every tool. CDP is used only while the Extension is unavailable. A
+> `browse(action="connect", port=9222)` call explicitly selects CDP for later tools; use `browse(action="connect")` to
+> return to Extension mode. A CDP connection created only as fallback yields to Extension after the Extension
+> reconnects.
 
 ## Available Tools (8 Tools)
 
 ### browse - Browser Management & Navigation
 
-| Action    | Description                           |
-|-----------|---------------------------------------|
-| `launch`  | Launch new Chrome instance (CDP mode) |
-| `connect` | Connect to running Chrome (CDP mode)  |
-| `list`    | List all pages/tabs                   |
-| `attach`  | Attach to a specific page/tab         |
-| `open`    | Navigate to URL                       |
-| `back`    | Go back in history                    |
-| `forward` | Go forward in history                 |
-| `refresh` | Reload page                           |
-| `close`   | Close browser connection              |
+| Action    | Description                                                                 |
+| --------- | --------------------------------------------------------------------------- |
+| `launch`  | Create a managed Extension tab, or launch CDP when Extension is unavailable |
+| `connect` | Confirm Extension by default; `port` explicitly selects CDP                 |
+| `list`    | List all pages/tabs                                                         |
+| `attach`  | Attach to a specific page/tab                                               |
+| `open`    | Navigate to URL                                                             |
+| `back`    | Go back in history                                                          |
+| `forward` | Go forward in history                                                       |
+| `refresh` | Reload page                                                                 |
+| `close`   | Close the page specified by `targetId`                                      |
 
 Extension-specific: `list` returns the flat `targets` array plus a `windows` tree. Each target includes `managed`
 (whether tab is controlled by MCP Chrome), `isActive` (whether it's the current operation target), `windowId`, `index`,
 `pinned`, `incognito`, and `status` (`loading`/`complete`). The tree includes `windowCount`, `focusedWindowId`,
 `activeTargetId`, and each window's ordered `tabs` list, so callers can distinguish the active tab inside each window
-from the page currently visible in the focused window.
-`open` auto-creates tab group (cyan color). `open`, `back`, `forward`, and `refresh` accept `diagnostics=true` to return
-new console warnings/errors and failed network requests observed during the action, including the first `open` that
-creates a page automatically.
+from the page currently visible in the focused window. `open` auto-creates tab group (cyan color). `open`, `back`,
+`forward`, and `refresh` accept `diagnostics=true` to return new console warnings/errors and failed network requests
+observed during the action, including the first `open` that creates a page automatically. `close` requires `targetId`
+and closes only that page. It never closes the entire CDP connection.
+
+### Access challenges
+
+After `open`, `back`, `forward`, `refresh`, `input`, and `evaluate`, MCP Chrome waits for a Cloudflare JS Challenge or
+Turnstile checkbox. When Extension mode is active, navigation starts without debugger logging and reads the live tab
+title passively for eight seconds. If the interstitial persists, MCP Chrome checks for a visible Turnstile control and
+clicks it only when it finds one. Extension inspect uses an isolated world and detaches the debugger first. Same-page
+fixture buttons use the existing page click. If a Cloudflare Turnstile iframe is present, inspect CSS coordinates are
+converted to screen coordinates and the OS mouse moves along a path, hovers, then presses and releases: `xdotool` on
+Linux uses the focused Chrome window origin plus window chrome insets only when that window title matches the test page,
+rather than Chrome `screenX` or `outerHeight - innerHeight`; `cliclick` or System Events on macOS; and PowerShell
+`mouse_event` on Windows. Widget clicks target the checkbox on the left of the compact Turnstile card, including when
+the host wrapper is wider than the card, not the label. If a Cloudflare iframe is already in the DOM, the OS mouse is
+used even when that iframe reports a zero-size rect, including the later host `Verify you are human` / `请验证您是真人`
+button. The OS click runs only when the managed test tab is already the active tab in an already-focused window; mixed
+windows are not focused. Debugger is detached and the viewport is read again before the OS click. Missing OS mouse tools
+or an unfocused window return a visible error instead of a silent CDP click. A Turnstile widget is clicked only after
+two inspections report the same click point. Distant OS-mouse paths start near the control instead of flying across the
+screen. The same checkbox or compact widget is clicked at most once; if Cloudflare then shows a visible
+`Verify you are human` or `请验证您是真人` button, that button is inspected as `verify` and clicked at most once in the
+same wait. Use the default `diagnostics=false` for challenge-protected pages because diagnostics starts debugger console
+and network collection.
+
+Detection covers titles such as `Just a moment...` and `请稍候…`, challenge DOM or body-text markers, and
+`Verify you are human` / `请验证您是真人` controls. CDP reads live titles with `Target.getTargetInfo`. A leftover
+Cloudflare iframe on a recovered page is not pending. Cached titles do not decide the result. MCP Chrome does not call a
+CAPTCHA solver, retry navigation, or export `cf_clearance` values. A CDP timeout does not prove that the site fails in a
+user Chrome session; check the returned `mode` before diagnosing the site.
+
+A resolved challenge returns `challengeResolved=true`, `challengeKind`, `waitedMs`, `clickedTurnstile`, and
+`clearanceCookiePresent` (name presence only). If the visible page text says verification succeeded and Cloudflare is
+waiting for the origin, the result also has `originResponsePending=true`; verification passed, but the destination page
+is not loaded yet. Hidden template text such as a `display:none` success heading does not count, and a visible Turnstile
+checkbox still counts as pending. Challenge results and errors include `mode`. Timeout returns `CHALLENGE_TIMEOUT` with
+`retryable=true`, `clickedTurnstile`, and the observed `challengeKind` (a Turnstile click is not reported as `js`).
+Cloudflare Access denied returns `CHALLENGE_DENIED`. Interactive CAPTCHAs, Bot Fight Mode, and IP reputation checks
+cannot be completed by waiting or clicking a checkbox. A later normal main-document response clears the header flag;
+clearing network logs does not.
 
 ### input - Keyboard & Mouse Input
 
 Event sequence model supporting arbitrary combinations:
 
-| Event Type                              | Description                                                                       |
-|-----------------------------------------|-----------------------------------------------------------------------------------|
-| `keydown` / `keyup`                     | Key press/release                                                                 |
-| `click`                                 | Click with actionability checks (visible, enabled, not-covered, auto-scroll)      |
-| `mousedown` / `mouseup`                 | Mouse button press/release                                                        |
-| `mousemove`                             | Mouse movement                                                                    |
-| `wheel`                                 | Mouse wheel scroll                                                                |
-| `touchstart` / `touchmove` / `touchend` | Touch events                                                                      |
-| `type`                                  | Type text (with optional `delay`, `dispatch` for React/Vue)                       |
-| `wait`                                  | Pause between events                                                              |
-| `select`                                | Select text by content (mouse sim)                                                |
-| `replace`                               | Find and replace text                                                             |
-| `drag`                                  | HTML5 drag-and-drop (DragEvent in MAIN world, with `target` source + `to` target) |
-| `editorContext`                         | Read focused editor and selection context                                         |
-| `editorInsert`                          | Insert text at the current editor selection                                       |
-| `editorCommand`                         | Execute browser editing commands such as `bold` or `insertOrderedList`            |
+| Event Type                              | Description                                                            |
+| --------------------------------------- | ---------------------------------------------------------------------- |
+| `keydown` / `keyup`                     | Key press/release                                                      |
+| `click`                                 | Click after visibility, enabled, coverage, and scroll checks           |
+| `mousedown` / `mouseup`                 | Mouse button press/release                                             |
+| `mousemove`                             | Mouse movement                                                         |
+| `wheel`                                 | Mouse wheel scroll                                                     |
+| `touchstart` / `touchmove` / `touchend` | Touch events                                                           |
+| `type`                                  | Type text (with optional `delay`, `dispatch` for React/Vue)            |
+| `wait`                                  | Pause between events                                                   |
+| `select`                                | Select text by content (mouse sim)                                     |
+| `replace`                               | Find and replace text                                                  |
+| `drag`                                  | HTML5 drag-and-drop (`target` source and `to` destination)             |
+| `editorContext`                         | Read focused editor and selection context                              |
+| `editorInsert`                          | Insert text at the current editor selection                            |
+| `editorCommand`                         | Execute browser editing commands such as `bold` or `insertOrderedList` |
 
 Special-case parameters:
 
@@ -199,28 +239,29 @@ Special-case parameters:
   the CDP commands API has no JS-event equivalent.
 - `keydown` on a key already held emits `rawKeyDown` with `autoRepeat: true` (Puppeteer-compatible long-press).
 
-Parameters: `humanize` enables Bézier curve movement and random delays. `diagnostics=true` returns new console
-warnings/errors and failed network requests after the action. `postCondition` waits for a page state after the events so
-callers can distinguish dispatched input from completed page behavior. `postCondition.timeout` defaults to 3000 ms and
-is capped at 60000 ms; `postCondition.interval` defaults to 100 ms and accepts 50-5000 ms. `tabId` targets a specific
-tab. `frame` targets an iframe (CSS selector or index). Both are Extension-mode only. When either scope is provided, the
-action, diagnostics, and post-condition use the backend selected for that target scope.
+`events` must contain at least one event. Parameters: `humanize` enables Bézier curve movement and random delays.
+`diagnostics=true` returns new console warnings/errors and failed network requests after the action. `postCondition`
+waits for a page state after the events so callers can distinguish dispatched input from completed page behavior.
+`postCondition.timeout` defaults to 3000 ms and is capped at 60000 ms; `postCondition.interval` defaults to 100 ms and
+accepts 50-5000 ms. `tabId` targets a specific tab. `frame` targets an iframe (CSS selector or index). Both are
+Extension-mode only. When either scope is provided, the action, diagnostics, and post-condition use the backend selected
+for that target scope.
 
 **`click`-specific**: `force: true` skips actionability checks (useful for testing or hidden elements). Actionability
 failures return `ACTIONABILITY_FAILED` with `rect`, `clickPoint`, covering element details, candidate blockers, and
-suggestions.
-**`type`-specific**: `mode="controlled"` or `dispatch: true` sets `.value` directly and fires `input`/`change` events —
-use for React/Vue controlled inputs where keyboard events don't update state. Requires a non-coordinate `target`.
-Extension mode only. Controlled input and target lookup failures return structured context with `target`, `matchCount`,
-`nth`, `activeElement`, `selection`, and candidate controls. Password input values are omitted from failure diagnostics,
-and input `find` or replacement `text` values are redacted from failed responses. For `select` and `replace`, event-level
-`nth` selects the Nth text occurrence while nested `target.nth` selects the Nth matching element; both are zero-based and
-may be used together. Locator targets for `select` and `replace` work in CDP mode without Extension ref IDs.
+suggestions. **`type`-specific**: `mode="controlled"` or `dispatch: true` sets `.value` directly and fires `input`/
+`change` events — use for React/Vue controlled inputs where keyboard events don't update state. Requires a
+non-coordinate `target`. Extension mode only. Controlled input and target lookup failures return structured context with
+`target`, `matchCount`, `nth`, `activeElement`, `selection`, and candidate controls. Password input values are omitted
+from failure diagnostics, and input `find` or replacement `text` values are redacted from failed responses. For `select`
+and `replace`, event-level `nth` selects the Nth text occurrence while nested `target.nth` selects the Nth matching
+element; both are zero-based and may be used together. Locator targets for `select` and `replace` work in CDP mode
+without Extension ref IDs.
 
 ### extract - Content Extraction
 
 | Type         | Description                                       |
-|--------------|---------------------------------------------------|
+| ------------ | ------------------------------------------------- |
 | `text`       | Extract text content                              |
 | `html`       | Extract HTML source                               |
 | `frameHtml`  | Extract HTML from the selected iframe             |
@@ -232,10 +273,12 @@ may be used together. Locator targets for `select` and `replace` work in CDP mod
 Parameters: `output` saves result to file (or directory for `images=data`). `images` (`info`/`data`) extracts image
 metadata or data alongside HTML. `frameHtml` extracts the current iframe document after `frame` routing. Screenshot
 accepts `clip` for coordinate-region capture, `compareWith` for PNG baseline comparison, and `diffOutput` for a PNG diff
-image. Screenshot responses include `metadata.format`, `width`, `height`, `dimensionSource`, `byteSize`, `fullPage`,
-`scale`, `clip`, and `capabilities`. PNG comparison is capped before decode at 25 MiB per PNG and 12,000,000 pixels; use
-`clip` or `scale` for larger captures. Hidden Extension tabs return `HIDDEN_TAB_SCREENSHOT` instead of auto-focusing the
-browser. If another debugger blocks the precise screenshot path, viewport fallback reports `degraded`, `fallback`, and
+image. `diffOutput` requires `compareWith`. A `target` screenshot that has no match, whose `nth` is out of range, or
+whose box has zero size returns a target error rather than silently returning a viewport screenshot. Screenshot
+responses include `metadata.format`, `width`, `height`, `dimensionSource`, `byteSize`, `fullPage`, `scale`, `clip`, and
+`capabilities`. PNG comparison is capped before decode at 25 MiB per PNG and 12,000,000 pixels; use `clip` or `scale`
+for larger captures. Hidden Extension tabs return `HIDDEN_TAB_SCREENSHOT` instead of automatically focusing the browser.
+If another debugger blocks the precise screenshot path, viewport fallback reports `degraded`, `fallback`, and
 `limitations`; unsupported fallback options return structured `SCREENSHOT_FALLBACK_UNSUPPORTED` errors. `state` returns
 `interactiveElements`; `metadata` returns `frames` in both Extension and CDP modes. `tabId` targets a specific tab.
 `frame` targets an iframe. Both Extension mode only.
@@ -251,35 +294,35 @@ browser. If another debugger blocks the precise screenshot path, viewport fallba
 ### wait - Wait for Conditions
 
 | For          | Description                                         |
-|--------------|-----------------------------------------------------|
+| ------------ | --------------------------------------------------- |
 | `element`    | Wait for element (visible/hidden/attached/detached) |
 | `navigation` | Wait for navigation complete                        |
 | `time`       | Fixed delay                                         |
-| `idle`       | Wait for page load + DOM mutation quiet period      |
+| `idle`       | Wait for DOM or network quiet period                |
 
 Parameters: `tabId` targets a specific tab. `frame` targets an iframe. Both Extension mode only.
 
-**`idle`-specific**: After `readyState === 'complete'`, injects a `MutationObserver` and waits for a quiet period with
-no DOM changes. The `ms` parameter controls the quiet period duration (default 500ms). Returns `domStable: true` when
-the DOM settled, `domStable: false` if still mutating when the budget ran out.
+**`idle`-specific**: In Extension mode, after `readyState === 'complete'`, it injects a `MutationObserver` and waits for
+a quiet period with no DOM changes. In CDP mode, it waits for network quiet instead. `ms` controls the relevant quiet
+period (default 500ms). The response returns `idleKind` and `idlePeriodMs`; Extension responses also return `domStable`.
 
 ### evaluate - JavaScript Execution
 
 Execute JavaScript in page context.
 
-| Parameter       | Description                                                                                                                       |
-|-----------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| `script`        | JavaScript code. Bare `return` statements auto-wrapped in IIFE                                                                    |
-| `scriptFile`    | Read script from a local file (alternative to `script`, relative paths default to controlled temp dir, use `cwd:` for repo files) |
-| `args`          | Arguments passed to script (script must be a function expression)                                                                 |
-| `mode`          | `precise` (default, debugger API) or `stealth` (JS injection)                                                                     |
-| `staleContextRetry` | iframe stale-context policy: `never` (default) or `readOnly`                                                                   |
-| `output`        | Save result to file (relative paths default to controlled temp dir, use `cwd:` to persist in repo)                                |
-| `tabId`         | Target a specific tab (Extension mode)                                                                                            |
-| `frame`         | Target an iframe by CSS selector or index (Extension mode)                                                                        |
-| `timeout`       | End-to-end budget (ms)                                                                                                            |
-| `diagnostics`   | Return new console warnings/errors and failed network requests after execution                                                    |
-| `postCondition` | Wait for text, selector, URL fragment, or script result after execution                                                           |
+| Parameter           | Description                                                             |
+| ------------------- | ----------------------------------------------------------------------- |
+| `script`            | JavaScript code. Bare `return` statements are wrapped in IIFE           |
+| `scriptFile`        | Read code from a local file instead of `script`                         |
+| `args`              | Arguments passed to a script written as a function expression           |
+| `mode`              | `precise` (default, debugger API) or `stealth` (JS injection)           |
+| `staleContextRetry` | iframe stale-context policy: `never` (default) or `readOnly`            |
+| `output`            | Save the result to a file                                               |
+| `tabId`             | Target a specific tab (Extension mode)                                  |
+| `frame`             | Target an iframe by CSS selector or index (Extension mode)              |
+| `timeout`           | End-to-end budget (ms)                                                  |
+| `diagnostics`       | Return new console warnings/errors and failed requests after execution  |
+| `postCondition`     | Wait for text, selector, URL fragment, or script result after execution |
 
 `script` and `scriptFile` are mutually exclusive; at least one must be provided. Relative `scriptFile` and `output`
 paths default to the OS temp directory managed by `mcp-chrome`. Use `cwd:relative/path` when the file must live in the
@@ -290,17 +333,19 @@ Results >100KB are auto-saved to the controlled OS temp directory with a structu
 `NodeList`, and `HTMLCollection` results return `NON_SERIALIZABLE_EVALUATE_RESULT` with a hint to return simple fields
 such as `textContent` or `outerHTML`. Result materialization and serialization failures report `actionExecuted=true`,
 `actionStatus="completed"`, and `failureStage="output"` because the page script has already finished. Evaluate defaults
-to `precise` even when global `inputMode` is `stealth`, and its
-`postCondition` checks use the same evaluate mode as the action. `postCondition` is optional; when it is not provided,
-`success=true` only means the script executed and returned. When it is provided and does not match before timeout, the
-tool returns `POST_CONDITION_FAILED` with the last observed checks. Precise iframe evaluation does not replay a script
-after a stale execution context by default. Set `staleContextRetry="readOnly"` only when the script has no side effects;
-the Extension may then resolve a new context and replay it once within the remaining timeout budget. A stale-context error after `Runtime.evaluate` reports `actionExecuted=true` and `actionStatus="unknown"`, because earlier side effects may already have happened even though the final result is unavailable.
+to `precise` even when global `inputMode` is `stealth`, and its `postCondition` checks use the same evaluate mode as the
+action. `postCondition` is optional; when it is not provided, `success=true` only means the script executed and
+returned. When it is provided and does not match before timeout, the tool returns `POST_CONDITION_FAILED` with the last
+observed checks. Precise iframe evaluation does not replay a script after a stale execution context by default. Set
+`staleContextRetry="readOnly"` only when the script has no side effects; the Extension may then resolve a new context
+and replay it once within the remaining timeout budget. A stale-context error after `Runtime.evaluate` reports
+`actionExecuted=true` and `actionStatus="unknown"`, because earlier side effects may already have happened even though
+the final result is unavailable.
 
 ### manage - Page & Environment Management
 
 | Action         | Description                                                |
-|----------------|------------------------------------------------------------|
+| -------------- | ---------------------------------------------------------- |
 | `newPage`      | Create new controlled page/tab                             |
 | `closePage`    | Close controlled page and return `affected.before/after`   |
 | `adoptPage`    | Mark an existing tab as controlled without focusing it     |
@@ -323,9 +368,11 @@ the Extension may then resolve a new context and replay it once within the remai
 | `cdp`          | Send raw CDP command (advanced, e.g. `Runtime.evaluate`)   |
 
 Tab/window management actions are Extension-mode only. Actions that change visible browser state require explicit
-`targetId` or `windowId` and return `affected.before/after`. `focusWindow` only returns success after the target window
-is observed as focused; otherwise it returns `WINDOW_FOCUS_NOT_OBSERVED`. `closeWindow` refuses mixed windows with
-unmanaged tabs and returns `WINDOW_HAS_UNMANAGED_TABS`.
+`targetId` or `windowId` and return `affected.before/after`. `clearCache` is unavailable in Extension mode and returns
+`UNSUPPORTED_MODE` without clearing anything. Use scoped `cookies(action="clear")` for cookies or CDP mode for storage
+and cache. `focusWindow` only returns success after the target window is observed as focused; otherwise it returns
+`WINDOW_FOCUS_NOT_OBSERVED`. `closeWindow` refuses mixed windows with unmanaged tabs and returns
+`WINDOW_HAS_UNMANAGED_TABS`.
 
 **Stealth mode levels** (CDP launch parameter, set via `browse action=launch stealth=...`):
 
@@ -336,30 +383,31 @@ unmanaged tabs and returns `WINDOW_HAS_UNMANAGED_TABS`.
 ### logs - Browser Logs
 
 | Type      | Description                            |
-|-----------|----------------------------------------|
+| --------- | -------------------------------------- |
 | `console` | Console logs (with level filter)       |
 | `network` | Network request logs (with URL filter) |
 
-Parameters: `output` saves result to file. Console entries use the public levels `error`, `warning`, `info`, and `debug`;
-raw browser levels such as `warn` and `log` are normalized before filtering and return. Network logs include completed
-requests, HTTP 4xx/5xx responses, and failed loads with `errorText`, `method`, `url`, `status`, `timestamp`, and `duration`
-when available. URL query parameters commonly used for credentials, signatures, passwords, and tokens are replaced with
-`[REDACTED]` in inline responses, diagnostics, and explicit `output` files. Redacted entries include `urlRedacted`,
-`urlOriginalLength`, and `redactedQueryParameters`. Inline network results limit each sanitized URL to 2048 characters and
-add `urlLength` plus `urlTruncated: true` when shortened. `urlPattern` supports `*` for any number of characters and `?`
-for one character. `tabId` targets a specific tab (Extension mode). `frame` is not applicable for logs.
+Parameters: `output` saves result to file. Console entries use the public levels `error`, `warning`, `info`, and
+`debug`; raw browser levels such as `warn` and `log` are normalized before filtering and return. Network logs include
+completed requests, HTTP 4xx/5xx responses, and failed loads with `errorText`, `method`, `url`, `status`, `timestamp`,
+and `duration` when available. URL query parameters commonly used for credentials, signatures, passwords, and tokens are
+replaced with `[REDACTED]` in inline responses, diagnostics, and explicit `output` files. Redacted entries include
+`urlRedacted`, `urlOriginalLength`, and `redactedQueryParameters`. Inline network results limit each sanitized URL to
+2048 characters and add `urlLength` plus `urlTruncated: true` when shortened. `urlPattern` supports `*` for any number
+of characters and `?` for one character. `tabId` targets a specific tab (Extension mode). `frame` is not applicable for
+logs.
 
 ### cookies - Cookie Management
 
-| Action   | Description                                                   |
-|----------|---------------------------------------------------------------|
-| `get`    | Get cookies                                                   |
-| `set`    | Set cookie                                                    |
-| `delete` | Delete cookie                                                 |
-| `clear`  | Delete cookies by filter (`name`/`domain`/`url`, ≥1 required) |
+| Action   | Description                                                            |
+| -------- | ---------------------------------------------------------------------- |
+| `get`    | Get cookies                                                            |
+| `set`    | Set cookie                                                             |
+| `delete` | Delete cookie                                                          |
+| `clear`  | Delete cookies in a URL or domain scope, optionally narrowed by `name` |
 
-**Note**: `clear` requires at least one of `name`, `domain`, or `url` to filter — calling without any filter is rejected
-to avoid wiping the user's login cookies.
+**Note**: `clear` requires `url` or `domain`. `name` can only further narrow that scope, so a same-named cookie on
+another site cannot be removed accidentally.
 
 ## Target: Unified Element Locator
 
@@ -367,57 +415,43 @@ All tools use a unified `Target` type for element location:
 
 ```typescript
 // By accessibility (recommended - most stable)
-{ role: "button", name: "Submit" }
+const byRole = { role: 'button', name: 'Submit' }
 
 // By accessibility with exact accessible name
-{ role: "button", name: "Submit", exact: true }
+const byExactRole = { role: 'button', name: 'Submit', exact: true }
 
 // By text content
-{ text: "Click here", exact: true }
+const byText = { text: 'Click here', exact: true }
 
 // By form label
-{
-    label: "Email"
-}
+const byLabel = { label: 'Email' }
 
 // By placeholder
-{
-    placeholder: "Enter your name"
-}
+const byPlaceholder = { placeholder: 'Enter your name' }
 
 // By title attribute
-{
-    title: "Close dialog"
-}
+const byTitle = { title: 'Close dialog' }
 
 // By alt text (images)
-{
-    alt: "Profile picture"
-}
+const byAlt = { alt: 'Profile picture' }
 
 // By test ID
-{
-    testId: "submit-button"
-}
+const byTestId = { testId: 'submit-button' }
 
 // By CSS selector
-{
-    css: "#login-form .submit-btn"
-}
+const byCss = { css: '#login-form .submit-btn' }
 
 // Disambiguate multiple matches (0-based)
-{ css: ".ant-select-input", nth: 1 }
+const secondMatch = { css: '.ant-select-input', nth: 1 }
 
 // By CSS + text (filter by text content)
-{ css: "button", text: "Submit", exact: true }
+const byCssText = { css: 'button', text: 'Submit', exact: true }
 
 // By XPath
-{
-    xpath: "//button[@type='submit']"
-}
+const byXPath = { xpath: "//button[@type='submit']" }
 
 // By coordinates
-{ x: 100, y: 200 }
+const byCoordinates = { x: 100, y: 200 }
 ```
 
 ## Usage Examples
@@ -511,7 +545,9 @@ input(events=[
 ], frame="iframe.login-frame")
 ```
 
-Selectors and numeric indices follow the parent document's DOM iframe order. Subframes absent from that DOM, including frames added by other extensions, cannot shift the index or become fallback targets. If the selected element cannot be tied to exactly one Chrome frame, the operation returns `FRAME_IDENTITY_UNAVAILABLE` instead of choosing another frame.
+Selectors and numeric indices follow the parent document's DOM iframe order. Subframes absent from that DOM, including
+frames added by other extensions, cannot shift the index or become fallback targets. If the selected element cannot be
+tied to exactly one Chrome frame, the operation returns `FRAME_IDENTITY_UNAVAILABLE` instead of choosing another frame.
 
 ### Wait for Element
 
@@ -601,8 +637,8 @@ mcp-chrome/
 
 ## Security Notes
 
-- **Trust boundary**: Extension mode auto-connects to local MCP servers by default. Use `MCP_CHROME_PAIRING_TOKEN`, or set
-  `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0`, on multi-user systems, CI runners, or containers with `--net=host` where
+- **Trust boundary**: Extension mode auto-connects to local MCP servers by default. Use `MCP_CHROME_PAIRING_TOKEN`, or
+  set `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0`, on multi-user systems, CI runners, or containers with `--net=host` where
   untrusted code can reach `127.0.0.1:19222-19299`. WebSocket upgrades require a `chrome-extension://` Origin header,
   which blocks browser pages and curl, but does not stop a malicious local process running as the same user.
 - Extension mode: shares your browser sessions — only use on trusted machines
@@ -610,7 +646,8 @@ mcp-chrome/
 - Default ports bind to 127.0.0.1 only (localhost)
 - The `evaluate` tool can execute arbitrary JavaScript
 - The `manage cdp` action can send arbitrary CDP commands
-- Network URL credential parameters are redacted by default, but console text and nonstandard parameter names may still contain sensitive information
+- Network URL credential parameters are redacted by default, but console text and nonstandard parameter names may still
+  contain sensitive information
 
 ### Anti-detection (stealth) — what it actually does
 
@@ -618,10 +655,11 @@ The `stealth` mode (`safe` / `aggressive`) only patches a small set of fingerpri
 
 - **Covers**: `navigator.webdriver`, `cdc_*` properties, User-Agent string, a few WebGL vendor/renderer values, Chrome
   runtime properties
-- **Does NOT cover**: Canvas fingerprinting, AudioContext fingerprinting, Font enumeration, TLS-level fingerprints (
-  JA3/JA4), CDP attach banner ("Chrome is being controlled by automated software"), Extension presence detection
-- **Warning**: Do NOT rely on this to bypass commercial anti-bot services (Cloudflare Turnstile, Akamai, DataDome,
-  PerimeterX). Real bot detection happens at multiple layers we cannot patch from inside the page
+- **Does NOT cover**: Canvas fingerprinting, AudioContext fingerprinting, Font enumeration, TLS-level fingerprints
+  (JA3/JA4), CDP attach banner ("Chrome is being controlled by automated software"), Extension presence detection
+- **Warning**: These patches do not pass Cloudflare. JS Challenge and Turnstile checkbox handling is a separate wait in
+  the real browser after navigation, input, or evaluate. It does not cover Akamai, DataDome, PerimeterX, interactive
+  CAPTCHAs, or IP reputation
 
 ## Known Limitations
 
@@ -639,9 +677,26 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [Model Context Protocol](https://modelcontextprotocol.io/) - MCP specification
 - [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) - CDP documentation
 
-
 ## Operation status and diagnostics
 
-Input and evaluate responses append `actionExecuted`, `actionStatus`, `verificationStatus`, `failureStage`, and `retryable`. Verification uses `matched`, `not_matched`, `unavailable`, or `error`; debugger timeouts report the action as `unknown` when completion cannot be proven. Page-thrown exceptions report `actionExecuted=true` with `actionStatus="failed"`; result materialization or serialization errors report `actionStatus="completed"` and `failureStage="output"`. Diagnostics are best-effort and return `diagnosticsStatus` without replacing the main action result. Browse and wait errors also retain any diagnostics collected before the action failed. Target diagnostics query the current tab state instead of relying on cached attach metadata.
+Input and evaluate responses append `actionExecuted`, `actionStatus`, `verificationStatus`, `failureStage`, and
+`retryable`. Verification uses `matched`, `not_matched`, `unavailable`, or `error`; debugger timeouts report the action
+as `unknown` when completion cannot be proven. Page-thrown exceptions report `actionExecuted=true` with
+`actionStatus="failed"`; result materialization or serialization errors report `actionStatus="completed"` and
+`failureStage="output"`. Diagnostics are best-effort and return `diagnosticsStatus` without replacing the main action
+result. Browse and wait errors also retain any diagnostics collected before the action failed. Target diagnostics query
+the current tab state instead of relying on cached attach metadata.
 
-`replace` uses text selection only for `textarea` and input types `text`, `search`, `tel`, `url`, and `password`. Other input types use a native full-value update and return the requested and actual browser-normalized values. A standalone `select` on unsupported types returns `UNSUPPORTED_SELECTION`. CDP locator targets for `select` and `replace` are focused through the CDP locator instead of Extension-only ref IDs. Password values are omitted from input failure context and text post-condition observations; failed input responses also redact supplied `find` and replacement `text` values. Target timeouts include bounded locator, tab, frame, match, and candidate context. Explicit `tabId` and `frame` scopes resolve the active backend before input, wait, logs, or extract work begins, so actions and verification use the same target backend. Precise iframe evaluation defaults to `staleContextRetry="never"` and does not replay stale scripts. `readOnly` permits one replay after the Extension verifies the frame identity and resolves a new execution context. Responses include the policy, `retryAttempted`, bounded `retryReason`, and the final `frameContext` with the Extension frame, parent frame, URL, CDP frame, and execution context IDs. Ambiguous same-URL frames are rejected. Port scanning aggregates ordinary pre-open failures at debug level; authentication and protocol rejections from identified MCP servers produce one bounded warning when the rejection summary changes.
+`replace` uses text selection only for `textarea` and input types `text`, `search`, `tel`, `url`, and `password`. Other
+input types use a native full-value update and return the requested and actual browser-normalized values. A standalone
+`select` on unsupported types returns `UNSUPPORTED_SELECTION`. CDP locator targets for `select` and `replace` are
+focused through the CDP locator instead of Extension-only ref IDs. Password values are omitted from input failure
+context and text post-condition observations; failed input responses also redact supplied `find` and replacement `text`
+values. Target timeouts include bounded locator, tab, frame, match, and candidate context. Explicit `tabId` and `frame`
+scopes resolve the active backend before input, wait, logs, or extract work begins, so actions and verification use the
+same target backend. Precise iframe evaluation defaults to `staleContextRetry="never"` and does not replay stale
+scripts. `readOnly` permits one replay after the Extension verifies the frame identity and resolves a new execution
+context. Responses include the policy, `retryAttempted`, bounded `retryReason`, and the final `frameContext` with the
+Extension frame, parent frame, URL, CDP frame, and execution context IDs. Ambiguous same-URL frames are rejected. Port
+scanning aggregates ordinary pre-open failures at debug level; authentication and protocol rejections from identified
+MCP servers produce one bounded warning when the rejection summary changes.

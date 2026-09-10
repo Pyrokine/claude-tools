@@ -26,7 +26,10 @@ import {
 const cookiesSchema = z.object({
     action: z.enum(['get', 'set', 'delete', 'clear']).describe('操作类型'),
     url: z.string().optional().describe('URL 过滤（get/clear/set/delete）'),
-    name: z.string().optional().describe('Cookie 名称（get/set/delete 必填；clear 可作过滤）'),
+    name: z
+        .string()
+        .optional()
+        .describe('Cookie 名称（get/set/delete 必填；clear 时只能作为 url/domain 范围内的附加过滤）'),
     domain: z.string().optional().describe('域名过滤（get/clear）'),
     path: z.string().optional().describe('路径过滤（get）或设置路径（set）'),
     secure: z.boolean().optional().describe('只返回 secure cookies（get）或设置 secure 属性（set）'),
@@ -227,8 +230,8 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
             }
 
             case 'clear': {
-                // 强制过滤：禁止无参数清全站（避免误删用户登录态）
-                if (!args.url && !args.domain && !args.name) {
+                // clear 必须限定到站点或域名，单独 name 会跨站删除同名 cookie
+                if (!args.url && !args.domain) {
                     return {
                         content: [
                             {
@@ -237,7 +240,8 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                                     error: {
                                         code: 'INVALID_ARGUMENT',
                                         message:
-                                            'cookies action=clear 必须带 name/domain/url 至少一个过滤参数（避免误删用户登录态）',
+                                            'cookies action=clear 必须带 url 或 domain 过滤参数；' +
+                                            'name 只能在该范围内进一步过滤，避免误删其他站点的同名 cookie',
                                     },
                                 }),
                             },

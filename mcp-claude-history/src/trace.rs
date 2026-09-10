@@ -7,8 +7,8 @@ use std::io::{BufRead, BufReader, Write};
 
 pub struct TraceParams {
     pub r#ref: String,
-    pub before: usize,
-    pub after: usize,
+    pub before: Option<usize>,
+    pub after: Option<usize>,
     pub project: Option<String>,
     pub max_content: usize,
     pub max_total: usize,
@@ -56,6 +56,21 @@ struct ToolResultRef {
 }
 
 pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, ErrorResponse> {
+    let mut params = params;
+    let filters = normalize_message_filters(&params.types, &params.subtypes, None)?;
+    let mut parameter_warnings = filters.warnings;
+    params.types = filters.types;
+    params.subtypes = filters.subtypes;
+    params.direction = parse_context_direction(&params.direction)?;
+    validate_context_range_selectors(
+        params.before,
+        params.after,
+        params.until_type.as_deref(),
+        params.until_ref.as_deref(),
+    )?;
+    if params.until_type.is_none() && params.direction == "backward" {
+        return Err(invalid_arguments("direction=backward 仅能与 until_type 一起使用"));
+    }
     let content_filter = build_content_filter(&params.pattern, params.regex, params.case_sensitive)?;
 
     let parsed_ref = ParsedRef::parse(&params.r#ref).ok_or_else(|| ErrorResponse {
@@ -170,7 +185,8 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
     } else {
         // before/after 计数模式
         let mut start = anchor_idx;
-        if params.before > 0 {
+        let before = params.before.unwrap_or(20);
+        if before > 0 {
             let mut count = 0usize;
             for i in (0..anchor_idx).rev() {
                 let type_ok = message_type_matches(records[i].effective_type, &params.types)
@@ -179,14 +195,15 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
                 if type_ok && pat_ok {
                     count += 1;
                     start = i;
-                    if count >= params.before {
+                    if count >= before {
                         break;
                     }
                 }
             }
         }
         let mut end = anchor_idx + 1;
-        if params.after > 0 {
+        let after = params.after.unwrap_or(20);
+        if after > 0 {
             let mut count = 0usize;
             for (i, msg) in records.iter().enumerate().skip(anchor_idx + 1) {
                 let type_ok = message_type_matches(msg.effective_type, &params.types)
@@ -195,7 +212,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
                 if type_ok && pat_ok {
                     count += 1;
                     end = i + 1;
-                    if count >= params.after {
+                    if count >= after {
                         break;
                     }
                 }
@@ -261,7 +278,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         });
     }
 
-    let warnings = jsonl_read_warnings(read_errors, parse_errors);
+    parameter_warnings.extend(jsonl_read_warnings(read_errors, parse_errors));
     let response = TraceResponse {
         anchor_ref: params.r#ref.clone(),
         project: project_id,
@@ -270,7 +287,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         tool_calls,
         association_issues,
         truncated: truncated.then_some(true),
-        warnings,
+        warnings: parameter_warnings,
         output_path: None,
         output: None,
     };
@@ -744,7 +761,10 @@ mod tests {
                     "tool_use_id": "call-1",
                     "content": [{
                         "type": "text",
-                        "text": r#"{"token":"SUPERSECRET","nested":{"accessToken":"ACCESSSECRET"},"host":"192.168.x.x"}"#
+                        "text": concat!(
+                            r#"{"token":"SUPERSECRET","nested":{"accessToken":"ACCESS"#,
+                            r#"SECRET"},"host":"192.168.x.x"}"#
+                        )
                     }]
                 }]}
             })
@@ -765,8 +785,8 @@ mod tests {
             },
             TraceParams {
                 r#ref: "session-:1".to_string(),
-                before: 0,
-                after: 1,
+                before: Some(0),
+                after: Some(1),
                 project: Some("project".to_string()),
                 max_content: 4000,
                 max_total: 40000,
@@ -788,14 +808,14 @@ mod tests {
 
         let preview = response.tool_calls[0].result_preview.as_deref().unwrap();
         assert!(!preview.contains("SUPERSECRET"));
-        assert!(!preview.contains("ACCESSSECRET"));
+        assert!(!preview.contains(concat!("ACCESS", "SECRET")));
         assert!(!preview.contains("192.168.x.x"));
         assert!(preview.contains("[redacted]"));
 
         let output = response.output.as_ref().unwrap();
         let exported = fs::read_to_string(&output.content).unwrap();
         assert!(!exported.contains("SUPERSECRET"));
-        assert!(!exported.contains("ACCESSSECRET"));
+        assert!(!exported.contains(concat!("ACCESS", "SECRET")));
         assert!(!exported.contains("192.168.x.x"));
         let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&output.manifest).unwrap()).unwrap();
         assert!(manifest["redaction"]["redacted_count"].as_u64().unwrap() >= 3);
@@ -838,8 +858,8 @@ mod tests {
             },
             TraceParams {
                 r#ref: "session-:4".to_string(),
-                before: 0,
-                after: 0,
+                before: Some(0),
+                after: Some(0),
                 project: Some("project".to_string()),
                 max_content: 4000,
                 max_total: 40000,
@@ -862,5 +882,37 @@ mod tests {
         assert_eq!(response.messages.len(), 1);
         assert_eq!(response.warnings, ["解析 JSONL 时跳过 2 行"]);
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn conflicting_trace_selectors_fail_before_ref_resolution() {
+        let error = trace(
+            &Config {
+                projects_dir: std::env::temp_dir(),
+            },
+            TraceParams {
+                r#ref: "invalid".to_string(),
+                before: Some(0),
+                after: None,
+                project: None,
+                max_content: 4000,
+                max_total: 40000,
+                types: Vec::new(),
+                subtypes: Vec::new(),
+                pattern: None,
+                regex: false,
+                case_sensitive: false,
+                servers: Vec::new(),
+                tools: Vec::new(),
+                until_type: Some("user".to_string()),
+                until_ref: None,
+                direction: "forward".to_string(),
+                output: None,
+                redaction: RedactionMode::Auto,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "invalid_arguments");
+        assert!(error.message.contains("不能和 before/after 同时传入"));
     }
 }

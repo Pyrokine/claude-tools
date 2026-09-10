@@ -400,8 +400,11 @@ export class HttpClient {
             .map(({ port, result }) => `${port} (${result.failureKind}: ${result.reason})`)
             .join(', ')
         if (failureSummary && failureSummary !== this.lastServerFailureSummary) {
+            const omittedSuffix = selectedFailures.length > 10 ? ', ...' : ''
             console.warn(
-                `[HTTP] ${selectedFailures.length} MCP Server candidate(s) rejected after health identification: ${failureSummary}${selectedFailures.length > 10 ? ', ...' : ''}`
+                `[HTTP] ${selectedFailures.length} MCP Server candidate(s) rejected after health identification: ` +
+                    failureSummary +
+                    omittedSuffix
             )
         }
         this.lastServerFailureSummary = failureSummary

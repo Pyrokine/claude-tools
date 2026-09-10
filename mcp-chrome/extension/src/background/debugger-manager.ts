@@ -18,6 +18,7 @@ export class DebuggerBlockedError extends ExpectedOperationError {
         this.context = { tabId }
     }
 
+    // noinspection JSUnusedGlobalSymbols — background/index.ts 通过结构化 toJSON 调用
     toJSON(): object {
         return {
             error: {
@@ -63,10 +64,15 @@ export class DebuggerManager {
 
     invalidateExecutionContext(tabId: number, contextId: number): void {
         const contexts = this.executionContexts.get(tabId)
-        if (!contexts) return
+        if (!contexts) {
+            return
+        }
         const next = contexts.filter((context) => context.id !== contextId)
-        if (next.length > 0) this.executionContexts.set(tabId, next)
-        else this.executionContexts.delete(tabId)
+        if (next.length > 0) {
+            this.executionContexts.set(tabId, next)
+        } else {
+            this.executionContexts.delete(tabId)
+        }
     }
 
     setupListeners(): void {

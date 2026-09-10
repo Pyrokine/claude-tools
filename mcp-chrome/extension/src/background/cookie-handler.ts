@@ -5,7 +5,9 @@ export class CookieHandler {
     async cookiesGet(params: unknown): Promise<chrome.cookies.Cookie[]> {
         const p = CookiesGetSchema.parse(params) ?? {}
         if (!p.url && !p.domain && !p.name) {
-            throw new ExpectedOperationError('cookies action=get 必须带 name/domain/url 至少一个过滤参数（避免读取全量 cookies）')
+            throw new ExpectedOperationError(
+                'cookies action=get 必须带 name/domain/url 至少一个过滤参数（避免读取全量 cookies）'
+            )
         }
 
         const filter: chrome.cookies.GetAllDetails = {}
@@ -69,9 +71,11 @@ export class CookieHandler {
     async cookiesClear(params: unknown): Promise<{ success: boolean; count: number }> {
         const p = CookiesClearSchema.parse(params) ?? {}
 
-        // 二层校验：禁止无过滤清全站（避免误删用户登录态）
-        if (!p.url && !p.domain && !p.name) {
-            throw new ExpectedOperationError('cookies action=clear 必须带 name/domain/url 至少一个过滤参数（项目规范）')
+        // 二层校验：必须按 URL 或域名限定范围，name 只能进一步缩小范围
+        if (!p.url && !p.domain) {
+            throw new ExpectedOperationError(
+                'cookies action=clear 必须带 url 或 domain 过滤参数，name 只能在该范围内进一步过滤（避免跨站误删同名 cookie）'
+            )
         }
 
         const filter: chrome.cookies.GetAllDetails = {}

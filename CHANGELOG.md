@@ -1,5 +1,90 @@
 # Changelog
 
+## v1.16.2 - 2026-09-10
+
+## Versions
+
+- mcp-claude-history: 1.9.1 → 1.9.2
+- mcp-chrome: 2.4.1 → 2.4.4
+- mcp-chrome Extension: 2.4.1 → 2.4.4
+- mcp-ssh: 2.4.1 → 2.4.3
+
+## What's Changed
+
+### mcp-claude-history
+
+- fix: Preserve punctuation in existing project paths and mark unresolved display paths with `path_approximate`
+- fix: Keep centered search previews within `max_content`, including ellipsis markers
+- fix: Validate message filters, refs, ranges, and time windows without silently widening the query
+- fix: Redact session topics before truncation and report redaction and invalid-timestamp metadata
+
+### mcp-chrome
+
+- feat: Add controlled page adoption, release, movement, ordering, pinning, and topology metadata
+- feat: Wait for browser challenges, handle visible Turnstile controls only on the active managed tab, and report denied or
+  timed-out states explicitly
+- fix: Scope CDP events, logs, challenge state, and diagnostics to the current flat session and main document
+- fix: Return structured input errors, bound and redact diagnostic data, and preserve action and verification state
+- fix: Clean server build output before packaging; replace the stale 2.4.2 and metadata-incomplete 2.4.3 packages with 2.4.4
+
+### mcp-ssh
+
+- fix: Add bounded SFTP operation timeouts and explicit unknown-state reporting after remote timeouts
+- fix: Preserve atomic upload and download targets until transfer and requested verification complete
+- fix: Harden tracked operation, PTY, forward, reconnect, and effective-user lifecycle handling
+- fix: Strengthen directory verification, UTF-8 pagination, transport selection, and cleanup reporting
+- fix: Clean server build output before packaging so removed files cannot enter npm packages
+- test: Attach timeout rejection assertions before async waiting to avoid load-sensitive unhandled rejections
+
+### Skills and documentation
+
+- docs: Expand `skill-cc-session-fix` diagnostics for large JSONL records, resume anchors, and session metadata
+- fix: Synchronize the `skill-elenchus` entry points, review formats, and technical notation
+- chore: Upgrade the shared MCP SDK dependency and refresh bilingual documentation and release regression guides
+
+---
+
+## 版本
+
+- mcp-claude-history: 1.9.1 → 1.9.2
+- mcp-chrome: 2.4.1 → 2.4.4
+- mcp-chrome Extension: 2.4.1 → 2.4.4
+- mcp-ssh: 2.4.1 → 2.4.3
+
+## 更新内容
+
+### mcp-claude-history
+
+- fix: 现存项目路径保留标点，无法解析的展示路径返回 `path_approximate`
+- fix: 居中搜索预览包含省略号时仍不超过 `max_content`
+- fix: 校验消息过滤、ref、范围和时间窗口，不再静默扩大查询范围
+- fix: 会话主题先脱敏再截断，并返回脱敏和无效时间戳统计
+
+### mcp-chrome
+
+- feat: 新增受控页面的 adopt、release、移动、排序、固定和拓扑信息
+- feat: 等待浏览器 Challenge，只在活动受控 tab 上处理可见 Turnstile，并明确报告拒绝或超时状态
+- fix: CDP 事件、日志、Challenge 状态和 diagnostics 只归属当前 flat session 与主文档
+- fix: 返回结构化输入错误，限制并脱敏诊断数据，保留动作和验证状态
+- fix: 发包前清理 server 构建目录；以 2.4.4 替换误含旧产物的 2.4.2 和缺少 gitHead 的 2.4.3
+
+### mcp-ssh
+
+- fix: 新增有界 SFTP 操作超时，远端超时后明确报告未知状态
+- fix: atomic upload 和 download 仅在传输及请求的校验完成后替换目标
+- fix: 加强 tracked operation、PTY、forward、reconnect 和有效用户的生命周期管理
+- fix: 加强目录校验、UTF-8 分页、transport 选择和清理结果报告
+- fix: 发包前清理 server 构建目录，防止已删除文件进入 npm 包
+- test: 在异步等待前注册超时拒绝断言，避免高负载下出现未处理 rejection
+
+### Skills 和文档
+
+- docs: 扩展 `skill-cc-session-fix` 对大 JSONL record、resume 锚点和 session metadata 的诊断说明
+- fix: 同步 `skill-elenchus` 入口版本、评审格式和技术标记
+- chore: 升级共用 MCP SDK 依赖，更新双语文档和发版回归指南
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.16.1...v1.16.2
+
 ## v1.16.1 - 2026-07-21
 
 ## Versions
@@ -78,26 +163,35 @@
 
 ### mcp-claude-history
 
-- feat: Add `history_build_info` with package, commit, target, profile, timestamp, dirty-state, and reproducibility metadata
-- feat: Add strict tool call/result association, independent tool-result preview limits, and compact UTF-8 response budgeting
-- fix: Ignore valid session metadata records without warnings while retaining warnings for malformed and incomplete message records
+- feat: Add `history_build_info` with package, commit, target, profile, timestamp, dirty-state, and reproducibility
+  metadata
+- feat: Add strict tool call/result association, independent tool-result preview limits, and compact UTF-8 response
+  budgeting
+- fix: Ignore valid session metadata records without warnings while retaining warnings for malformed and incomplete
+  message records
 - fix: Apply redaction and canonical output manifests consistently across search, get, context, and trace
-- chore: Upgrade Rust dependencies, raise the MSRV to 1.88, and publish stable platform asset names alongside target-triple names
+- chore: Upgrade Rust dependencies, raise the MSRV to 1.88, and publish stable platform asset names alongside
+  target-triple names
 
 ### mcp-chrome
 
 - feat: Add bounded target diagnostics and explicit action, verification, failure-stage, and retry state fields
-- fix: Separate text occurrence indexes from target-element indexes, support replace on non-selection inputs, and recover stale iframe contexts once
+- fix: Separate text occurrence indexes from target-element indexes, support replace on non-selection inputs, and
+  recover stale iframe contexts once
 - fix: Keep `evaluate` in precise mode by default and use the same mode for its post-condition
-- fix: Normalize public console levels, bound inline network URLs, and aggregate candidate-port failures without changing zero-configuration reconnect
+- fix: Normalize public console levels, bound inline network URLs, and aggregate candidate-port failures without
+  changing zero-configuration reconnect
 - chore: Upgrade the TypeScript compiler path, Vite, ESLint, Prettier, and related dependencies
 
 ### mcp-ssh
 
 - feat: Add tracked operation start, status, read, cancel, and list tools with bounded output and retention
-- feat: Select rsync or SFTP from route and credential capabilities, and return the selected transport with its decision reason
-- feat: Add bounded file and directory verification with explicit top-level failure when a requested check does not match
-- fix: Retain completed PTY output, wait for forward closure, report atomic upload temporary paths, and tighten line-range and command-risk handling
+- feat: Select rsync or SFTP from route and credential capabilities, and return the selected transport with its decision
+  reason
+- feat: Add bounded file and directory verification with explicit top-level failure when a requested check does not
+  match
+- fix: Retain completed PTY output, wait for forward closure, report atomic upload temporary paths, and tighten
+  line-range and command-risk handling
 - chore: Upgrade the TypeScript compiler path, ESLint, Prettier, and related dependencies
 
 ---

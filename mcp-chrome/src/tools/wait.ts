@@ -10,11 +10,17 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { formatErrorResponse, getSession, getUnifiedSession, TimeoutError } from '../core/index.js'
+import {
+    ElementNotFoundError,
+    formatErrorResponse,
+    getSession,
+    getUnifiedSession,
+    TimeoutError,
+} from '../core/index.js'
 import { DEFAULT_TIMEOUT, type ElementState, type Target } from '../core/types.js'
 import { withDiagnosticsResponse } from './diagnostics.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
-import { buildTargetDiagnostics, TargetTimeoutError, type TargetCandidate } from './target-diagnostics.js'
+import { buildTargetDiagnostics, type TargetCandidate, TargetTimeoutError } from './target-diagnostics.js'
 
 /** 轮询间隔（毫秒） */
 const POLL_INTERVAL = 100
@@ -69,7 +75,10 @@ const waitSchema = z.object({
     for: z.enum(['element', 'navigation', 'time', 'idle']).describe('等待类型'),
     target: targetZodSchema.optional().describe('目标元素（for=element 时必填；navigation/time/idle 不需要）'),
     state: z.enum(['visible', 'hidden', 'attached', 'detached']).optional().describe('元素状态（element）'),
-    ms: z.number().optional().describe('毫秒（time：等待时长；idle：DOM mutation 静默期，默认 500ms）'),
+    ms: z
+        .number()
+        .optional()
+        .describe('毫秒（time：等待时长；idle：Extension 为 DOM mutation 静默期，CDP 为网络静默期，默认 500ms）'),
     diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
     tabId: z
         .string()
@@ -227,7 +236,7 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                     }
 
                     case 'time': {
-                        if (!args.ms) {
+                        if (args.ms === undefined) {
                             return {
                                 content: [
                                     {
@@ -300,8 +309,9 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 const mutationRemaining = timeout - (Date.now() - idleStart)
                                 const scriptTimeout = mutationRemaining - POLL_INTERVAL
                                 if (scriptTimeout > quietPeriod) {
+                                    let domStable: boolean
                                     try {
-                                        const domStable = await new Promise<boolean>((resolve, reject) => {
+                                        domStable = await new Promise<boolean>((resolve, reject) => {
                                             let settled = false
                                             const timer = setTimeout(() => {
                                                 settled = true
@@ -376,23 +386,25 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                                     reject(err)
                                                 })
                                         })
-                                        if (!domStable) {
-                                            throw new TimeoutError(
-                                                `等待页面 idle 超时 (${timeout}ms): DOM 未达到 ${quietPeriod}ms 静默`
-                                            )
-                                        }
-                                        return {
-                                            success: true,
-                                            waited: 'idle',
-                                            domStable,
-                                            mode,
-                                        }
                                     } catch (err) {
                                         if (err instanceof TimeoutError) {
                                             throw err
                                         }
                                         const message = err instanceof Error ? err.message : String(err)
                                         throw new TimeoutError(`等待页面 idle 超时 (${timeout}ms): ${message}`)
+                                    }
+                                    if (!domStable) {
+                                        throw new TimeoutError(
+                                            `等待页面 idle 超时 (${timeout}ms): DOM 未达到 ${quietPeriod}ms 静默`
+                                        )
+                                    }
+                                    return {
+                                        success: true,
+                                        waited: 'idle',
+                                        idleKind: 'dom_mutation',
+                                        idlePeriodMs: quietPeriod,
+                                        domStable,
+                                        mode,
                                     }
                                 }
 
@@ -402,10 +414,12 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                             }
 
                             const session = getSession()
-                            await waitForNetworkIdle(session, timeout)
+                            await waitForNetworkIdle(session, timeout, args.ms ?? 500)
                             return {
                                 success: true,
                                 waited: 'idle',
+                                idleKind: 'network',
+                                idlePeriodMs: args.ms ?? 500,
                                 mode,
                             }
                         })
@@ -445,7 +459,6 @@ async function waitForElementExtension(
     frame?: string | number
 ): Promise<void> {
     const startTime = Date.now()
-    const retryDelay = POLL_INTERVAL
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
     const nth = nthParam ?? 0
     let lastError: Error | null = null
@@ -471,7 +484,7 @@ async function waitForElementExtension(
         // 未连接时跳过 find()，避免阻塞超出用户 timeout
         if (!unifiedSession.isExtensionConnected()) {
             lastError = new Error('Extension 未连接')
-            await sleepWithinBudget(startTime, timeout, retryDelay)
+            await sleepWithinBudget(startTime, timeout, POLL_INTERVAL)
             continue
         }
 
@@ -520,13 +533,13 @@ async function waitForElementExtension(
                 /Request timeout|Failed to send|disconnect|未连接|stopped|replaced/i.test(err.message)
             ) {
                 lastError = err
-                await sleepWithinBudget(startTime, timeout, retryDelay)
+                await sleepWithinBudget(startTime, timeout, POLL_INTERVAL)
                 continue
             }
             throw err
         }
 
-        await sleepWithinBudget(startTime, timeout, retryDelay)
+        await sleepWithinBudget(startTime, timeout, POLL_INTERVAL)
     }
 }
 
@@ -540,8 +553,6 @@ async function waitForElement(
     timeout: number
 ): Promise<void> {
     const startTime = Date.now()
-    const retryDelay = POLL_INTERVAL
-
     while (Date.now() - startTime < timeout) {
         try {
             const remaining = timeout - (Date.now() - startTime)
@@ -567,32 +578,29 @@ async function waitForElement(
 
                 case 'detached':
                 case 'hidden': {
-                    try {
-                        await locator.find()
-                        if (state === 'hidden') {
-                            // 元素存在，检查是否隐藏
-                            const box = await locator.getBoundingBox()
-                            if (box.width === 0 || box.height === 0) {
-                                return // 元素隐藏
-                            }
+                    await locator.find()
+                    if (state === 'hidden') {
+                        // 元素存在，检查是否隐藏
+                        const box = await locator.getBoundingBox()
+                        if (box.width === 0 || box.height === 0) {
+                            return // 元素隐藏
                         }
-                        // 元素仍然存在，继续等待
-                    } catch {
-                        // 元素不存在，符合预期
-                        return
                     }
+                    // 元素仍然存在，继续等待
                     break
                 }
             }
-        } catch {
-            // 元素未找到
-            if (state === 'detached' || state === 'hidden') {
-                return // 符合预期
+        } catch (error) {
+            if (!(error instanceof ElementNotFoundError)) {
+                throw error
             }
-            // 继续等待
+            if (state === 'detached' || state === 'hidden') {
+                return // 元素不存在，符合预期
+            }
+            // attached/visible 未找到时继续等待
         }
 
-        await sleepWithinBudget(startTime, timeout, retryDelay)
+        await sleepWithinBudget(startTime, timeout, POLL_INTERVAL)
     }
 
     throw new TimeoutError(`等待元素 ${JSON.stringify(target)} 状态 ${state} 超时 (${timeout}ms)`)
@@ -608,8 +616,12 @@ async function waitForNavigation(session: ReturnType<typeof getSession>, timeout
 /**
  * 等待网络空闲（复用 session 的事件驱动实现）
  */
-async function waitForNetworkIdle(session: ReturnType<typeof getSession>, timeout: number): Promise<void> {
-    await session.waitForNetworkIdle(timeout)
+async function waitForNetworkIdle(
+    session: ReturnType<typeof getSession>,
+    timeout: number,
+    idleTime: number
+): Promise<void> {
+    await session.waitForNetworkIdle(timeout, idleTime)
 }
 
 /**

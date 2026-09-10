@@ -83,7 +83,7 @@ enum Commands {
         #[arg(long, default_value = "assistant,user,summary")]
         types: String,
 
-        /// Message subtypes filter (comma separated).
+        /// Message subtype filter (comma separated). `human` means a user-shaped record, not verified human authorship.
         /// user subtypes: human, tool_result, meta;
         /// assistant subtypes: text, tool_use, thinking, empty; summary, system
         #[arg(long)]
@@ -117,7 +117,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Export search results as JSONL to output directory or .jsonl file
+        /// Export search results to an output directory or `.jsonl` file
         #[arg(long)]
         output: Option<String>,
 
@@ -137,7 +137,7 @@ enum Commands {
         #[arg(long)]
         regex: bool,
 
-        /// Case sensitive search
+        /// Use case-sensitive search
         #[arg(long)]
         case_sensitive: bool,
 
@@ -266,13 +266,13 @@ enum Commands {
         #[arg(long)]
         r#ref: String,
 
-        /// Messages before anchor (counts only matching --types and --pattern)
-        #[arg(long, default_value = "20")]
-        before: usize,
+        /// Messages before anchor (counts only matching --types and --pattern; default: 20)
+        #[arg(long)]
+        before: Option<usize>,
 
-        /// Messages after anchor (counts only matching --types and --pattern)
-        #[arg(long, default_value = "20")]
-        after: usize,
+        /// Messages after anchor (counts only matching --types and --pattern; default: 20)
+        #[arg(long)]
+        after: Option<usize>,
 
         /// Project ID
         #[arg(long)]
@@ -346,6 +346,10 @@ enum Commands {
         /// Project ID (default: current)
         #[arg(long)]
         project: Option<String>,
+
+        /// Redaction mode: auto, strict, off
+        #[arg(long)]
+        redaction: Option<String>,
     },
 }
 
@@ -556,7 +560,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Projects => serialize_result(list_projects(&config)),
 
-        Commands::Sessions { project } => serialize_result(list_sessions(&config, project.as_deref())),
+        Commands::Sessions { project, redaction } => match parse_optional_redaction_mode_param(redaction.as_deref()) {
+            Ok(redaction) => serialize_result(list_sessions(&config, project.as_deref(), redaction)),
+            Err(e) => serialize_result::<serde_json::Value, _>(Err(e)),
+        },
     };
 
     match result {

@@ -70,6 +70,7 @@ const COMMON_BODY = `
 `
 
 // aggressive 追加 body：plugins / languages / chrome / permissions / WebGL
+// noinspection SpellCheckingInspection — 模板包含固定的 Chrome PDF Viewer 插件 ID
 const AGGRESSIVE_EXTRA_BODY = `
   // ============================================
   // 4. 模拟真实插件列表
@@ -85,7 +86,7 @@ const AGGRESSIVE_EXTRA_BODY = `
           },
           {
             name: 'Chrome PDF Viewer',
-            filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+            filename: 'mhjfbmdgcfjbbpae' + 'ojofohoefgiehjai',
             description: '',
           },
           {

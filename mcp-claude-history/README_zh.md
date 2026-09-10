@@ -24,14 +24,15 @@ Claude Code 对话历史搜索工具
 
 ### 下载二进制（推荐）
 
-从 [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases) 下载最新版本，原有 target triple 资产名继续保留，已有自动化无需修改
+从 [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases) 下载最新版本，原有 target
+triple 资产名继续保留，已有自动化无需修改
 
-| 平台 | 稳定资产名 |
-|---|---|
-| Linux x86_64 | `mcp-claude-history-linux-x86_64.tar.gz` |
-| macOS Intel | `mcp-claude-history-macos-x86_64.tar.gz` |
+| 平台                | 稳定资产名                                |
+| ------------------- | ----------------------------------------- |
+| Linux x86_64        | `mcp-claude-history-linux-x86_64.tar.gz`  |
+| macOS Intel         | `mcp-claude-history-macos-x86_64.tar.gz`  |
 | macOS Apple Silicon | `mcp-claude-history-macos-aarch64.tar.gz` |
-| Windows x86_64 | `mcp-claude-history-windows-x86_64.zip` |
+| Windows x86_64      | `mcp-claude-history-windows-x86_64.zip`   |
 
 ```bash
 # 下载并安装
@@ -64,73 +65,100 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ```json
 {
-  "mcpServers": {
-    "mcp-claude-history": {
-      "command": "mcp-claude-history",
-      "args": [
-        "--mcp"
-      ]
+    "mcpServers": {
+        "mcp-claude-history": {
+            "command": "mcp-claude-history",
+            "args": ["--mcp"]
+        }
     }
-  }
 }
 ```
 
 ## 可用工具（7 个）
 
-| 工具                 | 描述                 |
-|--------------------|--------------------|
-| `history_search`   | 搜索对话历史             |
-| `history_get`      | 获取完整消息内容           |
-| `history_context`  | 获取消息上下文            |
-| `history_trace`    | 追踪附近消息和 tool 调用结果对 |
-| `history_build_info` | 查看当前运行二进制的构建身份  |
-| `history_projects` | 列出所有项目             |
-| `history_sessions` | 列出项目的会话            |
+| 工具                 | 描述                           |
+| -------------------- | ------------------------------ |
+| `history_search`     | 搜索对话历史                   |
+| `history_get`        | 获取完整消息内容               |
+| `history_context`    | 获取消息上下文                 |
+| `history_trace`      | 追踪附近消息和 tool 调用结果对 |
+| `history_build_info` | 查看当前运行二进制的构建身份   |
+| `history_projects`   | 列出所有项目                   |
+| `history_sessions`   | 列出项目的会话                 |
+
+### history_projects
+
+每个项目返回权威 `id`、展示用
+`path`、`path_approximate`、会话数和最后活动时间。现存本地路径会根据文件系统还原，保留连字符、下划线、点号和空格。无法唯一解析到现存路径时，`path`
+使用可读的近似值并返回 `path_approximate=true`；调用其他工具时应使用 `id`
+
+### history_sessions
+
+| 参数        | 类型   | 默认值   | 说明                                   |
+| ----------- | ------ | -------- | -------------------------------------- |
+| `project`   | string | 当前项目 | 项目 ID                                |
+| `redaction` | string | auto     | 会话主题使用 `auto`、`strict` 或 `off` |
+
+会话主题会先脱敏，再截取前 100 个字符。响应包含汇总 `redaction` 元数据，主题发生替换的会话会返回 `topic_redacted_count`
 
 ### history_search
 
-| 参数                    | 类型      | 默认值                    | 说明                                                       |
-|-----------------------|---------|------------------------|----------------------------------------------------------|
-| `pattern`             | string  | ""                     | 搜索词（空字符串返回所有）                                            |
-| `project`             | string  | 当前项目                   | 项目 ID（逗号分隔）                                              |
-| `all`                 | boolean | false                  | 搜索所有项目                                                   |
-| `sessions`            | string  | -                      | 会话 ID（逗号分隔）                                              |
-| `since`               | string  | -                      | 起始时间，支持 RFC3339 或 YYYY-MM-DD                             |
-| `until`               | string  | -                      | 结束时间，支持 RFC3339 或 YYYY-MM-DD                             |
-| `types`               | string  | assistant,user,summary | 消息类型                                                     |
-| `servers`             | string  | -                      | MCP server 过滤，逗号分隔                                       |
-| `tools`               | string  | -                      | MCP tool 过滤，逗号分隔                                         |
-| `lines`               | string  | -                      | 行号范围（如 100-200, !300-400）                                |
-| `regex`               | boolean | false                  | 使用正则                                                     |
-| `case_sensitive`      | boolean | false                  | 区分大小写                                                    |
-| `subagents`           | boolean | false                  | 包含 `subagents` 和 `remote-agents` 下的 sidechain transcript |
-| `summary`             | boolean | false                  | 返回聚合摘要，不返回完整结果正文                                         |
-| `failed_tool_results` | boolean | false                  | 只返回 harness 标记 `is_error=true` 的 tool_result             |
-| `tool_payload_errors` | boolean | false                  | 只返回 JSON payload 自身报告错误的 tool_result                     |
-| `output`              | string  | -                      | 写结果文件，相对路径默认走受控临时目录                                      |
-| `output_format`       | string  | jsonl                  | `jsonl`                                                  |
-| `redaction`           | string  | auto                   | `auto`、`strict` 或 `off`                                  |
-| `offset`              | number  | 0                      | 跳过前 N 条，不能和 `slice` 同用                                   |
-| `limit`               | number  | -                      | 最多返回 N 条，不能和 `slice` 同用                                  |
-| `slice`               | string  | -                      | 过滤和排序后的 Python 风格消息切片                                    |
-| `max_content`         | number  | 4000                   | 普通结果预览的最大字符数（1 至 1,000,000）                              |
-| `max_content_tool_result` | number | 500                  | tool result 独立预览上限（1 至 1,000,000）                          |
-| `max_total`           | number  | 40000                  | 紧凑 `SearchResponse` JSON 最大字节数（512 至 10,000,000）             |
+| 参数                      | 类型    | 默认值                 | 说明                                               |
+| ------------------------- | ------- | ---------------------- | -------------------------------------------------- |
+| `pattern`                 | string  | ""                     | 搜索词（空字符串返回所有）                         |
+| `project`                 | string  | 当前项目               | 项目 ID（逗号分隔）                                |
+| `all`                     | boolean | false                  | 搜索所有项目                                       |
+| `sessions`                | string  | -                      | 会话 ID（逗号分隔）                                |
+| `since`                   | string  | -                      | 起始时间，支持 RFC3339 或 YYYY-MM-DD               |
+| `until`                   | string  | -                      | 结束时间，支持 RFC3339 或 YYYY-MM-DD               |
+| `types`                   | string  | assistant,user,summary | 消息类型，逗号分隔                                 |
+| `subtypes`                | string  | -                      | 消息子类型，逗号分隔                               |
+| `servers`                 | string  | -                      | MCP server 过滤，逗号分隔                          |
+| `tools`                   | string  | -                      | MCP tool 过滤，逗号分隔                            |
+| `lines`                   | string  | -                      | 行号范围（如 100-200, !300-400）                   |
+| `regex`                   | boolean | false                  | 使用正则                                           |
+| `case_sensitive`          | boolean | false                  | 区分大小写                                         |
+| `subagents`               | boolean | false                  | 包含 sidechain 和 remote-agent transcript          |
+| `summary`                 | boolean | false                  | 在 `stats.summary` 中包含聚合计数                  |
+| `aggregate`               | boolean | false                  | 仅返回聚合计数，不返回结果行                       |
+| `dry_run`                 | boolean | false                  | 只预览项目、会话和文件，不读取消息正文             |
+| `failed_tool_results`     | boolean | false                  | 只返回 harness 标记 `is_error=true` 的 tool_result |
+| `tool_payload_errors`     | boolean | false                  | 只返回 JSON payload 自身报告错误的 tool_result     |
+| `output`                  | string  | -                      | 写结果文件，相对路径默认走受控临时目录             |
+| `output_format`           | string  | jsonl                  | `jsonl`                                            |
+| `redaction`               | string  | auto                   | `auto`、`strict` 或 `off`                          |
+| `offset`                  | number  | 0                      | 跳过前 N 条，不能和 `slice` 同用                   |
+| `limit`                   | number  | -                      | 最多返回 N 条，不能和 `slice` 同用                 |
+| `slice`                   | string  | -                      | 过滤和排序后的 Python 风格消息切片                 |
+| `max_content`             | number  | 4000                   | 普通结果预览的最大字符数（1 至 1,000,000）         |
+| `max_content_tool_result` | number  | 500                    | tool result 独立预览上限（1 至 1,000,000）         |
+| `max_total`               | number  | 40000                  | 紧凑响应上限（512 至 10,000,000 字节）             |
 
-默认 `types` 包含 `summary`，会检索上下文压缩摘要，只看原始对话时使用 `types=assistant,user`，`failed_tool_results`
-保持旧语义，只检查
-`tool_result.is_error`；`tool_payload_errors` 用于查找工具结果成功返回但正文 JSON 中包含 `success=false` 或 `error` 的记录
+默认 `types` 包含 `summary`，会检索上下文压缩摘要，只看原始对话时使用 `types=assistant,user`。合法 type 为
+`assistant`、`user`、`summary`、`system`、`other`。合法 subtype 为 `human`、`tool_result`、`meta`、`text`、
+`tool_use`、`thinking`、`empty`、`summary`、`system`、`other`。`types=user,subtypes=human` 用于筛选普通user-shaped
+record。这是分类启发式，不能证明消息由真人输入。为兼容旧调用，传入 `types` 的已知 subtype 会自动移入
+`subtypes`，未知 type 或 subtype 返回 `invalid_arguments`
 
-搜索输出默认使用 `redaction=auto` 处理消息正文、`tool_use` 预览和结构化 tool 字段，`auto` 覆盖 Authorization header，以及常见
-password、token、cookie、API key、secret、private key、key path 字段，`strict` 还会处理 private key block、private host name 和
-URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处理的结果会返回 `redacted=true` 和 `raw_available=true`
-，JSONL manifest 会记录 redaction 元数据
+`failed_tool_results` 保持旧语义，只检查 `tool_result.is_error`。`tool_payload_errors`
+用于查找工具结果成功返回但正文 JSON 中包含 `success=false` 或 `error` 的记录。非 regex 的 `pattern`
+以空格表示 AND，`a|b` 表示一组 OR，`!term` 排除命中； `regex=true` 时 `pattern` 作为一个正则表达式。设置 `since` 或
+`until` 后，时间戳无法解析的 record 不匹配，并通过 `stats.skipped_invalid_timestamps` 和 `incomplete_reasons`
+说明。`since` 不能晚于 `until`
 
-`output` 支持文件路径或目录，`tmp:relative/path` 写入受控临时目录，`cwd:relative/path` 持久化到当前工作目录，未加前缀的相对路径也写入受控临时目录，以
-`.jsonl`、`.json` 或 `.txt` 等扩展名结尾时按文件处理，manifest 写在该文件旁边
+搜索输出默认使用 `redaction=auto` 处理消息正文、`tool_use` 预览和结构化 tool 字段，`auto` 覆盖 Authorization
+header，以及常见 password、token、cookie、API key、secret、private key、key path 字段，`strict` 还会处理 private key
+block、private host name 和 URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处理的结果会返回
+`redacted=true` 和 `raw_available=true` ，JSONL manifest 会记录 redaction 元数据
 
-`slice` 使用 Python 半开区间语义，在全部过滤和按时间排序后执行，`[-10:]` 返回最近 10 条匹配消息，`[-10:-1]` 排除最新消息，最多返回
-9 条，`max_total` 删除部分切片结果时，`next_query` 会携带剩余半开区间对应的归一化正数 slice，连续续查不会离开原切片；预算无法容纳任何结果且 continuation 无法前进时返回 `response_too_large`，不会重复返回同一个 slice
+`output` 支持文件路径或目录，`tmp:relative/path` 写入受控临时目录，`cwd:relative/path`
+持久化到当前工作目录，未加前缀的相对路径也写入受控临时目录，以 `.jsonl`、`.json` 或 `.txt`
+等扩展名结尾时按文件处理，manifest 写在该文件旁边
+
+`slice` 按 Python 半开范围规则工作，在全部过滤和按时间排序后执行，`[-10:]` 返回最近 10 条匹配消息，`[-10:-1]`
+排除最新消息，最多返回 9 条，`max_total` 删除部分切片结果时，`next_query`
+会携带剩余范围对应的归一化正数 slice，连续续查不会离开原切片；预算无法容纳任何结果且 continuation 无法前进时返回
+`response_too_large`，不会重复返回同一个 slice
 
 `max_total` 统计 `history_search` 返回的紧凑 UTF-8 JSON 文本，不包含 JSON-RPC 和 MCP transport framing，响应会返回
 `serialized_bytes`、`max_total_bytes`、`limits_applied` 和 `complete`，导出的 JSONL 内容不受对话响应预算缩减，
@@ -138,74 +166,82 @@ URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处
 
 ### history_get
 
-| 参数          | 类型     | 说明                                           |
-|-------------|--------|----------------------------------------------|
-| `ref`       | string | 必填，消息定位（session前8位:行号）                       |
-| `range`     | string | 字符范围（如 0-100000）                             |
+| 参数        | 类型   | 说明                                                                              |
+| ----------- | ------ | --------------------------------------------------------------------------------- |
+| `ref`       | string | 必填，消息定位（session前8位:行号）                                               |
+| `range`     | string | Unicode 字符的半开范围（如 `0-100000`）                                           |
 | `output`    | string | 输出文件或目录（自动提取图片，相对路径默认走受控临时目录，持久化请显式写 `cwd:`） |
-| `project`   | string | 项目 ID                                        |
-| `redaction` | string | `auto`、`strict` 或 `off`，默认 `auto`            |
+| `project`   | string | 项目 ID                                                                           |
+| `redaction` | string | `auto`、`strict` 或 `off`，默认 `auto`                                            |
 
 直接返回过大时会返回 `content_too_large`，包含 `content_size`、`valid_range`、`parsed_range`、`head`、`tail`、
 `range_suggestion` 和 `output_suggestion`
 
 ### history_context
 
-| 参数               | 类型      | 默认值     | 说明                                       |
-|------------------|---------|---------|------------------------------------------|
-| `ref`            | string  | -       | 必填，消息定位                                  |
+| 参数             | 类型    | 默认值  | 说明                                                      |
+| ---------------- | ------- | ------- | --------------------------------------------------------- |
+| `ref`            | string  | -       | 必填，消息定位                                            |
 | `before`         | number  | -       | 向前取 N 条（仅计数同时匹配 `types` 和 `pattern` 的消息） |
 | `after`          | number  | -       | 向后取 N 条（仅计数同时匹配 `types` 和 `pattern` 的消息） |
-| `until_type`     | string  | -       | 持续到指定类型                                  |
-| `until_ref`      | string  | -       | 持续到同一 session 内的另一个 ref                  |
-| `direction`      | string  | forward | forward/backward                         |
-| `types`          | string  | -       | 要包含的消息类型（逗号分隔）                           |
-| `subtypes`       | string  | -       | 要包含的消息子类型（逗号分隔）                          |
-| `project`        | string  | -       | 项目 ID                                    |
-| `output`         | string  | -       | 导出选中上下文到文本文件，并返回 `output_path`           |
-| `redaction`      | string  | auto    | `auto`、`strict` 或 `off`                  |
-| `max_content`    | number  | 4000    | 单条最大字符数                                  |
-| `max_total`      | number  | 40000   | 总最大字符数                                   |
-| `pattern`        | string  | -       | 内容过滤 pattern，仅计数/返回匹配该 pattern 的消息       |
-| `regex`          | boolean | false   | 是否使用正则匹配                                 |
-| `case_sensitive` | boolean | false   | 是否区分大小写                                  |
+| `until_type`     | string  | -       | 持续到指定类型                                            |
+| `until_ref`      | string  | -       | 持续到同一 session 内的另一个 ref                         |
+| `direction`      | string  | forward | forward/backward                                          |
+| `types`          | string  | -       | 要包含的消息类型（逗号分隔）                              |
+| `subtypes`       | string  | -       | 要包含的消息子类型（逗号分隔）                            |
+| `project`        | string  | -       | 项目 ID                                                   |
+| `output`         | string  | -       | 导出选中上下文到文本文件，并返回 `output_path`            |
+| `redaction`      | string  | auto    | `auto`、`strict` 或 `off`                                 |
+| `max_content`    | number  | 4000    | 单条最大字符数                                            |
+| `max_total`      | number  | 40000   | 总最大字符数                                              |
+| `pattern`        | string  | -       | 内容过滤 pattern，仅计数/返回匹配该 pattern 的消息        |
+| `regex`          | boolean | false   | 是否使用正则匹配                                          |
+| `case_sensitive` | boolean | false   | 是否区分大小写                                            |
 
-**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，不受 `types` 和 `pattern` 过滤影响；设置 `pattern` 后，`before`/`after`
-的计数仅统计匹配该 pattern 的消息，合法 JSONL session metadata record 会被忽略且不产生解析警告，损坏 JSON 和不完整消息 record
-仍会产生警告，`history_trace` 使用相同的 record 处理规则
+**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，不受 `types` 和 `pattern` 过滤影响；设置 `pattern`
+后，`before`/`after` 的计数仅统计匹配该 pattern 的消息，合法 JSONL session metadata
+record 会被忽略且不产生解析警告，损坏 JSON 和不完整消息 record 仍会产生警告，`history_trace` 使用相同的 record 处理规则
+
+ref 必须是非空 session prefix 加正整数行号，例如 `c86bc677:1234`。`direction` 仅支持 `forward` 或 `backward`，且只用于
+`until_type`。`until_type`
+只接受有效消息 type。范围模式三选一：`before`/`after`、`until_type`、`until_ref`。`until_type` 和 `until_ref`
+不能同时传入，也都不能与 `before`/`after` 同用
 
 ### history_trace
 
-| 参数               | 类型      | 默认值     | 说明                                 |
-|------------------|---------|---------|------------------------------------|
-| `ref`            | string  | -       | 必填，消息定位                            |
+| 参数             | 类型    | 默认值  | 说明                                            |
+| ---------------- | ------- | ------- | ----------------------------------------------- |
+| `ref`            | string  | -       | 必填，消息定位                                  |
 | `before`         | number  | 20      | 锚点前消息数，按 type/pattern 过滤后计数        |
 | `after`          | number  | 20      | 锚点后消息数，按 type/pattern 过滤后计数        |
-| `project`        | string  | -       | 项目 ID                              |
-| `types`          | string  | -       | 要包含的消息类型                           |
-| `subtypes`       | string  | -       | 要包含的消息子类型                          |
-| `pattern`        | string  | -       | 内容过滤 pattern                       |
-| `regex`          | boolean | false   | 是否使用正则                             |
-| `case_sensitive` | boolean | false   | 是否区分大小写                            |
-| `servers`        | string  | -       | 按 MCP server 过滤 `tool_calls`       |
-| `tools`          | string  | -       | 按 tool 名过滤 `tool_calls`            |
-| `until_type`     | string  | -       | 持续到指定消息类型                          |
-| `until_ref`      | string  | -       | 持续到同一 session 内的另一个 ref            |
-| `direction`      | string  | forward | `until_type` 的 forward/backward    |
+| `project`        | string  | -       | 项目 ID                                         |
+| `types`          | string  | -       | 要包含的消息类型                                |
+| `subtypes`       | string  | -       | 要包含的消息子类型                              |
+| `pattern`        | string  | -       | 内容过滤 pattern                                |
+| `regex`          | boolean | false   | 是否使用正则                                    |
+| `case_sensitive` | boolean | false   | 是否区分大小写                                  |
+| `servers`        | string  | -       | 按 MCP server 过滤 `tool_calls`                 |
+| `tools`          | string  | -       | 按 tool 名过滤 `tool_calls`                     |
+| `until_type`     | string  | -       | 持续到指定消息类型                              |
+| `until_ref`      | string  | -       | 持续到同一 session 内的另一个 ref               |
+| `direction`      | string  | forward | `until_type` 的 forward/backward                |
 | `output`         | string  | -       | 导出选中 trace 到文本文件，并返回 `output_path` |
-| `redaction`      | string  | auto    | `auto`、`strict` 或 `off`            |
-| `max_content`    | number  | 4000    | 单条最大字符数                            |
-| `max_total`      | number  | 40000   | messages 总最大字符数                    |
+| `redaction`      | string  | auto    | `auto`、`strict` 或 `off`                       |
+| `max_content`    | number  | 4000    | 单条最大字符数                                  |
+| `max_total`      | number  | 40000   | messages 总最大字符数                           |
 
-`history_trace` 返回附近消息，并在 `tool_calls` 中列出识别到的 tool 调用和对应 tool_result，有
-`tool_use_id` 的 result 只匹配相同 ID；没有 ID 时先匹配 assistant parent UUID，再在仅有一个 pending call 时使用旧版顺序兼容，
-每个 call 返回 `match_method`，未匹配和歧义 result 进入有数量上限的 `association_issues`，结构化 tool-result preview 在 JSON
-序列化前按 key 递归脱敏，也会处理 text 中嵌入的 JSON object，trace 导出使用同一份脱敏 preview
+`history_trace` 返回附近消息，并在 `tool_calls` 中列出识别到的 tool 调用和对应 tool_result，有 `tool_use_id`
+的 result 只匹配相同 ID；没有 ID 时先匹配 assistant parent UUID，再在仅有一个 pending
+call 时使用旧版顺序兼容，每个 call 返回 `match_method`，未匹配和歧义 result 进入有数量上限的
+`association_issues`，结构化 tool-result preview 在 JSON 序列化前按 key 递归脱敏，也会处理 text 中嵌入的 JSON
+object，trace 导出使用同一份脱敏 preview。未设置 `until_type` 或 `until_ref` 时，`before` 和 `after`
+默认各为 20。ref、direction、type、subtype 和互斥范围模式规则与 `history_context` 相同
 
 ### history_build_info
 
-返回当前运行二进制的 package version、commit、target、profile、UTC 构建时间、dirty 状态和构建身份是否可复现，本地 dirty
-构建不会标记为可复现，CLI 对应命令为 `mcp-claude-history build-info`
+返回当前运行二进制的 package
+version、commit、target、profile、UTC 构建时间、dirty 状态和构建身份是否可复现，本地 dirty 构建不会标记为可复现，CLI 对应命令为
+`mcp-claude-history build-info`
 
 ## 使用示例
 

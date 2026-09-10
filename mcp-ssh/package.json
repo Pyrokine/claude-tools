@@ -1,6 +1,6 @@
 {
     "name": "@pyrokine/mcp-ssh",
-    "version": "2.4.1",
+    "version": "2.4.3",
     "description": "A comprehensive SSH MCP Server for Claude Code",
     "type": "module",
     "main": "dist/index.js",
@@ -8,16 +8,16 @@
         "mcp-ssh": "dist/index.js"
     },
     "scripts": {
-        "build": "node node_modules/typescript7/bin/tsc",
+        "build": "npm run clean && node node_modules/typescript7/bin/tsc",
         "start": "node dist/index.js",
         "dev": "node node_modules/typescript7/bin/tsc && node dist/index.js",
         "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
-        "prepublishOnly": "npm run build",
-        "lint": "eslint \"src/**/*.ts\"",
-        "lint:fix": "eslint \"src/**/*.ts\" --fix",
+        "prepack": "npm run build",
+        "lint": "eslint \"src/**/*.ts\" \"test/**/*.mjs\"",
+        "lint:fix": "eslint \"src/**/*.ts\" \"test/**/*.mjs\" --fix",
         "test": "npm run build && node test/run-tests.mjs",
-        "format": "prettier --write src/",
-        "format:check": "prettier --check src/"
+        "format": "prettier --write --prose-wrap always src/ test/ README.md README_zh.md TESTING.md",
+        "format:check": "prettier --check --prose-wrap always src/ test/ README.md README_zh.md TESTING.md"
     },
     "keywords": [
         "mcp",
@@ -33,7 +33,7 @@
         "url": "git+https://github.com/Pyrokine/claude-tools.git"
     },
     "dependencies": {
-        "@modelcontextprotocol/sdk": "^1.29.0",
+        "@modelcontextprotocol/sdk": "^1.30.0",
         "@xterm/headless": "^6.0.0",
         "ssh2": "^1.17.0",
         "zod": "^4.4.3"

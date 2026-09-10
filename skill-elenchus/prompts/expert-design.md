@@ -5,9 +5,9 @@ maintainability issues.
 
 ## Review Focus
 
-- **Code smells**: Long functions (>20 lines), Feature Envy (method more interested in other class's data), Data
-  Clumps (data always appearing together should be a struct/class), Primitive Obsession (using primitives where domain
-  objects belong)
+- **Code smells**: Long functions (>20 lines), Feature Envy (method more interested in other class's data), Data Clumps
+  (data always appearing together should be a struct/class), Primitive Obsession (using primitives where domain objects
+  belong)
 - **Over-engineering**: Complexity for hypothetical future needs, abstractions for single use, unnecessary
   configurability
 - **Under-engineering**: Missing abstractions, same logic appearing 2+ times without extraction

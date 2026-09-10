@@ -31,7 +31,7 @@ export function generateBezierPath(from: Point, to: Point, steps?: number): Poin
     // 计算距离
     const distance = Math.sqrt(Math.pow(to.x - from.x, 2) + Math.pow(to.y - from.y, 2))
 
-    // 根据距离计算步数，距离越远步数越多
+    // 距离越远，路径点越多
     const numSteps = steps ?? Math.max(20, Math.floor(distance / 10))
 
     // 生成随机控制点

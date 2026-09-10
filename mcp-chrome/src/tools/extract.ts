@@ -26,10 +26,10 @@ import {
     writePrivateFile,
 } from '../core/index.js'
 import type { Target } from '../core/types.js'
+import { sanitizeUrlRecords } from './network-sanitizer.js'
 import { comparePngImages, MAX_COMPARE_PIXELS, MAX_COMPARE_PNG_BYTES, readPngHeader } from './png.js'
 import { targetToFindParams, targetZodSchema } from './schema.js'
-import { sanitizeUrlRecords } from './network-sanitizer.js'
-import { buildTargetDiagnostics, TargetTimeoutError } from './target-diagnostics.js'
+import { buildTargetDiagnostics, TargetNotFoundError, TargetTimeoutError } from './target-diagnostics.js'
 
 /** 图片元信息 */
 interface ImageInfo {
@@ -55,73 +55,90 @@ const MAX_APPENDIX_IMAGES = 20
 /**
  * extract 参数 schema
  */
-const extractSchema = z.object({
-    type: z
-        .enum(['text', 'html', 'frameHtml', 'attribute', 'screenshot', 'state', 'metadata', 'diagnosticBundle'])
-        .describe('提取类型'),
-    target: targetZodSchema
-        .optional()
-        .describe(
-            '目标元素（attribute 必填；text/html 可选，省略则提取整个页面；screenshot 可选用于元素截图；state 可选（仅 Extension）用于返回目标子树；metadata 不需要）'
-        ),
-    attribute: z.string().optional().describe('属性名（attribute）'),
-    images: z
-        .enum(['info', 'data'])
-        .optional()
-        .describe('图片提取模式（仅 html 类型有效），info: 元信息（src/alt/尺寸）；data: 含图片数据'),
-    fullPage: z.boolean().optional().describe('是否全页面截图（screenshot）'),
-    scale: z
-        .number()
-        .optional()
-        .describe('截图缩放比例（screenshot fullPage），默认 1，设为 0.5 可降低分辨率加速大页面截图'),
-    format: z
-        .enum(['png', 'jpeg', 'webp'])
-        .optional()
-        .describe('截图格式（screenshot），默认 png，jpeg/webp 体积更小，复杂页面推荐 jpeg 减少超时'),
-    quality: z
-        .number()
-        .min(0)
-        .max(100)
-        .optional()
-        .describe('截图质量（screenshot，仅 jpeg/webp 有效），0-100，推荐 80'),
-    clip: z
-        .object({
-            x: z.number(),
-            y: z.number(),
-            width: z.number().positive(),
-            height: z.number().positive(),
-        })
-        .optional()
-        .describe('坐标区域截图（screenshot），单位为 CSS 像素'),
-    compareWith: z.string().optional().describe('截图对比基准 PNG 路径，遵循 output 相同的 tmp:/cwd: 路径规则'),
-    diffOutput: z.string().optional().describe('截图对比差异图输出路径，遵循 output 相同的 tmp:/cwd: 路径规则'),
-    output: z
-        .string()
-        .optional()
-        .describe(
-            `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，images=data 时作为输出目录路径`
-        ),
-    tabId: z
-        .string()
-        .optional()
-        .describe(
-            '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
-        ),
-    depth: z.number().optional().describe('DOM 遍历深度限制（state），默认 15，减小可降低返回数据量'),
-    mode: z
-        .enum(['accessibility', 'domsnapshot'])
-        .optional()
-        .describe(
-            '页面状态提取模式（state 类型有效），accessibility=可访问性树（默认，与原 read_page 一致），domsnapshot=CDP DOMSnapshot 全量快照（仅 CDP 模式）'
-        ),
-    timeout: z.number().optional().describe('等待目标元素超时'),
-    frame: z
-        .union([z.string(), z.number()])
-        .optional()
-        .describe(
-            'iframe 定位（可选，仅 Extension 模式），CSS 选择器（如 "iframe#main"）或索引（如 0），不指定则在主框架操作'
-        ),
-})
+const extractSchema = z
+    .object({
+        type: z
+            .enum(['text', 'html', 'frameHtml', 'attribute', 'screenshot', 'state', 'metadata', 'diagnosticBundle'])
+            .describe('提取类型'),
+        target: targetZodSchema
+            .optional()
+            .describe(
+                '目标元素（attribute 必填；text/html 可选，省略则提取整个页面；' +
+                    'screenshot 可选用于元素截图；state 可选（仅 Extension）用于返回目标子树；metadata 不需要）'
+            ),
+        attribute: z.string().optional().describe('属性名（attribute）'),
+        images: z
+            .enum(['info', 'data'])
+            .optional()
+            .describe('图片提取模式（仅 html 类型有效），info: 元信息（src/alt/尺寸）；data: 含图片数据'),
+        fullPage: z.boolean().optional().describe('是否全页面截图（screenshot）'),
+        scale: z
+            .number()
+            .optional()
+            .describe('截图缩放比例（screenshot fullPage），默认 1，设为 0.5 可降低分辨率加速大页面截图'),
+        format: z
+            .enum(['png', 'jpeg', 'webp'])
+            .optional()
+            .describe('截图格式（screenshot），默认 png，jpeg/webp 体积更小，复杂页面推荐 jpeg 减少超时'),
+        quality: z
+            .number()
+            .min(0)
+            .max(100)
+            .optional()
+            .describe('截图质量（screenshot，仅 jpeg/webp 有效），0-100，推荐 80'),
+        clip: z
+            .object({
+                x: z.number(),
+                y: z.number(),
+                width: z.number().positive(),
+                height: z.number().positive(),
+            })
+            .optional()
+            .describe('坐标区域截图（screenshot），单位为 CSS 像素'),
+        compareWith: z.string().optional().describe('截图对比基准 PNG 路径，遵循 output 相同的 tmp:/cwd: 路径规则'),
+        diffOutput: z.string().optional().describe('截图对比差异图输出路径，遵循 output 相同的 tmp:/cwd: 路径规则'),
+        output: z
+            .string()
+            .optional()
+            .describe(
+                `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，images=data 时作为输出目录路径`
+            ),
+        tabId: z
+            .string()
+            .optional()
+            .describe(
+                '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
+            ),
+        depth: z
+            .number()
+            .int()
+            .nonnegative()
+            .optional()
+            .describe('DOM 遍历深度限制（state），默认 15，减小可降低返回数据量'),
+        mode: z
+            .enum(['accessibility', 'domsnapshot'])
+            .optional()
+            .describe(
+                '页面状态提取模式（state 类型有效），accessibility=可访问性树（默认，与原 read_page 一致），' +
+                    'domsnapshot=CDP DOMSnapshot 全量快照（仅 CDP 模式）'
+            ),
+        timeout: z.number().optional().describe('等待目标元素超时'),
+        frame: z
+            .union([z.string(), z.number()])
+            .optional()
+            .describe(
+                'iframe 定位（可选，仅 Extension 模式），CSS 选择器（如 "iframe#main"）或索引（如 0），不指定则在主框架操作'
+            ),
+    })
+    .superRefine((args, context) => {
+        if (args.diffOutput && !args.compareWith) {
+            context.addIssue({
+                code: 'custom',
+                path: ['diffOutput'],
+                message: 'diffOutput 需要 compareWith 参数',
+            })
+        }
+    })
 
 /**
  * extract 工具处理器
@@ -286,22 +303,32 @@ async function handleScreenshotExtract(
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
     let clip: { x: number; y: number; width: number; height: number } | undefined
-    if (args.target) {
+    if (args.target && !args.clip) {
         const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
         const nth = nthParam ?? 0
-        const found = await unifiedSession.find(selector, text, xpath)
-        if (found.length > nth) {
-            const rect = found[nth].rect
-            if (rect.width > 0 && rect.height > 0) {
-                const scrollOffset =
-                    args.frame === undefined ? await getPageScrollOffset(unifiedSession, args.timeout) : { x: 0, y: 0 }
-                clip = {
-                    x: rect.x + scrollOffset.x,
-                    y: rect.y + scrollOffset.y,
-                    width: rect.width,
-                    height: rect.height,
-                }
-            }
+        const found = await unifiedSession.find(selector, text, xpath, args.timeout)
+        const target = found[nth]
+        if (!target || target.rect.width <= 0 || target.rect.height <= 0) {
+            throw new TargetNotFoundError(
+                await buildTargetDiagnostics(unifiedSession, args.target, {
+                    nth,
+                    timeout: args.timeout,
+                    frame: args.frame,
+                    matchCount: found.length,
+                    lastState: target ? 'zero-size' : 'not-found',
+                    candidates: found,
+                })
+            )
+        }
+
+        const scrollOffset =
+            args.frame === undefined ? await getPageScrollOffset(unifiedSession, args.timeout) : { x: 0, y: 0 }
+        const frameOffset = unifiedSession.getFrameOffset()
+        clip = {
+            x: target.rect.x + scrollOffset.x + (frameOffset?.x ?? 0),
+            y: target.rect.y + scrollOffset.y + (frameOffset?.y ?? 0),
+            width: target.rect.width,
+            height: target.rect.height,
         }
     }
 
@@ -441,7 +468,7 @@ async function handleDiagnosticBundleExtract(
 ): Promise<ExtractToolResponse> {
     const state = await unifiedSession.getLiveState().catch(() => null)
     const metadata = await unifiedSession.getMetadata()
-    const frames = useExtension ? await unifiedSession.getFrames() : { frames: [] }
+    const frames = await unifiedSession.getFrames()
     await unifiedSession.enableConsole()
     await unifiedSession.enableNetwork()
     const consoleLogs = sanitizeUrlRecords(await unifiedSession.getConsoleLogs())
@@ -467,7 +494,7 @@ async function handleDiagnosticBundleExtract(
         capabilities: {
             screenshot: true,
             hiddenTabScreenshot: useExtension,
-            frames: useExtension,
+            frames: true,
         },
     }
     const summary = {
@@ -494,11 +521,11 @@ async function handleDiagnosticBundleExtract(
 }
 
 async function handleMetadataExtract(
-    { unifiedSession, useExtension }: ExtractContext,
+    { unifiedSession }: ExtractContext,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
     const metadata = await unifiedSession.getMetadata()
-    const frames = useExtension ? await unifiedSession.getFrames() : { frames: [] }
+    const frames = await unifiedSession.getFrames()
     if (args.output) {
         const outputPath = await writeOutputFile(
             args.output,
@@ -572,7 +599,10 @@ async function getScreenshotFallbackDimensions(
     try {
         const size = await unifiedSession.evaluate<{ width: number; height: number }>(
             fullPage
-                ? '(() => ({ width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight }))()'
+                ? `(() => ({
+                      width: document.documentElement.scrollWidth,
+                      height: document.documentElement.scrollHeight,
+                  }))()`
                 : '(() => ({ width: window.innerWidth, height: window.innerHeight }))()',
             undefined,
             timeout
@@ -712,43 +742,29 @@ async function handleHtmlWithImages(
     content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>
     isError?: boolean
 }> {
-    const { selector, nth: nthParam } = args.target
-        ? targetToFindParams(args.target as Target & { nth?: number })
-        : { selector: undefined, nth: undefined }
-    const nth = nthParam ?? 0
-
     let result: { html: string; images: ImageInfo[] }
 
-    if (selector && nth > 0) {
-        // nth > 0：用 evaluate 取第 N 个匹配元素
-        result = await unifiedSession.evaluate<{ html: string; images: ImageInfo[] }>(
-            `(function(s, n) {
-                var els = document.querySelectorAll(s);
-                if (n >= els.length) return {html: '', images: []};
-                var root = els[n];
-                var html = root.outerHTML;
-                var imgList = [];
-                if (root.tagName === 'IMG') imgList.push(root);
-                root.querySelectorAll('img').forEach(function(img) { imgList.push(img); });
-                var images = [];
-                for (var i = 0; i < imgList.length; i++) {
-                    var img = imgList[i];
-                    images.push({index: i, src: img.src, dataSrc: (function() {
-                        var raw = img.dataset.src || img.dataset.lazySrc || img.dataset.original || '';
-                        if (!raw) return ''; try { return new URL(raw, location.href).href } catch(e) { return raw }
-                    })(), alt: img.alt, width: img.width, height: img.height,
-                        naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight});
-                }
-                return {html: html, images: images};
-            })`,
-            undefined,
-            undefined,
-            [selector, nth]
-        )
+    if (args.target) {
+        const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
+        const nth = nthParam ?? 0
+        const matches = await unifiedSession.find(selector, text, xpath, args.timeout)
+        if (matches.length <= nth) {
+            throw new TargetNotFoundError(
+                await buildTargetDiagnostics(unifiedSession, args.target, {
+                    nth,
+                    timeout: args.timeout,
+                    matchCount: matches.length,
+                    lastState: 'not-found',
+                    candidates: matches,
+                })
+            )
+        }
+
+        result = await extractHtmlWithImagesByTarget(unifiedSession, selector, text, xpath, nth, args.timeout)
     } else {
         result = useExtension
-            ? await unifiedSession.getHtmlWithImages(selector)
-            : await extractHtmlWithImagesCdp(session, selector, args.timeout)
+            ? await unifiedSession.getHtmlWithImages()
+            : await extractHtmlWithImagesCdp(session, undefined, args.timeout)
     }
 
     if (args.images === 'info') {
@@ -792,6 +808,62 @@ async function handleHtmlWithImages(
 
     // 无 output：MCP 附录方式返回
     return buildImageAppendixResponse(result.html, result.images, imageDataList)
+}
+
+async function extractHtmlWithImagesByTarget(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    selector: string | undefined,
+    text: string | undefined,
+    xpath: string | undefined,
+    nth: number,
+    timeout: number | undefined
+): Promise<{ html: string; images: ImageInfo[] }> {
+    return unifiedSession.evaluate<{ html: string; images: ImageInfo[] }>(
+        `(function(selector, text, xpath, nth) {
+            var candidates = [];
+            if (xpath) {
+                var snapshot = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                for (var i = 0; i < snapshot.snapshotLength; i++) candidates.push(snapshot.snapshotItem(i));
+            } else if (selector) {
+                candidates = Array.from(document.querySelectorAll(selector));
+            } else if (text) {
+                candidates = Array.from(document.querySelectorAll('*')).filter(function(element) {
+                    return (element.textContent || '').includes(text);
+                });
+            }
+            if (text && (selector || xpath)) {
+                candidates = candidates.filter(function(element) {
+                    return (element.textContent || '').includes(text);
+                });
+            }
+            var root = candidates[nth];
+            if (!root || !root.outerHTML) return { html: '', images: [] };
+            var imageNodes = [];
+            if (root.tagName === 'IMG') imageNodes.push(root);
+            root.querySelectorAll('img').forEach(function(img) { imageNodes.push(img); });
+            var images = imageNodes.map(function(img, index) {
+                var raw = img.dataset.src || img.dataset.lazySrc || img.dataset.original || '';
+                var dataSrc = '';
+                if (raw) {
+                    try { dataSrc = new URL(raw, location.href).href } catch (error) { dataSrc = raw }
+                }
+                return {
+                    index: index,
+                    src: img.src,
+                    dataSrc: dataSrc,
+                    alt: img.alt,
+                    width: img.width,
+                    height: img.height,
+                    naturalWidth: img.naturalWidth,
+                    naturalHeight: img.naturalHeight
+                };
+            });
+            return { html: root.outerHTML, images: images };
+        })`,
+        undefined,
+        timeout,
+        [selector ?? null, text ?? null, xpath ?? null, nth]
+    )
 }
 
 /**

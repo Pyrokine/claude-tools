@@ -7,7 +7,7 @@ version: 1.1.1
 
 # Elenchus — 辩证分析方法论
 
-一切工作都是辩证闭环：**正题（当前理解/方案）→ 反题（质疑与对抗）→ 合题（第一性原理还原）→ 验证 → 闭环**
+一切工作都是辩证闭环： **正题（当前理解/方案）→ 反题（质疑与对抗）→ 合题（第一性原理还原）→ 验证 → 闭环**
 
 区别仅在于深度，由复杂度自适应决定：
 
@@ -19,13 +19,13 @@ version: 1.1.1
 
 # 第一步：评估复杂度
 
-对任务问一个核心问题：**"如果我错了，代价多大？多久会被发现？"**
+对任务问一个核心问题： **"如果我错了，代价多大？多久会被发现？"**
 
-| 判定                      | 深度     | 进入                  |
-|-------------------------|--------|---------------------|
-| 方案明确无歧义，实现路径唯一          | **L0** | → 第二步 L0 轻量闭环       |
+| 判定                                           | 深度   | 进入                              |
+|------------------------------------------------|--------|-----------------------------------|
+| 方案明确无歧义，实现路径唯一                   | **L0** | → 第二步 L0 轻量闭环              |
 | 方案有多种选择，选错代价大或难以被自动验证发现 | **L1** | → 第三步读取规则 → 第四步串行模式 |
-| 影响范围大、安全敏感、或需要多视角系统性审视  | **L2** | → 第三步读取规则 → 第四步并行模式 |
+| 影响范围大、安全敏感、或需要多视角系统性审视   | **L2** | → 第三步读取规则 → 第四步并行模式 |
 
 **设计方案/需求提案**：先 L1 预审（2 轮，引擎模式），再 L2 并行模式
 
@@ -55,15 +55,15 @@ version: 1.1.1
 
 读取以下规则文件（相对于本文件所在目录，不存在则使用本文件末尾的缩略规则）：
 
-| 规则             | 文件                                                           | L1 |
-|----------------|--------------------------------------------------------------|----|
-| 辩证思维引擎         | [prompts/elenchus.md](prompts/elenchus.md)                   | ✓  |
-| 共享审查纪律         | [prompts/shared-rules.md](prompts/shared-rules.md)           |    |
-| 专家 1 — 逻辑与正确性  | [prompts/expert-logic.md](prompts/expert-logic.md)           |    |
-| 专家 2 — 安全与健壮性  | [prompts/expert-security.md](prompts/expert-security.md)     |    |
+| 规则                    | 文件                                                         | L1 |
+|-------------------------|--------------------------------------------------------------|----|
+| 辩证思维引擎            | [prompts/elenchus.md](prompts/elenchus.md)                   | ✓ |
+| 共享审查纪律            | [prompts/shared-rules.md](prompts/shared-rules.md)           |    |
+| 专家 1 — 逻辑与正确性   | [prompts/expert-logic.md](prompts/expert-logic.md)           |    |
+| 专家 2 — 安全与健壮性   | [prompts/expert-security.md](prompts/expert-security.md)     |    |
 | 专家 3 — 架构与代码质量 | [prompts/expert-design.md](prompts/expert-design.md)         |    |
 | 专家 4 — 性能与资源管理 | [prompts/expert-perf.md](prompts/expert-perf.md)             |    |
-| 专家 5 — 项目规范合规  | [prompts/expert-convention.md](prompts/expert-convention.md) |    |
+| 专家 5 — 项目规范合规   | [prompts/expert-convention.md](prompts/expert-convention.md) |    |
 
 L1 只需读取辩证思维引擎规则（✓ 列），L2 读取全部
 
@@ -110,7 +110,7 @@ mkdir -p -m 700 /tmp/skill-elenchus/<项目名>/runs/<YYYYMMDD_HHMMSS>/
     - **反题**：选择最有效的质疑类型（澄清 / 假设探测 / 证据探测 / 视角转换 / 后果追踪）
     - **合题**：第一性原理剥离权威和惯例，奥卡姆剃刀用最少假设重建
 3. **Mutation Guard**：合题必须与正题不同，连续 2 轮无跃迁 → 宣告认知边界
-4. 持续到收敛或用户中断，**最多 15 轮**（达到上限时输出当前最优合题并停止）
+4. 持续到收敛或用户中断， **最多 15 轮**（达到上限时输出当前最优合题并停止）
 
 涉及代码/系统时，用 Read/Grep/Glob 验证实际行为
 
@@ -164,17 +164,17 @@ mkdir -p -m 700 /tmp/skill-elenchus/<项目名>/runs/<YYYYMMDD_HHMMSS>/
 
 **代码变更**——根据用户请求执行对应 git 命令：
 
-| 输入          | 命令                                                                                       |
-|-------------|------------------------------------------------------------------------------------------|
+| 输入           | 命令                                                                                                                 |
+|----------------|----------------------------------------------------------------------------------------------------------------------|
 | 无参数         | 有暂存 → `git diff --cached`（**注**：未暂存改动会被排除，如需完整改动用 `git diff HEAD`）；无暂存 → `git diff HEAD` |
-| "暂存区"       | `git diff --cached`                                                                      |
-| "工作区"       | `git diff`                                                                               |
-| 文件路径        | `git diff HEAD -- <path>`                                                                |
-| 目录          | `git diff HEAD -- <dir>/`                                                                |
-| "最近N个提交"    | `git diff HEAD~N..HEAD`                                                                  |
-| "自vX.Y.Z以来" | `git diff vX.Y.Z..HEAD`                                                                  |
-| "整个文件X"     | 用 Read 读取完整文件                                                                            |
-| 提交哈希        | `git show <hash>`                                                                        |
+| "暂存区"       | `git diff --cached`                                                                                                  |
+| "工作区"       | `git diff`                                                                                                           |
+| 文件路径       | `git diff HEAD -- <path>`                                                                                            |
+| 目录           | `git diff HEAD -- <dir>/`                                                                                            |
+| "最近N个提交"  | `git diff HEAD~N..HEAD`                                                                                              |
+| "自vX.Y.Z以来" | `git diff vX.Y.Z..HEAD`                                                                                              |
+| "整个文件X"    | 用 Read 读取完整文件                                                                                                 |
+| 提交哈希       | `git show <hash>`                                                                                                    |
 
 同时执行 `git diff --stat`，如果 diff 为空，先检查是否存在未跟踪的新文件（`git ls-files --others --exclude-standard`
 ），若有则提示用户；确认无改动才告知停止
@@ -185,20 +185,20 @@ mkdir -p -m 700 /tmp/skill-elenchus/<项目名>/runs/<YYYYMMDD_HHMMSS>/
 
 **执行约束：必须使用前台模式（禁止 `run_in_background`），等待全部完成后再进入并行-2**
 
-用 Agent 工具**并行**派发 5 个专家 agent，每个专家接收：
+用 Agent 工具 **并行**派发 5 个专家 agent，每个专家接收：
 
 1. 共享审查纪律（`shared-rules.md`）
 2. 专项审查规则（`expert-<name>.md`）
 3. 项目约定（`CONVENTIONS`）
 4. 分析对象（diff 内容或设计方案 + 预审结论）
 
-| 专家      | 模型         | 规则文件                   |
-|---------|------------|------------------------|
-| 逻辑与正确性  | **opus**   | `expert-logic.md`      |
-| 安全与健壮性  | **opus**   | `expert-security.md`   |
+| 专家           | 模型       | 规则文件               |
+|----------------|------------|------------------------|
+| 逻辑与正确性   | **opus**   | `expert-logic.md`      |
+| 安全与健壮性   | **opus**   | `expert-security.md`   |
 | 架构与代码质量 | **sonnet** | `expert-design.md`     |
 | 性能与资源管理 | **sonnet** | `expert-perf.md`       |
-| 项目规范合规  | **sonnet** | `expert-convention.md` |
+| 项目规范合规   | **sonnet** | `expert-convention.md` |
 
 #### 专家 Prompt 模板
 
@@ -233,22 +233,22 @@ You are Expert N — <specialty name>.
 8. Return ONLY findings in [FINDING]...[/FINDING] format, with a summary count at the end
 ```
 
-**检查点：** 将每个专家的原始发现保存到输出目录（`expert-logic.md` 等），**必须全部写入文件后才进入并行-2**——并行-2
+**检查点：** 将每个专家的原始发现保存到输出目录（`expert-logic.md` 等）， **必须全部写入文件后才进入并行-2**——并行-2
 的输入依赖这些文件
 
 ### 并行-2：反题——5 交叉质疑者并行
 
 **执行约束：必须使用前台模式（禁止 `run_in_background`），等待全部完成后再进入并行-3**
 
-用 Agent 工具**并行**派发 5 个交叉质疑 agent，每个审查其他 4 个专家的发现
+用 Agent 工具 **并行**派发 5 个交叉质疑 agent，每个审查其他 4 个专家的发现
 
-| 交叉质疑者   | 审查来自          | 模型         |
-|---------|---------------|------------|
-| Cross-1 | 专家 2, 3, 4, 5 | **sonnet** |
-| Cross-2 | 专家 1, 3, 4, 5 | **sonnet** |
-| Cross-3 | 专家 1, 2, 4, 5 | **sonnet** |
-| Cross-4 | 专家 1, 2, 3, 5 | **sonnet** |
-| Cross-5 | 专家 1, 2, 3, 4 | **sonnet** |
+| 交叉质疑者 | 审查来自        | 模型       |
+|------------|-----------------|------------|
+| Cross-1    | 专家 2, 3, 4, 5 | **sonnet** |
+| Cross-2    | 专家 1, 3, 4, 5 | **sonnet** |
+| Cross-3    | 专家 1, 2, 4, 5 | **sonnet** |
+| Cross-4    | 专家 1, 2, 3, 5 | **sonnet** |
+| Cross-5    | 专家 1, 2, 3, 4 | **sonnet** |
 
 #### 交叉质疑者 Prompt 模板
 

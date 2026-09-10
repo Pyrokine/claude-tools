@@ -106,6 +106,16 @@ function matchesUrlPattern(url: string, pattern: string): boolean {
     return true
 }
 
+function isCloudflareChallenge(headers: Record<string, unknown> | undefined): boolean {
+    if (!headers) {
+        return false
+    }
+
+    return Object.entries(headers).some(
+        ([name, value]) => name.toLowerCase() === 'cf-mitigated' && String(value).toLowerCase() === 'challenge'
+    )
+}
+
 /**
  * 会话状态
  */
@@ -136,6 +146,11 @@ class SessionManager implements IBrowserDriver {
     private operationLock: Promise<void> = Promise.resolve()
     private consoleLogs: ConsoleLogEntry[] = []
     private networkRequests: NetworkRequestEntry[] = []
+    private nextConsoleLogSequence = 0
+    private nextNetworkRequestSequence = 0
+    private challengeRequired = false
+    private runtimeEnabled = false
+    private mainFrameId: string | null = null
     private requestMap = new Map<
         string,
         {
@@ -143,6 +158,7 @@ class SessionManager implements IBrowserDriver {
             method: string
             type: string
             timestamp: number
+            frameId?: string
             _monotonic: number
         }
     >()
@@ -360,7 +376,7 @@ class SessionManager implements IBrowserDriver {
                 await networkIdlePromise
             } else {
                 const eventName = wait === 'domcontentloaded' ? 'Page.domContentEventFired' : 'Page.loadEventFired'
-                await this.cdp!.waitForEvent(eventName, undefined, timeout)
+                await this.cdp!.waitForEvent(eventName, undefined, timeout, this.sessionId!)
             }
 
             // 更新状态
@@ -445,7 +461,7 @@ class SessionManager implements IBrowserDriver {
         return this.withLock(async () => {
             this.ensureSession()
 
-            const waitPromise = this.cdp!.waitForEvent('Page.loadEventFired', undefined, timeout)
+            const waitPromise = this.cdp!.waitForEvent('Page.loadEventFired', undefined, timeout, this.sessionId!)
             waitPromise.catch(() => {})
 
             await this.send('Page.reload', { ignoreCache }, timeout)
@@ -821,9 +837,9 @@ class SessionManager implements IBrowserDriver {
     // ==================== IBrowserDriver: 页面读取 ====================
 
     /** Extension readPage 等价物：CDP 通过页面 DOM 构造 pageContent 和 interactiveElements */
-    async readPage(_options?: ReadPageOptions): Promise<ReadPageResult> {
+    async readPage(options?: ReadPageOptions): Promise<ReadPageResult> {
         const state = await this.getPageState()
-        const interactiveElements = await this.collectInteractiveElements()
+        const interactiveElements = await this.collectInteractiveElements(options?.depth)
         const lines = interactiveElements.map((e) => {
             let line = e.role
             if (e.name) {
@@ -838,8 +854,10 @@ class SessionManager implements IBrowserDriver {
         }
     }
 
-    async collectInteractiveElements(): Promise<InteractiveElementInfo[]> {
+    async collectInteractiveElements(depth?: number): Promise<InteractiveElementInfo[]> {
+        const maxDepth = Number.isInteger(depth) && depth !== undefined && depth >= 0 ? depth : 15
         return this.evaluate<InteractiveElementInfo[]>(`(() => {
+            var maxDepth = ${maxDepth};
             function selectorFor(el) {
                 if (!(el instanceof Element)) return '';
                 if (el.id) return '#' + CSS.escape(el.id);
@@ -848,17 +866,31 @@ class SessionManager implements IBrowserDriver {
                 while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 4) {
                     var part = current.tagName.toLowerCase();
                     if (current.classList && current.classList.length) {
-                        part += '.' + Array.from(current.classList).slice(0, 2).map(function(cls) { return CSS.escape(cls); }).join('.');
+                        part += '.' + Array.from(current.classList)
+                            .slice(0, 2)
+                            .map(function(cls) { return CSS.escape(cls); })
+                            .join('.');
                     }
                     var parent = current.parentElement;
                     if (parent) {
-                        var siblings = Array.from(parent.children).filter(function(child) { return child.tagName === current.tagName; });
+                        var siblings = Array.from(parent.children).filter(function(child) {
+                            return child.tagName === current.tagName;
+                        });
                         if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
                     }
                     parts.unshift(part);
                     current = parent;
                 }
                 return parts.join(' > ');
+            }
+            function depthFor(el) {
+                var depth = 0;
+                var current = el;
+                while (current.parentElement) {
+                    depth += 1;
+                    current = current.parentElement;
+                }
+                return depth;
             }
             function roleFor(el) {
                 var explicit = el.getAttribute('role');
@@ -867,7 +899,9 @@ class SessionManager implements IBrowserDriver {
                 var type = (el.getAttribute('type') || '').toLowerCase();
                 if (tag === 'button' || type === 'button' || type === 'submit' || type === 'reset') return 'button';
                 if (tag === 'a' && el.hasAttribute('href')) return 'link';
-                if (tag === 'textarea' || tag === 'input' && !['checkbox', 'radio', 'range'].includes(type)) return 'textbox';
+                if (tag === 'textarea' || (tag === 'input' && !['checkbox', 'radio', 'range'].includes(type))) {
+                    return 'textbox';
+                }
                 if (type === 'checkbox') return 'checkbox';
                 if (type === 'radio') return 'radio';
                 if (tag === 'select') return 'combobox';
@@ -876,15 +910,28 @@ class SessionManager implements IBrowserDriver {
                 return tag;
             }
             function nameFor(el) {
-                return (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder') || el.textContent || '').replace(new RegExp('\\s+', 'g'), ' ').trim().slice(0, 160);
+                return (
+                    el.getAttribute('aria-label') ||
+                    el.getAttribute('title') ||
+                    el.getAttribute('placeholder') ||
+                    el.textContent ||
+                    ''
+                ).replace(new RegExp('\\s+', 'g'), ' ').trim().slice(0, 160);
             }
-            var selector = 'button,a[href],input,textarea,select,[role],[contenteditable="true"],[tabindex]:not([tabindex="-1"])';
-            return Array.from(document.querySelectorAll(selector)).slice(0, 100).map(function(el, index) {
+            var selector = [
+                'button,a[href],input,textarea,select,[role]',
+                '[contenteditable="true"],[tabindex]:not([tabindex="-1"])'
+            ].join(',');
+            return Array.from(document.querySelectorAll(selector)).filter(function(el) {
+                return depthFor(el) <= maxDepth;
+            }).slice(0, 100).map(function(el, index) {
                 var rect = el.getBoundingClientRect();
                 var cx = rect.left + rect.width / 2;
                 var cy = rect.top + rect.height / 2;
                 var top = rect.width > 0 && rect.height > 0 ? document.elementFromPoint(cx, cy) : null;
-                var visible = rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+                var style = getComputedStyle(el);
+                var visible = rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
                 return {
                     refId: 'cdp-' + index,
                     role: roleFor(el),
@@ -1219,9 +1266,9 @@ class SessionManager implements IBrowserDriver {
 
     // ==================== IBrowserDriver: 日志启用 ====================
 
-    /** CDP 模式：Network/Runtime 域已在 attach 时启用,no-op */
-    consoleEnable(): Promise<void> {
-        return Promise.resolve()
+    /** Runtime.enable 会暴露 CDP，只在需要 console 事件时再开 */
+    async consoleEnable(): Promise<void> {
+        await this.ensureRuntimeEnabled()
     }
 
     /** CDP 模式：Network 域已在 attach 时启用,no-op */
@@ -1381,9 +1428,11 @@ class SessionManager implements IBrowserDriver {
 
     async clearCookies(filter?: CookieFilter): Promise<{ count: number }> {
         this.ensureSession()
-        // Driver 级护栏：禁止无过滤的全站清除，必须带 url/domain/name 至少一项
-        if (!filter || (!filter.url && !filter.domain && !filter.name)) {
-            throw new Error('clearCookies 必须带 url/domain/name 至少一个过滤参数（防止误清全站 cookies）')
+        // Driver 级护栏：必须按 URL 或域名限定范围，name 只能进一步缩小范围
+        if (!filter || (!filter.url && !filter.domain)) {
+            throw new Error(
+                'clearCookies 必须带 url 或 domain 过滤参数，name 只能在该范围内进一步过滤（防止跨站误清同名 cookie）'
+            )
         }
         const urls = filter.url ? [filter.url] : undefined
         const { cookies } = (await this.send('Network.getCookies', urls ? { urls } : {})) as {
@@ -1427,7 +1476,7 @@ class SessionManager implements IBrowserDriver {
             const lp = pattern.toLowerCase()
             logs = logs.filter((l) => l.text.toLowerCase().includes(lp))
         }
-        const result = logs.slice(-100)
+        const result = logs
         if (clear) {
             this.consoleLogs = []
         }
@@ -1440,12 +1489,16 @@ class SessionManager implements IBrowserDriver {
         if (urlPattern) {
             requests = requests.filter((r) => matchesUrlPattern(String(r.url ?? ''), urlPattern))
         }
-        const result = requests.slice(-100)
+        const result = requests
         if (clear) {
             this.networkRequests = []
             this.requestMap.clear()
         }
         return result
+    }
+
+    async getChallengeState(): Promise<boolean> {
+        return this.challengeRequired
     }
 
     /**
@@ -1613,9 +1666,7 @@ class SessionManager implements IBrowserDriver {
 
             // 如果关闭的是当前页面，清除会话状态
             if (id === this.currentTargetId) {
-                this.sessionId = null
-                this.currentTargetId = null
-                this.state = null
+                this.clearAttachedTargetState()
             }
         })
     }
@@ -1644,6 +1695,22 @@ class SessionManager implements IBrowserDriver {
      * 获取当前状态
      */
     getState(): SessionState | null {
+        return this.state
+    }
+
+    async getLiveState(): Promise<SessionState | null> {
+        if (!this.currentTargetId) {
+            return this.state
+        }
+        this.ensureConnected()
+        const { targetInfo } = await this.sendBrowserCommand<{
+            targetInfo: { url?: string; title?: string; targetId: string }
+        }>('Target.getTargetInfo', { targetId: this.currentTargetId })
+        this.state = {
+            url: targetInfo.url ?? '',
+            title: targetInfo.title ?? '',
+            targetId: this.currentTargetId,
+        }
         return this.state
     }
 
@@ -1708,6 +1775,7 @@ class SessionManager implements IBrowserDriver {
      */
     private buildNetworkIdlePromise(cdp: CDPClient, timeout: number, idleTime: number): Promise<void> {
         const localPendingRequests = new Set<string>()
+        const sessionId = this.sessionId!
 
         return new Promise((resolve, reject) => {
             let idleTimer: NodeJS.Timeout | null = null
@@ -1729,13 +1797,19 @@ class SessionManager implements IBrowserDriver {
                 }
             }
 
-            const onRequestStart = (params: unknown) => {
+            const onRequestStart = (params: unknown, eventSessionId?: string) => {
+                if (eventSessionId !== sessionId) {
+                    return
+                }
                 const { requestId } = params as { requestId: string }
                 localPendingRequests.add(requestId)
                 checkIdle()
             }
 
-            const onRequestEnd = (params: unknown) => {
+            const onRequestEnd = (params: unknown, eventSessionId?: string) => {
+                if (eventSessionId !== sessionId) {
+                    return
+                }
                 const { requestId } = params as { requestId: string }
                 localPendingRequests.delete(requestId)
                 checkIdle()
@@ -1795,6 +1869,8 @@ class SessionManager implements IBrowserDriver {
             }
         }
 
+        this.clearAttachedTargetState()
+
         // 附加到目标
         const { sessionId } = (await this.cdp!.send('Target.attachToTarget', {
             targetId,
@@ -1828,6 +1904,21 @@ class SessionManager implements IBrowserDriver {
         }
     }
 
+    private clearAttachedTargetState(): void {
+        this.clearLogs()
+        this.challengeRequired = false
+        this.runtimeEnabled = false
+        this.mainFrameId = null
+        this.modifiers = 0
+        this.sessionId = null
+        this.currentTargetId = null
+        this.state = null
+    }
+
+    private isCurrentSessionEvent(eventSessionId: string | undefined): boolean {
+        return this.sessionId !== null && eventSessionId === this.sessionId
+    }
+
     /**
      * 重置所有状态（同步，不加锁）
      *
@@ -1845,12 +1936,8 @@ class SessionManager implements IBrowserDriver {
             this.launcher = null
         }
 
-        this.clearLogs()
-        this.modifiers = 0
+        this.clearAttachedTargetState()
         this.behaviorSimulator.setCurrentPosition({ x: 0, y: 0 })
-        this.sessionId = null
-        this.currentTargetId = null
-        this.state = null
         this.listenersInstalled = false
         this.connectedPort = 0
     }
@@ -1876,18 +1963,22 @@ class SessionManager implements IBrowserDriver {
      * 等待多个事件中的任一个触发
      *
      * 用于同时监听跨文档导航 (loadEventFired) 和同文档导航 (navigatedWithinDocument)，
-     * 任一事件触发后清理所有监听器和超时定时器
+     * 任意一个事件触发后清理所有监听器和超时定时器
      * close() 时通过 'disconnected' 信号立即 reject，不必等 timer 超时
      */
     private waitForAnyEvent(events: string[], timeout: number): Promise<void> {
         // 捕获当前 cdp 引用，防止 close() 并发置 null 导致回调崩溃
         const cdp = this.cdp
-        if (!cdp) {
+        const sessionId = this.sessionId
+        if (!cdp || !sessionId) {
             return Promise.reject(new Error('CDP 连接已关闭'))
         }
 
         return new Promise((resolve, reject) => {
-            const listeners: Array<{ event: string; listener: (params: unknown) => void }> = []
+            const listeners: Array<{
+                event: string
+                listener: (params: unknown, eventSessionId?: string) => void
+            }> = []
 
             const cleanup = () => {
                 clearTimeout(timer)
@@ -1909,7 +2000,10 @@ class SessionManager implements IBrowserDriver {
             cdp.once('disconnected', onDisconnected)
 
             for (const event of events) {
-                const listener = () => {
+                const listener = (_params: unknown, eventSessionId?: string) => {
+                    if (eventSessionId !== sessionId) {
+                        return
+                    }
                     cleanup()
                     resolve()
                 }
@@ -1927,20 +2021,17 @@ class SessionManager implements IBrowserDriver {
         await Promise.all([
             this.send('Page.enable'),
             this.send('DOM.enable'),
-            this.send('Runtime.enable'),
             this.send('Network.enable'),
             this.send('Log.enable'),
         ])
+        const { frameTree } = await this.send<{ frameTree: { frame: { id: string } } }>('Page.getFrameTree')
+        this.mainFrameId = frameTree.frame.id
 
-        // 根据 stealth 模式注入反检测脚本
+        // 根据 stealth 模式注入反检测脚本。不在当前文档 Runtime.evaluate，避免干扰 Cloudflare JS Challenge
         if (this.stealthMode !== 'off') {
             const script = getAntiDetectionScript(this.stealthMode)
             await this.send('Page.addScriptToEvaluateOnNewDocument', {
                 source: script,
-            })
-            // 对当前页面立即执行反检测脚本
-            await this.send('Runtime.evaluate', {
-                expression: script,
             })
         }
 
@@ -1960,8 +2051,21 @@ class SessionManager implements IBrowserDriver {
         }
         this.listenersInstalled = true
 
+        this.cdp!.onEvent('Page.frameNavigated', (params: unknown, eventSessionId?: string) => {
+            if (!this.isCurrentSessionEvent(eventSessionId)) {
+                return
+            }
+            const frame = (params as { frame?: { id?: string; parentId?: string } }).frame
+            if (frame?.id && !frame.parentId) {
+                this.mainFrameId = frame.id
+            }
+        })
+
         // 控制台日志
-        this.cdp!.onEvent('Runtime.consoleAPICalled', (params: unknown) => {
+        this.cdp!.onEvent('Runtime.consoleAPICalled', (params: unknown, eventSessionId?: string) => {
+            if (!this.isCurrentSessionEvent(eventSessionId)) {
+                return
+            }
             const p = params as {
                 type: string
                 args: Array<{ value?: unknown; description?: string }>
@@ -1969,6 +2073,7 @@ class SessionManager implements IBrowserDriver {
                 stackTrace?: { callFrames: Array<{ url: string; lineNumber: number }> }
             }
             this.consoleLogs.push({
+                sequence: ++this.nextConsoleLogSequence,
                 level: p.type,
                 text: p.args.map((a) => a.value ?? a.description ?? '').join(' '),
                 timestamp: Math.round(p.timestamp), // Runtime.Timestamp 已是 epoch 毫秒
@@ -1982,35 +2087,50 @@ class SessionManager implements IBrowserDriver {
         })
 
         // 网络请求
-        this.cdp!.onEvent('Network.requestWillBeSent', (params: unknown) => {
+        this.cdp!.onEvent('Network.requestWillBeSent', (params: unknown, eventSessionId?: string) => {
+            if (!this.isCurrentSessionEvent(eventSessionId)) {
+                return
+            }
             const p = params as {
                 requestId: string
                 request: { url: string; method: string }
                 type: string
                 timestamp: number
                 wallTime: number
+                frameId?: string
             }
             this.requestMap.set(p.requestId, {
                 url: p.request.url,
                 method: p.request.method,
                 type: p.type,
                 timestamp: Math.round(p.wallTime * 1000), // wallTime 是 epoch 秒 → epoch 毫秒
+                frameId: p.frameId,
                 _monotonic: p.timestamp, // MonotonicTime 用于 duration 计算
             })
         })
 
-        this.cdp!.onEvent('Network.responseReceived', (params: unknown) => {
+        this.cdp!.onEvent('Network.responseReceived', (params: unknown, eventSessionId?: string) => {
+            if (!this.isCurrentSessionEvent(eventSessionId)) {
+                return
+            }
             const p = params as {
                 requestId: string
-                response: { status: number }
+                response: { status: number; headers?: Record<string, unknown> }
                 timestamp: number
             }
             const request = this.requestMap.get(p.requestId)
             if (request) {
-                const { _monotonic, ...requestData } = request
+                const { _monotonic, frameId, ...requestData } = request
+                const challenge = isCloudflareChallenge(p.response.headers)
+                if (requestData.type.toLowerCase() === 'document' && frameId === this.mainFrameId) {
+                    // 仅新的主文档响应可以解除已知 Challenge，清空日志不能解除该状态
+                    this.challengeRequired = challenge
+                }
                 this.networkRequests.push({
+                    sequence: ++this.nextNetworkRequestSequence,
                     ...requestData,
                     status: p.response.status,
+                    challenge,
                     duration: Math.round((p.timestamp - _monotonic) * 1000),
                 })
                 // 环形缓冲区：批量裁剪到 800 条，均摊 O(n) 开销
@@ -2022,12 +2142,17 @@ class SessionManager implements IBrowserDriver {
         })
 
         // 网络请求失败时写入日志再清理 requestMap，防止 diagnostics 丢失失败请求
-        this.cdp!.onEvent('Network.loadingFailed', (params: unknown) => {
+        this.cdp!.onEvent('Network.loadingFailed', (params: unknown, eventSessionId?: string) => {
+            if (!this.isCurrentSessionEvent(eventSessionId)) {
+                return
+            }
             const p = params as { requestId: string; timestamp: number; errorText?: string; type?: string }
             const request = this.requestMap.get(p.requestId)
             if (request) {
                 const { _monotonic, ...requestData } = request
+                delete requestData.frameId
                 this.networkRequests.push({
+                    sequence: ++this.nextNetworkRequestSequence,
                     ...requestData,
                     type: p.type ?? requestData.type,
                     errorText: p.errorText,
@@ -2045,17 +2170,16 @@ class SessionManager implements IBrowserDriver {
      * 更新页面状态
      */
     private async updateState(): Promise<void> {
-        const result = (await this.send('Runtime.evaluate', {
-            expression: 'JSON.stringify({ url: location.href, title: document.title })',
-            returnByValue: true,
-        })) as { result: { value: string } }
+        await this.getLiveState()
+    }
 
-        const { url, title } = JSON.parse(result.result.value)
-        this.state = {
-            url,
-            title,
-            targetId: this.currentTargetId!,
+    private async ensureRuntimeEnabled(): Promise<void> {
+        if (this.runtimeEnabled) {
+            return
         }
+        this.ensureSession()
+        await this.send('Runtime.enable')
+        this.runtimeEnabled = true
     }
 
     /**

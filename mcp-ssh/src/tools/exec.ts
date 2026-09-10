@@ -6,11 +6,13 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { randomUUID } from 'crypto'
 import { z } from 'zod'
 import { classifyCommandRisk, type CommandRisk } from '../command-risk.js'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
 import { type ExecResult, HARD_EXEC_MAX_OUTPUT_SIZE } from '../types.js'
+import { sshPortSchema } from './schema.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js' // ========== Schemas ==========
 
 // ========== Schemas ==========
@@ -59,6 +61,9 @@ const execSudoSchema = z.object({
     sudoPassword: z.string().optional().describe('sudo 密码（如果需要）'),
     timeout: z.number().optional().describe('超时（毫秒）'),
     maxOutputSize: maxOutputSizeSchema,
+    runAs: z.string().optional().describe('本次命令使用的目标用户，覆盖连接级 runAs'),
+    useLoginUser: z.boolean().optional().describe('设为 true 时跳过连接级 runAs，直接以登录用户执行'),
+    loadProfile: z.boolean().optional().describe('runAs 执行时是否加载目标用户 shell 配置，默认 true'),
 })
 
 const execBatchSchema = z.object({
@@ -74,8 +79,9 @@ const quickExecSchema = z.object({
     command: z.string().describe('要执行的命令'),
     password: z.string().optional().describe('密码'),
     keyPath: z.string().optional().describe('密钥路径'),
-    port: z.number().optional().describe('端口'),
-    timeout: z.number().optional().describe('超时（毫秒）'),
+    port: sshPortSchema.optional().describe('SSH 端口，默认 22'),
+    readyTimeout: z.number().int().positive().max(600000).optional().describe('等待 SSH ready 的超时，默认 30000'),
+    timeout: z.number().optional().describe('命令执行超时（毫秒），默认 30000'),
 })
 
 const EXEC_PARALLEL_MAX_ALIASES = 32
@@ -159,6 +165,9 @@ async function handleExecSudo(args: z.infer<typeof execSudoSchema>) {
         const result = await sessionManager.execSudo(args.alias, args.command, args.sudoPassword, {
             timeout: args.timeout,
             maxOutputSize: args.maxOutputSize,
+            runAs: args.runAs,
+            useLoginUser: args.useLoginUser,
+            loadProfile: args.loadProfile,
         })
         return formatResult(result)
     } catch (error) {
@@ -213,15 +222,16 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
 }
 
 async function handleQuickExec(args: z.infer<typeof quickExecSchema>) {
-    const tempAlias = `_quick_${Date.now()}`
+    const tempAlias = `_quick_${randomUUID()}`
     try {
         await sessionManager.connect({
             host: args.host,
-            port: args.port || 22,
+            port: args.port ?? 22,
             username: args.user,
             password: args.password,
             privateKeyPath: args.keyPath,
             alias: tempAlias,
+            readyTimeout: args.readyTimeout,
         })
         const result = await sessionManager.exec(tempAlias, args.command, { timeout: args.timeout })
         return formatResult(result)
@@ -420,7 +430,7 @@ export function registerExecTools(server: McpServer): void {
     server.registerTool(
         'ssh_exec_sudo',
         {
-            description: '使用 sudo 执行命令',
+            description: '使用 sudo 执行命令。runAs、useLoginUser 与 loadProfile 的身份优先级与 ssh_exec 相同。',
             inputSchema: execSudoSchema,
         },
         (args) => handleExecSudo(args)
@@ -440,7 +450,8 @@ export function registerExecTools(server: McpServer): void {
     server.registerTool(
         'ssh_quick_exec',
         {
-            description: '一次性执行命令（自动连接、执行、断开），适用于单次命令，不需要保持连接',
+            description:
+                '一次性执行命令（自动连接、执行、断开）。readyTimeout 只限制建立 SSH 连接，timeout 只限制命令执行，适用于单次命令。',
             inputSchema: quickExecSchema,
         },
         (args) => handleQuickExec(args)

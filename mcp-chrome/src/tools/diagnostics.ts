@@ -5,8 +5,8 @@ import { sanitizeUrlRecords } from './network-sanitizer.js'
 export type DiagnosticsStatus = 'disabled' | 'collected' | 'unavailable' | 'error'
 
 interface DiagnosticsStart {
-    consoleCount: number
-    networkCount: number
+    consoleLastEntry?: string
+    networkLastEntry?: string
 }
 
 export interface DiagnosticsResult {
@@ -17,6 +17,25 @@ export interface DiagnosticsResult {
 
 function errorSummary(error: unknown): string {
     return sanitizeErrorMessage(error instanceof Error ? error.message : String(error)).slice(0, 500)
+}
+
+function entryMarker(entry: unknown): string {
+    return JSON.stringify(entry)
+}
+
+function entriesSince<T>(entries: T[], lastEntry: string | undefined): { entries: T[]; truncated: boolean } {
+    if (!lastEntry) {
+        return { entries, truncated: false }
+    }
+
+    for (let index = entries.length - 1; index >= 0; --index) {
+        if (entryMarker(entries[index]) === lastEntry) {
+            return { entries: entries.slice(index + 1), truncated: false }
+        }
+    }
+
+    // 旧 marker 已从环形缓冲淘汰，返回当前可用事件而不是伪装成没有增量
+    return { entries, truncated: true }
 }
 
 export async function startDiagnostics(
@@ -32,7 +51,10 @@ export async function startDiagnostics(
         const consoleLogs = await unifiedSession.getConsoleLogs()
         const network = await unifiedSession.getNetworkRequests()
         return {
-            start: { consoleCount: consoleLogs.length, networkCount: network.length },
+            start: {
+                consoleLastEntry: consoleLogs.length > 0 ? entryMarker(consoleLogs[consoleLogs.length - 1]) : undefined,
+                networkLastEntry: network.length > 0 ? entryMarker(network[network.length - 1]) : undefined,
+            },
             result: { diagnosticsStatus: 'collected' },
         }
     } catch (error) {
@@ -55,21 +77,20 @@ export async function finishDiagnostics(
     try {
         const consoleLogs = await unifiedSession.getConsoleLogs()
         const network = await unifiedSession.getNetworkRequests()
+        const consoleDelta = entriesSince(consoleLogs, started.start.consoleLastEntry)
+        const networkDelta = entriesSince(network, started.start.networkLastEntry)
         return {
             diagnosticsStatus: 'collected',
             diagnostics: {
                 console: sanitizeUrlRecords(
-                    consoleLogs
-                        .slice(started.start.consoleCount)
-                        .filter((item) => ['error', 'warning', 'warn'].includes(item.level))
-                        .slice(-20)
+                    consoleDelta.entries.filter((item) => ['error', 'warning', 'warn'].includes(item.level)).slice(-20)
                 ),
                 failedRequests: sanitizeUrlRecords(
-                    network
-                        .slice(started.start.networkCount)
+                    networkDelta.entries
                         .filter((item) => item.errorText || (item.status !== undefined && item.status >= 400))
                         .slice(-20)
                 ),
+                truncated: consoleDelta.truncated || networkDelta.truncated,
             },
         }
     } catch (error) {
@@ -97,7 +118,9 @@ type ToolResponse = {
 
 export function appendDiagnosticsToResponse(response: ToolResponse, result: DiagnosticsResult): void {
     const text = response.content[0]?.text
-    if (!text) return
+    if (!text) {
+        return
+    }
 
     try {
         const payload = JSON.parse(text) as Record<string, unknown>

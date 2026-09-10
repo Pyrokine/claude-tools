@@ -1,5 +1,6 @@
 const REDACTED_VALUE = '[REDACTED]'
 
+// noinspection LongLine — 拆分该完整匹配正则会降低参数名审查的可读性
 const SENSITIVE_QUERY_PARAMETER =
     /^(?:access[_-]?token|api[_-]?key|apikey|auth|authorization|code|credential|id[_-]?token|key|password|passwd|proxy[_-]?authorization|refresh[_-]?token|secret|sig|signature|token|x-amz-credential|x-amz-security-token|x-amz-signature|x-goog-credential|x-goog-signature)$/i
 

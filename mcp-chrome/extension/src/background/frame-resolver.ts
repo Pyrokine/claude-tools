@@ -146,7 +146,9 @@ export class FrameResolver {
             }
             const resolved = await this.resolveCdpFrame(tabId, identity.url)
             let contexts = this.debuggerManager.getExecutionContexts(tabId)
-            if (contexts.length === 0 || attempt > 0) await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
+            if (contexts.length === 0 || attempt > 0) {
+                await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
+            }
             let targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
             const deadline = p.timeout === undefined ? Date.now() + 2000 : startedAt + p.timeout
             while (!targetCtx && Date.now() < deadline) {
@@ -289,7 +291,9 @@ export class FrameResolver {
     ): Promise<chrome.webNavigation.GetAllFrameResultDetails> {
         const frames = await chrome.webNavigation.getAllFrames({ tabId })
         const frame = frames?.find((candidate) => candidate.frameId === frameId)
-        if (!frame) throw new ExpectedOperationError(`Frame ${frameId} not found`)
+        if (!frame) {
+            throw new ExpectedOperationError(`Frame ${frameId} not found`)
+        }
         return frame
     }
 

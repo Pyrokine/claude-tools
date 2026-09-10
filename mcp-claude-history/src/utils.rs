@@ -136,6 +136,143 @@ pub fn jsonl_read_warnings(read_errors: usize, parse_errors: usize) -> Vec<Strin
     warnings
 }
 
+pub const MESSAGE_TYPES: &[&str] = &["assistant", "user", "summary", "system", "other"];
+pub const MESSAGE_SUBTYPES: &[&str] = &[
+    "human",
+    "tool_result",
+    "meta",
+    "text",
+    "tool_use",
+    "thinking",
+    "empty",
+    "summary",
+    "system",
+    "other",
+];
+
+#[derive(Debug, Clone)]
+pub struct MessageFilters {
+    pub types: Vec<String>,
+    pub subtypes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !values.iter().any(|item| item == &value) {
+        values.push(value);
+    }
+}
+
+fn inferred_type_for_subtype(subtype: &str) -> Option<&'static str> {
+    match subtype {
+        "tool_use" | "text" | "thinking" | "empty" => Some("assistant"),
+        "tool_result" | "human" | "meta" => Some("user"),
+        "summary" => Some("summary"),
+        "system" => Some("system"),
+        "other" => Some("other"),
+        _ => None,
+    }
+}
+
+pub fn normalize_message_filters(
+    requested_types: &[String],
+    requested_subtypes: &[String],
+    default_types: Option<&[&str]>,
+) -> Result<MessageFilters, ErrorResponse> {
+    let mut types = Vec::new();
+    let mut subtypes = Vec::new();
+    let mut warnings = Vec::new();
+
+    for value in requested_types {
+        if MESSAGE_TYPES.contains(&value.as_str()) {
+            push_unique(&mut types, value.clone());
+        } else if MESSAGE_SUBTYPES.contains(&value.as_str()) {
+            push_unique(&mut subtypes, value.clone());
+            if let Some(inferred_type) = inferred_type_for_subtype(value) {
+                push_unique(&mut types, inferred_type);
+            }
+            warnings.push(format!("types={value} 是 subtype，已自动转入 subtypes"));
+        } else {
+            return Err(invalid_arguments(format!(
+                "未知 type 过滤值: {value}，仅支持 {}",
+                MESSAGE_TYPES.join("、")
+            )));
+        }
+    }
+
+    for value in requested_subtypes {
+        if MESSAGE_SUBTYPES.contains(&value.as_str()) {
+            push_unique(&mut subtypes, value.clone());
+            if requested_types.is_empty()
+                && let Some(inferred_type) = inferred_type_for_subtype(value)
+            {
+                push_unique(&mut types, inferred_type);
+            }
+        } else if MESSAGE_TYPES.contains(&value.as_str()) {
+            push_unique(&mut types, value.clone());
+            warnings.push(format!("subtypes={value} 是 type，已自动转入 types"));
+        } else {
+            return Err(invalid_arguments(format!(
+                "未知 subtype 过滤值: {value}，仅支持 {}",
+                MESSAGE_SUBTYPES.join("、")
+            )));
+        }
+    }
+
+    if types.is_empty()
+        && let Some(default_types) = default_types
+    {
+        types.extend(default_types.iter().map(|value| (*value).to_string()));
+    }
+
+    Ok(MessageFilters {
+        types,
+        subtypes,
+        warnings,
+    })
+}
+
+pub fn validate_effective_message_type(value: &str, name: &str) -> Result<(), ErrorResponse> {
+    if MESSAGE_TYPES.contains(&value) {
+        return Ok(());
+    }
+    Err(invalid_arguments(format!(
+        "{name} 仅支持 {}，收到 {value}",
+        MESSAGE_TYPES.join("、")
+    )))
+}
+
+pub fn parse_context_direction(value: &str) -> Result<String, ErrorResponse> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "forward" => Ok("forward".to_string()),
+        "backward" => Ok("backward".to_string()),
+        other => Err(invalid_arguments(format!(
+            "direction 仅支持 forward 或 backward，收到 {other}"
+        ))),
+    }
+}
+
+pub fn validate_context_range_selectors(
+    before: Option<usize>,
+    after: Option<usize>,
+    until_type: Option<&str>,
+    until_ref: Option<&str>,
+) -> Result<(), ErrorResponse> {
+    if until_type.is_some() && until_ref.is_some() {
+        return Err(invalid_arguments("until_type 和 until_ref 不能同时传入"));
+    }
+    if (until_type.is_some() || until_ref.is_some()) && (before.is_some() || after.is_some()) {
+        return Err(invalid_arguments(
+            "until_type 或 until_ref 不能和 before/after 同时传入",
+        ));
+    }
+    if let Some(until_type) = until_type {
+        validate_effective_message_type(until_type, "until_type")?;
+    }
+    Ok(())
+}
+
 pub fn message_type_matches(effective_type: &str, types: &[String]) -> bool {
     types.is_empty() || types.iter().any(|t| t == effective_type)
 }
@@ -731,28 +868,56 @@ pub fn truncate_around_match(content: &str, match_pos: Option<usize>, max_len: u
     if char_count <= max_len {
         return (content.to_string(), false);
     }
+    if max_len == 0 {
+        return (String::new(), true);
+    }
 
     let Some(pos) = match_pos else {
         // 从头截断：用 nth 直接定位第 max_len 个字符的 byte 偏移
         return (content[..nth_byte_or_end(content, max_len)].to_string(), true);
     };
 
-    let half = max_len / 2;
-    let mut start = pos.saturating_sub(half);
-    let end = (start + max_len).min(char_count);
-    if end == char_count && char_count > max_len {
-        start = char_count - max_len;
+    let pos = pos.min(char_count);
+    let centered_window = |content_len: usize| {
+        let mut start = pos.saturating_sub(content_len / 2);
+        let end = (start + content_len).min(char_count);
+        if end == char_count {
+            start = char_count.saturating_sub(content_len);
+        }
+        (start, end)
+    };
+    let mut prefix_ellipsis = false;
+    let mut suffix_ellipsis = false;
+
+    for _ in 0..3 {
+        let ellipsis_len = 3 * usize::from(prefix_ellipsis) + 3 * usize::from(suffix_ellipsis);
+        if ellipsis_len >= max_len {
+            prefix_ellipsis = false;
+            suffix_ellipsis = false;
+            break;
+        }
+        let (start, end) = centered_window(max_len - ellipsis_len);
+        let next_prefix_ellipsis = start > 0;
+        let next_suffix_ellipsis = end < char_count;
+        if next_prefix_ellipsis == prefix_ellipsis && next_suffix_ellipsis == suffix_ellipsis {
+            break;
+        }
+        prefix_ellipsis = next_prefix_ellipsis;
+        suffix_ellipsis = next_suffix_ellipsis;
     }
+
+    let ellipsis_len = 3 * usize::from(prefix_ellipsis) + 3 * usize::from(suffix_ellipsis);
+    let (start, end) = centered_window(max_len - ellipsis_len);
 
     // 二次扫描定位 start/end 的 byte 偏移（O(N)、无内存分配）
     let start_byte = nth_byte_or_end(content, start);
     let end_byte = nth_byte_or_end(content, end);
-    let mut result = content[start_byte..end_byte].to_string();
-
-    if start > 0 {
-        result = format!("...{result}");
+    let mut result = String::with_capacity(max_len);
+    if prefix_ellipsis {
+        result.push_str("...");
     }
-    if end < char_count {
+    result.push_str(&content[start_byte..end_byte]);
+    if suffix_ellipsis {
         result.push_str("...");
     }
 
@@ -925,29 +1090,40 @@ pub fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
-/// 比较时间
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeRangeMatch {
+    Matches,
+    OutsideRange,
+    UnparseableTimestamp,
+}
+
+/// 比较时间。未启用时间过滤时保留无法解析时间的记录；启用后无法解析的记录不匹配
 pub fn time_in_range(
     timestamp: &str,
     since: Option<&chrono::DateTime<chrono::Utc>>,
     until: Option<&chrono::DateTime<chrono::Utc>>,
-) -> bool {
+) -> TimeRangeMatch {
+    if since.is_none() && until.is_none() {
+        return TimeRangeMatch::Matches;
+    }
+
     let Some(ts) = parse_time(timestamp) else {
-        return true; // 无法解析时间时不过滤
+        return TimeRangeMatch::UnparseableTimestamp;
     };
 
     if let Some(since) = since
         && ts < *since
     {
-        return false;
+        return TimeRangeMatch::OutsideRange;
     }
 
     if let Some(until) = until
         && ts > *until
     {
-        return false;
+        return TimeRangeMatch::OutsideRange;
     }
 
-    true
+    TimeRangeMatch::Matches
 }
 
 pub const SIDECHAIN_SESSION_DIRS: &[&str] = &["subagents", "remote-agents"];
@@ -1056,10 +1232,11 @@ fn redact_plain_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction
         });
     let result = SECRET_FIELD_RE
         .get_or_init(|| {
-            Regex::new(
-                r#"(?i)\b((?:password|passwd|pwd|token|cookie|api[_-]?key|secret|private[_-]?key|keypath|key_path)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)"#,
-            )
-                .expect("valid regex")
+            Regex::new(concat!(
+                r#"(?i)\b((?:password|passwd|pwd|token|cookie|api[_-]?key|secret|"#,
+                r#"private[_-]?key|keypath|key_path)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)"#,
+            ))
+            .expect("valid regex")
         })
         .replace_all(&result, |caps: &regex::Captures<'_>| {
             count += 1;
@@ -1383,6 +1560,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn centered_truncation_includes_ellipsis_within_the_limit() {
+        let content = "0123456789abcdefghijklmnopqrstuvwxyz";
+        for max_len in 0..=20 {
+            for match_pos in [0, 4, 18, content.len()] {
+                let (truncated, was_truncated) = truncate_around_match(content, Some(match_pos), max_len);
+                assert!(was_truncated);
+                assert!(truncated.chars().count() <= max_len);
+            }
+        }
+
+        let (centered, _) = truncate_around_match(content, Some(18), 12);
+        assert!(centered.starts_with("..."));
+        assert!(centered.ends_with("..."));
+        assert_eq!(centered.chars().count(), 12);
+
+        let (unicode, _) = truncate_around_match("甲乙丙丁戊己庚辛壬癸", Some(5), 7);
+        assert_eq!(unicode.chars().count(), 7);
+    }
+
+    #[test]
     fn parse_message_slice_accepts_python_bounds() {
         let cases = [
             ("[-10:-1]", Some(-10), Some(-1), (90, 99)),
@@ -1404,5 +1601,42 @@ mod tests {
     fn parse_message_slice_rejects_step() {
         let err = parse_message_slice_param("[::-1]").unwrap_err();
         assert!(err.contains("不支持 step"));
+    }
+
+    #[test]
+    fn message_filter_normalization_rejects_unknown_values_and_keeps_compatibility() {
+        let filters =
+            normalize_message_filters(&["human".to_string()], &[], Some(&["assistant", "user", "summary"])).unwrap();
+        assert_eq!(filters.types, ["user"]);
+        assert_eq!(filters.subtypes, ["human"]);
+        assert_eq!(filters.warnings, ["types=human 是 subtype，已自动转入 subtypes"]);
+
+        let subtype_only =
+            normalize_message_filters(&[], &["system".to_string()], Some(&["assistant", "user"])).unwrap();
+        assert_eq!(subtype_only.types, ["system"]);
+
+        let error = normalize_message_filters(&["visitor".to_string()], &[], None).unwrap_err();
+        assert_eq!(error.error, "invalid_arguments");
+        assert!(error.message.contains("未知 type 过滤值"));
+    }
+
+    #[test]
+    fn context_selector_validation_rejects_ambiguous_combinations() {
+        assert!(validate_context_range_selectors(None, None, Some("user"), None).is_ok());
+        assert!(validate_context_range_selectors(Some(0), None, Some("user"), None).is_err());
+        assert!(validate_context_range_selectors(None, None, Some("user"), Some("session:1")).is_err());
+        assert!(validate_context_range_selectors(None, None, Some("human"), None).is_err());
+        assert!(parse_context_direction("backward").is_ok());
+        assert!(parse_context_direction("sideways").is_err());
+    }
+
+    #[test]
+    fn time_filter_excludes_unparseable_timestamps_only_when_enabled() {
+        assert_eq!(time_in_range("not-a-time", None, None), TimeRangeMatch::Matches);
+        let since = parse_time("2026-01-01").unwrap();
+        assert_eq!(
+            time_in_range("not-a-time", Some(&since), None),
+            TimeRangeMatch::UnparseableTimestamp
+        );
     }
 }

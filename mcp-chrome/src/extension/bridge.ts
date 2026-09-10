@@ -23,7 +23,7 @@ import {
     type StaleContextRetryPolicy,
 } from '../core/browser-driver.js'
 import type { ConsoleLogEntry, NetworkRequestEntry } from '../core/types.js'
-import { ExtensionHttpServer, type ExtensionConnectionInfo } from './http-server.js'
+import { type ExtensionConnectionInfo, ExtensionHttpServer } from './http-server.js'
 
 /** RPC 传输余量（毫秒）：给网络往返和 Extension 处理留出的额外时间 */
 const RPC_MARGIN = 5000
@@ -290,6 +290,7 @@ export class ExtensionBridge implements IBrowserDriver {
         return this.normalizePageChange(result)
     }
 
+    // noinspection JSUnusedGlobalSymbols — UnifiedSessionManager 通过 bridge 结构类型调用
     async activatePageWithAffected(targetId: string): Promise<PageManagementResult> {
         const tabId = this.parseTargetId(targetId)
         const result = (await this.httpServer.sendCommand('tabs_activate_managed', {
@@ -629,6 +630,13 @@ export class ExtensionBridge implements IBrowserDriver {
         return requests as NetworkRequestEntry[]
     }
 
+    async getChallengeState(): Promise<boolean> {
+        const result = (await this.httpServer.sendCommand('network_challenge_state', {
+            tabId: this.requireCurrentTabId(),
+        })) as { challengeRequired: boolean }
+        return result.challengeRequired
+    }
+
     async screenshot(options?: {
         format?: string
         quality?: number
@@ -770,6 +778,45 @@ export class ExtensionBridge implements IBrowserDriver {
         )
     }
 
+    async debuggerDetach(tabId?: number): Promise<void> {
+        await this.httpServer.sendCommand('debugger_detach', {
+            tabId: tabId ?? this.requireCurrentTabId(),
+        })
+    }
+
+    async getViewportMetrics(frameId?: number): Promise<unknown> {
+        const selectedFrameId = frameId ?? this.currentFrameId
+        return this.httpServer.sendCommand('viewport_metrics', {
+            tabId: this.requireCurrentTabId(),
+            frameId: selectedFrameId || undefined,
+        })
+    }
+
+    async inspectChallenge(
+        params: {
+            challengeSelectors: string[]
+            deniedSelectors: string[]
+            widgetSelectors: string[]
+            verifyButtonSelectors: string[]
+            frameSelectors: string[]
+            titleNeedles: string[]
+            textMarkers: string[]
+            originResponsePendingTextMarkers: string[]
+        },
+        timeout?: number
+    ): Promise<unknown> {
+        const rpcTimeout = timeout !== undefined ? timeout + RPC_MARGIN : undefined
+        return this.httpServer.sendCommand(
+            'challenge_inspect',
+            {
+                tabId: this.requireCurrentTabId(),
+                frameId: this.currentFrameId || undefined,
+                ...params,
+            },
+            rpcTimeout
+        )
+    }
+
     // ==================== Debugger (CDP via Extension) ====================
 
     async inputKey(
@@ -904,6 +951,9 @@ export class ExtensionBridge implements IBrowserDriver {
             type: string
             timestamp: number
             duration?: number
+            errorText?: string
+            sequence?: number
+            challenge?: boolean
         }>
     > {
         const result = (await this.httpServer.sendCommand('network_get', {
@@ -917,6 +967,9 @@ export class ExtensionBridge implements IBrowserDriver {
                 type: string
                 timestamp: number
                 duration?: number
+                errorText?: string
+                sequence?: number
+                challenge?: boolean
             }>
         }
         return result.requests

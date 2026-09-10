@@ -114,20 +114,6 @@ pub const MAX_CONTENT_LIMIT: usize = 1_000_000;
 pub const MIN_TOTAL_LIMIT: usize = 512;
 pub const MAX_TOTAL_LIMIT: usize = 10_000_000;
 
-const TYPE_VALUES: &[&str] = &["assistant", "user", "summary", "system", "other"];
-const SUBTYPE_VALUES: &[&str] = &[
-    "human",
-    "tool_result",
-    "meta",
-    "text",
-    "tool_use",
-    "thinking",
-    "empty",
-    "summary",
-    "system",
-    "other",
-];
-
 struct FileSearchResult {
     lines_scanned: usize,
     results: Vec<SearchResult>,
@@ -135,6 +121,7 @@ struct FileSearchResult {
     read_errors: usize,
     parse_errors: usize,
     metadata_parse_errors: usize,
+    invalid_timestamps: usize,
     metadata_issues: Vec<String>,
 }
 
@@ -155,6 +142,12 @@ fn push_jsonl_error_reasons(
     }
 }
 
+fn push_time_filter_reason(reasons: &mut Vec<String>, invalid_timestamps: usize) {
+    if invalid_timestamps > 0 {
+        reasons.push(format!("timestamp_unparseable_excluded={invalid_timestamps}"));
+    }
+}
+
 fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
     let value = value.into();
     if !values.iter().any(|item| item == &value) {
@@ -162,47 +155,12 @@ fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
     }
 }
 
-fn normalize_filters(mut params: SearchParams) -> SearchParams {
-    let mut normalized_types = Vec::new();
-    let mut normalized_subtypes = params.subtypes.clone();
-    for value in &params.types {
-        if TYPE_VALUES.contains(&value.as_str()) {
-            push_unique(&mut normalized_types, value.clone());
-        } else if SUBTYPE_VALUES.contains(&value.as_str()) {
-            push_unique(&mut normalized_subtypes, value.clone());
-            match value.as_str() {
-                "tool_use" | "text" | "thinking" | "empty" => push_unique(&mut normalized_types, "assistant"),
-                "tool_result" | "human" | "meta" => push_unique(&mut normalized_types, "user"),
-                "summary" => push_unique(&mut normalized_types, "summary"),
-                "system" => push_unique(&mut normalized_types, "system"),
-                _ => {}
-            }
-            params
-                .warnings
-                .push(format!("types={value} 是 subtype，已自动转入 subtypes"));
-        } else {
-            params.warnings.push(format!("未知 type 过滤值: {value}"));
-            push_unique(&mut normalized_types, value.clone());
-        }
-    }
-    if normalized_types.is_empty() {
-        normalized_types = vec!["assistant".to_string(), "user".to_string(), "summary".to_string()];
-    }
-
-    let mut final_subtypes = Vec::new();
-    for value in normalized_subtypes {
-        if SUBTYPE_VALUES.contains(&value.as_str()) {
-            push_unique(&mut final_subtypes, value);
-        } else if TYPE_VALUES.contains(&value.as_str()) {
-            push_unique(&mut normalized_types, value.clone());
-            params
-                .warnings
-                .push(format!("subtypes={value} 是 type，已自动转入 types"));
-        } else {
-            params.warnings.push(format!("未知 subtype 过滤值: {value}"));
-            push_unique(&mut final_subtypes, value);
-        }
-    }
+fn normalize_filters(mut params: SearchParams) -> Result<SearchParams, ErrorResponse> {
+    let message_filters =
+        normalize_message_filters(&params.types, &params.subtypes, Some(&["assistant", "user", "summary"]))?;
+    let mut normalized_types = message_filters.types;
+    let mut normalized_subtypes = message_filters.subtypes;
+    params.warnings.extend(message_filters.warnings);
 
     let mut normalized_servers = params.servers.clone();
     let mut normalized_tools = Vec::new();
@@ -223,16 +181,16 @@ fn normalize_filters(mut params: SearchParams) -> SearchParams {
 
     if params.failed_tool_results || params.tool_payload_errors {
         normalized_types.clear();
-        final_subtypes.clear();
+        normalized_subtypes.clear();
         push_unique(&mut normalized_types, "user");
-        push_unique(&mut final_subtypes, "tool_result");
+        push_unique(&mut normalized_subtypes, "tool_result");
     }
 
     params.types = normalized_types;
-    params.subtypes = final_subtypes;
+    params.subtypes = normalized_subtypes;
     params.servers = normalized_servers;
     params.tools = normalized_tools;
-    params
+    Ok(params)
 }
 
 fn effective_filters(params: &SearchParams) -> EffectiveFilters {
@@ -283,6 +241,7 @@ struct SearchInputs {
 struct SearchCollection {
     files_scanned: usize,
     lines_scanned: usize,
+    invalid_timestamps: usize,
     results: Vec<SearchResult>,
     incomplete_reasons: Vec<String>,
     truncated_global: bool,
@@ -341,12 +300,17 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
 }
 
 fn prepare_search_params(params: SearchParams) -> Result<SearchParams, ErrorResponse> {
-    let params = normalize_filters(params);
+    let params = normalize_filters(params)?;
     validate_search_params(&params)?;
     Ok(params)
 }
 
 fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
+    if let (Some(since), Some(until)) = (params.since, params.until)
+        && since > until
+    {
+        return Err(invalid_arguments("since 不能晚于 until"));
+    }
     if let Some(format) = &params.output_format
         && format != "jsonl"
     {
@@ -450,6 +414,7 @@ fn build_dry_run_response(
         stats: SearchStats {
             files_scanned: 0,
             lines_scanned: 0,
+            skipped_invalid_timestamps: 0,
             total_matches: 0,
             returned_count: 0,
             time_ms: start.elapsed().as_millis() as u64,
@@ -498,6 +463,7 @@ fn collect_search_results(
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
     let mut metadata_parse_errors = 0usize;
+    let mut invalid_timestamps = 0usize;
 
     for file_result in file_results {
         files_scanned += 1;
@@ -508,6 +474,7 @@ fn collect_search_results(
         read_errors += file_result.read_errors;
         parse_errors += file_result.parse_errors;
         metadata_parse_errors += file_result.metadata_parse_errors;
+        invalid_timestamps += file_result.invalid_timestamps;
         for issue in file_result.metadata_issues {
             push_unique(&mut incomplete_reasons, issue);
         }
@@ -519,6 +486,7 @@ fn collect_search_results(
         parse_errors,
         metadata_parse_errors,
     );
+    push_time_filter_reason(&mut incomplete_reasons, invalid_timestamps);
 
     results.sort_by(|a, b| {
         a.timestamp
@@ -540,6 +508,7 @@ fn collect_search_results(
     SearchCollection {
         files_scanned,
         lines_scanned,
+        invalid_timestamps,
         results,
         incomplete_reasons,
         truncated_global,
@@ -649,6 +618,7 @@ fn build_search_response(
         stats: SearchStats {
             files_scanned: collection.files_scanned,
             lines_scanned: collection.lines_scanned,
+            skipped_invalid_timestamps: collection.invalid_timestamps,
             total_matches,
             returned_count,
             time_ms: start.elapsed().as_millis() as u64,
@@ -1497,6 +1467,7 @@ fn search_aggregate_streaming(
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
     let mut metadata_parse_errors = 0usize;
+    let mut invalid_timestamps = 0usize;
 
     'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
@@ -1531,6 +1502,12 @@ fn search_aggregate_streaming(
             };
             observe_tool_uses(&mut tool_uses, &record);
             if !in_range {
+                continue;
+            }
+            if time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
+                == TimeRangeMatch::UnparseableTimestamp
+            {
+                invalid_timestamps += 1;
                 continue;
             }
             if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
@@ -1569,6 +1546,7 @@ fn search_aggregate_streaming(
         parse_errors,
         metadata_parse_errors,
     );
+    push_time_filter_reason(&mut incomplete_reasons, invalid_timestamps);
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     let summary_value = Some(aggregation.summary());
@@ -1579,6 +1557,7 @@ fn search_aggregate_streaming(
         stats: SearchStats {
             files_scanned,
             lines_scanned,
+            skipped_invalid_timestamps: invalid_timestamps,
             total_matches,
             returned_count: 0,
             time_ms: start.elapsed().as_millis() as u64,
@@ -1632,6 +1611,7 @@ fn search_to_output_streaming(
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
     let mut metadata_parse_errors = 0usize;
+    let mut invalid_timestamps = 0usize;
 
     'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
@@ -1666,6 +1646,12 @@ fn search_to_output_streaming(
             };
             observe_tool_uses(&mut tool_uses, &record);
             if !in_range {
+                continue;
+            }
+            if time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
+                == TimeRangeMatch::UnparseableTimestamp
+            {
+                invalid_timestamps += 1;
                 continue;
             }
             if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
@@ -1736,6 +1722,7 @@ fn search_to_output_streaming(
         parse_errors,
         metadata_parse_errors,
     );
+    push_time_filter_reason(&mut incomplete_reasons, invalid_timestamps);
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     let summary_value = (params.summary || params.aggregate).then(|| aggregation.summary());
@@ -1764,6 +1751,7 @@ fn search_to_output_streaming(
         stats: SearchStats {
             files_scanned,
             lines_scanned,
+            skipped_invalid_timestamps: invalid_timestamps,
             total_matches,
             returned_count: 0,
             time_ms: start.elapsed().as_millis() as u64,
@@ -1893,7 +1881,8 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
     if !ctx.params.subtypes.is_empty() && !ctx.params.subtypes.iter().any(|s| s == subtype) {
         return None;
     }
-    if !time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref()) {
+    if time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref()) != TimeRangeMatch::Matches
+    {
         return None;
     }
 
@@ -2011,6 +2000,7 @@ fn search_file(
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
     let mut metadata_parse_errors = 0usize;
+    let mut invalid_timestamps = 0usize;
     let mut metadata_issues = Vec::new();
 
     let file = match File::open(path) {
@@ -2023,6 +2013,7 @@ fn search_file(
                 read_errors: 1,
                 parse_errors: 0,
                 metadata_parse_errors: 0,
+                invalid_timestamps: 0,
                 metadata_issues: Vec::new(),
             };
         }
@@ -2062,6 +2053,12 @@ fn search_file(
         if !in_range {
             continue;
         }
+        if time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
+            == TimeRangeMatch::UnparseableTimestamp
+        {
+            invalid_timestamps += 1;
+            continue;
+        }
         if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
             push_unique(&mut metadata_issues, issue);
         }
@@ -2093,6 +2090,7 @@ fn search_file(
         read_errors,
         parse_errors,
         metadata_parse_errors,
+        invalid_timestamps,
         metadata_issues,
     }
 }
@@ -2130,6 +2128,7 @@ mod tests {
             stats: SearchStats {
                 files_scanned: 1,
                 lines_scanned: 1,
+                skipped_invalid_timestamps: 0,
                 total_matches: 1,
                 returned_count: 1,
                 time_ms: 0,
@@ -2603,6 +2602,65 @@ mod tests {
         assert_eq!(file_result.results.len(), 30, "all 30 should be returned");
         assert_eq!(file_result.lines_scanned, 30);
         assert!(!file_result.truncated, "should not mark truncation under cap");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn time_filter_excludes_invalid_timestamps_and_reports_the_count() {
+        let tmp = env::temp_dir().join(format!("mcp-search-time-filter-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut file = File::create(project_dir.join("session-time.jsonl")).unwrap();
+        for (uuid, timestamp) in [("valid", "2026-01-02T00:00:00Z"), ("invalid", "not-a-time")] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": uuid,
+                    "type": "user",
+                    "timestamp": timestamp,
+                    "message": {"content": "message"}
+                })
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            projects_dir: tmp.clone(),
+        };
+        let filtered = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["user".to_string()],
+                since: Some(parse_time("2026-01-01").unwrap()),
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.results.len(), 1);
+        assert_eq!(filtered.stats.skipped_invalid_timestamps, 1);
+        assert!(
+            filtered
+                .stats
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason == "timestamp_unparseable_excluded=1")
+        );
+
+        let unfiltered = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["user".to_string()],
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(unfiltered.results.len(), 2);
+        assert_eq!(unfiltered.stats.skipped_invalid_timestamps, 0);
 
         fs::remove_dir_all(&tmp).ok();
     }

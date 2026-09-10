@@ -20,9 +20,17 @@ import {
     type SetCookieParams,
     type StaleContextRetryPolicy,
 } from './browser-driver.js'
+import { OsMouseError } from './errors.js'
 import { isExtensionDisconnected } from './extension-errors.js'
+import {
+    asViewportMetrics,
+    osLeftClick,
+    resolveTurnstileOsClickPoint,
+    type TurnstileOsClickInput,
+    type ViewportMetrics,
+} from './os-mouse.js'
 import { getKeyDefinition, getSession as getCdpSession } from './session.js'
-import type { CdpResultObject, TargetInfo, WaitUntil } from './types.js'
+import type { CdpResultObject, ChallengeState, TargetInfo, WaitUntil } from './types.js'
 import {
     EvaluateResultTooLargeError,
     extractCdpValue,
@@ -81,6 +89,9 @@ class UnifiedSessionManager {
     private pressedKeys = new Set<string>()
     private lastConnectionFailure = 0
     private activeMode: ActiveConnectionMode | null = null
+    private cdpExplicitlySelected = false
+    private extensionChallengeStateUnsupported = false
+    private unsupportedChallengeStateBundleHash: string | null = null
     private tabSwitchLock: Promise<void> = Promise.resolve() // 串行化 tab 切换，防止并发竞态
     private requireExtension = false // 指定 tabId 或 frame 时为 true，禁止 CDP 回退
     private currentFrameOffset: { x: number; y: number } | null = null // iframe 在主页面的偏移量（withFrame 期间有效）
@@ -121,23 +132,25 @@ class UnifiedSessionManager {
         if (this.activeMode === 'extension' && this.extensionBridge?.isConnected()) {
             return 'extension'
         }
-        if (this.activeMode === 'cdp' && getCdpSession().isConnected()) {
+        if (this.activeMode === 'cdp' && this.cdpExplicitlySelected && getCdpSession().isConnected()) {
             return 'cdp'
         }
-        this.activeMode = null
         if (this.extensionBridge?.isConnected()) {
             this.activeMode = 'extension'
+            this.cdpExplicitlySelected = false
             return 'extension'
         }
         if (getCdpSession().isConnected()) {
             this.activeMode = 'cdp'
             return 'cdp'
         }
+        this.activeMode = null
         return 'none'
     }
 
-    setActiveMode(mode: ActiveConnectionMode): void {
+    setActiveMode(mode: ActiveConnectionMode, cdpExplicitlySelected = false): void {
         this.activeMode = mode
+        this.cdpExplicitlySelected = mode === 'cdp' && cdpExplicitlySelected
     }
 
     /**
@@ -225,10 +238,7 @@ class UnifiedSessionManager {
             stealth?: 'off' | 'safe' | 'aggressive'
         } = {}
     ): Promise<TargetInfo & { mode: ConnectionMode }> {
-        const extensionReady =
-            this.activeMode === 'cdp'
-                ? (this.extensionBridge?.isConnected() ?? false)
-                : await this.ensureExtensionConnected(options.timeout)
+        const extensionReady = this.cdpExplicitlySelected ? false : await this.ensureExtensionConnected(options.timeout)
         // 优先检查 Extension 是否已连接，如果断开则等待重连（受 timeout 约束）
         if (extensionReady) {
             // newPage 会设置 currentTabId，需要加锁
@@ -236,6 +246,7 @@ class UnifiedSessionManager {
                 return this.extensionBridge!.newPage(undefined, options.timeout)
             })
             this.activeMode = 'extension'
+            this.cdpExplicitlySelected = false
             return {
                 targetId: result.targetId,
                 type: result.type ?? 'page',
@@ -249,6 +260,7 @@ class UnifiedSessionManager {
         // Fallback 到 CDP 模式
         const target = await getCdpSession().launch(options)
         this.activeMode = 'cdp'
+        this.cdpExplicitlySelected = false
         return {
             ...target,
             mode: 'cdp',
@@ -456,11 +468,6 @@ class UnifiedSessionManager {
     async actionableClick(refId: string, force?: boolean): Promise<ActionableClickResult> {
         const driver = await this.getDriver()
         return driver.actionableClick(refId, force)
-    }
-
-    async checkActionability(refId: string): Promise<ActionableClickResult> {
-        const driver = await this.getDriver()
-        return driver.checkActionability(refId)
     }
 
     /**
@@ -784,6 +791,11 @@ class UnifiedSessionManager {
     }
 
     async clearCookies(filter?: { url?: string; domain?: string; name?: string }): Promise<{ count: number }> {
+        if (!filter || (!filter.url && !filter.domain)) {
+            throw new Error(
+                'clearCookies 必须带 url 或 domain 过滤参数，name 只能在该范围内进一步过滤（防止跨站误清同名 cookie）'
+            )
+        }
         return (await this.getDriver()).clearCookies(filter)
     }
 
@@ -949,7 +961,7 @@ class UnifiedSessionManager {
 
     async getLiveState(): Promise<UnifiedSessionState | null> {
         if (this.getMode() !== 'extension') {
-            return getCdpSession().getState()
+            return getCdpSession().getLiveState()
         }
         const targetId = this.extensionBridge!.getCurrentTargetId()
         if (!targetId) {
@@ -1132,6 +1144,136 @@ class UnifiedSessionManager {
     }
 
     /**
+     * Turnstile 点击：同页控件走页面鼠标；Cloudflare iframe 只在已聚焦窗口的活动受控 tab 上使用系统鼠标
+     */
+    // noinspection JSUnusedGlobalSymbols — resolveChallenge 通过 ChallengeHost 结构类型调用
+    async clickTurnstile(snapshot: TurnstileOsClickInput): Promise<void> {
+        if (snapshot.clickSource !== 'iframe') {
+            const point = snapshot.clickPoint
+            if (!point) {
+                throw new OsMouseError(
+                    'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                    '页面未返回可点击的 Turnstile 坐标',
+                    '重新检查页面状态后再重试；交互式验证码无法自动完成'
+                )
+            }
+            const frameOffset = this.currentFrameOffset
+            const clickPoint =
+                frameOffset && this.inputMode !== 'stealth'
+                    ? { x: point.x + frameOffset.x, y: point.y + frameOffset.y }
+                    : point
+            await this.mouseMove(clickPoint.x, clickPoint.y)
+            await this.mouseClick('left')
+            return
+        }
+        if (this.getMode() !== 'extension' || !this.extensionBridge) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                'Cloudflare iframe 需要 Extension 模式下的系统鼠标点击',
+                '先确认 Chrome Extension 已连接，把受控测试页放到已经聚焦的窗口并保持该 tab 为活动页后重试；混合窗口不会调用 focusWindow',
+                { mode: this.getMode() }
+            )
+        }
+        const targetId = this.getCurrentTargetId()
+        if (!targetId) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                '没有当前受控页面，无法使用系统鼠标点击 Turnstile',
+                '先 browse attach 到受控测试页，把该页放到已经聚焦的窗口并保持为活动 tab 后重试'
+            )
+        }
+        const topology = await this.listTopology()
+        const windowInfo = topology?.windows.find((item) =>
+            item.tabs.some((tab) => String(tab.id) === targetId || tab.targetId === targetId)
+        )
+        const tab = windowInfo?.tabs.find((item) => String(item.id) === targetId || item.targetId === targetId)
+        if (!windowInfo || !tab) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                '找不到当前受控页面所在窗口，无法使用系统鼠标点击 Turnstile',
+                '先 browse list 确认受控测试页仍在，再把它放到已经聚焦的窗口后重试'
+            )
+        }
+        if (tab.managed !== true) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                '当前页面不是受控测试页，拒绝系统鼠标点击',
+                '只对 assistant 创建或 adopt 的受控测试页使用 Turnstile 系统鼠标'
+            )
+        }
+        if (!windowInfo.focused) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                '当前窗口未聚焦，拒绝系统鼠标点击',
+                '把受控测试页放到已经聚焦的窗口并保持该 tab 为活动页后重试；混合窗口不会调用 focusWindow'
+            )
+        }
+        const activeTabId = windowInfo.activeTabId
+        if (tab.active !== true && (activeTabId === undefined || String(activeTabId) !== targetId)) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                '受控测试页不是当前窗口的活动 tab，拒绝系统鼠标点击',
+                '先把受控测试页设为该窗口的活动 tab，且窗口已经聚焦后再重试'
+            )
+        }
+        await this.extensionBridge.debuggerDetach()
+        const viewport = await this.readViewportMetrics(0)
+        const refreshedTopology = await this.listTopology()
+        const refreshedWindow = refreshedTopology?.windows.find((item) =>
+            item.tabs.some((candidate) => String(candidate.id) === targetId || candidate.targetId === targetId)
+        )
+        const refreshedTab = refreshedWindow?.tabs.find(
+            (candidate) => String(candidate.id) === targetId || candidate.targetId === targetId
+        )
+        const refreshedActiveTabId = refreshedWindow?.activeTabId
+        if (
+            !refreshedWindow?.focused ||
+            refreshedTab?.managed !== true ||
+            (refreshedTab.active !== true &&
+                (refreshedActiveTabId === undefined || String(refreshedActiveTabId) !== targetId))
+        ) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                '系统鼠标点击前，受控测试页的窗口或活动 tab 已变化',
+                '重新聚焦受控测试页并保持为活动 tab 后重试'
+            )
+        }
+        const frameOffset = this.currentFrameOffset
+        const clickPoint =
+            snapshot.clickPoint && frameOffset
+                ? { x: snapshot.clickPoint.x + frameOffset.x, y: snapshot.clickPoint.y + frameOffset.y }
+                : snapshot.clickPoint
+        const screen = await resolveTurnstileOsClickPoint({
+            ...snapshot,
+            clickPoint,
+            screenPoint: null,
+            viewport,
+        })
+        await osLeftClick(screen.x, screen.y)
+    }
+
+    // noinspection JSUnusedGlobalSymbols — resolveChallenge 通过 ChallengeHost 结构类型调用
+    async inspectChallenge(
+        options: {
+            challengeSelectors: string[]
+            deniedSelectors: string[]
+            widgetSelectors: string[]
+            verifyButtonSelectors: string[]
+            frameSelectors: string[]
+            titleNeedles: string[]
+            textMarkers: string[]
+            originResponsePendingTextMarkers: string[]
+        },
+        timeout?: number
+    ): Promise<unknown> {
+        if (this.getMode() !== 'extension' || !this.extensionBridge) {
+            throw new Error('challenge_inspect 仅在 Extension 模式可用')
+        }
+        await this.extensionBridge.debuggerDetach()
+        return this.extensionBridge.inspectChallenge(options, timeout)
+    }
+
+    /**
      * 鼠标滚轮
      */
     async mouseWheel(deltaX: number, deltaY: number): Promise<void> {
@@ -1204,9 +1346,44 @@ class UnifiedSessionManager {
             timestamp: number
             duration?: number
             errorText?: string
+            sequence?: number
+            challenge?: boolean
         }>
     > {
         return (await this.getDriver()).getNetworkRequests(options)
+    }
+
+    // noinspection JSUnusedGlobalSymbols — resolveChallenge 通过 ChallengeHost 结构类型调用
+    async getChallengeState(): Promise<ChallengeState | null> {
+        const mode = this.getMode()
+        if (mode === 'none') {
+            return null
+        }
+        const extensionBundleHash = this.extensionBridge?.getConnectionInfo().extensionBackgroundBundleHash ?? null
+        if (mode === 'extension' && this.extensionChallengeStateUnsupported) {
+            if (this.unsupportedChallengeStateBundleHash === extensionBundleHash) {
+                return null
+            }
+            this.extensionChallengeStateUnsupported = false
+        }
+        try {
+            const challengeRequired = await (await this.getDriver()).getChallengeState()
+            return challengeRequired ? { state: 'pending', mode } : null
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            const errorCode =
+                error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
+            if (
+                mode === 'extension' &&
+                (errorCode === 'UNKNOWN_ACTION' || message.includes('Unknown action: network_challenge_state'))
+            ) {
+                this.extensionChallengeStateUnsupported = true
+                this.unsupportedChallengeStateBundleHash = extensionBundleHash
+                console.warn('[MCP] Extension 未实现 network_challenge_state，改用页面标题和 DOM 检测 Cloudflare')
+                return null
+            }
+            throw error
+        }
     }
 
     async enableNetwork(): Promise<void> {
@@ -1295,6 +1472,29 @@ class UnifiedSessionManager {
 
     private async evaluateViaExtensionStealth<T>(expression: string, timeout?: number): Promise<T> {
         return (await this.extensionBridge!.evaluate(expression, undefined, timeout)) as T
+    }
+
+    private async readViewportMetrics(frameId?: number): Promise<ViewportMetrics> {
+        let raw: unknown
+        try {
+            raw = await this.extensionBridge!.getViewportMetrics(frameId)
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                `卸掉 debugger 后无法读取视口: ${message}`,
+                '把受控测试页放到已经聚焦的窗口并保持该 tab 为活动页后重试；混合窗口不会调用 focusWindow'
+            )
+        }
+        const viewport = asViewportMetrics(raw)
+        if (!viewport) {
+            throw new OsMouseError(
+                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                '卸掉 debugger 后读到的视口无效',
+                '把受控测试页放到已经聚焦的窗口并保持该 tab 为活动页后重试；混合窗口不会调用 focusWindow'
+            )
+        }
+        return viewport
     }
 
     /**
@@ -1552,15 +1752,17 @@ class UnifiedSessionManager {
      *               避免工具 timeout 被连接等待吞掉，不传则使用默认 30s
      */
     private async getDriver(timeout?: number): Promise<IBrowserDriver> {
-        if (this.activeMode === 'cdp' && getCdpSession().isConnected()) {
+        if (this.activeMode === 'cdp' && this.cdpExplicitlySelected && getCdpSession().isConnected()) {
             this.assertCdpFallbackAllowed()
             return getCdpSession()
         }
         if (await this.ensureExtensionConnected(timeout)) {
             this.activeMode = 'extension'
+            this.cdpExplicitlySelected = false
             return this.extensionBridge!
         }
         this.activeMode = 'cdp'
+        this.cdpExplicitlySelected = false
         return getCdpSession()
     }
 
@@ -1568,16 +1770,18 @@ class UnifiedSessionManager {
         if (!this.extensionBridge) {
             return this.assertCdpFallbackAllowed()
         }
-        if (this.activeMode === 'cdp' && getCdpSession().isConnected()) {
+        if (this.activeMode === 'cdp' && this.cdpExplicitlySelected && getCdpSession().isConnected()) {
             return this.assertCdpFallbackAllowed()
         }
         if (this.extensionBridge.isConnected()) {
             this.activeMode = 'extension'
+            this.cdpExplicitlySelected = false
             return true
         }
         // CDP 已连接时跳过 Extension 等待，直接使用 CDP 回退
         if (getCdpSession().isConnected()) {
             this.activeMode = 'cdp'
+            this.cdpExplicitlySelected = false
             return this.assertCdpFallbackAllowed()
         }
         // 冷却期内不重复等待，避免每次操作都阻塞 30 秒
@@ -1623,6 +1827,7 @@ class UnifiedSessionManager {
         )) as { result?: CdpResultObject }
         const globalObjectId = globalResult.result?.objectId
         if (!globalObjectId) {
+            console.warn('[MCP] Runtime.evaluate 未返回 globalThis objectId，改用表达式传递 evaluate args')
             const fallbackExpression = buildFallbackExpression()
             return this.evaluateViaExtensionPrecise<T>(fallbackExpression, fallbackExpression, undefined, timeout)
         }
@@ -1639,29 +1844,14 @@ class UnifiedSessionManager {
                 params.timeout = timeout
             }
 
-            let result: {
+            const result = (await this.extensionBridge!.debuggerSend(
+                'Runtime.callFunctionOn',
+                params,
+                undefined,
+                timeout
+            )) as {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
-            }
-            try {
-                result = (await this.extensionBridge!.debuggerSend(
-                    'Runtime.callFunctionOn',
-                    params,
-                    undefined,
-                    timeout
-                )) as typeof result
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error)
-                if (message.includes('Either objectId or executionContextId or uniqueContextId must be specified')) {
-                    const fallbackExpression = buildFallbackExpression()
-                    return this.evaluateViaExtensionPrecise<T>(
-                        fallbackExpression,
-                        fallbackExpression,
-                        undefined,
-                        timeout
-                    )
-                }
-                throw error
             }
 
             if (result.exceptionDetails) {

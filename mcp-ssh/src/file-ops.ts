@@ -7,12 +7,14 @@ import { createHash, randomBytes } from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { StringDecoder } from 'string_decoder'
 import { SFTPWrapper, Stats } from 'ssh2'
+import { StringDecoder } from 'string_decoder'
 import { matchesDirectoryExclude } from './directory-verification.js'
 import { sessionManager } from './session-manager.js'
+import { SftpOperationTimeoutError, withSftpOperationTimeout } from './sftp-timeout.js'
 import { escapeShellArg, expandTilde } from './tools/utils.js'
 import { ExternalTransferCapability, FileInfo, TransferProgress } from './types.js'
+import { ensureUtf8Boundary, isUtf8ContinuationByte, utf8SafeEnd } from './utf8.js'
 
 // 文件类型 mode 常量
 const S_IFMT = 0o170000 // 文件类型位掩码
@@ -149,13 +151,6 @@ type SftpTraversalState = {
     directories: number
     bytes: number
     activeDirectories?: Set<string>
-}
-
-class SftpOperationTimeoutError extends Error {
-    constructor(readonly timeout: number) {
-        super(`SFTP operation timed out after ${timeout}ms; remote transfer state is unknown`)
-        this.name = 'SftpOperationTimeoutError'
-    }
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -317,7 +312,8 @@ function validateLocalUploadSource(
     }
     if (followSymlinks && getAllowListStatus(expandedPath).configured) {
         throw new Error(
-            'followSymlinks=true cannot be combined with SSH_MCP_FILE_OPS_ALLOW_DIRS because symlink targets can change during transfer'
+            'followSymlinks=true cannot be combined with SSH_MCP_FILE_OPS_ALLOW_DIRS because ' +
+                'symlink targets can change during transfer'
         )
     }
     return {
@@ -344,8 +340,7 @@ export function validateUploadFileSource(localPath: string): ValidatedLocalUploa
 
 export function validateSyncUploadSource(
     localPath: string,
-    followSymlinks: boolean = false,
-    _exclude?: string[]
+    followSymlinks: boolean = false
 ): ValidatedLocalUploadSource {
     return validateLocalUploadSource(
         localPath,
@@ -381,16 +376,34 @@ export function probeLocalPath(localPath: string, followSymlinks: boolean = fals
 /**
  * sftp.stat 的 Promise 包装
  */
-function sftpStat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
-    return new Promise((resolve, reject) => {
-        sftp.stat(remotePath, (err, stats) => {
-            if (err) {
-                reject(err)
-            } else {
-                resolve(stats)
-            }
-        })
+async function getSftpWithinDeadline(alias: string, timeout?: number): Promise<SFTPWrapper> {
+    const request = sessionManager.getSftp(alias)
+    return withSftpOperationTimeout(request, timeout, () => {
+        void request.then(
+            (sftp) => sftp.end(),
+            () => undefined
+        )
     })
+}
+
+function withSftpDeadline<T>(sftp: SFTPWrapper, operation: Promise<T>, timeout?: number): Promise<T> {
+    return withSftpOperationTimeout(operation, timeout, () => sftp.end())
+}
+
+function sftpStat(sftp: SFTPWrapper, remotePath: string, timeout?: number): Promise<Stats> {
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            sftp.stat(remotePath, (err, stats) => {
+                if (err) {
+                    reject(err)
+                } else {
+                    resolve(stats)
+                }
+            })
+        }),
+        timeout
+    )
 }
 
 function isSftpMissingError(error: unknown): boolean {
@@ -422,7 +435,7 @@ async function sftpExists(sftp: SFTPWrapper, remotePath: string): Promise<boolea
 }
 
 async function remoteExists(alias: string, remotePath: string): Promise<boolean> {
-    const sftp = await sessionManager.getSftp(alias)
+    const sftp = await getSftpWithinDeadline(alias)
     try {
         return await sftpExists(sftp, remotePath)
     } finally {
@@ -435,27 +448,30 @@ export async function hashRemoteFileDigest(
     remotePath: string,
     algorithm: 'md5' | 'sha256'
 ): Promise<string> {
-    const sftp = await sessionManager.getSftp(alias)
-    return new Promise((resolve, reject) => {
-        const hash = createHash(algorithm)
-        const stream = sftp.createReadStream(remotePath)
-        let settled = false
-        const finish = (error?: Error): void => {
-            if (settled) {
-                return
+    const sftp = await getSftpWithinDeadline(alias)
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            const hash = createHash(algorithm)
+            const stream = sftp.createReadStream(remotePath)
+            let settled = false
+            const finish = (error?: Error): void => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                sftp.end()
+                if (error) {
+                    reject(error)
+                } else {
+                    resolve(hash.digest('hex'))
+                }
             }
-            settled = true
-            sftp.end()
-            if (error) {
-                reject(error)
-            } else {
-                resolve(hash.digest('hex'))
-            }
-        }
-        stream.on('data', (chunk: Buffer) => hash.update(chunk))
-        stream.once('error', finish)
-        stream.once('end', () => finish())
-    })
+            stream.on('data', (chunk: Buffer) => hash.update(chunk))
+            stream.once('error', finish)
+            stream.once('end', () => finish())
+        })
+    )
 }
 
 export class RemoteRenameNotStartedError extends Error {
@@ -469,47 +485,55 @@ export async function renameRemoteFile(
     alias: string,
     sourcePath: string,
     targetPath: string,
-    replaceExisting: boolean = false
+    replaceExisting: boolean = false,
+    timeout?: number
 ): Promise<void> {
-    const sftp = await sessionManager.getSftp(alias)
-    return new Promise((resolve, reject) => {
-        const callback = (error?: Error | null): void => {
-            sftp.end()
-            if (error) {
-                reject(error)
-            } else {
-                resolve()
+    const sftp = await getSftpWithinDeadline(alias, timeout)
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            const callback = (error?: Error | null): void => {
+                sftp.end()
+                if (error) {
+                    reject(error)
+                } else {
+                    resolve()
+                }
             }
-        }
-        try {
-            if (replaceExisting) {
-                sftp.ext_openssh_rename(sourcePath, targetPath, callback)
-            } else {
-                sftp.rename(sourcePath, targetPath, callback)
-            }
-        } catch (error) {
-            sftp.end()
-            reject(
-                new RemoteRenameNotStartedError(
-                    `SFTP rename request was not sent: ${error instanceof Error ? error.message : String(error)}`
+            try {
+                if (replaceExisting) {
+                    sftp.ext_openssh_rename(sourcePath, targetPath, callback)
+                } else {
+                    sftp.rename(sourcePath, targetPath, callback)
+                }
+            } catch (error) {
+                sftp.end()
+                reject(
+                    new RemoteRenameNotStartedError(
+                        `SFTP rename request was not sent: ${error instanceof Error ? error.message : String(error)}`
+                    )
                 )
-            )
-        }
-    })
+            }
+        }),
+        timeout
+    )
 }
 
 export async function removeRemoteFile(alias: string, remotePath: string): Promise<void> {
-    const sftp = await sessionManager.getSftp(alias)
-    return new Promise((resolve, reject) => {
-        sftp.unlink(remotePath, (error) => {
-            sftp.end()
-            if (error && !isSftpMissingError(error)) {
-                reject(error)
-            } else {
-                resolve()
-            }
+    const sftp = await getSftpWithinDeadline(alias)
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            sftp.unlink(remotePath, (error) => {
+                sftp.end()
+                if (error && !isSftpMissingError(error)) {
+                    reject(error)
+                } else {
+                    resolve()
+                }
+            })
         })
-    })
+    )
 }
 
 /**
@@ -599,6 +623,8 @@ function pipeWithProgress(
 }
 
 export class UploadFileError extends Error {
+    readonly details?: Record<string, unknown>
+
     constructor(
         message: string,
         readonly remoteCreated: boolean,
@@ -606,6 +632,10 @@ export class UploadFileError extends Error {
     ) {
         super(message, options)
         this.name = 'UploadFileError'
+        const cause = options?.cause
+        if (cause && typeof cause === 'object' && 'details' in cause) {
+            this.details = (cause as { details?: Record<string, unknown> }).details
+        }
     }
 }
 
@@ -621,7 +651,8 @@ export async function uploadFile(
     createMode?: number,
     signal?: AbortSignal,
     followSymlinks: boolean = false,
-    exclusive: boolean = false
+    exclusive: boolean = false,
+    timeout?: number
 ): Promise<{ success: boolean; size: number; createMode: string }> {
     throwIfAborted(signal)
     const source = followSymlinks
@@ -640,7 +671,7 @@ export async function uploadFile(
         throw new Error('UPLOAD_PATH_IS_NOT_FILE: localPath is not a regular file')
     }
 
-    const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
+    const sftp = sharedSftp ?? (await getSftpWithinDeadline(alias, timeout))
     const totalSize = stats.size
 
     const safeCreateMode = (createMode ?? stats.mode) & 0o777
@@ -650,20 +681,61 @@ export async function uploadFile(
         remoteCreated = true
     })
     try {
-        const result = await pipeWithProgress(
-            fs.createReadStream(localPath),
-            writeStream,
+        const result = await withSftpDeadline(
             sftp,
-            totalSize,
-            onProgress,
-            !sharedSftp,
-            signal
+            pipeWithProgress(
+                fs.createReadStream(localPath),
+                writeStream,
+                sftp,
+                totalSize,
+                onProgress,
+                !sharedSftp,
+                signal
+            ),
+            timeout
         )
         return { ...result, createMode: safeCreateMode.toString(8).padStart(4, '0') }
     } catch (error) {
         throw new UploadFileError(error instanceof Error ? error.message : String(error), remoteCreated, {
             cause: error,
         })
+    }
+}
+
+async function prepareDownloadTransfer(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    localDir: string,
+    temporaryPath: string,
+    closeSftpOnFailure: boolean,
+    timeout?: number
+): Promise<{
+    totalSize: number
+    readStream: NodeJS.ReadableStream
+    writeStream: NodeJS.WritableStream
+}> {
+    let readStream: NodeJS.ReadableStream | undefined
+    try {
+        const totalSize = (await sftpStat(sftp, remotePath, timeout)).size
+        if (!fs.existsSync(localDir)) {
+            fs.mkdirSync(localDir, { recursive: true })
+        }
+        readStream = sftp.createReadStream(remotePath)
+        return {
+            totalSize,
+            readStream,
+            writeStream: fs.createWriteStream(temporaryPath, { flags: 'wx' }),
+        }
+    } catch (error) {
+        try {
+            ;(readStream as (NodeJS.ReadableStream & { destroy?: () => void }) | undefined)?.destroy?.()
+        } catch {
+            /* ignore cleanup errors while preserving the transfer setup error */
+        }
+        if (closeSftpOnFailure) {
+            sftp.end()
+        }
+        throw error
     }
 }
 
@@ -676,41 +748,35 @@ export async function downloadFile(
     localPath: string,
     onProgress?: (progress: TransferProgress) => void,
     sharedSftp?: SFTPWrapper,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    timeout?: number
 ): Promise<{ success: boolean; size: number; atomic: true }> {
     throwIfAborted(signal)
     localPath = expandTilde(localPath)
     validateLocalPathAgainstAllowList(localPath)
-    const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
+    const sftp = sharedSftp ?? (await getSftpWithinDeadline(alias, timeout))
     const localDir = path.dirname(localPath)
     const temporaryPath = path.join(
         localDir,
         `.${path.basename(localPath)}.mcp-tmp-${process.pid}-${randomBytes(8).toString('hex')}`
     )
-    let transferStarted = false
     try {
-        const totalSize = (await sftpStat(sftp, remotePath)).size
-
-        if (!fs.existsSync(localDir)) {
-            fs.mkdirSync(localDir, { recursive: true })
-        }
-
-        transferStarted = true
-        const result = await pipeWithProgress(
-            sftp.createReadStream(remotePath),
-            fs.createWriteStream(temporaryPath, { flags: 'wx' }),
+        const { totalSize, readStream, writeStream } = await prepareDownloadTransfer(
             sftp,
-            totalSize,
-            onProgress,
+            remotePath,
+            localDir,
+            temporaryPath,
             !sharedSftp,
-            signal
+            timeout
+        )
+        const result = await withSftpDeadline(
+            sftp,
+            pipeWithProgress(readStream, writeStream, sftp, totalSize, onProgress, !sharedSftp, signal),
+            timeout
         )
         await fs.promises.rename(temporaryPath, localPath)
         return { ...result, atomic: true }
     } catch (error) {
-        if (!sharedSftp && !transferStarted) {
-            sftp.end()
-        }
         try {
             await fs.promises.unlink(temporaryPath)
         } catch (cleanupError) {
@@ -734,6 +800,7 @@ type ReadFileOptions = {
     offset?: number
     tail?: boolean
     lineRange?: string
+    timeout?: number
 }
 
 type NormalizedReadFileOptions = ReadFileOptions & { maxBytes: number }
@@ -743,7 +810,10 @@ type ReadFileResult = {
     size: number
     total_size: number
     read_offset: number
+    requested_offset?: number
     read_bytes: number
+    read_end?: number
+    next_offset?: number
     remaining_bytes?: number
     sample_kind: ReadFileSampleKind
     truncated: boolean
@@ -828,7 +898,8 @@ export function buildLineRangeAwkProgram(start: number, end: number): string {
         `NR > ${end} { if (full_body) { byte_limit = 1 } saw_after = 1; exit }`,
         'END {',
         '    if (full_body && final_terminated) { byte_limit = 1 }',
-        '    printf "__MCP_LINE_META__%d:%d:%d:%d:%d\\n", actual_start, actual_end, written, byte_limit, saw_after > "/dev/stderr"',
+        '    printf "__MCP_LINE_META__%d:%d:%d:%d:%d\\n",' +
+            ' actual_start, actual_end, written, byte_limit, saw_after > "/dev/stderr"',
         '}',
     ].join('\n')
 }
@@ -838,7 +909,8 @@ async function readLineRange(
     remotePath: string,
     totalSize: number,
     maxBytes: number,
-    lineRange: string
+    lineRange: string,
+    timeout?: number
 ): Promise<ReadFileResult> {
     const { start, end } = parseLineRange(lineRange)
     const awkProgram = buildLineRangeAwkProgram(start, end)
@@ -846,13 +918,14 @@ async function readLineRange(
     const command = [
         `last_byte=$(tail -c 1 -- ${escapedPath} 2>/dev/null | od -An -tu1 | tr -d ' ')`,
         'if [ "$last_byte" = "10" ]; then terminated=1; else terminated=0; fi',
-        `LC_ALL=C awk -v max=${maxBytes} -v final_terminated="$terminated" ${escapeShellArg(awkProgram)} ${escapedPath} | base64 | tr -d '\\n'`,
+        `LC_ALL=C awk -v max=${maxBytes} -v final_terminated="$terminated" ` +
+            `${escapeShellArg(awkProgram)} ${escapedPath} | base64 | tr -d '\\n'`,
         'status=${PIPESTATUS[0]}',
         'printf "__MCP_LINE_END__%s\\n" "$terminated" >&2',
         'exit "$status"',
     ].join('; ')
     const result = await sessionManager.exec(alias, `bash -c ${escapeShellArg(command)}`, {
-        timeout: 30000,
+        timeout: timeout ?? 30000,
         useLoginUser: true,
         maxOutputSize: Math.ceil(maxBytes / 3) * 4 + 4096,
     })
@@ -914,10 +987,10 @@ export async function readFile(
     const readOptions = normalizeReadFileOptions(options)
     validateReadFileOptions(readOptions)
 
-    const sftp = await sessionManager.getSftp(alias)
+    const sftp = await getSftpWithinDeadline(alias, readOptions.timeout)
     let actualSize: number
     try {
-        actualSize = (await sftpStat(sftp, remotePath)).size
+        actualSize = (await sftpStat(sftp, remotePath, readOptions.timeout)).size
     } catch (error) {
         sftp.end()
         throw error
@@ -925,7 +998,14 @@ export async function readFile(
 
     if (readOptions.lineRange) {
         sftp.end()
-        return readLineRange(alias, remotePath, actualSize, readOptions.maxBytes, readOptions.lineRange)
+        return readLineRange(
+            alias,
+            remotePath,
+            actualSize,
+            readOptions.maxBytes,
+            readOptions.lineRange,
+            readOptions.timeout
+        )
     }
 
     if (actualSize === 0) {
@@ -933,10 +1013,10 @@ export async function readFile(
         return emptyReadResult(0, readOptions.tail ? 'tail' : readOptions.offset !== undefined ? 'range' : 'full')
     }
 
-    const readOffset = readOptions.tail
+    const requestedOffset = readOptions.tail
         ? Math.max(0, actualSize - readOptions.maxBytes)
         : Math.min(readOptions.offset ?? 0, actualSize)
-    const readSize = Math.min(actualSize - readOffset, readOptions.maxBytes)
+    const readSize = Math.min(actualSize - requestedOffset, readOptions.maxBytes)
     const sampleKind: ReadFileSampleKind = readOptions.tail
         ? 'tail'
         : readOptions.offset !== undefined
@@ -947,42 +1027,77 @@ export async function readFile(
 
     if (readSize === 0) {
         sftp.end()
-        return emptyReadResult(actualSize, sampleKind, readOffset)
+        return emptyReadResult(actualSize, sampleKind, requestedOffset)
     }
 
-    return new Promise((resolve, reject) => {
-        const chunks: Buffer[] = []
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            const chunks: Buffer[] = []
+            let settled = false
+            const finish = (error?: Error): void => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                sftp.end()
+                if (error) {
+                    reject(error)
+                    return
+                }
 
-        const readStream = sftp.createReadStream(remotePath, {
-            start: readOffset,
-            end: readOffset + readSize - 1,
-        })
+                try {
+                    const buffer = Buffer.concat(chunks)
+                    let contentStart = 0
+                    if (readOptions.tail) {
+                        while (contentStart < buffer.length && isUtf8ContinuationByte(buffer[contentStart])) {
+                            ++contentStart
+                        }
+                    } else {
+                        ensureUtf8Boundary(buffer, 0, 'offset')
+                    }
+                    const contentEnd = utf8SafeEnd(
+                        buffer,
+                        contentStart,
+                        buffer.length,
+                        remotePath,
+                        requestedOffset + buffer.length < actualSize
+                    )
+                    const contentBuffer = buffer.subarray(contentStart, contentEnd)
+                    const actualReadOffset = requestedOffset + contentStart
+                    const nextOffset = requestedOffset + contentEnd
+                    const remainingBytes = Math.max(0, actualSize - nextOffset)
+                    resolve({
+                        content: contentBuffer.toString('utf-8'),
+                        size: actualSize,
+                        total_size: actualSize,
+                        read_offset: actualReadOffset,
+                        requested_offset: requestedOffset,
+                        read_bytes: contentBuffer.length,
+                        read_end: nextOffset,
+                        next_offset: nextOffset,
+                        remaining_bytes: remainingBytes,
+                        sample_kind: sampleKind,
+                        truncated: actualReadOffset > 0 || remainingBytes > 0,
+                    })
+                } catch (processingError) {
+                    reject(processingError)
+                }
+            }
 
-        readStream.on('data', (chunk: Buffer) => {
-            chunks.push(chunk)
-        })
-
-        readStream.on('end', () => {
-            sftp.end()
-            const buffer = Buffer.concat(chunks)
-            const remainingBytes = Math.max(0, actualSize - readOffset - buffer.length)
-            resolve({
-                content: buffer.toString('utf-8'),
-                size: actualSize,
-                total_size: actualSize,
-                read_offset: readOffset,
-                read_bytes: buffer.length,
-                remaining_bytes: remainingBytes,
-                sample_kind: sampleKind,
-                truncated: readOffset > 0 || remainingBytes > 0,
+            const readStream = sftp.createReadStream(remotePath, {
+                start: requestedOffset,
+                end: requestedOffset + readSize - 1,
             })
-        })
 
-        readStream.on('error', (err: Error) => {
-            sftp.end()
-            reject(err)
-        })
-    })
+            readStream.on('data', (chunk: Buffer) => {
+                chunks.push(chunk)
+            })
+            readStream.once('end', () => finish())
+            readStream.once('error', (error: Error) => finish(error))
+        }),
+        readOptions.timeout
+    )
 }
 
 /**
@@ -992,28 +1107,33 @@ export async function writeFile(
     alias: string,
     remotePath: string,
     content: string,
-    append: boolean = false
+    append: boolean = false,
+    timeout?: number
 ): Promise<{ success: boolean; size: number }> {
-    const sftp = await sessionManager.getSftp(alias)
+    const sftp = await getSftpWithinDeadline(alias, timeout)
     const flags = append ? 'a' : 'w'
     const contentBuffer = Buffer.from(content, 'utf-8')
 
-    return new Promise((resolve, reject) => {
-        const writeStream = sftp.createWriteStream(remotePath, { flags })
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            const writeStream = sftp.createWriteStream(remotePath, { flags })
 
-        writeStream.on('close', () => {
-            sftp.end()
-            resolve({ success: true, size: contentBuffer.length })
-        })
+            writeStream.on('close', () => {
+                sftp.end()
+                resolve({ success: true, size: contentBuffer.length })
+            })
 
-        writeStream.on('error', (err: Error) => {
-            sftp.end()
-            reject(err)
-        })
+            writeStream.on('error', (err: Error) => {
+                sftp.end()
+                reject(err)
+            })
 
-        writeStream.write(contentBuffer)
-        writeStream.end()
-    })
+            writeStream.write(contentBuffer)
+            writeStream.end()
+        }),
+        timeout
+    )
 }
 
 function validateSftpEntryName(filename: string): void {
@@ -1036,134 +1156,150 @@ export async function listDir(
     alias: string,
     remotePath: string,
     showHidden: boolean = false,
-    sharedSftp?: SFTPWrapper
+    sharedSftp?: SFTPWrapper,
+    timeout?: number
 ): Promise<FileInfo[]> {
-    const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
+    const sftp = sharedSftp ?? (await getSftpWithinDeadline(alias, timeout))
     const closeWhenDone = !sharedSftp
 
-    return new Promise((resolve, reject) => {
-        sftp.readdir(remotePath, (err, list) => {
-            if (err) {
-                if (closeWhenDone) {
-                    sftp.end()
-                }
-                reject(err)
-                return
-            }
-
-            try {
-                for (const item of list) {
-                    validateSftpEntryName(item.filename)
-                }
-            } catch (error) {
-                if (closeWhenDone) {
-                    sftp.end()
-                }
-                reject(error)
-                return
-            }
-
-            const files: FileInfo[] = list
-                .filter((item) => showHidden || !item.filename.startsWith('.'))
-                .map((item) => ({
-                    name: item.filename,
-                    path: path.posix.join(remotePath, item.filename),
-                    size: item.attrs.size,
-                    isDirectory: (item.attrs.mode & S_IFMT) === S_IFDIR,
-                    isFile: (item.attrs.mode & S_IFMT) === S_IFREG,
-                    isSymlink: (item.attrs.mode & S_IFMT) === S_IFLNK,
-                    permissions: formatPermissions(item.attrs.mode),
-                    owner: item.attrs.uid,
-                    group: item.attrs.gid,
-                    mtime: new Date(item.attrs.mtime * 1000),
-                    atime: new Date(item.attrs.atime * 1000),
-                }))
-                .sort((a, b) => {
-                    // 目录在前
-                    if (a.isDirectory !== b.isDirectory) {
-                        return a.isDirectory ? -1 : 1
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            sftp.readdir(remotePath, (err, list) => {
+                if (err) {
+                    if (closeWhenDone) {
+                        sftp.end()
                     }
-                    return a.name.localeCompare(b.name)
-                })
+                    reject(err)
+                    return
+                }
 
-            if (closeWhenDone) {
-                sftp.end()
-            }
-            resolve(files)
-        })
-    })
+                try {
+                    for (const item of list) {
+                        validateSftpEntryName(item.filename)
+                    }
+                } catch (error) {
+                    if (closeWhenDone) {
+                        sftp.end()
+                    }
+                    reject(error)
+                    return
+                }
+
+                const files: FileInfo[] = list
+                    .filter((item) => showHidden || !item.filename.startsWith('.'))
+                    .map((item) => ({
+                        name: item.filename,
+                        path: path.posix.join(remotePath, item.filename),
+                        size: item.attrs.size,
+                        isDirectory: (item.attrs.mode & S_IFMT) === S_IFDIR,
+                        isFile: (item.attrs.mode & S_IFMT) === S_IFREG,
+                        isSymlink: (item.attrs.mode & S_IFMT) === S_IFLNK,
+                        permissions: formatPermissions(item.attrs.mode),
+                        owner: item.attrs.uid,
+                        group: item.attrs.gid,
+                        mtime: new Date(item.attrs.mtime * 1000),
+                        atime: new Date(item.attrs.atime * 1000),
+                    }))
+                    .sort((a, b) => {
+                        // 目录在前
+                        if (a.isDirectory !== b.isDirectory) {
+                            return a.isDirectory ? -1 : 1
+                        }
+                        return a.name.localeCompare(b.name)
+                    })
+
+                if (closeWhenDone) {
+                    sftp.end()
+                }
+                resolve(files)
+            })
+        }),
+        timeout
+    )
 }
 
 /**
  * 获取文件信息
  */
-export async function getFileInfo(alias: string, remotePath: string): Promise<FileInfo> {
-    const sftp = await sessionManager.getSftp(alias)
+export async function getFileInfo(alias: string, remotePath: string, timeout?: number): Promise<FileInfo> {
+    const sftp = await getSftpWithinDeadline(alias, timeout)
 
-    return new Promise((resolve, reject) => {
-        sftp.stat(remotePath, (err, stats) => {
-            sftp.end()
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            sftp.stat(remotePath, (err, stats) => {
+                sftp.end()
 
-            if (err) {
-                reject(err)
-                return
-            }
+                if (err) {
+                    reject(err)
+                    return
+                }
 
-            resolve({
-                name: path.posix.basename(remotePath),
-                path: remotePath,
-                size: stats.size,
-                isDirectory: (stats.mode & S_IFMT) === S_IFDIR,
-                isFile: (stats.mode & S_IFMT) === S_IFREG,
-                isSymlink: (stats.mode & S_IFMT) === S_IFLNK,
-                permissions: formatPermissions(stats.mode),
-                owner: stats.uid,
-                group: stats.gid,
-                mtime: new Date(stats.mtime * 1000),
-                atime: new Date(stats.atime * 1000),
+                resolve({
+                    name: path.posix.basename(remotePath),
+                    path: remotePath,
+                    size: stats.size,
+                    isDirectory: (stats.mode & S_IFMT) === S_IFDIR,
+                    isFile: (stats.mode & S_IFMT) === S_IFREG,
+                    isSymlink: (stats.mode & S_IFMT) === S_IFLNK,
+                    permissions: formatPermissions(stats.mode),
+                    owner: stats.uid,
+                    group: stats.gid,
+                    mtime: new Date(stats.mtime * 1000),
+                    atime: new Date(stats.atime * 1000),
+                })
             })
-        })
-    })
+        }),
+        timeout
+    )
 }
 
-function sftpMkdir(sftp: SFTPWrapper, remotePath: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-        sftp.mkdir(remotePath, (error) => {
-            if (error) {
-                reject(error)
-            } else {
-                resolve()
-            }
-        })
-    })
+function sftpMkdir(sftp: SFTPWrapper, remotePath: string, timeout?: number): Promise<void> {
+    return withSftpDeadline(
+        sftp,
+        new Promise((resolve, reject) => {
+            sftp.mkdir(remotePath, (error) => {
+                if (error) {
+                    reject(error)
+                } else {
+                    resolve()
+                }
+            })
+        }),
+        timeout
+    )
 }
 
-async function ensureSftpDirectory(sftp: SFTPWrapper, remotePath: string): Promise<void> {
+async function ensureSftpDirectory(sftp: SFTPWrapper, remotePath: string, timeout?: number): Promise<void> {
     const normalizedPath = path.posix.normalize(remotePath)
     if (normalizedPath === '/' || normalizedPath === '.') {
         return
     }
+    let existingMode: number | undefined
     try {
-        const stats = await sftpStat(sftp, normalizedPath)
-        if ((stats.mode & S_IFMT) !== S_IFDIR) {
-            throw new Error(`Remote path exists and is not a directory: ${normalizedPath}`)
-        }
-        return
+        existingMode = (await sftpStat(sftp, normalizedPath, timeout)).mode
     } catch (error) {
         if (!isSftpMissingError(error)) {
             throw error
         }
     }
+    if (existingMode !== undefined) {
+        if ((existingMode & S_IFMT) !== S_IFDIR) {
+            throw new Error(`Remote path exists and is not a directory: ${normalizedPath}`)
+        }
+        return
+    }
 
     const parent = path.posix.dirname(normalizedPath)
     if (parent !== normalizedPath) {
-        await ensureSftpDirectory(sftp, parent)
+        await ensureSftpDirectory(sftp, parent, timeout)
     }
     try {
-        await sftpMkdir(sftp, normalizedPath)
+        await sftpMkdir(sftp, normalizedPath, timeout)
     } catch (error) {
         try {
-            const stats = await sftpStat(sftp, normalizedPath)
+            const stats = await sftpStat(sftp, normalizedPath, timeout)
             if ((stats.mode & S_IFMT) === S_IFDIR) {
                 return
             }
@@ -1181,21 +1317,28 @@ export async function mkdir(
     alias: string,
     remotePath: string,
     recursive: boolean = false,
-    sharedSftp?: SFTPWrapper
+    sharedSftp?: SFTPWrapper,
+    timeout?: number
 ): Promise<boolean> {
-    const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
-    try {
-        if (recursive) {
-            await ensureSftpDirectory(sftp, remotePath)
-        } else {
-            await sftpMkdir(sftp, remotePath)
-        }
-        return true
-    } finally {
-        if (!sharedSftp) {
-            sftp.end()
-        }
-    }
+    const sftp = sharedSftp ?? (await getSftpWithinDeadline(alias, timeout))
+    return withSftpDeadline(
+        sftp,
+        (async () => {
+            try {
+                if (recursive) {
+                    await ensureSftpDirectory(sftp, remotePath, timeout)
+                } else {
+                    await sftpMkdir(sftp, remotePath, timeout)
+                }
+                return true
+            } finally {
+                if (!sharedSftp) {
+                    sftp.end()
+                }
+            }
+        })(),
+        timeout
+    )
 }
 
 /**
@@ -1328,7 +1471,7 @@ export async function syncFiles(
 
     let sourceIsDirectory: boolean
     if (direction === 'upload') {
-        const source = validateSyncUploadSource(localPath, options.followSymlinks === true, options.exclude)
+        const source = validateSyncUploadSource(localPath, options.followSymlinks === true)
         localPath = source.expandedPath
         sourceIsDirectory = source.stats.isDirectory()
     } else {
@@ -1985,9 +2128,13 @@ async function syncWithSftp(
                 }
             }
             if (stats.isDirectory() && options.recursive === false) {
-                throw new Error(
-                    'recursive=false is not supported for directory sources; use a file source or enable recursion'
-                )
+                return {
+                    success: false,
+                    method: 'sftp',
+                    operationStatus: 'failed',
+                    stats: { added: 0, updated: 0, deleted: 0, skipped: 0, failed: 1 },
+                    output: 'recursive=false does not support directories; use a file source or enable recursion',
+                }
             }
             if (stats.isDirectory()) {
                 const result = await uploadDirectory(
@@ -2024,9 +2171,13 @@ async function syncWithSftp(
         // download
         const info = await getFileInfo(alias, remotePath)
         if (info.isDirectory && options.recursive === false) {
-            throw new Error(
-                'recursive=false is not supported for directory sources; use a file source or enable recursion'
-            )
+            return {
+                success: false,
+                method: 'sftp',
+                operationStatus: 'failed',
+                stats: { added: 0, updated: 0, deleted: 0, skipped: 0, failed: 1 },
+                output: 'recursive=false is not supported for directory sources; use a file source or enable recursion',
+            }
         }
         if (info.isDirectory) {
             const result = await downloadDirectory(
@@ -2094,7 +2245,7 @@ async function uploadDirectory(
 
     recordSftpDirectory(traversal, depth, localPath)
     const ownSftp = !sharedSftp
-    const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
+    const sftp = sharedSftp ?? (await getSftpWithinDeadline(alias))
     const activeDirectories = (traversal.activeDirectories ??= new Set())
     const realPath = fs.realpathSync(localPath)
     if (activeDirectories.has(realPath)) {
@@ -2207,7 +2358,7 @@ async function downloadDirectory(
 
     recordSftpDirectory(traversal, depth, remotePath)
     const ownSftp = !sharedSftp
-    const sftp = sharedSftp ?? (await sessionManager.getSftp(alias))
+    const sftp = sharedSftp ?? (await getSftpWithinDeadline(alias))
 
     try {
         if (!fs.existsSync(localPath)) {

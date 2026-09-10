@@ -63,6 +63,7 @@ function remainingMs(timeout: number, startedAt: number): number {
 }
 
 function isUnavailableError(message: string): boolean {
+    // noinspection LongLine — 保持不可用错误模式在一个正则中，避免分组语义变化
     return /frame|execution context|debugger|extension.*(?:disconnect|未连接)|not connected|cannot resolve cdp|failed to attach|restricted|cannot access/i.test(
         message
     )
@@ -89,14 +90,21 @@ async function checkPostCondition(
                 if (!body) return { matched: false, actual: '' }
                 const values = Array.from(body.querySelectorAll('input, textarea, select')).map((element) =>
                     element instanceof HTMLSelectElement
-                        ? Array.from(element.selectedOptions).map((option) => option.value || option.textContent || '').join(' ')
+                        ? Array.from(element.selectedOptions)
+                            .map((option) => option.value || option.textContent || '')
+                            .join(' ')
                         : element instanceof HTMLInputElement && element.type === 'password'
                           ? ''
                           : element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
                             ? element.value || ''
                             : '')
                 const text = [body.textContent || '', ...values].join('\\n')
-                return { matched: exact ? [body.textContent || '', ...values].some((value) => value === expected) : text.includes(expected), actual: text.slice(0, 500) }
+                return {
+                    matched: exact
+                        ? [body.textContent || '', ...values].some((value) => value === expected)
+                        : text.includes(expected),
+                    actual: text.slice(0, 500),
+                }
             }`,
             mode,
             nextTimeout(),
@@ -166,7 +174,9 @@ export async function waitForPostCondition(
             }
         }
         const waitMs = Math.min(interval, remainingMs(timeout, startedAt))
-        if (waitMs > 0) await sleep(waitMs)
+        if (waitMs > 0) {
+            await sleep(waitMs)
+        }
     }
 
     return {

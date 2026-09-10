@@ -97,14 +97,19 @@ function timingSafeEqualHex(left: string, right: string): boolean {
 }
 
 class ExtensionStructuredError extends Error {
+    readonly code: string | undefined
+
     constructor(
         private readonly body: object,
         message: string
     ) {
         super(message)
         this.name = 'ExtensionStructuredError'
+        const code = (body as { error?: { code?: unknown } }).error?.code
+        this.code = typeof code === 'string' ? code : undefined
     }
 
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
     toJSON(): object {
         return this.body
     }
@@ -492,7 +497,8 @@ export class ExtensionHttpServer extends EventEmitter {
                     port: this.port,
                     authRequired: true,
                     message:
-                        'No pairing token configured and no-token local connections are disabled. Unset MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0 or set MCP_CHROME_PAIRING_TOKEN.',
+                        'No pairing token configured and no-token local connections are disabled. ' +
+                        'Unset MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0 or set MCP_CHROME_PAIRING_TOKEN.',
                 })
             )
             return

@@ -388,7 +388,8 @@ export class TabHandler {
             throw structuredOperationError(
                 'WINDOW_FOCUS_NOT_OBSERVED',
                 'focusWindow 已请求聚焦窗口，但 Chrome 未观测到目标窗口获得焦点',
-                '请确认目标窗口属于 managed 测试窗口，并检查当前桌面环境是否允许浏览器扩展主动聚焦窗口；需要可见 tab 时可改用 manage(action="activatePage") 激活目标测试 tab',
+                '请确认目标是 managed 测试窗口，并检查桌面环境是否允许扩展聚焦窗口；' +
+                    '需要可见 tab 时可用 manage(action="activatePage") 激活目标测试 tab',
                 {
                     windowId: p.windowId,
                     beforeFocused: before.focused,
@@ -435,7 +436,7 @@ export class TabHandler {
         if (tabId !== undefined) {
             await markManagedTab(tabId)
         }
-        const after = await getWindowInfo(window.id, context)
+        const after = p.focused ? await waitForWindowFocus(window.id, context) : await getWindowInfo(window.id, context)
         return {
             success: true,
             windowId: window.id,

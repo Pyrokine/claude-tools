@@ -6,15 +6,13 @@
 
 import * as net from 'net'
 import type { Client, ClientChannel } from 'ssh2'
-import type { ForwardCloseOptions, ForwardCloseResult, PortForwardInfo } from './types.js'
+import type { ForwardCloseOptions, ForwardCloseResult, ForwardLifecycle, PortForwardInfo } from './types.js'
 
 /** 端口转发所需的外部依赖 */
 export interface ForwardDependencies {
     /** 获取 SSH client */
     getClient(alias: string): Client
 }
-
-type ForwardLifecycle = 'pending' | 'active' | 'closing' | 'closed'
 
 const MAX_PENDING_CHANNEL_OPENS_PER_ALIAS = 32
 
@@ -90,7 +88,8 @@ export class ForwardManager {
                 existing.pendingChannelOpens > 0
             ) {
                 throw new Error(
-                    `Alias '${alias}' still has an unresolved SSH channel open; retry closing the existing forward or disconnect the alias`
+                    `Alias '${alias}' still has an unresolved SSH channel open; ` +
+                        'retry closing the existing forward or disconnect the alias'
                 )
             }
         }
@@ -128,7 +127,8 @@ export class ForwardManager {
             }
             if (this.pendingChannelOpensForAlias(alias) >= MAX_PENDING_CHANNEL_OPENS_PER_ALIAS) {
                 console.warn(
-                    `Local forward ${session.id} rejected a connection because alias '${alias}' already has ${MAX_PENDING_CHANNEL_OPENS_PER_ALIAS} pending SSH channel opens`
+                    `Local forward ${session.id} rejected a connection because alias '${alias}' already has ` +
+                        `${MAX_PENDING_CHANNEL_OPENS_PER_ALIAS} pending SSH channel opens`
                 )
                 socket.destroy()
                 return
@@ -374,6 +374,7 @@ export class ForwardManager {
                     }
                 })
             }
+            // noinspection ES6MissingAwait — Promise 与 listener close 并发，随后由 Promise.all 等待
             const channelOpenDrain = fwd.type === 'local' ? this.waitForChannelOpenDrain(fwd) : Promise.resolve()
             const closeCompletion =
                 mode === 'force'
@@ -479,6 +480,8 @@ export class ForwardManager {
                 remotePort: fwd.remotePort,
                 createdAt: fwd.createdAt,
                 active: fwd.active,
+                lifecycle: fwd.lifecycle,
+                acceptingConnections: fwd.active && fwd.lifecycle === 'active',
             })
         }
         return result
@@ -668,9 +671,8 @@ export class ForwardManager {
                 }
             })
         } catch (error) {
-            console.warn(
-                `Cancelled remote forward ${fwd.id} cleanup failed: ${error instanceof Error ? error.message : String(error)}`
-            )
+            const message = error instanceof Error ? error.message : String(error)
+            console.warn(`Canceled remote forward ${fwd.id} cleanup failed: ${message}`)
         }
     }
 

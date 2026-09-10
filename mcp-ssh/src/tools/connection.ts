@@ -11,52 +11,87 @@ import * as path from 'path'
 import { z } from 'zod'
 import { sessionManager } from '../session-manager.js'
 import { parseProxyJump, parseSSHConfig } from '../ssh-config.js'
+import { sshPortSchema } from './schema.js'
 import { expandTilde, formatError, formatResult } from './utils.js'
 
-type ConnectionTemplate = {
-    configHost?: string
-    host?: string
-    user?: string
-    username?: string
-    password?: string
-    keyPath?: string
-    privateKeyPath?: string
-    port?: number
-    alias?: string
-    env?: Record<string, string>
-    defaultEnv?: Record<string, string>
-    runAs?: string
-    keepaliveInterval?: number
-    readyTimeout?: number
-}
+const templateJumpHostSchema = z.object({
+    host: z.string(),
+    user: z.string(),
+    password: z.string().optional(),
+    keyPath: z.string().optional(),
+    port: sshPortSchema.optional(),
+    readyTimeout: z.number().int().positive().max(600000).optional(),
+})
 
-function loadTemplates(): Record<string, ConnectionTemplate> {
+const connectionTemplateSchema = z.object({
+    configHost: z.string().optional(),
+    host: z.string().optional(),
+    user: z.string().optional(),
+    username: z.string().optional(),
+    password: z.string().optional(),
+    keyPath: z.string().optional(),
+    privateKeyPath: z.string().optional(),
+    port: sshPortSchema.optional(),
+    alias: z.string().optional(),
+    env: z.record(z.string(), z.string()).optional(),
+    defaultEnv: z.record(z.string(), z.string()).optional(),
+    runAs: z.string().optional(),
+    keepaliveInterval: z.number().int().positive().optional(),
+    readyTimeout: z.number().int().positive().max(600000).optional(),
+    jumpHost: templateJumpHostSchema.optional(),
+})
+
+type ConnectionTemplate = z.infer<typeof connectionTemplateSchema>
+
+function loadTemplates(): Record<string, unknown> {
     const fromEnv = process.env.SSH_MCP_TEMPLATES
-    if (fromEnv) {
-        return JSON.parse(fromEnv) as Record<string, ConnectionTemplate>
-    }
-
-    const filePath = path.join(os.homedir(), '.mcp-ssh', 'templates.json')
-    if (!fs.existsSync(filePath)) {
+    const source =
+        fromEnv ??
+        (() => {
+            const filePath = path.join(os.homedir(), '.mcp-ssh', 'templates.json')
+            return fs.existsSync(filePath) ? fs.readFileSync(expandTilde(filePath), 'utf-8') : undefined
+        })()
+    if (!source) {
         return {}
     }
-    return JSON.parse(fs.readFileSync(expandTilde(filePath), 'utf-8')) as Record<string, ConnectionTemplate>
+
+    const parsed: unknown = JSON.parse(source)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('SSH templates must be an object keyed by template name')
+    }
+    return parsed as Record<string, unknown>
 }
 
 function getTemplate(name?: string): ConnectionTemplate {
     if (!name) {
         return {}
     }
-    const templates = loadTemplates()
-    const template = templates[name]
-    if (!template) {
+    let templates: Record<string, unknown>
+    try {
+        templates = loadTemplates()
+    } catch (error) {
+        throw new Error(
+            `Template '${name}' could not be loaded: ${error instanceof Error ? error.message : String(error)}`,
+            {
+                cause: error,
+            }
+        )
+    }
+    const rawTemplate = templates[name]
+    if (!rawTemplate) {
         const available = Object.keys(templates)
         const suggestion = available.length
             ? `Available templates: ${available.slice(0, 20).join(', ')}`
             : 'No templates found. Define SSH_MCP_TEMPLATES or ~/.mcp-ssh/templates.json'
         throw new Error(`Template '${name}' not found. ${suggestion}`)
     }
-    return template
+    const parsed = connectionTemplateSchema.safeParse(rawTemplate)
+    if (!parsed.success) {
+        const issue = parsed.error.issues[0]
+        const field = issue.path.length > 0 ? issue.path.join('.') : '<root>'
+        throw new Error(`Template '${name}' is invalid at ${field}: ${issue.message}`)
+    }
+    return parsed.data
 }
 
 function mergeEnv(
@@ -77,7 +112,7 @@ const connectSchema = z.object({
     user: z.string().optional().describe('用户名（使用 configHost 时可省略）'),
     password: z.string().optional().describe('密码'),
     keyPath: z.string().optional().describe('SSH 私钥路径'),
-    port: z.number().optional().describe('SSH 端口，默认 22'),
+    port: sshPortSchema.optional().describe('SSH 端口，默认 22'),
     alias: z.string().optional().describe('连接别名（可选，默认使用 configHost 或 host）'),
     env: z.record(z.string(), z.string()).optional().describe('环境变量'),
     defaultEnv: z.record(z.string(), z.string()).optional().describe('连接级默认环境变量'),
@@ -96,7 +131,7 @@ const connectSchema = z.object({
             user: z.string().describe('跳板机用户名'),
             password: z.string().optional().describe('跳板机密码'),
             keyPath: z.string().optional().describe('跳板机私钥路径'),
-            port: z.number().optional().describe('跳板机端口，默认 22'),
+            port: sshPortSchema.optional().describe('跳板机端口，默认 22'),
             readyTimeout: z
                 .number()
                 .int()
@@ -179,10 +214,10 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                 })
             }
             // 显式参数优先于 config 值
-            host = host || hostConfig.hostName || hostConfig.host
-            user = user || hostConfig.user
-            port = port || hostConfig.port
-            keyPath = keyPath || hostConfig.identityFile
+            host = host ?? hostConfig.hostName ?? hostConfig.host
+            user = user ?? hostConfig.user
+            port = port ?? hostConfig.port
+            keyPath = keyPath ?? hostConfig.identityFile
 
             // 解析 ProxyJump（支持 user@host:port 格式）
             if (hostConfig.proxyJump) {
@@ -202,7 +237,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                         }
                         jumpHostResolved = {
                             host: jumpHostConfig.hostName || jumpHostConfig.host,
-                            port: parsed.port || jumpHostConfig.port || 22,
+                            port: parsed.port ?? jumpHostConfig.port ?? 22,
                             username: jumpUser,
                             privateKeyPath: jumpHostConfig.identityFile,
                         }
@@ -217,7 +252,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                         }
                         jumpHostResolved = {
                             host: parsed.host,
-                            port: parsed.port || 22,
+                            port: parsed.port ?? 22,
                             username: parsed.user,
                         }
                     }
@@ -233,19 +268,20 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
         }
 
         // 手动指定的 jumpHost 优先级高于 ProxyJump
-        const jumpHost = args.jumpHost
+        const requestedJumpHost = args.jumpHost ?? template.jumpHost
+        const jumpHost = requestedJumpHost
             ? {
-                  host: args.jumpHost.host,
-                  port: args.jumpHost.port || 22,
-                  username: args.jumpHost.user,
-                  password: args.jumpHost.password,
-                  privateKeyPath: args.jumpHost.keyPath,
-                  readyTimeout: args.jumpHost.readyTimeout ?? readyTimeout,
+                  host: requestedJumpHost.host,
+                  port: requestedJumpHost.port ?? 22,
+                  username: requestedJumpHost.user,
+                  password: requestedJumpHost.password,
+                  privateKeyPath: requestedJumpHost.keyPath,
+                  readyTimeout: requestedJumpHost.readyTimeout ?? readyTimeout,
               }
             : jumpHostResolved
 
-        const finalPort = port || 22
-        const finalAlias = requestedAlias || `${user}@${host}:${finalPort}`
+        const finalPort = port ?? 22
+        const finalAlias = requestedAlias ?? `${user}@${host}:${finalPort}`
         const identity = `${user}@${host}:${finalPort}`
         const sessionsBeforeConnect = sessionManager.listSessionDetails()
         const reused = sessionsBeforeConnect.some((session) => session.alias === finalAlias && session.connected)
@@ -258,7 +294,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             username: user,
             password,
             privateKeyPath: keyPath,
-            alias: requestedAlias,
+            alias: finalAlias,
             template: args.template,
             runAs,
             defaultEnv,
@@ -364,7 +400,7 @@ export function registerConnectionTools(server: McpServer): void {
             description: [
                 '建立 SSH 连接并保持会话，支持密码、密钥认证，支持跳板机',
                 '',
-                '可通过 configHost 参数使用 ~/.ssh/config 中的配置，无需重复填写连接信息',
+                '可通过 configHost 参数使用 ~/.ssh/config 中的配置，无需重复填写连接信息；模板会在连接前校验端口和嵌套 jumpHost 字段',
                 '支持 Host 多别名、Host * 全局默认继承、ProxyJump（user@host:port 格式）',
                 '',
                 '示例',
