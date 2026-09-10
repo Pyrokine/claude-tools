@@ -26,7 +26,7 @@
 - fix: Scope CDP events, logs, challenge state, and diagnostics to the current flat session and main document
 - fix: Return structured input errors, bound and redact diagnostic data, and preserve action and verification state
 - fix: Clean server build output before packaging; replace the stale 2.4.2 and metadata-incomplete 2.4.3 packages with 2.4.4
-- chore: Refresh Extension build dependencies to remove npm audit findings
+- chore: Refresh npm development and Extension build dependencies to remove audit findings
 
 ### mcp-ssh
 
@@ -68,7 +68,7 @@
 - fix: CDP 事件、日志、Challenge 状态和 diagnostics 只归属当前 flat session 与主文档
 - fix: 返回结构化输入错误，限制并脱敏诊断数据，保留动作和验证状态
 - fix: 发包前清理 server 构建目录；以 2.4.4 替换误含旧产物的 2.4.2 和缺少 gitHead 的 2.4.3
-- chore: 更新 Extension 构建依赖，清除 npm audit 告警
+- chore: 更新 npm 开发依赖和 Extension 构建依赖，清除 npm audit 告警
 
 ### mcp-ssh
 
