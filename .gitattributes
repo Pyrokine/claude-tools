@@ -1,1 +1,13 @@
 * whitespace=-blank-at-eof
+*.sh text eol=lf
+*.bash text eol=lf
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.rs text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

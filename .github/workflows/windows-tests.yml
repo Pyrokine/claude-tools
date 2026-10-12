@@ -1,0 +1,88 @@
+name: Cross-platform tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            mcp-chrome/package-lock.json
+            mcp-chrome/extension/package-lock.json
+            mcp-ssh/package-lock.json
+
+      - name: Check source line endings
+        run: |
+          node -e 'const fs = require("node:fs"); const cp = require("node:child_process"); const files = cp.execFileSync("git", ["ls-files", "-z"]).toString().split("\0").filter(Boolean).filter((file) => /\.(?:sh|bash|ps1|psm1|rs|ts|tsx|js|mjs|cjs|yml|yaml)$/.test(file)); const bad = files.filter((file) => fs.readFileSync(file).includes(13)); if (bad.length) { console.error("Non-LF source files:\n" + bad.join("\n")); process.exitCode = 1; }'
+
+      - name: Install Chrome packages
+        run: npm ci
+        working-directory: mcp-chrome
+
+      - name: Install Chrome extension packages
+        run: npm ci
+        working-directory: mcp-chrome/extension
+
+      - name: Test Chrome server
+        run: npm test
+        working-directory: mcp-chrome
+
+      - name: Build and test Chrome extension
+        run: npm run build && npm test && npm run lint:css
+        working-directory: mcp-chrome/extension
+
+      - name: Lint Chrome
+        run: npm run lint
+        working-directory: mcp-chrome
+
+      - name: Check Chrome package files
+        run: |
+          node -e 'const fs = require("node:fs"); const cp = require("node:child_process"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); const [pack] = JSON.parse(cp.execSync("npm pack --json --dry-run --ignore-scripts", { encoding: "utf8" })); const paths = new Set(pack.files.map((file) => file.path)); if (pack.name !== pkg.name || pack.version !== pkg.version || !paths.has("dist/index.js") || !paths.has("extension/dist/manifest.json") || !paths.has("scripts/start-chrome.ps1")) { console.error("Chrome package lacks build output or Windows launcher, or has mismatched metadata"); process.exitCode = 1; }'
+        working-directory: mcp-chrome
+
+      - name: Install SSH packages
+        run: npm ci
+        working-directory: mcp-ssh
+
+      - name: Test and lint SSH
+        run: npm test && npm run lint
+        working-directory: mcp-ssh
+
+      - name: Check SSH package files
+        run: |
+          node -e 'const fs = require("node:fs"); const cp = require("node:child_process"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); const [pack] = JSON.parse(cp.execSync("npm pack --json --dry-run --ignore-scripts", { encoding: "utf8" })); const paths = new Set(pack.files.map((file) => file.path)); if (pack.name !== pkg.name || pack.version !== pkg.version || !paths.has("dist/index.js")) { console.error("SSH package lacks build output or has mismatched metadata"); process.exitCode = 1; }'
+        working-directory: mcp-ssh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Test and lint History
+        working-directory: mcp-claude-history
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo clippy --locked -- -W clippy::all
+          cargo build --release --locked
+          cargo package --locked --allow-dirty --list
+          cargo package --locked --allow-dirty --no-verify
+        shell: bash
