@@ -11,19 +11,28 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { z } from 'zod'
 import {
-    buildRemoteDirectoryManifestCommand,
     compareDirectoryManifests,
     createEmptyDirectoryManifest,
     createLocalDirectoryManifest,
+    createRemoteDirectoryManifest,
     DIRECTORY_VERIFY_MAX_ENTRIES,
     DIRECTORY_VERIFY_MAX_FILE_BYTES,
     DIRECTORY_VERIFY_MAX_TOTAL_BYTES,
     type DirectoryManifest,
     type DirectoryVerifyRequest,
-    parseRemoteDirectoryManifest,
 } from '../directory-verification.js'
+import { FILE_CREATE_MODE_MASK, formatFileMode, parseExpectedFileMode } from '../file-mode.js'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
+import { withSftpOperationTimeout } from '../sftp-timeout.js'
+import {
+    encodedPowershell,
+    quotePowershell,
+    remoteDirname,
+    remoteJoin,
+    remoteShellPath,
+    sftpPath,
+} from '../remote-platform.js'
 import { buildTransferOutcome } from '../transfer-outcome.js'
 import { operationTimeoutSchema } from './schema.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js'
@@ -36,7 +45,7 @@ const uploadSchema = z.object({
     remotePath: z.string().describe('远程目标路径'),
     atomic: z.boolean().optional().describe('是否先上传到同目录临时文件，校验后 rename 到目标路径'),
     verifyOwner: z.union([z.string(), z.number()]).optional().describe('上传后校验远端 owner（用户名或 uid）'),
-    verifyMode: z.string().optional().describe('上传后校验远端权限，例如 0644 或 -rw-r--r--'),
+    verifyMode: z.string().optional().describe('上传后校验远端权限，例如 0644、4755 或 -rwsr-xr-x'),
     verifyMd5: z.boolean().optional().describe('上传后比对本地和远端 MD5'),
     verifySize: z.boolean().optional().describe('上传后校验文件大小'),
     verifyMtime: z.boolean().optional().describe('上传后返回并比较本地和远端 mtime'),
@@ -67,7 +76,15 @@ const readFileSchema = z.object({
         .optional()
         .describe('从 UTF-8 字符边界的字节偏移读取，与 tail/lineRange 互斥；使用上次返回的 next_offset'),
     tail: z.boolean().optional().describe('读取文件尾部 maxBytes 字节，与 offset/lineRange 互斥'),
-    lineRange: z.string().optional().describe('按行号读取，格式为 "start-end" 或 "start"，与 offset/tail 互斥'),
+    lineRange: z
+        .string()
+        .optional()
+        .describe('通过 SFTP 按行号读取，格式为 "start-end" 或 "start"，与 offset/tail 互斥'),
+    encoding: z
+        .enum(['auto', 'utf8', 'utf16le', 'utf16be', 'gbk'])
+        .optional()
+        .describe('文本编码；auto 在文件起始处检测 UTF-16 BOM，否则用 UTF-8'),
+    binary: z.boolean().optional().describe('无损 base64 输出，不执行文本解码'),
     timeout: operationTimeoutSchema.optional(),
 })
 
@@ -116,13 +133,19 @@ const syncSchema = z.object({
     connectTimeout: z.number().int().positive().max(120000).optional().describe('rsync SSH 连接超时，默认 30000ms'),
     operationTimeout: z.number().int().positive().max(3600000).optional().describe('同步操作超时，默认 600000ms'),
     verifyOwner: z.union([z.string(), z.number()]).optional().describe('upload 后校验远端 owner（用户名或 uid）'),
-    verifyMode: z.string().optional().describe('upload 后校验远端权限，例如 0644 或 -rw-r--r--'),
+    verifyMode: z.string().optional().describe('upload 后校验远端权限，例如 0644、4755 或 -rwsr-xr-x'),
     verify: z
         .object({
             count: z.boolean().optional().describe('校验目录条目数'),
             sha256: z.boolean().optional().describe('校验 SHA-256 root manifest'),
             owner: z.boolean().optional().describe('逐项校验 owner'),
-            mode: z.boolean().optional().describe('逐项校验 mode'),
+            mode: z.boolean().optional().describe('逐项校验 POSIX mode；Windows 不支持'),
+            aclSddl: z
+                .string()
+                .min(1)
+                .max(8192)
+                .optional()
+                .describe('Windows 远端目录根路径的预期 DACL SDDL，独立于 POSIX mode/owner'),
             deletions: z.boolean().optional().describe('校验请求删除后没有额外条目'),
             staleFiles: z.boolean().optional().describe('校验没有旧文件残留'),
             maxEntries: z
@@ -232,6 +255,9 @@ function summarizeLocalPathProbe(probe: LocalPathProbe): Record<string, unknown>
     if ('mode' in probe) {
         summary.mode = probe.mode
     }
+    if ('modeValue' in probe) {
+        summary.modeValue = probe.modeValue
+    }
     if ('mtimeMs' in probe) {
         summary.mtimeMs = probe.mtimeMs
     }
@@ -256,8 +282,12 @@ function uploadPathError(code: string, message: string, diagnostics: Record<stri
     })
 }
 
+function normalizeRemotePath(alias: string, remotePath: string): string {
+    return sftpPath(remotePath, sessionManager.getRemotePathStyle(alias))
+}
+
 async function probeRemoteParent(alias: string, remotePath: string) {
-    const parent = path.posix.dirname(remotePath)
+    const parent = remoteDirname(sessionManager.getRemotePathStyle(alias), remotePath)
     try {
         const result = await probeRemoteFile(alias, parent)
         return {
@@ -345,27 +375,6 @@ async function resolveExpectedOwnerId(alias: string, owner: string | number): Pr
     return ownerId
 }
 
-function permissionStringToOctal(permissions: string): string | undefined {
-    const bits = permissions.slice(-9)
-    if (bits.length !== 9) {
-        return undefined
-    }
-    const values = [bits.slice(0, 3), bits.slice(3, 6), bits.slice(6, 9)].map((part) => {
-        let value = 0
-        if (part[0] === 'r') {
-            value += 4
-        }
-        if (part[1] === 'w') {
-            value += 2
-        }
-        if (part[2] === 'x' || part[2] === 's' || part[2] === 't') {
-            value += 1
-        }
-        return value
-    })
-    return `0${values.join('')}`
-}
-
 function isRemoteMissingError(error: unknown): boolean {
     if (!error || typeof error !== 'object') {
         return false
@@ -390,13 +399,6 @@ async function probeRemoteFile(alias: string, remotePath: string, timeout: numbe
             { operation: 'stat', probeMethod: 'sftp' }
         )
     }
-    const mode = permissionStringToOctal(info.permissions)
-    if (!mode) {
-        throw new VerificationStageError('remote_probe', 'Remote SFTP stat returned invalid mode metadata', false, {
-            operation: 'stat',
-            probeMethod: 'sftp',
-        })
-    }
     return {
         exists: true as const,
         remotePath,
@@ -405,7 +407,9 @@ async function probeRemoteFile(alias: string, remotePath: string, timeout: numbe
         ownerId: info.owner,
         groupName: undefined,
         groupId: info.group,
-        mode,
+        mode: formatFileMode(info.mode),
+        modeValue: info.mode,
+        permissions: info.permissions,
         size: info.size,
         mtimeMs: info.mtime.getTime(),
         fileType: info.isDirectory
@@ -437,7 +441,7 @@ async function buildUploadVerification(
     }
     if (args.verifyMode) {
         const expectedMode = normalizeExpectedMode(args.verifyMode)
-        checks.mode = remote.exists && expectedMode !== undefined && remote.mode === expectedMode
+        checks.mode = remote.exists && expectedMode !== undefined && remote.modeValue === expectedMode
     }
     if (args.verifyOwner !== undefined) {
         const expectedOwnerId = await resolveExpectedOwnerId(args.alias, args.verifyOwner)
@@ -452,7 +456,7 @@ async function buildUploadVerification(
         return {
             expected: {
                 owner: args.verifyOwner,
-                mode: args.verifyMode ? normalizeExpectedMode(args.verifyMode) : undefined,
+                mode: args.verifyMode ? displayExpectedMode(args.verifyMode) : undefined,
                 size: args.verifySize && local.exists ? local.size : undefined,
                 mtimeMs: args.verifyMtime && local.exists ? local.mtimeMs : undefined,
                 md5: localMd5,
@@ -466,7 +470,7 @@ async function buildUploadVerification(
     return {
         expected: {
             owner: args.verifyOwner,
-            mode: args.verifyMode ? normalizeExpectedMode(args.verifyMode) : undefined,
+            mode: args.verifyMode ? displayExpectedMode(args.verifyMode) : undefined,
             size: args.verifySize && local.exists ? local.size : undefined,
             mtimeMs: args.verifyMtime && local.exists ? local.mtimeMs : undefined,
         },
@@ -477,12 +481,13 @@ async function buildUploadVerification(
     }
 }
 
-function normalizeExpectedMode(mode: string): string | undefined {
-    const trimmed = mode.trim()
-    if (/^[0-7]{3,4}$/.test(trimmed)) {
-        return trimmed.length === 3 ? `0${trimmed}` : trimmed
-    }
-    return permissionStringToOctal(trimmed)
+function normalizeExpectedMode(mode: string): number | undefined {
+    return parseExpectedFileMode(mode)
+}
+
+function displayExpectedMode(mode: string): string | undefined {
+    const parsed = normalizeExpectedMode(mode)
+    return parsed === undefined ? undefined : formatFileMode(parsed)
 }
 
 async function buildSyncVerificationChecks(
@@ -496,7 +501,7 @@ async function buildSyncVerificationChecks(
     }
     if (args.verifyMode !== undefined) {
         const expectedMode = normalizeExpectedMode(args.verifyMode)
-        checks.mode = remote.exists && expectedMode !== undefined && remote.mode === expectedMode
+        checks.mode = remote.exists && expectedMode !== undefined && remote.modeValue === expectedMode
     }
     return checks
 }
@@ -508,10 +513,18 @@ async function resolveSyncUploadVerificationPath(
 ): Promise<string> {
     const requestedRemote = await probeRemoteFile(args.alias, args.remotePath, timeout)
     if (requestedRemote.exists && requestedRemote.isDirectory) {
-        return path.posix.join(args.remotePath, path.basename(local.resolvedPath))
+        return remoteJoin(
+            sessionManager.getRemotePathStyle(args.alias),
+            args.remotePath,
+            path.basename(local.resolvedPath)
+        )
     }
     if (!requestedRemote.exists && args.remotePath.endsWith('/')) {
-        return path.posix.join(args.remotePath, path.basename(local.resolvedPath))
+        return remoteJoin(
+            sessionManager.getRemotePathStyle(args.alias),
+            args.remotePath,
+            path.basename(local.resolvedPath)
+        )
     }
     return args.remotePath
 }
@@ -557,7 +570,7 @@ async function buildSyncUploadVerification(
         expected: {
             owner: args.verifyOwner,
             mode: args.verifyMode,
-            normalizedMode: args.verifyMode ? normalizeExpectedMode(args.verifyMode) : undefined,
+            normalizedMode: args.verifyMode ? displayExpectedMode(args.verifyMode) : undefined,
         },
         requestedRemotePath: args.remotePath,
         remote,
@@ -576,57 +589,34 @@ async function captureRemoteDirectoryManifest(
     followSymlinks: boolean | undefined,
     timeout: number
 ): Promise<DirectoryManifest> {
-    const remoteCommand = buildRemoteDirectoryManifestCommand(remotePath, request, exclude, followSymlinks)
-    let remoteResult: Awaited<ReturnType<typeof sessionManager.exec>>
+    const requestSftp = sessionManager.getSftp(alias)
+    const sftp = await withSftpOperationTimeout(requestSftp, timeout, () => {
+        void requestSftp.then(
+            (late) => late.end(),
+            () => undefined
+        )
+    })
     try {
-        remoteResult = await sessionManager.exec(alias, remoteCommand, {
+        return await withSftpOperationTimeout(
+            createRemoteDirectoryManifest(
+                sftp,
+                remotePath,
+                request,
+                exclude,
+                followSymlinks,
+                sessionManager.getRemotePathStyle(alias)
+            ),
             timeout,
-            useLoginUser: true,
-            maxOutputSize: 16 * 1024 * 1024,
-        })
+            () => sftp.end()
+        )
     } catch (error) {
-        const details =
-            error && typeof error === 'object' && 'details' in error
-                ? (error as { details?: Record<string, unknown> }).details
-                : undefined
-        throw new VerificationStageError(
-            'remote_manifest_command',
-            boundedDiagnostic(error instanceof Error ? error.message : String(error)).text,
-            true,
-            { timeout, ...details }
-        )
-    }
-    if (!remoteResult.success) {
-        const detail = boundedDiagnostic(
-            remoteResult.stderr || remoteResult.stdout || 'remote directory manifest failed'
-        )
-        throw new VerificationStageError(
-            'remote_manifest_command',
-            detail.text,
-            remoteResult.failureKind !== 'remote_command',
-            {
-                ...commandFailureDetails(remoteResult),
-                diagnosticBytes: detail.bytes,
-                diagnosticTruncated: detail.truncated || undefined,
-            }
-        )
-    }
-    if (remoteResult.stdoutTruncated) {
         throw new VerificationStageError(
             'remote_manifest_output',
-            'remote directory manifest output exceeded the 16MB response limit',
-            false,
-            { maxOutputSize: 16 * 1024 * 1024 }
-        )
-    }
-    try {
-        return parseRemoteDirectoryManifest(remoteResult.stdout)
-    } catch (error) {
-        throw new VerificationStageError(
-            'remote_manifest_parse',
             error instanceof Error ? error.message : String(error),
-            false
+            true
         )
+    } finally {
+        sftp.end()
     }
 }
 
@@ -767,9 +757,29 @@ async function buildDirectorySyncVerification(
             false
         )
     }
-    return args.direction === 'upload'
-        ? compareDirectoryManifests(localManifest, remoteManifest, request, deletionBaseline)
-        : compareDirectoryManifests(remoteManifest, localManifest, request, deletionBaseline)
+    const comparison =
+        args.direction === 'upload'
+            ? compareDirectoryManifests(localManifest, remoteManifest, request, deletionBaseline)
+            : compareDirectoryManifests(remoteManifest, localManifest, request, deletionBaseline)
+    if (request.aclSddl && !('skipped' in comparison)) {
+        const command = encodedPowershell(
+            `$acl = Get-Acl -LiteralPath ${quotePowershell(remoteShellPath(args.remotePath, sessionManager.getRemotePathStyle(args.alias)))}; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)`
+        )
+        const result = await sessionManager.exec(args.alias, command, {
+            timeout,
+            useLoginUser: true,
+            maxOutputSize: 8192,
+        })
+        if (!result.success || result.stdoutTruncated) {
+            throw new VerificationStageError('remote_probe', 'Windows remote ACL could not be verified', true)
+        }
+        const aclMatch = result.stdout.trim() === request.aclSddl
+        const checks = comparison.checks as Record<string, boolean>
+        checks.acl = aclMatch
+        comparison.matched = comparison.matched === true && aclMatch
+        comparison.acl = { matched: aclMatch, expected: request.aclSddl, actual: result.stdout.trim() }
+    }
+    return comparison
 }
 
 function mergeSyncVerification(
@@ -835,6 +845,21 @@ function addUploadVerificationPaths(
 }
 
 async function handleUpload(args: z.infer<typeof uploadSchema>) {
+    try {
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
+        if (
+            sessionManager.getRemotePlatform(args.alias) === 'windows' &&
+            (args.verifyOwner !== undefined || args.verifyMode !== undefined)
+        ) {
+            return formatResult({
+                success: false,
+                code: 'unsupported_remote_platform',
+                error: 'Windows SFTP owner/mode metadata cannot verify POSIX permissions; use Windows ACL verification',
+            })
+        }
+    } catch (error) {
+        return formatError(error)
+    }
     let local: LocalPathProbe
     try {
         fileOps.validateUploadFileSource(args.localPath)
@@ -883,12 +908,35 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             },
         })
     }
+    let atomicReplaceSupported: boolean | null = null
+    if (args.atomic && remoteBefore.exists) {
+        try {
+            const capability = await fileOps.atomicReplaceCapability(args.alias, args.timeout)
+            atomicReplaceSupported = capability.atomicReplaceSupported
+            if (!capability.atomicReplaceSupported) {
+                return formatResult({
+                    success: false,
+                    code: 'atomic_replace_unsupported',
+                    atomicReplaceSupported: false,
+                    targetReplaced: false,
+                    error: capability.reason,
+                })
+            }
+        } catch (error) {
+            return formatResult({
+                success: false,
+                code: 'atomic_replace_unverified',
+                atomicReplaceSupported: null,
+                targetReplaced: false,
+                error: error instanceof Error ? error.message : String(error),
+            })
+        }
+    }
     const sourceMode =
-        local.exists && 'mode' in local && typeof local.mode === 'string'
-            ? Number.parseInt(local.mode, 8) & 0o777
+        local.exists && 'modeValue' in local && typeof local.modeValue === 'number'
+            ? local.modeValue & FILE_CREATE_MODE_MASK
             : undefined
-    const existingMode =
-        remoteBefore.exists && remoteBefore.mode ? Number.parseInt(remoteBefore.mode, 8) & 0o777 : undefined
+    const existingMode = remoteBefore.exists ? remoteBefore.modeValue & FILE_CREATE_MODE_MASK : undefined
     const createMode = args.atomic && existingMode !== undefined ? existingMode : sourceMode
     const tempRemotePath = args.atomic ? createAtomicUploadPath(args.remotePath) : args.remotePath
     const verificationRequested = Boolean(
@@ -899,7 +947,14 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
         args.verifyMtime
     )
 
+    let privateTempCreated = false
+    let uploadedTempCreated = false
     try {
+        if (args.atomic && sessionManager.getRemotePlatform(args.alias) === 'windows') {
+            const shellPath = remoteShellPath(tempRemotePath, sessionManager.getRemotePathStyle(args.alias))
+            await fileOps.prepareWindowsRemotePrivateFile(args.alias, tempRemotePath, args.timeout, shellPath)
+            privateTempCreated = true
+        }
         const uploadResult = await fileOps.uploadFile(
             args.alias,
             args.localPath,
@@ -909,9 +964,10 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             createMode,
             undefined,
             false,
-            args.atomic === true,
+            args.atomic === true && !privateTempCreated,
             args.timeout
         )
+        uploadedTempCreated = args.atomic === true
         let verification: Record<string, unknown> | undefined
         let verificationError: unknown
         if (verificationRequested) {
@@ -950,6 +1006,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                         : `Atomic upload verification failed: ${verificationMessage}`,
                 cleanupWarning,
                 atomic: true,
+                atomicReplaceSupported,
                 targetReplaced: false,
                 ...pathDetails,
                 createMode: uploadResult.createMode,
@@ -994,6 +1051,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                         : `Atomic SFTP rename response failed; target replacement state is unknown: ${renameError}`,
                     cleanupWarning,
                     atomic: true,
+                    atomicReplaceSupported,
                     targetReplaced: renameNotStarted ? false : null,
                     targetReplacementStatus: renameNotStarted ? 'not_replaced' : 'unknown',
                     ...pathDetails,
@@ -1021,6 +1079,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                     ? undefined
                     : `Upload completed, but verification failed: ${verificationMessage}`,
             atomic: args.atomic === true,
+            atomicReplaceSupported,
             targetReplaced: args.atomic ? true : undefined,
             ...pathDetails,
             createMode: uploadResult.createMode,
@@ -1038,7 +1097,10 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
     } catch (error) {
         let cleanupWarning: string | undefined
         const shouldCleanupTemporaryUpload =
-            args.atomic && (!(error instanceof fileOps.UploadFileError) || error.remoteCreated)
+            args.atomic &&
+            (privateTempCreated ||
+                uploadedTempCreated ||
+                (error instanceof fileOps.UploadFileError && error.remoteCreated))
         if (shouldCleanupTemporaryUpload) {
             try {
                 await cleanupRemotePath(args.alias, tempRemotePath)
@@ -1051,6 +1113,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             ...sftpOperationOutcome(error),
             error: error instanceof Error ? error.message : String(error),
             cleanupWarning,
+            atomicReplaceSupported,
             finalRemotePath: args.remotePath,
             diagnostics: {
                 local: summarizeLocalPathProbe(local),
@@ -1065,6 +1128,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
 
 async function handleDownload(args: z.infer<typeof downloadSchema>) {
     try {
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
         const downloadResult = await fileOps.downloadFile(
             args.alias,
             args.remotePath,
@@ -1091,11 +1155,14 @@ async function handleDownload(args: z.infer<typeof downloadSchema>) {
 
 async function handleReadFile(args: z.infer<typeof readFileSchema>) {
     try {
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
         const readResult = await fileOps.readFile(args.alias, args.remotePath, {
             maxBytes: args.maxBytes,
             offset: args.offset,
             tail: args.tail,
             lineRange: args.lineRange,
+            encoding: args.encoding,
+            binary: args.binary,
             timeout: args.timeout,
         })
         return formatResult({ success: true, ...readResult })
@@ -1106,6 +1173,7 @@ async function handleReadFile(args: z.infer<typeof readFileSchema>) {
 
 async function handleWriteFile(args: z.infer<typeof writeFileSchema>) {
     try {
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
         const result = await fileOps.writeFile(args.alias, args.remotePath, args.content, args.append, args.timeout)
         return formatResult(result)
     } catch (error) {
@@ -1115,7 +1183,15 @@ async function handleWriteFile(args: z.infer<typeof writeFileSchema>) {
 
 async function handleListDir(args: z.infer<typeof listDirSchema>) {
     try {
-        const files = await fileOps.listDir(args.alias, args.remotePath, args.showHidden, undefined, args.timeout)
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
+        const files = await fileOps.listDir(
+            args.alias,
+            args.remotePath,
+            args.showHidden,
+            undefined,
+            args.timeout,
+            sessionManager.getRemotePathStyle(args.alias)
+        )
         return formatResult({
             success: true,
             path: args.remotePath,
@@ -1129,7 +1205,13 @@ async function handleListDir(args: z.infer<typeof listDirSchema>) {
 
 async function handleFileInfo(args: z.infer<typeof fileInfoSchema>) {
     try {
-        const info = await fileOps.getFileInfo(args.alias, args.remotePath, args.timeout)
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
+        const info = await fileOps.getFileInfo(
+            args.alias,
+            args.remotePath,
+            args.timeout,
+            sessionManager.getRemotePathStyle(args.alias)
+        )
         return formatResult({ success: true, ...info })
     } catch (error) {
         return formatFileOperationError(error)
@@ -1138,7 +1220,15 @@ async function handleFileInfo(args: z.infer<typeof fileInfoSchema>) {
 
 async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
     try {
-        const success = await fileOps.mkdir(args.alias, args.remotePath, args.recursive, undefined, args.timeout)
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
+        const success = await fileOps.mkdir(
+            args.alias,
+            args.remotePath,
+            args.recursive,
+            undefined,
+            args.timeout,
+            sessionManager.getRemotePathStyle(args.alias)
+        )
         return formatResult({ success, path: args.remotePath })
     } catch (error) {
         return formatFileOperationError(error)
@@ -1147,6 +1237,29 @@ async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
 
 async function handleSync(args: z.infer<typeof syncSchema>) {
     const startedAt = Date.now()
+    try {
+        args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
+        const windows = sessionManager.getRemotePlatform(args.alias) === 'windows'
+        if (
+            windows &&
+            (args.verifyOwner !== undefined || args.verifyMode !== undefined || args.verify?.owner || args.verify?.mode)
+        ) {
+            return formatResult({
+                success: false,
+                code: 'unsupported_remote_platform',
+                error: 'Windows SFTP owner/mode metadata cannot verify POSIX permissions; use verify.aclSddl',
+            })
+        }
+        if (!windows && args.verify?.aclSddl) {
+            return formatResult({
+                success: false,
+                code: 'unsupported_remote_platform',
+                error: 'verify.aclSddl requires a Windows remote platform',
+            })
+        }
+    } catch (error) {
+        return formatError(error)
+    }
     if (args.verify?.deletions && args.delete !== true) {
         return formatResult({
             success: false,
@@ -1227,6 +1340,7 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
             preflightTimeout: args.preflightTimeout,
             connectTimeout: args.connectTimeout,
             operationTimeout: transferTimeout,
+            remotePathStyle: sessionManager.getRemotePathStyle(args.alias),
         })
         const localAfter = fileOps.probeLocalPath(
             args.localPath,
@@ -1298,7 +1412,8 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_download',
         {
-            description: '从远程服务器下载文件。timeout 限制单个 SFTP 操作，超时后远端传输状态可能未知。',
+            description:
+                '从远程服务器原子下载文件。新文件使用 0600，替换普通文件时保留其 rwx 权限；symlink、目录和其他非普通目标会被拒绝。timeout 限制单个 SFTP 操作，超时后远端传输状态可能未知。',
             inputSchema: downloadSchema,
         },
         (args) => handleDownload(args)
@@ -1325,7 +1440,7 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_list_dir',
         {
-            description: '列出远程目录内容',
+            description: '列出远程目录内容，返回包含特殊权限位的数值 mode 和 permissions 文本',
             inputSchema: listDirSchema,
         },
         (args) => handleListDir(args)
@@ -1334,7 +1449,7 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_file_info',
         {
-            description: '获取远程文件信息（大小、权限、修改时间等）',
+            description: '获取远程文件信息（大小、数值 mode、权限文本、修改时间等）',
             inputSchema: fileInfoSchema,
         },
         (args) => handleFileInfo(args)

@@ -11,6 +11,23 @@
 ![Linux](https://img.shields.io/badge/Linux-tested-success) ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
 ![Windows](https://img.shields.io/badge/Windows-untested-yellow)
 
+## 迁移到 3.0
+
+`maxOutputSize`
+现在按 UTF-8 字节分别限制 exec 的 stdout/stderr 返回正文，原来按 JavaScript 字符串长度计量；非 ASCII 输出需要重新计算预算，并检查
+`stdoutTruncated` / `stderrTruncated`；`maxOutputSize=3` 可返回一个汉字，不能返回三个，文本只返回完整字符
+
+PTY 的 `bufferSize` 参数、read/list 结果中的 `bufferSize`、`unreadRawBytes` 和 `rawBufferLimit`
+现在按原始字节计量；raw 读取使用 `clear=true` 时，响应中的计数和 `rawBufferTruncated`
+描述清理前的状态，下次读取才反映清理后的缓冲区；精确读取 ANSI 或二进制输出用 `dataBase64`，`data` 是 UTF-8 文本预览
+
+文件读取支持 `encoding`（`auto`、`utf8`、`utf16le`、`utf16be`、`gbk`）和无损 `binary=true`；偏移按字节计量，分页使用
+`next_offset`，非零偏移读取 UTF-16 时显式指定编码；预算不足以容纳下一个完整字符时返回错误，不再成功返回空页，EOF 处编码无效也会失败；binary 读取按实际字节前移；`lineRange`
+的行号和末行换行状态只描述已返回的前缀
+
+连接 Windows 主机须设置 `remotePlatform="windows"`，本机为 Windows 不会改变远端默认值；按主机设置 `commandShell` 和
+`remotePathStyle`，使用 Windows rsync 时显式设置 `rsyncProfile`；下文 Windows 功能和示例继续适用
+
 ## 功能特性
 
 - **多种认证方式**：密码、SSH 密钥
@@ -127,6 +144,9 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_quick_exec`    | 一次性执行：连接、执行、断开    |
 | `ssh_exec_script`   | 上传并执行远端临时脚本          |
 
+远端为 Windows 时，`ssh_exec_script` 给 PowerShell 脚本写入 UTF-8 BOM，避免 Windows
+PowerShell 将 Unicode 脚本误读为系统编码；CMD 脚本先切换到代码页 65001 再执行 UTF-8 内容，切换失败则终止。POSIX 脚本内容保持不变
+
 ### 可跟踪任务
 
 | 工具                   | 描述                                    |
@@ -134,7 +154,7 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_operation_start`  | 启动可跟踪的长时间远端命令              |
 | `ssh_operation_status` | 读取状态、PID、退出码和输出计数         |
 | `ssh_operation_read`   | 按字节偏移读取有上限的 stdout 和 stderr |
-| `ssh_operation_cancel` | 校验任务 marker 后发送 TERM             |
+| `ssh_operation_cancel` | 校验进程身份后取消任务                  |
 | `ssh_operation_list`   | 列出未过期任务，可按 alias 过滤         |
 
 ### 文件操作
@@ -169,6 +189,53 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_forward_remote` | 远程端口转发（ssh -R）：暴露本地服务 |
 | `ssh_forward_close`  | 关闭端口转发                         |
 | `ssh_forward_list`   | 列出所有端口转发                     |
+
+## Windows 与跨平台 SSH
+
+连接 Windows 主机时设置 `remotePlatform="windows"`；默认值始终是 `posix`，与客户端操作系统无关；Windows 默认使用
+`commandShell="powershell"` 和 `remotePathStyle="win32"`；远端 SFTP 若使用 `/C:/...`，设置
+`remotePathStyle="sftp-posix"`；还可选择 `commandShell="cmd"`，`cwd` 和 `env`
+与完整命令放在同一个 shell 命令组中，cmd 注入值含无法安全处理的展开字符时会拒绝；`ssh_quick_exec` 同样支持
+`remotePlatform`、`commandShell` 和 `agent`；Windows 的 `runAs`、`ssh_exec_as_user` 和 `ssh_exec_sudo` 在发送命令前返回
+`unsupported_remote_platform`
+
+```text
+ssh_connect(host="example.com", user="tester", agent="\\\\.\\pipe\\openssh-ssh-agent", remotePlatform="windows", commandShell="powershell", remotePathStyle="win32", rsyncProfile="native-win32")
+ssh_exec(alias="tester@example.com:22", command="Get-Location", cwd="C:\\Test Data", env={REGION:"test"})
+ssh_read_file(alias="tester@example.com:22", remotePath="C:\\Test Data\\report.txt", lineRange="1-20", encoding="utf16le")
+```
+
+`ssh_connect(agent="...")` 会将 agent socket 或 Windows OpenSSH named pipe 传给 ssh2；Windows 还支持 ssh2 的
+`agent="pageant"`；未显式设置 agent 和私钥时，SSH config 的 `IdentityAgent` 可提供路径；`IdentityAgent none` 或
+`agent="none"`
+明确禁用 agent 和环境 socket 回退，即使配置私钥也保留禁用状态，ProxyJump 主机同样适用；密码和密钥认证仍可使用；显式参数或模板中的
+`agent` 优先于 SSH config；重连保留该选择，外部 OpenSSH/rsync 在 `none`
+下也禁用环境 agent；连接结果返回远端平台、shell、路径格式，以及 Windows 私钥的
+`keyAclStatus`；已有私钥只校验权限，不自动修改；`key_acl_insecure`、`key_acl_unverified`
+均拒绝读取；Windows 会话文件和临时下载文件在写入正文前设置并验证私有 DACL；Windows 脚本和 atomic 上传的临时文件先由 SFTP 独占创建空文件，DACL 验证后才写入正文，清理也使用 SFTP
+
+Windows tracked operation 返回 PID 与创建时间；取消时检查进程命令行中的随机 marker 和创建时间，匹配后才执行
+`taskkill /T /F`；`cancellationStatus` 分别返回 `requested`、`unknown` 或 `unsupported`，关闭 SSH
+channel 不代表取消成功；DACL 和进程行为仍需原生 Windows 环境验收
+
+`ssh_read_file.lineRange` 只通过 SFTP 扫描，支持 CRLF、UTF-8、UTF-16LE/BE 和 GBK；`encoding="auto"`
+在文件起始处识别 BOM；`binary=true` 返回无损 base64，`content` 和 `content_base64`
+均含编码结果；偏移仍指向远端文件字节；GBK 的随机字节偏移与 tail 无法证明字符边界，需使用 `lineRange` 或
+`binary=true`；非零偏移读取 UTF-16 时须显式指定编码；`ssh_exec.maxOutputSize`
+分别限制 stdout/stderr 正文的 UTF-8 字节数，截断由 `stdoutTruncated`、`stderrTruncated` 单独提示；PTY raw 的
+`dataBase64` 保存原始字节，`data` 是文本预览
+
+目录校验通过 SFTP 有界遍历与流式哈希；Windows 上不接受 POSIX `verify.owner`、`verify.mode`；`verify.aclSddl`
+可单独比较 Windows 远端根目录的 DACL SDDL；覆盖已有目标时，`ssh_upload(atomic=true)` 在传输前检查 SFTP
+`posix-rename@openssh.com` 扩展，无法确认支持时不覆盖旧文件；`ssh_sync` 支持
+`rsyncProfile`（`posix`、`native-win32`、`msys2`、`cygwin`）和远端
+`rsyncExecutable`；本机或远端为 Windows 时须显式设置 profile 才探测 rsync；预检失败时改用 SFTP 并返回
+`selectedTransport` 与 `decisionReason`；rsync 传输开始后失败时远端状态标为未知，不自动重新传输
+
+Windows 目录上传会在两种传输开始前，按 `exclude` 和 `followSymlinks` 筛选后的源名称检查候选碰撞；名称比较使用 Windows
+ordinal 大小写规则，并查询已存在目标父目录的大小写敏感标志；确认碰撞返回
+`windows_filename_collision`，父目录不存在、shell 不可用、查询超时或响应不完整则返回
+`case_semantics_unverified`，此时没有上传或创建目录，dry-run 也不写入；已存在且启用大小写敏感的目录允许保留仅大小写不同的名称，不从祖先目录推断新目录的规则；没有候选时不增加 PowerShell 或 exec 要求，普通 SFTP-only 上传继续可用，POSIX 上传保留其名称语义
 
 ## 使用示例
 
@@ -302,10 +369,11 @@ ssh_connect(
 `profileLoaded`、`envInjectedKeys`、`failureKind`、`stdoutBytes`、`stderrBytes` 和截断提示，大输出会返回 `stdoutHead`、
 `stdoutTail`、`stderrHead`、`stderrTail` 和 `recommendedReadCommand`。
 
-timeout 错误也包含超时前已经产生的 head/tail 输出。
+timeout 错误也包含超时前已经产生的 head/tail 输出。stdout 和 stderr 使用增量解码，UTF-8 字符即使跨越多个 SSH data
+chunk，也会完整返回。
 
-包含 destructive、process-control、service-control、credential-bearing、未限制 `find`、递归
-`grep`、长管道、后台任务、直接 `su - user -c` 或长运行模式的命令会返回带 `categories` 和 `signals` 的 `commandRisk`
+`commandRisk`
+按所选 shell 报告破坏性、提权、凭据参数、进程控制及资源使用风险。只读搜索中的敏感词和普通 Python/Node 命令不会仅凭词语触发风险提示
 
 ### 可跟踪的长时间命令
 
@@ -362,7 +430,8 @@ ssh_exec_script(alias="server", script=<script-above>, timeout=30000)
 ssh_read_file(alias="server", remotePath="/tmp/mcp-log-errors.txt", maxBytes=65536)
 ```
 
-日志查询由通用命令和文件工具组合完成，不再提供独立的日志专用 MCP 工具
+日志查询由通用命令和文件工具组合完成，不再提供独立的日志专用 MCP 工具。`ssh_exec_script.timeout`
+同时用于临时脚本上传、权限准备和执行阶段；SFTP 上传停滞时按请求的 timeout 结束，不再使用默认 SFTP 预算
 
 ### 设置环境变量
 
@@ -428,22 +497,26 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180"
 `verifySize`、`verifyMd5`、`verifyMode`、`verifyOwner`、`verifyMtime`
 会追加显式传输校验，父目录和目标探测、递归建目录、文件哈希、rename、临时文件清理都使用 SFTP，普通上传不依赖 GNU
 `stat`、`md5sum`、`sha256sum`、`mkdir`、`mv` 或
-`rm`，可用于禁用 exec 的 SFTP-only 服务和 BSD 系统，显式目录 manifest 校验仍会执行远端 shell 命令
+`rm`，可用于禁用 exec 的 SFTP-only 服务和 BSD 系统，目录 manifest 校验也通过 SFTP 读取远端目录树
 
-`ssh_download` 先写入目标同目录的临时文件，SFTP 流关闭且传输字节数与 SFTP `stat`
-报告的大小一致后再 rename 到本地目标；下载失败、提前截断或取消时会删除临时文件，已有本地目标保持原内容，SFTP 目录列表在构造子路径前会拒绝空名称、`.`、
-`..`、NUL 和路径分隔符
+`ssh_download` 先以 `0600` mode 写入目标同目录的临时文件，SFTP 流关闭且传输字节数与 SFTP `stat`
+报告的大小一致后再 rename 到本地目标。新文件保持 `0600`；替换普通文件时保留其 `rwx`
+位，但不复制 setuid、setgid 或 sticky 位。目标是 symlink、目录或其他非普通对象时，在远端读取开始前拒绝。下载失败、提前截断或取消时会删除临时文件，已有本地目标保持原内容。SFTP 目录列表在构造子路径前会拒绝空名称、`.`、`..`、NUL 和路径分隔符
 
 命令执行结果在远端命令非零退出且没有 stdout/stderr 时返回 `emptyOutputFailure=true`，同时给出 effective
 user、cwd 和可用的后续读取建议，`ssh_read_file` 默认读取 1 MiB，`maxBytes` 超过 16 MiB 时会在远端传输前拒绝，返回
 `total_size`、
 `read_offset`、`requested_offset`、`read_bytes`、`read_end`、`next_offset`、`remaining_bytes`、`sample_kind` 和
 `truncated`，调用方可以区分完整读取、头部样本、尾部样本、字节范围和行范围。文本读取不会截断 UTF-8 字符，后续分段应使用
-`next_offset`。
+`next_offset`。行范围读取不执行远端 shell 工具。
 
 `ssh_upload`、`ssh_download`、`ssh_read_file`、`ssh_write_file`、`ssh_list_dir`、`ssh_file_info` 和 `ssh_mkdir`
 支持单个 SFTP 操作的 `timeout`，默认 10 分钟，最大 1 小时。超时返回 `operationStatus="unknown"` 和
 `retryable=true`，重试前应检查受影响的远端或本地路径
+
+`ssh_list_dir` 和 `ssh_file_info` 返回按 `07777` 掩码提取的数值 `mode`，`permissions` 用作展示，其中 setuid/setgid 使用
+`s`/`S`，sticky 使用 `t`/`T`。`verifyMode` 支持 `4755` 等四位八进制值和 `-rwsr-xr-x`
+等权限文本；校验直接比较数值 mode，不从展示文本反向推导
 
 ### 使用 rsync 或 SFTP 同步目录
 
@@ -496,8 +569,9 @@ ssh_sync(..., delete=true, verify={deletions: true})
 目录源路径在 rsync 和 SFTP 模式下都表示“把源目录内容同步到目标根目录”，目录源使用 `recursive=false`
 会被明确拒绝，相对排除模式按源目录下的相对路径匹配，不含 `/` 的模式匹配每一级 basename
 
-目录校验会生成有界的本地和远端 manifest，可比较条目数、SHA-256 root manifest、owner、mode、旧文件和删除结果，
-`verify.deletions=true` 必须同时设置 `delete=true`，工具会在传输前记录目标目录，只检查这些删除候选是否消失，`staleFiles`
+目录校验会生成有界的本地和远端 manifest，可比较条目数、SHA-256 root
+manifest、owner、包括 setuid、setgid、sticky 在内的四位八进制 mode、旧文件和删除结果。`verify.deletions=true`
+必须同时设置 `delete=true`，工具会在传输前记录目标目录，只检查这些删除候选是否消失，`staleFiles`
 则独立检查目标端全部额外条目，响应只返回摘要和最多 20 个 mismatch 样本，不返回完整 manifest，默认上限为 10000 个条目、单文件 256
 MiB、总哈希字节 1 GiB，可通过 `verify.maxEntries`、`verify.maxFileBytes` 和 `verify.maxTotalBytes`
 提高到最多 50000 个条目、单文件 4 GiB、总哈希字节 16 GiB，遇到被跳过的 symlink 或不支持的文件系统条目时，校验会明确返回
@@ -551,10 +625,13 @@ ssh_pty_read(ptyId="pty_1_xxx")
 ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 ```
 
-`ssh_pty_read` 和 `ssh_pty_list` 返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`unreadRawBytes`、`rawBufferLimit`、
-`foregroundProcess`，便于观察长时间运行的会话，无需读取完整 raw 流，有限命令自然结束后仍可读取最终 screen，返回
+`ssh_pty_read` 和 `ssh_pty_list` 返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`bufferSize`、
+`unreadRawBytes`、`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`。三个 size 字段都按字节计数。screen 输出使用增量解码；raw 的
+`dataBase64` 无损保存原始字节，包括不完整的 UTF-8 序列，`data` 是文本预览。`rawBufferTruncated=true`
+表示从上次 clear 起已有更早的 raw 输出因字节上限被丢弃。raw 读取默认
+`clear=true`，响应返回清理前的字节数和截断标志，随后重置 raw 缓冲区和标志；screen 读取不清理 raw 状态。有限命令自然结束后仍可读取最终 screen，返回
 `active=false`，直到显式 close 或 closed session 保留期结束，默认 5 分钟，可通过 `SSH_MCP_PTY_CLOSED_RETENTION_MS`
-调整。`ssh_pty_write` 返回 `accepted=true` 表示本地 stream 已接收输入，`backpressured=true`
+调整。`ssh_pty_write` 返回 `accepted=true` 表示本地 stream 已接收输入， `backpressured=true`
 只表示缓冲区达到高水位，不代表输入丢失。`ssh_pty_close` 返回 `closed`、`not_found`、`failed` 或
 `unknown`，可重试的失败会保留 PTY 状态
 
@@ -601,8 +678,9 @@ forward 在 `listen` 或 `forwardIn` 完成前就进入生命周期管理，disc
 creation。延迟返回的本地 listener 会被关闭，延迟分配的远端 listener 会被移除；close 开始后立即拒绝新的本地或远端连接。
 `forwardOut`、close 和 unforward 的延迟 callback 修改状态前会检查同一生命周期记录，已关闭的 forward 不会重新出现在
 `ssh_forward_list`；每条本地转发连接同时跟踪本地 socket 和 SSH `forwardOut`
-channel，任一端关闭或失败都会销毁另一端，force close 只在两端都销毁且 `activeConnections`
-归零后返回；每个 alias 最多允许 32 个 pending `forwardOut`
+channel，任一端关闭或失败都会销毁另一端，force close 只在两端都销毁且 `activeConnections` 归零后返回。remote force
+close 在 `unforwardIn`
+后遵循相同的连接排空规则，同一连接两端的 close/error 事件只递减一次计数。每个 alias 最多允许 32 个 pending `forwardOut`
 请求，close 会等待全部 callback；如果 SSH 服务端始终不回应 channel-open，请求会超时并保留可重试的 forward，同时拒绝同 alias 新建 local
 forward，避免 ssh2 pending channel 继续累积，此时断开 alias 才能释放始终不返回的底层请求
 
@@ -632,16 +710,16 @@ forward，避免 ssh2 pending channel 继续累积，此时断开 alias 才能�
 
 ### 执行选项
 
-| 选项            | 类型    | 默认值       | 描述                            |
-| --------------- | ------- | ------------ | ------------------------------- |
-| `timeout`       | number  | 30000        | 命令超时（毫秒）                |
-| `cwd`           | string  | -            | 工作目录                        |
-| `env`           | object  | -            | 额外环境变量                    |
-| `pty`           | boolean | false        | 启用 PTY 模式（用于交互式命令） |
-| `maxOutputSize` | number  | 10 MB 字符   | 输出截断上限                    |
-| `runAs`         | string  | 连接级 runAs | 本次命令执行用户                |
-| `useLoginUser`  | boolean | false        | 跳过连接级 runAs                |
-| `loadProfile`   | boolean | true         | runAs 时加载目标用户 shell 配置 |
+| 选项            | 类型    | 默认值       | 描述                                |
+| --------------- | ------- | ------------ | ----------------------------------- |
+| `timeout`       | number  | 30000        | 命令超时（毫秒）                    |
+| `cwd`           | string  | -            | 工作目录                            |
+| `env`           | object  | -            | 额外环境变量                        |
+| `pty`           | boolean | false        | 启用 PTY 模式（用于交互式命令）     |
+| `maxOutputSize` | number  | 10 MiB 字节  | stdout/stderr 各自的 UTF-8 字节上限 |
+| `runAs`         | string  | 连接级 runAs | 本次命令执行用户                    |
+| `useLoginUser`  | boolean | false        | 跳过连接级 runAs                    |
+| `loadProfile`   | boolean | true         | runAs 时加载目标用户 shell 配置     |
 
 传入 `cwd` 或 `env` 时，生成的 shell 命令会用 `&&` 连接 `cd` 和每个通过校验的
 `export`，再把完整用户命令作为当前登录 shell 的一个转义后 `eval`

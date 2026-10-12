@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, execFile as execFileCallback } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -421,6 +422,69 @@ test('exec rejects a delayed callback after disconnect and reconnect', async (t)
     await assert.rejects(pending, /SSH session changed/)
     assert.equal(channel.destroyed, true)
     assert.equal(closeCalled(), true)
+})
+
+test('exec incrementally decodes UTF-8 split across stdout and stderr chunks', async (t) => {
+    const { manager } = createManager(t)
+    let channel
+    const client = {
+        exec(_command, _options, callback) {
+            channel = createChannel().channel
+            callback(null, channel)
+        },
+        end() {},
+    }
+    manager.sessions.set('server', createSession(client))
+
+    const pending = manager.exec('server', 'printf output')
+    const stdout = Buffer.from('中😀')
+    const stderr = Buffer.from('😀中')
+    channel.emit('data', stdout.subarray(0, 1))
+    channel.emit('data', stdout.subarray(1, 4))
+    channel.emit('data', stdout.subarray(4))
+    channel.stderr.emit('data', stderr.subarray(0, 2))
+    channel.stderr.emit('data', stderr.subarray(2, 5))
+    channel.stderr.emit('data', stderr.subarray(5))
+    channel.emit('close', 0)
+
+    const result = await pending
+    assert.equal(result.stdout, '中😀')
+    assert.equal(result.stderr, '😀中')
+    assert.equal(result.stdoutBytes, stdout.length)
+    assert.equal(result.stderrBytes, stderr.length)
+})
+
+test('execSudo incrementally decodes UTF-8 split across stdout and stderr chunks', async (t) => {
+    const { manager } = createManager(t)
+    const channel = new EventEmitter()
+    channel.stderr = new EventEmitter()
+    channel.write = () => true
+    channel.end = () => {}
+    channel.close = () => channel.emit('close', 0)
+    const client = {
+        exec(_command, _options, callback) {
+            callback(null, channel)
+        },
+        end() {},
+    }
+    manager.sessions.set('server', createSession(client))
+
+    const pending = manager.execSudo('server', 'printf output', 'test-password')
+    const stdout = Buffer.from('中😀')
+    const stderr = Buffer.from('😀中')
+    channel.emit('data', stdout.subarray(0, 2))
+    channel.emit('data', stdout.subarray(2, 5))
+    channel.emit('data', stdout.subarray(5))
+    channel.stderr.emit('data', stderr.subarray(0, 1))
+    channel.stderr.emit('data', stderr.subarray(1, 6))
+    channel.stderr.emit('data', stderr.subarray(6))
+    channel.emit('close', 0)
+
+    const result = await pending
+    assert.equal(result.stdout, '中😀')
+    assert.equal(result.stderr, '😀中')
+    assert.equal(result.stdoutBytes, stdout.length)
+    assert.equal(result.stderrBytes, stderr.length)
 })
 
 test('execSudo closes a delayed callback without writing the password after timeout', async (t) => {

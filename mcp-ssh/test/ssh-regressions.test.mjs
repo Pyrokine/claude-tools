@@ -8,14 +8,12 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 import { classifyCommandRisk } from '../dist/command-risk.js'
 import {
-    buildRemoteDirectoryManifestCommand,
+    createRemoteDirectoryManifest,
     compareDirectoryManifests,
     createLocalDirectoryManifest,
     matchesDirectoryExclude,
-    parseRemoteDirectoryManifest,
 } from '../dist/directory-verification.js'
 import {
-    buildLineRangeAwkProgram,
     checkRsync,
     clearRsyncCache,
     downloadFile,
@@ -26,17 +24,65 @@ import {
     syncFiles,
     uploadFile,
 } from '../dist/file-ops.js'
+import { formatFileMode, formatFilePermissions, parseExpectedFileMode } from '../dist/file-mode.js'
 import { sessionManager, SessionManager } from '../dist/session-manager.js'
+import { registerExecTools } from '../dist/tools/exec.js'
 import { createAtomicUploadPath, registerFileTools } from '../dist/tools/file.js'
 import { dynamicSshPortSchema, sshPortSchema } from '../dist/tools/schema.js'
 import { buildTransferOutcome } from '../dist/transfer-outcome.js'
 
 const exec = promisify(execCallback)
 
+// File-operation fixtures replace getSftp without opening a real SessionManager connection.
+const originalPathStyle = sessionManager.getRemotePathStyle.bind(sessionManager)
+const originalPlatform = sessionManager.getRemotePlatform.bind(sessionManager)
+sessionManager.getRemotePathStyle = (alias) => (sessionManager.sessions.has(alias) ? originalPathStyle(alias) : 'posix')
+sessionManager.getRemotePlatform = (alias) => (sessionManager.sessions.has(alias) ? originalPlatform(alias) : 'posix')
+
 function makeTempDir(t) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-ssh-test-'))
     t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
     return directory
+}
+
+function fixtureSftp() {
+    const read = new Set()
+    const callStat = (method) => (remotePath, callback) => {
+        try {
+            const stats = fs[method](remotePath)
+            callback(null, { mode: stats.mode, size: stats.size, uid: stats.uid })
+        } catch (error) {
+            callback(error)
+        }
+    }
+    return {
+        stat: callStat('statSync'),
+        lstat: callStat('lstatSync'),
+        realpath(remotePath, callback) {
+            callback(null, fs.realpathSync(remotePath))
+        },
+        opendir(remotePath, callback) {
+            callback(null, Buffer.from(remotePath))
+        },
+        readdir(handle, callback) {
+            const directory = handle.toString()
+            if (read.has(directory)) {
+                callback(Object.assign(new Error('EOF'), { code: 1 }))
+                return
+            }
+            read.add(directory)
+            callback(
+                null,
+                fs.readdirSync(directory).map((filename) => ({ filename, attrs: {} }))
+            )
+        },
+        close(_handle, callback) {
+            callback(null)
+        },
+        createReadStream(remotePath) {
+            return fs.createReadStream(remotePath)
+        },
+    }
 }
 
 test('SSH port schemas reject out-of-range and fractional values', () => {
@@ -48,18 +94,10 @@ test('SSH port schemas reject out-of-range and fractional values', () => {
     assert.equal(dynamicSshPortSchema.safeParse(65535).success, true)
 })
 
-test('lineRange awk program keeps statements separated', () => {
-    const program = buildLineRangeAwkProgram(2, 4)
-    assert.match(program, /^BEGIN \{.*\}$/m)
-    assert.match(program, /^NR >= 2 && NR <= 4 \{$/m)
-    assert.match(program, /^ {4}actual_end = NR$/m)
-    assert.match(program, /^END \{$/m)
-})
-
 test('command risk keeps bounded read-only pipelines below high and flags destructive commands', () => {
     const readOnly = classifyCommandRisk('grep -R "Build ID" /opt/app | sort | uniq | head -20', 30_000)
-    assert.equal(readOnly?.level, 'medium')
-    assert.equal(classifyCommandRisk('printf x | sed s/x/y/ | sort | uniq | head -1', 30_000)?.level, 'medium')
+    assert.equal(readOnly, undefined)
+    assert.equal(classifyCommandRisk('printf x | sed s/x/y/ | sort | uniq | head -1', 30_000), undefined)
     assert.equal(classifyCommandRisk('printf x 2>&1'), undefined)
     assert.equal(classifyCommandRisk('printf x &>/tmp/example.log'), undefined)
     assert.equal(classifyCommandRisk('printf "x\\&y"'), undefined)
@@ -116,6 +154,36 @@ test('SFTP upload masks create mode to permission bits', async (t) => {
     assert.equal(requestedMode, 0o777)
     assert.equal(requestedFlags, 'w')
     assert.equal(result.createMode, '0777')
+})
+
+test('file mode metadata and permission text preserve special bits', async () => {
+    const cases = [
+        [0o104755, '4755', '-rwsr-xr-x'],
+        [0o104644, '4644', '-rwSr--r--'],
+        [0o102755, '2755', '-rwxr-sr-x'],
+        [0o102644, '2644', '-rw-r-Sr--'],
+        [0o101755, '1755', '-rwxr-xr-t'],
+        [0o101644, '1644', '-rw-r--r-T'],
+    ]
+    for (const [mode, octal, permissions] of cases) {
+        assert.equal(formatFileMode(mode), octal)
+        assert.equal(formatFilePermissions(mode), permissions)
+        assert.equal(parseExpectedFileMode(permissions), Number.parseInt(octal, 8))
+        assert.equal(parseExpectedFileMode(octal), Number.parseInt(octal, 8))
+    }
+    assert.equal(parseExpectedFileMode('755'), 0o755)
+    assert.equal(parseExpectedFileMode('-rwxr-xr-x'), 0o755)
+    assert.equal(parseExpectedFileMode('-rwxr-xr-z'), undefined)
+
+    const attrs = { size: 0, mode: 0o104755, uid: 1, gid: 2, mtime: 0, atime: 0 }
+    const files = await listDir('unused', '/remote', true, {
+        readdir(_remotePath, callback) {
+            callback(null, [{ filename: 'setuid-file', attrs }])
+        },
+        end() {},
+    })
+    assert.equal(files[0].mode, 0o4755)
+    assert.equal(files[0].permissions, '-rwsr-xr-x')
 })
 
 test('atomic upload paths are unpredictable and exclusive SFTP writes refuse reuse', async (t) => {
@@ -217,6 +285,7 @@ test('synchronous SFTP read stream failure closes an owned session without tempo
     const originalGetSftp = sessionManager.getSftp
     let endCalls = 0
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(_remotePath, callback) {
             callback(null, { size: 12 })
         },
@@ -259,6 +328,102 @@ test('clean premature SFTP EOF preserves the existing target and removes tempora
     assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
 })
 
+test('atomic SFTP download keeps temporary files private and preserves ordinary target permissions', async (t) => {
+    if (process.platform === 'win32') {
+        t.skip('POSIX file modes are not available on Windows')
+        return
+    }
+    const directory = makeTempDir(t)
+    const payload = Buffer.from('replacement')
+    const cases = [
+        { name: 'new.txt', mode: undefined, expected: 0o600 },
+        { name: 'private.txt', mode: 0o600, expected: 0o600 },
+        { name: 'group.txt', mode: 0o750, expected: 0o750 },
+        { name: 'setuid.txt', mode: 0o4755, expected: 0o755 },
+    ]
+
+    for (const entry of cases) {
+        const localPath = path.join(directory, entry.name)
+        if (entry.mode !== undefined) {
+            fs.writeFileSync(localPath, 'original')
+            fs.chmodSync(localPath, entry.mode)
+        }
+        const remoteStream = new Readable({ read() {} })
+        const sftp = {
+            stat(_remotePath, callback) {
+                callback(null, { size: payload.length })
+            },
+            createReadStream() {
+                return remoteStream
+            },
+            end() {},
+        }
+
+        const pending = downloadFile('unused', '/remote/target.txt', localPath, undefined, sftp)
+        let temporaryPath
+        for (let attempt = 0; attempt < 100; ++attempt) {
+            temporaryPath = fs.readdirSync(directory).find((name) => name.startsWith(`.${entry.name}.mcp-tmp-`))
+            if (temporaryPath) {
+                break
+            }
+            await new Promise((resolve) => setImmediate(resolve))
+        }
+        assert.ok(temporaryPath, `temporary file was not created for ${entry.name}`)
+        assert.equal(fs.statSync(path.join(directory, temporaryPath)).mode & 0o7777, 0o600)
+
+        remoteStream.push(payload)
+        remoteStream.push(null)
+        const result = await pending
+        assert.equal(result.success, true)
+        assert.equal(fs.readFileSync(localPath, 'utf8'), payload.toString())
+        assert.equal(fs.statSync(localPath).mode & 0o7777, entry.expected)
+        assert.equal(
+            fs.readdirSync(directory).some((name) => name.startsWith(`.${entry.name}.mcp-tmp-`)),
+            false
+        )
+    }
+})
+
+test('atomic SFTP download rejects non-regular local targets before remote reads', async (t) => {
+    if (process.platform === 'win32') {
+        t.skip('symlink and FIFO target checks require POSIX filesystem behavior')
+        return
+    }
+    const directory = makeTempDir(t)
+    const source = path.join(directory, 'source.txt')
+    const symlink = path.join(directory, 'target-link')
+    const targetDirectory = path.join(directory, 'target-directory')
+    const fifo = path.join(directory, 'target-fifo')
+    fs.writeFileSync(source, 'original')
+    fs.symlinkSync(source, symlink)
+    fs.mkdirSync(targetDirectory)
+    await exec(`mkfifo ${JSON.stringify(fifo)}`)
+
+    let statCalls = 0
+    let readCalls = 0
+    const sftp = {
+        stat(_remotePath, callback) {
+            ++statCalls
+            callback(null, { size: 1 })
+        },
+        createReadStream() {
+            ++readCalls
+            return Readable.from(['x'])
+        },
+        end() {},
+    }
+
+    for (const localPath of [symlink, targetDirectory, fifo]) {
+        await assert.rejects(
+            downloadFile('unused', '/remote/target.txt', localPath, undefined, sftp),
+            /non-regular local target/
+        )
+    }
+    assert.equal(statCalls, 0)
+    assert.equal(readCalls, 0)
+    assert.equal(fs.readFileSync(source, 'utf8'), 'original')
+})
+
 test('recursive SFTP mkdir creates missing parents without remote exec', async () => {
     const directories = new Set(['/'])
     const created = []
@@ -288,6 +453,7 @@ test('SFTP read pagination returns whole UTF-8 characters and next byte offsets'
     const content = Buffer.from('A😀B')
     const originalGetSftp = sessionManager.getSftp
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(_remotePath, callback) {
             callback(null, { size: content.length })
         },
@@ -319,6 +485,7 @@ test('SFTP timeout reports an unknown remote operation state and ignores late ca
     let ended = false
     let statCallback
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(_remotePath, callback) {
             statCallback = callback
         },
@@ -342,6 +509,59 @@ test('SFTP timeout reports an unknown remote operation state and ignores late ca
     assert.equal(ended, true)
     statCallback(null, { size: 0, mode: 0o100644, uid: 1, gid: 1, mtime: 0, atime: 0 })
     await new Promise((resolve) => setImmediate(resolve))
+})
+
+test('exec_script applies its timeout while uploading the temporary script', async (t) => {
+    const handlers = new Map()
+    registerExecTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+    const originalExec = sessionManager.exec
+    const originalGetSftp = sessionManager.getSftp
+    const commands = []
+    let endCalls = 0
+    sessionManager.exec = async (_alias, command) => {
+        commands.push(command)
+        if (command === 'mktemp /tmp/mcp-ssh-script.XXXXXX') {
+            return { success: true, stdout: '/tmp/mcp-ssh-script.fixture\n', stderr: '', exitCode: 0 }
+        }
+        assert.fail(`exec_script reached the execution stage: ${command}`)
+    }
+    sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
+        createWriteStream() {
+            return new Writable({
+                write() {},
+            })
+        },
+        unlink(_remotePath, callback) {
+            callback(null)
+        },
+        end() {
+            ++endCalls
+        },
+    })
+    t.after(() => {
+        sessionManager.exec = originalExec
+        sessionManager.getSftp = originalGetSftp
+    })
+
+    const startedAt = Date.now()
+    const response = await handlers.get('ssh_exec_script')({
+        alias: 'stalled-upload',
+        script: 'printf never-executed',
+        timeout: 20,
+    })
+    const result = JSON.parse(response.content[0].text)
+    const duration = Date.now() - startedAt
+
+    assert.equal(result.success, false)
+    assert.match(result.error, /timed out after 20ms/)
+    assert.ok(duration >= 15 && duration < 500, `unexpected upload timeout duration: ${duration}ms`)
+    assert.equal(endCalls, 2) // timed-out upload and SFTP cleanup
+    assert.equal(commands.length, 1)
 })
 
 test('followSymlinks is rejected before transport selection when the local allowlist is configured', async (t) => {
@@ -430,6 +650,7 @@ test('ordinary upload uses SFTP probes and transfer on an exec-disabled server',
         throw new Error('exec is disabled')
     }
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(remotePath, callback) {
             if (remotePath === '/remote') {
                 callback(null, {
@@ -469,6 +690,73 @@ test('ordinary upload uses SFTP probes and transfer on an exec-disabled server',
     assert.equal(execCalls, 0)
 })
 
+test('upload mode verification compares all four permission digits', async (t) => {
+    const directory = makeTempDir(t)
+    const localPath = path.join(directory, 'source.txt')
+    fs.writeFileSync(localPath, 'payload')
+    const handlers = new Map()
+    registerFileTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+
+    const originalGetSftp = sessionManager.getSftp
+    const createModes = []
+    sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
+        stat(remotePath, callback) {
+            callback(null, {
+                size: remotePath === '/remote' ? 0 : 7,
+                mode: remotePath === '/remote' ? 0o040755 : 0o104755,
+                uid: 1000,
+                gid: 1000,
+                mtime: 1,
+                atime: 1,
+            })
+        },
+        createWriteStream(_remotePath, options) {
+            createModes.push(options.mode)
+            return new Writable({
+                write(_chunk, _encoding, callback) {
+                    callback()
+                },
+            })
+        },
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+
+    const mismatchResponse = await handlers.get('ssh_upload')({
+        alias: 'mode-test',
+        localPath,
+        remotePath: '/remote/target.txt',
+        verifyMode: '0755',
+    })
+    const mismatch = JSON.parse(mismatchResponse.content[0].text)
+    assert.equal(mismatch.transferSuccess, true)
+    assert.equal(mismatch.success, false)
+    assert.equal(mismatch.verification.checks.mode, false)
+    assert.equal(mismatch.verification.actual.mode, '4755')
+    assert.equal(mismatch.verification.actual.modeValue, 0o4755)
+    assert.equal(mismatch.verification.actual.permissions, '-rwsr-xr-x')
+
+    const matchResponse = await handlers.get('ssh_upload')({
+        alias: 'mode-test',
+        localPath,
+        remotePath: '/remote/target.txt',
+        verifyMode: '-rwsr-xr-x',
+    })
+    const match = JSON.parse(matchResponse.content[0].text)
+    assert.equal(match.success, true)
+    assert.equal(match.verification.checks.mode, true)
+    assert.equal(match.verification.expected.mode, '4755')
+    const sourceMode = fs.statSync(localPath).mode & 0o777
+    assert.deepEqual(createModes, [sourceMode, sourceMode])
+})
+
 test('atomic upload verifies the temporary file before replacing an existing target', async (t) => {
     const directory = makeTempDir(t)
     const localPath = path.join(directory, 'source.txt')
@@ -485,6 +773,7 @@ test('atomic upload verifies the temporary file before replacing an existing tar
     let renameCalls = 0
     let exclusiveWrites = 0
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(remotePath, callback) {
             if (remotePath === '/remote') {
                 callback(null, { size: 0, mode: 0o040755, uid: 1000, gid: 1000, mtime: 1, atime: 1 })
@@ -577,6 +866,7 @@ test('atomic upload uses OpenSSH replace only when the target already exists', a
     let renameCalls = 0
     let replaceCalls = 0
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(remotePath, callback) {
             if (remotePath === '/remote') {
                 callback(null, { size: 0, mode: 0o040755, uid: 1000, gid: 1000, mtime: 1, atime: 1 })
@@ -678,6 +968,7 @@ test('atomic upload reports an unknown target state when rename commits but its 
 
     const originalGetSftp = sessionManager.getSftp
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(remotePath, callback) {
             if (remotePath === '/remote') {
                 callback(null, { size: 0, mode: 0o040755, uid: 1000, gid: 1000, mtime: 1, atime: 1 })
@@ -764,6 +1055,7 @@ test('atomic upload reports a definite non-replacement when rename cannot be sta
 
     const originalGetSftp = sessionManager.getSftp
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(remotePath, callback) {
             if (remotePath === '/remote') {
                 callback(null, { size: 0, mode: 0o040755, uid: 1000, gid: 1000, mtime: 1, atime: 1 })
@@ -846,6 +1138,7 @@ test('atomic upload collision does not delete another operation temporary file',
     let collisionPath
     let unlinkCalls = 0
     sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
         stat(remotePath, callback) {
             if (remotePath === '/remote') {
                 callback(null, { size: 0, mode: 0o040755, uid: 1000, gid: 1000, mtime: 1, atime: 1 })
@@ -889,10 +1182,6 @@ test('atomic upload collision does not delete another operation temporary file',
 })
 
 test('directory manifests stream hashes, apply excludes, and compare local with remote output', async (t) => {
-    if (process.platform === 'win32') {
-        t.skip('remote manifest command targets POSIX SSH hosts')
-        return
-    }
     const directory = makeTempDir(t)
     fs.mkdirSync(path.join(directory, 'sub'))
     fs.writeFileSync(path.join(directory, 'sub', 'file name.txt'), 'content')
@@ -901,10 +1190,7 @@ test('directory manifests stream hashes, apply excludes, and compare local with 
     const exclude = ['*.tmp']
 
     const local = await createLocalDirectoryManifest(directory, request, exclude)
-    const command = buildRemoteDirectoryManifestCommand(directory, request, exclude)
-    // noinspection JSCheckFunctionSignatures — util.promisify 保留 exec 的参数签名
-    const { stdout } = await exec(command, { maxBuffer: 1024 * 1024 })
-    const remote = parseRemoteDirectoryManifest(stdout)
+    const remote = await createRemoteDirectoryManifest(fixtureSftp(), directory, request, exclude)
     const comparison = compareDirectoryManifests(local, remote, request)
 
     assert.equal(
@@ -913,6 +1199,29 @@ test('directory manifests stream hashes, apply excludes, and compare local with 
     )
     assert.equal(comparison.matched, true)
     assert.equal(comparison.summary.missing, 0)
+})
+
+test('directory mode verification includes setuid, setgid, and sticky bits', async (t) => {
+    if (process.platform === 'win32') {
+        t.skip('POSIX file modes are not available on Windows')
+        return
+    }
+    const directory = makeTempDir(t)
+    const filePath = path.join(directory, 'setuid-file')
+    fs.writeFileSync(filePath, 'content')
+    fs.chmodSync(filePath, 0o4755)
+    const request = { mode: true }
+    const local = await createLocalDirectoryManifest(directory, request)
+    assert.equal(local.entries.find((entry) => entry.path === 'setuid-file').mode, '4755')
+    const remote = await createRemoteDirectoryManifest(fixtureSftp(), directory, request)
+    assert.equal(remote.entries.find((entry) => entry.path === 'setuid-file').mode, '4755')
+
+    const withoutSetuid = { ...local, entries: local.entries.map((entry) => ({ ...entry })) }
+    withoutSetuid.entries.find((entry) => entry.path === 'setuid-file').mode = '0755'
+    const comparison = compareDirectoryManifests(local, withoutSetuid, request)
+    assert.equal(comparison.matched, false)
+    assert.equal(comparison.checks.mode, false)
+    assert.equal(comparison.summary.modeMismatch, 1)
 })
 
 // noinspection LongLine — 回归测试标题完整描述两个独立校验维度
@@ -954,7 +1263,7 @@ test('directory verification uses relative excludes and deletion baselines indep
 
 test('directory manifests report unsupported entries and follow a symlinked root', async (t) => {
     if (process.platform === 'win32') {
-        t.skip('remote manifest command targets POSIX SSH hosts')
+        t.skip('FIFO and symlink fixtures require POSIX filesystem behavior')
         return
     }
     const root = makeTempDir(t)
@@ -968,10 +1277,7 @@ test('directory manifests report unsupported entries and follow a symlinked root
 
     const request = { count: true }
     const local = await createLocalDirectoryManifest(linkedRoot, request)
-    const command = buildRemoteDirectoryManifestCommand(linkedRoot, request)
-    // noinspection JSCheckFunctionSignatures — util.promisify 保留 exec 的参数签名
-    const { stdout } = await exec(command, { maxBuffer: 1024 * 1024 })
-    const remote = parseRemoteDirectoryManifest(stdout)
+    const remote = await createRemoteDirectoryManifest(fixtureSftp(), linkedRoot, request)
     const comparison = compareDirectoryManifests(local, remote, request)
 
     assert.equal(

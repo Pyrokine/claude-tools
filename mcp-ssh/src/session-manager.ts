@@ -8,17 +8,21 @@
  * - 会话持久化
  */
 
-import { createHash } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import { Client, ClientChannel, ConnectConfig, ExecOptions as Ssh2ExecOptions, SFTPWrapper } from 'ssh2'
+import { StringDecoder } from 'string_decoder'
+import { isUtf8ContinuationByte, retainUtf8Suffix } from './utf8.js'
 import { clearRsyncCache } from './file-ops.js'
 import { ForwardManager } from './forward-manager.js'
 import { OperationManager } from './operation-manager.js'
 import { PtyManager } from './pty-manager.js'
+import { buildRemoteCommand, encodedPowershell, quotePowershell, remotePathStyle } from './remote-platform.js'
 import { sanitizeKeyError, validateKeyFile } from './security.js'
 import { escapeShellArg, expandTilde } from './tools/utils.js'
+import { checkWindowsAcl } from './windows-acl.js'
 import {
     ConnectionFailureDetails,
     DEFAULT_EXEC_MAX_OUTPUT_SIZE,
@@ -36,6 +40,7 @@ import {
     PortForwardInfo,
     PtyCloseResult,
     PtyOptions,
+    PtyReadResult,
     PtySessionInfo,
     PtyWriteResult,
     SSHConnectionConfig,
@@ -50,6 +55,7 @@ interface SSHSession {
     lastUsedAt: number
     reconnectAttempts: number
     connected: boolean // 通过事件监听维护的连接状态
+    authAgent?: string
     manualClose: boolean // 标记主动关闭，阻止 close 事件触发自动重连
     /** 当前正在等待的重连定时器,disconnect 时需要清除以防 zombie 重连 */
     reconnectTimer?: NodeJS.Timeout
@@ -78,6 +84,10 @@ interface SessionConnectionInfo {
     defaultEnvKeys: string[]
     envKeys: string[]
     hasJumpHost: boolean
+    remotePlatform: 'posix' | 'windows'
+    commandShell: 'posix' | 'cmd' | 'powershell'
+    remotePathStyle: 'posix' | 'win32' | 'sftp-posix'
+    keyAclStatus?: 'key_path_usable' | 'key_acl_insecure' | 'key_acl_unverified'
 }
 
 interface CommandContext {
@@ -131,6 +141,7 @@ export class SessionManager {
     private readonly forwardManager = new ForwardManager()
     private readonly operationManager: OperationManager
     private readonly persistPath: string
+    private persistQueue: Promise<void> = Promise.resolve()
     private defaultKeepaliveInterval = 30000 // 30秒
     private defaultKeepaliveCountMax = 3
     private defaultTimeout = 30000 // 30秒
@@ -143,8 +154,8 @@ export class SessionManager {
         this.operationManager = new OperationManager({
             openStream: (alias, command, marker, options, adopt) =>
                 this.openOperationStream(alias, command, marker, options, adopt),
-            cancelRemote: (alias, pid, marker, processGroup, options) =>
-                this.cancelRemoteOperation(alias, pid, marker, processGroup, options),
+            cancelRemote: (alias, pid, marker, processGroup, options, processCreatedAt) =>
+                this.cancelRemoteOperation(alias, pid, marker, processGroup, options, processCreatedAt),
         })
         this.ensurePersistDir()
     }
@@ -153,6 +164,20 @@ export class SessionManager {
      * 建立 SSH 连接（per-alias mutex，防止并发 connect 同一 alias 重复建连）
      */
     async connect(config: SSHConnectionConfig): Promise<string> {
+        const platform = config.remotePlatform ?? 'posix'
+        const shell = config.commandShell ?? (platform === 'windows' ? 'powershell' : 'posix')
+        if ((platform === 'windows') !== (shell !== 'posix')) {
+            throw new CommandError('commandShell must match remotePlatform', {
+                code: 'unsupported_remote_platform',
+                platform,
+                shell,
+            })
+        }
+        if (platform === 'windows' && config.runAs) {
+            throw new CommandError('runAs is not supported for Windows remote hosts', {
+                code: 'unsupported_remote_platform',
+            })
+        }
         const alias = this.generateAlias(config)
 
         const fingerprint = this.connectionFingerprint(config)
@@ -311,6 +336,10 @@ export class SessionManager {
             connectedAt: session.connectedAt,
             lastUsedAt: session.lastUsedAt,
             hasJumpHost: Boolean(session.config.jumpHost),
+            remotePlatform: session.config.remotePlatform ?? 'posix',
+            commandShell:
+                session.config.commandShell ?? (session.config.remotePlatform === 'windows' ? 'powershell' : 'posix'),
+            remotePathStyle: remotePathStyle(session.config.remotePlatform ?? 'posix', session.config.remotePathStyle),
         }))
     }
 
@@ -327,7 +356,37 @@ export class SessionManager {
             defaultEnvKeys: config.defaultEnv ? Object.keys(config.defaultEnv) : [],
             envKeys: config.env ? Object.keys(config.env) : [],
             hasJumpHost: Boolean(config.jumpHost),
+            remotePlatform: config.remotePlatform ?? 'posix',
+            commandShell: config.commandShell ?? (config.remotePlatform === 'windows' ? 'powershell' : 'posix'),
+            remotePathStyle: remotePathStyle(config.remotePlatform ?? 'posix', config.remotePathStyle),
+            keyAclStatus:
+                process.platform === 'win32' && config.privateKeyPath
+                    ? checkWindowsAcl(expandTilde(config.privateKeyPath))
+                    : undefined,
         }
+    }
+
+    requirePosixPrivilege(alias: string): void {
+        if (this.getRemotePlatform(alias) === 'windows') {
+            throw new CommandError('Remote Windows does not support su/sudo/runAs', {
+                code: 'unsupported_remote_platform',
+                remotePlatform: 'windows',
+            })
+        }
+    }
+
+    getRemotePlatform(alias: string): 'posix' | 'windows' {
+        return this.getSession(alias).config.remotePlatform ?? 'posix'
+    }
+
+    getRemotePathStyle(alias: string): 'posix' | 'win32' | 'sftp-posix' {
+        const config = this.getSession(alias).config
+        return remotePathStyle(config.remotePlatform ?? 'posix', config.remotePathStyle)
+    }
+
+    getCommandShell(alias: string): 'posix' | 'cmd' | 'powershell' {
+        const config = this.getSession(alias).config
+        return config.commandShell ?? (config.remotePlatform === 'windows' ? 'powershell' : 'posix')
     }
 
     getExternalTransferCapability(alias: string): ExternalTransferCapability {
@@ -344,21 +403,28 @@ export class SessionManager {
         const routeSafeForOpenSsh = !hasJumpHost
         const expandedKeyPath = config.privateKeyPath ? expandTilde(config.privateKeyPath) : undefined
         const keyPathUsable = authMethod === 'key-path' && this.isOpenSshKeyPathUsable(expandedKeyPath!)
-        const agentAvailable = authMethod === 'agent' && this.isSshAgentAvailable()
-        const rsyncEligible = routeSafeForOpenSsh && (keyPathUsable || agentAvailable)
+        const agent = session.authAgent ?? config.agent
+        const agentAvailable = authMethod === 'agent' && this.isSshAgentAvailable(agent)
+        const profileRequired =
+            (process.platform === 'win32' || config.remotePlatform === 'windows') && !config.rsyncProfile
+        const rsyncEligible = routeSafeForOpenSsh && (keyPathUsable || agentAvailable) && !profileRequired
         const decisionReason = hasJumpHost
             ? 'jump_host_route_requires_live_ssh_session'
             : authMethod === 'password'
               ? 'password_not_forwarded_to_openssh'
               : authMethod === 'inline-key'
                 ? 'inline_private_key_not_written_to_disk'
-                : authMethod === 'key-path'
-                  ? keyPathUsable
-                      ? 'direct_openssh_compatible_key_path'
-                      : 'key_path_not_openssh_compatible'
-                  : agentAvailable
-                    ? 'direct_ssh_agent_socket'
-                    : 'ssh_agent_socket_unavailable'
+                : authMethod === 'key-path' && !keyPathUsable
+                  ? 'key_path_not_openssh_compatible'
+                  : authMethod === 'agent' && !agentAvailable
+                    ? agent
+                        ? 'ssh_agent_not_openssh_compatible'
+                        : 'ssh_agent_socket_unavailable'
+                    : profileRequired
+                      ? 'rsync_profile_required_for_windows'
+                      : authMethod === 'key-path'
+                        ? 'direct_openssh_compatible_key_path'
+                        : 'direct_ssh_agent_socket'
         return {
             alias,
             identity: this.sessionIdentity(session),
@@ -371,6 +437,11 @@ export class SessionManager {
             routeSafeForOpenSsh,
             rsyncEligible,
             decisionReason,
+            agent: config.agent === 'none' ? 'none' : agentAvailable ? agent : undefined,
+            rsyncExecutable: config.rsyncExecutable,
+            rsyncProfile: config.rsyncProfile,
+            commandShell: config.commandShell ?? (config.remotePlatform === 'windows' ? 'powershell' : 'posix'),
+            remotePathStyle: remotePathStyle(config.remotePlatform ?? 'posix', config.remotePathStyle),
         }
     }
 
@@ -387,6 +458,9 @@ export class SessionManager {
     }
 
     operationStart(alias: string, command: string, options: OperationStartOptions = {}): Promise<OperationInfo> {
+        if (options.runAs || (this.getSession(alias).config.runAs && !options.useLoginUser)) {
+            this.requirePosixPrivilege(alias)
+        }
         return this.operationManager.start(alias, command, options)
     }
 
@@ -423,6 +497,7 @@ export class SessionManager {
         targetUser: string,
         options: ExecOptions & { loadProfile?: boolean } = {}
     ): Promise<ExecResult> {
+        this.requirePosixPrivilege(alias)
         // 校验用户名防止注入
         if (!this.isValidUsername(targetUser)) {
             throw new Error(`Invalid username: ${targetUser}`)
@@ -459,6 +534,7 @@ export class SessionManager {
         sudoPassword?: string,
         options: ExecOptions = {}
     ): Promise<ExecResult> {
+        this.requirePosixPrivilege(alias)
         if (!sudoPassword) {
             return this.exec(alias, `sudo ${command}`, options)
         }
@@ -501,8 +577,39 @@ export class SessionManager {
             let stderrTail = ''
             let stdoutBytes = 0
             let stderrBytes = 0
+            let stdoutKeptBytes = 0
+            let stderrKeptBytes = 0
             let stdoutTruncated = false
             let stderrTruncated = false
+            const stdoutDecoder = new StringDecoder('utf8')
+            const stderrDecoder = new StringDecoder('utf8')
+            let decodersEnded = false
+            const appendStdout = (chunk: string): void => {
+                stdoutTail = this.appendOutputTail(stdoutTail, chunk)
+                if (!stdoutTruncated) {
+                    const appended = this.appendWithinByteLimit(stdout, chunk, maxOutputSize - stdoutKeptBytes)
+                    stdout = appended.text
+                    stdoutKeptBytes += appended.appendedBytes
+                    stdoutTruncated = appended.truncated
+                }
+            }
+            const appendStderr = (chunk: string): void => {
+                stderrTail = this.appendOutputTail(stderrTail, chunk)
+                if (!stderrTruncated) {
+                    const appended = this.appendWithinByteLimit(stderr, chunk, maxOutputSize - stderrKeptBytes)
+                    stderr = appended.text
+                    stderrKeptBytes += appended.appendedBytes
+                    stderrTruncated = appended.truncated
+                }
+            }
+            const endDecoders = (): void => {
+                if (decodersEnded) {
+                    return
+                }
+                decodersEnded = true
+                appendStdout(stdoutDecoder.end())
+                appendStderr(stderrDecoder.end())
+            }
             const outputPreview = (): OutputPreview => ({
                 stdout,
                 stderr,
@@ -519,6 +626,7 @@ export class SessionManager {
                     return
                 }
                 settled = true
+                endDecoders()
                 try {
                     streamRef?.close()
                 } catch {
@@ -533,6 +641,7 @@ export class SessionManager {
                     this.closeClientChannel(stream)
                     if (!settled) {
                         settled = true
+                        endDecoders()
                         reject(new Error('Sudo exec was cancelled because the SSH session changed'))
                     }
                     return
@@ -541,6 +650,7 @@ export class SessionManager {
                     clearTimeout(timeoutId)
                     if (!settled) {
                         settled = true
+                        endDecoders()
                         reject(new Error(`Exec failed: ${err.message}`))
                     }
                     return
@@ -562,10 +672,11 @@ export class SessionManager {
                         return
                     }
                     settled = true
+                    endDecoders()
                     resolve({
                         success: code === 0,
-                        stdout: stdoutTruncated ? stdout + '\n... [truncated]' : stdout,
-                        stderr: stderrTruncated ? stderr + '\n... [truncated]' : stderr,
+                        stdout,
+                        stderr,
                         exitCode: code,
                         duration: Date.now() - startTime,
                         failureKind: code === 0 ? undefined : 'remote_command',
@@ -578,31 +689,19 @@ export class SessionManager {
                 })
 
                 stream.on('data', (data: Buffer) => {
-                    const chunk = data.toString('utf-8')
-                    stdoutBytes += data.length
-                    stdoutTail = this.appendOutputTail(stdoutTail, chunk)
-                    if (!stdoutTruncated) {
-                        if (stdout.length + chunk.length > maxOutputSize) {
-                            stdout += chunk.slice(0, maxOutputSize - stdout.length)
-                            stdoutTruncated = true
-                        } else {
-                            stdout += chunk
-                        }
+                    if (settled) {
+                        return
                     }
+                    stdoutBytes += data.length
+                    appendStdout(stdoutDecoder.write(data))
                 })
 
                 stream.stderr.on('data', (data: Buffer) => {
-                    const chunk = data.toString('utf-8')
-                    stderrBytes += data.length
-                    stderrTail = this.appendOutputTail(stderrTail, chunk)
-                    if (!stderrTruncated) {
-                        if (stderr.length + chunk.length > maxOutputSize) {
-                            stderr += chunk.slice(0, maxOutputSize - stderr.length)
-                            stderrTruncated = true
-                        } else {
-                            stderr += chunk
-                        }
+                    if (settled) {
+                        return
                     }
+                    stderrBytes += data.length
+                    appendStderr(stderrDecoder.write(data))
                 })
             })
         })
@@ -646,21 +745,7 @@ export class SessionManager {
         return this.ptyManager.write(ptyId, data)
     }
 
-    ptyRead(
-        ptyId: string,
-        options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}
-    ): {
-        data: string
-        active: boolean
-        rows: number
-        cols: number
-        lastInputAt: number | null
-        lastOutputAt: number | null
-        lastReadAt: number
-        unreadRawBytes: number
-        rawBufferLimit: number
-        foregroundProcess: string
-    } {
+    ptyRead(ptyId: string, options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}): PtyReadResult {
         return this.ptyManager.read(ptyId, options)
     }
 
@@ -726,13 +811,12 @@ export class SessionManager {
         return this.forwardManager.list()
     }
 
-    private isSshAgentAvailable(): boolean {
-        const socketPath = process.env.SSH_AUTH_SOCK
-        if (!socketPath) {
-            return false
+    private isSshAgentAvailable(socketPath?: string): boolean {
+        if (!socketPath || socketPath === 'none' || socketPath === 'pageant') {
+            return false // ssh2 can use Pageant, but the independent OpenSSH rsync process cannot inherit it.
         }
         if (process.platform === 'win32') {
-            return true
+            return /^\\\\\.\\pipe\\openssh-ssh-agent$/i.test(socketPath)
         }
         try {
             return fs.statSync(socketPath).isSocket()
@@ -745,6 +829,9 @@ export class SessionManager {
         try {
             const stats = fs.statSync(keyPath)
             if (!stats.isFile()) {
+                return false
+            }
+            if (process.platform === 'win32' && checkWindowsAcl(keyPath) !== 'key_path_usable') {
                 return false
             }
             if (process.platform !== 'win32' && (stats.mode & 0o077) !== 0) {
@@ -786,6 +873,12 @@ export class SessionManager {
             readyTimeout: value.readyTimeout,
             lang: value.lang,
             shell: value.shell,
+            agent: value.agent,
+            remotePlatform: value.remotePlatform ?? 'posix',
+            commandShell: value.commandShell ?? (value.remotePlatform === 'windows' ? 'powershell' : 'posix'),
+            remotePathStyle: remotePathStyle(value.remotePlatform ?? 'posix', value.remotePathStyle),
+            rsyncExecutable: value.rsyncExecutable,
+            rsyncProfile: value.rsyncProfile,
             password: secretHash(value.password),
             privateKeyPath: value.privateKeyPath ? path.resolve(expandTilde(value.privateKeyPath)) : undefined,
             privateKey: secretHash(value.privateKey),
@@ -811,15 +904,32 @@ export class SessionManager {
             identity: this.sessionIdentity(session),
             cwd: context.cwd ?? options.cwd,
             resolvedCwd: context.cwd ?? options.cwd,
-            shell: session.config.shell,
+            shell:
+                session.config.commandShell ?? (session.config.remotePlatform === 'windows' ? 'powershell' : 'posix'),
             profileLoaded: context.loadProfile,
             envInjectedKeys: context.envInjectedKeys ?? Object.keys(env).filter((key) => this.isValidEnvKey(key)),
         }
     }
 
+    private appendWithinByteLimit(
+        current: string,
+        chunk: string,
+        available: number
+    ): { text: string; appendedBytes: number; truncated: boolean } {
+        const bytes = Buffer.from(chunk, 'utf8')
+        if (bytes.length <= available) {
+            return { text: current + chunk, appendedBytes: bytes.length, truncated: false }
+        }
+        let end = Math.max(0, available)
+        while (end > 0 && end < bytes.length && isUtf8ContinuationByte(bytes[end])) {
+            --end
+        }
+        return { text: current + bytes.subarray(0, end).toString('utf8'), appendedBytes: end, truncated: true }
+    }
+
     private appendOutputTail(current: string, chunk: string): string {
-        const next = current + chunk
-        return next.length > OUTPUT_PREVIEW_CHARS ? next.slice(-OUTPUT_PREVIEW_CHARS) : next
+        const next = Buffer.from(current + chunk, 'utf8')
+        return retainUtf8Suffix(next, OUTPUT_PREVIEW_CHARS).toString('utf8')
     }
 
     private recommendedReadCommand(): string {
@@ -847,9 +957,13 @@ export class SessionManager {
         return {
             stdoutBytes: preview.stdoutBytes,
             stderrBytes: preview.stderrBytes,
-            stdoutHead: preview.stdoutTruncated ? preview.stdout.slice(0, OUTPUT_PREVIEW_CHARS) : undefined,
+            stdoutHead: preview.stdoutTruncated
+                ? this.appendWithinByteLimit('', preview.stdout, OUTPUT_PREVIEW_CHARS).text
+                : undefined,
             stdoutTail: preview.stdoutTruncated ? preview.stdoutTail : undefined,
-            stderrHead: preview.stderrTruncated ? preview.stderr.slice(0, OUTPUT_PREVIEW_CHARS) : undefined,
+            stderrHead: preview.stderrTruncated
+                ? this.appendWithinByteLimit('', preview.stderr, OUTPUT_PREVIEW_CHARS).text
+                : undefined,
             stderrTail: preview.stderrTruncated ? preview.stderrTail : undefined,
             recommendedReadCommand: truncated ? this.recommendedReadCommand() : undefined,
             maxOutputSize: truncated ? preview.maxOutputSize : undefined,
@@ -892,7 +1006,23 @@ export class SessionManager {
             `else exec env ${markerEnv} sh -c ${operationScript} sh 0; fi`
         const runAs = options.useLoginUser ? undefined : (options.runAs ?? session.config.runAs)
         let fullCommand: string
-        if (runAs) {
+        if (session.config.remotePlatform === 'windows') {
+            if (runAs) {
+                this.requirePosixPrivilege(alias)
+            }
+            const execution =
+                session.config.commandShell === 'cmd'
+                    ? `& cmd.exe /D /C ${quotePowershell(command)}`
+                    : `& { ${command} }`
+            const script = [
+                `$operationMarker = ${quotePowershell(marker)}`,
+                '$created = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks',
+                '[Console]::Error.WriteLine("__MCP_SSH_OPERATION__:{0}:{1}:0:{2}", $operationMarker, $PID, $created)',
+                execution,
+                'if (-not $?) { exit 1 }',
+            ].join('; ')
+            fullCommand = this.buildCommand(encodedPowershell(script), session, options)
+        } else if (runAs) {
             if (!this.isValidUsername(runAs)) {
                 throw new Error(`Invalid username: ${runAs}`)
             }
@@ -934,8 +1064,44 @@ export class SessionManager {
         pid: number,
         marker: string,
         processGroup: boolean,
-        options: OperationStartOptions
-    ): Promise<{ success: boolean; error?: string }> {
+        options: OperationStartOptions,
+        processCreatedAt?: string
+    ): Promise<{ success: boolean; error?: string; cancellationStatus?: 'unknown' | 'unsupported' }> {
+        if (this.getRemotePlatform(alias) === 'windows') {
+            if (!processCreatedAt || !/^[1-9]\d*$/.test(processCreatedAt)) {
+                return {
+                    success: false,
+                    cancellationStatus: 'unsupported',
+                    error: 'unsupported_remote_platform: process creation time is unavailable',
+                }
+            }
+            const script = [
+                '$ErrorActionPreference = "Stop"',
+                `$remotePid = ${pid}`,
+                `$expectedTicks = ${quotePowershell(processCreatedAt)}`,
+                `$expectedMarker = ${quotePowershell(marker)}`,
+                '$process = Get-CimInstance Win32_Process -Filter "ProcessId=$remotePid"',
+                'if (-not $process -or $process.CommandLine -notmatch "-EncodedCommand\\s+([A-Za-z0-9+/=]+)") { throw "process identity unavailable" }',
+                '$script = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))',
+                'if (-not $script.Contains($expectedMarker)) { throw "operation marker mismatch" }',
+                '$start = (Get-Process -Id $remotePid).StartTime.ToUniversalTime().Ticks.ToString()',
+                'if ($start -ne $expectedTicks) { throw "process creation time mismatch" }',
+                'taskkill.exe /PID $remotePid /T /F',
+                'if ($LASTEXITCODE -ne 0) { throw "tree termination failed" }',
+            ].join('; ')
+            try {
+                const result = await this.exec(alias, encodedPowershell(script), {
+                    useLoginUser: true,
+                    timeout: 5000,
+                    maxOutputSize: 4096,
+                })
+                return result.success
+                    ? { success: true }
+                    : { success: false, error: result.stderr || `Remote cancel exited with code ${result.exitCode}` }
+            } catch (error) {
+                return { success: false, error: error instanceof Error ? error.message : String(error) }
+            }
+        }
         const expectedMarker = `MCP_SSH_OPERATION_MARKER=${marker}`
         const signalTarget = processGroup ? `-${pid}` : `${pid}`
         const command = [
@@ -982,10 +1148,42 @@ export class SessionManager {
             let stderrTail = ''
             let stdoutBytes = 0
             let stderrBytes = 0
+            let stdoutKeptBytes = 0
+            let stderrKeptBytes = 0
             let stdoutTruncated = false
             let stderrTruncated = false
             let settled = false
             let activeStream: ClientChannel | null = null
+            const stdoutDecoder = new StringDecoder('utf8')
+            const stderrDecoder = new StringDecoder('utf8')
+            let decodersEnded = false
+
+            const appendStdout = (chunk: string): void => {
+                stdoutTail = this.appendOutputTail(stdoutTail, chunk)
+                if (!stdoutTruncated) {
+                    const appended = this.appendWithinByteLimit(stdout, chunk, maxOutputSize - stdoutKeptBytes)
+                    stdout = appended.text
+                    stdoutKeptBytes += appended.appendedBytes
+                    stdoutTruncated = appended.truncated
+                }
+            }
+            const appendStderr = (chunk: string): void => {
+                stderrTail = this.appendOutputTail(stderrTail, chunk)
+                if (!stderrTruncated) {
+                    const appended = this.appendWithinByteLimit(stderr, chunk, maxOutputSize - stderrKeptBytes)
+                    stderr = appended.text
+                    stderrKeptBytes += appended.appendedBytes
+                    stderrTruncated = appended.truncated
+                }
+            }
+            const endDecoders = (): void => {
+                if (decodersEnded) {
+                    return
+                }
+                decodersEnded = true
+                appendStdout(stdoutDecoder.end())
+                appendStderr(stderrDecoder.end())
+            }
 
             const execOptions: Ssh2ExecOptions = {}
 
@@ -1021,12 +1219,14 @@ export class SessionManager {
                     return
                 }
                 settled = true
+                endDecoders()
                 clearTimer()
                 activeStream?.close()
                 reject(error)
             }
 
             timeoutId = setTimeout(() => {
+                endDecoders()
                 rejectOnce(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
             }, timeout)
 
@@ -1052,11 +1252,12 @@ export class SessionManager {
                         return
                     }
                     settled = true
+                    endDecoders()
                     clearTimer()
                     resolve({
                         success: code === 0,
-                        stdout: stdoutTruncated ? stdout + '\n... [truncated]' : stdout,
-                        stderr: stderrTruncated ? stderr + '\n... [truncated]' : stderr,
+                        stdout,
+                        stderr,
                         exitCode: code,
                         duration: Date.now() - startTime,
                         failureKind: code === 0 ? undefined : 'remote_command',
@@ -1069,31 +1270,19 @@ export class SessionManager {
                 })
 
                 stream.on('data', (data: Buffer) => {
-                    const chunk = data.toString('utf-8')
-                    stdoutBytes += data.length
-                    stdoutTail = this.appendOutputTail(stdoutTail, chunk)
-                    if (!stdoutTruncated) {
-                        if (stdout.length + chunk.length > maxOutputSize) {
-                            stdout += chunk.slice(0, maxOutputSize - stdout.length)
-                            stdoutTruncated = true
-                        } else {
-                            stdout += chunk
-                        }
+                    if (settled) {
+                        return
                     }
+                    stdoutBytes += data.length
+                    appendStdout(stdoutDecoder.write(data))
                 })
 
                 stream.stderr.on('data', (data: Buffer) => {
-                    const chunk = data.toString('utf-8')
-                    stderrBytes += data.length
-                    stderrTail = this.appendOutputTail(stderrTail, chunk)
-                    if (!stderrTruncated) {
-                        if (stderr.length + chunk.length > maxOutputSize) {
-                            stderr += chunk.slice(0, maxOutputSize - stderr.length)
-                            stderrTruncated = true
-                        } else {
-                            stderr += chunk
-                        }
+                    if (settled) {
+                        return
                     }
+                    stderrBytes += data.length
+                    appendStderr(stderrDecoder.write(data))
                 })
             })
         })
@@ -1141,6 +1330,12 @@ export class SessionManager {
                 const keyPath = expandTilde(config.privateKeyPath)
                 // 路径白名单 + 大小上限校验，避免任意文件读取
                 validateKeyFile(keyPath)
+                if (process.platform === 'win32') {
+                    const aclStatus = checkWindowsAcl(keyPath)
+                    if (aclStatus !== 'key_path_usable') {
+                        throw new CommandError(`Private key ACL check failed: ${aclStatus}`, { code: aclStatus })
+                    }
+                }
                 connectConfig.privateKey = fs.readFileSync(keyPath)
             }
             if (config.privateKey) {
@@ -1148,6 +1343,20 @@ export class SessionManager {
             }
             if (config.passphrase) {
                 connectConfig.passphrase = config.passphrase
+            }
+            const agent =
+                config.agent ??
+                (!config.password && !config.privateKey && !config.privateKeyPath
+                    ? process.env.SSH_AUTH_SOCK
+                    : undefined)
+            if (agent && agent !== 'none') {
+                if (agent === 'pageant' && process.platform !== 'win32') {
+                    throw new Error('Pageant authentication is only available on Windows')
+                }
+                if (agent !== 'pageant' && !agent.startsWith('\\\\.\\pipe\\') && !fs.existsSync(agent)) {
+                    throw new Error('SSH agent socket or pipe is unavailable')
+                }
+                connectConfig.agent = agent
             }
         } catch (error) {
             throw this.createConnectionError(error, config, readyTimeout, 'key_read')
@@ -1231,6 +1440,7 @@ export class SessionManager {
                 const session: SSHSession = {
                     client,
                     config,
+                    authAgent: typeof connectConfig.agent === 'string' ? connectConfig.agent : undefined,
                     connectedAt: Date.now(),
                     lastUsedAt: Date.now(),
                     reconnectAttempts: 0,
@@ -1308,6 +1518,14 @@ export class SessionManager {
         const dir = path.dirname(this.persistPath)
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+        }
+        if (process.platform === 'win32') {
+            if (checkWindowsAcl(dir, true) !== 'key_path_usable') {
+                throw new Error('privacy_not_enforced_on_windows: session directory ACL could not be verified')
+            }
+            if (fs.existsSync(this.persistPath) && checkWindowsAcl(this.persistPath, true) !== 'key_path_usable') {
+                throw new Error('privacy_not_enforced_on_windows: existing session file ACL could not be verified')
+            }
         }
     }
 
@@ -1483,9 +1701,9 @@ export class SessionManager {
             loadProfile: context.loadProfile,
             cwd: context.cwd,
             remoteProcessKnown: false,
-            stdoutHead: preview?.stdout.slice(0, OUTPUT_PREVIEW_CHARS),
+            stdoutHead: preview ? this.appendWithinByteLimit('', preview.stdout, OUTPUT_PREVIEW_CHARS).text : undefined,
             stdoutTail: preview?.stdoutTail,
-            stderrHead: preview?.stderr.slice(0, OUTPUT_PREVIEW_CHARS),
+            stderrHead: preview ? this.appendWithinByteLimit('', preview.stderr, OUTPUT_PREVIEW_CHARS).text : undefined,
             stderrTail: preview?.stderrTail,
             stdoutBytes: preview?.stdoutBytes,
             stderrBytes: preview?.stderrBytes,
@@ -1511,6 +1729,17 @@ export class SessionManager {
             return new ConnectionError(error.message, {
                 ...error.details,
                 connectionStep: error.details.connectionStep ?? connectionStep,
+            })
+        }
+        if (
+            error instanceof CommandError &&
+            (error.details.code === 'key_acl_insecure' || error.details.code === 'key_acl_unverified')
+        ) {
+            return new ConnectionError(error.message, {
+                failureStage: 'preflight',
+                connectionStep,
+                retryable: false,
+                keyAclStatus: error.details.code,
             })
         }
         const err = error instanceof Error ? error : new Error(String(error))
@@ -1593,24 +1822,12 @@ export class SessionManager {
         session: SSHSession,
         options: { env?: Record<string, string>; cwd?: string; skipSessionEnv?: boolean }
     ): string {
-        const segments: string[] = []
         const env = options.skipSessionEnv
             ? { ...options.env }
             : { ...session.config.defaultEnv, ...session.config.env, ...options.env }
-
-        if (options.cwd) {
-            segments.push(`cd ${this.escapeShellArg(options.cwd)}`)
-        }
-        for (const [key, value] of Object.entries(env)) {
-            if (this.isValidEnvKey(key)) {
-                segments.push(`export ${key}=${this.escapeShellArg(value)}`)
-            }
-        }
-        if (segments.length === 0) {
-            return command
-        }
-        segments.push(`eval ${this.escapeShellArg(command)}`)
-        return segments.join(' && ')
+        const shell =
+            session.config.commandShell ?? (session.config.remotePlatform === 'windows' ? 'powershell' : 'posix')
+        return buildRemoteCommand(command, shell, options.cwd, env)
     }
 
     /**
@@ -1642,6 +1859,31 @@ export class SessionManager {
                 runAs: session.config.runAs,
                 connectedAt: session.connectedAt,
             })
+        }
+        if (process.platform === 'win32') {
+            const temporary = `${this.persistPath}.${randomUUID()}.tmp`
+            this.persistQueue = this.persistQueue
+                .then(async () => {
+                    try {
+                        const handle = await fs.promises.open(temporary, 'wx', 0o600)
+                        try {
+                            if (checkWindowsAcl(temporary, true) !== 'key_path_usable') {
+                                throw new Error(
+                                    'privacy_not_enforced_on_windows: session file ACL could not be verified'
+                                )
+                            }
+                            await handle.writeFile(JSON.stringify(data, null, 2))
+                            await handle.sync()
+                        } finally {
+                            await handle.close()
+                        }
+                        await fs.promises.rename(temporary, this.persistPath)
+                    } finally {
+                        await fs.promises.rm(temporary, { force: true })
+                    }
+                })
+                .catch((err: Error) => console.error('[SSH] 会话持久化写入失败:', err))
+            return
         }
         fs.promises
             .writeFile(this.persistPath, JSON.stringify(data, null, 2), { mode: 0o600 })

@@ -5,6 +5,11 @@
 export const DEFAULT_EXEC_MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 export const HARD_EXEC_MAX_OUTPUT_SIZE = 50 * 1024 * 1024
 
+export type RemotePlatform = 'posix' | 'windows'
+export type CommandShell = 'posix' | 'cmd' | 'powershell'
+export type RemotePathStyle = 'posix' | 'win32' | 'sftp-posix'
+export type RsyncProfile = 'posix' | 'native-win32' | 'msys2' | 'cygwin'
+
 export interface SSHConnectionConfig {
     host: string
     port: number
@@ -13,6 +18,12 @@ export interface SSHConnectionConfig {
     privateKeyPath?: string
     privateKey?: string
     passphrase?: string
+    agent?: string // "none" explicitly disables agent authentication and SSH_AUTH_SOCK fallback
+    remotePlatform?: RemotePlatform
+    commandShell?: CommandShell
+    remotePathStyle?: RemotePathStyle
+    rsyncExecutable?: string
+    rsyncProfile?: RsyncProfile
     alias?: string
     template?: string
     runAs?: string
@@ -44,6 +55,9 @@ export interface SSHSessionDetail extends SSHSessionBrief {
     authMethod: 'key' | 'password' | 'agent' | 'inline-key'
     connectedAt: number
     hasJumpHost: boolean
+    remotePlatform: RemotePlatform
+    commandShell: CommandShell
+    remotePathStyle: RemotePathStyle
 }
 
 export interface ExternalTransferCapability {
@@ -58,6 +72,11 @@ export interface ExternalTransferCapability {
     routeSafeForOpenSsh: boolean
     rsyncEligible: boolean
     decisionReason: string
+    agent?: string
+    rsyncExecutable?: string
+    rsyncProfile?: RsyncProfile
+    commandShell?: CommandShell
+    remotePathStyle?: RemotePathStyle
 }
 
 export type ConnectionFailureStage =
@@ -70,6 +89,7 @@ export interface ConnectionFailureDetails {
     connectionStep?: ConnectionStep
     retryable: boolean
     suggestion?: string
+    keyAclStatus?: 'key_path_usable' | 'key_acl_insecure' | 'key_acl_unverified'
 }
 
 export interface ExecOptions {
@@ -77,8 +97,7 @@ export interface ExecOptions {
     env?: Record<string, string> // 额外环境变量
     cwd?: string // 工作目录
     pty?: boolean // 是否使用 PTY
-    maxOutputSize?: number // 最大输出长度（UTF-16 char length）
-    // 与 String.prototype.length 一致；ASCII 时近似 10MB 字节，含多字节字符时实际字节数会更大，默认 10*1024*1024
+    maxOutputSize?: number // stdout/stderr 各自允许返回的 UTF-8 字节数
     // PTY 配置
     rows?: number
     cols?: number
@@ -139,6 +158,7 @@ export interface OperationInfo {
     pid: number | null
     processGroup: boolean
     markerVerified: boolean
+    processCreatedAt?: string
     cancelRequested: boolean
     startedAt: number
     finishedAt: number | null
@@ -171,6 +191,7 @@ export interface OperationCancelResult extends OperationInfo {
     success: boolean
     cancelRequested: boolean
     retryable: boolean
+    cancellationStatus: 'requested' | 'unknown' | 'unsupported' | 'not_applicable'
     verificationError?: string
 }
 
@@ -181,6 +202,7 @@ export interface FileInfo {
     isDirectory: boolean
     isFile: boolean
     isSymlink: boolean
+    mode: number
     permissions: string
     owner: number
     group: number
@@ -225,11 +247,27 @@ export interface PtySessionInfo {
     lastInputAt: number | null
     lastOutputAt: number | null
     lastReadAt: number
-    bufferSize: number // 当前缓冲区字符长度
+    bufferSize: number // 当前 raw 缓冲区的原始字节数
     unreadRawBytes: number
     rawBufferLimit: number
+    rawBufferTruncated: boolean
     foregroundProcess: string
     active: boolean
+}
+
+export interface PtyReadResult {
+    data: string
+    dataBase64?: string
+    active: boolean
+    rows: number
+    cols: number
+    lastInputAt: number | null
+    lastOutputAt: number | null
+    lastReadAt: number
+    unreadRawBytes: number
+    rawBufferLimit: number
+    rawBufferTruncated: boolean
+    foregroundProcess: string
 }
 
 export interface PtyWriteResult {

@@ -44,8 +44,9 @@ export interface OperationDependencies {
         pid: number,
         marker: string,
         processGroup: boolean,
-        options: OperationStartOptions
-    ): Promise<{ success: boolean; error?: string }>
+        options: OperationStartOptions,
+        processCreatedAt?: string
+    ): Promise<{ success: boolean; error?: string; cancellationStatus?: 'unsupported' | 'unknown' }>
 }
 
 type PendingTermination =
@@ -60,6 +61,7 @@ interface OperationRecord {
     pid: number | null
     processGroup: boolean
     markerVerified: boolean
+    processCreatedAt?: string
     cancelRequested: boolean
     cancelInFlight: boolean
     pendingTermination: PendingTermination | null
@@ -266,6 +268,7 @@ export class OperationManager {
                 success: false,
                 cancelRequested: record.cancelRequested,
                 retryable: false,
+                cancellationStatus: 'not_applicable',
                 verificationError: `Operation is ${record.status}`,
             }
         }
@@ -275,6 +278,7 @@ export class OperationManager {
                 success: false,
                 cancelRequested: false,
                 retryable: true,
+                cancellationStatus: 'unknown',
                 verificationError: 'Remote operation marker has not been verified',
             }
         }
@@ -285,19 +289,21 @@ export class OperationManager {
                 success: false,
                 cancelRequested: record.cancelRequested,
                 retryable: true,
+                cancellationStatus: 'unknown',
                 verificationError: 'Remote cancellation is already in progress',
             }
         }
 
         record.cancelInFlight = true
-        let result: { success: boolean; error?: string }
+        let result: { success: boolean; error?: string; cancellationStatus?: 'unsupported' | 'unknown' }
         try {
             result = await this.dependencies.cancelRemote(
                 record.alias,
                 record.pid,
                 record.marker,
                 record.processGroup,
-                record.options
+                record.options,
+                record.processCreatedAt
             )
         } catch (error) {
             record.cancelInFlight = false
@@ -314,6 +320,7 @@ export class OperationManager {
             success: result.success,
             cancelRequested: record.cancelRequested,
             retryable: !result.success,
+            cancellationStatus: result.success ? 'requested' : (result.cancellationStatus ?? 'unknown'),
             ...(result.error ? { verificationError: result.error } : {}),
         }
     }
@@ -476,7 +483,7 @@ export class OperationManager {
                 return
             }
 
-            const metadata = line.slice(expectedPrefix.length).match(/^([1-9]\d*):(0|1)$/)
+            const metadata = line.slice(expectedPrefix.length).match(/^([1-9]\d*):(0|1)(?::([1-9]\d*))?$/)
             const pid = metadata ? Number(metadata[1]) : Number.NaN
             if (!metadata || !Number.isSafeInteger(pid)) {
                 this.appendStderr(record, lineBytes)
@@ -487,6 +494,7 @@ export class OperationManager {
             }
             record.pid = pid
             record.processGroup = metadata[2] === '1'
+            record.processCreatedAt = metadata[3]
             record.markerVerified = true
             record.status = 'running'
             this.appendStderr(record, record.markerBuffer)
@@ -544,6 +552,7 @@ export class OperationManager {
             pid: record.pid,
             processGroup: record.processGroup,
             markerVerified: record.markerVerified,
+            processCreatedAt: record.processCreatedAt,
             cancelRequested: record.cancelRequested,
             startedAt: record.startedAt,
             finishedAt: record.finishedAt,

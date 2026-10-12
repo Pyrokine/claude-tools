@@ -37,7 +37,7 @@ const ptyWriteSchema = z.object({
 const ptyReadSchema = z.object({
     ptyId: z.string().describe('PTY 会话 ID'),
     mode: z.enum(['screen', 'raw']).optional().describe('输出模式：screen（当前屏幕）或 raw（原始流），默认 screen'),
-    clear: z.boolean().optional().describe('(仅 raw 模式) 读取后是否清空缓冲区，默认 true'),
+    clear: z.boolean().optional().describe('(仅 raw 模式) 读取后是否清空缓冲区并重置 rawBufferTruncated，默认 true'),
 })
 
 const ptyResizeSchema = z.object({
@@ -187,7 +187,9 @@ write 返回 accepted=true 表示数据已被本地 stream 接收。backpressure
 
 两种模式：
 - screen（默认）：返回当前屏幕内容（解析后的纯文本，适合 top/btop/htop 等全屏刷新工具）
-- raw：返回原始 ANSI 流（包含转义序列，适合需要完整终端数据的场景）
+- raw：data 为 UTF-8 文本预览，dataBase64 为原始 ANSI/二进制字节的无损 base64
+
+bufferSize、unreadRawBytes 和 rawBufferLimit 均按原始字节计数。rawBufferTruncated=true 表示本次 clear 之后已有更早的 raw 输出因上限被丢弃；raw 读取使用默认 clear=true 时，响应返回清理前的计数和标志，然后重置缓冲区。
 
 示例：
 - 获取 top 当前画面: ssh_pty_read(ptyId="xxx")
@@ -219,7 +221,8 @@ write 返回 accepted=true 表示数据已被本地 stream 接收。backpressure
     server.registerTool(
         'ssh_pty_list',
         {
-            description: '列出所有 PTY 会话',
+            description:
+                '列出所有 PTY 会话。bufferSize、unreadRawBytes 和 rawBufferLimit 使用原始字节，rawBufferTruncated 表示更早的 raw 输出已因缓冲区上限被丢弃。',
             inputSchema: ptyListSchema,
         },
         () => handlePtyList()

@@ -14,7 +14,16 @@ import { parseProxyJump, parseSSHConfig } from '../ssh-config.js'
 import { sshPortSchema } from './schema.js'
 import { expandTilde, formatError, formatResult } from './utils.js'
 
+const remotePlatformSchema = z.enum(['posix', 'windows'])
+const commandShellSchema = z.enum(['posix', 'cmd', 'powershell'])
+const remotePathStyleSchema = z.enum(['posix', 'win32', 'sftp-posix'])
+const rsyncProfileSchema = z.enum(['posix', 'native-win32', 'msys2', 'cygwin'])
+
 const templateJumpHostSchema = z.object({
+    agent: z.string().optional(),
+    remotePlatform: remotePlatformSchema.optional(),
+    commandShell: commandShellSchema.optional(),
+    remotePathStyle: remotePathStyleSchema.optional(),
     host: z.string(),
     user: z.string(),
     password: z.string().optional(),
@@ -31,6 +40,12 @@ const connectionTemplateSchema = z.object({
     password: z.string().optional(),
     keyPath: z.string().optional(),
     privateKeyPath: z.string().optional(),
+    agent: z.string().optional(),
+    remotePlatform: remotePlatformSchema.optional(),
+    commandShell: commandShellSchema.optional(),
+    remotePathStyle: remotePathStyleSchema.optional(),
+    rsyncExecutable: z.string().optional(),
+    rsyncProfile: rsyncProfileSchema.optional(),
     port: sshPortSchema.optional(),
     alias: z.string().optional(),
     env: z.record(z.string(), z.string()).optional(),
@@ -112,6 +127,12 @@ const connectSchema = z.object({
     user: z.string().optional().describe('用户名（使用 configHost 时可省略）'),
     password: z.string().optional().describe('密码'),
     keyPath: z.string().optional().describe('SSH 私钥路径'),
+    agent: z.string().optional().describe('SSH agent socket 或 Windows OpenSSH named pipe 路径'),
+    remotePlatform: remotePlatformSchema.optional().describe('远端平台，默认 posix；Windows 须明确设置 windows'),
+    commandShell: commandShellSchema.optional().describe('远端命令 shell，POSIX 默认 posix，Windows 默认 powershell'),
+    remotePathStyle: remotePathStyleSchema.optional().describe('远端 SFTP 路径格式，Windows 默认 win32'),
+    rsyncExecutable: z.string().optional().describe('远端 rsync 可执行文件路径'),
+    rsyncProfile: rsyncProfileSchema.optional().describe('rsync 环境：posix、native-win32、msys2 或 cygwin'),
     port: sshPortSchema.optional().describe('SSH 端口，默认 22'),
     alias: z.string().optional().describe('连接别名（可选，默认使用 configHost 或 host）'),
     env: z.record(z.string(), z.string()).optional().describe('环境变量'),
@@ -131,6 +152,10 @@ const connectSchema = z.object({
             user: z.string().describe('跳板机用户名'),
             password: z.string().optional().describe('跳板机密码'),
             keyPath: z.string().optional().describe('跳板机私钥路径'),
+            agent: z.string().optional().describe('跳板机 SSH agent socket 路径'),
+            remotePlatform: remotePlatformSchema.optional(),
+            commandShell: commandShellSchema.optional(),
+            remotePathStyle: remotePathStyleSchema.optional(),
             port: sshPortSchema.optional().describe('跳板机端口，默认 22'),
             readyTimeout: z
                 .number()
@@ -160,6 +185,9 @@ const sessionFieldSchema = z.enum([
     'authMethod',
     'connectedAt',
     'hasJumpHost',
+    'remotePlatform',
+    'commandShell',
+    'remotePathStyle',
 ])
 
 const listSessionsSchema = z.object({
@@ -186,6 +214,17 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
         let port = args.port ?? template.port
         let keyPath = args.keyPath ?? template.keyPath ?? template.privateKeyPath
         const password = args.password ?? template.password
+        let agent = args.agent ?? template.agent
+        const remotePlatform = args.remotePlatform ?? template.remotePlatform ?? 'posix'
+        const commandShell =
+            args.commandShell ?? template.commandShell ?? (remotePlatform === 'windows' ? 'powershell' : 'posix')
+        if ((remotePlatform === 'windows') !== (commandShell !== 'posix')) {
+            throw new Error('commandShell must match remotePlatform')
+        }
+        const remotePathStyle =
+            args.remotePathStyle ?? template.remotePathStyle ?? (remotePlatform === 'windows' ? 'win32' : 'posix')
+        const rsyncExecutable = args.rsyncExecutable ?? template.rsyncExecutable
+        const rsyncProfile = args.rsyncProfile ?? template.rsyncProfile
         const requestedAlias = args.alias ?? template.alias ?? configHost
         const runAs = args.runAs ?? template.runAs
         const defaultEnv = mergeEnv(template.defaultEnv, args.defaultEnv)
@@ -199,6 +238,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                   username: string
                   password?: string
                   privateKeyPath?: string
+                  agent?: string
               }
             | undefined
 
@@ -218,6 +258,11 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             user = user ?? hostConfig.user
             port = port ?? hostConfig.port
             keyPath = keyPath ?? hostConfig.identityFile
+            // IdentityAgent 指定的 agent 优先于进程环境，仅在未显式传参时使用
+            const configAgent = hostConfig.identityAgent
+            if (agent === undefined && configAgent && (!keyPath || configAgent === 'none')) {
+                agent = configAgent
+            }
 
             // 解析 ProxyJump（支持 user@host:port 格式）
             if (hostConfig.proxyJump) {
@@ -240,6 +285,10 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                             port: parsed.port ?? jumpHostConfig.port ?? 22,
                             username: jumpUser,
                             privateKeyPath: jumpHostConfig.identityFile,
+                            agent:
+                                jumpHostConfig.identityAgent === 'none' || !jumpHostConfig.identityFile
+                                    ? jumpHostConfig.identityAgent
+                                    : undefined,
                         }
                     } else {
                         // 直接使用 parsed 的值
@@ -276,6 +325,10 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                   username: requestedJumpHost.user,
                   password: requestedJumpHost.password,
                   privateKeyPath: requestedJumpHost.keyPath,
+                  agent: requestedJumpHost.agent,
+                  remotePlatform: requestedJumpHost.remotePlatform,
+                  commandShell: requestedJumpHost.commandShell,
+                  remotePathStyle: requestedJumpHost.remotePathStyle,
                   readyTimeout: requestedJumpHost.readyTimeout ?? readyTimeout,
               }
             : jumpHostResolved
@@ -294,6 +347,12 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             username: user,
             password,
             privateKeyPath: keyPath,
+            agent,
+            remotePlatform,
+            commandShell,
+            remotePathStyle,
+            rsyncExecutable,
+            rsyncProfile,
             alias: finalAlias,
             template: args.template,
             runAs,
@@ -311,6 +370,10 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             identity: connected.identity,
             loginUser: connected.loginUser,
             runAs: connected.runAs,
+            remotePlatform: connected.remotePlatform,
+            commandShell: connected.commandShell,
+            remotePathStyle: connected.remotePathStyle,
+            keyAclStatus: connected.keyAclStatus,
             host: connected.host,
             port: connected.port,
             defaultEnvKeys: connected.defaultEnvKeys,
@@ -383,6 +446,7 @@ async function handleConfigList(args: z.infer<typeof configListSchema>) {
                 user: h.user,
                 port: h.port,
                 identityFile: h.identityFile,
+                identityAgent: h.identityAgent,
                 proxyJump: h.proxyJump,
             })),
         })

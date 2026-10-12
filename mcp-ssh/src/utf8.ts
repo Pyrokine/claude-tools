@@ -24,6 +24,18 @@ export function ensureUtf8Boundary(buffer: Buffer, offset: number, field: string
     }
 }
 
+export function retainUtf8Suffix(buffer: Buffer, maxBytes: number): Buffer {
+    if (buffer.length <= maxBytes) {
+        return buffer
+    }
+
+    let start = buffer.length - maxBytes
+    while (start < buffer.length && isUtf8ContinuationByte(buffer[start])) {
+        ++start
+    }
+    return buffer.subarray(start)
+}
+
 export function utf8SafeEnd(
     buffer: Buffer,
     start: number,

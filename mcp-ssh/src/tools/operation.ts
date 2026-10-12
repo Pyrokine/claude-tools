@@ -163,7 +163,8 @@ export function registerOperationTools(server: McpServer): void {
     server.registerTool(
         'ssh_operation_cancel',
         {
-            description: '校验远端 operation marker 后发送 TERM；marker 无法证明时拒绝取消',
+            description:
+                '校验远端 operation marker 和进程身份后执行取消；POSIX 发送 TERM，Windows 在 PID、创建时间和 marker 验证后执行 taskkill /T /F；无法证明身份时拒绝取消',
             inputSchema: operationIdSchema,
         },
         (args) => handleOperationCancel(args)

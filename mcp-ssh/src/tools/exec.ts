@@ -11,7 +11,9 @@ import { z } from 'zod'
 import { classifyCommandRisk, type CommandRisk } from '../command-risk.js'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
+import { encodedPowershell, quotePowershell, sftpPath } from '../remote-platform.js'
 import { type ExecResult, HARD_EXEC_MAX_OUTPUT_SIZE } from '../types.js'
+import { windowsTemporaryPathScript } from '../windows-acl.js'
 import { sshPortSchema } from './schema.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js' // ========== Schemas ==========
 
@@ -23,7 +25,7 @@ const maxOutputSizeSchema = z
     .positive()
     .max(HARD_EXEC_MAX_OUTPUT_SIZE)
     .optional()
-    .describe('最大输出字符数，超过后截断并返回提示')
+    .describe('stdout/stderr 各自的 UTF-8 字节上限，超过后截断并返回提示')
 
 const execSchema = z.object({
     alias: z.string().describe('连接别名'),
@@ -79,6 +81,9 @@ const quickExecSchema = z.object({
     command: z.string().describe('要执行的命令'),
     password: z.string().optional().describe('密码'),
     keyPath: z.string().optional().describe('密钥路径'),
+    agent: z.string().optional().describe('SSH agent socket 或 Windows named pipe'),
+    remotePlatform: z.enum(['posix', 'windows']).optional().describe('远端平台，默认 posix'),
+    commandShell: z.enum(['posix', 'cmd', 'powershell']).optional().describe('远端命令 shell'),
     port: sshPortSchema.optional().describe('SSH 端口，默认 22'),
     readyTimeout: z.number().int().positive().max(600000).optional().describe('等待 SSH ready 的超时，默认 30000'),
     timeout: z.number().optional().describe('命令执行超时（毫秒），默认 30000'),
@@ -110,7 +115,7 @@ const execScriptSchema = z.object({
     runAs: z.string().optional().describe('本次脚本使用的目标用户'),
     cwd: z.string().optional().describe('工作目录（可选）'),
     env: z.record(z.string(), z.string()).optional().describe('额外环境变量'),
-    timeout: z.number().optional().describe('超时（毫秒）'),
+    timeout: z.number().optional().describe('上传、准备和执行各阶段的超时（毫秒）'),
     keepScript: z.boolean().optional().describe('是否保留远端临时脚本，默认 false'),
     maxOutputSize: maxOutputSizeSchema,
 })
@@ -129,7 +134,10 @@ async function handleExec(args: z.infer<typeof execSchema>) {
             useLoginUser: args.useLoginUser,
             loadProfile: args.loadProfile,
         })
-        return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command, args.timeout) })
+        return formatResult({
+            ...result,
+            commandRisk: classifyCommandRisk(args.command, args.timeout, sessionManager.getCommandShell(args.alias)),
+        })
     } catch (error) {
         return formatError(error)
     }
@@ -137,6 +145,7 @@ async function handleExec(args: z.infer<typeof execSchema>) {
 
 async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
     try {
+        sessionManager.requirePosixPrivilege(args.alias)
         if (args.targetUser) {
             const result = await sessionManager.execAsUser(args.alias, args.command, args.targetUser, {
                 timeout: args.timeout,
@@ -145,7 +154,14 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
                 maxOutputSize: args.maxOutputSize,
                 loadProfile: args.loadProfile,
             })
-            return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command, args.timeout) })
+            return formatResult({
+                ...result,
+                commandRisk: classifyCommandRisk(
+                    args.command,
+                    args.timeout,
+                    sessionManager.getCommandShell(args.alias)
+                ),
+            })
         }
         const result = await sessionManager.exec(args.alias, args.command, {
             timeout: args.timeout,
@@ -154,7 +170,10 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
             maxOutputSize: args.maxOutputSize,
             loadProfile: args.loadProfile,
         })
-        return formatResult({ ...result, commandRisk: classifyCommandRisk(args.command, args.timeout) })
+        return formatResult({
+            ...result,
+            commandRisk: classifyCommandRisk(args.command, args.timeout, sessionManager.getCommandShell(args.alias)),
+        })
     } catch (error) {
         return formatError(error)
     }
@@ -184,7 +203,11 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
         const results: BatchEntry[] = []
 
         for (let i = 0; i < args.commands.length; i++) {
-            const commandRisk = classifyCommandRisk(args.commands[i], args.timeout)
+            const commandRisk = classifyCommandRisk(
+                args.commands[i],
+                args.timeout,
+                sessionManager.getCommandShell(args.alias)
+            )
             try {
                 const execResult = await sessionManager.exec(args.alias, args.commands[i], { timeout: args.timeout })
                 results.push({
@@ -230,6 +253,9 @@ async function handleQuickExec(args: z.infer<typeof quickExecSchema>) {
             username: args.user,
             password: args.password,
             privateKeyPath: args.keyPath,
+            agent: args.agent,
+            remotePlatform: args.remotePlatform,
+            commandShell: args.commandShell,
             alias: tempAlias,
             readyTimeout: args.readyTimeout,
         })
@@ -292,17 +318,10 @@ async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
     }
 }
 
-async function cleanupRemoteScript(alias: string, remotePath: string): Promise<string | undefined> {
+async function cleanupRemoteScript(alias: string, remotePath: string, timeout?: number): Promise<string | undefined> {
     try {
-        const result = await sessionManager.exec(alias, `rm -f ${escapeShellArg(remotePath)}`, {
-            timeout: 10000,
-            useLoginUser: true,
-            maxOutputSize: 4096,
-        })
-        if (result.success) {
-            return undefined
-        }
-        return result.stderr || result.stdout || `cleanup failed with exit code ${result.exitCode}`
+        await fileOps.removeRemoteFile(alias, remotePath, timeout)
+        return undefined
     } catch (error) {
         return error instanceof Error ? error.message : String(error)
     }
@@ -320,6 +339,14 @@ function resolveScriptUsers(args: z.infer<typeof execScriptSchema>): { effective
         effectiveUser: args.targetUser ?? args.runAs ?? session?.runAs,
         loginUser: session?.username,
     }
+}
+
+export function windowsScriptContent(script: string, interpreter: string): string {
+    const bom = String.fromCharCode(0xfeff)
+    if (interpreter.toLowerCase().startsWith('cmd')) {
+        return `@chcp 65001>nul || exit /b 1\r\n${script.startsWith(bom) ? script.slice(1) : script}`
+    }
+    return script.startsWith(bom) ? script : bom + script
 }
 
 async function prepareRemoteScript(
@@ -345,25 +372,83 @@ async function prepareRemoteScript(
 
 async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
     let remotePath: string | undefined
+    let remoteSftpPath: string | undefined
+    let ownsRemotePath = false
+    let executionStarted = false
     try {
-        const interpreter = args.interpreter ?? 'bash'
+        const windows = sessionManager.getRemotePlatform(args.alias) === 'windows'
+        const interpreter = args.interpreter ?? (windows ? sessionManager.getCommandShell(args.alias) : 'bash')
         const { effectiveUser, loginUser } = resolveScriptUsers(args)
+        if (windows && (args.targetUser || args.runAs || effectiveUser)) {
+            sessionManager.requirePosixPrivilege(args.alias)
+        }
         validateScriptUser(effectiveUser)
-
-        const tempResult = await sessionManager.exec(args.alias, 'mktemp /tmp/mcp-ssh-script.XXXXXX', {
-            timeout: args.timeout,
-            useLoginUser: true,
-            maxOutputSize: 4096,
-        })
-        remotePath = tempResult.stdout.trim()
-        if (!tempResult.success || remotePath.length === 0) {
-            return formatResult({ success: false, error: tempResult.stderr || 'mktemp failed' })
+        if (windows && !['powershell', 'powershell.exe', 'cmd', 'cmd.exe'].includes(interpreter.toLowerCase())) {
+            throw new Error('Windows script interpreter must be cmd or powershell')
+        }
+        if (windows) {
+            const suffix = interpreter.toLowerCase().startsWith('cmd') ? '.cmd' : '.ps1'
+            const name = `mcp-ssh-script-${randomUUID()}${suffix}`
+            const tempResult = await sessionManager.exec(
+                args.alias,
+                encodedPowershell(windowsTemporaryPathScript(name)),
+                {
+                    timeout: args.timeout,
+                    useLoginUser: true,
+                    maxOutputSize: 4096,
+                }
+            )
+            if (!tempResult.success) {
+                throw new Error(
+                    tempResult.stderr.includes('privacy_not_enforced_on_windows')
+                        ? 'privacy_not_enforced_on_windows: remote temporary directory ACL was not verified'
+                        : `Remote Windows temporary directory lookup failed: ${tempResult.stderr || tempResult.stdout}`
+                )
+            }
+            remotePath = tempResult.stdout.trim()
+            if (
+                !remotePath ||
+                /[\r\n\0]/.test(remotePath) ||
+                !(remotePath.endsWith(`\\${name}`) || remotePath.endsWith(`/${name}`))
+            ) {
+                throw new Error('Remote Windows temporary directory lookup failed')
+            }
+            remoteSftpPath = sftpPath(remotePath, sessionManager.getRemotePathStyle(args.alias))
+            await fileOps.prepareWindowsRemotePrivateFile(args.alias, remoteSftpPath, args.timeout, remotePath)
+            ownsRemotePath = true
+        } else {
+            const tempResult = await sessionManager.exec(args.alias, 'mktemp /tmp/mcp-ssh-script.XXXXXX', {
+                timeout: args.timeout,
+                useLoginUser: true,
+                maxOutputSize: 4096,
+            })
+            remotePath = tempResult.stdout.trim()
+            if (!tempResult.success || remotePath.length === 0) {
+                return formatResult({ success: false, error: tempResult.stderr || 'mktemp failed' })
+            }
+            ownsRemotePath = true
+            remoteSftpPath = remotePath
         }
 
-        await fileOps.writeFile(args.alias, remotePath, args.script, false)
-        await prepareRemoteScript(args.alias, remotePath, effectiveUser, loginUser, args.timeout)
+        if (!remoteSftpPath) {
+            throw new Error('Remote temporary script path was not created')
+        }
+        await fileOps.writeFile(
+            args.alias,
+            remoteSftpPath,
+            windows ? windowsScriptContent(args.script, interpreter) : args.script,
+            false,
+            args.timeout
+        )
+        if (!windows) {
+            await prepareRemoteScript(args.alias, remotePath, effectiveUser, loginUser, args.timeout)
+        }
 
-        const command = `${escapeShellArg(interpreter)} ${escapeShellArg(remotePath)}`
+        const command = windows
+            ? interpreter.toLowerCase().startsWith('cmd')
+                ? `cmd.exe /D /C "${remotePath.replace(/"/g, '""')}"`
+                : encodedPowershell(`& ${quotePowershell(remotePath)}; if (-not $?) { exit 1 }`)
+            : `${escapeShellArg(interpreter)} ${escapeShellArg(remotePath)}`
         const execOptions = {
             timeout: args.timeout,
             cwd: args.cwd,
@@ -371,11 +456,14 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
             maxOutputSize: args.maxOutputSize,
             runAs: args.targetUser ?? args.runAs,
         }
+        executionStarted = true
         const result = args.targetUser
             ? await sessionManager.execAsUser(args.alias, command, args.targetUser, execOptions)
             : await sessionManager.exec(args.alias, command, execOptions)
         const cleanupWarning =
-            remotePath && args.keepScript !== true ? await cleanupRemoteScript(args.alias, remotePath) : undefined
+            remoteSftpPath && ownsRemotePath && args.keepScript !== true
+                ? await cleanupRemoteScript(args.alias, remoteSftpPath, args.timeout)
+                : undefined
 
         return formatResult({
             ...result,
@@ -385,7 +473,9 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
         })
     } catch (error) {
         const cleanupWarning =
-            remotePath && args.keepScript !== true ? await cleanupRemoteScript(args.alias, remotePath) : undefined
+            remoteSftpPath && ownsRemotePath && (args.keepScript !== true || !executionStarted)
+                ? await cleanupRemoteScript(args.alias, remoteSftpPath, args.timeout)
+                : undefined
         if (cleanupWarning) {
             return formatResult({
                 success: false,
@@ -474,7 +564,7 @@ export function registerExecTools(server: McpServer): void {
     server.registerTool(
         'ssh_exec_script',
         {
-            description: '上传远端临时脚本并执行，默认执行后清理脚本',
+            description: '上传远端临时脚本并执行，默认执行后清理脚本；timeout 同时用于上传、准备和执行阶段',
             inputSchema: execScriptSchema,
         },
         (args) => handleExecScript(args)

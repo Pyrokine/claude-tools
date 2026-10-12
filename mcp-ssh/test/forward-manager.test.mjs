@@ -313,6 +313,35 @@ test('force remote close rejects incoming connections while unforward is pending
     assert.equal(manager.list().length, 0)
 })
 
+test('force remote close drains an active connection on the first attempt', async (t) => {
+    const localServer = await listen(0)
+    t.after(() => new Promise((resolve) => localServer.close(() => resolve())))
+    const localPort = localServer.address().port
+    const manager = new ForwardManager()
+    const client = new FakeClient()
+    const deps = { getClient: () => client }
+    const created = await manager.forwardRemote(deps, 'server', 9003, '127.0.0.1', localPort)
+    const stream = new PassThrough()
+
+    client.emit(
+        'tcp connection',
+        { destIP: '127.0.0.1', destPort: 9003, srcIP: '127.0.0.1', srcPort: 41000 },
+        () => stream,
+        () => assert.fail('active remote forward rejected its connection')
+    )
+    assert.equal(manager.sessions.get(created.forwardId).activeConnections, 1)
+
+    const closePromise = manager.close(created.forwardId, deps, { mode: 'force', timeoutMs: 1000 })
+    client.unforwardCallback(null)
+    const closed = await closePromise
+
+    assert.equal(closed.success, true)
+    assert.equal(closed.remoteUnforwarded, true)
+    assert.equal(closed.activeConnections, 0)
+    assert.equal(stream.destroyed, true)
+    assert.equal(manager.list().length, 0)
+})
+
 test('disconnect during remote close prevents delayed callback from republishing state', async () => {
     const manager = new ForwardManager()
     const client = new FakeClient()

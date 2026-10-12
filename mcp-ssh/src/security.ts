@@ -14,7 +14,7 @@ const MAX_KEY_FILE_SIZE = 64 * 1024 // 私钥实际不会超过 64KB
 const MAX_CONFIG_FILE_SIZE = 1024 * 1024 // SSH config 上限 1MB
 
 function getAllowedDirs(): string[] {
-    const base = [path.resolve(os.homedir(), '.ssh'), '/etc/ssh']
+    const base = [path.resolve(os.homedir(), '.ssh'), ...(process.platform === 'win32' ? [] : ['/etc/ssh'])]
     const env =
         process.env.SSH_MCP_ALLOWED_KEY_DIRS?.split(path.delimiter)
             .map((d) => d.trim())
@@ -24,7 +24,13 @@ function getAllowedDirs(): string[] {
 
 function isUnderAllowedDir(resolved: string): { ok: boolean; allowed: string[] } {
     const allowed = getAllowedDirs()
-    const ok = allowed.some((dir) => resolved === dir || resolved.startsWith(dir + path.sep))
+    const ok = allowed.some((dir) => {
+        const relative = path.relative(dir, resolved)
+        return (
+            relative === '' ||
+            (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+        )
+    })
     return { ok, allowed }
 }
 

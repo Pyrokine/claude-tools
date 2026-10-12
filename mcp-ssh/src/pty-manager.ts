@@ -6,7 +6,8 @@
 
 import xterm from '@xterm/headless'
 import type { ClientChannel } from 'ssh2'
-import type { PtyCloseResult, PtyOptions, PtySessionInfo, PtyWriteResult } from './types.js'
+import { StringDecoder } from 'string_decoder'
+import type { PtyCloseResult, PtyOptions, PtyReadResult, PtySessionInfo, PtyWriteResult } from './types.js'
 
 const Terminal = xterm.Terminal as typeof import('@xterm/headless').Terminal
 type TerminalType = import('@xterm/headless').Terminal
@@ -31,9 +32,12 @@ interface PtySession {
     lastInputAt: number | null
     lastOutputAt: number | null
     lastReadAt: number
-    rawBuffer: string
+    rawBuffer: Buffer
     unreadRawBytes: number
+    rawBufferTruncated: boolean
     maxBufferSize: number
+    decoder: StringDecoder
+    decoderEnded: boolean
     active: boolean
     closedAt: number | null
 }
@@ -74,43 +78,40 @@ export class PtyManager {
             lastInputAt: null,
             lastOutputAt: null,
             lastReadAt: Date.now(),
-            rawBuffer: '',
+            rawBuffer: Buffer.alloc(0),
             unreadRawBytes: 0,
+            rawBufferTruncated: false,
             maxBufferSize,
+            decoder: new StringDecoder('utf8'),
+            decoderEnded: false,
             active: true,
             closedAt: null,
         }
 
         // 监听输出数据
         stream.on('data', (data: Buffer) => {
-            if (!ptySession.active) {
+            if (!ptySession.active || ptySession.decoderEnded) {
                 return
             }
-            const chunk = data.toString('utf-8')
             ptySession.lastOutputAt = Date.now()
-            // 写入终端仿真器（解析 ANSI 序列）
-            terminal.write(chunk)
-            // 同时保留原始流（用于 raw 模式）
-            ptySession.rawBuffer += chunk
-            ptySession.unreadRawBytes += Buffer.byteLength(chunk, 'utf-8')
-            if (ptySession.rawBuffer.length > maxBufferSize) {
-                ptySession.rawBuffer = ptySession.rawBuffer.slice(-maxBufferSize)
-                ptySession.unreadRawBytes = Math.min(
-                    ptySession.unreadRawBytes,
-                    Buffer.byteLength(ptySession.rawBuffer, 'utf-8')
-                )
-            }
+            this.appendRaw(ptySession, data)
+            this.appendOutput(ptySession, ptySession.decoder.write(data))
         })
 
         stream.on('close', () => {
             if (!this.sessions.has(ptyId)) {
                 return
             }
+            this.endDecoder(ptySession)
             ptySession.active = false
             ptySession.closedAt = Date.now()
         })
 
         stream.on('error', (err: Error) => {
+            if (!this.sessions.has(ptyId)) {
+                return
+            }
+            this.endDecoder(ptySession)
             ptySession.active = false
             ptySession.closedAt = Date.now()
             terminal.write(`\n[PTY Error: ${err.message}]`)
@@ -132,47 +133,40 @@ export class PtyManager {
         }
     }
 
-    read(
-        ptyId: string,
-        options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}
-    ): {
-        data: string
-        active: boolean
-        rows: number
-        cols: number
-        lastInputAt: number | null
-        lastOutputAt: number | null
-        lastReadAt: number
-        unreadRawBytes: number
-        rawBufferLimit: number
-        foregroundProcess: string
-    } {
+    read(ptyId: string, options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}): PtyReadResult {
         const session = this.getSession(ptyId)
         const mode = options.mode ?? 'screen'
         const clear = options.clear !== false
+        const unreadRawBytes = session.unreadRawBytes
+        const rawBufferTruncated = session.rawBufferTruncated
 
         let data: string
+        let dataBase64: string | undefined
         if (mode === 'screen') {
             data = this.getScreenContent(session.terminal)
         } else {
-            data = session.rawBuffer
+            data = session.rawBuffer.toString('utf8')
+            dataBase64 = session.rawBuffer.toString('base64')
             if (clear) {
-                session.rawBuffer = ''
+                session.rawBuffer = Buffer.alloc(0)
                 session.unreadRawBytes = 0
+                session.rawBufferTruncated = false
             }
         }
 
         session.lastReadAt = Date.now()
         return {
             data,
+            dataBase64,
             active: session.active,
             rows: session.rows,
             cols: session.cols,
             lastInputAt: session.lastInputAt,
             lastOutputAt: session.lastOutputAt,
             lastReadAt: session.lastReadAt,
-            unreadRawBytes: session.unreadRawBytes,
+            unreadRawBytes,
             rawBufferLimit: session.maxBufferSize,
+            rawBufferTruncated,
             foregroundProcess: session.command,
         }
     }
@@ -213,6 +207,7 @@ export class PtyManager {
                 }
             }
         }
+        this.endDecoder(session)
 
         try {
             session.terminal.dispose()
@@ -250,6 +245,7 @@ export class PtyManager {
             } catch {
                 // SSH 连接已失效，继续释放本地状态
             }
+            this.endDecoder(session)
             try {
                 session.terminal.dispose()
             } catch {
@@ -277,11 +273,36 @@ export class PtyManager {
                 bufferSize: pty.rawBuffer.length,
                 unreadRawBytes: pty.unreadRawBytes,
                 rawBufferLimit: pty.maxBufferSize,
+                rawBufferTruncated: pty.rawBufferTruncated,
                 foregroundProcess: pty.command,
                 active: pty.active,
             })
         }
         return result
+    }
+
+    private appendOutput(session: PtySession, output: string): void {
+        if (output.length === 0) {
+            return
+        }
+        session.terminal.write(output)
+    }
+
+    private appendRaw(session: PtySession, data: Buffer): void {
+        const appended = Buffer.concat([session.rawBuffer, data])
+        if (appended.length > session.maxBufferSize) {
+            session.rawBufferTruncated = true
+        }
+        session.rawBuffer = appended.subarray(Math.max(0, appended.length - session.maxBufferSize))
+        session.unreadRawBytes = session.rawBuffer.length
+    }
+
+    private endDecoder(session: PtySession): void {
+        if (session.decoderEnded) {
+            return
+        }
+        session.decoderEnded = true
+        this.appendOutput(session, session.decoder.end())
     }
 
     private normalizeBufferSize(bufferSize?: number): number {

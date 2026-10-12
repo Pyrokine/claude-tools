@@ -1,3 +1,5 @@
+import type { CommandShell } from './types.js'
+
 export type CommandRisk = {
     level: 'medium' | 'high'
     categories: string[]
@@ -5,114 +7,148 @@ export type CommandRisk = {
     suggestion: string
 }
 
-function pushRisk(categories: Set<string>, signals: string[], category: string, signal: string): void {
-    categories.add(category)
-    signals.push(signal)
+function withoutQuotedText(command: string, shell: CommandShell): string {
+    let quote: "'" | '"' | undefined
+    let escaped = false
+    let result = ''
+    for (const char of command) {
+        if (escaped) {
+            result += ' '
+            escaped = false
+        } else if (
+            (shell === 'posix' && char === '\\' && quote !== "'") ||
+            (shell === 'powershell' && char === '`' && quote !== "'") ||
+            (shell === 'cmd' && char === '^' && !quote)
+        ) {
+            escaped = true
+            result += ' '
+        } else if (quote && char === quote) {
+            quote = undefined
+            result += ' '
+        } else if (!quote && (char === '"' || (shell !== 'cmd' && char === "'"))) {
+            quote = char
+            result += ' '
+        } else {
+            result += quote ? ' ' : char
+        }
+    }
+    return result
 }
 
 function hasBackgroundOperator(command: string): boolean {
     let quote: "'" | '"' | undefined
     let escaped = false
     for (let index = 0; index < command.length; ++index) {
-        const character = command[index]
+        const char = command[index]
         if (escaped) {
             escaped = false
-            continue
-        }
-        if (character === '\\' && quote !== "'") {
+        } else if (char === '\\' && quote !== "'") {
             escaped = true
-            continue
+        } else if (quote && char === quote) {
+            quote = undefined
+        } else if (!quote && (char === "'" || char === '"')) {
+            quote = char
+        } else if (
+            !quote &&
+            char === '&' &&
+            !'&<>'.includes(command[index - 1] ?? '') &&
+            !'&>'.includes(command[index + 1] ?? '')
+        ) {
+            return true
         }
-        if (quote) {
-            if (character === quote) {
-                quote = undefined
-            }
-            continue
-        }
-        if (character === "'" || character === '"') {
-            quote = character
-            continue
-        }
-        if (character !== '&') {
-            continue
-        }
-        const previous = command[index - 1]
-        const next = command[index + 1]
-        if (previous === '&' || next === '&' || previous === '>' || previous === '<' || next === '>') {
-            continue
-        }
-        return true
     }
     return false
 }
 
-export function classifyCommandRisk(command: string, timeout?: number): CommandRisk | undefined {
+export function classifyCommandRisk(
+    command: string,
+    timeout?: number,
+    shell: CommandShell = 'posix'
+): CommandRisk | undefined {
     const signals: string[] = []
     const categories = new Set<string>()
-    const pipeCount = (command.match(/\|/g) ?? []).length
-    const lowerCommand = command.toLowerCase()
-    const background = hasBackgroundOperator(command)
-    const continuous = /\b(?:tail\s+-f|journalctl\s+-f|watch|top|htop)\b/.test(command)
-    const unboundedFind = /\bfind\b/.test(command) && !/\s-maxdepth\s+\d+/.test(command)
-    const recursiveGrep = /\bgrep\s+(?:-\S*R|--recursive)\b/.test(command)
-
-    if (command.length > 500) {
-        pushRisk(categories, signals, 'complexity-signal', 'long_command')
+    const add = (category: string, signal: string): void => {
+        categories.add(category)
+        signals.push(signal)
     }
-    if (pipeCount >= 3) {
-        pushRisk(categories, signals, 'complexity-signal', 'long_pipeline')
+    const text = command.toLowerCase()
+    const executable = withoutQuotedText(text, shell)
+    if (shell === 'posix') {
+        if (/(?:^|[;&|]\s*|\b(?:sudo|doas)\s+)(?:rm|mkfs|fdisk|parted|shutdown|reboot)(?=\s|$)/m.test(executable)) {
+            add('destructive', 'destructive_command')
+        }
+        if (/\b(?:sudo|su\s+-|doas)\s+/.test(executable)) {
+            add('privilege-escalation', 'privileged_command')
+        }
+        if (/\b(?:killall|pkill)\b|\bkill\s+(?!-0\b)/.test(executable)) {
+            add('process-control', 'process_control')
+        }
+        if (/\b(?:systemctl|service|docker|kubectl)\s+(?:restart|stop|kill|delete|rm|down)\b/.test(executable)) {
+            add('service-control', 'service_control')
+        }
+        if (!timeout || timeout > 300_000) {
+            if (/\b(?:find\s+\S+|grep\s+-\S*[rR])\b/.test(executable)) {
+                add('long-running', 'unbounded_search')
+            }
+        }
+        if (/\b(?:tail\s+-f|journalctl\s+-f|watch|top|htop)\b/.test(executable)) {
+            add('long-running', 'continuous_command')
+        }
+        if (hasBackgroundOperator(command)) {
+            add('process-control', 'background_task')
+        }
+    } else if (shell === 'cmd') {
+        if (/\b(?:del|erase|rmdir|rd)\s+(?!\/\?)|\bformat\s+[a-z]:/.test(executable)) {
+            add('destructive', 'destructive_command')
+        }
+        if (/\btaskkill\s+\/f\b/.test(executable)) {
+            add('process-control', 'process_control')
+        }
+        if (/\brunas\s+\/user:/.test(executable)) {
+            add('privilege-escalation', 'privileged_command')
+        }
+        if ((!timeout || timeout > 300_000) && /\bdir\s+\/s\b/.test(executable)) {
+            add('long-running', 'unbounded_search')
+        }
+    } else {
+        if (/\b(?:remove-item|clear-content|format-volume)\b\s+/.test(executable)) {
+            add('destructive', 'destructive_command')
+        }
+        if (/\b(?:stop-process|stop-service|restart-service)\b/.test(executable)) {
+            add('process-control', 'process_control')
+        }
+        if (/\bstart-process\b[^\r\n;]*-verb\s+runas\b/.test(executable)) {
+            add('privilege-escalation', 'privileged_command')
+        }
+        if ((!timeout || timeout > 300_000) && /\bget-childitem\b[^\r\n;]*-recurse\b/.test(executable)) {
+            add('long-running', 'unbounded_search')
+        }
     }
-    if (recursiveGrep) {
-        pushRisk(categories, signals, 'long-running', 'recursive_grep')
-    }
-    if (unboundedFind) {
-        pushRisk(categories, signals, 'long-running', 'unbounded_find')
-    }
-    if (/\b(?:python|python3|node|perl|ruby)\b/.test(command)) {
-        pushRisk(categories, signals, 'script-execution', 'interpreter_script')
-    }
-    if (/\bsleep\s+\d{2,}\b/.test(command) || continuous) {
-        pushRisk(categories, signals, 'long-running', continuous ? 'continuous_command' : 'long_sleep')
-    }
-    if (background) {
-        pushRisk(categories, signals, 'process-control', 'background_task')
-    }
-    const recursiveRemove = /\brm\b(?=[^\n;|&]*(?:\s-[a-z]*r[a-z]*\b|\s--recursive\b))/.test(lowerCommand)
-    if (recursiveRemove || /\b(?:dd\s+if=|mkfs|fdisk|parted|shutdown|reboot)\b/.test(lowerCommand)) {
-        pushRisk(categories, signals, 'destructive', 'destructive_command')
-    }
-    const processControl = /\b(?:pkill|killall)\b/.test(lowerCommand) || /\bkill\s+(?!-0(?:\s|$))/.test(lowerCommand)
-    if (processControl) {
-        pushRisk(categories, signals, 'process-control', 'process_control')
-    }
-    if (/\b(?:systemctl|service|docker|kubectl)\s+(?:restart|stop|kill|delete|rm|down)\b/.test(lowerCommand)) {
-        pushRisk(categories, signals, 'service-control', 'service_control')
-    }
-    if (/\b(?:password|passwd|token|authorization|cookie|secret|private[_-]?key)\b/i.test(command)) {
-        pushRisk(categories, signals, 'credential-bearing', 'credential_bearing')
-    }
-    if (/\bsu\s+-?\s*[a-zA-Z_][a-zA-Z0-9_-]*\s+-c\b/.test(command)) {
-        pushRisk(categories, signals, 'user-switch', 'direct_su_command')
+    const credentialArgument =
+        /--password\b|--token\b|\$env:(?:password|token|secret)\s*=/.test(executable) ||
+        (/\bset\s+"?/.test(executable) && /\bset\s+"?(?:password|token|secret)=/i.test(command))
+    const authorizationHeader =
+        /\b(?:curl|wget)\b[^\r\n;]*(?:-h|--header)\s*/.test(executable) &&
+        /\b(?:curl|wget)\b[^\r\n;]*(?:-H|--header)\s+['"]?authorization:/i.test(command)
+    if (credentialArgument || authorizationHeader) {
+        add('credential-bearing', 'credential_argument')
     }
     if (signals.length === 0) {
         return undefined
     }
-
-    const boundedTimeout = timeout !== undefined && timeout > 0 && timeout <= 300_000
     const high =
-        categories.has('destructive') ||
-        categories.has('service-control') ||
-        categories.has('process-control') ||
-        continuous ||
-        ((unboundedFind || recursiveGrep) && !boundedTimeout)
+        ['destructive', 'process-control', 'service-control', 'privilege-escalation'].some((category) =>
+            categories.has(category)
+        ) || signals.includes('continuous_command')
     return {
         level: high ? 'high' : 'medium',
-        categories: Array.from(categories),
+        categories: [...categories],
         signals,
-        suggestion: signals.includes('direct_su_command')
-            ? '建议使用 ssh_exec 的 runAs 参数或 ssh_exec_as_user，避免手写 su 命令造成引用和环境加载差异'
-            : high
-              ? '长任务使用 ssh_operation_start，交互命令使用 ssh_pty_start，破坏性操作执行前确认目标范围'
-              : '如输出较大，请设置 maxOutputSize 或重定向到远端文件后分块读取',
+        suggestion:
+            categories.has('privilege-escalation') && shell === 'posix'
+                ? 'Use runAs or ssh_exec_as_user for user switching'
+                : high
+                  ? 'Confirm the target and scope before executing this command'
+                  : 'Use a bounded timeout or redirect large output to a file',
     }
 }

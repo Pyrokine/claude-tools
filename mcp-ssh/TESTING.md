@@ -65,6 +65,17 @@
 **预期**：白名单内不存在的路径返回明确的 `ENOENT`/`no such file` 错误，不挂死，错误中的 `connectionStep="key_read"`
 ；白名单外路径单独返回安全校验错误，不要求回显原始路径
 
+### connect-agent-none-01
+
+**步骤**：使用本次测试创建的 SSH config，分别在目标 Host 和 `Host *` 设置
+`IdentityAgent none`；覆盖密码、私钥、ProxyJump 私钥，以及显式参数和模板提供 agent 的情况；在 mock
+ssh2 中设置一个环境 socket，连接后重连，再用可用密钥执行隔离的 rsync fixture
+
+**预期**：`none` 不作为 socket 预检，不传给 ssh2，也不使用
+`SSH_AUTH_SOCK`；密码和私钥连接可完成；目标与跳板机配置即使含私钥也保留 `none`；显式 agent 优先于模板，模板优先于 SSH
+config；重连和配置 fingerprint 保留禁用语义；外部 ssh/rsync 不继承环境 socket，ssh 参数含
+`IdentityAgent=none`，密钥仍可使用 rsync；其他不存在的显式 socket 仍拒绝连接
+
 ### connect-ready-timeout-01
 
 **步骤**：连接一个可建立 TCP 但不完成 SSH ready 的受控目标，设置 `readyTimeout=1000`
@@ -205,15 +216,22 @@ keys 来自实际发布的 session
 **预期**：返回 `stdoutTruncated=true`、`stdoutBytes`、`stderrBytes`、`stdoutHead`、`stdoutTail`、`maxOutputSize` 和
 `recommendedReadCommand`
 
+### exec-utf8-chunks-01
+
+**步骤**：故障注入把中文 BMP 字符和四字节 emoji 分散到多个 stdout/stderr data
+chunk，在普通 exec 和带密码的 sudo 分支分别执行；最后一个 chunk 后触发 close
+
+**预期**：stdout/stderr 与原文一致，不含替换字符；`stdoutBytes`/`stderrBytes`
+等于原始 Buffer 字节数；close 时处理增量解码器残余，重复终态事件不追加输出
+
 ### exec-command-risk-01
 
-**步骤**：分别执行或 dry-run 观察 `ssh_exec` 响应中的风险分类：`find /tmp`、`grep -R secret /tmp`、`sleep 60`、
-`tail -f /tmp/x`、`cmd1 | cmd2 | cmd3 | cmd4`、`kill 1`、`systemctl restart x`、`echo secret-marker`、
-`su - appuser -c whoami`
+**步骤**：只在 mock handler 中输入下列命令检查 `ssh_exec`
+风险分类，不在真实主机执行：`grep -R secret /tmp`、`python app.py`、`tail -f /tmp/x`、`kill 1`、`systemctl restart x`、`echo secret-marker`、`su - appuser -c whoami`、`curl --token=xxx`，另用 cmd 的
+`taskkill /F /PID 1` 和 PowerShell 的 `Remove-Item -Recurse C:\\Test` 测试
 
-**预期**：返回 `commandRisk.categories` 和
-`commandRisk.signals`，覆盖long-running、process-control、service-control、credential-bearing、user-switch；直接
-`su - user -c` 给出改用 `runAs` 或 `ssh_exec_as_user` 的 suggestion
+**预期**：只读搜索、普通解释器和敏感词输出不误报；破坏性、提权、凭据参数、进程控制和资源使用分别返回对应的
+`commandRisk.categories` 与 `signals`
 
 ### exec-script-01
 
@@ -221,6 +239,13 @@ keys 来自实际发布的 session
 
 **预期**：脚本执行成功，默认不返回 remotePath；连接级 `runAs` 或参数 `runAs`
 生效时脚本仍保持 700 私有权限并能由目标用户执行； `keepScript=true` 时返回 remotePath 且远端文件存在
+
+### exec-script-upload-timeout-01
+
+**步骤**：故障注入让 `mktemp` 成功，但 SFTP write stream 不完成；调用
+`ssh_exec_script(alias=..., script="printf never", timeout=25)`
+
+**预期**：上传阶段在请求的 timeout 内失败，错误说明 SFTP 状态未知；不进入 chmod 或脚本执行阶段；默认清理开启时仍尝试删除远端临时文件
 
 ### log-query-recipe-01
 
@@ -331,8 +356,8 @@ offset 返回明确 UTF-8 boundary 错误
 4. `ssh_pty_read(ptyId=..., mode="screen")`
 5. `ssh_pty_close(ptyId=...)`
 
-**预期**：read 输出含 "pty_test"，返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`unreadRawBytes`、`rawBufferLimit`、
-`foregroundProcess`，close 后 ptyId 失效
+**预期**：read 输出含 "pty_test"，返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`bufferSize`、
+`unreadRawBytes`、`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`，close 后 ptyId 失效
 
 ### pty-02: top 全屏刷新
 
@@ -351,11 +376,22 @@ offset 返回明确 UTF-8 boundary 错误
 
 **预期**：包含 ANSI 转义序列原文
 
+### pty-utf8-byte-limit-01
+
+**步骤**：使用 4 到 7 字节的 `bufferSize`，把中文字符和 emoji 跨多个 data
+chunk 写入 PTY，使总输出超过限制；依次执行 screen 读取、`raw clear=false`、默认 raw clear 和 list
+
+**预期**：screen 正常解码；raw 的 `dataBase64`
+解码后与保留的原始字节完全相同，包括边界处不完整 UTF-8 序列。`bufferSize`、`unreadRawBytes`、`rawBufferLimit`
+按字节计数；溢出后 `rawBufferTruncated=true`。默认 raw
+clear 的响应返回清理前计数和标志，随后 list 返回 0/false；screen 读取不清理 raw 状态
+
 ### pty-list-observability-01
 
 **步骤**：创建 pty 后调用 `ssh_pty_list`
 
-**预期**：会话项含 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`unreadRawBytes`、`rawBufferLimit`、`foregroundProcess`
+**预期**：会话项含 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`bufferSize`、`unreadRawBytes`、
+`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`，三个 size 字段均按原始字节计数
 
 ### pty-write-backpressure-01
 
@@ -462,6 +498,14 @@ close 后，列表项消失
 `remoteUnforwarded=false`、`retryable=true`，forward 状态保留，可使用同一 ID 重试；closing 期间的新连接被 reject，不会增加
 `activeConnections` 或遗留 stream/socket；callback 完成后重试成功
 
+### forward-close-remote-force-01
+
+**步骤**：创建 remote forward，接收一条指向本地测试服务的活跃连接，再调用
+`ssh_forward_close(forwardId=..., mode="force", timeoutMs=1000)`；让 stream 和 socket 的 close/error 都能到达
+
+**预期**：首次 close 返回
+`success=true`、`remoteUnforwarded=true`、`activeConnections=0`，不需要重试；同一连接两端事件只计数一次，forward 从 list 删除
+
 ### forward-idle-timeout-01: idle-timeout 主动回收（C.7 验证）
 
 **步骤**：建 forward 后无连接活动一段时间（或测试时改阈值）
@@ -503,6 +547,25 @@ close 后，列表项消失
 **预期**：每次 `content` 只含完整字符，并返回 `requested_offset`、实际 `read_offset`、`read_end` 和
 `next_offset`。中间偏移返回 UTF-8 boundary 错误，不返回替换字符
 
+### file-read-encoding-boundary-01
+
+**步骤**：通过公开 `ssh_read_file` handler 读取 UTF-16LE/BE 的普通字符、代理对、BOM 和 EOF 无效编码；将 `maxBytes`
+分别设为 1、2、3 和能容纳完整字符的值，使用 `next_offset` 继续；把 code unit 和代理对分散到不同 SFTP chunk；另用
+`binary=true` 每次读取一个字节
+
+**预期**：预算不足时明确返回
+`maxBytes is too small`，不成功返回零进度页；只裁掉预算造成的末尾不完整字符，EOF 处奇数字节、孤立代理和完整无效编码返回错误；BOM 已消耗的字节计入前移，不因正文为空报预算不足；read
+stream 不请求超过 `maxBytes` 的字节；binary 原样返回所有字节并持续前移
+
+### file-read-line-metadata-01
+
+**步骤**：对 UTF-8、UTF-16LE/BE 和 binary，以公开 handler 读取 `hello\r\nworld\r\n` 的
+`lineRange="1-2"`；预算覆盖第一行内部、完整第一行、第二行内部和完整两行；再用非 ASCII 字符验证解码丢弃末尾不完整字符的情况，改变 chunk 边界并覆盖 UTF-16 奇数字节预算
+
+**预期**：`line_start`、`line_end` 和 `final_line_terminated` 只描述 `read_bytes`
+对应的返回前缀；第一行截断仍有行号，完整第一行后没有返回第二行字节时不能计入第二行；CRLF 和 UTF-16 换行宽度正确；binary 部分 code
+unit 原样返回；metadata 不发起额外远端读取
+
 ### file-sftp-timeout-01
 
 **步骤**：故障注入 SFTP 的 stat、readdir、read stream、write stream 或 rename callback 不返回，对任一文件工具传入短
@@ -521,7 +584,8 @@ close 后，列表项消失
 
 **步骤**：`ssh_file_info(alias=..., remotePath="/tmp/mcp-test-write")`
 
-**预期**：含 size、mtime、permissions
+**预期**：含 size、mtime、数值 `mode` 和 `permissions`；对 4755、2644、1755 等权限分别返回完整特殊位及对应的 `s/S/t/T`
+展示
 
 ### list-dir-01
 
@@ -577,6 +641,14 @@ ssh_upload(
 `verification.actual.remotePath` 与该临时路径相同；校验通过后才 rename，目标文件内容为 "abc\n"，临时路径不再存在，
 `targetReplaced=true`
 
+### upload-special-mode-verify-01
+
+**步骤**：让 SFTP stat 返回 mode 4755，分别以 `verifyMode="0755"`、`verifyMode="4755"` 和 `verifyMode="-rwsr-xr-x"`
+执行单文件 upload 校验
+
+**预期**：0755 校验失败，4755 和权限文本校验成功；实际结果保留数值 mode 和
+`-rwsr-xr-x`，判断不依赖 permissions 文本反向转换；创建新内容时仍只使用 0777 范围内的权限位
+
 ### upload-atomic-verification-failure-01
 
 **步骤**：远端目标先写入 `original`，执行 `atomic=true` 上传并故障注入 size、MD5、mode、owner 或 mtime 任一校验失败
@@ -599,6 +671,19 @@ API 同步抛错，以及 rename 请求发出后 callback 返回错误
 `ssh_download(alias=..., remotePath="/tmp/mcp-dn-r.txt", localPath="/tmp/mcp-dn.txt")`；本地 cat
 
 **预期**：本地 mcp-dn.txt 含 "xyz\n"，响应含 `atomic=true`，目标目录不残留 `.mcp-tmp-*` 文件
+
+### download-mode-01
+
+**步骤**：分别下载到不存在的目标，以及 mode 为 0600、0750、4755 的既有普通文件；传输暂停在临时文件已创建、尚未完成的阶段检查临时 mode
+
+**预期**：传输中的临时文件为 0600；新目标最终为 0600；0600 和 0750 目标保留原 `rwx`
+位；4755 目标最终为 0755，不复制 setuid/setgid/sticky；内容均在完整传输后原子替换
+
+### download-nonregular-target-01
+
+**步骤**：把本地目标分别设为 symlink、目录和 FIFO，再调用 `ssh_download`
+
+**预期**：三类目标都在 SFTP stat/read stream 创建前被拒绝；symlink 指向的文件保持不变，同目录不产生临时文件
 
 ### download-atomic-failure-01
 
@@ -667,6 +752,13 @@ API 同步抛错，以及 rename 请求发出后 callback 返回错误
 和目录 summary；owner 不一致时应明确返回 `mismatched`
 和限量样本，不能自动 chown；完整 manifest 不进入响应，mismatch 样本不超过 20 个
 
+### sync-directory-special-mode-01
+
+**步骤**：在源目录中创建 setuid、setgid 和 sticky
+mode 条目，生成本地与远端 manifest；再分别清除目标 manifest 中的特殊位并比较 `verify.mode`
+
+**预期**：manifest 使用四位八进制 mode；特殊位一致时匹配，任一特殊位不同都返回 `checks.mode=false` 和 mode mismatch 样本
+
 ### sync-directory-delete-verify-01
 
 **步骤**：使用 direct key path 或 SSH agent 的 rsync eligible session，目标目录先放入源目录没有的 `stale.txt`，调用
@@ -720,9 +812,10 @@ API 同步抛错，以及 rename 请求发出后 callback 返回错误
 
 ### security-rsync-stderr-01: rsync 失败警告（C.9 验证）
 
-**步骤**：人为破坏 rsync（如设置远端非法 PATH），触发 sync fallback 到 SFTP
+**步骤**：用 mock 分别让远端 rsync 探测失败，以及在 rsync 已开始传输后返回非零退出码
 
-**预期**：返回 SyncResult.output 含 "rsync 失败原因: ..." 警告，而非静默 fallback
+**预期**：探测阶段失败时 `selectedTransport` 和 `fallbackReason` 表明使用 SFTP；传输开始后失败时返回
+`operationStatus="unknown"`，不再发起第二次 SFTP 传输
 
 ### security-ssh-config-hostname-01: ssh-config hostname 字符白名单（C.5 验证）
 
@@ -751,6 +844,57 @@ Host evil
 **清理**：构建失败时删除测试文件；构建成功后测试文件应已被自动删除
 
 ---
+
+## 9. Windows 与跨平台兼容性（S1-S14）
+
+本节的 mock/fixture 回归运行
+`npm test`，覆盖公开工具注册、SessionManager、SFTP 和 shell 构造；Windows 原生验收必须在隔离的 Windows runner 或 Windows
+OpenSSH 测试端执行；Linux 上通过模拟分支不能标为原生 PASS
+
+### win-connect-shell-01（S1-S3、S11-S12）
+
+在 Windows 机器用可用的 OpenSSH named pipe、Pageant 和 Cygwin/MSYS
+agent 分别连接测试主机，检查连接结果、ssh2 实际认证以及 `ssh_sync`
+capability；路径含空格和 Unicode 的私钥先用安全 DACL、再用 Everyone 可读 DACL、无法读取 ACL 的条件和显式拒绝当前身份读取文件内容的 DACL 测试；安全私钥可用，不安全时返回
+`key_acl_insecure`，无法验证或无法实际读取时返回 `key_acl_unverified`，不得报告 `key_path_usable`，不修改已有私钥；SSH
+config 的 `IdentityFile`、`IdentityAgent` 覆盖引号、`~\\`、盘符、UNC 和转义空格；连接 POSIX 与 Windows 各一台，用
+`cwd/env`、`&&`、分号、带空格值验证选定 shell 的命令分组；Windows `runAs`、`ssh_exec_as_user` 和 `ssh_exec_sudo`
+必须在发送远端命令前返回 `unsupported_remote_platform`
+
+### win-script-operation-01（S4、S6）
+
+在隔离 Windows OpenSSH 主机用 PowerShell 和 cmd 分别执行含空格路径、中文字符的 `ssh_exec_script`，确认 `.ps1` 的 UTF-8
+BOM 和 `.cmd` 的代码页 65001 使内容正确执行；检查临时 `.ps1/.cmd`
+在脚本正文写入前为私有 DACL；拒绝 ACL 操作时脚本不执行且空文件被清理；启动 tracked
+operation，读取 PID、创建时间、marker 校验状态；对正确身份取消并确认进程树结束；将 PID 重用、创建时间不符、marker 不符和进程元数据不可读分别故障注入；不得仅因关闭 SSH
+channel 就返回取消成功；无法验证身份时 `cancellationStatus` 应为 `unknown` 或 `unsupported`
+
+### win-file-sync-01（S5、S7-S10、S13）
+
+通过仅支持 SFTP 的测试账号读取 UTF-8、带 BOM 的 UTF-16LE/BE、GBK 和 CRLF 文件的 `lineRange`；`binary=true`
+解码 base64 后与原文件逐字节相同；对目录 manifest 使用 `maxEntries/maxFileBytes/maxTotalBytes`
+测试有限结果，Windows 的 POSIX owner/mode 参数必须拒绝，`verify.aclSddl` 则验证根目录 DACL；对 native
+Win32、MSYS2、Cygwin 配置独立 rsync profile，用带空格的盘符及 UNC 双向同步，观察
+`-e`、远端 executable 和路径映射；本地或远端 rsync 不可用时应显示 SFTP
+fallback 原因；模拟 rsync 传输开始后失败，不应再启动 SFTP 重传；分别让 SFTP 服务支持和不支持
+`posix-rename@openssh.com`，后者应在上传前拒绝覆盖旧文件；PTY 输出插入非 UTF-8 字节及不完整多字节序列，`dataBase64`
+解码结果必须与保留的原始字节相等；exec 超过输出字节预算时不得截断半个字符
+
+### win-upload-case-preflight-01
+
+**步骤**：在区分大小写的本地文件系统建立 `a.txt` 和
+`A.txt`，分别上传到已存在的 Windows 大小写敏感和不敏感目录；使用密码 SFTP 和密钥 rsync 两条路径；覆盖 file-directory、嵌套目录、Unicode 名称、exclude、默认跳过链接、followSymlinks、循环目录链接和 dry-run；故障注入父目录不存在、exec 不可用、超时、截断响应和缺字段；无候选目录使用只支持 SFTP 的账号，POSIX 目标也执行大小写不同的文件上传
+
+**预期**：传输和目录创建前完成共享预检；大小写不敏感目标出现实际碰撞时返回 `windows_filename_collision`
+且零传输，已存在的敏感目录可保留两个名称；候选语义无法验证时返回 `case_semantics_unverified`
+且零写入，不能转用其他传输继续；查询使用 Windows `GetFileInformationByHandleEx` 的 `FileCaseSensitiveInfo` 和
+`CompareStringOrdinal`，不能用本地 lowercase 作为最终证据；不从祖先推断尚不存在目录的标志，dry-run 不创建目录；exclude 和链接处理与上传一致；没有候选时不新增 exec/PowerShell 要求，POSIX 名称语义不变
+
+### win-path-permission-risk-01（S9、S11、S14）
+
+用本地和远端均含空格的 Win32/UNC 路径运行 list/mkdir、单文件与目录同步，检查最终 basename、父目录与目标位置；下载中断和既有目标文件被锁住时应保留原文件且清理临时文件；检查 Windows 会话产物及临时下载的 DACL 仅授权当前身份、SYSTEM 与 Administrators；分别运行无害
+`grep -R secret`、普通 Python/Node、cmd 的 `taskkill /F`、PowerShell 的 `Remove-Item -Recurse`
+和包含凭据参数的命令，风险字段按 shell 区分
 
 ## 测试清理
 

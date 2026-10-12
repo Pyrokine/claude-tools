@@ -153,14 +153,7 @@ export class ForwardManager {
                 if (!socket.destroyed) {
                     socket.destroy()
                 }
-                session.activeConnections = Math.max(0, session.activeConnections - 1)
-                session.lastActivityAt = Date.now()
-                if (session.activeConnections === 0) {
-                    for (const resolve of session.connectionDrainWaiters) {
-                        resolve()
-                    }
-                    session.connectionDrainWaiters.clear()
-                }
+                this.recordConnectionClosed(session)
             }
             socket.once('close', closeConnection)
             socket.once('error', closeConnection)
@@ -444,6 +437,9 @@ export class ForwardManager {
             for (const connection of fwd.connections) {
                 connection.destroy()
             }
+            fwd.connections.clear()
+            fwd.activeConnections = 0
+            this.notifyConnectionDrainIfIdle(fwd)
             this.sessions.delete(fwd.id)
             if (fwd.type === 'local' && fwd.server && !fwd.closePromise) {
                 this.closeServerAfterCancelledCreation(fwd.server)
@@ -504,6 +500,22 @@ export class ForwardManager {
         return new Promise((resolve) => {
             fwd.connectionDrainWaiters.add(resolve)
         })
+    }
+
+    private recordConnectionClosed(fwd: ForwardSession): void {
+        fwd.activeConnections = Math.max(0, fwd.activeConnections - 1)
+        fwd.lastActivityAt = Date.now()
+        this.notifyConnectionDrainIfIdle(fwd)
+    }
+
+    private notifyConnectionDrainIfIdle(fwd: ForwardSession): void {
+        if (fwd.activeConnections !== 0) {
+            return
+        }
+        for (const resolve of fwd.connectionDrainWaiters) {
+            resolve()
+        }
+        fwd.connectionDrainWaiters.clear()
     }
 
     private waitForChannelOpenDrain(fwd: ForwardSession): Promise<void> {
@@ -756,8 +768,7 @@ export class ForwardManager {
                         closed = true
                         fwd.connections.delete(stream)
                         fwd.connections.delete(socket)
-                        fwd.activeConnections = Math.max(0, fwd.activeConnections - 1)
-                        fwd.lastActivityAt = Date.now()
+                        this.recordConnectionClosed(fwd)
                     }
                     socket.pipe(stream).pipe(socket)
                     socket.on('error', () => stream.close())

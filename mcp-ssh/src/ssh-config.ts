@@ -20,6 +20,7 @@ export interface SSHConfigHost {
     user?: string // 用户名
     port?: number // 端口
     identityFile?: string // 私钥路径
+    identityAgent?: string // SSH agent socket/pipe
     proxyJump?: string // 跳板机（原始字符串，可能是 user@host:port 格式）
 }
 
@@ -125,26 +126,46 @@ export function parseProxyJump(proxyJump: string): ParsedProxyJump | null {
     return { host, port }
 }
 
-/**
- * 剥离行尾注释
- * "value # comment" -> "value"
- */
-function stripInlineComment(value: string): string {
-    // 查找不在引号内的 #
-    let inQuote = false
-    let quoteChar = ''
-    for (let i = 0; i < value.length; i++) {
-        const ch = value[i]
-        if (!inQuote && (ch === '"' || ch === "'")) {
-            inQuote = true
-            quoteChar = ch
-        } else if (inQuote && ch === quoteChar) {
-            inQuote = false
-        } else if (!inQuote && ch === '#') {
-            return value.slice(0, i).trim()
+/** Parse SSH config values without treating Windows path separators as escapes. */
+export function parseConfigValue(value: string): string[] {
+    const tokens: string[] = []
+    let token = ''
+    let quote: '"' | "'" | undefined
+    let started = false
+    for (let i = 0; i < value.length; ++i) {
+        const char = value[i]
+        if (char === '\\' && i + 1 < value.length && /[\s"']/.test(value[i + 1])) {
+            token += value[++i]
+            started = true
+        } else if (char === '"' || char === "'") {
+            if (quote === char) {
+                quote = undefined
+            } else if (!quote && !started) {
+                quote = char
+            } else {
+                token += char
+            }
+            started = true
+        } else if (char === '#' && !quote && !started) {
+            break
+        } else if (/\s/.test(char) && !quote) {
+            if (started) {
+                tokens.push(token)
+                token = ''
+                started = false
+            }
+        } else {
+            token += char
+            started = true
         }
     }
-    return value.trim()
+    if (quote) {
+        throw new Error('ssh-config: unclosed quote')
+    }
+    if (started) {
+        tokens.push(token)
+    }
+    return tokens
 }
 
 /**
@@ -187,7 +208,8 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
 
         const { key, rawValue } = match.groups as { key: string; rawValue: string }
         const keyLower = key.toLowerCase()
-        const value = stripInlineComment(rawValue)
+        const values = parseConfigValue(rawValue)
+        const value = values.join(' ')
 
         if (keyLower === 'host') {
             // Host 块开始，结束 Match 块
@@ -199,7 +221,7 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
             }
 
             // Host 行可能有多个别名/模式，用空格分隔
-            const patterns = value.split(/\s+/).filter((p) => p.length > 0)
+            const patterns = values.filter((p) => p.length > 0)
             currentBlock = { patterns, config: {} }
         } else if (keyLower === 'match') {
             // Match 块开始，跳过直到下一个 Host
@@ -225,6 +247,9 @@ export function parseSSHConfig(configPath?: string): SSHConfigHost[] {
                     break
                 case 'identityfile':
                     currentBlock.config.identityFile = expandTilde(value)
+                    break
+                case 'identityagent':
+                    currentBlock.config.identityAgent = expandTilde(value)
                     break
                 case 'proxyjump':
                     currentBlock.config.proxyJump = value

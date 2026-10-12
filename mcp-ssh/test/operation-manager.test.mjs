@@ -58,7 +58,6 @@ test('operation start timeout leaves a queryable record and blocks duplicate pen
         assert.match(error.message, /timed out/)
         return true
     })
-    await waitForEvents()
     const [starting] = manager.list('server')
     assert.equal(starting.status, 'starting')
     await assert.rejects(manager.start('server', 'sleep 2'), /already has an operation start/)

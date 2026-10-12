@@ -1,7 +1,10 @@
 import { createHash } from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import { escapeShellArg } from './tools/utils.js'
+import type { SFTPWrapper, Stats } from 'ssh2'
+import type { RemotePathStyle } from './types.js'
+import { remoteJoin } from './remote-platform.js'
+import { formatFileMode } from './file-mode.js'
 
 export const DIRECTORY_VERIFY_MAX_ENTRIES = 50_000
 export const DIRECTORY_VERIFY_MAX_MISMATCHES = 20
@@ -15,6 +18,7 @@ export type DirectoryVerifyRequest = {
     sha256?: boolean
     owner?: boolean
     mode?: boolean
+    aclSddl?: string
     deletions?: boolean
     staleFiles?: boolean
     maxEntries?: number
@@ -31,7 +35,7 @@ type ManifestEntry = {
     sha256?: string
 }
 
-type DirectoryManifestLimitReason = 'entries' | 'file_bytes' | 'total_bytes'
+type DirectoryManifestLimitReason = 'entries' | 'file_bytes' | 'total_bytes' | 'depth'
 
 export type DirectoryManifest = {
     entries: ManifestEntry[]
@@ -60,14 +64,19 @@ function rootHash(entries: ManifestEntry[]): string {
     return hash.digest('hex')
 }
 
-async function hashFile(filePath: string): Promise<string> {
+async function hashFile(filePath: string, size: number, maxBytes: number): Promise<string> {
     const hash = createHash('sha256')
-    await new Promise<void>((resolve, reject) => {
-        const stream = fs.createReadStream(filePath)
-        stream.on('data', (chunk) => hash.update(chunk))
-        stream.on('error', reject)
-        stream.on('end', resolve)
-    })
+    let readBytes = 0
+    for await (const chunk of fs.createReadStream(filePath)) {
+        readBytes += Buffer.byteLength(chunk)
+        if (readBytes > maxBytes) {
+            throw new Error('local file grew beyond directory manifest hash budget')
+        }
+        hash.update(chunk)
+    }
+    if (readBytes !== size) {
+        throw new Error('local file changed during manifest hashing')
+    }
     return hash.digest('hex')
 }
 
@@ -131,7 +140,7 @@ export async function createLocalDirectoryManifest(
             path: '.',
             type: 'directory',
             size: 0,
-            mode: (rootStats.mode & 0o777).toString(8).padStart(4, '0'),
+            mode: formatFileMode(rootStats.mode),
             owner: String(rootStats.uid),
         },
     ]
@@ -171,7 +180,7 @@ export async function createLocalDirectoryManifest(
                         path: relativePath,
                         type: 'directory',
                         size: 0,
-                        mode: (stats.mode & 0o777).toString(8).padStart(4, '0'),
+                        mode: formatFileMode(stats.mode),
                         owner: String(stats.uid),
                     })
                     await visit(fullPath, relativePath)
@@ -189,14 +198,18 @@ export async function createLocalDirectoryManifest(
                             limitReason = 'total_bytes'
                             return
                         }
+                        sha256 = await hashFile(
+                            fullPath,
+                            stats.size,
+                            Math.min(maxFileBytes, maxTotalBytes - hashedBytes)
+                        )
                         hashedBytes += stats.size
-                        sha256 = await hashFile(fullPath)
                     }
                     entries.push({
                         path: relativePath,
                         type: 'file',
                         size: stats.size,
-                        mode: (stats.mode & 0o777).toString(8).padStart(4, '0'),
+                        mode: formatFileMode(stats.mode),
                         owner: String(stats.uid),
                         sha256,
                     })
@@ -225,6 +238,175 @@ export async function createLocalDirectoryManifest(
     }
 }
 
+export async function createRemoteDirectoryManifest(
+    sftp: SFTPWrapper,
+    rootPath: string,
+    request: DirectoryVerifyRequest,
+    exclude?: string[],
+    followSymlinks: boolean = false,
+    style: RemotePathStyle = 'posix'
+): Promise<DirectoryManifest> {
+    const maxEntries = Math.min(request.maxEntries ?? 10_000, DIRECTORY_VERIFY_MAX_ENTRIES)
+    const maxFileBytes = Math.min(
+        request.maxFileBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_FILE_BYTES,
+        DIRECTORY_VERIFY_MAX_FILE_BYTES
+    )
+    const maxTotalBytes = Math.min(
+        request.maxTotalBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_TOTAL_BYTES,
+        DIRECTORY_VERIFY_MAX_TOTAL_BYTES
+    )
+    const join = (parent: string, child: string): string => remoteJoin(style, parent, child)
+    const stat = (remotePath: string): Promise<Stats> =>
+        new Promise((resolve, reject) => {
+            sftp.stat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
+        })
+    const lstat = (remotePath: string): Promise<Stats> =>
+        new Promise((resolve, reject) => {
+            sftp.lstat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
+        })
+    const root = await stat(rootPath)
+    if ((root.mode & 0o170000) !== 0o040000) {
+        throw new Error('remote directory verification root is not a directory')
+    }
+    const entry = (name: string, kind: 'file' | 'directory', stats: Stats, sha256?: string): ManifestEntry => ({
+        path: name,
+        type: kind,
+        size: kind === 'file' ? stats.size : 0,
+        mode: formatFileMode(stats.mode),
+        owner: String(stats.uid),
+        sha256,
+    })
+    const entries = [entry('.', 'directory', root)]
+    let hashedBytes = 0
+    let skippedSymlinks = 0
+    let skippedUnsupported = 0
+    const unsupportedSamples: string[] = []
+    let limitReason: DirectoryManifestLimitReason | undefined
+    const active = new Set<string>()
+    const visit = async (directory: string, relative: string, depth: number): Promise<void> => {
+        if (depth > 64) {
+            limitReason = 'depth'
+            return
+        }
+        const resolved = await new Promise<string>((resolve, reject) => {
+            sftp.realpath(directory, (error, result) => (error ? reject(error) : resolve(result)))
+        })
+        if (active.has(resolved)) {
+            ++skippedSymlinks
+            return
+        }
+        active.add(resolved)
+        const handle = await new Promise<Buffer>((resolve, reject) => {
+            sftp.opendir(directory, (error, result) => (error ? reject(error) : resolve(result)))
+        })
+        try {
+            while (!limitReason) {
+                const batch = await new Promise<Array<{ filename: string; attrs: Stats }> | null>((resolve, reject) => {
+                    sftp.readdir(handle, (error, list) => {
+                        if (error && (error as Error & { code?: number }).code === 1) {
+                            resolve(null)
+                        } else if (error) {
+                            reject(error)
+                        } else {
+                            resolve(list)
+                        }
+                    })
+                })
+                if (!batch || batch.length === 0) {
+                    break
+                }
+                for (const item of batch) {
+                    const name = item.filename
+                    if (!name || name.length > 1024 || name === '.' || name === '..' || /[\\/\0]/.test(name)) {
+                        throw new Error('remote directory verification returned unsafe entry name')
+                    }
+                    const relativePath = relative ? `${relative}/${name}` : name
+                    if (matchesDirectoryExclude(relativePath, exclude)) {
+                        continue
+                    }
+                    if (entries.length >= maxEntries) {
+                        limitReason = 'entries'
+                        break
+                    }
+                    const fullPath = join(directory, name)
+                    const link = await lstat(fullPath)
+                    if ((link.mode & 0o170000) === 0o120000 && !followSymlinks) {
+                        ++skippedSymlinks
+                        continue
+                    }
+                    const stats = (link.mode & 0o170000) === 0o120000 ? await stat(fullPath) : link
+                    if ((stats.mode & 0o170000) === 0o040000) {
+                        entries.push(entry(relativePath, 'directory', stats))
+                        await visit(fullPath, relativePath, depth + 1)
+                    } else if ((stats.mode & 0o170000) === 0o100000) {
+                        if (!Number.isSafeInteger(stats.size) || stats.size < 0) {
+                            throw new Error('remote manifest returned an invalid file size')
+                        }
+                        let sha256: string | undefined
+                        if (request.sha256) {
+                            if (stats.size > maxFileBytes) {
+                                limitReason = 'file_bytes'
+                                break
+                            }
+                            if (hashedBytes + stats.size > maxTotalBytes) {
+                                limitReason = 'total_bytes'
+                                break
+                            }
+                            const digest = createHash('sha256')
+                            let actualSize = 0
+                            for await (const chunk of sftp.createReadStream(fullPath)) {
+                                actualSize += Buffer.byteLength(chunk)
+                                if (actualSize > maxFileBytes) {
+                                    limitReason = 'file_bytes'
+                                    break
+                                }
+                                if (hashedBytes + actualSize > maxTotalBytes) {
+                                    limitReason = 'total_bytes'
+                                    break
+                                }
+                                digest.update(chunk)
+                            }
+                            if (limitReason) {
+                                break
+                            }
+                            if (actualSize !== stats.size) {
+                                throw new Error('remote file changed during manifest hashing')
+                            }
+                            hashedBytes += actualSize
+                            sha256 = digest.digest('hex')
+                        }
+                        entries.push(entry(relativePath, 'file', stats, sha256))
+                    } else {
+                        ++skippedUnsupported
+                        if (unsupportedSamples.length < 10) {
+                            unsupportedSamples.push(relativePath)
+                        }
+                    }
+                    if (limitReason) {
+                        break
+                    }
+                }
+            }
+        } finally {
+            active.delete(resolved)
+            await new Promise<void>((resolve, reject) =>
+                sftp.close(handle, (error) => (error ? reject(error) : resolve()))
+            )
+        }
+    }
+    await visit(rootPath, '', 0)
+    return {
+        entries,
+        count: entries.length,
+        rootSha256: rootHash(entries),
+        limited: limitReason !== undefined,
+        limitReason,
+        skippedSymlinks,
+        skippedUnsupported,
+        unsupportedSamples,
+    }
+}
+
 export function createEmptyDirectoryManifest(): DirectoryManifest {
     const entries: ManifestEntry[] = []
     return {
@@ -235,221 +417,6 @@ export function createEmptyDirectoryManifest(): DirectoryManifest {
         skippedSymlinks: 0,
         skippedUnsupported: 0,
         unsupportedSamples: [],
-    }
-}
-
-function buildExcludeRegexes(exclude: string[] | undefined): { path?: string; basename?: string } {
-    const pathPatterns: string[] = []
-    const basenamePatterns: string[] = []
-    for (const pattern of exclude ?? []) {
-        const normalized = pattern.replace(/^\//, '')
-        const expression = globPatternToRegExp(normalized).source.replace(/^\^|\$$/g, '')
-        if (normalized.includes('/')) {
-            pathPatterns.push(expression)
-        } else {
-            basenamePatterns.push(expression)
-        }
-    }
-    return {
-        path: pathPatterns.length > 0 ? `^(${pathPatterns.join('|')})$` : undefined,
-        basename: basenamePatterns.length > 0 ? `^(${basenamePatterns.join('|')})$` : undefined,
-    }
-}
-
-export function buildRemoteDirectoryManifestCommand(
-    rootPath: string,
-    request: DirectoryVerifyRequest,
-    exclude?: string[],
-    followSymlinks: boolean = false
-): string {
-    const maxEntries = Math.min(request.maxEntries ?? 10_000, DIRECTORY_VERIFY_MAX_ENTRIES)
-    const maxFileBytes = Math.min(
-        request.maxFileBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_FILE_BYTES,
-        DIRECTORY_VERIFY_MAX_FILE_BYTES
-    )
-    const maxTotalBytes = Math.min(
-        request.maxTotalBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_TOTAL_BYTES,
-        DIRECTORY_VERIFY_MAX_TOTAL_BYTES
-    )
-    const normalizedRoot = rootPath.replace(/\/+$/, '') || '/'
-    const root = escapeShellArg(normalizedRoot)
-    const includeHash = request.sha256 === true
-    const excludeRegexes = buildExcludeRegexes(exclude)
-    const pathExcludeRegex = excludeRegexes.path ? escapeShellArg(excludeRegexes.path) : undefined
-    const basenameExcludeRegex = excludeRegexes.basename ? escapeShellArg(excludeRegexes.basename) : undefined
-    const findFollow = followSymlinks ? '-L' : '-H'
-    const script = [
-        'set -euo pipefail',
-        'export LC_ALL=C',
-        `root=${root}`,
-        '[ -d "$root" ] || { printf "remote directory does not exist\\n" >&2; exit 3; }',
-        'count=0',
-        'hashed_bytes=0',
-        'skipped_symlinks=0',
-        'skipped_unsupported=0',
-        'unsupported_samples=()',
-        'excluded_dirs=()',
-        'while IFS= read -r -d "" item; do',
-        '  if [ "$item" = "__MCP_FIND_ERROR__" ]; then exit 4; fi',
-        `  if [ "$item" = "$root" ]; then
-    rel=.
-  elif [ "$root" = / ]; then
-    rel=\${item#/}
-  else
-    rel=\${item#"$root"/}
-  fi`,
-        '  for excluded_dir in "${excluded_dirs[@]}"; do case "$rel" in "$excluded_dir"/*) continue 2;; esac; done',
-        pathExcludeRegex
-            ? `  if [ "$rel" != . ] && printf %s "$rel" | grep -Eq -- ${pathExcludeRegex}; then
-    [ -d "$item" ] && excluded_dirs+=("$rel")
-    continue
-  fi`
-            : '  :',
-        basenameExcludeRegex
-            ? `  base=\${rel##*/}
-  if [ "$rel" != . ] && printf %s "$base" | grep -Eq -- ${basenameExcludeRegex}; then
-    [ -d "$item" ] && excluded_dirs+=("$rel")
-    continue
-  fi`
-            : '  :',
-        followSymlinks
-            ? '  :'
-            : '  if [ "$rel" != . ] && [ -L "$item" ]; then skipped_symlinks=$((skipped_symlinks + 1)); continue; fi',
-        `  if [ -d "$item" ]; then
-    type=directory
-    size=0
-  elif [ -f "$item" ]; then
-    type=file
-    size=$(stat -c %s -- "$item")
-  else
-    skipped_unsupported=$((skipped_unsupported + 1))
-    if [ "\${#unsupported_samples[@]}" -lt 10 ]; then
-      unsupported_samples+=("$(printf %s "$rel" | base64 | tr -d "\\n")")
-    fi
-    continue
-  fi`,
-        '  count=$((count + 1))',
-        `  if [ "$count" -gt ${maxEntries} ]; then printf '__MCP_LIMIT__\\tentries\\n'; break; fi`,
-        '  raw_mode=$(stat -c %a -- "$item")',
-        '  mode=$(printf \'%04o\' "$((8#$raw_mode & 0777))")',
-        '  owner=$(stat -c %u -- "$item")',
-        includeHash
-            ? `  if [ "$type" = file ]; then
-    if [ "$size" -gt ${maxFileBytes} ]; then printf '__MCP_LIMIT__\\tfile_bytes\\n'; break; fi
-    next_hashed_bytes=$((hashed_bytes + size))
-    if [ "$next_hashed_bytes" -gt ${maxTotalBytes} ]; then printf '__MCP_LIMIT__\\ttotal_bytes\\n'; break; fi
-    hashed_bytes=$next_hashed_bytes
-    digest=$(sha256sum -- "$item" | cut -d " " -f 1)
-  else digest=; fi`
-            : '  digest=',
-        '  encoded=$(printf %s "$rel" | base64 | tr -d "\\n")',
-        '  printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$encoded" "$type" "$size" "$mode" "$owner" "$digest"',
-        `done < <({ find ${findFollow} "$root" -print0 || printf '%s\\0' '__MCP_FIND_ERROR__'; })`,
-        'printf "__MCP_SKIPPED_SYMLINKS__\\t%s\\n" "$skipped_symlinks"',
-        'printf "__MCP_SKIPPED_UNSUPPORTED__\\t%s\\n" "$skipped_unsupported"',
-        'for sample in "${unsupported_samples[@]}"; do printf "__MCP_UNSUPPORTED_SAMPLE__\\t%s\\n" "$sample"; done',
-    ].join('\n')
-    return `bash -c ${escapeShellArg(script)}`
-}
-
-function decodeManifestPath(encodedPath: string): string {
-    const decodedPath = Buffer.from(encodedPath, 'base64').toString('utf-8')
-    if (
-        !encodedPath ||
-        !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedPath) ||
-        encodedPath.length % 4 !== 0 ||
-        !decodedPath ||
-        decodedPath.length > 4096 ||
-        decodedPath.includes('\0') ||
-        path.posix.isAbsolute(decodedPath) ||
-        decodedPath.split('/').includes('..')
-    ) {
-        throw new Error('remote directory verification returned malformed manifest path')
-    }
-    return decodedPath
-}
-
-export function parseRemoteDirectoryManifest(output: string): DirectoryManifest {
-    const entries: ManifestEntry[] = []
-    const paths = new Set<string>()
-    let skippedSymlinks = 0
-    let skippedUnsupported = 0
-    const unsupportedSamples: string[] = []
-    let limitReason: DirectoryManifestLimitReason | undefined
-    for (const line of output.split('\n')) {
-        if (!line) {
-            continue
-        }
-        if (line.startsWith('__MCP_LIMIT__\t')) {
-            const reason = line.slice('__MCP_LIMIT__\t'.length)
-            if (reason === 'entries' || reason === 'file_bytes' || reason === 'total_bytes') {
-                limitReason = reason
-                continue
-            }
-            throw new Error('remote directory verification returned an unknown limit reason')
-        }
-        if (line.startsWith('__MCP_SKIPPED_SYMLINKS__\t')) {
-            const count = Number(line.slice('__MCP_SKIPPED_SYMLINKS__\t'.length))
-            if (!Number.isSafeInteger(count) || count < 0) {
-                throw new Error('remote directory verification returned an invalid symlink count')
-            }
-            skippedSymlinks = count
-            continue
-        }
-        if (line.startsWith('__MCP_SKIPPED_UNSUPPORTED__\t')) {
-            const count = Number(line.slice('__MCP_SKIPPED_UNSUPPORTED__\t'.length))
-            if (!Number.isSafeInteger(count) || count < 0) {
-                throw new Error('remote directory verification returned an invalid unsupported entry count')
-            }
-            skippedUnsupported = count
-            continue
-        }
-        if (line.startsWith('__MCP_UNSUPPORTED_SAMPLE__\t')) {
-            const encodedPath = line.slice('__MCP_UNSUPPORTED_SAMPLE__\t'.length)
-            const samplePath = decodeManifestPath(encodedPath)
-            if (unsupportedSamples.length >= 10) {
-                throw new Error('remote directory verification returned too many unsupported entry samples')
-            }
-            unsupportedSamples.push(samplePath)
-            continue
-        }
-        const fields = line.split('\t')
-        if (fields.length !== 6) {
-            throw new Error('remote directory verification returned malformed manifest data')
-        }
-        const [encodedPath, type, sizeText, mode, owner, sha256] = fields
-        const size = Number(sizeText)
-        const entryPath = decodeManifestPath(encodedPath)
-        if (
-            paths.has(entryPath) ||
-            (type !== 'file' && type !== 'directory') ||
-            !Number.isSafeInteger(size) ||
-            size < 0 ||
-            !/^0[0-7]{3}$/.test(mode) ||
-            !/^\d+$/.test(owner) ||
-            (sha256 !== undefined && sha256 !== '' && !/^[a-f0-9]{64}$/.test(sha256))
-        ) {
-            throw new Error('remote directory verification returned malformed manifest data')
-        }
-        paths.add(entryPath)
-        entries.push({
-            path: entryPath,
-            type,
-            size,
-            mode,
-            owner,
-            sha256: sha256 || undefined,
-        })
-    }
-    return {
-        entries,
-        count: entries.length,
-        rootSha256: rootHash(entries),
-        limited: limitReason !== undefined,
-        limitReason,
-        skippedSymlinks,
-        skippedUnsupported,
-        unsupportedSamples,
     }
 }
 

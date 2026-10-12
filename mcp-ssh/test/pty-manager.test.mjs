@@ -80,6 +80,66 @@ test('PTY write reports backpressure without reporting a rejected input', async 
     })
 })
 
+test('PTY raw output uses UTF-8 byte limits and reports discarded history until clear', async () => {
+    const stream = new FakePtyStream()
+    const manager = new PtyManager()
+    const ptyId = await manager.start(
+        {
+            async execPty() {
+                return stream
+            },
+        },
+        'test',
+        'printf output',
+        { rows: 4, cols: 40, bufferSize: 7 }
+    )
+    const output = Buffer.from('中中😀')
+    stream.emit('data', output.subarray(0, 1))
+    stream.emit('data', output.subarray(1, 4))
+    stream.emit('data', output.subarray(4, 8))
+    stream.emit('data', output.subarray(8))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    const retained = manager.read(ptyId, { mode: 'raw', clear: false })
+    assert.equal(retained.data, '中😀')
+    assert.deepEqual(Buffer.from(retained.dataBase64, 'base64'), output.subarray(-7))
+    assert.equal(retained.unreadRawBytes, 7)
+    assert.equal(retained.rawBufferLimit, 7)
+    assert.equal(retained.rawBufferTruncated, true)
+    assert.match(manager.read(ptyId, { mode: 'screen' }).data, /中中😀/)
+    assert.deepEqual(
+        manager.list().map(({ bufferSize, unreadRawBytes, rawBufferLimit, rawBufferTruncated }) => ({
+            bufferSize,
+            unreadRawBytes,
+            rawBufferLimit,
+            rawBufferTruncated,
+        })),
+        [{ bufferSize: 7, unreadRawBytes: 7, rawBufferLimit: 7, rawBufferTruncated: true }]
+    )
+
+    const cleared = manager.read(ptyId, { mode: 'raw' })
+    assert.equal(cleared.data, '中😀')
+    assert.equal(cleared.unreadRawBytes, 7)
+    assert.equal(cleared.rawBufferTruncated, true)
+    assert.equal(manager.list()[0].bufferSize, 0)
+    assert.equal(manager.list()[0].unreadRawBytes, 0)
+    assert.equal(manager.list()[0].rawBufferTruncated, false)
+    assert.deepEqual(manager.read(ptyId, { mode: 'raw' }), {
+        data: '',
+        dataBase64: '',
+        active: true,
+        rows: 4,
+        cols: 40,
+        lastInputAt: null,
+        lastOutputAt: retained.lastOutputAt,
+        lastReadAt: manager.list()[0].lastReadAt,
+        unreadRawBytes: 0,
+        rawBufferLimit: 7,
+        rawBufferTruncated: false,
+        foregroundProcess: 'printf output',
+    })
+})
+
 test('PTY close failure retains the session for retry', async () => {
     const stream = new FakePtyStream({ closeError: new Error('injected close failure') })
     const manager = new PtyManager()

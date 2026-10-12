@@ -14,8 +14,8 @@ export function expandTilde(p: string): string {
     if (p === '~') {
         return os.homedir()
     }
-    if (p.startsWith('~/')) {
-        return path.join(os.homedir(), p.slice(2))
+    if (p.startsWith('~/') || p.startsWith('~\\')) {
+        return path.join(os.homedir(), p.slice(2).replace(/\\/g, path.sep))
     }
     return p
 }
