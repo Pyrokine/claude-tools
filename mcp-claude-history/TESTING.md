@@ -87,11 +87,17 @@
 
 **预期**：只返回 `type=user, subtype=human` 的普通 user-shaped record。结果和说明不得把该分类表示为可验证的真人作者来源
 
-### search-05: subagents=true
+### search-05: subagents 扫描范围与有效配置
 
-**步骤**：`history_search(pattern="...", subagents=true, project="<project>")`
+**步骤**：在隔离 HOME/TMPDIR 创建自有主 JSONL、`<session>/subagents/agent-local.jsonl` 和
+`<session>/remote-agents/agent-remote.jsonl`，分别省略 subagents、传 false 和 true
+对每组分别查询全部会话、父 ID、各子 ID，覆盖普通、summary、aggregate、dry_run、output，以及 limit 和 max_total 续查
+读取公开 MCP schema，核对 subagents 的默认值和文件范围说明
 
-**预期**：含 sidechain session 中的命中（CLI 与 MCP 都应支持，E.3 验证）
+**预期**：省略与 false 只含主文件，true 纳入两种 agent 文件；sessions 匹配文件自身 ID，父 ID 不自动包含子会话
+未选中的子 ID 返回 session_not_found，所有成功响应始终回显布尔型 `stats.effective_filters.subagents`，false 不省略
+coverage 与导出文件对应相同集合，续查不重复或遗漏会话，schema 说明默认 false 和两种目录
+该回显不证明存在其他 Workflow 存储布局，CLI 与 MCP 保持同一范围
 
 ### search-06: subagents flag CLI 与 MCP 一致
 
@@ -113,6 +119,14 @@ record 不返回，`stats.skipped_invalid_timestamps` 和 `incomplete_reasons`
 **步骤**：先 `limit=5, offset=0` 拿一批；再 `limit=5, offset=5` 拿下一批
 
 **预期**：两批结果不重叠；如还有更多则 has_more=true
+
+### search-08a: lines 分页续查
+
+**步骤**：在至少 10 行的 fixture 上调用 `history_search(lines="5-7,!6", limit=1)`，随后原样执行返回的
+`next_query`，直到 `has_more=false`
+
+**预期**：每个 `next_query` 都保留规范化的 `lines="5-7,!6"`；结果只含第 5、7 行，顺序不变且不重复。单行、闭区间、
+开放区间和排除范围都应按相同规则保留
 
 ### search-09: slice 最近消息
 
@@ -169,6 +183,15 @@ record 不返回，`stats.skipped_invalid_timestamps` 和 `incomplete_reasons`
 
 **预期**：仅返回匹配 server/tool 的 tool_use 记录，每条含 matched_filters
 
+### search-13a: 多 tool block 字段关联
+
+**步骤**：在同一 assistant record 中放入三个 `tool_use`，各自使用不同 name、input marker 和
+`tool_use_id`；下一条 user record 放入对应的三个 `tool_result`，让首项 payload 报错、中间项 `is_error=true`、末项成功。分别按
+每个 tool、`failed_tool_results` 和 `tool_payload_errors` 查询
+
+**预期**：每次选择第一个同时满足全部过滤条件的 block；返回的 server、tool、input、result、`is_error` 和 payload error
+状态都来自该 block 及其 `tool_use_id`，不得拼接其他 block 的字段。首项和中间项失败都能被相应过滤条件命中
+
 ### search-14: summary/jsonl/incomplete
 
 **步骤**：
@@ -185,6 +208,48 @@ history_search(
 ```
 
 **预期**：返回 summary、coverage、incomplete/incomplete_reasons；输出文件为 JSONL，manifest 存在
+
+### search-14a: 内容完整性与工具归因
+
+**步骤**：在独立 fixture 中分别构造 `unknown_id`、`missing_id`、`ambiguous_parent`，再添加正常用户文字；分别通过关键词、`subtypes=human`、时间和行范围排除工具记录；再查询匹配的工具记录，以及用 `servers/tools` 筛选无法确认归属的记录；对普通、`summary`、`aggregate` 和 JSONL 导出重复查询
+
+**预期**：被排除的工具记录不影响内容完整性，也不进入归因诊断；匹配工具记录的关联缺失仅进入 `stats.attribution_incomplete_reasons` 和记录级 `metadata_incomplete_reason`，正文搜索仍完整；工具名称或服务筛选无法确认时，返回 `tool_filter_unverifiable`，`complete=false`、`total_matches_exact=false`；manifest 与响应的归因原因一致，真实 parse/read 错误及容量限制仍保持不完整语义
+
+### search-14b: 扫描路径不挤占命中消息
+
+**步骤**：构造一条短命中和大量无关会话路径，将最终紧凑响应限制为 1800 字节
+
+**预期**：缩减 `coverage.searched_files` 后保留完整命中消息，不返回空结果或 `response_too_large`；`coverage.searched_files` 表示扫描范围，实际命中在 `results` 中，预算缩减仍通过 `max_total` 标记
+
+### search-14c: 容量与读取缺口的四模式计数
+
+**步骤**：分别构造有效 JSONL 超过 8 MiB 的命中行、单条 record 超过 2,048 个 tool block、跨 record 超过 2,048 个 pending ID、pending 字段累计超过 8 MiB 的 fixture，每组保留一条短命中
+对普通、summary、aggregate 和 output 重复查询，再使用读取失败与损坏 JSON fixture；同时执行 search-14a 的归因矩阵
+
+**预期**：四种模式都通过 `incomplete_reasons` 说明对应缺口，并返回 `incomplete=true`、`total_matches_exact=false`
+容量原因分别为 `oversized_jsonl_lines=...`、`tool_blocks_cap`、`tool_pending_cap`、`tool_pending_bytes_cap`，读取和解析原因带实际计数
+纯归因缺口仍只影响归因诊断，名称筛选无法确认时保留 `tool_filter_unverifiable`；manifest 的完整性和原因与扫描结果一致
+
+### search-14d: 已扫描前缀与未扫描后缀
+
+**步骤**：准备排序相邻的两个 session，第一个含 5 条 UUID 各异的短于 8 MiB 的合法命中行，每条正文约 7 MiB；第二个只有一条短命中
+对普通、summary 和 output 使用 `max_content=100` 查询，再缩小响应字节预算并检查导出 manifest
+对 aggregate 分别使用超过 50,000 个独立 UUID、超过 50,000 条空 UUID 命中，以及总 UUID 字节超过 32 MiB 的 fixture，并在后面保留第二个 session
+重复全部文件可扫描、空文件、首文件读取失败和零文件场景；同一 fixture 再执行 `dry_run=true`
+
+**预期**：32 MiB 结果缓存停止后，`files_scanned=1`，`searched_files` 只含第一个 session，`skipped_files` 只含第二个
+aggregate 的去重、命中及字节容量停止使用相同的实际前缀语义；当前文件中途停止仍属于已尝试范围，打开失败也计入尝试数
+响应与 manifest 的两个路径集合无交集，预算缩减后的剩余路径不改变归属；全扫描时 skipped 为空，零文件时两个集合都为空
+`dry_run` 不读取正文，`files_scanned=0`，单独返回完整计划范围
+
+### search-14e: 混合工具名与筛选关联
+
+**步骤**：在隔离 fixture 中写入 `Bash`、`mcp__mcp-ssh__ssh_exec`、两个 server 的 read/write 工具，以及各自的 tool_result；分别混合查询本地名与完整 MCP 名、两个指定 server/tool 组合、短名和显式 servers，再加入多工具 record 与 harness/payload 错误条件
+对普通、summary、aggregate、JSONL 导出比较命中集；用 limit 和 max_total 分别触发分页与预算续查，再测试 slice 的预算续查；通过 dry_run 检查有效过滤条件
+
+**预期**：混合查询不排除本地工具，完整名称只匹配指定的 server/tool 组合，不匹配交叉组合；短名继续跨 server 匹配
+显式 servers 与 tools 按 AND 组合，错误条件与工具名必须在同一 block 满足
+`stats.effective_filters.tools` 和 `next_query.tools` 保留完整名称，servers 不包含推导值；续查不遗漏、不重复命中，导出与内联结果一致；dry_run 不读取正文
 
 ### search-15: summary 噪声控制
 
@@ -205,9 +270,53 @@ history_search(
 **步骤**：同一查询分别执行 `redaction="strict"` 与 `redaction="off"`，导出到
 `output="tmp:mcp-history-test/redaction-strict.jsonl"` 和 `output="tmp:mcp-history-test/redaction-off.jsonl"`
 
-**预期**：`.jsonl` 按文件路径处理，不额外创建同名目录；manifest 写在 JSONL 文件旁边；`strict` manifest 含
+**预期**：默认显式文件名导出到 `<stem>.export-<唯一后缀>/` 目录，JSONL 和 manifest 同在该目录；`overwrite=true` 才以 `<stem>.export/` 为固定目标；`strict` manifest 含
 `mode="strict"`、 `enabled=true`、`raw_available=true`；`off` manifest 含
 `mode="off"`、`enabled=false`、`rules=[]`、`raw_available=true`
+
+### search-17a: 完整 tool input 与带前缀 JSON 脱敏
+
+**步骤**：构造一个长度超过 300 字符的 tool input，把 `FAR_NEEDLE` 放在第 200 字符之后，并让正文包含
+`Output: {"password":"fixture_secret"}` 和 fenced JSON。分别用 `redaction="auto"`、`strict`、`off` 搜索并导出
+
+**预期**：三种模式都能通过 `FAR_NEEDLE` 命中；auto 和 strict 的响应及导出不含 `fixture_secret`，off 保留完整原文；
+`max_content` 只限制结果预览，不改变搜索集合
+
+### search-17b: Unicode 转义字段名与字面反斜杠
+
+**步骤**：在隔离 fixture 中用下面的构造保留字段名的字面反斜杠，不要先解析后重序列化 `body`
+
+```javascript
+const body = '{"pass' + String.fromCharCode(92) + 'u0077ord":"fixture_secret"}';
+if (!body.includes(String.fromCharCode(92) + 'u0077') || JSON.parse(body).password !== 'fixture_secret') {
+  throw new Error('fixture must retain its original Unicode escape');
+}
+const literal = JSON.stringify({ ['pass' + String.fromCharCode(92) + 'u0077ord']: 'public_value' });
+```
+
+将 `body` 原样写入 user 字符串、嵌套 JSON、带前缀或 fenced JSON、序列化 tool input 和 tool-result `text`
+使用 `JSON.stringify(body)` 及再次 `JSON.stringify` 构造多层嵌入文本，并加入 `literal` 作为不应反复解码的对照
+分别用 auto、strict 和 off 调用 get、search、context、trace、sessions；前四个工具分别导出并按返回路径读取正文及 manifest
+对含中文前缀的原文，使用只覆盖敏感值内部或部分字符的 get range，再读取导出结果
+
+**预期**：auto 和 strict 的内联、会话主题、tool-result 文本及导出均不出现 `fixture_secret`，相交 range 返回 `[redacted]`
+原文字段名、非敏感文本、格式和 Unicode 坐标保持，`literal` 的字面反斜杠不会被解读成敏感字段名
+off 保留完整原文与对应原文 range；manifest 为 v2，脱敏模式和替换计数与实际正文一致
+
+### search-17c: 代码 RHS 与敏感值字面量
+
+**步骤**：在隔离 HOME/TMPDIR 的自有 JSONL 中，将 `token = text(node, 1)`、
+`sorted(values, key=lambda x: x['durationNs'])`、`process_key = path.name.rsplit('.', 1)[0]`
+分别写入普通文本、fenced 文本、JSON String 和工具输入
+使用无效测试值覆盖直接赋值、普通及转义敏感 JSON、无字段名的调用参数、内层敏感赋值或 JSON、lambda 返回字符串、
+字符串拼接、未闭合表达式和超过 32 层的括号，增加中文前缀及只覆盖测试值内部的 range
+分别调用 auto、strict、off 的 get、search、context、trace，比较内联与导出；用内层裸敏感赋值验证保留表达式仍继续扫描
+
+**预期**：三个代码原例在三种模式下保持完整，auto/strict 的测试值及其内部 range 不泄漏，off 返回对应原文
+字符串参数、返回字符串的 lambda、拼接和不满足有限语法的候选 RHS 整体遮蔽
+下标字段名和方法 `(标点分隔符, 整数)[下标]` 按语法位置判断，不以任意短字符串、熵值或函数名称豁免
+括号深度最多 32，未闭合或超限时不得留下未检查尾部；带引号的 JSON 敏感键与结构化敏感字段仍整值脱敏
+内层敏感字段、Authorization/Cookie 检测保持，全文替换后按原 Unicode range 选取，直接返回和导出一致
 
 ### search-18: 过滤参数校验
 
@@ -239,6 +348,14 @@ history_search(
 **步骤**：`history_get(ref="<ref>", range="0-1000")`，再 `range="1000-2000"`
 
 **预期**：两块互补，组合等于完整内容（按字符计）
+
+### get-02a: range 与敏感值交集
+
+**步骤**：fixture 正文使用 `前缀 password=fixture_secret 后缀`。按原始 Unicode 字符位置分别读取完整 secret、左侧部分、
+右侧部分和字段名不在 range 内的 secret，再用 strict 模式重复；其中一组结果写入 `output`
+
+**预期**：auto 和 strict 的每个相交 range 只返回脱敏标记，不出现 secret 的任何局部字符；range 前后的普通字符按原始坐标保留；
+导出正文和 manifest 使用同一结果，manifest 的 `sample_kind="range"` 且 redaction count 非零
 
 ### get-03: range 越界
 
@@ -280,8 +397,16 @@ history_search(
 
 **步骤**：`history_get(ref="<ref>", redaction="off", output="tmp:mcp-history-test/get-message.txt")`
 
-**预期**：`.txt` 按文件路径处理；manifest 写在同目录；manifest 含 `schema="mcp-claude-history.get-output.v1"`、
+**预期**：默认 `.txt` 文件及 manifest 一同导出到 `<stem>.export-<唯一后缀>/` 目录；manifest 含 `schema="mcp-claude-history.get-output.v2"`、
 `redaction.mode="off"`、`redaction.enabled=false`、`redaction.raw_available=true`、`original_content_size`
+
+### get-08a: 完整 tool input 与三种 redaction 模式
+
+**步骤**：tool input 使用超过 300 字符的参数，在尾部放入 `FAR_NEEDLE password=fixture_secret`，分别调用 auto、strict 和 off，
+并分别验证直接响应与导出文件
+
+**预期**：三种模式均保留 `FAR_NEEDLE` 和完整输入长度；auto 与 strict 不含 `fixture_secret`；off 原样保留 secret；响应和导出
+使用相同模式，不存在固定 200 字符截断
 
 ---
 
@@ -331,18 +456,28 @@ history_search(
 
 **预期**：全部返回 `invalid_arguments` 或 `ref_invalid`，不忽略任一冲突参数
 
+### context-06b: agent session 的规范 ref
+
+**步骤**：在 `subagents/agent-12345678abcdef.jsonl` 中创建至少两条消息，分别使用 `12345678:1` 和完整
+`agent-12345678abcdef:1` 作为 ref，再用对应短 ref 或完整 ID 的第 2 行作为 `until_ref`
+
+**预期**：短 ref 和完整 session ID 都定位到同一 agent session；`until_ref` 成功返回两行，输出 ref 使用规范前缀
+`12345678`
+
 ### context-07: max_content / max_total
 
-**步骤**：`history_context(ref="<ref>", before=10, after=10, max_content=100)`
+**步骤**：`history_context(ref="<ref>", before=10, after=10, max_content=100)`，并使用单条内容为 `FIVE` 的 fixture
+调用 `max_content=1`
 
-**预期**：每条 preview 不超 100 字符
+**预期**：每条 preview 不超 100 字符；`FIVE` 返回 `F` 且响应含 `truncated=true`。单条 `max_content` 截断和整体
+`max_total` 截断任一发生都必须报告 truncated
 
 ### context-08: redaction=strict 和显式文本文件路径
 
 **步骤**：
 `history_context(ref="<ref>", before=2, after=2, redaction="strict", output="tmp:mcp-history-test/context.txt")`
 
-**预期**：`.txt` 按文件路径处理；manifest 写在同目录；manifest 含 `schema="mcp-claude-history.context-output.v1"`、
+**预期**：默认 `.txt` 文件及 manifest 一同导出到 `<stem>.export-<唯一后缀>/` 目录；manifest 含 `schema="mcp-claude-history.context-output.v2"`、
 `redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`
 
 ### context-09: 合法非消息 JSONL record
@@ -387,7 +522,14 @@ history_trace(
 
 **预期**：同 session 成功；跨 session 返回参数错误
 
-### trace-03a: 互斥范围
+### trace-03a: agent session 的规范 until_ref
+
+**步骤**：对 `agent-12345678abcdef.jsonl` 使用 `ref="12345678:1", until_ref="12345678:2"`，再用完整 session ID
+重复
+
+**预期**：两种形式都成功，返回消息 ref 使用 `12345678`；其他 agent 或主 session 的 `until_ref` 仍被拒绝
+
+### trace-03b: 互斥范围
 
 **步骤**：`history_trace(ref="<ref>", before=1, until_type="user")`
 
@@ -397,7 +539,7 @@ history_trace(
 
 **步骤**：`history_trace(ref="<ref>", before=200, after=200, max_total=1000)`
 
-**预期**：返回 `truncated=true`，且不影响 `tool_calls` 识别
+**预期**：最终紧凑 JSON（含 `tool_calls`、`association_issues`、其他字段）不超过 1000 UTF-8 字节，`truncated=true`；超预算时可减少 `tool_calls`，不可返回不完整的单条 tool call；锚点无法容纳时返回 `response_too_large`
 
 ### trace-05: 严格关联
 
@@ -418,7 +560,7 @@ result，以及一个无 ID result
 
 **步骤**：`history_trace(ref="<ref>", before=2, after=2, redaction="strict", output="tmp:mcp-history-test/trace.txt")`
 
-**预期**：`.txt` 按文件路径处理；manifest 写在同目录；manifest 含 `schema="mcp-claude-history.trace-output.v1"`、
+**预期**：默认 `.txt` 文件及 manifest 一同导出到 `<stem>.export-<唯一后缀>/` 目录；manifest 含 `schema="mcp-claude-history.trace-output.v2"`、
 `redaction.mode="strict"`、`redaction.enabled=true`、`redaction.raw_available=true`。
 
 fixture 的 tool_result 同时包含结构化 object、array 和 text 内嵌 JSON。
@@ -454,16 +596,11 @@ binary 的 commit 与发布 commit 一致且 `dirty=false`、`reproducible=true`
 
 ## 8. 安全 / 输入校验
 
-### project-id-01: 路径注入拦截（C.4 验证）
+### project-id-01: 项目路径映射与非法值
 
-**步骤**：
+**步骤**：准备一个现存项目的绝对路径 `<existing-project-path>` 和对应的项目 ID；依次传入 `project="<existing-project-path>"`、该项目 ID、`project="../../../etc"`、`project="/not-an-existing-project"` 和 `project=".hidden"`
 
-1. `history_sessions(project="../../../etc")` → 应被拒绝
-2. `history_sessions(project="/absolute/path")` → 应被拒绝
-3. `history_sessions(project=".hidden")` → 应被拒绝
-4. `history_sessions(project="my-project_123")` → 应通过
-
-**预期**：1-3 返回 error（含 "invalid project_id" 或同类提示）；4 通过
+**预期**：现存绝对路径和项目 ID 查询同一个项目；其余输入不能映射到现存项目，返回 `invalid_project_id` 或 `project_not_found`，不访问项目目录之外的文件
 
 ---
 
@@ -480,6 +617,76 @@ binary 的 commit 与发布 commit 一致且 `dirty=false`、`reproducible=true`
 **步骤**：jsonl 中含二进制（如非法 UTF-8）的消息时 `history_get` / `search`
 
 **预期**：跳过该消息，error 写入返回，整体不挂
+
+---
+
+## 10. Windows 和资源边界
+
+### history-boundary-01：UTC 日期和排序
+
+**步骤**：受控 fixture 分别写入 `2026-10-08T23:30:00-01:00`、`2026-10-09T00:15:00Z`、`2026-10-10T00:00:00Z`，按 `since="2026-10-09", until="2026-10-09"` 查询，并用 UTC 当天调用 `since="today"`；另用有时区偏移的 RFC3339 查询
+
+**预期**：日期边界按 UTC 定义，前两条按真实 UTC 时间排序，次日零点不在 `until` 当日范围；`today` 与当天 UTC 日期等价。内联和导出排序一致
+
+### history-boundary-02：搜索导出容量
+
+**步骤**：用超过 20,000 条结果的受控 fixture 导出，比较文件行数、文件字节数与 manifest 的 `count`、`bytes`、`complete`、`incomplete_reasons`，再使用单行超过 8 MiB 的 JSONL fixture 查询
+
+**预期**：最多导出 20,000 条、16 MiB；manifest 标明对应 `export_record_cap` 或 `export_byte_cap`；大行被跳过并通过 `oversized_jsonl_lines` 计数，不发生无界内存增长
+
+### history-boundary-03：context/trace 完整 JSON 预算与窗口
+
+**步骤**：让 fixture 含大量中文、转义字符及多个 tool call，分别调用 `history_context` 和 `history_trace`，设 `max_total=700`，再使选中窗口超过 2,000 条或 32 MiB
+
+**预期**：成功响应完整紧凑 JSON 不超过 700 UTF-8 字节，保留锚点并以 `truncated=true` 告知删减；装不下锚点时报 `response_too_large`；超过 2,000 条报 `session_window_limit`，超过 32 MiB 报 `session_window_memory_limit`
+
+### history-boundary-04：超长会话的局部读取
+
+**步骤**：在隔离项目中生成 100005 条有效消息，交替写入 assistant tool_use 和 user tool_result，使用第 31714 行及第 100002 行作 ref，分别调用 context/trace，传入 `before=0, after=1, types="user", subtypes="tool_result", max_content=1500, max_total=3500`
+
+**预期**：两种工具均返回锚点及下一条匹配的 tool_result，不因会话总消息数报错；trace 使用跨度内未显示的 tool_use 关联结果，敏感字段保持脱敏，完整紧凑 JSON 不超过 3500 UTF-8 字节
+
+### history-boundary-05：稀疏匹配和范围边界
+
+**步骤**：构造超过 5000 条消息的 fixture，使匹配项之间包含超过 2000 条非匹配消息；分别测试 before/after 的零值、缺省值、稀疏匹配、无后续匹配，以及 until_type 双向最近边界和无边界；对 until_ref 测试相同端点、双向端点、跨 session、非法 ref、缺失端点和有效但跨度超限的端点
+
+**预期**：before/after 联合匹配 type、subtype 与脱敏后的 pattern，锚点始终包含；已经超出保留窗口的必要匹配项仍报 `session_window_limit`，不能被当作不存在
+后续没有匹配时不把非匹配尾部计入最终窗口，后来出现匹配且选定跨度超限时才报错
+until_type 不将锚点自身作为边界，无边界只选锚点；until_ref 包含两端，缺失报 `ref_not_found`，非法或跨 session 报 `ref_invalid`
+context 两项计数均缺省时扩展到 EOF，仅指定 before 时 after 为零；trace 计数模式缺省前后各 20 条
+
+### history-boundary-06：窗口容量、读取诊断和导出
+
+**步骤**：分别选择跨度为 2000/2001 条的窗口，以及原始 JSONL 字节数（含换行）恰为 32 MiB/多一字节的窗口；在锚点之前和已满足范围之后放置坏行与超大行，再模拟索引和正文读取之间文件截短、所选行损坏或类型变化；按反向 ref 范围导出，并用过滤条件仅保留锚点
+
+**预期**：恰好达到容量上限时成功，超限明确报错；诊断保留已扫描前缀的错误计数，不统计未扫描后缀；文件变化明确失败，不返回部分成功
+导出正文中的锚点标记、消息数、脱敏内容与响应一致，manifest 的行数和完整性与实际选定范围一致
+
+### history-output-01：唯一目录、覆盖和失败恢复
+
+**步骤**：同一 `output="tmp:mcp-history-test/export"` 连续导出两次，再对第一次的目录使用 `overwrite=true`；尝试覆盖没有 `.mcp-history-bundle` 归属标记的目录。执行 `get.rs` 中的中断恢复测试，分别模拟旧目录已移到备份、新目录已发布、目录被更改，以及其他进程的恢复记录未满 30 秒、已满 30 秒但进程仍在运行、已满 30 秒且进程已退出。Windows 上使用无共享权限的目录句柄占用旧目录后再尝试覆盖
+
+**预期**：默认两次导出返回不同目录，正文与 manifest 位于同一目录；只有已标记目录允许显式覆盖。被占用或权限不足时返回错误，旧目录可用，不混用新旧文件；中断后再次覆盖会恢复旧目录或确认新目录并清理旧备份，其他进程的恢复记录未满 30 秒或原进程仍在运行时返回 `output_busy`；状态无法确认时返回 `output_restore_failed`，原目录和备份均保留
+
+### history-output-02：Windows 原生路径和 DACL
+
+**条件**：在 Windows runner 执行
+
+**步骤**：以现存盘符、UNC 与 extended UNC 路径查询同一项目，对大小写别名和多个项目匹配同一路径的 fixture 分别测试。逐个尝试 `tmp:sample:stream.txt`、`tmp:CON.txt`、尾随空格或点号、控制字符、非法符号路径。为受控空文件添加显式 Everyone 读取 ACE，再设置私有 DACL 并检查该 ACE 已删除；对不存在的路径设置 DACL 并检查报错。创建目录、含空格正文文件和 manifest 后检查 DACL
+
+**预期**：路径别名指向同一项目；歧义明确返回 `project_ambiguous`。非法输出路径被拒绝且不产生文件；私有 DACL 限定当前用户和系统必需主体，无法创建或验证时返回 `privacy_not_enforced_on_windows`，不把 POSIX mode 当作验证证据
+
+### history-output-03：CLI 与 MCP 参数
+
+**步骤**：运行 `mcp-claude-history --version` 和 `build-info`；检查四个输出工具的 MCP `overwrite` 和 redaction schema，并传入旧值 `none`、`raw`
+
+**预期**：CLI 返回版本号，`build-info` 保留构建身份；redaction schema 列出 `auto/strict/off`，旧别名仍能解析；`overwrite=true` 未指定 `output` 时返回 `invalid_arguments`
+
+### history-output-04：临时会话自动清理范围
+
+**步骤**：在独立测试根目录中创建带新归属标记的已退出进程会话和运行中进程会话，再创建旧版标记目录与无标记目录；先按当前时间执行清理，再用超过 24 小时的测试时钟执行清理。Linux 和 Windows runner 都执行 `get.rs` 的对应单元测试
+
+**预期**：只有超过 24 小时且原进程已退出的新标记会话被清理；运行中的会话、未到期会话、旧版标记目录和无标记目录均保留。`tmp:` 导出响应带 `output.retention`，`cwd:` 导出不带，`cwd:` 路径不在清理范围
 
 ---
 

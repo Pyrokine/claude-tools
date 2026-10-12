@@ -1,14 +1,26 @@
 use crate::config::Config;
-use crate::get::resolve_output_dir;
+use crate::get::{OutputTransaction, ResolvedOutputFiles, resolve_output_files};
 use crate::types::*;
 use crate::utils::*;
-use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+fn compare_results(a: &SearchResult, b: &SearchResult) -> std::cmp::Ordering {
+    parse_time(&a.timestamp)
+        .cmp(&parse_time(&b.timestamp))
+        .then_with(|| a.project.cmp(&b.project))
+        .then_with(|| a.session.cmp(&b.session))
+        .then_with(|| a.line.cmp(&b.line))
+        .then_with(|| a.timestamp.cmp(&b.timestamp))
+}
+
+fn utc_day(timestamp: &str) -> Option<String> {
+    parse_time(timestamp).map(|time| time.date_naive().format("%Y-%m-%d").to_string())
+}
 
 /// 搜索参数
 pub struct SearchParams {
@@ -17,7 +29,7 @@ pub struct SearchParams {
     pub all_projects: bool,
     pub sessions: Vec<String>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
-    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    pub until: Option<UntilBound>,
     pub types: Vec<String>,
     pub subtypes: Vec<String>,
     pub servers: Vec<String>,
@@ -42,6 +54,7 @@ pub struct SearchParams {
     pub warnings: Vec<String>,
     pub output: Option<String>,
     pub output_format: Option<String>,
+    pub overwrite: bool,
     /// 是否包含 agent 子会话（默认 false）
     pub subagents: bool,
 }
@@ -78,34 +91,18 @@ impl Default for SearchParams {
             warnings: Vec::new(),
             output: None,
             output_format: None,
+            overwrite: false,
             subagents: false,
         }
     }
 }
 
-/// 单文件命中上限（避免单一巨型 jsonl 把内存吃满）
-/// 上限 = clamp((offset + limit) * 2, 1_000, GLOBAL_RESULT_CAP)
-/// 不让 offset 把单文件 cap 拉到无限，否则并行 search_file 会先 OOM 再被全局截断
-fn per_file_cap(params: &SearchParams) -> usize {
-    if params.output.is_some() || params.dry_run {
-        return usize::MAX;
-    }
-    if let Some(slice) = &params.slice {
-        if slice.needs_full_scan() {
-            return usize::MAX;
-        }
-        if let Some(end) = slice.positive_end() {
-            return end.saturating_mul(2).clamp(1_000, GLOBAL_RESULT_CAP);
-        }
-        return usize::MAX;
-    }
-    let target = params.offset.saturating_add(params.limit.unwrap_or(10_000));
-    target.saturating_mul(2).clamp(1_000, GLOBAL_RESULT_CAP)
-}
-
 /// 全局命中硬上限（防止 OOM；超过即截断 + 在响应里标 truncated）
 const GLOBAL_RESULT_CAP: usize = 50_000;
 const STREAMING_UUID_DEDUPE_CAP: usize = GLOBAL_RESULT_CAP;
+const MAX_SEARCH_RESULTS_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EXPORT_RECORDS: usize = 20_000;
+const MAX_EXPORT_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_CONTENT: usize = 4_000;
 pub const DEFAULT_MAX_CONTENT_TOOL_RESULT: usize = 500;
 pub const DEFAULT_MAX_TOTAL: usize = 40_000;
@@ -123,6 +120,15 @@ struct FileSearchResult {
     metadata_parse_errors: usize,
     invalid_timestamps: usize,
     metadata_issues: Vec<String>,
+    attribution_issues: Vec<String>,
+    result_bytes: usize,
+    memory_capped: bool,
+    oversized_lines: usize,
+}
+
+struct FileSearchLimits {
+    max_matches: usize,
+    max_bytes: usize,
 }
 
 fn push_jsonl_error_reasons(
@@ -162,21 +168,9 @@ fn normalize_filters(mut params: SearchParams) -> Result<SearchParams, ErrorResp
     let mut normalized_subtypes = message_filters.subtypes;
     params.warnings.extend(message_filters.warnings);
 
-    let mut normalized_servers = params.servers.clone();
     let mut normalized_tools = Vec::new();
     for value in &params.tools {
-        let parsed = parse_mcp_tool_name(value);
-        if let Some(server) = parsed.server {
-            push_unique(&mut normalized_servers, server);
-            if let Some(tool) = parsed.tool {
-                push_unique(&mut normalized_tools, tool);
-            }
-            params
-                .warnings
-                .push(format!("tools={value} 是完整 MCP tool 名，已拆分为 server/tool"));
-        } else {
-            push_unique(&mut normalized_tools, parsed.tool.unwrap_or_else(|| value.clone()));
-        }
+        push_unique(&mut normalized_tools, value.clone());
     }
 
     if params.failed_tool_results || params.tool_payload_errors {
@@ -188,7 +182,6 @@ fn normalize_filters(mut params: SearchParams) -> Result<SearchParams, ErrorResp
 
     params.types = normalized_types;
     params.subtypes = normalized_subtypes;
-    params.servers = normalized_servers;
     params.tools = normalized_tools;
     Ok(params)
 }
@@ -199,8 +192,9 @@ fn effective_filters(params: &SearchParams) -> EffectiveFilters {
         projects: params.projects.clone(),
         all_projects: params.all_projects,
         sessions: params.sessions.clone(),
+        subagents: params.subagents,
         since: params.since.map(|v| v.to_rfc3339()),
-        until: params.until.map(|v| v.to_rfc3339()),
+        until: params.until.map(UntilBound::query_value),
         types: params.types.clone(),
         subtypes: params.subtypes.clone(),
         servers: params.servers.clone(),
@@ -244,6 +238,7 @@ struct SearchCollection {
     invalid_timestamps: usize,
     results: Vec<SearchResult>,
     incomplete_reasons: Vec<String>,
+    attribution_issues: Vec<String>,
     truncated_global: bool,
 }
 
@@ -272,13 +267,13 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
             start,
         ))
     } else if params.output.is_some() {
-        search_to_output_streaming(
+        return search_to_output_bounded(
             &params,
             &inputs.files,
             inputs.regex.as_ref(),
             inputs.search_pattern.as_ref(),
             start,
-        )
+        );
     } else if params.aggregate {
         search_aggregate_streaming(
             &params,
@@ -306,8 +301,11 @@ fn prepare_search_params(params: SearchParams) -> Result<SearchParams, ErrorResp
 }
 
 fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
+    if params.overwrite && params.output.is_none() {
+        return Err(invalid_arguments("overwrite=true 需要 output"));
+    }
     if let (Some(since), Some(until)) = (params.since, params.until)
-        && since > until
+        && (since > until.instant || (until.exclusive && since == until.instant))
     {
         return Err(invalid_arguments("since 不能晚于 until"));
     }
@@ -358,7 +356,8 @@ fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
 
 fn prepare_search_inputs(config: &Config, params: &SearchParams) -> Result<SearchInputs, ErrorResponse> {
     let project_dirs = get_project_dirs(config, params)?;
-    let files = collect_jsonl_files(&project_dirs, &params.sessions, params.subagents);
+    let mut files = collect_jsonl_files(&project_dirs, &params.sessions, params.subagents)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
     ensure_session_filters_unambiguous(&files, &params.sessions)?;
     let regex = build_search_regex(params)?;
     let search_pattern = if !params.use_regex && !params.pattern.is_empty() {
@@ -421,6 +420,7 @@ fn build_dry_run_response(
             total_matches_exact: true,
             incomplete: false,
             incomplete_reasons: Vec::new(),
+            attribution_incomplete_reasons: Vec::new(),
             coverage,
             summary: None,
             slice: None,
@@ -448,29 +448,41 @@ fn collect_search_results(
     regex: Option<&Regex>,
     search_pattern: Option<&SearchPattern>,
 ) -> SearchCollection {
-    let file_cap = per_file_cap(params);
-    let file_results: Vec<_> = files
-        .par_iter()
-        .map(|(project_id, session_id, path)| {
-            search_file(project_id, session_id, path, params, regex, search_pattern, file_cap)
-        })
-        .collect();
-
     let mut results = Vec::new();
     let mut files_scanned = 0;
     let mut lines_scanned = 0;
     let mut incomplete_reasons = Vec::new();
+    let mut attribution_issues = Vec::new();
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
     let mut metadata_parse_errors = 0usize;
     let mut invalid_timestamps = 0usize;
+    let mut oversized_lines = 0usize;
+    let mut remaining_bytes = MAX_SEARCH_RESULTS_BYTES;
 
-    for file_result in file_results {
+    for (project_id, session_id, path) in files {
+        let file_result = search_file(
+            project_id,
+            session_id,
+            path,
+            params,
+            regex,
+            search_pattern,
+            FileSearchLimits {
+                max_matches: GLOBAL_RESULT_CAP,
+                max_bytes: remaining_bytes,
+            },
+        );
         files_scanned += 1;
         lines_scanned += file_result.lines_scanned;
         if file_result.truncated {
-            incomplete_reasons.push("per_file_cap".to_string());
+            push_unique(&mut incomplete_reasons, "per_file_cap");
         }
+        if file_result.memory_capped {
+            push_unique(&mut incomplete_reasons, "result_memory_cap");
+        }
+        remaining_bytes = remaining_bytes.saturating_sub(file_result.result_bytes);
+        oversized_lines += file_result.oversized_lines;
         read_errors += file_result.read_errors;
         parse_errors += file_result.parse_errors;
         metadata_parse_errors += file_result.metadata_parse_errors;
@@ -478,7 +490,14 @@ fn collect_search_results(
         for issue in file_result.metadata_issues {
             push_unique(&mut incomplete_reasons, issue);
         }
+        for issue in file_result.attribution_issues {
+            push_unique(&mut attribution_issues, issue);
+        }
         results.extend(file_result.results);
+        if remaining_bytes == 0 || file_result.memory_capped {
+            push_unique(&mut incomplete_reasons, "result_memory_cap");
+            break;
+        }
     }
     push_jsonl_error_reasons(
         &mut incomplete_reasons,
@@ -487,14 +506,12 @@ fn collect_search_results(
         metadata_parse_errors,
     );
     push_time_filter_reason(&mut incomplete_reasons, invalid_timestamps);
+    push_attribution_filter_reason(params, &mut incomplete_reasons, &attribution_issues);
+    if oversized_lines > 0 {
+        incomplete_reasons.push(format!("oversized_jsonl_lines={oversized_lines}"));
+    }
 
-    results.sort_by(|a, b| {
-        a.timestamp
-            .cmp(&b.timestamp)
-            .then_with(|| a.project.cmp(&b.project))
-            .then_with(|| a.session.cmp(&b.session))
-            .then_with(|| a.line.cmp(&b.line))
-    });
+    results.sort_by(compare_results);
 
     let mut seen_uuids = HashSet::new();
     results.retain(|r| r.uuid.is_empty() || seen_uuids.insert(r.uuid.clone()));
@@ -511,6 +528,7 @@ fn collect_search_results(
         invalid_timestamps,
         results,
         incomplete_reasons,
+        attribution_issues,
         truncated_global,
     }
 }
@@ -539,7 +557,7 @@ fn select_search_window(params: &SearchParams, all_results: &[SearchResult]) -> 
         };
     }
 
-    if params.aggregate {
+    if params.aggregate && params.output.is_none() {
         return SearchWindow {
             selected_results: Vec::new(),
             slice_info: None,
@@ -560,7 +578,7 @@ fn select_search_window(params: &SearchParams, all_results: &[SearchResult]) -> 
 }
 
 fn truncate_selected_results(params: &SearchParams, selected_results: Vec<SearchResult>) -> Vec<SearchResult> {
-    if params.aggregate {
+    if params.aggregate && params.output.is_none() {
         return Vec::new();
     }
 
@@ -601,18 +619,13 @@ fn build_search_response(
     } else {
         params.offset + final_results.len()
     };
-    let coverage = build_coverage(&collection.results, searched_files(&files));
+    let coverage = build_coverage(&collection.results, &files, collection.files_scanned);
     let summary = (params.summary || params.aggregate).then(|| build_summary(&collection.results));
     let returned_results = if params.aggregate { Vec::new() } else { final_results };
     let returned_count = returned_results.len();
     let next_query = has_more.then(|| build_next_query(&params, next_offset));
-    let total_matches_exact = !collection.incomplete_reasons.iter().any(|r| {
-        matches!(
-            r.as_str(),
-            "per_file_cap" | "global_result_cap" | "max_total" | "has_more"
-        )
-    });
-    let warning = build_response_warning(&collection.incomplete_reasons, &params);
+    let total_matches_exact = collection.incomplete_reasons.is_empty();
+    let warning = build_response_warning(&collection.incomplete_reasons, &collection.attribution_issues, &params);
 
     Ok(SearchResponse {
         stats: SearchStats {
@@ -625,6 +638,7 @@ fn build_search_response(
             total_matches_exact,
             incomplete: !collection.incomplete_reasons.is_empty(),
             incomplete_reasons: collection.incomplete_reasons,
+            attribution_incomplete_reasons: collection.attribution_issues,
             coverage,
             summary,
             slice: window.slice_info,
@@ -722,7 +736,7 @@ fn replace_structured_value_with_preview(value: &mut Option<serde_json::Value>) 
         *value = Some(original);
         return false;
     }
-    let serialized = serde_json::to_string(&original).unwrap_or_default();
+    let serialized = serde_json::to_string(&original).expect("serde_json::Value serialization cannot fail");
     let (preview, _) = truncate_content(&serialized, 100);
     *value = Some(serde_json::json!({
         "preview": preview,
@@ -856,27 +870,38 @@ fn apply_response_budget(
             }
             return Ok(response);
         }
+        if trim_response_metadata(&mut response) {
+            continue;
+        }
         if shorten_last_result(&mut response, max_total)? || trim_last_result_metadata(&mut response) {
             continue;
         }
         if response.results.pop().is_some() {
             continue;
         }
-        if trim_response_metadata(&mut response) {
-            continue;
-        }
         return Err(response_too_large_error(&response, max_total));
     }
 }
 
-fn build_response_warning(incomplete_reasons: &[String], params: &SearchParams) -> Option<String> {
-    if incomplete_reasons.is_empty() && params.warnings.is_empty() && params.ignored_keys.is_empty() {
+fn build_response_warning(
+    incomplete_reasons: &[String],
+    attribution_issues: &[String],
+    params: &SearchParams,
+) -> Option<String> {
+    if incomplete_reasons.is_empty()
+        && attribution_issues.is_empty()
+        && params.warnings.is_empty()
+        && params.ignored_keys.is_empty()
+    {
         return None;
     }
 
     let mut parts = Vec::new();
     if !incomplete_reasons.is_empty() {
         parts.push(format!("结果不完整，原因: {}", incomplete_reasons.join(",")));
+    }
+    if !attribution_issues.is_empty() {
+        parts.push(format!("工具归因不完整，原因: {}", attribution_issues.join(",")));
     }
     if !params.warnings.is_empty() {
         parts.push(format!("查询提示: {}", params.warnings.join("; ")));
@@ -898,7 +923,7 @@ fn ensure_session_filters_unambiguous(
     for filter in sessions {
         let mut matches = BTreeSet::new();
         for (project, session, _) in files {
-            if session == filter || ref_prefix(session) == *filter {
+            if session_matches_ref(session, filter) {
                 matches.insert(format!("{project}:{session}"));
             }
         }
@@ -945,7 +970,7 @@ fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Va
         query.insert("since".to_string(), serde_json::Value::String(since.to_rfc3339()));
     }
     if let Some(until) = params.until {
-        query.insert("until".to_string(), serde_json::Value::String(until.to_rfc3339()));
+        query.insert("until".to_string(), serde_json::Value::String(until.query_value()));
     }
     if !params.types.is_empty() {
         query.insert("types".to_string(), serde_json::Value::String(params.types.join(",")));
@@ -964,6 +989,12 @@ fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Va
     }
     if !params.tools.is_empty() {
         query.insert("tools".to_string(), serde_json::Value::String(params.tools.join(",")));
+    }
+    if !params.lines.is_empty() {
+        query.insert(
+            "lines".to_string(),
+            serde_json::Value::String(format_line_ranges(&params.lines)),
+        );
     }
     if params.use_regex {
         query.insert("regex".to_string(), serde_json::Value::Bool(true));
@@ -1002,7 +1033,8 @@ fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Va
     serde_json::Value::Object(query)
 }
 
-fn build_coverage(results: &[SearchResult], searched_files: Vec<String>) -> SearchCoverage {
+fn build_coverage(results: &[SearchResult], files: &[SearchFile], files_scanned: usize) -> SearchCoverage {
+    let (attempted, skipped) = files.split_at(files_scanned);
     let mut projects = BTreeSet::new();
     let mut sessions = BTreeSet::new();
     let mut start: Option<String> = None;
@@ -1011,10 +1043,16 @@ fn build_coverage(results: &[SearchResult], searched_files: Vec<String>) -> Sear
     for result in results {
         projects.insert(result.project.clone());
         sessions.insert(result.session.clone());
-        if start.as_ref().is_none_or(|s| result.timestamp < *s) {
+        if start
+            .as_ref()
+            .is_none_or(|s| parse_time(&result.timestamp) < parse_time(s))
+        {
             start = Some(result.timestamp.clone());
         }
-        if end.as_ref().is_none_or(|s| result.timestamp > *s) {
+        if end
+            .as_ref()
+            .is_none_or(|s| parse_time(&result.timestamp) > parse_time(s))
+        {
             end = Some(result.timestamp.clone());
         }
     }
@@ -1024,8 +1062,8 @@ fn build_coverage(results: &[SearchResult], searched_files: Vec<String>) -> Sear
         end,
         projects: projects.into_iter().collect(),
         sessions: sessions.into_iter().collect(),
-        searched_files,
-        skipped_files: Vec::new(),
+        searched_files: searched_files(attempted),
+        skipped_files: searched_files(skipped),
     }
 }
 
@@ -1049,8 +1087,8 @@ fn build_summary(results: &[SearchResult]) -> SearchSummary {
         *by_type
             .entry(format!("{}:{}", result.r#type, result.subtype))
             .or_insert(0) += 1;
-        if let Some(day) = result.timestamp.get(..10) {
-            *by_day.entry(day.to_string()).or_insert(0) += 1;
+        if let Some(day) = utc_day(&result.timestamp) {
+            *by_day.entry(day).or_insert(0) += 1;
         }
         if let Some(server) = &result.server {
             *by_server.entry(server.clone()).or_insert(0) += 1;
@@ -1070,83 +1108,16 @@ fn build_summary(results: &[SearchResult]) -> SearchSummary {
     }
 }
 
-fn prefixed_parent_output(raw: &str, parent: &Path) -> String {
-    let parent = parent.to_string_lossy();
-    if let Some(rest) = raw.strip_prefix("tmp:") {
-        return if parent.is_empty() {
-            "tmp:.".to_string()
-        } else {
-            format!(
-                "tmp:{}",
-                Path::new(rest).parent().unwrap_or_else(|| Path::new(".")).display()
-            )
-        };
-    }
-    if let Some(rest) = raw.strip_prefix("cwd:") {
-        return if parent.is_empty() {
-            "cwd:.".to_string()
-        } else {
-            format!(
-                "cwd:{}",
-                Path::new(rest).parent().unwrap_or_else(|| Path::new(".")).display()
-            )
-        };
-    }
-    if parent.is_empty() {
-        ".".to_string()
-    } else {
-        parent.to_string()
-    }
-}
-
-fn resolve_search_output_paths(raw_output: &str) -> Result<(PathBuf, PathBuf), ErrorResponse> {
-    let trimmed = raw_output.trim();
-    let path_part = trimmed
+fn resolve_search_output_paths(raw_output: &str) -> Result<ResolvedOutputFiles, ErrorResponse> {
+    let path = raw_output
         .strip_prefix("tmp:")
-        .or_else(|| trimmed.strip_prefix("cwd:"))
-        .unwrap_or(trimmed);
-    let requested_path = Path::new(path_part);
-    if requested_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-        let dir = resolve_output_dir(trimmed)?;
-        fs::create_dir_all(&dir).map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("无法创建搜索输出目录: {e}"),
-            available: None,
-        })?;
-        set_private_permissions(&dir, 0o700)?;
-        return Ok((dir.join("search-results.jsonl"), dir.join("search-manifest.json")));
+        .or_else(|| raw_output.strip_prefix("cwd:"))
+        .unwrap_or(raw_output);
+    let extension = Path::new(path).extension().and_then(|ext| ext.to_str());
+    if extension.is_some_and(|ext| ext != "jsonl") {
+        return Err(invalid_arguments("search output 文件扩展名必须是 .jsonl"));
     }
-
-    let file_name = requested_path.file_name().ok_or_else(|| ErrorResponse {
-        error: "invalid_output_dir".to_string(),
-        message: "output 指向 .jsonl 文件时必须包含文件名".to_string(),
-        available: Some(serde_json::json!({
-            "examples": [
-                "tmp:search-results.jsonl",
-                "tmp:export/search-results.jsonl",
-                "cwd:export/search-results.jsonl"
-            ]
-        })),
-    })?;
-    let parent = requested_path.parent().unwrap_or_else(|| Path::new("."));
-    let parent_output = prefixed_parent_output(trimmed, parent);
-    let dir = resolve_output_dir(&parent_output)?;
-    fs::create_dir_all(&dir).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建搜索输出目录: {e}"),
-        available: None,
-    })?;
-    set_private_permissions(&dir, 0o700)?;
-    let results_path = dir.join(file_name);
-    let manifest_name = format!(
-        "{}_manifest.json",
-        results_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("search-results")
-    );
-    let manifest_path = results_path.with_file_name(manifest_name);
-    Ok((results_path, manifest_path))
+    resolve_output_files(raw_output, "search-results.jsonl", "search-manifest.json")
 }
 
 #[derive(Default)]
@@ -1161,16 +1132,43 @@ struct SearchAggregation {
     by_server: BTreeMap<String, usize>,
     by_tool: BTreeMap<String, usize>,
     by_day: BTreeMap<String, usize>,
+    matches: usize,
+    retained_bytes: usize,
 }
 
 impl SearchAggregation {
-    fn observe(&mut self, result: &SearchResult) {
+    fn observe(&mut self, result: &SearchResult) -> Result<(), &'static str> {
+        if self.matches >= GLOBAL_RESULT_CAP {
+            return Err("aggregate_matches_cap");
+        }
+        let cost = result.uuid.len()
+            + result.project.len() * 2
+            + result.session.len() * 2
+            + result.r#type.len()
+            + result.subtype.len()
+            + result.timestamp.len() * 2
+            + result.server.as_ref().map_or(0, |value| value.len())
+            + result.tool.as_ref().map_or(0, |value| value.len())
+            + 256;
+        if self.retained_bytes.saturating_add(cost) > MAX_SEARCH_RESULTS_BYTES {
+            return Err("aggregate_bytes_cap");
+        }
+        self.matches += 1;
+        self.retained_bytes += cost;
         self.projects.insert(result.project.clone());
         self.sessions.insert(result.session.clone());
-        if self.start.as_ref().is_none_or(|s| result.timestamp < *s) {
+        if self
+            .start
+            .as_ref()
+            .is_none_or(|s| parse_time(&result.timestamp) < parse_time(s))
+        {
             self.start = Some(result.timestamp.clone());
         }
-        if self.end.as_ref().is_none_or(|s| result.timestamp > *s) {
+        if self
+            .end
+            .as_ref()
+            .is_none_or(|s| parse_time(&result.timestamp) > parse_time(s))
+        {
             self.end = Some(result.timestamp.clone());
         }
         *self.by_project.entry(result.project.clone()).or_insert(0) += 1;
@@ -1179,8 +1177,8 @@ impl SearchAggregation {
             .by_type
             .entry(format!("{}:{}", result.r#type, result.subtype))
             .or_insert(0) += 1;
-        if let Some(day) = result.timestamp.get(..10) {
-            *self.by_day.entry(day.to_string()).or_insert(0) += 1;
+        if let Some(day) = utc_day(&result.timestamp) {
+            *self.by_day.entry(day).or_insert(0) += 1;
         }
         if let Some(server) = &result.server {
             *self.by_server.entry(server.clone()).or_insert(0) += 1;
@@ -1188,16 +1186,18 @@ impl SearchAggregation {
         if let Some(tool) = &result.tool {
             *self.by_tool.entry(tool.clone()).or_insert(0) += 1;
         }
+        Ok(())
     }
 
-    fn coverage(self, searched_files: Vec<String>) -> SearchCoverage {
+    fn coverage(self, files: &[SearchFile], files_scanned: usize) -> SearchCoverage {
+        let (attempted, skipped) = files.split_at(files_scanned);
         SearchCoverage {
             start: self.start,
             end: self.end,
             projects: self.projects.into_iter().collect(),
             sessions: self.sessions.into_iter().collect(),
-            searched_files,
-            skipped_files: Vec::new(),
+            searched_files: searched_files(attempted),
+            skipped_files: searched_files(skipped),
         }
     }
 
@@ -1213,46 +1213,10 @@ impl SearchAggregation {
     }
 }
 
-fn streaming_selection(params: &SearchParams) -> (usize, Option<usize>, bool) {
-    if let Some(slice) = &params.slice {
-        let start = slice.start.and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
-        let end = slice.end.and_then(|v| usize::try_from(v).ok());
-        return (start, end, true);
-    }
-    let end = params.limit.map(|limit| params.offset.saturating_add(limit));
-    (params.offset, end, params.offset > 0 || params.limit.is_some())
-}
-
-fn streaming_slice_info(params: &SearchParams, total_matches: usize) -> Option<SearchSliceInfo> {
-    let slice = params.slice.as_ref()?;
-    let start = slice
-        .start
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(0)
-        .min(total_matches);
-    let end = slice
-        .end
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(total_matches)
-        .min(total_matches);
-    Some(SearchSliceInfo {
-        raw: slice.raw.clone(),
-        start,
-        end,
-        total_before_slice: total_matches,
-        total_after_slice: end.saturating_sub(start),
-    })
-}
-
-fn create_search_output_file(output: &str) -> Result<(PathBuf, PathBuf, File), ErrorResponse> {
-    let (results_path, manifest_path) = resolve_search_output_paths(output)?;
-    let file = open_private_output_file(&results_path)?;
-    Ok((results_path, manifest_path, file))
-}
-
 struct SearchManifestContext<'a> {
     results_path: &'a Path,
     manifest_path: &'a Path,
+    staging_manifest: &'a Path,
     coverage: &'a SearchCoverage,
     summary: Option<&'a SearchSummary>,
     slice: Option<&'a SearchSliceInfo>,
@@ -1264,9 +1228,12 @@ struct SearchManifestContext<'a> {
     complete: bool,
     explicit_range: bool,
     incomplete_reasons: &'a [String],
+    attribution_issues: &'a [String],
     bytes: u64,
     max_content: usize,
     max_content_tool_result: usize,
+    max_records: usize,
+    max_bytes: u64,
 }
 
 fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputInfo, ErrorResponse> {
@@ -1288,7 +1255,7 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
     );
     let manifest = serde_json::json!({
         "format": "jsonl",
-        "schema": "mcp-claude-history.search-results.v1",
+        "schema": "mcp-claude-history.search-results.v2",
         "results": ctx.results_path,
         "count": ctx.written_count,
         "total_matches": ctx.total_matches,
@@ -1303,19 +1270,30 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         "summary": ctx.summary,
         "slice": ctx.slice,
         "incomplete_reasons": ctx.incomplete_reasons,
+        "attribution_incomplete_reasons": ctx.attribution_issues,
         "cap_reasons": ctx.incomplete_reasons,
         "max_content": ctx.max_content,
         "max_content_tool_result": ctx.max_content_tool_result,
+        "max_export_records": ctx.max_records,
+        "max_export_bytes": ctx.max_bytes,
         "redaction": &redaction,
     });
-    let mut manifest_file = open_private_output_file(ctx.manifest_path)?;
-    manifest_file
-        .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
-        .map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("写入搜索 manifest 失败: {e}"),
-            available: None,
-        })?;
+    let mut manifest_file = open_private_output_file(ctx.staging_manifest)?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| ErrorResponse {
+        error: "serialize_error".to_string(),
+        message: format!("无法序列化 search manifest: {e}"),
+        available: None,
+    })?;
+    manifest_file.write_all(&manifest_bytes).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("写入搜索 manifest 失败: {e}"),
+        available: None,
+    })?;
+    manifest_file.sync_all().map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("同步搜索 manifest 失败: {e}"),
+        available: None,
+    })?;
 
     Ok(SearchOutputInfo {
         results: ctx.results_path.to_path_buf(),
@@ -1332,6 +1310,7 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         lines: ctx.written_count,
         cap_reasons: ctx.incomplete_reasons.to_vec(),
         redaction,
+        retention: None,
     })
 }
 
@@ -1392,8 +1371,7 @@ fn session_matches_filter(session_id: &str, sessions: &[String]) -> bool {
     if sessions.is_empty() {
         return true;
     }
-    let prefix = ref_prefix(session_id);
-    sessions.iter().any(|s| s == session_id || s == &prefix)
+    sessions.iter().any(|session| session_matches_ref(session_id, session))
 }
 
 /// 收集所有 jsonl 文件
@@ -1401,42 +1379,45 @@ fn collect_jsonl_files(
     project_dirs: &[(String, PathBuf)],
     sessions: &[String],
     include_subagents: bool,
-) -> Vec<(String, String, PathBuf)> {
+) -> Result<Vec<(String, String, PathBuf)>, ErrorResponse> {
     let mut files = Vec::new();
 
     for (project_id, dir) in project_dirs {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map(|e| e == "jsonl").unwrap_or(false)
-                    && let Some(session_id) = session_id_from_filename(&entry.file_name().to_string_lossy())
+        for entry in fs::read_dir(dir).map_err(search_io_error)? {
+            let entry = entry.map_err(search_io_error)?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                if let Some(session_id) = session_id_from_filename(&entry.file_name().to_string_lossy())
                     && session_matches_filter(&session_id, sessions)
                 {
                     files.push((project_id.clone(), session_id, path));
                 }
+                continue;
             }
-        }
-
-        if !include_subagents {
-            continue;
-        }
-
-        for sidechain_dir in SIDECHAIN_SESSION_DIRS {
-            let pattern = dir.join("*/").join(sidechain_dir);
-            if let Ok(entries) = glob::glob(&pattern.to_string_lossy()) {
-                for subdir in entries.flatten() {
-                    if let Ok(sub_entries) = fs::read_dir(&subdir) {
-                        for entry in sub_entries.flatten() {
-                            let path = entry.path();
-                            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                                let filename = entry.file_name().to_string_lossy().to_string();
-                                if filename.starts_with("agent-") {
-                                    let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
-                                    if session_matches_filter(&session_id, sessions) {
-                                        files.push((project_id.clone(), session_id, path));
-                                    }
-                                }
-                            }
+            if !include_subagents || !entry.file_type().map_err(search_io_error)?.is_dir() {
+                continue;
+            }
+            for sidechain_dir in SIDECHAIN_SESSION_DIRS {
+                let subdir = path.join(sidechain_dir);
+                let sub_entries = match fs::read_dir(&subdir) {
+                    Ok(entries) => entries,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(search_io_error(e)),
+                };
+                for sub_entry in sub_entries {
+                    let sub_entry = sub_entry.map_err(search_io_error)?;
+                    let path = sub_entry.path();
+                    if path.extension().is_none_or(|ext| ext != "jsonl") {
+                        continue;
+                    }
+                    let filename = sub_entry.file_name().to_string_lossy().to_string();
+                    if let Some(session_id) = filename
+                        .strip_prefix("agent-")
+                        .and_then(|name| name.strip_suffix(".jsonl"))
+                    {
+                        let session_id = format!("agent-{session_id}");
+                        if session_matches_filter(&session_id, sessions) {
+                            files.push((project_id.clone(), session_id, path));
                         }
                     }
                 }
@@ -1444,7 +1425,15 @@ fn collect_jsonl_files(
         }
     }
 
-    files
+    Ok(files)
+}
+
+fn search_io_error(error: std::io::Error) -> ErrorResponse {
+    ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("枚举会话失败: {error}"),
+        available: None,
+    }
 }
 
 fn search_aggregate_streaming(
@@ -1454,20 +1443,18 @@ fn search_aggregate_streaming(
     pattern: Option<&SearchPattern>,
     start: Instant,
 ) -> Result<SearchResponse, ErrorResponse> {
-    let searched_files = files
-        .iter()
-        .map(|(_, _, path)| path.display().to_string())
-        .collect::<Vec<_>>();
     let mut aggregation = SearchAggregation::default();
     let mut seen_uuids = HashSet::new();
     let mut files_scanned = 0;
     let mut lines_scanned = 0;
     let mut total_matches = 0;
     let mut incomplete_reasons = Vec::new();
+    let mut attribution_issues = Vec::new();
     let mut read_errors = 0usize;
     let mut parse_errors = 0usize;
     let mut metadata_parse_errors = 0usize;
     let mut invalid_timestamps = 0usize;
+    let mut oversized_lines = 0usize;
 
     'files: for (project_id, session_id, path) in files {
         files_scanned += 1;
@@ -1476,13 +1463,17 @@ fn search_aggregate_streaming(
             continue;
         };
         let prefix = ref_prefix(session_id);
-        let mut tool_uses = ToolUseIndex::default();
-        for (line_num, line) in BufReader::new(input).lines().enumerate() {
+        let mut tool_tracker = ToolAssociationTracker::default();
+        for (line_num, line) in bounded_jsonl_lines(BufReader::new(input)).enumerate() {
             let line_num = line_num + 1;
             lines_scanned += 1;
             let in_range = line_in_ranges(line_num, &params.lines);
             let line = match line {
-                Ok(line) => line,
+                Ok(BoundedLine::Record(line)) => line,
+                Ok(BoundedLine::TooLarge) => {
+                    oversized_lines += 1;
+                    continue;
+                }
                 Err(_) => {
                     read_errors += 1;
                     continue;
@@ -1500,7 +1491,19 @@ fn search_aggregate_streaming(
                     continue;
                 }
             };
-            observe_tool_uses(&mut tool_uses, &record);
+            if tool_block_count(&record) > MAX_TOOL_BLOCKS {
+                incomplete_reasons.push("tool_blocks_cap".to_string());
+                break 'files;
+            }
+            let tool_blocks = tool_tracker.observe_record(&record, params.tool_payload_errors);
+            if tool_tracker.pending_len() > MAX_TOOL_BLOCKS {
+                incomplete_reasons.push("tool_pending_cap".to_string());
+                break 'files;
+            }
+            if tool_tracker.pending_bytes() > MAX_TOOL_PENDING_BYTES {
+                incomplete_reasons.push("tool_pending_bytes_cap".to_string());
+                break 'files;
+            }
             if !in_range {
                 continue;
             }
@@ -1510,9 +1513,6 @@ fn search_aggregate_streaming(
                 invalid_timestamps += 1;
                 continue;
             }
-            if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
-                push_unique(&mut incomplete_reasons, issue);
-            }
             let ctx = RecordBuildContext {
                 project_id,
                 session_id,
@@ -1520,9 +1520,9 @@ fn search_aggregate_streaming(
                 params,
                 regex,
                 pattern,
-                tool_uses: &tool_uses,
             };
-            let Some(result) = build_search_result(&ctx, line_num, record) else {
+            let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues)
+            else {
                 continue;
             };
             if !result.uuid.is_empty() {
@@ -1533,10 +1533,15 @@ fn search_aggregate_streaming(
                     incomplete_reasons.push("uuid_dedupe_cap".to_string());
                     break 'files;
                 }
+            }
+            if let Err(reason) = aggregation.observe(&result) {
+                incomplete_reasons.push(reason.to_string());
+                break 'files;
+            }
+            if !result.uuid.is_empty() {
                 seen_uuids.insert(result.uuid.clone());
             }
             total_matches += 1;
-            aggregation.observe(&result);
         }
     }
 
@@ -1547,11 +1552,15 @@ fn search_aggregate_streaming(
         metadata_parse_errors,
     );
     push_time_filter_reason(&mut incomplete_reasons, invalid_timestamps);
+    push_attribution_filter_reason(params, &mut incomplete_reasons, &attribution_issues);
+    if oversized_lines > 0 {
+        incomplete_reasons.push(format!("oversized_jsonl_lines={oversized_lines}"));
+    }
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     let summary_value = Some(aggregation.summary());
-    let coverage = aggregation.coverage(searched_files);
-    let warning = build_response_warning(&incomplete_reasons, params);
+    let coverage = aggregation.coverage(files, files_scanned);
+    let warning = build_response_warning(&incomplete_reasons, &attribution_issues, params);
 
     Ok(SearchResponse {
         stats: SearchStats {
@@ -1564,6 +1573,7 @@ fn search_aggregate_streaming(
             total_matches_exact: incomplete_reasons.is_empty(),
             incomplete: !incomplete_reasons.is_empty(),
             incomplete_reasons,
+            attribution_incomplete_reasons: attribution_issues,
             coverage,
             summary: summary_value,
             slice: None,
@@ -1585,204 +1595,124 @@ fn search_aggregate_streaming(
     })
 }
 
-fn search_to_output_streaming(
+fn search_to_output_bounded(
     params: &SearchParams,
-    files: &[(String, String, PathBuf)],
+    files: &[SearchFile],
     regex: Option<&Regex>,
     pattern: Option<&SearchPattern>,
     start: Instant,
 ) -> Result<SearchResponse, ErrorResponse> {
-    let output = params.output.as_ref().expect("output checked by caller");
-    let (results_path, manifest_path, mut file) = create_search_output_file(output)?;
-    let searched_files = files
-        .iter()
-        .map(|(_, _, path)| path.display().to_string())
-        .collect::<Vec<_>>();
-    let (selection_start, selection_end, explicit_range) = streaming_selection(params);
-    let mut aggregation = SearchAggregation::default();
-    let mut seen_uuids = HashSet::new();
-    let mut files_scanned = 0;
-    let mut lines_scanned = 0;
-    let mut total_matches = 0;
-    let mut written_count = 0;
-    let mut content_truncated_count = 0;
-    let mut redacted_count = 0;
-    let mut incomplete_reasons = Vec::new();
-    let mut read_errors = 0usize;
-    let mut parse_errors = 0usize;
-    let mut metadata_parse_errors = 0usize;
-    let mut invalid_timestamps = 0usize;
+    let collection = collect_search_results(params, files, regex, pattern);
+    let total_matches = collection.results.len();
+    let window = select_search_window(params, &collection.results);
+    let selected_results = truncate_selected_results(params, window.selected_results);
+    let mut incomplete_reasons = collection.incomplete_reasons;
+    let attribution_issues = collection.attribution_issues;
+    let coverage = build_coverage(&collection.results, files, collection.files_scanned);
+    let summary = (params.summary || params.aggregate).then(|| build_summary(&collection.results));
 
-    'files: for (project_id, session_id, path) in files {
-        files_scanned += 1;
-        let Ok(input) = File::open(path) else {
-            read_errors += 1;
-            continue;
-        };
-        let prefix = ref_prefix(session_id);
-        let mut tool_uses = ToolUseIndex::default();
-        for (line_num, line) in BufReader::new(input).lines().enumerate() {
-            let line_num = line_num + 1;
-            lines_scanned += 1;
-            let in_range = line_in_ranges(line_num, &params.lines);
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => {
-                    read_errors += 1;
-                    continue;
-                }
-            };
-            let record = match parse_message_record(&line) {
-                Ok(Some(record)) => record,
-                Ok(None) => continue,
-                Err(_) => {
-                    if in_range {
-                        parse_errors += 1;
-                    } else {
-                        metadata_parse_errors += 1;
-                    }
-                    continue;
-                }
-            };
-            observe_tool_uses(&mut tool_uses, &record);
-            if !in_range {
-                continue;
-            }
-            if time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
-                == TimeRangeMatch::UnparseableTimestamp
-            {
-                invalid_timestamps += 1;
-                continue;
-            }
-            if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
-                push_unique(&mut incomplete_reasons, issue);
-            }
-            let ctx = RecordBuildContext {
-                project_id,
-                session_id,
-                prefix: &prefix,
-                params,
-                regex,
-                pattern,
-                tool_uses: &tool_uses,
-            };
-            let Some(result) = build_search_result(&ctx, line_num, record) else {
-                continue;
-            };
-            if !result.uuid.is_empty() {
-                if seen_uuids.contains(&result.uuid) {
-                    continue;
-                }
-                if seen_uuids.len() >= STREAMING_UUID_DEDUPE_CAP {
-                    incomplete_reasons.push("uuid_dedupe_cap".to_string());
-                    break 'files;
-                }
-                seen_uuids.insert(result.uuid.clone());
-            }
-
-            let result_index = total_matches;
-            total_matches += 1;
-            aggregation.observe(&result);
-            if result_index < selection_start {
-                continue;
-            }
-            if selection_end.is_some_and(|end| result_index >= end) {
-                continue;
-            }
-            if result.truncated {
-                content_truncated_count += 1;
-            }
-            if result.redacted == Some(true) {
-                redacted_count += 1;
-            }
-            let line = serde_json::to_string(&result).map_err(|e| ErrorResponse {
-                error: "serialize_error".to_string(),
-                message: format!("序列化搜索结果失败: {e}"),
-                available: None,
-            })?;
-            writeln!(file, "{line}").map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写入搜索结果失败: {e}"),
-                available: None,
-            })?;
-            written_count += 1;
+    let resolved = resolve_search_output_paths(params.output.as_deref().expect("output checked by caller"))?;
+    let temp_output = resolved.temp_output;
+    let transaction = OutputTransaction::begin(resolved, params.overwrite)?;
+    let results_path = transaction.content();
+    let manifest_path = transaction.manifest();
+    let mut file = open_private_output_file(&transaction.staging_content())?;
+    let mut bytes = 0u64;
+    let mut written_count = 0usize;
+    let mut redacted_count = 0usize;
+    let mut content_truncated_count = 0usize;
+    for result in selected_results {
+        if written_count == MAX_EXPORT_RECORDS {
+            push_unique(&mut incomplete_reasons, "export_record_cap");
+            break;
         }
+        let line = serde_json::to_string(&result).map_err(|e| ErrorResponse {
+            error: "serialize_error".to_string(),
+            message: format!("序列化搜索结果失败: {e}"),
+            available: None,
+        })?;
+        let next_bytes = bytes.saturating_add(line.len() as u64 + 1);
+        if next_bytes > MAX_EXPORT_BYTES {
+            push_unique(&mut incomplete_reasons, "export_byte_cap");
+            break;
+        }
+        writeln!(file, "{line}").map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("写入搜索结果失败: {e}"),
+            available: None,
+        })?;
+        bytes = next_bytes;
+        written_count += 1;
+        content_truncated_count += usize::from(result.truncated);
+        redacted_count += usize::from(result.redacted == Some(true));
     }
-
-    file.flush().map_err(|e| ErrorResponse {
+    file.sync_all().map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
-        message: format!("刷新搜索结果文件失败: {e}"),
+        message: format!("同步搜索结果失败: {e}"),
         available: None,
     })?;
-    let bytes = fs::metadata(&results_path).map(|m| m.len()).unwrap_or(0);
-    let slice_info = streaming_slice_info(params, total_matches);
-    push_jsonl_error_reasons(
-        &mut incomplete_reasons,
-        read_errors,
-        parse_errors,
-        metadata_parse_errors,
-    );
-    push_time_filter_reason(&mut incomplete_reasons, invalid_timestamps);
+    push_time_filter_reason(&mut incomplete_reasons, collection.invalid_timestamps);
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
-    let summary_value = (params.summary || params.aggregate).then(|| aggregation.summary());
-    let coverage = aggregation.coverage(searched_files);
-    let output = Some(write_search_manifest(SearchManifestContext {
+    let complete = incomplete_reasons.is_empty();
+    let mut output_info = write_search_manifest(SearchManifestContext {
         results_path: &results_path,
         manifest_path: &manifest_path,
+        staging_manifest: &transaction.staging_manifest(),
         coverage: &coverage,
-        summary: summary_value.as_ref(),
-        slice: slice_info.as_ref(),
+        summary: summary.as_ref(),
+        slice: window.slice_info.as_ref(),
         total_matches,
         written_count,
         content_truncated_count,
         redaction: params.redaction,
         redacted_count,
-        complete: incomplete_reasons.is_empty(),
-        explicit_range,
+        complete,
+        explicit_range: params.offset > 0 || params.limit.is_some() || params.slice.is_some(),
         incomplete_reasons: &incomplete_reasons,
+        attribution_issues: &attribution_issues,
         bytes,
         max_content: params.max_content,
         max_content_tool_result: params.max_content_tool_result,
-    })?);
-    let warning = build_response_warning(&incomplete_reasons, params);
-
-    Ok(SearchResponse {
+        max_records: MAX_EXPORT_RECORDS,
+        max_bytes: MAX_EXPORT_BYTES,
+    })?;
+    output_info.retention = temp_output.then(|| TEMP_OUTPUT_RETENTION.to_string());
+    let warning = build_response_warning(&incomplete_reasons, &attribution_issues, params);
+    let response = SearchResponse {
         stats: SearchStats {
-            files_scanned,
-            lines_scanned,
-            skipped_invalid_timestamps: invalid_timestamps,
+            files_scanned: collection.files_scanned,
+            lines_scanned: collection.lines_scanned,
+            skipped_invalid_timestamps: collection.invalid_timestamps,
             total_matches,
             returned_count: 0,
             time_ms: start.elapsed().as_millis() as u64,
-            total_matches_exact: incomplete_reasons.is_empty(),
-            incomplete: !incomplete_reasons.is_empty(),
+            total_matches_exact: complete,
+            incomplete: !complete,
             incomplete_reasons,
+            attribution_incomplete_reasons: attribution_issues,
             coverage,
-            summary: summary_value,
-            slice: slice_info,
+            summary,
+            slice: window.slice_info,
             effective_filters: effective_filters(params),
             ignored_keys: params.ignored_keys.clone(),
             warnings: params.warnings.clone(),
-            truncated_global: None,
+            truncated_global: collection.truncated_global.then_some(true),
         },
         results: Vec::new(),
         has_more: false,
         next_offset: 0,
         next_query: None,
-        output,
+        output: Some(output_info),
         warning,
         serialized_bytes: 0,
         max_total_bytes: params.max_total,
         limits_applied: Vec::new(),
-        complete: true,
-    })
-}
-
-#[derive(Default)]
-struct ToolUseIndex {
-    by_id: BTreeMap<String, ToolInfo>,
-    by_assistant_uuid: BTreeMap<String, Vec<ToolInfo>>,
+        complete,
+    };
+    let response = apply_response_budget(response, params.max_total, build_next_query(params, params.offset))?;
+    transaction.publish()?;
+    Ok(response)
 }
 
 struct RecordBuildContext<'a> {
@@ -1792,88 +1722,50 @@ struct RecordBuildContext<'a> {
     params: &'a SearchParams,
     regex: Option<&'a Regex>,
     pattern: Option<&'a SearchPattern>,
-    tool_uses: &'a ToolUseIndex,
 }
 
-fn observe_tool_uses(tool_uses: &mut ToolUseIndex, record: &MessageRecord) {
-    let Some(content) = record
-        .message
-        .as_ref()
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    else {
-        return;
-    };
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-            continue;
-        }
-        let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
-            continue;
-        };
-        let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
-            continue;
-        };
-        let info = parse_mcp_tool_name(name);
-        tool_uses.by_id.insert(id.to_string(), info.clone());
-        tool_uses
-            .by_assistant_uuid
-            .entry(record.uuid.clone())
-            .or_default()
-            .push(info);
+fn tool_block_matches(block: &AssociatedToolBlock, params: &SearchParams) -> bool {
+    let server_matches = params.servers.is_empty()
+        || block
+            .info
+            .server
+            .as_ref()
+            .is_some_and(|server| params.servers.iter().any(|filter| filter == server));
+    let tool_matches = params.tools.is_empty()
+        || params.tools.iter().any(|filter| {
+            let parsed = parse_mcp_tool_name(filter);
+            parsed.tool == block.info.tool && (parsed.server.is_none() || parsed.server == block.info.server)
+        });
+    let failed_matches = !params.failed_tool_results || block.result_is_error == Some(true);
+    let payload_matches = !params.tool_payload_errors || block.result_has_error_payload == Some(true);
+    server_matches && tool_matches && failed_matches && payload_matches
+}
+
+fn has_tool_filter(params: &SearchParams) -> bool {
+    !params.servers.is_empty() || !params.tools.is_empty() || params.failed_tool_results || params.tool_payload_errors
+}
+
+fn push_attribution_filter_reason(params: &SearchParams, reasons: &mut Vec<String>, attribution_issues: &[String]) {
+    if (!params.servers.is_empty() || !params.tools.is_empty()) && !attribution_issues.is_empty() {
+        push_unique(reasons, "tool_filter_unverifiable");
     }
 }
 
-fn linked_tool_result_info(record: &MessageRecord, tool_uses: &ToolUseIndex) -> (Option<ToolInfo>, Option<String>) {
-    let Some(content) = record
-        .message
-        .as_ref()
-        .and_then(|message| message.get("content"))
-        .and_then(|value| value.as_array())
-    else {
-        return (None, None);
-    };
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
-            continue;
-        }
-        if let Some(id) = item.get("tool_use_id").and_then(|id| id.as_str()) {
-            return tool_uses
-                .by_id
-                .get(id)
-                .cloned()
-                .map_or((None, Some("unknown_id".to_string())), |info| (Some(info), None));
-        }
-        for parent in [
-            record.source_tool_assistant_uuid.as_deref(),
-            record.parent_uuid.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(matches) = tool_uses.by_assistant_uuid.get(parent) {
-                return if matches.len() == 1 {
-                    (matches.first().cloned(), None)
-                } else {
-                    (None, Some("ambiguous_parent".to_string()))
-                };
-            }
-        }
-        return (None, Some("missing_id".to_string()));
+fn select_tool_block<'a>(blocks: &'a [AssociatedToolBlock], params: &SearchParams) -> Option<&'a AssociatedToolBlock> {
+    if has_tool_filter(params) {
+        blocks.iter().find(|block| tool_block_matches(block, params))
+    } else {
+        blocks.first()
     }
-    (None, None)
 }
 
-fn record_tool_info(record: &MessageRecord, tool_uses: &ToolUseIndex) -> (ToolInfo, Option<String>) {
-    let tool_info = extract_tool_info(record);
-    if tool_info.server.is_some() || tool_info.tool.is_some() {
-        return (tool_info, None);
-    }
-    let (linked, issue) = linked_tool_result_info(record, tool_uses);
-    (linked.unwrap_or(tool_info), issue)
-}
-
-fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: MessageRecord) -> Option<SearchResult> {
+fn build_search_result(
+    ctx: &RecordBuildContext<'_>,
+    line_num: usize,
+    record: MessageRecord,
+    tool_blocks: &[AssociatedToolBlock],
+    attribution_issues: &mut Vec<String>,
+) -> Option<SearchResult> {
     let (effective_type, subtype) = classify_message(&record);
     if !ctx.params.types.iter().any(|t| t == effective_type) {
         return None;
@@ -1886,34 +1778,7 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         return None;
     }
 
-    let (tool_info, metadata_incomplete_reason) = record_tool_info(&record, ctx.tool_uses);
-    if !ctx.params.servers.is_empty() {
-        let Some(server) = &tool_info.server else {
-            return None;
-        };
-        if !ctx.params.servers.iter().any(|s| s == server) {
-            return None;
-        }
-    }
-    if !ctx.params.tools.is_empty() {
-        let Some(tool) = &tool_info.tool else {
-            return None;
-        };
-        if !ctx.params.tools.iter().any(|t| t == tool) {
-            return None;
-        }
-    }
-
-    let structured_tool_data =
-        extract_structured_tool_data_with_mode(&record, ctx.params.redaction, ctx.params.tool_payload_errors);
-    if ctx.params.failed_tool_results && structured_tool_data.result_is_error != Some(true) {
-        return None;
-    }
-    if ctx.params.tool_payload_errors && structured_tool_data.result_has_error_payload != Some(true) {
-        return None;
-    }
-
-    let (raw_content, images) = extract_and_replace_images_with_mode(&record, ctx.params.redaction);
+    let (raw_content, images) = extract_and_replace_images(&record);
     let (matches, match_pos) = if ctx.params.pattern.is_empty() {
         (true, None)
     } else if let Some(regex) = ctx.regex {
@@ -1929,6 +1794,24 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         return None;
     }
 
+    for block in tool_blocks {
+        if (!ctx.params.failed_tool_results || block.result_is_error == Some(true))
+            && (!ctx.params.tool_payload_errors || block.result_has_error_payload == Some(true))
+            && let Some(issue) = &block.metadata_incomplete_reason
+        {
+            push_unique(attribution_issues, issue.clone());
+        }
+    }
+    let selected_tool_block = select_tool_block(tool_blocks, ctx.params);
+    if has_tool_filter(ctx.params) && selected_tool_block.is_none() {
+        return None;
+    }
+    let tool_info = selected_tool_block.map(|block| block.info.clone()).unwrap_or(ToolInfo {
+        server: None,
+        tool: None,
+    });
+    let metadata_incomplete_reason = selected_tool_block.and_then(|block| block.metadata_incomplete_reason.clone());
+    let rendered_tool_block = selected_tool_block.map(|block| render_tool_block(block, ctx.params.redaction));
     let text_redaction = redact_text_with_mode(&raw_content, ctx.params.redaction);
     let content_redacted = text_redaction.count > 0;
     let content = text_redaction.text;
@@ -1973,12 +1856,14 @@ fn build_search_result(ctx: &RecordBuildContext<'_>, line_num: usize, record: Me
         server: tool_info.server,
         tool: tool_info.tool,
         metadata_incomplete_reason,
-        tool_input_redacted: structured_tool_data.input,
-        tool_result_redacted: structured_tool_data.result,
-        tool_result_is_error: structured_tool_data.result_is_error,
-        tool_result_has_error_payload: structured_tool_data.result_has_error_payload,
-        raw_available: (structured_tool_data.raw_available || content_redacted).then_some(true),
-        redacted: (structured_tool_data.redacted || content_redacted).then_some(true),
+        tool_input_redacted: rendered_tool_block.as_ref().and_then(|block| block.input.clone()),
+        tool_result_redacted: rendered_tool_block.as_ref().and_then(|block| block.result.clone()),
+        tool_result_is_error: selected_tool_block.and_then(|block| block.result_is_error),
+        tool_result_has_error_payload: selected_tool_block.and_then(|block| block.result_has_error_payload),
+        raw_available: (rendered_tool_block.as_ref().is_some_and(|block| block.raw_available) || content_redacted)
+            .then_some(true),
+        redacted: (rendered_tool_block.as_ref().is_some_and(|block| block.redacted) || content_redacted)
+            .then_some(true),
         matched_filters,
         match_pos: (!content_redacted).then_some(match_pos).flatten(),
     })
@@ -1992,7 +1877,7 @@ fn search_file(
     params: &SearchParams,
     regex: Option<&Regex>,
     pattern: Option<&SearchPattern>,
-    max_per_file: usize,
+    limits: FileSearchLimits,
 ) -> FileSearchResult {
     let mut results = Vec::new();
     let mut lines_scanned = 0;
@@ -2002,6 +1887,10 @@ fn search_file(
     let mut metadata_parse_errors = 0usize;
     let mut invalid_timestamps = 0usize;
     let mut metadata_issues = Vec::new();
+    let mut attribution_issues = Vec::new();
+    let mut result_bytes = 0usize;
+    let mut memory_capped = false;
+    let mut oversized_lines = 0usize;
 
     let file = match File::open(path) {
         Ok(f) => f,
@@ -2015,21 +1904,29 @@ fn search_file(
                 metadata_parse_errors: 0,
                 invalid_timestamps: 0,
                 metadata_issues: Vec::new(),
+                attribution_issues: Vec::new(),
+                result_bytes: 0,
+                memory_capped: false,
+                oversized_lines: 0,
             };
         }
     };
 
     let reader = BufReader::new(file);
     let prefix = ref_prefix(session_id);
-    let mut tool_uses = ToolUseIndex::default();
+    let mut tool_tracker = ToolAssociationTracker::default();
 
-    for (line_num, line) in reader.lines().enumerate() {
+    for (line_num, line) in bounded_jsonl_lines(reader).enumerate() {
         let line_num = line_num + 1; // 1-based
         lines_scanned += 1;
 
         let in_range = line_in_ranges(line_num, &params.lines);
         let line = match line {
-            Ok(l) => l,
+            Ok(BoundedLine::Record(l)) => l,
+            Ok(BoundedLine::TooLarge) => {
+                oversized_lines += 1;
+                continue;
+            }
             Err(_) => {
                 read_errors += 1;
                 continue;
@@ -2049,7 +1946,19 @@ fn search_file(
                 continue;
             }
         };
-        observe_tool_uses(&mut tool_uses, &record);
+        if tool_block_count(&record) > MAX_TOOL_BLOCKS {
+            push_unique(&mut metadata_issues, "tool_blocks_cap");
+            break;
+        }
+        let tool_blocks = tool_tracker.observe_record(&record, params.tool_payload_errors);
+        if tool_tracker.pending_len() > MAX_TOOL_BLOCKS {
+            push_unique(&mut metadata_issues, "tool_pending_cap");
+            break;
+        }
+        if tool_tracker.pending_bytes() > MAX_TOOL_PENDING_BYTES {
+            push_unique(&mut metadata_issues, "tool_pending_bytes_cap");
+            break;
+        }
         if !in_range {
             continue;
         }
@@ -2059,10 +1968,6 @@ fn search_file(
             invalid_timestamps += 1;
             continue;
         }
-        if let (_, Some(issue)) = record_tool_info(&record, &tool_uses) {
-            push_unique(&mut metadata_issues, issue);
-        }
-
         let ctx = RecordBuildContext {
             project_id,
             session_id,
@@ -2070,16 +1975,19 @@ fn search_file(
             params,
             regex,
             pattern,
-            tool_uses: &tool_uses,
         };
-        if let Some(result) = build_search_result(&ctx, line_num, record) {
-            results.push(result);
-
-            // 单文件早停（避免一个巨型 jsonl 把内存吃满）
-            if results.len() >= max_per_file {
+        if let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues) {
+            if results.len() == limits.max_matches {
                 truncated = true;
                 break;
             }
+            let bytes = serde_json::to_vec(&result).map_or(MAX_SEARCH_RESULTS_BYTES + 1, |json| json.len());
+            if bytes > limits.max_bytes.saturating_sub(result_bytes) {
+                memory_capped = true;
+                break;
+            }
+            result_bytes += bytes;
+            results.push(result);
         }
     }
 
@@ -2092,6 +2000,10 @@ fn search_file(
         metadata_parse_errors,
         invalid_timestamps,
         metadata_issues,
+        attribution_issues,
+        result_bytes,
+        memory_capped,
+        oversized_lines,
     }
 }
 
@@ -2123,6 +2035,85 @@ mod tests {
         path
     }
 
+    #[test]
+    fn mixed_tool_filters_preserve_each_server_tool_pair() {
+        let root = env::temp_dir().join(format!("mcp-search-mixed-tools-{}", process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("mixed-tools-session.jsonl")).unwrap();
+        let names = [
+            "Bash",
+            "mcp__alpha__read",
+            "mcp__alpha__write",
+            "mcp__beta__read",
+            "mcp__beta__write",
+            "mcp__mcp-ssh__ssh_exec",
+        ];
+        for (idx, name) in names.iter().enumerate() {
+            for record in [
+                serde_json::json!({"uuid": format!("call-{idx}"), "type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": [{"type": "tool_use", "id": format!("tool-{idx}"), "name": name, "input": {"command": "fixture"}}]}}),
+                serde_json::json!({"uuid": format!("result-{idx}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": format!("tool-{idx}"),
+                        "is_error": idx % 2 == 0, "content": "fixture"}]}}),
+            ] {
+                writeln!(file, "{record}").unwrap();
+            }
+        }
+        drop(file);
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        for (servers, tools, expected) in [
+            ("", "Bash,mcp__mcp-ssh__ssh_exec", vec![0, 5]),
+            ("", "mcp__alpha__read,mcp__beta__write", vec![1, 4]),
+            ("", "read", vec![1, 3]),
+            ("", "mcp__alpha__read,mcp__alpha__read", vec![1]),
+            ("alpha", "Bash,mcp__alpha__read", vec![1]),
+            ("alpha", "mcp__beta__read", vec![]),
+            ("alpha", "read", vec![1]),
+            ("alpha,beta", "mcp__alpha__read,mcp__beta__write", vec![1, 4]),
+            ("", "bash", vec![]),
+            ("", "", vec![0, 1, 2, 3, 4, 5]),
+        ] {
+            for failed in [false, true] {
+                let response = search(
+                    &config,
+                    SearchParams {
+                        projects: vec!["project".to_string()],
+                        servers: split_csv_param(Some(servers)),
+                        tools: split_csv_param(Some(tools)),
+                        failed_tool_results: failed,
+                        ..SearchParams::default()
+                    },
+                )
+                .unwrap();
+                let expected_lines = expected
+                    .iter()
+                    .flat_map(|idx| {
+                        if failed {
+                            if idx % 2 == 0 { vec![idx * 2 + 2] } else { vec![] }
+                        } else {
+                            vec![idx * 2 + 1, idx * 2 + 2]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    response.results.iter().map(|result| result.line).collect::<Vec<_>>(),
+                    expected_lines,
+                    "servers={servers}, tools={tools}, failed={failed}"
+                );
+                assert_eq!(response.stats.effective_filters.servers, split_csv_param(Some(servers)));
+                let mut unique_tools = Vec::new();
+                for tool in split_csv_param(Some(tools)) {
+                    push_unique(&mut unique_tools, tool);
+                }
+                assert_eq!(response.stats.effective_filters.tools, unique_tools);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn response_with_content(content: String) -> SearchResponse {
         SearchResponse {
             stats: SearchStats {
@@ -2135,6 +2126,7 @@ mod tests {
                 total_matches_exact: true,
                 incomplete: false,
                 incomplete_reasons: Vec::new(),
+                attribution_incomplete_reasons: Vec::new(),
                 coverage: SearchCoverage {
                     start: None,
                     end: None,
@@ -2375,24 +2367,67 @@ mod tests {
     }
 
     #[test]
-    fn test_per_file_cap_default() {
-        let p = SearchParams::default();
-        // limit None → unwrap_or(10000); offset 0; cap = max(20000, 1000) = 20000
-        assert_eq!(per_file_cap(&p), 20_000);
-    }
-
-    #[test]
-    fn test_per_file_cap_with_limit() {
-        let mut p = SearchParams::default();
-        p.offset = 100;
-        p.limit = Some(50);
-        // (100 + 50) * 2 = 300，下限 1000 → 1000
-        assert_eq!(per_file_cap(&p), 1_000);
-
-        p.offset = 0;
-        p.limit = Some(5_000);
-        // 5000 * 2 = 10000
-        assert_eq!(per_file_cap(&p), 10_000);
+    fn pending_tool_ids_stop_search_before_unbounded_memory_growth() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = env::temp_dir().join(format!("mcp-search-pending-{}-{nonce}", process::id()));
+        let project = tmp.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("session-pending.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for (index, letter) in ['x', 'y'].into_iter().enumerate() {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("assistant-{index}"),
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": [{"type": "tool_use", "id": letter.to_string().repeat(MAX_TOOL_PENDING_BYTES / 2 + 1024), "name": "Bash"}]}
+                })
+            )
+            .unwrap();
+        }
+        drop(file);
+        let params = SearchParams {
+            pattern: "absent".to_string(),
+            ..Default::default()
+        };
+        let result = search_file(
+            "project",
+            "session-pending",
+            &path,
+            &params,
+            None,
+            None,
+            FileSearchLimits {
+                max_matches: 10,
+                max_bytes: MAX_SEARCH_RESULTS_BYTES,
+            },
+        );
+        assert!(result.metadata_issues.contains(&"tool_pending_bytes_cap".to_string()));
+        assert_eq!(result.lines_scanned, 2);
+        let aggregate = search(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            SearchParams {
+                projects: vec!["project".to_string()],
+                aggregate: true,
+                pattern: "absent".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            aggregate
+                .stats
+                .incomplete_reasons
+                .contains(&"tool_pending_bytes_cap".to_string())
+        );
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
@@ -2406,7 +2441,18 @@ mod tests {
         p.pattern = String::new(); // 全部命中
 
         let cap = 50;
-        let file_result = search_file("proj", "session-aaa", &path, &p, None, None, cap);
+        let file_result = search_file(
+            "proj",
+            "session-aaa",
+            &path,
+            &p,
+            None,
+            None,
+            FileSearchLimits {
+                max_matches: cap,
+                max_bytes: MAX_SEARCH_RESULTS_BYTES,
+            },
+        );
         let lines_scanned = file_result.lines_scanned;
         let results = file_result.results;
         assert!(
@@ -2479,7 +2525,18 @@ mod tests {
             end: Some(3),
             exclude: false,
         }];
-        let result = search_file("proj", "session-metadata", &path, &params, None, None, 10);
+        let result = search_file(
+            "proj",
+            "session-metadata",
+            &path,
+            &params,
+            None,
+            None,
+            FileSearchLimits {
+                max_matches: 10,
+                max_bytes: MAX_SEARCH_RESULTS_BYTES,
+            },
+        );
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.parse_errors, 0);
         assert_eq!(result.metadata_parse_errors, 0);
@@ -2546,10 +2603,150 @@ mod tests {
         )
         .unwrap();
         assert!(output.stats.incomplete_reasons.is_empty());
-        let summary = output.stats.summary.unwrap();
+        let summary = output.stats.summary.as_ref().unwrap();
         assert_eq!(summary.by_server[0].key, "mcp-chrome");
         assert_eq!(summary.by_tool[0].key, "browse");
+        assert!(
+            output
+                .output
+                .as_ref()
+                .unwrap()
+                .retention
+                .as_deref()
+                .unwrap()
+                .contains("24 小时")
+        );
+        assert!(serde_json::to_vec(&output).unwrap().len() <= output.max_total_bytes);
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn unrelated_tool_attribution_does_not_make_content_search_incomplete() {
+        let root = env::temp_dir().join(format!("mcp-search-attribution-test-{}", process::id()));
+        for reason in ["unknown_id", "missing_id", "ambiguous_parent"] {
+            let project = root.join(reason);
+            fs::create_dir_all(&project).unwrap();
+            let mut records = Vec::new();
+            if reason == "ambiguous_parent" {
+                records.push(serde_json::json!({
+                    "uuid": "calls", "type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": [
+                        {"type": "tool_use", "id": "a", "name": "mcp__mcp-chrome__browse"},
+                        {"type": "tool_use", "id": "b", "name": "mcp__mcp-chrome__extract"}
+                    ]}
+                }));
+            }
+            let mut block = serde_json::json!({"type": "tool_result", "content": "tool needle"});
+            if reason == "unknown_id" {
+                block["tool_use_id"] = serde_json::json!("orphan");
+            }
+            records.push(serde_json::json!({
+                "uuid": "result", "parentUuid": "calls", "type": "user",
+                "timestamp": "2026-01-01T00:00:01Z", "message": {"content": [block]}
+            }));
+            records.push(serde_json::json!({
+                "uuid": "human", "type": "user", "timestamp": "2026-01-02T00:00:00Z",
+                "message": {"content": "human needle"}
+            }));
+            fs::write(
+                project.join("session.jsonl"),
+                records.iter().map(|record| format!("{record}\n")).collect::<String>(),
+            )
+            .unwrap();
+            let config = Config {
+                projects_dir: root.clone(),
+            };
+            for mode in ["normal", "summary", "aggregate", "output"] {
+                for filter in ["keyword", "type", "time", "lines", "matched", "named"] {
+                    let attributed = filter == "matched" || filter == "named";
+                    let params = SearchParams {
+                        projects: vec![reason.to_string()],
+                        pattern: if attributed {
+                            "tool"
+                        } else if filter == "keyword" {
+                            "human"
+                        } else {
+                            "needle"
+                        }
+                        .to_string(),
+                        tools: if filter == "named" {
+                            vec!["browse".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        types: vec!["user".to_string()],
+                        subtypes: if filter == "type" {
+                            vec!["human".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        since: (filter == "time").then(|| parse_time("2026-01-02T00:00:00Z").unwrap()),
+                        lines: if filter == "lines" {
+                            vec![Range {
+                                start: Some(records.len()),
+                                end: Some(records.len()),
+                                exclude: false,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        summary: mode == "summary" || mode == "output",
+                        aggregate: mode == "aggregate",
+                        output: (mode == "output")
+                            .then(|| format!("tmp:attribution-{reason}-{filter}-{}", process::id())),
+                        ..Default::default()
+                    };
+                    let response = search(&config, params).unwrap();
+                    assert_eq!(
+                        response.complete,
+                        filter != "named",
+                        "{reason}/{mode}/{filter}: {:?}",
+                        response.stats.incomplete_reasons
+                    );
+                    assert_eq!(response.stats.total_matches_exact, filter != "named");
+                    assert_eq!(response.stats.total_matches, usize::from(filter != "named"));
+                    let expected_attribution: Vec<String> = if attributed {
+                        vec![reason.to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(response.stats.attribution_incomplete_reasons, expected_attribution);
+                    if filter == "named" {
+                        assert_eq!(response.stats.incomplete_reasons, ["tool_filter_unverifiable"]);
+                    } else {
+                        assert!(response.stats.incomplete_reasons.is_empty());
+                    }
+                    if filter == "matched" && !response.results.is_empty() {
+                        assert_eq!(response.results[0].metadata_incomplete_reason.as_deref(), Some(reason));
+                    }
+                    if let Some(output) = response.output {
+                        let manifest: serde_json::Value =
+                            serde_json::from_slice(&fs::read(&output.manifest).unwrap()).unwrap();
+                        assert_eq!(manifest["complete"], filter != "named");
+                        assert_eq!(
+                            manifest["attribution_incomplete_reasons"],
+                            serde_json::json!(expected_attribution)
+                        );
+                        fs::remove_dir_all(output.results.parent().unwrap()).unwrap();
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn coverage_paths_do_not_displace_search_hits() {
+        let content = "needle正文".repeat(10);
+        let mut response = response_with_content(content.clone());
+        response.stats.coverage.searched_files = (0..100)
+            .map(|i| format!("/history/unrelated-long-project-path/session-{i}.jsonl"))
+            .collect();
+        let response = apply_response_budget(response, 1800, serde_json::json!({})).unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].content, content);
+        assert!(!response.results[0].truncated);
+        assert!(response.stats.coverage.searched_files.len() < 100);
     }
 
     #[test]
@@ -2589,6 +2786,47 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_limits_empty_uuid_and_unique_tool_names_before_retaining_them() {
+        let result = SearchResult {
+            r#ref: "session:1".to_string(),
+            session: "session".to_string(),
+            line: 1,
+            uuid: String::new(),
+            r#type: "assistant".to_string(),
+            subtype: "tool_use".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            content: String::new(),
+            content_size: 0,
+            truncated: false,
+            image_count: 0,
+            images: Vec::new(),
+            project: "project".to_string(),
+            server: None,
+            tool: Some("unique-tool".to_string()),
+            metadata_incomplete_reason: None,
+            tool_input_redacted: None,
+            tool_result_redacted: None,
+            tool_result_is_error: None,
+            tool_result_has_error_payload: None,
+            raw_available: None,
+            redacted: None,
+            matched_filters: Vec::new(),
+            match_pos: None,
+        };
+        let mut aggregation = SearchAggregation {
+            retained_bytes: MAX_SEARCH_RESULTS_BYTES - 1,
+            ..Default::default()
+        };
+        assert_eq!(aggregation.observe(&result), Err("aggregate_bytes_cap"));
+        assert!(aggregation.by_tool.is_empty());
+        aggregation.retained_bytes = 0;
+        aggregation.matches = GLOBAL_RESULT_CAP - 1;
+        assert!(aggregation.observe(&result).is_ok());
+        assert_eq!(aggregation.observe(&result), Err("aggregate_matches_cap"));
+        assert_eq!(aggregation.by_tool["unique-tool"], 1);
+    }
+
+    #[test]
     fn test_search_file_no_break_when_under_cap() {
         let tmp = env::temp_dir().join(format!("mcp-search-test2-{}", process::id()));
         fs::create_dir_all(&tmp).unwrap();
@@ -2598,7 +2836,18 @@ mod tests {
         p.types = vec!["user".to_string()];
         p.pattern = String::new();
 
-        let file_result = search_file("proj", "session-bbb", &path, &p, None, None, 1000);
+        let file_result = search_file(
+            "proj",
+            "session-bbb",
+            &path,
+            &p,
+            None,
+            None,
+            FileSearchLimits {
+                max_matches: 1000,
+                max_bytes: MAX_SEARCH_RESULTS_BYTES,
+            },
+        );
         assert_eq!(file_result.results.len(), 30, "all 30 should be returned");
         assert_eq!(file_result.lines_scanned, 30);
         assert!(!file_result.truncated, "should not mark truncation under cap");
@@ -2663,5 +2912,865 @@ mod tests {
         assert_eq!(unfiltered.stats.skipped_invalid_timestamps, 0);
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn search_matches_complete_tool_input_after_the_old_preview_boundary() {
+        let tmp = env::temp_dir().join(format!("mcp-search-long-tool-input-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut file = File::create(project_dir.join("session-long-input.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "assistant-long",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "call-long",
+                    "name": "Bash",
+                    "input": {"command": format!("{}FAR_NEEDLE", "x".repeat(300))}
+                }]}
+            })
+        )
+        .unwrap();
+
+        let response = search(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            SearchParams {
+                pattern: "FAR_NEEDLE".to_string(),
+                projects: vec!["project".to_string()],
+                types: vec!["assistant".to_string()],
+                max_content: 100,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert!(response.results[0].content.contains("FAR_NEEDLE"));
+        assert!(
+            response.results[0]
+                .tool_input_redacted
+                .as_ref()
+                .and_then(|input| input.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|command| command.ends_with("FAR_NEEDLE"))
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn continuation_query_preserves_line_ranges_and_result_order() {
+        let tmp = env::temp_dir().join(format!("mcp-search-lines-continuation-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_jsonl(&project_dir, "session-lines.jsonl", 8);
+        let config = Config {
+            projects_dir: tmp.clone(),
+        };
+        let first = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["user".to_string()],
+                lines: parse_line_ranges_param("5-7").unwrap(),
+                limit: Some(1),
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.results[0].line, 5);
+        let next_query = first.next_query.unwrap();
+        assert_eq!(next_query["lines"], "5-7");
+
+        let second = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["user".to_string()],
+                lines: parse_line_ranges_param(next_query["lines"].as_str().unwrap()).unwrap(),
+                offset: next_query["offset"].as_u64().unwrap() as usize,
+                limit: Some(next_query["limit"].as_u64().unwrap() as usize),
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.results[0].line, 6);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn multi_tool_search_keeps_name_payload_and_error_fields_on_one_block() {
+        let tmp = env::temp_dir().join(format!("mcp-search-multi-tool-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut file = File::create(project_dir.join("session-multi-tool.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "assistant-tools",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "call-a", "name": "mcp__server__tool_a", "input": {"marker": "INPUT_A"}},
+                    {"type": "tool_use", "id": "call-b", "name": "mcp__server__tool_b", "input": {"marker": "INPUT_B"}},
+                    {"type": "tool_use", "id": "call-c", "name": "mcp__server__tool_c", "input": {"marker": "INPUT_C"}}
+                ]}
+            })
+        )
+        .unwrap();
+        let payload_error = serde_json::json!({"success": false, "error": "A_FAIL"}).to_string();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "user-results",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "call-a", "is_error": false, "content": payload_error},
+                    {"type": "tool_result", "tool_use_id": "call-b", "is_error": true, "content": "B_FAIL"},
+                    {"type": "tool_result", "tool_use_id": "call-c", "is_error": false, "content": "C_OK"}
+                ]}
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "user-inline-result",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:02Z",
+                "message": {"content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-inline",
+                        "name": "mcp__server__tool_inline",
+                        "input": {"marker": "INPUT_INLINE"}
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-inline",
+                        "is_error": true,
+                        "content": "INLINE_FAIL"
+                    }
+                ]}
+            })
+        )
+        .unwrap();
+        let config = Config {
+            projects_dir: tmp.clone(),
+        };
+
+        let tool_use = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["assistant".to_string()],
+                servers: vec!["server".to_string()],
+                tools: vec!["tool_b".to_string()],
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tool_use.results.len(), 1);
+        assert_eq!(tool_use.results[0].tool.as_deref(), Some("tool_b"));
+        assert_eq!(
+            tool_use.results[0].tool_input_redacted.as_ref().unwrap()["marker"],
+            "INPUT_B"
+        );
+
+        let failed = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                servers: vec!["server".to_string()],
+                tools: vec!["tool_b".to_string()],
+                failed_tool_results: true,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(failed.results.len(), 1);
+        assert_eq!(failed.results[0].tool.as_deref(), Some("tool_b"));
+        assert_eq!(failed.results[0].tool_result_is_error, Some(true));
+        assert_eq!(
+            failed.results[0].tool_result_redacted.as_ref().unwrap()["content"],
+            "B_FAIL"
+        );
+
+        let payload_error = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                servers: vec!["server".to_string()],
+                tools: vec!["tool_a".to_string()],
+                tool_payload_errors: true,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(payload_error.results.len(), 1);
+        assert_eq!(payload_error.results[0].tool.as_deref(), Some("tool_a"));
+        assert_eq!(payload_error.results[0].tool_result_has_error_payload, Some(true));
+        assert_eq!(payload_error.results[0].tool_result_is_error, Some(false));
+
+        let inline_result = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                servers: vec!["server".to_string()],
+                tools: vec!["tool_inline".to_string()],
+                failed_tool_results: true,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(inline_result.results.len(), 1);
+        assert_eq!(inline_result.results[0].tool.as_deref(), Some("tool_inline"));
+        assert_eq!(inline_result.results[0].tool_result_is_error, Some(true));
+        assert_eq!(
+            inline_result.results[0].tool_result_redacted.as_ref().unwrap()["content"],
+            "INLINE_FAIL"
+        );
+
+        for (tools, failed, payload, expected) in [
+            ("Bash,mcp__server__tool_b", true, false, Some("tool_b")),
+            ("Bash,mcp__server__tool_a", false, true, Some("tool_a")),
+            ("mcp__server__tool_a,mcp__other__tool_b", true, false, None),
+            ("mcp__server__tool_b,mcp__other__tool_a", false, true, None),
+        ] {
+            let response = search(
+                &config,
+                SearchParams {
+                    projects: vec!["project".to_string()],
+                    tools: split_csv_param(Some(tools)),
+                    failed_tool_results: failed,
+                    tool_payload_errors: payload,
+                    ..SearchParams::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(response.results.len(), usize::from(expected.is_some()));
+            assert_eq!(
+                response.results.first().and_then(|result| result.tool.as_deref()),
+                expected
+            );
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn agent_session_filter_uses_the_canonical_ref_prefix() {
+        let tmp = env::temp_dir().join(format!("mcp-search-agent-ref-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let sidechain = tmp.join("project").join("main-session").join("subagents");
+        fs::create_dir_all(&sidechain).unwrap();
+        let mut file = File::create(sidechain.join("agent-12345678abcdef.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "agent-user",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": "agent message"}
+            })
+        )
+        .unwrap();
+
+        let response = search(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            SearchParams {
+                projects: vec!["project".to_string()],
+                sessions: vec!["12345678".to_string()],
+                types: vec!["user".to_string()],
+                subagents: true,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].session, "agent-12345678abcdef");
+        assert_eq!(response.results[0].r#ref, "12345678:1");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn literal_project_brackets_do_not_break_sidechain_lookup() {
+        let root = env::temp_dir().join(format!("mcp-history[bracket]-{}", process::id()));
+        let sidechain = root.join("project").join("main-session").join("subagents");
+        fs::create_dir_all(&sidechain).unwrap();
+        fs::write(
+            sidechain.join("agent-12345678abcdef.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "uuid": "fixture-uuid", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": "bracket fixture"}
+                })
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        let result = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                subagents: true,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.results.len(), 1);
+        let found = crate::get::find_session_file(&config, "12345678", Some("project")).unwrap();
+        assert_eq!(found.1, "agent-12345678abcdef");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_export_uses_inline_filter_and_utc_order() {
+        let root = env::temp_dir().join(format!("mcp-search-export-order-test-{}", process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        for (name, uuid, stamp, text) in [
+            ("session-a.jsonl", "a", "2026-01-02T00:00:00+02:00", "needle a"),
+            ("session-b.jsonl", "b", "2026-01-01T23:00:00Z", "needle b"),
+            ("session-c.jsonl", "c", "2026-01-01T01:00:00Z", "ignored"),
+        ] {
+            fs::write(
+                project.join(name),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "uuid": uuid, "type": "user", "timestamp": stamp, "message": {"content": text}
+                    })
+                ),
+            )
+            .unwrap();
+        }
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        let params = || SearchParams {
+            projects: vec!["project".to_string()],
+            pattern: "needle".to_string(),
+            types: vec!["user".to_string()],
+            summary: true,
+            ..SearchParams::default()
+        };
+        let inline = search(&config, params()).unwrap();
+        assert_eq!(
+            inline
+                .results
+                .iter()
+                .map(|result| result.uuid.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let exported = search(
+            &config,
+            SearchParams {
+                output: Some(format!("tmp:ordered-export-{}", process::id())),
+                ..params()
+            },
+        )
+        .unwrap();
+        let info = exported.output.unwrap();
+        let file = fs::read_to_string(&info.results).unwrap();
+        let rows: Vec<serde_json::Value> = file.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(
+            rows.iter()
+                .map(|result| result["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&info.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["count"], 2);
+        assert_eq!(manifest["bytes"], file.len() as u64);
+        assert_eq!(manifest["complete"], true);
+        assert_eq!(manifest["schema"], "mcp-claude-history.search-results.v2");
+        assert_eq!(manifest["summary"]["by_day"][0]["key"], "2026-01-01");
+        fs::remove_dir_all(info.results.parent().unwrap()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_export_caps_records_with_manifest_reason() {
+        let root = env::temp_dir().join(format!("mcp-search-export-cap-test-{}", process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("session-many.jsonl")).unwrap();
+        for i in 0..=MAX_EXPORT_RECORDS {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("row-{i}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": "row"}
+                })
+            )
+            .unwrap();
+        }
+        let output = search(
+            &Config {
+                projects_dir: root.clone(),
+            },
+            SearchParams {
+                projects: vec!["project".to_string()],
+                types: vec!["user".to_string()],
+                output: Some(format!("tmp:capped-export-{}", process::id())),
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        let info = output.output.unwrap();
+        assert_eq!(info.written_count, MAX_EXPORT_RECORDS);
+        assert!(!info.complete);
+        assert!(info.cap_reasons.contains(&"export_record_cap".to_string()));
+        let file = fs::read_to_string(&info.results).unwrap();
+        assert_eq!(file.lines().count(), MAX_EXPORT_RECORDS);
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&info.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["count"], MAX_EXPORT_RECORDS);
+        assert_eq!(manifest["bytes"], file.len() as u64);
+        assert_eq!(manifest["complete"], false);
+        assert_eq!(manifest["cap_reasons"], serde_json::json!(["export_record_cap"]));
+        fs::remove_dir_all(info.results.parent().unwrap()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_export_byte_cap_reports_actual_bytes() {
+        let root = env::temp_dir().join(format!("mcp-search-export-byte-test-{}", process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("session-bytes.jsonl")).unwrap();
+        for i in 0..20 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("bytes-{i}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": "x".repeat(1_000_000)}
+                })
+            )
+            .unwrap();
+        }
+        let output = search(
+            &Config {
+                projects_dir: root.clone(),
+            },
+            SearchParams {
+                projects: vec!["project".to_string()],
+                output: Some(format!("tmp:byte-export-{}", process::id())),
+                max_content: 1_000_000,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        let info = output.output.unwrap();
+        assert!(!info.complete);
+        assert!(info.bytes <= MAX_EXPORT_BYTES);
+        assert!(info.cap_reasons.contains(&"export_byte_cap".to_string()));
+        assert_eq!(info.bytes, fs::metadata(&info.results).unwrap().len());
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&info.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["bytes"], info.bytes);
+        assert_eq!(manifest["max_export_bytes"], MAX_EXPORT_BYTES);
+        fs::remove_dir_all(info.results.parent().unwrap()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_capacity_reasons_make_counts_inexact_in_all_modes() {
+        let root = env::temp_dir().join(format!("mcp-search-capacity-matrix-{}", process::id()));
+        for reason in [
+            "oversized_jsonl_lines=1",
+            "tool_blocks_cap",
+            "tool_pending_cap",
+            "tool_pending_bytes_cap",
+        ] {
+            let project = root.join(reason.replace('=', "-"));
+            fs::create_dir_all(&project).unwrap();
+            let first = project.join("a-session.jsonl");
+            let second = project.join("b-session.jsonl");
+            let mut file = File::create(&first).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": "first", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": "needle"}
+                })
+            )
+            .unwrap();
+            if reason.starts_with("oversized") {
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "uuid": "oversized", "type": "user", "timestamp": "2026-01-01T00:00:01Z",
+                        "message": {"content": format!("needle{}", "x".repeat(MAX_JSONL_LINE_BYTES))}
+                    })
+                )
+                .unwrap();
+            } else {
+                let counts = if reason == "tool_blocks_cap" {
+                    vec![MAX_TOOL_BLOCKS + 1]
+                } else if reason == "tool_pending_cap" {
+                    vec![MAX_TOOL_BLOCKS, 1]
+                } else {
+                    vec![1, 1]
+                };
+                for (record, count) in counts.into_iter().enumerate() {
+                    let blocks: Vec<_> = (0..count)
+                        .map(|index| {
+                            serde_json::json!({
+                                "type": "tool_use", "name": "Bash",
+                                "id": if reason == "tool_pending_bytes_cap" {
+                                    format!("{record}{}", "x".repeat(MAX_TOOL_PENDING_BYTES / 2 + 1024))
+                                } else { format!("call-{record}-{index}") }
+                            })
+                        })
+                        .collect();
+                    writeln!(
+                        file,
+                        "{}",
+                        serde_json::json!({
+                            "uuid": format!("calls-{record}"), "type": "assistant",
+                            "timestamp": "2026-01-01T00:00:02Z", "message": {"content": blocks}
+                        })
+                    )
+                    .unwrap();
+                }
+            }
+            drop(file);
+            fs::write(
+                &second,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "uuid": "second", "type": "user", "timestamp": "2026-01-01T00:00:03Z",
+                        "message": {"content": "later needle"}
+                    })
+                ),
+            )
+            .unwrap();
+            let config = Config {
+                projects_dir: root.clone(),
+            };
+            for mode in ["normal", "summary", "aggregate", "output"] {
+                let response = search(
+                    &config,
+                    SearchParams {
+                        pattern: "needle".to_string(),
+                        projects: vec![reason.replace('=', "-")],
+                        types: vec!["user".to_string()],
+                        summary: mode == "summary",
+                        aggregate: mode == "aggregate",
+                        output: (mode == "output")
+                            .then(|| format!("tmp:capacity-matrix-{}-{reason}.jsonl", process::id())),
+                        max_content: 100,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(
+                    response.stats.incomplete_reasons.contains(&reason.to_string()),
+                    "{reason}/{mode}"
+                );
+                assert!(response.stats.incomplete, "{reason}/{mode}");
+                assert!(!response.stats.total_matches_exact, "{reason}/{mode}");
+                assert!(response.stats.attribution_incomplete_reasons.is_empty());
+                let stopped = mode == "aggregate" && !reason.starts_with("oversized");
+                assert_eq!(response.stats.files_scanned, if stopped { 1 } else { 2 });
+                assert_eq!(
+                    response.stats.coverage.searched_files,
+                    if stopped {
+                        vec![first.display().to_string()]
+                    } else {
+                        vec![first.display().to_string(), second.display().to_string()]
+                    }
+                );
+                assert_eq!(
+                    response.stats.coverage.skipped_files,
+                    if stopped {
+                        vec![second.display().to_string()]
+                    } else {
+                        Vec::new()
+                    }
+                );
+                if let Some(output) = response.output {
+                    let manifest: serde_json::Value =
+                        serde_json::from_slice(&fs::read(output.manifest).unwrap()).unwrap();
+                    assert_eq!(manifest["complete"], false);
+                    assert_eq!(
+                        manifest["coverage"],
+                        serde_json::to_value(&response.stats.coverage).unwrap()
+                    );
+                    fs::remove_dir_all(output.results.parent().unwrap()).unwrap();
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn result_memory_cap_reports_only_attempted_files_and_disjoint_manifest_paths() {
+        let root = env::temp_dir().join(format!("mcp-search-memory-coverage-{}", process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let first = project.join("a-session.jsonl");
+        let second = project.join("b-session.jsonl");
+        let mut file = File::create(&first).unwrap();
+        let content = format!("needle{}", "x".repeat(7 * 1024 * 1024));
+        for index in 0..5 {
+            let record = serde_json::json!({
+                "uuid": format!("large-{index}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": content}
+            })
+            .to_string();
+            assert!(record.len() < MAX_JSONL_LINE_BYTES);
+            writeln!(file, "{record}").unwrap();
+        }
+        drop(file);
+        fs::write(
+            &second,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "uuid": "later", "type": "user", "timestamp": "2026-01-01T00:00:01Z",
+                    "message": {"content": "later needle"}
+                })
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        for mode in ["normal", "summary", "output"] {
+            let response = search(
+                &config,
+                SearchParams {
+                    projects: vec!["project".to_string()],
+                    pattern: "needle".to_string(),
+                    types: vec!["user".to_string()],
+                    redaction: RedactionMode::Off,
+                    max_content: 100,
+                    summary: mode == "summary",
+                    output: (mode == "output").then(|| format!("tmp:memory-coverage-{}.jsonl", process::id())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(response.stats.files_scanned, 1);
+            assert_eq!(response.stats.total_matches, 4);
+            assert!(
+                response
+                    .stats
+                    .incomplete_reasons
+                    .contains(&"result_memory_cap".to_string())
+            );
+            assert!(!response.stats.total_matches_exact);
+            assert_eq!(response.stats.coverage.searched_files, [first.display().to_string()]);
+            assert_eq!(response.stats.coverage.skipped_files, [second.display().to_string()]);
+            if let Some(output) = response.output {
+                let manifest: serde_json::Value = serde_json::from_slice(&fs::read(output.manifest).unwrap()).unwrap();
+                assert_eq!(
+                    manifest["coverage"],
+                    serde_json::to_value(&response.stats.coverage).unwrap()
+                );
+                assert!(
+                    !manifest["coverage"]["searched_files"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|path| manifest["coverage"]["skipped_files"].as_array().unwrap().contains(path))
+                );
+                fs::remove_dir_all(output.results.parent().unwrap()).unwrap();
+            } else {
+                let budgeted = apply_response_budget(response, 1400, serde_json::json!({})).unwrap();
+                assert!(serde_json::to_vec(&budgeted).unwrap().len() <= 1400);
+                assert!(
+                    budgeted.stats.coverage.searched_files.iter().all(|path| !budgeted
+                        .stats
+                        .coverage
+                        .skipped_files
+                        .contains(path))
+                );
+            }
+        }
+        let dry_run = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".to_string()],
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dry_run.stats.files_scanned, 0);
+        assert_eq!(dry_run.stats.coverage.searched_files.len(), 2);
+        assert!(dry_run.stats.coverage.skipped_files.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn aggregate_early_stops_exclude_unopened_suffix_files() {
+        let root = env::temp_dir().join(format!("mcp-search-aggregate-coverage-{}", process::id()));
+        for reason in ["uuid_dedupe_cap", "aggregate_matches_cap", "aggregate_bytes_cap"] {
+            let project = root.join(reason);
+            fs::create_dir_all(&project).unwrap();
+            let first = project.join("a-session.jsonl");
+            let second = project.join("b-session.jsonl");
+            let mut file = File::create(&first).unwrap();
+            let count = if reason == "aggregate_bytes_cap" {
+                5
+            } else {
+                GLOBAL_RESULT_CAP + 1
+            };
+            for index in 0..count {
+                let uuid = match reason {
+                    "aggregate_matches_cap" => String::new(),
+                    "aggregate_bytes_cap" => format!("{index}{}", "x".repeat(7 * 1024 * 1024)),
+                    _ => format!("uuid-{index}"),
+                };
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "uuid": uuid, "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                        "message": {"content": "needle"}
+                    })
+                )
+                .unwrap();
+            }
+            drop(file);
+            fs::write(&second, "").unwrap();
+            let response = search(
+                &Config {
+                    projects_dir: root.clone(),
+                },
+                SearchParams {
+                    projects: vec![reason.to_string()],
+                    aggregate: true,
+                    redaction: RedactionMode::Off,
+                    pattern: "needle".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(response.stats.incomplete_reasons, [reason]);
+            assert_eq!(response.stats.files_scanned, 1);
+            assert_eq!(
+                response.stats.total_matches,
+                if reason == "aggregate_bytes_cap" {
+                    4
+                } else {
+                    GLOBAL_RESULT_CAP
+                }
+            );
+            assert!(!response.stats.total_matches_exact);
+            assert_eq!(response.stats.coverage.searched_files, [first.display().to_string()]);
+            assert_eq!(response.stats.coverage.skipped_files, [second.display().to_string()]);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn coverage_attempts_include_empty_and_failed_files_in_every_mode() {
+        let root = env::temp_dir().join(format!("mcp-search-attempted-coverage-{}", process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let empty = root.join("empty.jsonl");
+        fs::write(&empty, "").unwrap();
+        let missing = root.join("missing.jsonl");
+        for mode in ["normal", "summary", "aggregate", "output"] {
+            for paths in [Vec::new(), vec![empty.clone()], vec![missing.clone(), empty.clone()]] {
+                let files: Vec<SearchFile> = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| ("project".to_string(), format!("session-{index}"), path.clone()))
+                    .collect();
+                let params = SearchParams {
+                    summary: mode == "summary",
+                    aggregate: mode == "aggregate",
+                    output: (mode == "output")
+                        .then(|| format!("tmp:attempted-coverage-{}-{}.jsonl", process::id(), paths.len())),
+                    ..Default::default()
+                };
+                let response = if mode == "aggregate" {
+                    search_aggregate_streaming(&params, &files, None, None, Instant::now()).unwrap()
+                } else if mode == "output" {
+                    search_to_output_bounded(&params, &files, None, None, Instant::now()).unwrap()
+                } else {
+                    let collection = collect_search_results(&params, &files, None, None);
+                    build_search_response(params, files, collection, Instant::now()).unwrap()
+                };
+                assert_eq!(response.stats.files_scanned, paths.len());
+                assert_eq!(
+                    response.stats.coverage.searched_files,
+                    paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>()
+                );
+                assert!(response.stats.coverage.skipped_files.is_empty());
+                assert_eq!(response.stats.total_matches_exact, !paths.contains(&missing));
+                if let Some(output) = response.output {
+                    fs::remove_dir_all(output.results.parent().unwrap()).unwrap();
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_jsonl_line_is_counted_and_following_record_is_searchable() {
+        let root = env::temp_dir().join(format!("mcp-search-oversized-test-{}", process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("session-oversized.jsonl")).unwrap();
+        writeln!(file, "{}", "x".repeat(MAX_JSONL_LINE_BYTES + 1)).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "valid", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": "needle"}
+            })
+        )
+        .unwrap();
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        let result = search(
+            &config,
+            SearchParams {
+                pattern: "needle".to_string(),
+                projects: vec!["project".to_string()],
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].line, 2);
+        assert!(
+            result
+                .stats
+                .incomplete_reasons
+                .contains(&"oversized_jsonl_lines=1".to_string())
+        );
+        assert!(result.stats.incomplete);
+        fs::remove_dir_all(root).unwrap();
     }
 }

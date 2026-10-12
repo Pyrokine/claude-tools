@@ -2,9 +2,14 @@ use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
 use std::env;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 const TMP_PATH_PREFIX: &str = "tmp:";
 const CWD_PATH_PREFIX: &str = "cwd:";
@@ -16,10 +21,14 @@ pub struct GetParams {
     pub output: Option<String>,
     pub project: Option<String>,
     pub redaction: RedactionMode,
+    pub overwrite: bool,
 }
 
 /// 获取完整内容
 pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorResponse> {
+    if params.overwrite && params.output.is_none() {
+        return Err(invalid_arguments("overwrite=true 需要 output"));
+    }
     // 解析 ref
     let parsed_ref = ParsedRef::parse(&params.r#ref).ok_or_else(|| ErrorResponse {
         error: "ref_invalid".to_string(),
@@ -41,13 +50,25 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     let reader = BufReader::new(file);
     let mut target_line = None;
 
-    for (line_num, line) in reader.lines().enumerate() {
+    for (line_num, line) in bounded_jsonl_lines(reader).enumerate() {
         if line_num + 1 == parsed_ref.line {
-            target_line = Some(line.map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("读取行失败: {e}"),
-                available: None,
-            })?);
+            target_line = Some(match line {
+                Ok(BoundedLine::Record(line)) => line,
+                Ok(BoundedLine::TooLarge) => {
+                    return Err(ErrorResponse {
+                        error: "record_too_large".to_string(),
+                        message: format!("ref 行超过 {MAX_JSONL_LINE_BYTES} 字节上限"),
+                        available: None,
+                    });
+                }
+                Err(e) => {
+                    return Err(ErrorResponse {
+                        error: "io_error".to_string(),
+                        message: format!("读取行失败: {e}"),
+                        available: None,
+                    });
+                }
+            });
             break;
         }
     }
@@ -72,23 +93,26 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     let image_count = images.len();
     let original_content_size = raw_content.chars().count();
 
-    let ranged_content = if let Some((start, end)) = params.range {
-        if start > end {
+    let selected_range = if let Some((start, end)) = params.range {
+        if start > end || start >= original_content_size {
             return Err(invalid_range_response(start, end, original_content_size));
         }
-        if start >= original_content_size {
-            return Err(invalid_range_response(start, end, original_content_size));
-        }
-        let end = end.min(original_content_size);
-        raw_content.chars().skip(start).take(end - start).collect::<String>()
+        Some((start, end.min(original_content_size)))
     } else {
-        raw_content
+        None
     };
-    let redaction = redact_text_with_mode(&ranged_content, params.redaction);
+    let redaction = redact_text_range_with_mode(&raw_content, params.redaction, selected_range);
     let content = redaction.text;
     let selected_content_size = content.chars().count();
 
     if let Some(output_raw) = params.output {
+        if image_count > 64 {
+            return Err(ErrorResponse {
+                error: "export_image_limit".to_string(),
+                message: "单次导出最多包含 64 张图片".to_string(),
+                available: None,
+            });
+        }
         let resolved_output = resolve_output_files(
             &output_raw,
             &format!("{}.txt", params.r#ref.replace(':', "_")),
@@ -102,8 +126,10 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
             content_size: selected_content_size,
             original_content_size,
             image_count,
+            range_selected: selected_range.is_some(),
             redaction_mode: params.redaction,
             redacted_count: redaction.count,
+            overwrite: params.overwrite,
         });
     }
 
@@ -193,26 +219,21 @@ pub fn find_session_file(
         }
         vec![(normalized, dir)]
     } else if let Some(pid) = config.current_project_id() {
-        // 优先搜当前项目（current_project_id 返回的 id 已通过 cwd 转码,可信）
-        match config.project_dir(&pid) {
-            Ok(dir) => vec![(pid.clone(), dir)],
-            Err(_) => config.list_project_dirs().unwrap_or_default(),
-        }
+        vec![(pid.clone(), config.project_dir(&pid)?)]
     } else {
-        config.list_project_dirs().unwrap_or_default()
+        config.list_project_dirs().map_err(session_io_error)?
     };
 
-    let mut matches = search_sessions_in_dirs(&project_dirs, session_prefix);
+    let mut matches = search_sessions_in_dirs(&project_dirs, session_prefix)?;
 
-    if project_id.is_none()
-        && let Ok(all_dirs) = config.list_project_dirs()
-    {
+    if project_id.is_none() {
+        let all_dirs = config.list_project_dirs().map_err(session_io_error)?;
         let remaining: Vec<_> = all_dirs
             .into_iter()
             .filter(|(id, _)| !project_dirs.iter().any(|(pid, _)| pid == id))
             .collect();
         if !remaining.is_empty() {
-            matches.extend(search_sessions_in_dirs(&remaining, session_prefix));
+            matches.extend(search_sessions_in_dirs(&remaining, session_prefix)?);
         }
     }
 
@@ -240,56 +261,79 @@ pub fn find_session_file(
 }
 
 /// 在指定的项目目录列表中搜索匹配 session prefix 的文件
-fn search_sessions_in_dirs(project_dirs: &[(String, PathBuf)], session_prefix: &str) -> Vec<(String, String, PathBuf)> {
+fn session_io_error(error: std::io::Error) -> ErrorResponse {
+    ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("搜索会话失败: {error}"),
+        available: None,
+    }
+}
+
+fn search_sessions_in_dirs(
+    project_dirs: &[(String, PathBuf)],
+    session_prefix: &str,
+) -> Result<Vec<(String, String, PathBuf)>, ErrorResponse> {
     let mut matches = Vec::new();
     for (project_id, dir) in project_dirs {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    continue;
-                }
-
+        for entry in fs::read_dir(dir).map_err(session_io_error)? {
+            let entry = entry.map_err(session_io_error)?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
                 let filename = entry.file_name().to_string_lossy().to_string();
                 if let Some(session_id) = session_id_from_filename(&filename)
-                    && (ref_prefix(&session_id) == session_prefix || session_id == session_prefix)
+                    && session_matches_ref(&session_id, session_prefix)
                 {
                     matches.push((project_id.clone(), session_id, path));
                 }
+                continue;
             }
-        }
-
-        for sidechain_dir in SIDECHAIN_SESSION_DIRS {
-            let pattern = dir.join("*/").join(sidechain_dir);
-            if let Ok(entries) = glob::glob(&pattern.to_string_lossy()) {
-                for subdir in entries.flatten() {
-                    if let Ok(sub_entries) = fs::read_dir(&subdir) {
-                        for entry in sub_entries.flatten() {
-                            let path = entry.path();
-                            if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                                continue;
-                            }
-                            let filename = entry.file_name().to_string_lossy().to_string();
-                            if filename.starts_with("agent-") {
-                                let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
-                                if ref_prefix(&session_id) == session_prefix || session_id == session_prefix {
-                                    matches.push((project_id.clone(), session_id, path));
-                                }
-                            }
+            if !entry.file_type().map_err(session_io_error)?.is_dir() {
+                continue;
+            }
+            for sidechain_dir in SIDECHAIN_SESSION_DIRS {
+                let subdir = path.join(sidechain_dir);
+                let sub_entries = match fs::read_dir(&subdir) {
+                    Ok(entries) => entries,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(session_io_error(e)),
+                };
+                for sub_entry in sub_entries {
+                    let sub_entry = sub_entry.map_err(session_io_error)?;
+                    let path = sub_entry.path();
+                    if path.extension().is_none_or(|ext| ext != "jsonl") {
+                        continue;
+                    }
+                    let filename = sub_entry.file_name().to_string_lossy().to_string();
+                    if filename.starts_with("agent-") {
+                        let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
+                        if session_matches_ref(&session_id, session_prefix) {
+                            matches.push((project_id.clone(), session_id, path));
                         }
                     }
                 }
             }
         }
     }
-
-    matches
+    Ok(matches)
 }
 
+#[derive(Debug)]
 pub struct ResolvedOutputFiles {
     pub directory: PathBuf,
     pub content: PathBuf,
     pub manifest: PathBuf,
+    pub explicit_file: bool,
+    pub temp_output: bool,
+}
+
+fn is_temp_output(raw_output: &str, directory: &Path) -> Result<bool, ErrorResponse> {
+    if raw_output.starts_with(CWD_PATH_PREFIX) {
+        return Ok(false);
+    }
+    if raw_output.starts_with(TMP_PATH_PREFIX) || !Path::new(raw_output).is_absolute() {
+        return Ok(true);
+    }
+    Ok(directory.starts_with(controlled_temp_root()?))
 }
 
 pub fn resolve_output_files(
@@ -297,6 +341,7 @@ pub fn resolve_output_files(
     default_file_name: &str,
     default_manifest_name: &str,
 ) -> Result<ResolvedOutputFiles, ErrorResponse> {
+    validate_output_path(raw_output)?;
     let trimmed = raw_output.trim();
     let path_part = trimmed
         .strip_prefix(TMP_PATH_PREFIX)
@@ -308,7 +353,9 @@ pub fn resolve_output_files(
         return Ok(ResolvedOutputFiles {
             content: directory.join(default_file_name),
             manifest: directory.join(default_manifest_name),
+            temp_output: is_temp_output(trimmed, &directory)?,
             directory,
+            explicit_file: false,
         });
     }
 
@@ -329,10 +376,702 @@ pub fn resolve_output_files(
     );
     let manifest = content.with_file_name(manifest_name);
     Ok(ResolvedOutputFiles {
+        temp_output: is_temp_output(trimmed, &directory)?,
         directory,
         content,
         manifest,
+        explicit_file: true,
     })
+}
+
+static EXPORT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn export_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        EXPORT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+const PUBLISH_JOURNAL_MAX_BYTES: u64 = 2048;
+static PUBLISH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PROCESS_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PublishJournal {
+    version: u8,
+    target: String,
+    backup: String,
+    token: String,
+    owner: String,
+}
+
+fn process_instance() -> &'static str {
+    PROCESS_INSTANCE.get_or_init(export_nonce)
+}
+
+fn owner_pid(owner: &str) -> Option<u32> {
+    let mut parts = owner.split('-');
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    if pid == 0
+        || !parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        || !parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some(pid)
+}
+
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    (unsafe { libc::kill(pid, 0) }) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_is_gone(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(0x0010_0000, 0, pid); // SYNCHRONIZE
+        if handle.is_null() {
+            return GetLastError() == 87; // ERROR_INVALID_PARAMETER: PID does not exist
+        }
+        let stopped = WaitForSingleObject(handle, 0) == 0; // WAIT_OBJECT_0
+        CloseHandle(handle);
+        stopped
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_gone(_pid: u32) -> bool {
+    false
+}
+
+fn publish_journal_path(final_dir: &Path) -> Result<PathBuf, ErrorResponse> {
+    let name = final_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid_arguments("output 必须有 UTF-8 目录名"))?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in name.to_ascii_lowercase().bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    Ok(final_dir
+        .parent()
+        .ok_or_else(|| invalid_arguments("output 必须有父目录"))?
+        .join(format!(".mcp-history-publish-{hash:016x}")))
+}
+
+fn sync_publish_directory(directory: &Path) -> Result<(), ErrorResponse> {
+    #[cfg(unix)]
+    {
+        File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| ErrorResponse {
+                error: "output_sync_failed".to_string(),
+                message: format!("同步导出目录 {} 失败: {error}", directory.display()),
+                available: None,
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
+}
+
+fn create_publish_journal(final_dir: &Path, backup: &Path, token: &str) -> Result<PathBuf, ErrorResponse> {
+    let journal_path = publish_journal_path(final_dir)?;
+    let journal = PublishJournal {
+        version: 1,
+        target: final_dir.file_name().unwrap().to_string_lossy().into_owned(),
+        backup: backup.file_name().unwrap().to_string_lossy().into_owned(),
+        token: token.to_string(),
+        owner: process_instance().to_string(),
+    };
+    let bytes = serde_json::to_vec(&journal).map_err(|error| ErrorResponse {
+        error: "serialize_error".to_string(),
+        message: format!("序列化导出恢复记录失败: {error}"),
+        available: None,
+    })?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&journal_path).map_err(|error| ErrorResponse {
+        error: if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "output_busy"
+        } else {
+            "io_error"
+        }
+        .to_string(),
+        message: format!("无法建立导出恢复记录 {}: {error}", journal_path.display()),
+        available: None,
+    })?;
+    let result = (|| {
+        set_private_permissions(&journal_path, 0o600)?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("同步导出恢复记录失败: {error}"),
+                available: None,
+            })?;
+        sync_publish_directory(final_dir.parent().unwrap())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&journal_path);
+        return Err(error);
+    }
+    Ok(journal_path)
+}
+
+fn recover_interrupted_export(final_dir: &Path) -> Result<(), ErrorResponse> {
+    let journal_path = publish_journal_path(final_dir)?;
+    let metadata = match fs::symlink_metadata(&journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ErrorResponse {
+                error: "output_restore_failed".to_string(),
+                message: format!("无法检查导出恢复记录: {error}"),
+                available: None,
+            });
+        }
+    };
+    let conflict = |reason: &str| ErrorResponse {
+        error: "output_restore_failed".to_string(),
+        message: format!("导出恢复记录 {} 无效: {reason}", journal_path.display()),
+        available: None,
+    };
+    if !metadata.file_type().is_file() || metadata.len() > PUBLISH_JOURNAL_MAX_BYTES {
+        return Err(conflict("类型或大小不符合预期"));
+    }
+    let mut bytes = Vec::new();
+    File::open(&journal_path)
+        .map_err(|_| conflict("无法读取"))?
+        .take(PUBLISH_JOURNAL_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| conflict("读取失败"))?;
+    if bytes.len() as u64 > PUBLISH_JOURNAL_MAX_BYTES {
+        return Err(conflict("记录过大"));
+    }
+    let journal: PublishJournal = serde_json::from_slice(&bytes).map_err(|_| conflict("JSON 格式错误"))?;
+    let target_name = final_dir.file_name().and_then(|name| name.to_str());
+    let suffix = journal.backup.strip_prefix(".mcp-history-backup-");
+    if journal.version != 1
+        || target_name != Some(journal.target.as_str())
+        || !suffix.is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+        || journal.token.is_empty()
+        || journal.token.len() > 128
+    {
+        return Err(conflict("目标、备份或版本不匹配"));
+    }
+    let journal_pid = owner_pid(&journal.owner).ok_or_else(|| conflict("原进程标记无效"))?;
+    let age = metadata
+        .modified()
+        .map_err(|_| conflict("无法确认创建时间"))?
+        .elapsed()
+        .unwrap_or_default();
+    if journal.owner != process_instance() && (age < Duration::from_secs(30) || !process_is_gone(journal_pid)) {
+        return Err(ErrorResponse {
+            error: "output_busy".to_string(),
+            message: format!(
+                "导出恢复记录 {} 的原进程仍在运行或无法确认已退出",
+                journal_path.display()
+            ),
+            available: None,
+        });
+    }
+    let backup = final_dir.parent().unwrap().join(&journal.backup);
+    let backup_exists = match fs::symlink_metadata(&backup) {
+        Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() && bundle_marker_matches(&backup) => {
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        _ => return Err(conflict("原目录备份不完整或已被修改")),
+    };
+    let final_exists = match fs::symlink_metadata(final_dir) {
+        Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() && bundle_marker_matches(final_dir) => {
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        _ => return Err(conflict("目标目录不完整或已被修改")),
+    };
+    match (backup_exists, final_exists) {
+        (true, false) => fs::rename(&backup, final_dir).map_err(|error| ErrorResponse {
+            error: "output_restore_failed".to_string(),
+            message: format!("无法从 {} 恢复旧输出: {error}", backup.display()),
+            available: None,
+        })?,
+        (true, true) => {
+            if !published_token_matches(final_dir, &journal.token) {
+                return Err(conflict("当前输出无法确认属于此次发布，旧备份保留"));
+            }
+            fs::remove_dir_all(&backup).map_err(|error| ErrorResponse {
+                error: "output_restore_failed".to_string(),
+                message: format!("无法清理旧输出备份 {}: {error}", backup.display()),
+                available: None,
+            })?;
+        }
+        (false, false) => return Err(conflict("目标与原目录备份均不存在")),
+        (false, true) => {}
+    }
+    sync_publish_directory(final_dir.parent().unwrap())?;
+    remove_publish_journal(&journal_path)
+}
+
+fn remove_publish_journal(path: &Path) -> Result<(), ErrorResponse> {
+    fs::remove_file(path).map_err(|error| ErrorResponse {
+        error: "output_cleanup_failed".to_string(),
+        message: format!("无法清理导出恢复记录 {}: {error}", path.display()),
+        available: None,
+    })?;
+    sync_publish_directory(path.parent().unwrap())
+}
+
+#[derive(Debug)]
+pub struct OutputTransaction {
+    staging: PathBuf,
+    final_dir: PathBuf,
+    content_name: std::ffi::OsString,
+    manifest_name: std::ffi::OsString,
+    overwrite: bool,
+    committed: bool,
+    created_parents: Vec<PathBuf>,
+}
+
+fn planned_temp_parents(parent: &Path, is_temp: bool) -> Result<Vec<PathBuf>, ErrorResponse> {
+    if !is_temp {
+        return Ok(Vec::new());
+    }
+    let root = controlled_temp_root()?;
+    if !parent.starts_with(&root) {
+        return Err(invalid_arguments("临时输出父目录不属于当前会话"));
+    }
+    let mut missing = Vec::new();
+    let mut current = parent;
+    while current != root {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(invalid_arguments("临时输出父路径不是普通目录")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(current.to_path_buf()),
+            Err(error) => return Err(invalid_arguments(format!("无法检查临时输出父目录: {error}"))),
+        }
+        current = current
+            .parent()
+            .ok_or_else(|| invalid_arguments("临时输出父目录无效"))?;
+        if missing.len() > SESSION_MAX_FILES {
+            return Err(invalid_arguments("临时输出父目录超过会话文件数上限"));
+        }
+    }
+    enforce_session_quota_with_extra(&root, missing.len() + 4, missing.len() as u64 * 4096)?;
+    missing.reverse();
+    Ok(missing)
+}
+
+impl OutputTransaction {
+    pub fn begin(output: ResolvedOutputFiles, overwrite: bool) -> Result<Self, ErrorResponse> {
+        if overwrite {
+            let _guard = PUBLISH_LOCK
+                .lock()
+                .map_err(|_| invalid_arguments("导出发布状态不可用"))?;
+            recover_interrupted_export(&output.directory)?;
+        }
+        let nonce = export_nonce();
+        let final_dir = if output.explicit_file {
+            let stem = output.content.file_stem().and_then(|s| s.to_str()).unwrap_or("export");
+            if overwrite && bundle_marker_matches(&output.directory) {
+                output.directory.clone()
+            } else if overwrite {
+                output.directory.join(format!("{stem}.export"))
+            } else {
+                output.directory.join(format!("{stem}.export-{nonce}"))
+            }
+        } else if overwrite {
+            output.directory.clone()
+        } else {
+            let resolved = fs::canonicalize(&output.directory).ok();
+            let cwd = env::current_dir().ok().and_then(|path| fs::canonicalize(path).ok());
+            let temp = controlled_temp_root().ok();
+            if resolved
+                .as_ref()
+                .is_some_and(|dir| cwd.as_ref() == Some(dir) || temp.as_ref() == Some(dir))
+            {
+                output.directory.join(format!("export-{nonce}"))
+            } else {
+                let name = output
+                    .directory
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("export");
+                output.directory.with_file_name(format!("{name}-{nonce}"))
+            }
+        };
+        if overwrite && final_dir != output.directory {
+            let _guard = PUBLISH_LOCK
+                .lock()
+                .map_err(|_| invalid_arguments("导出发布状态不可用"))?;
+            recover_interrupted_export(&final_dir)?;
+        }
+        let parent = final_dir
+            .parent()
+            .ok_or_else(|| invalid_arguments("output 必须有父目录"))?
+            .to_path_buf();
+        let planned = planned_temp_parents(&parent, output.temp_output)?;
+        let staging = parent.join(format!(".mcp-history-stage-{nonce}"));
+        let mut transaction = Self {
+            staging,
+            final_dir,
+            content_name: output.content.file_name().unwrap_or_default().to_os_string(),
+            manifest_name: output.manifest.file_name().unwrap_or_default().to_os_string(),
+            overwrite,
+            committed: false,
+            created_parents: Vec::new(),
+        };
+        if output.temp_output {
+            for directory in planned {
+                match fs::create_dir(&directory) {
+                    Ok(()) => {
+                        transaction.created_parents.push(directory.clone());
+                        set_private_permissions(&directory, 0o700)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        checked_temp_directory(&directory).map_err(invalid_arguments)?;
+                    }
+                    Err(error) => {
+                        return Err(ErrorResponse {
+                            error: "io_error".to_string(),
+                            message: format!("创建输出父目录失败: {error}"),
+                            available: None,
+                        });
+                    }
+                }
+            }
+        } else {
+            fs::create_dir_all(&parent).map_err(|error| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("创建输出父目录失败: {error}"),
+                available: None,
+            })?;
+        }
+        fs::create_dir(&transaction.staging).map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("创建暂存目录失败: {e}"),
+            available: None,
+        })?;
+        if let Err(error) = set_private_permissions(&transaction.staging, 0o700) {
+            transaction.committed = false;
+            return Err(error);
+        }
+        Ok(transaction)
+    }
+
+    pub fn staging_content(&self) -> PathBuf {
+        self.staging.join(&self.content_name)
+    }
+
+    pub fn staging_manifest(&self) -> PathBuf {
+        self.staging.join(&self.manifest_name)
+    }
+
+    pub fn content(&self) -> PathBuf {
+        self.final_dir.join(&self.content_name)
+    }
+
+    pub fn manifest(&self) -> PathBuf {
+        self.final_dir.join(&self.manifest_name)
+    }
+
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging
+    }
+
+    pub fn final_dir(&self) -> &Path {
+        &self.final_dir
+    }
+
+    pub fn publish(mut self) -> Result<(), ErrorResponse> {
+        let sync = |path: &Path| -> Result<(), ErrorResponse> {
+            File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| ErrorResponse {
+                    error: "io_error".to_string(),
+                    message: format!("同步输出文件失败: {error}"),
+                    available: None,
+                })
+        };
+        sync(&self.staging_content())?;
+        sync(&self.staging_manifest())?;
+        let mut marker = open_private_output_file(&self.staging.join(".mcp-history-bundle"))?;
+        marker
+            .write_all(b"mcp-claude-history.bundle.v1\n")
+            .map_err(|error| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("写入导出归属标记失败: {error}"),
+                available: None,
+            })?;
+        marker.sync_all().map_err(|error| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("同步导出归属标记失败: {error}"),
+            available: None,
+        })?;
+
+        let _guard = PUBLISH_LOCK
+            .lock()
+            .map_err(|_| invalid_arguments("导出发布状态不可用"))?;
+        if self.overwrite {
+            recover_interrupted_export(&self.final_dir)?;
+        }
+        let had_existing = match fs::symlink_metadata(&self.final_dir) {
+            Ok(meta) => {
+                if !self.overwrite
+                    || !meta.file_type().is_dir()
+                    || meta.file_type().is_symlink()
+                    || !bundle_marker_matches(&self.final_dir)
+                {
+                    return Err(ErrorResponse {
+                        error: "output_exists".to_string(),
+                        message: format!("输出目录已存在或不可安全替换: {}", self.final_dir.display()),
+                        available: None,
+                    });
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(ErrorResponse {
+                    error: "io_error".to_string(),
+                    message: format!("无法检查输出目录: {error}"),
+                    available: None,
+                });
+            }
+        };
+        let token = export_nonce();
+        if had_existing {
+            let mut file = open_private_output_file(&self.staging.join(".mcp-history-publish-token"))?;
+            file.write_all(token.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|error| ErrorResponse {
+                    error: "io_error".to_string(),
+                    message: format!("同步导出发布标记失败: {error}"),
+                    available: None,
+                })?;
+        }
+        #[cfg(unix)]
+        sync(&self.staging)?;
+        enforce_session_quota(&self.staging)?;
+
+        let parent = self.final_dir.parent().expect("output parent exists");
+        let backup = parent.join(format!(".mcp-history-backup-{}", export_nonce()));
+        let journal = if had_existing {
+            match fs::symlink_metadata(&backup) {
+                Ok(_) => {
+                    return Err(ErrorResponse {
+                        error: "output_busy".to_string(),
+                        message: format!("输出备份目录已存在: {}", backup.display()),
+                        available: None,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ErrorResponse {
+                        error: "io_error".to_string(),
+                        message: format!("无法检查输出备份目录: {error}"),
+                        available: None,
+                    });
+                }
+            }
+            let journal = create_publish_journal(&self.final_dir, &backup, &token)?;
+            if let Err(error) = enforce_session_quota(&self.staging) {
+                remove_publish_journal(&journal)?;
+                return Err(error);
+            }
+            if let Err(error) = fs::rename(&self.final_dir, &backup) {
+                remove_publish_journal(&journal)?;
+                return Err(ErrorResponse {
+                    error: "io_error".to_string(),
+                    message: format!("无法将原输出目录移到备份（权限或文件占用）: {error}"),
+                    available: None,
+                });
+            }
+            if let Err(error) = sync_publish_directory(parent) {
+                self.restore_previous(&backup, &journal)?;
+                return Err(error);
+            }
+            Some(journal)
+        } else {
+            None
+        };
+        if let Err(error) = fs::rename(&self.staging, &self.final_dir) {
+            if let Some(journal) = &journal {
+                self.restore_previous(&backup, journal)?;
+            }
+            return Err(ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("发布输出失败（权限或文件占用）: {error}"),
+                available: None,
+            });
+        }
+        self.committed = true;
+        sync_publish_directory(parent)?;
+        if let Some(journal) = journal {
+            fs::remove_dir_all(&backup).map_err(|error| ErrorResponse {
+                error: "output_cleanup_failed".to_string(),
+                message: format!("新输出已发布，但旧输出备份 {} 无法清理: {error}", backup.display()),
+                available: None,
+            })?;
+            sync_publish_directory(parent)?;
+            remove_publish_journal(&journal)?;
+        }
+        Ok(())
+    }
+
+    fn restore_previous(&self, backup: &Path, journal: &Path) -> Result<(), ErrorResponse> {
+        fs::rename(backup, &self.final_dir).map_err(|error| ErrorResponse {
+            error: "output_restore_failed".to_string(),
+            message: format!("旧目录保留在 {}，但无法恢复原位置: {error}", backup.display()),
+            available: None,
+        })?;
+        sync_publish_directory(self.final_dir.parent().unwrap())?;
+        remove_publish_journal(journal)
+    }
+}
+
+fn marker_matches(path: &Path, expected: &[u8]) -> bool {
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file() && meta.len() == expected.len() as u64) {
+        return false;
+    }
+    let mut contents = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(expected.len() as u64 + 1).read_to_end(&mut contents))
+        .is_ok_and(|_| contents == expected)
+}
+
+fn bundle_marker_matches(directory: &Path) -> bool {
+    marker_matches(
+        &directory.join(".mcp-history-bundle"),
+        b"mcp-claude-history.bundle.v1\n",
+    )
+}
+
+fn published_token_matches(directory: &Path, token: &str) -> bool {
+    marker_matches(&directory.join(".mcp-history-publish-token"), token.as_bytes())
+}
+
+const SESSION_MAX_FILES: usize = 256;
+const SESSION_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+fn enforce_session_quota(staging: &Path) -> Result<(), ErrorResponse> {
+    enforce_session_quota_with_extra(staging, 0, 0)
+}
+
+fn enforce_session_quota_with_extra(
+    staging: &Path,
+    additional_entries: usize,
+    additional_bytes: u64,
+) -> Result<(), ErrorResponse> {
+    let temp_root = controlled_temp_root()?;
+    if !staging.starts_with(&temp_root) {
+        return Ok(());
+    }
+    let mut retries = 0;
+    loop {
+        let mut disappeared = false;
+        let mut io_error = |error: std::io::Error| {
+            disappeared = error.kind() == std::io::ErrorKind::NotFound;
+            ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("无法检查临时导出配额: {error}"),
+                available: None,
+            }
+        };
+        let result = (|| {
+            let mut pending = vec![temp_root.clone()];
+            let mut count = 0usize;
+            let mut bytes = 0u64;
+            while let Some(directory) = pending.pop() {
+                for entry in fs::read_dir(directory).map_err(&mut io_error)? {
+                    let entry = entry.map_err(&mut io_error)?;
+                    let kind = entry.file_type().map_err(&mut io_error)?;
+                    if kind.is_symlink() {
+                        return Err(ErrorResponse {
+                            error: "export_quota_unverifiable".to_string(),
+                            message: "临时会话目录中存在符号链接，无法校验导出配额".to_string(),
+                            available: None,
+                        });
+                    }
+                    let meta = entry.metadata().map_err(&mut io_error)?;
+                    count += 1;
+                    bytes = bytes.saturating_add(meta.len());
+                    if count.saturating_add(additional_entries) > SESSION_MAX_FILES
+                        || bytes.saturating_add(additional_bytes) > SESSION_MAX_BYTES
+                    {
+                        return Err(ErrorResponse {
+                            error: "export_quota_exceeded".to_string(),
+                            message: format!("临时会话导出超过 {SESSION_MAX_FILES} 项或 {SESSION_MAX_BYTES} 字节"),
+                            available: None,
+                        });
+                    }
+                    if kind.is_dir() {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_ok() || !disappeared || retries == 7 {
+            return result;
+        }
+        if retries == 0 {
+            eprintln!("[mcp-claude-history] 导出目录在配额扫描期间发生变化，重新计算完整配额");
+        }
+        std::thread::sleep(Duration::from_millis(1 << retries));
+        retries += 1;
+    }
+}
+
+impl Drop for OutputTransaction {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = fs::remove_dir_all(&self.staging)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "[mcp-claude-history] 无法清理未发布的输出 {}: {error}",
+                    self.staging.display()
+                );
+            }
+            for directory in self.created_parents.iter().rev() {
+                if let Err(error) = fs::remove_dir(directory)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                    && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+                {
+                    eprintln!(
+                        "[mcp-claude-history] 无法清理未使用的目录 {}: {error}",
+                        directory.display()
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn prefixed_parent_output(trimmed: &str, parent: &Path) -> String {
@@ -358,60 +1097,65 @@ struct OutputWriteRequest<'a> {
     content_size: usize,
     original_content_size: usize,
     image_count: usize,
+    range_selected: bool,
     redaction_mode: RedactionMode,
     redacted_count: usize,
+    overwrite: bool,
 }
 
 /// 写入输出文件
 fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorResponse> {
-    let output_dir = request.output.directory;
-    let content_path = request.output.content;
-    let manifest_path = request.output.manifest;
+    let retention = request.output.temp_output.then(|| TEMP_OUTPUT_RETENTION.to_string());
+    let transaction = OutputTransaction::begin(request.output, request.overwrite)?;
+    let output_dir = transaction.staging_dir();
+    let content_path = transaction.content();
+    let manifest_path = transaction.manifest();
     let safe_ref = request.r#ref.replace(':', "_");
 
-    let was_new = !output_dir.exists();
-    fs::create_dir_all(&output_dir).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建输出目录: {e}"),
-        available: None,
-    })?;
-    if was_new {
-        set_private_permissions(&output_dir, 0o700)?;
-    }
-
-    let mut file = open_private_output_file(&content_path)?;
+    let mut file = open_private_output_file(&transaction.staging_content())?;
     file.write_all(request.content.as_bytes()).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("写入文件失败: {e}"),
         available: None,
     })?;
 
-    // 导出图片（失败时记录 warning，不中断）
+    // 图片和正文必须作为同一个完整导出发布。
     let mut image_paths = Vec::new();
-    let mut image_warnings = Vec::new();
     let images = extract_images(request.record);
     for img in &images {
-        if let Some((ext, data)) = extract_image_data(request.record, img.index) {
-            let img_path = output_dir.join(format!("{}_img{}.{}", safe_ref, img.index, ext));
-            match open_private_output_file(&img_path) {
-                Ok(mut img_file) => {
-                    if let Err(e) = img_file.write_all(&data) {
-                        image_warnings.push(format!("图片 {} 写入失败: {}", img.index, e));
-                    } else {
-                        image_paths.push(img_path);
-                    }
-                }
-                Err(e) => {
-                    image_warnings.push(format!("图片 {} 创建失败: {}", img.index, e.message));
-                }
-            }
-        }
-    }
-    if !image_warnings.is_empty() {
-        eprintln!("[get] 图片导出警告: {}", image_warnings.join("; "));
+        let (ext, data) = extract_image_data(request.record, img.index).ok_or_else(|| ErrorResponse {
+            error: "image_export_failed".to_string(),
+            message: format!("无法解码图片 {}，导出未发布", img.index),
+            available: None,
+        })?;
+        let name = format!("{}_img{}.{}", safe_ref, img.index, ext);
+        let mut img_file = open_private_output_file(&output_dir.join(&name))?;
+        img_file.write_all(&data).map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("图片写入失败: {e}"),
+            available: None,
+        })?;
+        img_file.sync_all().map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("图片同步失败: {e}"),
+            available: None,
+        })?;
+        image_paths.push(transaction.final_dir().join(name));
     }
 
-    let bytes = fs::metadata(&content_path).map(|m| m.len()).unwrap_or(0);
+    file.sync_all().map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("正文同步失败: {e}"),
+        available: None,
+    })?;
+    let bytes = file
+        .metadata()
+        .map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("无法读取正文大小: {e}"),
+            available: None,
+        })?
+        .len();
     let lines = request.content.lines().count();
     let redaction = redaction_info(
         request.redaction_mode,
@@ -419,7 +1163,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         request.redaction_mode == RedactionMode::Off || request.redacted_count > 0,
     );
     let manifest = serde_json::json!({
-        "schema": "mcp-claude-history.get-output.v1",
+        "schema": "mcp-claude-history.get-output.v2",
         "ref": request.r#ref,
         "content_size": request.content_size,
         "original_content_size": request.original_content_size,
@@ -428,17 +1172,26 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         "bytes": bytes,
         "lines": lines,
         "complete": true,
-        "sample_kind": if request.content_size == request.original_content_size { "all" } else { "range" },
+        "sample_kind": if request.range_selected { "range" } else { "all" },
         "redaction": &redaction,
     });
-    let mut manifest_file = open_private_output_file(&manifest_path)?;
-    manifest_file
-        .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
-        .map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("写入 manifest 失败: {e}"),
-            available: None,
-        })?;
+    let mut manifest_file = open_private_output_file(&transaction.staging_manifest())?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| ErrorResponse {
+        error: "serialize_error".to_string(),
+        message: format!("无法序列化 get manifest: {e}"),
+        available: None,
+    })?;
+    manifest_file.write_all(&manifest_bytes).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("写入 manifest 失败: {e}"),
+        available: None,
+    })?;
+    manifest_file.sync_all().map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("manifest 同步失败: {e}"),
+        available: None,
+    })?;
+    transaction.publish()?;
 
     Ok(GetResponse::Output {
         r#ref: request.r#ref.to_string(),
@@ -448,15 +1201,11 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
             images: image_paths,
             bytes,
             lines,
-            schema: "mcp-claude-history.get-output.v1".to_string(),
+            schema: "mcp-claude-history.get-output.v2".to_string(),
             complete: true,
-            sample_kind: if request.content_size == request.original_content_size {
-                "all"
-            } else {
-                "range"
-            }
-            .to_string(),
+            sample_kind: if request.range_selected { "range" } else { "all" }.to_string(),
             redaction,
+            retention,
         },
         content_size: request.content_size,
         original_content_size: request.original_content_size,
@@ -465,6 +1214,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
 }
 
 pub fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
+    validate_output_path(raw_output)?;
     let trimmed = raw_output.trim();
     if trimmed.is_empty() {
         return Err(ErrorResponse {
@@ -502,19 +1252,217 @@ pub fn resolve_output_dir(raw_output: &str) -> Result<PathBuf, ErrorResponse> {
     resolve_relative_output_dir(trimmed, &temp_root, TMP_PATH_PREFIX)
 }
 
-fn controlled_temp_root() -> Result<PathBuf, ErrorResponse> {
-    let root = env::temp_dir().join("claude-tools").join("mcp-claude-history");
-    fs::create_dir_all(&root).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法创建临时目录: {e}"),
+fn validate_output_path(raw: &str) -> Result<(), ErrorResponse> {
+    let invalid = || ErrorResponse {
+        error: "invalid_output_dir".to_string(),
+        message: format!("output 包含不安全的 Windows 路径组件: {raw}"),
         available: None,
-    })?;
-    set_private_permissions(&root, 0o700)?;
-    fs::canonicalize(&root).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("canonicalize 临时目录失败: {e}"),
+    };
+    if raw != raw.trim() {
+        return Err(invalid());
+    }
+    let prefixed = raw.starts_with(TMP_PATH_PREFIX) || raw.starts_with(CWD_PATH_PREFIX);
+    let path = raw
+        .strip_prefix(TMP_PATH_PREFIX)
+        .or_else(|| raw.strip_prefix(CWD_PATH_PREFIX))
+        .unwrap_or(raw);
+    let path = if !prefixed
+        && Path::new(path).is_absolute()
+        && path.len() >= 3
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1] == b':'
+        && matches!(path.as_bytes()[2], b'\\' | b'/')
+    {
+        &path[2..]
+    } else {
+        path
+    };
+    for component in path.split(['/', '\\']).filter(|part| !part.is_empty()) {
+        if component == "." || component == ".." {
+            continue;
+        }
+        if component.ends_with([' ', '.']) || component.chars().any(|c| c <= '\u{1f}' || "<>:\"|?*".contains(c)) {
+            return Err(invalid());
+        }
+        let base = component
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+            || base
+                .strip_prefix("COM")
+                .or_else(|| base.strip_prefix("LPT"))
+                .is_some_and(|digit| {
+                    matches!(
+                        digit,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TempSessionMarker {
+    version: u8,
+    session: String,
+    owner: String,
+}
+
+fn checked_temp_directory(path: &Path) -> Result<fs::Metadata, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("临时目录不是普通目录: {}", path.display()));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!("临时目录不属于当前用户: {}", path.display()));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x400 != 0 {
+        return Err(format!("临时目录是重解析点: {}", path.display()));
+    }
+    Ok(metadata)
+}
+
+fn controlled_temp_root() -> Result<PathBuf, ErrorResponse> {
+    static SESSION_ROOT: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    let path = SESSION_ROOT.get_or_init(|| {
+        let parent = env::temp_dir().join("claude-tools");
+        fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+        checked_temp_directory(&parent)?;
+        let root = parent.join("mcp-claude-history");
+        fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        checked_temp_directory(&root)?;
+        set_private_permissions(&root, 0o700).map_err(|e| e.message)?;
+        schedule_temp_cleanup(&root);
+        let session_name = format!("session-{}", export_nonce());
+        let session = root.join(&session_name);
+        fs::create_dir(&session).map_err(|e| e.to_string())?;
+        let result = (|| {
+            set_private_permissions(&session, 0o700).map_err(|e| e.message)?;
+            let mut file = open_private_output_file(&session.join(".mcp-history-session")).map_err(|e| e.message)?;
+            let marker = TempSessionMarker {
+                version: 2,
+                session: session_name,
+                owner: process_instance().to_string(),
+            };
+            file.write_all(&serde_json::to_vec(&marker).map_err(|e| e.to_string())?)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| e.to_string())?;
+            fs::canonicalize(&session).map_err(|e| e.to_string())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&session);
+        }
+        result
+    });
+    path.clone().map_err(|message| ErrorResponse {
+        error: if cfg!(windows) {
+            "privacy_not_enforced_on_windows"
+        } else {
+            "io_error"
+        }
+        .to_string(),
+        message,
         available: None,
     })
+}
+
+pub(crate) fn cleanup_expired_temp_sessions() {
+    let parent = env::temp_dir().join("claude-tools");
+    let root = parent.join("mcp-claude-history");
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!("[mcp-claude-history] 无法检查受控临时目录 {}: {error}", root.display());
+            return;
+        }
+        Ok(_) => {}
+    }
+    let result = (|| -> Result<(), String> {
+        checked_temp_directory(&parent)?;
+        checked_temp_directory(&root)?;
+        set_private_permissions(&root, 0o700).map_err(|error| error.message)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("[mcp-claude-history] 无法清理受控临时目录 {}: {error}", root.display());
+        return;
+    }
+    schedule_temp_cleanup(&root);
+}
+
+fn schedule_temp_cleanup(root: &Path) {
+    static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let root = root.to_path_buf();
+    if let Err(error) = std::thread::Builder::new()
+        .name("mcp-history-temp-cleanup".to_string())
+        .spawn(move || cleanup_owned_temp_sessions(&root, SystemTime::now()))
+    {
+        eprintln!("[mcp-claude-history] 无法启动受控临时会话清理: {error}");
+        CLEANUP_STARTED.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn cleanup_owned_temp_sessions(root: &Path, now: SystemTime) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("[mcp-claude-history] 无法扫描受控临时目录 {}: {error}", root.display());
+            return;
+        }
+    };
+    for (index, entry) in entries.flatten().enumerate() {
+        if index > 0 && index % 128 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("session-") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = checked_temp_directory(&path) else {
+            continue;
+        };
+        let marker_path = path.join(".mcp-history-session");
+        let Ok(marker_metadata) = fs::symlink_metadata(&marker_path) else {
+            continue;
+        };
+        if !marker_metadata.file_type().is_file() || marker_metadata.len() > 256 {
+            continue;
+        }
+        let Some(marker) = fs::read(&marker_path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<TempSessionMarker>(&data).ok())
+        else {
+            continue;
+        };
+        let Some(pid) = owner_pid(&marker.owner) else { continue };
+        if marker.version != 2 || marker.session != name || !name.starts_with(&format!("session-{pid}-")) {
+            continue;
+        }
+        if now
+            .duration_since(metadata.modified().unwrap_or(now))
+            .unwrap_or_default()
+            <= Duration::from_secs(24 * 60 * 60)
+            || !process_is_gone(pid)
+        {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(&path) {
+            eprintln!("[mcp-claude-history] 无法清理过期临时会话 {}: {error}", path.display());
+        }
+    }
 }
 
 fn resolve_relative_output_dir(relative: &str, root: &Path, prefix: &str) -> Result<PathBuf, ErrorResponse> {
@@ -624,4 +1572,678 @@ fn canonicalize_or_ancestor(path: &Path) -> std::io::Result<PathBuf> {
         std::io::ErrorKind::NotFound,
         format!("无法 canonicalize 路径: {}", path.display()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fixture(record: serde_json::Value) -> (PathBuf, Config, String) {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = env::temp_dir().join(format!("mcp-history-get-test-{}-{nonce}", std::process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "session-history-test";
+        let mut file = File::create(project.join(format!("{session_id}.jsonl"))).unwrap();
+        writeln!(file, "{record}").unwrap();
+        (
+            root.clone(),
+            Config { projects_dir: root },
+            format!("{}:1", ref_prefix(session_id)),
+        )
+    }
+
+    fn finished_pid() -> u32 {
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/C", "exit", "0"]);
+            command
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        pid
+    }
+
+    fn session_with_marker(root: &Path, pid: u32, suffix: usize) -> PathBuf {
+        let name = format!("session-{pid}-123-{suffix}");
+        let directory = root.join(&name);
+        fs::create_dir(&directory).unwrap();
+        let marker = TempSessionMarker {
+            version: 2,
+            session: name,
+            owner: format!("{pid}-123-{suffix}"),
+        };
+        fs::write(
+            directory.join(".mcp-history-session"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        directory
+    }
+
+    fn bundle_paths(root: &Path) -> ResolvedOutputFiles {
+        let directory = root.join("bundle");
+        ResolvedOutputFiles {
+            content: directory.join("content.txt"),
+            manifest: directory.join("manifest.json"),
+            directory,
+            explicit_file: false,
+            temp_output: false,
+        }
+    }
+
+    fn published_bundle(root: &Path) {
+        let output = OutputTransaction::begin(bundle_paths(root), true).unwrap();
+        fs::write(output.staging_content(), "old").unwrap();
+        fs::write(output.staging_manifest(), "old manifest").unwrap();
+        output.publish().unwrap();
+    }
+
+    fn success_content(response: GetResponse) -> String {
+        match response {
+            GetResponse::Success { content, .. } => content,
+            _ => panic!("expected success response"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_parent_symlink_is_rejected() {
+        let root = env::temp_dir().join(format!("mcp-history-temp-parent-test-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        let parent = root.join("claude-tools");
+        std::os::unix::fs::symlink(&root, &parent).unwrap();
+        assert!(checked_temp_directory(&parent).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_only_removes_expired_owned_sessions_with_exited_processes() {
+        let root = env::temp_dir().join(format!("mcp-history-session-cleanup-test-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        let live = session_with_marker(&root, std::process::id(), 1);
+        let finished_pid = finished_pid();
+        let expired = session_with_marker(&root, finished_pid, 2);
+        let previous_version = root.join("session-old");
+        fs::create_dir(&previous_version).unwrap();
+        fs::write(
+            previous_version.join(".mcp-history-session"),
+            b"mcp-claude-history.session.v1\n",
+        )
+        .unwrap();
+        let unrelated = root.join("session-unmarked");
+        fs::create_dir(&unrelated).unwrap();
+
+        cleanup_owned_temp_sessions(&root, SystemTime::now());
+        assert!(expired.exists());
+        cleanup_owned_temp_sessions(&root, SystemTime::now() + Duration::from_secs(25 * 60 * 60));
+        assert!(!expired.exists());
+        assert!(live.exists());
+        assert!(previous_version.exists());
+        assert!(unrelated.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_reaches_expired_session_after_many_unmarked_directories() {
+        let root = env::temp_dir().join(format!("mcp-history-cleanup-scan-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        for index in 0..130 {
+            fs::create_dir(root.join(format!("session-legacy-{index}"))).unwrap();
+        }
+        let expired = session_with_marker(&root, finished_pid(), 7);
+        cleanup_owned_temp_sessions(&root, SystemTime::now() + Duration::from_secs(25 * 60 * 60));
+        assert!(!expired.exists());
+        assert!(root.join("session-legacy-0").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tmp_export_rejects_deep_parent_without_creating_directories() {
+        let session = controlled_temp_root().unwrap();
+        let prefix = format!("quota-parent-{}", export_nonce());
+        let mut parent = session.join(&prefix);
+        for _ in 0..260 {
+            parent.push("dir");
+        }
+        let directory = parent.join("bundle");
+        let error = OutputTransaction::begin(
+            ResolvedOutputFiles {
+                content: directory.join("content.txt"),
+                manifest: directory.join("manifest.json"),
+                directory,
+                explicit_file: false,
+                temp_output: true,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "invalid_arguments");
+        assert!(!session.join(prefix).exists());
+    }
+
+    #[test]
+    fn get_requires_output_for_overwrite_before_resolving_ref() {
+        let error = get(
+            &Config {
+                projects_dir: env::temp_dir(),
+            },
+            GetParams {
+                r#ref: "invalid".to_string(),
+                range: None,
+                output: None,
+                project: None,
+                redaction: RedactionMode::Auto,
+                overwrite: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "invalid_arguments");
+    }
+
+    #[test]
+    fn invalid_image_fails_without_publishing_an_export() {
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "image-fixture", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not-base64!"}}]}
+        }));
+        let error = get(
+            &config,
+            GetParams {
+                r#ref: reference,
+                range: None,
+                output: Some(format!("tmp:image-failure-{}", export_nonce())),
+                project: Some("project".to_string()),
+                redaction: RedactionMode::Auto,
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "image_export_failed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn range_redaction_never_exposes_a_partial_secret() {
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "user-1",
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": "password=fixture_secret"}
+        }));
+
+        for range in [(9, 23), (11, 23), (9, 20)] {
+            let response = get(
+                &config,
+                GetParams {
+                    r#ref: reference.clone(),
+                    range: Some(range),
+                    output: None,
+                    project: Some("project".to_string()),
+                    redaction: RedactionMode::Auto,
+                    overwrite: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(success_content(response), "[redacted]");
+        }
+
+        let output_name = format!(
+            "tmp:mcp-history-get-range-output-{}-{}/message.txt",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let response = get(
+            &config,
+            GetParams {
+                r#ref: reference.clone(),
+                range: Some((11, 20)),
+                output: Some(output_name),
+                project: Some("project".to_string()),
+                redaction: RedactionMode::Strict,
+                overwrite: false,
+            },
+        )
+        .unwrap();
+        let GetResponse::Output { output, .. } = response else {
+            panic!("expected output response");
+        };
+        assert_eq!(fs::read_to_string(&output.content).unwrap(), "[redacted]");
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&output.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["sample_kind"], "range");
+        assert_eq!(manifest["redaction"]["redacted_count"], 1);
+
+        fs::remove_dir_all(output.content.parent().unwrap()).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn full_range_export_reports_range_sample_kind_consistently() {
+        let content = "visible content";
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "user-full-range",
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": content}
+        }));
+        let output_name = format!(
+            "tmp:mcp-history-get-full-range-output-{}-{}/message.txt",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let response = get(
+            &config,
+            GetParams {
+                r#ref: reference,
+                range: Some((0, content.chars().count())),
+                output: Some(output_name),
+                project: Some("project".to_string()),
+                redaction: RedactionMode::Auto,
+                overwrite: false,
+            },
+        )
+        .unwrap();
+        let GetResponse::Output { output, .. } = response else {
+            panic!("expected output response");
+        };
+        assert_eq!(output.sample_kind, "range");
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&output.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["sample_kind"], "range");
+
+        fs::remove_dir_all(output.content.parent().unwrap()).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn get_redacts_json_embedded_in_serialized_tool_input() {
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "assistant-escaped-json",
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "call-escaped-json",
+                "name": "Bash",
+                "input": {"command": r#"Output: {"password":"fixture_secret"}"#}
+            }]}
+        }));
+
+        let redacted = success_content(
+            get(
+                &config,
+                GetParams {
+                    r#ref: reference.clone(),
+                    range: None,
+                    output: None,
+                    project: Some("project".to_string()),
+                    redaction: RedactionMode::Auto,
+                    overwrite: false,
+                },
+            )
+            .unwrap(),
+        );
+        assert!(!redacted.contains("fixture_secret"));
+        assert!(redacted.contains("[redacted]"));
+
+        let raw = success_content(
+            get(
+                &config,
+                GetParams {
+                    r#ref: reference,
+                    range: None,
+                    output: None,
+                    project: Some("project".to_string()),
+                    redaction: RedactionMode::Off,
+                    overwrite: false,
+                },
+            )
+            .unwrap(),
+        );
+        assert!(raw.contains("fixture_secret"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn get_preserves_complete_tool_input_and_honors_redaction_mode() {
+        let command = format!("{} FAR_NEEDLE password=fixture_secret", "x".repeat(300));
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "assistant-1",
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "Bash",
+                "input": {"command": command}
+            }]}
+        }));
+
+        let raw = success_content(
+            get(
+                &config,
+                GetParams {
+                    r#ref: reference.clone(),
+                    range: None,
+                    output: None,
+                    project: Some("project".to_string()),
+                    redaction: RedactionMode::Off,
+                    overwrite: false,
+                },
+            )
+            .unwrap(),
+        );
+        assert!(raw.contains("FAR_NEEDLE"));
+        assert!(raw.contains("fixture_secret"));
+        assert!(raw.chars().count() > 300);
+
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            let content = success_content(
+                get(
+                    &config,
+                    GetParams {
+                        r#ref: reference.clone(),
+                        range: None,
+                        output: None,
+                        project: Some("project".to_string()),
+                        redaction: mode,
+                        overwrite: false,
+                    },
+                )
+                .unwrap(),
+            );
+            assert!(content.contains("FAR_NEEDLE"));
+            assert!(!content.contains("fixture_secret"));
+            assert!(content.contains("password=[redacted]"));
+        }
+
+        let output_name = format!(
+            "tmp:mcp-history-get-raw-output-{}-{}/message.txt",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let response = get(
+            &config,
+            GetParams {
+                r#ref: reference,
+                range: None,
+                output: Some(output_name),
+                project: Some("project".to_string()),
+                redaction: RedactionMode::Off,
+                overwrite: false,
+            },
+        )
+        .unwrap();
+        let GetResponse::Output { output, .. } = response else {
+            panic!("expected output response");
+        };
+        assert_eq!(fs::read_to_string(&output.content).unwrap(), raw);
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&output.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["sample_kind"], "all");
+        assert_eq!(manifest["redaction"]["mode"], "off");
+
+        fs::remove_dir_all(output.content.parent().unwrap()).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_windows_special_paths_before_resolving_output() {
+        for name in [
+            "tmp:report.txt:payload",
+            "tmp:C:secret",
+            "tmp:CON",
+            "tmp:COM¹.txt",
+            "tmp:CONOUT$.txt",
+            "cwd:folder/LPT1.txt",
+            "tmp:folder/aux.json",
+            "tmp:folder. ",
+            "tmp:folder.",
+            "tmp:file<name>.txt",
+            "tmp:foo|bar",
+            "tmp:foo\u{1f}bar",
+            "tmp:foo?bar",
+            "tmp:foo*bar",
+            "tmp:foo\"bar",
+        ] {
+            assert_eq!(
+                resolve_output_files(name, "result.txt", "manifest.json")
+                    .unwrap_err()
+                    .error,
+                "invalid_output_dir",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_overwrite_restores_old_bundle_before_replacing_it() {
+        let root = env::temp_dir().join(format!("mcp-history-recover-old-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let target = root.join("bundle");
+        let backup = root.join(format!(".mcp-history-backup-{}", export_nonce()));
+        let journal = create_publish_journal(&target, &backup, &export_nonce()).unwrap();
+        fs::rename(&target, &backup).unwrap();
+
+        let replacement = OutputTransaction::begin(bundle_paths(&root), true).unwrap();
+        assert_eq!(fs::read_to_string(replacement.content()).unwrap(), "old");
+        assert!(!backup.exists());
+        assert!(!journal.exists());
+        fs::write(replacement.staging_content(), "new").unwrap();
+        fs::write(replacement.staging_manifest(), "new manifest").unwrap();
+        replacement.publish().unwrap();
+        assert_eq!(fs::read_to_string(target.join("content.txt")).unwrap(), "new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_overwrite_cleans_only_a_confirmed_published_bundle() {
+        let root = env::temp_dir().join(format!("mcp-history-recover-new-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let target = root.join("bundle");
+        let backup = root.join(format!(".mcp-history-backup-{}", export_nonce()));
+        let token = export_nonce();
+        let journal = create_publish_journal(&target, &backup, &token).unwrap();
+        fs::rename(&target, &backup).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join(".mcp-history-bundle"), b"mcp-claude-history.bundle.v1\n").unwrap();
+        fs::write(target.join(".mcp-history-publish-token"), &token).unwrap();
+        fs::write(target.join("content.txt"), "new").unwrap();
+
+        let replacement = OutputTransaction::begin(bundle_paths(&root), true).unwrap();
+        assert_eq!(fs::read_to_string(replacement.content()).unwrap(), "new");
+        assert!(!backup.exists());
+        assert!(!journal.exists());
+        drop(replacement);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_overwrite_preserves_unrecognized_output_and_backup() {
+        let root = env::temp_dir().join(format!("mcp-history-recover-conflict-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let target = root.join("bundle");
+        let backup = root.join(format!(".mcp-history-backup-{}", export_nonce()));
+        let journal = create_publish_journal(&target, &backup, &export_nonce()).unwrap();
+        fs::rename(&target, &backup).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join(".mcp-history-bundle"), b"mcp-claude-history.bundle.v1\n").unwrap();
+        fs::write(target.join("content.txt"), "unrelated").unwrap();
+
+        let error = OutputTransaction::begin(bundle_paths(&root), true).unwrap_err();
+        assert_eq!(error.error, "output_restore_failed");
+        assert_eq!(fs::read_to_string(backup.join("content.txt")).unwrap(), "old");
+        assert_eq!(fs::read_to_string(target.join("content.txt")).unwrap(), "unrelated");
+        assert!(journal.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_journal_from_another_process_is_not_recovered() {
+        let root = env::temp_dir().join(format!("mcp-history-recover-busy-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let target = root.join("bundle");
+        let backup = root.join(format!(".mcp-history-backup-{}", export_nonce()));
+        let journal = create_publish_journal(&target, &backup, &export_nonce()).unwrap();
+        let mut data: PublishJournal = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        let finished_pid = finished_pid();
+        data.owner = format!("{finished_pid}-123-0");
+        fs::write(&journal, serde_json::to_vec(&data).unwrap()).unwrap();
+        let error = OutputTransaction::begin(bundle_paths(&root), true).unwrap_err();
+        assert_eq!(error.error, "output_busy");
+        assert_eq!(fs::read_to_string(target.join("content.txt")).unwrap(), "old");
+        let file = OpenOptions::new().write(true).open(&journal).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - std::time::Duration::from_secs(31)))
+            .unwrap();
+        drop(file);
+        let replacement = OutputTransaction::begin(bundle_paths(&root), true).unwrap();
+        assert!(!journal.exists());
+        drop(replacement);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn aged_journal_from_a_running_process_is_not_recovered() {
+        let root = env::temp_dir().join(format!("mcp-history-recover-live-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let target = root.join("bundle");
+        let backup = root.join(format!(".mcp-history-backup-{}", export_nonce()));
+        let journal = create_publish_journal(&target, &backup, &export_nonce()).unwrap();
+        let mut data: PublishJournal = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        data.owner = format!("{}-123-0", std::process::id());
+        fs::write(&journal, serde_json::to_vec(&data).unwrap()).unwrap();
+        let file = OpenOptions::new().write(true).open(&journal).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(31)))
+            .unwrap();
+        drop(file);
+        let error = OutputTransaction::begin(bundle_paths(&root), true).unwrap_err();
+        assert_eq!(error.error, "output_busy");
+        assert_eq!(fs::read_to_string(target.join("content.txt")).unwrap(), "old");
+        assert!(journal.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_locked_output_refuses_overwrite_and_keeps_old_bundle() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = env::temp_dir().join(format!("mcp-history-locked-output-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let target = root.join("bundle");
+        let replacement = OutputTransaction::begin(bundle_paths(&root), true).unwrap();
+        fs::write(replacement.staging_content(), "new").unwrap();
+        fs::write(replacement.staging_manifest(), "new manifest").unwrap();
+
+        let exclusive = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS: open a directory handle
+            .open(&target)
+            .unwrap();
+        let failure = replacement.publish().unwrap_err();
+        assert!(
+            matches!(failure.error.as_str(), "io_error" | "output_exists"),
+            "{failure:?}"
+        );
+        drop(exclusive);
+        assert_eq!(fs::read_to_string(target.join("content.txt")).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(target.join("manifest.json")).unwrap(),
+            "old manifest"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_bundle_publishes_together_and_requires_explicit_overwrite() {
+        let root = env::temp_dir().join(format!(
+            "mcp-history-transaction-test-{}-{}",
+            std::process::id(),
+            export_nonce()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = || ResolvedOutputFiles {
+            directory: root.join("bundle"),
+            content: root.join("bundle").join("content.txt"),
+            manifest: root.join("bundle").join("manifest.json"),
+            explicit_file: false,
+            temp_output: false,
+        };
+        let missing = OutputTransaction::begin(paths(), true).unwrap();
+        fs::write(missing.staging_content(), "new").unwrap();
+        assert!(missing.publish().is_err());
+        assert!(!root.join("bundle").exists());
+
+        let first = OutputTransaction::begin(paths(), true).unwrap();
+        fs::write(first.staging_content(), "old").unwrap();
+        fs::write(first.staging_manifest(), "old manifest").unwrap();
+        first.publish().unwrap();
+        assert_eq!(fs::read_to_string(root.join("bundle/content.txt")).unwrap(), "old");
+
+        let other = OutputTransaction::begin(paths(), false).unwrap();
+        fs::write(other.staging_content(), "new").unwrap();
+        fs::write(other.staging_manifest(), "new manifest").unwrap();
+        other.publish().unwrap();
+        assert_eq!(fs::read_to_string(root.join("bundle/content.txt")).unwrap(), "old");
+
+        let overwrite = OutputTransaction::begin(paths(), true).unwrap();
+        fs::write(overwrite.staging_content(), "new").unwrap();
+        fs::write(overwrite.staging_manifest(), "new manifest").unwrap();
+        overwrite.publish().unwrap();
+        assert_eq!(fs::read_to_string(root.join("bundle/content.txt")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(root.join("bundle/manifest.json")).unwrap(),
+            "new manifest"
+        );
+        let explicit = || ResolvedOutputFiles {
+            directory: root.clone(),
+            content: root.join("message.txt"),
+            manifest: root.join("message_manifest.json"),
+            explicit_file: true,
+            temp_output: false,
+        };
+        let first = OutputTransaction::begin(explicit(), false).unwrap();
+        let first_path = first.content();
+        fs::write(first.staging_content(), "first").unwrap();
+        fs::write(first.staging_manifest(), "first manifest").unwrap();
+        first.publish().unwrap();
+        let second = OutputTransaction::begin(explicit(), false).unwrap();
+        let second_path = second.content();
+        fs::write(second.staging_content(), "second").unwrap();
+        fs::write(second.staging_manifest(), "second manifest").unwrap();
+        second.publish().unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second_path).unwrap(), "second");
+
+        let directory = first_path.parent().unwrap().to_path_buf();
+        let replacement = OutputTransaction::begin(
+            ResolvedOutputFiles {
+                directory: directory.clone(),
+                content: first_path.clone(),
+                manifest: directory.join("message_manifest.json"),
+                explicit_file: true,
+                temp_output: false,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(replacement.final_dir(), directory);
+        fs::write(replacement.staging_content(), "updated").unwrap();
+        fs::write(replacement.staging_manifest(), "updated manifest").unwrap();
+        replacement.publish().unwrap();
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), "updated");
+        assert_eq!(fs::read_to_string(&second_path).unwrap(), "second");
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

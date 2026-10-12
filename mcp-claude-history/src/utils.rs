@@ -1,11 +1,86 @@
 use crate::types::{ErrorResponse, ImageInfo, MessageRecord, Range, RedactionInfo, ToolInfo};
 use regex::{Regex, RegexBuilder};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::OnceLock;
+
+pub const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+pub enum BoundedLine {
+    Record(String),
+    TooLarge,
+}
+
+pub struct BoundedJsonlLines<R> {
+    reader: R,
+    finished: bool,
+}
+
+pub fn bounded_jsonl_lines<R: BufRead>(reader: R) -> BoundedJsonlLines<R> {
+    BoundedJsonlLines {
+        reader,
+        finished: false,
+    }
+}
+
+impl<R: BufRead> Iterator for BoundedJsonlLines<R> {
+    type Item = io::Result<BoundedLine>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        let mut oversized = false;
+        let mut read_any = false;
+        loop {
+            let available = match self.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            };
+            if available.is_empty() {
+                self.finished = true;
+                if !read_any {
+                    return None;
+                }
+                break;
+            }
+            read_any = true;
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |i| i + 1);
+            if !oversized && bytes.len().saturating_add(consumed) > MAX_JSONL_LINE_BYTES {
+                oversized = true;
+                bytes.clear();
+            }
+            if !oversized {
+                bytes.extend_from_slice(&available[..consumed]);
+            }
+            let finished_line = available[consumed - 1] == b'\n';
+            self.reader.consume(consumed);
+            if finished_line {
+                break;
+            }
+        }
+        if oversized {
+            Some(Ok(BoundedLine::TooLarge))
+        } else {
+            Some(
+                String::from_utf8(bytes)
+                    .map(BoundedLine::Record)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            )
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RedactionMode {
@@ -69,7 +144,77 @@ pub fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorRespon
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn set_private_permissions(path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
+    // Pass the path as an environment variable; it must never be interpreted as PowerShell code.
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$p = $env:MCP_HISTORY_PRIVATE_PATH
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$item = Get-Item -LiteralPath $p -Force
+if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'private path is a reparse point' }
+$acl = Get-Acl -LiteralPath $p
+if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'private path owner mismatch' }
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
+$inherit = if (Test-Path -LiteralPath $p -PathType Container) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', $inherit, 'None', 'Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $p -AclObject $acl
+$actual = Get-Acl -LiteralPath $p
+$entries = @($actual.Access)
+if (-not $actual.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].IsInherited -or
+    $entries[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or
+    $entries[0].AccessControlType -ne 'Allow' -or
+    ($entries[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
+    throw 'private DACL verification failed'
+}
+"#;
+    let result = (|| -> io::Result<std::process::Output> {
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("MCP_HISTORY_PRIVATE_PATH", path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output(),
+                Ok(None) if started.elapsed() < std::time::Duration::from_secs(10) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let termination = child.kill();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("Windows DACL 验证超过 10 秒；终止进程结果: {termination:?}"),
+                    ));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    return Err(error);
+                }
+            }
+        }
+    })();
+    if result.as_ref().is_ok_and(|output| output.status.success()) {
+        return Ok(());
+    }
+    Err(ErrorResponse {
+        error: "privacy_not_enforced_on_windows".to_string(),
+        message: format!(
+            "无法设置并验证私有 DACL: {}",
+            result.map_or_else(
+                |e| e.to_string(),
+                |out| String::from_utf8_lossy(&out.stderr).into_owned()
+            )
+        ),
+        available: None,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
     Ok(())
 }
@@ -354,6 +499,339 @@ pub fn build_content_filter(
     })
 }
 
+pub const MAX_SESSION_WINDOW: usize = 2_000;
+pub const MAX_SESSION_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_TOOL_BLOCKS: usize = 2048;
+pub const MAX_TOOL_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
+pub fn tool_block_count(record: &MessageRecord) -> usize {
+    record
+        .message
+        .as_ref()
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |blocks| {
+            blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block.get("type").and_then(serde_json::Value::as_str),
+                        Some("tool_use" | "tool_result")
+                    )
+                })
+                .count()
+        })
+}
+
+pub struct IndexedMessage {
+    pub line_num: usize,
+    pub effective_type: &'static str,
+    pub subtype: &'static str,
+    pub matches_pattern: bool,
+}
+
+pub enum SessionRange<'a> {
+    Counts { before: usize, after: Option<usize> },
+    UntilType { effective_type: &'a str, backward: bool },
+    UntilRef { line: usize },
+}
+
+pub struct SessionIndex {
+    pub messages: Vec<IndexedMessage>,
+    pub anchor_idx: usize,
+    pub warnings: Vec<String>,
+    pub incomplete_reasons: Vec<String>,
+}
+
+pub struct WindowRecord {
+    pub line_num: usize,
+    pub record: MessageRecord,
+    pub effective_type: &'static str,
+    pub subtype: &'static str,
+    pub content: String,
+    pub redacted_count: usize,
+}
+
+pub fn index_session_messages(
+    path: &Path,
+    anchor_line: usize,
+    filter: &ContentFilter,
+    redaction: RedactionMode,
+    types: &[String],
+    subtypes: &[String],
+    range: SessionRange<'_>,
+) -> Result<SessionIndex, ErrorResponse> {
+    let file = File::open(path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法读取会话文件: {e}"),
+        available: None,
+    })?;
+    let window_limit = || ErrorResponse {
+        error: "session_window_limit".to_string(),
+        message: format!("上下文范围超过 {MAX_SESSION_WINDOW} 条，使用 before/after 或 until_ref 缩小范围"),
+        available: None,
+    };
+    let missing_until = || ErrorResponse {
+        error: "ref_not_found".to_string(),
+        message: "until_ref 行不存在或无法读取".to_string(),
+        available: None,
+    };
+    let matches = |message: &IndexedMessage| {
+        message_type_matches(message.effective_type, types)
+            && message_subtype_matches(message.subtype, subtypes)
+            && message.matches_pattern
+    };
+    let mut messages = VecDeque::new();
+    let mut message_pos = 0;
+    let mut anchor_pos = None;
+    let mut boundary_pos = None;
+    let mut evicted_match = false;
+    let mut start = 0;
+    let mut end = 0;
+    let mut after_matches = 0;
+    let mut read_errors = 0;
+    let mut parse_errors = 0;
+    let mut oversized = 0;
+    for (line_idx, line) in bounded_jsonl_lines(BufReader::new(file)).enumerate() {
+        let line_num = line_idx + 1;
+        if line_num > anchor_line && anchor_pos.is_none() {
+            break;
+        }
+        if let SessionRange::UntilRef { line } = range
+            && line_num > line.max(anchor_line)
+        {
+            break;
+        }
+        let line = match line {
+            Ok(BoundedLine::Record(line)) => line,
+            Ok(BoundedLine::TooLarge) => {
+                oversized += 1;
+                continue;
+            }
+            Err(_) => {
+                read_errors += 1;
+                continue;
+            }
+        };
+        let record = match parse_message_record(&line) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        let pos = message_pos;
+        message_pos += 1;
+        let (effective_type, subtype) = classify_message(&record);
+        let item = IndexedMessage {
+            line_num,
+            effective_type,
+            subtype,
+            matches_pattern: !filter.has_filter()
+                || filter.matches(&redact_text_with_mode(&replace_images_with_placeholders(&record), redaction).text),
+        };
+        let matched = matches(&item);
+        if let SessionRange::UntilRef { line } = range
+            && line_num == line
+        {
+            boundary_pos = Some(pos);
+        }
+        if line_num < anchor_line {
+            if let SessionRange::UntilType {
+                effective_type,
+                backward: true,
+            } = range
+                && item.effective_type == effective_type
+            {
+                boundary_pos = Some(pos);
+            }
+            if messages.len() == MAX_SESSION_WINDOW {
+                evicted_match |= messages.pop_front().as_ref().is_some_and(&matches);
+            }
+            messages.push_back(item);
+            continue;
+        }
+        if line_num == anchor_line {
+            anchor_pos = Some(pos);
+            start = match range {
+                SessionRange::Counts { before, .. } => {
+                    let mut selected = pos;
+                    let mut count = 0;
+                    if before > 0 {
+                        for (offset, message) in messages.iter().enumerate().rev() {
+                            if matches(message) {
+                                count += 1;
+                                selected = pos - messages.len() + offset;
+                                if count == before {
+                                    break;
+                                }
+                            }
+                        }
+                        if count < before && evicted_match {
+                            return Err(window_limit());
+                        }
+                    }
+                    selected
+                }
+                SessionRange::UntilType { backward: true, .. } => boundary_pos.unwrap_or(pos),
+                SessionRange::UntilRef { line } if line < anchor_line => boundary_pos.ok_or_else(&missing_until)?,
+                _ => pos,
+            };
+            end = pos + 1;
+            if end - start > MAX_SESSION_WINDOW {
+                return Err(window_limit());
+            }
+            messages.drain(..start - (pos - messages.len()));
+            messages.push_back(item);
+            if matches!(
+                range,
+                SessionRange::Counts { after: Some(0), .. } | SessionRange::UntilType { backward: true, .. }
+            ) || matches!(range, SessionRange::UntilRef { line } if line <= anchor_line)
+            {
+                break;
+            }
+            continue;
+        }
+        if messages.len() < MAX_SESSION_WINDOW {
+            messages.push_back(item);
+        }
+        let finished = match range {
+            SessionRange::Counts { after: Some(after), .. } => {
+                if matched {
+                    after_matches += 1;
+                    end = pos + 1;
+                }
+                after_matches == after
+            }
+            SessionRange::Counts { after: None, .. } => {
+                end = pos + 1;
+                false
+            }
+            SessionRange::UntilType {
+                effective_type: until_type,
+                ..
+            } => {
+                if effective_type == until_type {
+                    end = pos + 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            SessionRange::UntilRef { line } => {
+                if line_num == line {
+                    end = pos + 1;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if end - start > MAX_SESSION_WINDOW {
+            return Err(window_limit());
+        }
+        if finished {
+            break;
+        }
+    }
+    let anchor_pos = anchor_pos.ok_or_else(|| ErrorResponse {
+        error: "ref_not_found".to_string(),
+        message: format!("ref 行不存在或超出 {MAX_JSONL_LINE_BYTES} 字节限制: {anchor_line}"),
+        available: None,
+    })?;
+    if matches!(range, SessionRange::UntilRef { .. }) && boundary_pos.is_none() {
+        return Err(missing_until());
+    }
+    messages.truncate(end - start);
+    let mut warnings = jsonl_read_warnings(read_errors, parse_errors);
+    let mut incomplete_reasons = Vec::new();
+    if read_errors > 0 {
+        incomplete_reasons.push(format!("read_errors={read_errors}"));
+    }
+    if parse_errors > 0 {
+        incomplete_reasons.push(format!("parse_errors={parse_errors}"));
+    }
+    if oversized > 0 {
+        warnings.push(format!("oversized_jsonl_lines={oversized}"));
+        incomplete_reasons.push(format!("oversized_jsonl_lines={oversized}"));
+    }
+    Ok(SessionIndex {
+        messages: messages.into(),
+        anchor_idx: anchor_pos - start,
+        warnings,
+        incomplete_reasons,
+    })
+}
+
+pub fn load_session_window(
+    path: &Path,
+    selected: &[IndexedMessage],
+    redaction: RedactionMode,
+) -> Result<Vec<WindowRecord>, ErrorResponse> {
+    if selected.len() > MAX_SESSION_WINDOW {
+        return Err(ErrorResponse {
+            error: "session_window_limit".to_string(),
+            message: format!("上下文范围超过 {MAX_SESSION_WINDOW} 条，使用 before/after 或 until_ref 缩小范围"),
+            available: None,
+        });
+    }
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法读取会话文件: {e}"),
+        available: None,
+    })?;
+    let mut records = Vec::new();
+    let mut bytes = 0usize;
+    let mut selected_idx = 0usize;
+    for (line_idx, line) in bounded_jsonl_lines(BufReader::new(file)).enumerate() {
+        let line_num = line_idx + 1;
+        if line_num < selected[selected_idx].line_num {
+            continue;
+        }
+        let Ok(BoundedLine::Record(line)) = line else {
+            return Err(invalid_arguments("会话在读取过程中变化，无法读取完整上下文"));
+        };
+        bytes = bytes.saturating_add(line.len());
+        if bytes > MAX_SESSION_WINDOW_BYTES {
+            return Err(ErrorResponse {
+                error: "session_window_memory_limit".to_string(),
+                message: format!("选定范围超过 {MAX_SESSION_WINDOW_BYTES} 字节，使用较小的范围"),
+                available: None,
+            });
+        }
+        let record = parse_message_record(&line)
+            .ok()
+            .flatten()
+            .ok_or_else(|| invalid_arguments("会话在读取过程中变化"))?;
+        let (effective_type, subtype) = classify_message(&record);
+        let expected = &selected[selected_idx];
+        if effective_type != expected.effective_type || subtype != expected.subtype {
+            return Err(invalid_arguments("会话在读取过程中变化"));
+        }
+        let rendered = redact_text_with_mode(&replace_images_with_placeholders(&record), redaction);
+        records.push(WindowRecord {
+            line_num,
+            record,
+            effective_type,
+            subtype,
+            content: rendered.text,
+            redacted_count: rendered.count,
+        });
+        selected_idx += 1;
+        if selected_idx == selected.len() {
+            break;
+        }
+    }
+    if selected_idx != selected.len() {
+        return Err(invalid_arguments("会话在读取过程中变化，范围不完整"));
+    }
+    Ok(records)
+}
+
 pub fn write_filtered_message_export<'a, W, I>(
     writer: &mut W,
     prefix: &str,
@@ -548,67 +1026,13 @@ fn extract_tool_result_texts(item: &serde_json::Value) -> Vec<String> {
     texts
 }
 
-/// 将内容中的图片替换为占位符
+/// 将内容中的图片替换为占位符，保留完整工具输入
 pub fn replace_images_with_placeholders(record: &MessageRecord) -> String {
-    replace_images_with_placeholders_with_mode(record, RedactionMode::Auto)
+    extract_and_replace_images(record).0
 }
 
-pub fn replace_images_with_placeholders_with_mode(record: &MessageRecord, mode: RedactionMode) -> String {
-    let Some(message) = &record.message else {
-        return String::new();
-    };
-
-    let Some(content) = message.get("content") else {
-        return String::new();
-    };
-
-    if let Some(s) = content.as_str() {
-        return s.to_string();
-    }
-
-    let Some(arr) = content.as_array() else {
-        return String::new();
-    };
-
-    let mut result = Vec::new();
-    for (idx, item) in arr.iter().enumerate() {
-        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match item_type {
-            "image" => {
-                if let Some(source) = item.get("source") {
-                    let size = source
-                        .get("data")
-                        .and_then(|d| d.as_str())
-                        .map(|d| d.len())
-                        .unwrap_or(0);
-                    let size_mb = size as f64 / 1024.0 / 1024.0;
-                    result.push(format!("[IMAGE:{idx} size={size_mb:.1}MB]"));
-                }
-            }
-            "tool_use" => {
-                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                let input_preview = item
-                    .get("input")
-                    .map(|i| value_preview(i, 200, mode))
-                    .unwrap_or_default();
-                result.push(format!("[TOOL_USE:{name}({input_preview})]"));
-            }
-            "tool_result" => {
-                result.extend(extract_tool_result_texts(item));
-            }
-            _ => {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    result.push(text.to_string());
-                }
-            }
-        }
-    }
-
-    result.join("\n")
-}
-
-/// 一次遍历同时提取图片列表和带占位符的文本（避免 search.rs 中的双次遍历）
-pub fn extract_and_replace_images_with_mode(record: &MessageRecord, mode: RedactionMode) -> (String, Vec<ImageInfo>) {
+/// 一次遍历同时提取图片列表和带占位符的完整文本
+pub fn extract_and_replace_images(record: &MessageRecord) -> (String, Vec<ImageInfo>) {
     let Some(message) = &record.message else {
         return (String::new(), Vec::new());
     };
@@ -641,15 +1065,10 @@ pub fn extract_and_replace_images_with_mode(record: &MessageRecord, mode: Redact
             }
             "tool_use" => {
                 let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                let input_preview = item
-                    .get("input")
-                    .map(|i| value_preview(i, 200, mode))
-                    .unwrap_or_default();
-                text_parts.push(format!("[TOOL_USE:{name}({input_preview})]"));
+                let input = item.get("input").map(serde_json::Value::to_string).unwrap_or_default();
+                text_parts.push(format!("[TOOL_USE:{name}({input})]"));
             }
-            "tool_result" => {
-                text_parts.extend(extract_tool_result_texts(item));
-            }
+            "tool_result" => text_parts.extend(extract_tool_result_texts(item)),
             _ => {
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                     text_parts.push(text.to_string());
@@ -667,7 +1086,27 @@ fn nth_byte_or_end(s: &str, n: usize) -> usize {
 }
 
 pub fn parse_time_param(s: &str, name: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    parse_time(s).ok_or_else(|| format!("{name} 必须是 RFC3339 或 YYYY-MM-DD 格式"))
+    if s == "today" {
+        return date_bound(chrono::Utc::now().date_naive(), name);
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return date_bound(date, name);
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|time| time.with_timezone(&chrono::Utc))
+        .map_err(|_| format!("{name} 必须是带时区的 RFC3339、UTC 日期 YYYY-MM-DD 或 today"))
+}
+
+fn date_bound(date: chrono::NaiveDate, name: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let start = date.and_hms_opt(0, 0, 0).expect("midnight is valid");
+    let time = if name == "until" {
+        date.succ_opt()
+            .and_then(|next| next.and_hms_opt(0, 0, 0))
+            .ok_or_else(|| "until 日期超出支持范围".to_string())?
+    } else {
+        start
+    };
+    Ok(chrono::DateTime::from_naive_utc_and_offset(time, chrono::Utc))
 }
 
 pub fn parse_range_param(s: &str) -> Result<(usize, usize), String> {
@@ -690,10 +1129,6 @@ pub struct MessageSlice {
 impl MessageSlice {
     pub fn needs_full_scan(&self) -> bool {
         self.start.is_some_and(|v| v < 0) || self.end.is_none_or(|v| v < 0)
-    }
-
-    pub fn positive_end(&self) -> Option<usize> {
-        self.end.and_then(|v| usize::try_from(v).ok())
     }
 }
 
@@ -792,6 +1227,23 @@ pub fn parse_line_ranges_param(s: &str) -> Result<Vec<Range>, String> {
     Ok(ranges)
 }
 
+pub fn format_line_ranges(ranges: &[Range]) -> String {
+    ranges
+        .iter()
+        .map(|range| {
+            let prefix = if range.exclude { "!" } else { "" };
+            match (range.start, range.end) {
+                (Some(start), Some(end)) if start == end => format!("{prefix}{start}"),
+                (Some(start), Some(end)) => format!("{prefix}{start}-{end}"),
+                (Some(start), None) => format!("{prefix}{start}-"),
+                (None, Some(end)) => format!("{prefix}-{end}"),
+                (None, None) => format!("{prefix}-"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub fn invalid_arguments(message: impl Into<String>) -> ErrorResponse {
     ErrorResponse {
         error: "invalid_arguments".to_string(),
@@ -818,6 +1270,49 @@ pub fn parse_optional_time_param(
     value
         .map(|s| parse_time_param(s, name).map_err(invalid_arguments))
         .transpose()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UntilBound {
+    pub instant: chrono::DateTime<chrono::Utc>,
+    pub exclusive: bool,
+}
+
+impl UntilBound {
+    pub fn query_value(self) -> String {
+        if self.exclusive {
+            self.instant
+                .date_naive()
+                .pred_opt()
+                .expect("exclusive date has a predecessor")
+                .format("%Y-%m-%d")
+                .to_string()
+        } else {
+            self.instant.to_rfc3339()
+        }
+    }
+}
+
+pub fn parse_time_bounds(
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<(Option<chrono::DateTime<chrono::Utc>>, Option<UntilBound>), ErrorResponse> {
+    let today = chrono::Utc::now().date_naive();
+    let parse = |value: Option<&str>, name: &str| {
+        if value == Some("today") {
+            date_bound(today, name).map(Some).map_err(invalid_arguments)
+        } else {
+            parse_optional_time_param(value, name)
+        }
+    };
+    Ok((
+        parse(since, "since")?,
+        parse(until, "until")?.map(|instant| UntilBound {
+            instant,
+            exclusive: until
+                .is_some_and(|value| value == "today" || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()),
+        }),
+    ))
 }
 
 pub fn parse_optional_range_param(value: Option<&str>) -> Result<Option<(usize, usize)>, ErrorResponse> {
@@ -1101,7 +1596,7 @@ pub enum TimeRangeMatch {
 pub fn time_in_range(
     timestamp: &str,
     since: Option<&chrono::DateTime<chrono::Utc>>,
-    until: Option<&chrono::DateTime<chrono::Utc>>,
+    until: Option<&UntilBound>,
 ) -> TimeRangeMatch {
     if since.is_none() && until.is_none() {
         return TimeRangeMatch::Matches;
@@ -1118,7 +1613,7 @@ pub fn time_in_range(
     }
 
     if let Some(until) = until
-        && ts > *until
+        && (ts > until.instant || (until.exclusive && ts == until.instant))
     {
         return TimeRangeMatch::OutsideRange;
     }
@@ -1143,6 +1638,10 @@ pub fn ref_prefix(session_id: &str) -> String {
     // agent 子会话文件名为 "agent-<id>.jsonl"，前缀固定会导致 ref_prefix 冲突率过高
     let normalized = session_id.strip_prefix("agent-").unwrap_or(session_id);
     normalized.chars().take(8).collect()
+}
+
+pub fn session_matches_ref(session_id: &str, requested: &str) -> bool {
+    session_id == requested || ref_prefix(session_id) == requested
 }
 
 /// 解析 "start-end" 格式的范围字符串
@@ -1176,123 +1675,545 @@ pub fn parse_mcp_tool_name(name: &str) -> ToolInfo {
     }
 }
 
-fn value_preview(value: &serde_json::Value, max_chars: usize, mode: RedactionMode) -> String {
-    let redacted = redact_value_with_mode(value, mode).to_string();
-    redacted.chars().take(max_chars).collect()
-}
-
 pub struct TextRedaction {
     pub text: String,
     pub count: usize,
 }
 
+#[derive(Debug)]
+struct RedactionEdit {
+    start: usize,
+    end: usize,
+    replacement: &'static str,
+}
+
 pub fn redact_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
+    redact_text_range_with_mode(text, mode, None)
+}
+
+pub fn redact_text_range_with_mode(text: &str, mode: RedactionMode, range: Option<(usize, usize)>) -> TextRedaction {
+    let char_count = text.chars().count();
+    let (start_char, end_char) = range.unwrap_or((0, char_count));
+    if start_char >= end_char {
+        return TextRedaction {
+            text: String::new(),
+            count: 0,
+        };
+    }
+    let start = nth_byte_or_end(text, start_char.min(char_count));
+    let end = nth_byte_or_end(text, end_char.min(char_count));
     if mode == RedactionMode::Off {
         return TextRedaction {
-            text: text.to_string(),
+            text: text[start..end].to_string(),
             count: 0,
         };
     }
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-        && (value.is_object() || value.is_array())
-    {
-        let (redacted, count) = redact_value_with_count(&value, mode);
-        return TextRedaction {
-            text: redacted.to_string(),
-            count,
-        };
+    let edits = collect_redaction_edits(text, mode);
+    let mut output = String::new();
+    let mut cursor = start;
+    let mut count = 0;
+    for edit in edits {
+        if edit.end <= start || edit.start >= end {
+            continue;
+        }
+        let visible_start = edit.start.max(start);
+        if cursor < visible_start {
+            output.push_str(&text[cursor..visible_start]);
+        }
+        output.push_str(edit.replacement);
+        cursor = cursor.max(edit.end.min(end));
+        count += 1;
     }
-
-    redact_plain_text_with_mode(text, mode)
+    if cursor < end {
+        output.push_str(&text[cursor..end]);
+    }
+    TextRedaction { text: output, count }
 }
 
-fn redact_plain_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
+fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit> {
     static AUTH_HEADER_RE: OnceLock<Regex> = OnceLock::new();
     static COOKIE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
-    static SECRET_FIELD_RE: OnceLock<Regex> = OnceLock::new();
-    static QUERY_SECRET_RE: OnceLock<Regex> = OnceLock::new();
     static PRIVATE_KEY_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     static PRIVATE_HOST_RE: OnceLock<Regex> = OnceLock::new();
     static INTERNAL_URL_RE: OnceLock<Regex> = OnceLock::new();
 
-    if mode == RedactionMode::Off {
-        return TextRedaction {
-            text: text.to_string(),
-            count: 0,
-        };
+    let mut edits = collect_sensitive_field_edits(text, mode);
+    for captures in AUTH_HEADER_RE
+        .get_or_init(|| Regex::new(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+").expect("valid regex"))
+        .captures_iter(text)
+    {
+        let whole = captures.get(0).expect("whole match");
+        let prefix = captures.get(1).expect("authorization prefix");
+        edits.push(RedactionEdit {
+            start: prefix.end(),
+            end: whole.end(),
+            replacement: "[redacted]",
+        });
     }
 
-    let mut count = 0usize;
-    let result = AUTH_HEADER_RE
-        .get_or_init(|| Regex::new(r"(?i)\b(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+").expect("valid regex"))
-        .replace_all(text, |caps: &regex::Captures<'_>| {
-            count += 1;
-            format!("{}[redacted]", &caps[1])
-        });
-    let result = SECRET_FIELD_RE
-        .get_or_init(|| {
-            Regex::new(concat!(
-                r#"(?i)\b((?:password|passwd|pwd|token|cookie|api[_-]?key|secret|"#,
-                r#"private[_-]?key|keypath|key_path)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)"#,
-            ))
-            .expect("valid regex")
-        })
-        .replace_all(&result, |caps: &regex::Captures<'_>| {
-            count += 1;
-            format!("{}[redacted]", &caps[1])
-        });
-    let result = QUERY_SECRET_RE
-        .get_or_init(|| {
-            Regex::new(r"(?i)([?&](?:password|token|api[_-]?key|secret|key)=)[^&\s]+").expect("valid regex")
-        })
-        .replace_all(&result, |caps: &regex::Captures<'_>| {
-            count += 1;
-            format!("{}[redacted]", &caps[1])
-        });
-
-    if mode != RedactionMode::Strict {
-        return TextRedaction {
-            text: result.into_owned(),
-            count,
-        };
-    }
-
-    let result = COOKIE_HEADER_RE
-        .get_or_init(|| Regex::new(r"(?i)\b(cookie\s*[:=]\s*)[^\n\r]+").expect("valid regex"))
-        .replace_all(&result, |caps: &regex::Captures<'_>| {
-            count += 1;
-            format!("{}[redacted]", &caps[1])
-        });
-    let result = PRIVATE_KEY_BLOCK_RE
-        .get_or_init(|| {
-            Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----")
+    if mode == RedactionMode::Strict {
+        for captures in COOKIE_HEADER_RE
+            .get_or_init(|| Regex::new(r"(?i)\b(cookie\s*[:=]\s*)[^\n\r]+").expect("valid regex"))
+            .captures_iter(text)
+        {
+            let whole = captures.get(0).expect("whole match");
+            let prefix = captures.get(1).expect("cookie prefix");
+            edits.push(RedactionEdit {
+                start: prefix.end(),
+                end: whole.end(),
+                replacement: "[redacted]",
+            });
+        }
+        push_matches(
+            &mut edits,
+            text,
+            PRIVATE_KEY_BLOCK_RE.get_or_init(|| {
+                Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----")
+                    .expect("valid regex")
+            }),
+            "[redacted-private-key]",
+        );
+        push_matches(
+            &mut edits,
+            text,
+            PRIVATE_HOST_RE.get_or_init(|| {
+                Regex::new(
+                    r"\b(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})\b",
+                )
                 .expect("valid regex")
-        })
-        .replace_all(&result, |_: &regex::Captures<'_>| {
-            count += 1;
-            "[redacted-private-key]".to_string()
-        });
-    let result = PRIVATE_HOST_RE
-        .get_or_init(|| {
-            Regex::new(
-                r"\b(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})\b",
-            )
-            .expect("valid regex")
-        })
-        .replace_all(&result, |_: &regex::Captures<'_>| {
-            count += 1;
-            "[redacted-host]".to_string()
-        });
-    let text = INTERNAL_URL_RE
-        .get_or_init(|| Regex::new(r#"https?://[^\s"'<>]+"#).expect("valid regex"))
-        .replace_all(&result, |_: &regex::Captures<'_>| {
-            count += 1;
-            "[redacted-url]".to_string()
-        })
-        .into_owned();
+            }),
+            "[redacted-host]",
+        );
+        push_matches(
+            &mut edits,
+            text,
+            INTERNAL_URL_RE.get_or_init(|| Regex::new(r#"https?://[^\s"'<>]+"#).expect("valid regex")),
+            "[redacted-url]",
+        );
+    }
 
-    TextRedaction { text, count }
+    edits.sort_by(|left, right| left.start.cmp(&right.start).then_with(|| right.end.cmp(&left.end)));
+    let mut normalized: Vec<RedactionEdit> = Vec::new();
+    for edit in edits {
+        if let Some(previous) = normalized.last_mut()
+            && edit.start < previous.end
+        {
+            if edit.end > previous.end {
+                previous.end = edit.end;
+            }
+            continue;
+        }
+        normalized.push(edit);
+    }
+    normalized
+}
+
+fn push_matches(edits: &mut Vec<RedactionEdit>, text: &str, regex: &Regex, replacement: &'static str) {
+    edits.extend(regex.find_iter(text).map(|matched| RedactionEdit {
+        start: matched.start(),
+        end: matched.end(),
+        replacement,
+    }));
+}
+
+fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit> {
+    let bytes = text.as_bytes();
+    let mut edits = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let escaped_key = escaped_quoted_token(bytes, cursor);
+        let (key_start, key_end, key, quoted_content_start) =
+            if let Some((end, content_start, content_end)) = escaped_key {
+                (cursor, end, &text[content_start..content_end], Some(content_start))
+            } else {
+                match bytes[cursor] {
+                    b'"' | b'\'' => {
+                        let quote = bytes[cursor];
+                        let Some(end) = quoted_value_end(bytes, cursor, quote) else {
+                            cursor += 1;
+                            continue;
+                        };
+                        (cursor, end, &text[cursor + 1..end - 1], Some(cursor + 1))
+                    }
+                    value if is_key_byte(value) && (cursor == 0 || !is_key_byte(bytes[cursor.saturating_sub(1)])) => {
+                        let mut end = cursor + 1;
+                        while end < bytes.len() && is_key_byte(bytes[end]) {
+                            end += 1;
+                        }
+                        (cursor, end, &text[cursor..end], None)
+                    }
+                    _ => {
+                        cursor += 1;
+                        continue;
+                    }
+                }
+            };
+
+        let mut separator = key_end;
+        while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
+            separator += 1;
+        }
+        if separator >= bytes.len() || !matches!(bytes[separator], b':' | b'=') {
+            cursor = quoted_content_start.unwrap_or(key_end);
+            continue;
+        }
+        let decoded_key = if let Some((_, content_start, _)) = escaped_key {
+            let delimiter_width = content_start - key_start - 1;
+            if (delimiter_width + 1).is_power_of_two() {
+                (0..=(delimiter_width + 1).trailing_zeros())
+                    .try_fold(key.to_string(), |encoded, _| {
+                        serde_json::from_str::<String>(&format!("\"{encoded}\""))
+                    })
+                    .ok()
+            } else {
+                None
+            }
+        } else if bytes[key_start] == b'"' {
+            serde_json::from_str::<String>(&text[key_start..key_end]).ok()
+        } else {
+            None
+        };
+        if !is_sensitive_key(&decoded_key.as_deref().unwrap_or(key).to_ascii_lowercase(), mode) {
+            cursor = key_end.max(cursor + 1);
+            continue;
+        }
+
+        let mut value_start = separator + 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let value_end = if quoted_content_start.is_none() && bytes[separator] == b'=' {
+            let (end, preserve) = code_rhs_span(bytes, value_start);
+            if preserve {
+                // Inspect nested assignments even when the enclosing expression is preserved.
+                cursor = value_start;
+                continue;
+            }
+            end
+        } else {
+            escaped_quoted_token(bytes, value_start)
+                .map(|(end, _, _)| end)
+                .unwrap_or_else(|| json_like_value_end(bytes, value_start))
+        };
+        if value_end > value_start {
+            edits.push(RedactionEdit {
+                start: value_start,
+                end: value_end,
+                replacement: "[redacted]",
+            });
+            cursor = value_end;
+        } else {
+            cursor = key_end.max(key_start + 1);
+        }
+    }
+    edits
+}
+
+fn code_rhs_span(bytes: &[u8], start: usize) -> (usize, bool) {
+    // Frames track delimiters and method-call argument positions, not an AST.
+    let mut frames: Vec<(u8, bool, usize)> = Vec::new();
+    let mut cursor = start;
+    let mut end = start;
+    let mut safe = true;
+    let mut code = false;
+    let mut needs_value = true;
+    let mut property = false;
+    let mut identifier = false;
+    let mut method = false;
+    let mut lambda_params = false;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte.is_ascii_whitespace() {
+            if frames.is_empty() && matches!(byte, b'\n' | b'\r') {
+                break;
+            }
+            cursor += 1;
+            continue;
+        }
+        if frames.is_empty() && !lambda_params {
+            if matches!(byte, b',' | b';' | b')' | b']' | b'}')
+                || (byte == b'&' && !code && !needs_value && cursor == end)
+                || (byte == b'#' && code && !needs_value && cursor > end)
+                || (byte == b'`' && code && !needs_value && cursor == end)
+            {
+                break;
+            }
+            if !needs_value
+                && ((code && cursor == end && matches!(byte, b'"' | b'\'')) || bytes[cursor..].starts_with(b"\\n"))
+            {
+                break;
+            }
+            // Whitespace following a complete expression belongs to surrounding prose.
+            if safe
+                && !needs_value
+                && !property
+                && cursor > end
+                && ((!code && byte.is_ascii_alphabetic()) || byte >= 128)
+            {
+                break;
+            }
+        }
+        let quoted = escaped_quoted_token(bytes, cursor).or_else(|| {
+            if matches!(byte, b'"' | b'\'' | b'`') {
+                quoted_value_end(bytes, cursor, byte).map(|end| (end, cursor + 1, end - 1))
+            } else {
+                None
+            }
+        });
+        if let Some((quoted_end, content_start, content_end)) = quoted {
+            let content = &bytes[content_start..content_end];
+            let field_name = frames.last().is_some_and(|(open, _, args)| *open == b'[' && *args == 0)
+                && content.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                && content.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                && bytes[quoted_end..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b']');
+            let delimiter = frames
+                .last()
+                .is_some_and(|(open, method, args)| *open == b'(' && *method && *args == 0)
+                && !content.is_empty()
+                && content
+                    .iter()
+                    .all(|c| c.is_ascii_punctuation() && !matches!(c, b'\\' | b'"' | b'\''))
+                && split_limit_suffix(bytes, quoted_end);
+            safe &= needs_value && (field_name || delimiter);
+            needs_value = false;
+            identifier = false;
+            method = false;
+            cursor = quoted_end;
+        } else if matches!(byte, b'"' | b'\'' | b'`') {
+            return (bytes.len(), false);
+        } else if byte.is_ascii_alphabetic() || byte == b'_' {
+            let word_start = cursor;
+            cursor += 1;
+            while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_') {
+                cursor += 1;
+            }
+            if &bytes[word_start..cursor] == b"lambda" && needs_value && !property {
+                lambda_params = true;
+                identifier = false;
+                code = true;
+            } else if lambda_params {
+                safe &= !identifier;
+                identifier = true;
+            } else {
+                safe &= needs_value;
+                method = property;
+                property = false;
+                needs_value = false;
+                identifier = true;
+            }
+        } else {
+            match byte {
+                b'0'..=b'9' => {
+                    safe &= needs_value && !property && !lambda_params;
+                    cursor += 1;
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                        cursor += 1;
+                    }
+                    needs_value = false;
+                    identifier = false;
+                    method = false;
+                    end = cursor;
+                    continue;
+                }
+                b'.' => {
+                    safe &= !needs_value && !lambda_params;
+                    code = true;
+                    property = true;
+                    needs_value = true;
+                }
+                b'(' | b'[' | b'{' => {
+                    if frames.len() == 32 {
+                        return (bytes.len(), false);
+                    }
+                    let postfix = !needs_value;
+                    safe &= !property && !lambda_params && byte != b'{' && (byte != b'[' || postfix);
+                    code |= postfix;
+                    frames.push((byte, method && postfix, 0));
+                    lambda_params = false;
+                    needs_value = true;
+                    identifier = false;
+                    method = false;
+                }
+                b')' | b']' | b'}' => {
+                    let opening = match byte {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
+                    };
+                    let Some((open, _, args)) = frames.pop() else {
+                        return (end, false);
+                    };
+                    if open != opening {
+                        return (bytes.len(), false);
+                    }
+                    safe &= !property && !lambda_params && (!needs_value || (open == b'(' && args == 0));
+                    lambda_params = false;
+                    needs_value = false;
+                    identifier = false;
+                    method = false;
+                }
+                b',' if lambda_params => {
+                    identifier = false;
+                }
+                b',' => {
+                    safe &= !needs_value && !property;
+                    if let Some(frame) = frames.last_mut() {
+                        frame.2 += 1;
+                    }
+                    needs_value = true;
+                    identifier = false;
+                    method = false;
+                }
+                b':' if lambda_params => {
+                    lambda_params = false;
+                    needs_value = true;
+                    identifier = false;
+                }
+                b'=' => {
+                    safe &= identifier && frames.last().is_some_and(|frame| frame.0 == b'(');
+                    needs_value = true;
+                    identifier = false;
+                }
+                _ => {
+                    safe = false;
+                    needs_value = true;
+                    identifier = false;
+                }
+            }
+            cursor += 1;
+        }
+        end = cursor;
+    }
+    if !frames.is_empty() {
+        return (bytes.len(), false);
+    }
+    (end, safe && code && !needs_value && !property && !lambda_params)
+}
+
+fn split_limit_suffix(bytes: &[u8], mut cursor: usize) -> bool {
+    // A punctuation delimiter is allowed only in a method's (delimiter, limit)[index] shape.
+    for expected in [b',', b'0', b')', b'['] {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if expected == b'0' {
+            let start = cursor;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+            if cursor == start {
+                return false;
+            }
+        } else if bytes.get(cursor) == Some(&expected) {
+            cursor += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn escaped_quoted_token(bytes: &[u8], start: usize) -> Option<(usize, usize, usize)> {
+    if bytes.get(start) != Some(&b'\\') {
+        return None;
+    }
+
+    let mut opening_quote = start;
+    while bytes.get(opening_quote) == Some(&b'\\') {
+        opening_quote += 1;
+    }
+    let delimiter_width = opening_quote - start;
+    if delimiter_width.is_multiple_of(2) || bytes.get(opening_quote) != Some(&b'"') {
+        return None;
+    }
+
+    let content_start = opening_quote + 1;
+    let mut cursor = content_start;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'\\' {
+            cursor += 1;
+            continue;
+        }
+        let run_start = cursor;
+        while bytes.get(cursor) == Some(&b'\\') {
+            cursor += 1;
+        }
+        if cursor - run_start == delimiter_width && bytes.get(cursor) == Some(&b'"') {
+            return Some((cursor + 1, content_start, run_start));
+        }
+        if bytes.get(cursor) == Some(&b'"') {
+            cursor += 1;
+        }
+    }
+    None
+}
+
+fn is_key_byte(value: u8) -> bool {
+    value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-')
+}
+
+fn quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> Option<usize> {
+    let mut cursor = start + 1;
+    let mut escaped = false;
+    while cursor < bytes.len() {
+        let value = bytes[cursor];
+        if escaped {
+            escaped = false;
+        } else if value == b'\\' {
+            escaped = true;
+        } else if value == quote {
+            return Some(cursor + 1);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn json_like_value_end(bytes: &[u8], start: usize) -> usize {
+    if start >= bytes.len() {
+        return start;
+    }
+    if matches!(bytes[start], b'"' | b'\'') {
+        return quoted_value_end(bytes, start, bytes[start]).unwrap_or(bytes.len());
+    }
+    if matches!(bytes[start], b'{' | b'[') {
+        let mut stack = vec![bytes[start]];
+        let mut cursor = start + 1;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                quote @ (b'"' | b'\'') => {
+                    cursor = quoted_value_end(bytes, cursor, quote).unwrap_or(bytes.len());
+                    continue;
+                }
+                b'{' | b'[' => stack.push(bytes[cursor]),
+                b'}' if stack.last() == Some(&b'{') => {
+                    stack.pop();
+                    if stack.is_empty() {
+                        return cursor + 1;
+                    }
+                }
+                b']' if stack.last() == Some(&b'[') => {
+                    stack.pop();
+                    if stack.is_empty() {
+                        return cursor + 1;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        return bytes.len();
+    }
+
+    let mut cursor = start;
+    while cursor < bytes.len()
+        && !bytes[cursor].is_ascii_whitespace()
+        && !matches!(bytes[cursor], b',' | b';' | b'&' | b'}' | b']' | b'"' | b'\'')
+    {
+        cursor += 1;
+    }
+    cursor
 }
 
 pub fn redaction_info(mode: RedactionMode, redacted_count: usize, raw_available: bool) -> RedactionInfo {
@@ -1310,6 +2231,7 @@ fn redaction_rules(mode: RedactionMode) -> Vec<String> {
         RedactionMode::Off => Vec::new(),
         RedactionMode::Auto => vec![
             "password".to_string(),
+            "secret".to_string(),
             "token".to_string(),
             "cookie".to_string(),
             "authorization".to_string(),
@@ -1319,6 +2241,7 @@ fn redaction_rules(mode: RedactionMode) -> Vec<String> {
         ],
         RedactionMode::Strict => vec![
             "password".to_string(),
+            "secret".to_string(),
             "token".to_string(),
             "cookie".to_string(),
             "authorization".to_string(),
@@ -1329,10 +2252,6 @@ fn redaction_rules(mode: RedactionMode) -> Vec<String> {
             "url".to_string(),
         ],
     }
-}
-
-fn redact_value_with_mode(value: &serde_json::Value, mode: RedactionMode) -> serde_json::Value {
-    redact_value_with_count(value, mode).0
 }
 
 fn redact_value_with_count(value: &serde_json::Value, mode: RedactionMode) -> (serde_json::Value, usize) {
@@ -1379,6 +2298,9 @@ fn redact_value_with_count(value: &serde_json::Value, mode: RedactionMode) -> (s
 
 fn is_sensitive_key(lower_key: &str, mode: RedactionMode) -> bool {
     lower_key.contains("password")
+        || lower_key.contains("passwd")
+        || lower_key == "pwd"
+        || lower_key.contains("secret")
         || lower_key.contains("token")
         || lower_key.contains("cookie")
         || lower_key.contains("authorization")
@@ -1392,15 +2314,6 @@ fn is_sensitive_key(lower_key: &str, mode: RedactionMode) -> bool {
                 || lower_key.contains("url")
                 || lower_key.contains("endpoint")
                 || lower_key.contains("domain")))
-}
-
-pub struct StructuredToolData {
-    pub input: Option<serde_json::Value>,
-    pub result: Option<serde_json::Value>,
-    pub result_is_error: Option<bool>,
-    pub result_has_error_payload: Option<bool>,
-    pub raw_available: bool,
-    pub redacted: bool,
 }
 
 fn json_payload_has_error(value: &serde_json::Value) -> bool {
@@ -1449,90 +2362,263 @@ fn tool_result_has_error_payload(item: &serde_json::Value) -> bool {
     })
 }
 
-pub fn extract_structured_tool_data_with_mode(
-    record: &MessageRecord,
-    mode: RedactionMode,
-    detect_error_payload: bool,
-) -> StructuredToolData {
-    let Some(message) = &record.message else {
-        return StructuredToolData {
-            input: None,
-            result: None,
-            result_is_error: None,
-            result_has_error_payload: None,
-            raw_available: false,
-            redacted: false,
-        };
-    };
-    let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
-        return StructuredToolData {
-            input: None,
-            result: None,
-            result_is_error: None,
-            result_has_error_payload: None,
-            raw_available: false,
-            redacted: false,
-        };
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolBlockKind {
+    Use,
+    Result,
+}
 
-    let mut input = None;
-    let mut result = None;
-    let mut result_is_error = None;
-    let mut result_has_error_payload = None;
-    for item in content {
-        match item.get("type").and_then(|t| t.as_str()) {
-            Some("tool_use") => {
-                if let Some(raw_input) = item.get("input") {
-                    input = Some(redact_value_with_mode(raw_input, mode));
-                }
-            }
-            Some("tool_result") => {
-                result = Some(redact_value_with_mode(item, mode));
-                result_is_error = item.get("is_error").and_then(|v| v.as_bool());
-                if detect_error_payload {
-                    result_has_error_payload =
-                        Some(result_has_error_payload.unwrap_or(false) || tool_result_has_error_payload(item));
-                }
-            }
-            _ => {}
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct AssociatedToolBlock {
+    pub kind: ToolBlockKind,
+    pub call_key: Option<usize>,
+    pub info: ToolInfo,
+    pub input: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub result_is_error: Option<bool>,
+    pub result_has_error_payload: Option<bool>,
+    pub metadata_incomplete_reason: Option<String>,
+    pub match_method: Option<&'static str>,
+    pub association_issue: Option<&'static str>,
+    pub pending_count: usize,
+    pub tool_use_id: Option<String>,
+}
 
+pub struct RenderedToolBlock {
+    pub input: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub raw_available: bool,
+    pub redacted: bool,
+    pub redacted_count: usize,
+}
+
+pub fn render_tool_block(block: &AssociatedToolBlock, mode: RedactionMode) -> RenderedToolBlock {
+    let (input, input_count) = block.input.as_ref().map_or((None, 0), |input| {
+        let (value, count) = redact_value_with_count(input, mode);
+        (Some(value), count)
+    });
+    let (result, result_count) = block.result.as_ref().map_or((None, 0), |result| {
+        let (value, count) = redact_value_with_count(result, mode);
+        (Some(value), count)
+    });
     let raw_available = input.is_some() || result.is_some();
-    StructuredToolData {
+    RenderedToolBlock {
         input,
         result,
-        result_is_error,
-        result_has_error_payload,
         raw_available,
         redacted: mode.enabled() && raw_available,
+        redacted_count: input_count.saturating_add(result_count),
     }
 }
 
-pub fn extract_tool_info(record: &MessageRecord) -> ToolInfo {
-    let Some(message) = &record.message else {
-        return ToolInfo {
-            server: None,
-            tool: None,
-        };
-    };
-    let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
-        return ToolInfo {
-            server: None,
-            tool: None,
-        };
-    };
+#[derive(Debug)]
+struct PendingToolUse {
+    key: usize,
+    id: Option<String>,
+    assistant_uuid: String,
+    info: ToolInfo,
+}
 
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-            continue;
-        }
-        let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
-            continue;
-        };
-        return parse_mcp_tool_name(name);
+impl PendingToolUse {
+    fn stored_bytes(&self) -> usize {
+        self.id.as_ref().map_or(0, String::len)
+            + self.assistant_uuid.len()
+            + self.info.server.as_ref().map_or(0, String::len)
+            + self.info.tool.as_ref().map_or(0, String::len)
+    }
+}
+
+#[derive(Default)]
+pub struct ToolAssociationTracker {
+    pending: Vec<PendingToolUse>,
+    pending_bytes: usize,
+    next_key: usize,
+}
+
+impl ToolAssociationTracker {
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    pub fn observe_record(&mut self, record: &MessageRecord, detect_error_payload: bool) -> Vec<AssociatedToolBlock> {
+        let Some(content) = record
+            .message
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Vec::new();
+        };
+
+        let mut blocks = Vec::new();
+        for item in content {
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_use") => blocks.push(self.observe_use(record, item)),
+                Some("tool_result") => blocks.push(self.observe_result(record, item, detect_error_payload)),
+                _ => {}
+            }
+        }
+        blocks
+    }
+
+    fn observe_use(&mut self, record: &MessageRecord, item: &serde_json::Value) -> AssociatedToolBlock {
+        let info = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(parse_mcp_tool_name)
+            .unwrap_or_else(empty_tool_info);
+        let id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        let input = item.get("input").cloned();
+        let key = self.next_key;
+        self.next_key = self.next_key.saturating_add(1);
+        let pending = PendingToolUse {
+            key,
+            id: id.clone(),
+            assistant_uuid: record.uuid.clone(),
+            info: info.clone(),
+        };
+        self.pending_bytes = self.pending_bytes.saturating_add(pending.stored_bytes());
+        self.pending.push(pending);
+        AssociatedToolBlock {
+            kind: ToolBlockKind::Use,
+            call_key: Some(key),
+            info,
+            input,
+            result: None,
+            result_is_error: None,
+            result_has_error_payload: None,
+            metadata_incomplete_reason: None,
+            match_method: None,
+            association_issue: None,
+            pending_count: self.pending.len(),
+            tool_use_id: id,
+        }
+    }
+
+    fn observe_result(
+        &mut self,
+        record: &MessageRecord,
+        item: &serde_json::Value,
+        detect_error_payload: bool,
+    ) -> AssociatedToolBlock {
+        let id = item
+            .get("tool_use_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        let association = self.associate_result(record, id.as_deref());
+        AssociatedToolBlock {
+            kind: ToolBlockKind::Result,
+            call_key: association.call_key,
+            info: association.info,
+            input: None,
+            result: Some(item.clone()),
+            result_is_error: item.get("is_error").and_then(serde_json::Value::as_bool),
+            result_has_error_payload: detect_error_payload.then(|| tool_result_has_error_payload(item)),
+            metadata_incomplete_reason: association.metadata_incomplete_reason,
+            match_method: association.match_method,
+            association_issue: association.issue,
+            pending_count: self.pending.len(),
+            tool_use_id: id,
+        }
+    }
+
+    fn associate_result(&mut self, record: &MessageRecord, result_id: Option<&str>) -> ToolAssociationMatch {
+        if let Some(result_id) = result_id {
+            return self
+                .pending
+                .iter()
+                .position(|pending| pending.id.as_deref() == Some(result_id))
+                .map_or_else(
+                    || ToolAssociationMatch::unmatched("unknown_id"),
+                    |position| self.take_pending(position, "tool_use_id"),
+                );
+        }
+
+        let mut saw_ambiguous_parent = false;
+        for parent in [
+            record.source_tool_assistant_uuid.as_deref(),
+            record.parent_uuid.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let matches = self
+                .pending
+                .iter()
+                .enumerate()
+                .filter(|(_, pending)| pending.assistant_uuid == parent)
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                return self.take_pending(matches[0], "parent");
+            }
+            saw_ambiguous_parent |= matches.len() > 1;
+        }
+
+        if self.pending.len() == 1 {
+            return self.take_pending(0, "legacy_single_pending");
+        }
+        if self.pending.len() > 1 {
+            return ToolAssociationMatch::ambiguous(if saw_ambiguous_parent {
+                "ambiguous_parent"
+            } else {
+                "missing_id"
+            });
+        }
+        ToolAssociationMatch::unmatched("missing_id")
+    }
+
+    fn take_pending(&mut self, position: usize, match_method: &'static str) -> ToolAssociationMatch {
+        let pending = self.pending.remove(position);
+        self.pending_bytes = self.pending_bytes.saturating_sub(pending.stored_bytes());
+        ToolAssociationMatch {
+            call_key: Some(pending.key),
+            info: pending.info,
+            metadata_incomplete_reason: None,
+            match_method: Some(match_method),
+            issue: None,
+        }
+    }
+}
+
+struct ToolAssociationMatch {
+    call_key: Option<usize>,
+    info: ToolInfo,
+    metadata_incomplete_reason: Option<String>,
+    match_method: Option<&'static str>,
+    issue: Option<&'static str>,
+}
+
+impl ToolAssociationMatch {
+    fn unmatched(reason: &str) -> Self {
+        Self {
+            call_key: None,
+            info: empty_tool_info(),
+            metadata_incomplete_reason: Some(reason.to_string()),
+            match_method: None,
+            issue: Some("unmatched"),
+        }
+    }
+
+    fn ambiguous(reason: &str) -> Self {
+        Self {
+            call_key: None,
+            info: empty_tool_info(),
+            metadata_incomplete_reason: Some(reason.to_string()),
+            match_method: None,
+            issue: Some("ambiguous"),
+        }
+    }
+}
+
+fn empty_tool_info() -> ToolInfo {
     ToolInfo {
         server: None,
         tool: None,
@@ -1558,6 +2644,302 @@ pub fn project_id_to_display_path(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window_fixture(name: &str, lines: impl IntoIterator<Item = String>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("mcp-history-window-{name}-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let mut file = io::BufWriter::new(File::create(&path).unwrap());
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn session_window_counts_preserve_sparse_spans_and_evicted_matches() {
+        let path = window_fixture(
+            "counts",
+            (1..=5005).map(|line| {
+                serde_json::json!({
+                    "uuid": format!("message-{line}"), "timestamp": "2026-01-01T00:00:00Z",
+                    "type": if [1, 3000, 3002, 5003].contains(&line) { "user" } else { "assistant" },
+                    "message": {"content": "marker password=fixture_secret"}
+                })
+                .to_string()
+            }),
+        );
+        let filter = build_content_filter(&Some("marker".to_string()), false, true).unwrap();
+        for (anchor, before, after, expected) in [
+            (3003, 1, Some(0), Some((3002, 3003))),
+            (3003, 2, Some(0), Some((3000, 3003))),
+            (3003, 3, Some(0), None),
+            (3002, 2, Some(0), None),
+            (3003, 0, Some(1), None),
+            (3004, 0, Some(1), Some((3004, 5003))),
+            (3003, 0, Some(0), Some((3003, 3003))),
+            (5004, 1, Some(1), Some((5003, 5004))),
+            (5004, 2, Some(0), None),
+            (4999, 0, Some(usize::MAX), Some((4999, 5003))),
+            (2, usize::MAX, Some(0), Some((1, 2))),
+            (3006, 0, None, Some((3006, 5005))),
+            (3005, 0, None, None),
+        ] {
+            let result = index_session_messages(
+                &path,
+                anchor,
+                &filter,
+                RedactionMode::Auto,
+                &["user".to_string()],
+                &["human".to_string()],
+                SessionRange::Counts { before, after },
+            );
+            match expected {
+                Some((start, end)) => {
+                    let index = result.unwrap();
+                    assert_eq!(
+                        index.messages.iter().map(|item| item.line_num).collect::<Vec<_>>(),
+                        (start..=end).collect::<Vec<_>>()
+                    );
+                    assert_eq!(index.anchor_idx, anchor - start);
+                    assert!(index.messages.len() <= MAX_SESSION_WINDOW);
+                }
+                None => assert_eq!(result.err().unwrap().error, "session_window_limit"),
+            }
+        }
+        let secret = build_content_filter(&Some("fixture_secret".to_string()), false, true).unwrap();
+        let index = index_session_messages(
+            &path,
+            3003,
+            &secret,
+            RedactionMode::Auto,
+            &[],
+            &[],
+            SessionRange::Counts {
+                before: usize::MAX,
+                after: Some(usize::MAX),
+            },
+        )
+        .unwrap();
+        assert_eq!(index.messages.len(), 1);
+        assert_eq!(index.messages[0].line_num, 3003);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_window_boundaries_ignore_display_filters_and_distinguish_missing_refs() {
+        let path = window_fixture(
+            "boundaries",
+            (1..=5005).map(|line| {
+                serde_json::json!({
+                    "uuid": format!("message-{line}"), "timestamp": "2026-01-01T00:00:00Z",
+                    "type": if [1, 3000, 3002, 5003].contains(&line) { "user" } else { "assistant" },
+                    "message": {"content": "fixture"}
+                })
+                .to_string()
+            }),
+        );
+        let filter = build_content_filter(&Some("absent".to_string()), false, true).unwrap();
+        for (anchor, backward, expected) in [
+            (1, true, Some((1, 1))),
+            (3000, true, None),
+            (3002, true, Some((3000, 3002))),
+            (3003, true, Some((3002, 3003))),
+            (3000, false, Some((3000, 3002))),
+            (3003, false, None),
+            (3004, false, Some((3004, 5003))),
+            (5003, false, Some((5003, 5003))),
+        ] {
+            let result = index_session_messages(
+                &path,
+                anchor,
+                &filter,
+                RedactionMode::Auto,
+                &["assistant".to_string()],
+                &[],
+                SessionRange::UntilType {
+                    effective_type: "user",
+                    backward,
+                },
+            );
+            match expected {
+                Some((start, end)) => {
+                    let index = result.unwrap();
+                    assert_eq!(index.messages.len(), end - start + 1);
+                    assert_eq!(index.messages[0].line_num, start);
+                    assert_eq!(index.messages.last().unwrap().line_num, end);
+                    assert_eq!(index.anchor_idx, anchor - start);
+                }
+                None => assert_eq!(result.err().unwrap().error, "session_window_limit"),
+            }
+        }
+        for backward in [false, true] {
+            let index = index_session_messages(
+                &path,
+                3000,
+                &filter,
+                RedactionMode::Auto,
+                &[],
+                &[],
+                SessionRange::UntilType {
+                    effective_type: "system",
+                    backward,
+                },
+            )
+            .unwrap();
+            assert_eq!(index.messages.len(), 1);
+            assert_eq!(index.messages[0].line_num, 3000);
+        }
+        for (anchor, line, expected_error) in [
+            (3000, 3000, None),
+            (3000, 4999, None),
+            (4999, 3000, None),
+            (3000, 5000, Some("session_window_limit")),
+            (5000, 3000, Some("session_window_limit")),
+            (1, 6000, Some("ref_not_found")),
+            (6000, 1, Some("ref_not_found")),
+        ] {
+            let result = index_session_messages(
+                &path,
+                anchor,
+                &filter,
+                RedactionMode::Auto,
+                &[],
+                &[],
+                SessionRange::UntilRef { line },
+            );
+            if let Some(error) = expected_error {
+                assert_eq!(result.err().unwrap().error, error);
+            } else {
+                let index = result.unwrap();
+                assert_eq!(index.messages.len(), anchor.abs_diff(line) + 1);
+                assert_eq!(index.anchor_idx, anchor - anchor.min(line));
+            }
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_window_diagnostics_cover_only_scanned_lines_and_detect_changed_records() {
+        let record = serde_json::json!({"uuid": "message", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": "fixture"}})
+        .to_string();
+        let path = window_fixture(
+            "diagnostics",
+            ["{".to_string(), "x".repeat(MAX_JSONL_LINE_BYTES + 1)]
+                .into_iter()
+                .chain(std::iter::repeat_n(record.clone(), MAX_SESSION_WINDOW + 5))
+                .chain(["{".to_string(), "x".repeat(MAX_JSONL_LINE_BYTES + 1)]),
+        );
+        let filter = build_content_filter(&None, false, false).unwrap();
+        let anchor = MAX_SESSION_WINDOW + 7;
+        let index = index_session_messages(
+            &path,
+            anchor,
+            &filter,
+            RedactionMode::Auto,
+            &[],
+            &[],
+            SessionRange::Counts {
+                before: 0,
+                after: Some(0),
+            },
+        )
+        .unwrap();
+        assert_eq!(index.messages.len(), 1);
+        assert_eq!(index.incomplete_reasons, ["parse_errors=1", "oversized_jsonl_lines=1"]);
+        assert_eq!(
+            load_session_window(&path, &index.messages, RedactionMode::Auto)
+                .unwrap()
+                .len(),
+            1
+        );
+        let full = index_session_messages(
+            &path,
+            anchor,
+            &filter,
+            RedactionMode::Auto,
+            &[],
+            &[],
+            SessionRange::Counts { before: 0, after: None },
+        )
+        .unwrap();
+        assert_eq!(full.incomplete_reasons, ["parse_errors=2", "oversized_jsonl_lines=2"]);
+        for line in [1, 2, anchor + 1, anchor + 2] {
+            let error = index_session_messages(
+                &path,
+                anchor,
+                &filter,
+                RedactionMode::Auto,
+                &[],
+                &[],
+                SessionRange::UntilRef { line },
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.error, "ref_not_found");
+        }
+        for replacement in [
+            "".to_string(),
+            "{".to_string(),
+            record.replace("\"user\"", "\"assistant\""),
+        ] {
+            let mut lines = std::iter::repeat_n(record.clone(), anchor - 1).collect::<Vec<_>>();
+            lines.push(replacement);
+            fs::write(&path, lines.join("\n")).unwrap();
+            assert_eq!(
+                load_session_window(&path, &index.messages, RedactionMode::Auto)
+                    .err()
+                    .unwrap()
+                    .error,
+                "invalid_arguments"
+            );
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_window_body_budget_accepts_exact_limit_and_rejects_one_extra_byte() {
+        let base = serde_json::json!({"uuid": "message", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": ""}})
+        .to_string();
+        let line_bytes = MAX_SESSION_WINDOW_BYTES / 8;
+        let record = base.replace(
+            "\"content\":\"\"",
+            &format!("\"content\":\"{}\"", "x".repeat(line_bytes - base.len() - 1)),
+        );
+        assert_eq!(record.len() + 1, line_bytes);
+        let path = window_fixture("bytes", std::iter::repeat_n(record.clone(), 8));
+        let filter = build_content_filter(&None, false, false).unwrap();
+        let index = index_session_messages(
+            &path,
+            1,
+            &filter,
+            RedactionMode::Off,
+            &[],
+            &[],
+            SessionRange::UntilRef { line: 8 },
+        )
+        .unwrap();
+        assert_eq!(
+            load_session_window(&path, &index.messages, RedactionMode::Off)
+                .unwrap()
+                .len(),
+            8
+        );
+        let mut content = fs::read_to_string(&path).unwrap();
+        content.insert(content.len() - 1, ' ');
+        fs::write(&path, content).unwrap();
+        assert_eq!(
+            load_session_window(&path, &index.messages, RedactionMode::Off)
+                .err()
+                .unwrap()
+                .error,
+            "session_window_memory_limit"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn centered_truncation_includes_ellipsis_within_the_limit() {
@@ -1638,5 +3020,412 @@ mod tests {
             time_in_range("not-a-time", Some(&since), None),
             TimeRangeMatch::UnparseableTimestamp
         );
+    }
+
+    #[test]
+    fn utc_date_until_includes_full_day_and_today_uses_utc_calendar() {
+        let (_, until) = parse_time_bounds(None, Some("2026-01-02")).unwrap();
+        let until = until.unwrap();
+        assert!(until.exclusive);
+        assert_eq!(until.query_value(), "2026-01-02");
+        assert_eq!(
+            time_in_range("2026-01-02T23:59:59.999999999Z", None, Some(&until)),
+            TimeRangeMatch::Matches
+        );
+        assert_eq!(
+            time_in_range("2026-01-03T00:00:00Z", None, Some(&until)),
+            TimeRangeMatch::OutsideRange
+        );
+        let since = parse_optional_time_param(Some("2026-01-02"), "since").unwrap().unwrap();
+        assert_eq!(
+            time_in_range("2026-01-01T23:59:59-01:00", Some(&since), None),
+            TimeRangeMatch::Matches
+        );
+        let before = chrono::Utc::now().date_naive();
+        let (since, until) = parse_time_bounds(Some("today"), Some("today")).unwrap();
+        let after = chrono::Utc::now().date_naive();
+        let date = since.unwrap().date_naive();
+        assert!(date == before || date == after);
+        assert_eq!(date.succ_opt(), Some(until.unwrap().instant.date_naive()));
+        let (_, leap_day) = parse_time_bounds(None, Some("2016-12-31")).unwrap();
+        assert_eq!(
+            time_in_range("2016-12-31T23:59:60Z", None, leap_day.as_ref()),
+            TimeRangeMatch::Matches
+        );
+        let (_, exact_midnight) = parse_time_bounds(None, Some("2017-01-01T00:00:00Z")).unwrap();
+        assert_eq!(
+            time_in_range("2017-01-01T00:00:00Z", None, exact_midnight.as_ref()),
+            TimeRangeMatch::Matches
+        );
+        assert!(parse_time_param("2026-01-01T00:00:00", "since").is_err());
+    }
+
+    #[test]
+    fn bounded_jsonl_lines_reports_persistent_read_error_once() {
+        struct BrokenReader;
+        impl io::Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("read failed"))
+            }
+        }
+        impl BufRead for BrokenReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                Err(io::Error::other("read failed"))
+            }
+            fn consume(&mut self, _: usize) {}
+        }
+        let mut lines = bounded_jsonl_lines(BrokenReader);
+        assert!(lines.next().unwrap().is_err());
+        assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn bounded_jsonl_lines_discard_large_line_and_resume_on_next_line() {
+        let text = format!("{}\n{{\"ok\":true}}\n", "x".repeat(MAX_JSONL_LINE_BYTES + 2));
+        let mut lines = bounded_jsonl_lines(BufReader::new(text.as_bytes()));
+        assert!(matches!(lines.next().unwrap().unwrap(), BoundedLine::TooLarge));
+        assert!(matches!(lines.next().unwrap().unwrap(), BoundedLine::Record(line) if line == "{\"ok\":true}\n"));
+        assert!(lines.next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_output_requires_verified_dacl() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mcp-history-acl-test-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        set_private_permissions(&root, 0o700).unwrap();
+        let path = root.join("private.txt");
+        let mut file = open_private_output_file(&path).unwrap();
+        file.write_all(b"fixture").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"fixture");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_acl_is_applied_and_verified_on_directory_and_file() {
+        let root = std::env::temp_dir().join(format!("mcp-history-acl-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        set_private_permissions(&root, 0o700).unwrap();
+        let file_path = root.join("private file.txt");
+        let mut file = open_private_output_file(&file_path).unwrap();
+        file.write_all(b"fixture").unwrap();
+        set_private_permissions(&file_path, 0o600).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_acl_removes_explicit_everyone_access() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mcp-history-acl-negative-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        set_private_permissions(&root, 0o700).unwrap();
+        let path = root.join("empty fixture.txt");
+        fs::write(&path, b"").unwrap();
+        set_private_permissions(&path, 0o600).unwrap();
+
+        let inject = r#"
+$ErrorActionPreference = 'Stop'
+$acl = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
+$everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($everyone, 'ReadData', 'Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH -AclObject $acl
+$actual = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
+if (@($actual.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $everyone.Value }).Count -ne 1) { throw 'Everyone rule was not applied' }
+"#;
+        let injected = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", inject])
+            .env("MCP_HISTORY_PRIVATE_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            injected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&injected.stderr)
+        );
+
+        set_private_permissions(&path, 0o600).unwrap();
+        let verify = r#"
+$ErrorActionPreference = 'Stop'
+$acl = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
+$owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$entries = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].IdentityReference.Value -ne $owner) { throw 'ACL still grants another identity access' }
+"#;
+        let verified = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", verify])
+            .env("MCP_HISTORY_PRIVATE_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert_eq!(
+            set_private_permissions(&root.join("missing.txt"), 0o600)
+                .unwrap_err()
+                .error,
+            "privacy_not_enforced_on_windows"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn range_redaction_uses_full_text_context_and_raw_unicode_offsets() {
+        let text = "前缀 password=fixture_secret 后缀";
+        let secret_start = text.find("fixture_secret").unwrap();
+        let secret_start = text[..secret_start].chars().count();
+        let secret_end = secret_start + "fixture_secret".chars().count();
+
+        for range in [
+            (secret_start, secret_end),
+            (secret_start + 2, secret_end),
+            (secret_start, secret_end - 2),
+        ] {
+            let redaction = redact_text_range_with_mode(text, RedactionMode::Auto, Some(range));
+            assert_eq!(redaction.text, "[redacted]");
+            assert_eq!(redaction.count, 1);
+        }
+
+        let with_prefix = redact_text_range_with_mode(
+            text,
+            RedactionMode::Strict,
+            Some((secret_start.saturating_sub(1), secret_start + 2)),
+        );
+        assert_eq!(with_prefix.text, "=[redacted]");
+        assert!(!with_prefix.text.contains("fi"));
+
+        let raw = redact_text_range_with_mode(text, RedactionMode::Off, Some((0, secret_end)));
+        assert_eq!(raw.text, text.chars().take(secret_end).collect::<String>());
+    }
+
+    #[test]
+    fn code_rhs_preserves_complete_expressions_in_text_and_tool_input() {
+        for code in [
+            "token = text(node, 1)",
+            "sorted(values, key=lambda x: x['durationNs'])",
+            "process_key = path.name.rsplit('.', 1)[0]",
+        ] {
+            for text in [
+                code.to_string(),
+                format!("```python\n{code}\n```"),
+                serde_json::to_string(code).unwrap(),
+                format!("[TOOL_USE:Bash({})]", serde_json::json!({"command": code})),
+                format!("中文前缀 {code} 中文后缀"),
+            ] {
+                for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                    assert_eq!(redact_text_with_mode(&text, mode).text, text);
+                    let (value, count) = redact_value_with_count(&serde_json::json!({"command": text}), mode);
+                    assert_eq!(value["command"], text);
+                    assert_eq!(count, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn code_rhs_redacts_literal_and_unclassified_tails_with_original_ranges() {
+        let secret = "fixture_secret_NOT_A_REAL_CREDENTIAL";
+        let cases = [
+            format!("token=\"{secret}\""),
+            format!("token={secret}"),
+            format!("token=build(\"{secret}\")"),
+            format!("key=lambda x: \"{secret}\""),
+            format!("token=prefix + \"{secret}\""),
+            format!("token=\"prefix\" + \"{secret}\""),
+            format!("token=\"prefix\" \"{secret}\""),
+            format!("token=`{secret}`"),
+            format!("token=prefix#{secret}"),
+            format!("token=read(node) & \"{secret}\""),
+            format!("token=build(password=\"{secret}\")"),
+            format!("token=build({{\"password\":\"{secret}\"}})"),
+            format!("token=build(node, \"{secret}\""),
+            format!("token=\"prefix,{secret}"),
+            format!("token='prefix\n{secret}"),
+            format!("token=`prefix;{secret}"),
+            format!("token={}node, \"{secret}\"{}", "build(".repeat(33), ")".repeat(33)),
+            format!("token=build(node] + \"{secret}\")"),
+            format!("token=build(node) + \"{secret}\""),
+            format!("token=path.name.rsplit(\"{secret}\", 1)[0]"),
+        ];
+        for case in cases {
+            for text in [case.clone(), serde_json::to_string(&case).unwrap()] {
+                let text = format!("中文前缀 {text}");
+                let secret_start = text[..text.find(secret).unwrap()].chars().count();
+                let range = (secret_start + 3, secret_start + 8);
+                for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+                    let redacted = redact_text_with_mode(&text, mode);
+                    assert!(!redacted.text.contains(secret), "{text}: {}", redacted.text);
+                    assert_eq!(redacted.count, 1, "{text}");
+                    assert_eq!(redact_text_range_with_mode(&text, mode, Some(range)).text, "[redacted]");
+                }
+                assert_eq!(redact_text_with_mode(&text, RedactionMode::Off).text, text);
+                assert_eq!(
+                    redact_text_range_with_mode(&text, RedactionMode::Off, Some(range)).text,
+                    text.chars().skip(range.0).take(range.1 - range.0).collect::<String>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn code_rhs_keeps_inner_sensitive_scanning_and_json_policy() {
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            let text = "token=build(password=fixture_secret, value=node.attr)";
+            let redacted = redact_text_with_mode(text, mode).text;
+            assert!(!redacted.contains("fixture_secret"), "{redacted}");
+            assert_eq!(redacted, "token=build(password=[redacted], value=node.attr)");
+            for text in [r#"{"token":"text(node, 1)"}"#, r#"{"token":text(node, 1)}"#] {
+                assert!(redact_text_with_mode(text, mode).text.contains("[redacted]"));
+            }
+            let (redacted, _) = redact_value_with_count(&serde_json::json!({"token": "text(node, 1)"}), mode);
+            assert_eq!(redacted["token"], "[redacted]");
+            let at_limit = format!("token={}node{}", "call(".repeat(32), ")".repeat(32));
+            assert_eq!(redact_text_with_mode(&at_limit, mode).text, at_limit);
+            assert_eq!(
+                redact_text_with_mode("token=build(\".\")", mode).text,
+                "token=[redacted]"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_and_fenced_json_fields_are_redacted() {
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            for text in [
+                r#"Output: {"password":"fixture_secret"}"#,
+                "```json\n{\"password\":\"fixture_secret\"}\n```",
+                r#"result = {'api_key':'fixture_secret'}"#,
+                r#"[TOOL_USE:Bash({"command":"Output: {\"password\":\"fixture_secret\"}"})]"#,
+            ] {
+                let redaction = redact_text_with_mode(text, mode);
+                assert!(!redaction.text.contains("fixture_secret"));
+                assert!(redaction.text.contains("[redacted]"));
+            }
+        }
+
+        let raw = redact_text_with_mode(r#"Output: {"password":"fixture_secret"}"#, RedactionMode::Off);
+        assert_eq!(raw.text, r#"Output: {"password":"fixture_secret"}"#);
+    }
+
+    #[test]
+    fn unicode_escaped_json_keys_preserve_raw_ranges_and_redact_values() {
+        let body = format!(
+            "{{\"pass{}u0077ord\":\"fixture_secret\",\"plain\":\"文字\"}}",
+            char::from(92)
+        );
+        assert!(body.contains(&format!("pass{}u0077ord", char::from(92))));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["password"],
+            "fixture_secret"
+        );
+        let mut embedded = body.clone();
+        for depth in 0..4 {
+            let text = format!("前缀 ```json\n{embedded}\n``` 后缀");
+            let secret_byte = text.find("fixture_secret").unwrap();
+            let secret_start = text[..secret_byte].chars().count();
+            for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+                let redaction = redact_text_with_mode(&text, mode);
+                assert!(
+                    !redaction.text.contains("fixture_secret"),
+                    "depth={depth}: {}",
+                    redaction.text
+                );
+                assert_eq!(redaction.count, 1);
+                assert!(redaction.text.starts_with("前缀 ```json\n"));
+                assert!(redaction.text.ends_with("\n``` 后缀"));
+                for range in [(secret_start, secret_start + 14), (secret_start + 3, secret_start + 8)] {
+                    let partial = redact_text_range_with_mode(&text, mode, Some(range));
+                    assert_eq!(partial.text, "[redacted]");
+                    assert_eq!(partial.count, 1);
+                    assert_eq!(
+                        redact_text_range_with_mode(&text, RedactionMode::Off, Some(range)).text,
+                        text.chars().skip(range.0).take(range.1 - range.0).collect::<String>()
+                    );
+                }
+            }
+            assert_eq!(redact_text_with_mode(&text, RedactionMode::Off).text, text);
+            embedded = serde_json::to_string(&embedded).unwrap();
+        }
+        let nested = format!("{{\"outer\": {body}, \"untouched\": [1, 2]}}");
+        assert_eq!(
+            redact_text_with_mode(&nested, RedactionMode::Auto).text,
+            nested.replace("\"fixture_secret\"", "[redacted]")
+        );
+    }
+
+    #[test]
+    fn literal_backslashes_in_json_keys_are_not_recursively_decoded() {
+        let body = format!("{{\"pass{}u0077ord\":\"fixture_secret\"}}", "\\".repeat(2));
+        let decoded: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(body.contains(r"pass\\u0077ord"));
+        assert_eq!(
+            decoded.as_object().unwrap().keys().next().unwrap(),
+            &format!("pass{}u0077ord", char::from(92))
+        );
+        assert!(decoded.get("password").is_none());
+        let mut embedded = body;
+        for _ in 0..4 {
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let redaction = redact_text_with_mode(&embedded, mode);
+                assert_eq!(redaction.text, embedded);
+                assert_eq!(redaction.count, 0);
+            }
+            embedded = serde_json::to_string(&embedded).unwrap();
+        }
+    }
+
+    #[test]
+    fn json_like_keys_and_tool_result_text_keep_existing_redaction_rules() {
+        let body = format!("{{\"pass{}u0077ord\":\"fixture_secret\"}}", char::from(92));
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            for text in ["{'password':'fixture_secret'}", "password=fixture_secret"] {
+                assert!(!redact_text_with_mode(text, mode).text.contains("fixture_secret"));
+            }
+            let value = serde_json::json!({"content": [{"type": "text", "text": body}]});
+            let (redacted, count) = redact_value_with_count(&value, mode);
+            assert_eq!(count, 1);
+            assert!(!redacted.to_string().contains("fixture_secret"));
+        }
+    }
+
+    #[test]
+    fn canonical_extraction_keeps_complete_tool_input() {
+        let tail = "FAR_NEEDLE";
+        let record: MessageRecord = serde_json::from_value(serde_json::json!({
+            "uuid": "assistant-1",
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "Bash",
+                "input": {"command": format!("{}{}", "x".repeat(300), tail)}
+            }]}
+        }))
+        .unwrap();
+
+        let content = replace_images_with_placeholders(&record);
+        assert!(content.contains(tail));
+        assert!(content.chars().count() > 300);
+    }
+
+    #[test]
+    fn line_ranges_and_agent_refs_have_canonical_forms() {
+        let ranges = parse_line_ranges_param("5-7,!6,10-,-3").unwrap();
+        assert_eq!(format_line_ranges(&ranges), "5-7,!6,10-,-3");
+        assert!(session_matches_ref("agent-12345678abcdef", "12345678"));
+        assert!(session_matches_ref("agent-12345678abcdef", "agent-12345678abcdef"));
+        assert!(!session_matches_ref("agent-12345678abcdef", "agent-12"));
     }
 }

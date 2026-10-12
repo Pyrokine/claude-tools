@@ -137,6 +137,8 @@ pub struct SearchStats {
     pub incomplete: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub incomplete_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attribution_incomplete_reasons: Vec<String>,
     pub coverage: SearchCoverage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<SearchSummary>,
@@ -179,6 +181,7 @@ pub struct EffectiveFilters {
     pub projects: Vec<String>,
     pub all_projects: bool,
     pub sessions: Vec<String>,
+    pub subagents: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +194,9 @@ pub struct EffectiveFilters {
     pub regex: bool,
     pub case_sensitive: bool,
 }
+
+pub const TEMP_OUTPUT_RETENTION: &str =
+    "受控临时会话创建超过 24 小时、所属进程已退出后，后续启动时会清理；长期保留请使用 cwd: 输出";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchOutputInfo {
@@ -208,6 +214,8 @@ pub struct SearchOutputInfo {
     pub redacted_count: usize,
     pub cap_reasons: Vec<String>,
     pub redaction: RedactionInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,6 +278,8 @@ pub struct OutputInfo {
     pub complete: bool,
     pub sample_kind: String,
     pub redaction: RedactionInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<String>,
 }
 
 /// Context 响应
@@ -340,6 +350,8 @@ pub struct TraceToolCall {
     pub result_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,
+    #[serde(skip)]
+    pub redacted_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -408,6 +420,8 @@ pub struct SessionInfo {
     pub topic: Option<String>,
     #[serde(skip_serializing_if = "is_zero")]
     pub topic_redacted_count: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skipped_oversized_lines: usize,
 }
 
 /// 会话列表响应

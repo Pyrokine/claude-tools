@@ -1,9 +1,11 @@
 use crate::config::Config;
-use crate::get::{find_session_file, resolve_output_files};
+use crate::get::{OutputTransaction, find_session_file, resolve_output_files};
+use crate::search::{MAX_CONTENT_LIMIT, MAX_TOTAL_LIMIT, MIN_CONTENT_LIMIT, MIN_TOTAL_LIMIT};
 use crate::types::*;
 use crate::utils::*;
+#[cfg(test)]
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 
 pub struct TraceParams {
     pub r#ref: String,
@@ -28,35 +30,20 @@ pub struct TraceParams {
     pub direction: String,
     // 导出到文件，支持 tmp:/cwd: 前缀
     pub output: Option<String>,
+    pub overwrite: bool,
     pub redaction: RedactionMode,
-}
-
-struct TraceRecord {
-    line_num: usize,
-    record: MessageRecord,
-    effective_type: &'static str,
-    subtype: &'static str,
-    content: String,
-    redacted_count: usize,
-}
-
-struct ToolUseRef {
-    id: Option<String>,
-    assistant_uuid: String,
-    server: Option<String>,
-    tool: Option<String>,
-}
-
-struct ToolResultRef {
-    id: Option<String>,
-    source_tool_assistant_uuid: Option<String>,
-    parent_uuid: Option<String>,
-    preview: String,
-    redacted_count: usize,
 }
 
 pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, ErrorResponse> {
     let mut params = params;
+    if !(MIN_CONTENT_LIMIT..=MAX_CONTENT_LIMIT).contains(&params.max_content)
+        || !(MIN_TOTAL_LIMIT..=MAX_TOTAL_LIMIT).contains(&params.max_total)
+    {
+        return Err(invalid_arguments("max_content 或 max_total 超出支持范围"));
+    }
+    if params.overwrite && params.output.is_none() {
+        return Err(invalid_arguments("overwrite=true 需要 output"));
+    }
     let filters = normalize_message_filters(&params.types, &params.subtypes, None)?;
     let mut parameter_warnings = filters.warnings;
     params.types = filters.types;
@@ -81,152 +68,59 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
 
     let (project_id, session_id, path) =
         find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
-    let file = File::open(&path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法打开文件: {e}"),
-        available: None,
-    })?;
-
-    let reader = BufReader::new(file);
-    let mut records = Vec::new();
-    let mut anchor_idx = None;
-    let mut read_errors = 0usize;
-    let mut parse_errors = 0usize;
-
-    for (line_num, line) in reader.lines().enumerate() {
-        let line_num = line_num + 1;
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => {
-                read_errors += 1;
-                continue;
-            }
-        };
-        let record = match parse_message_record(&line) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-        let (effective_type, subtype) = classify_message(&record);
-        let redaction = redact_text_with_mode(
-            &replace_images_with_placeholders_with_mode(&record, params.redaction),
-            params.redaction,
-        );
-        records.push(TraceRecord {
-            line_num,
-            record,
-            effective_type,
-            subtype,
-            content: redaction.text,
-            redacted_count: redaction.count,
-        });
-        if line_num == parsed_ref.line {
-            anchor_idx = Some(records.len() - 1);
+    let range = if let Some(until_type) = &params.until_type {
+        SessionRange::UntilType {
+            effective_type: until_type,
+            backward: params.direction == "backward",
         }
-    }
-
-    let anchor_idx = anchor_idx.ok_or_else(|| ErrorResponse {
-        error: "ref_not_found".to_string(),
-        message: format!("ref 不存在: {}", params.r#ref),
-        available: None,
-    })?;
-
-    // 确定范围（逻辑与 context 一致）
-    let (start, end) = if let Some(ref until_type) = params.until_type {
-        if params.direction == "backward" {
-            let mut start = anchor_idx;
-            for i in (0..anchor_idx).rev() {
-                if records[i].effective_type == until_type.as_str() {
-                    start = i;
-                    break;
-                }
-            }
-            (start, anchor_idx + 1)
-        } else {
-            let mut end = anchor_idx + 1;
-            for (i, msg) in records.iter().enumerate().skip(anchor_idx + 1) {
-                if msg.effective_type == until_type.as_str() {
-                    end = i + 1;
-                    break;
-                }
-            }
-            (anchor_idx, end)
-        }
-    } else if let Some(ref end_ref_str) = params.until_ref {
+    } else if let Some(end_ref_str) = &params.until_ref {
         let end_parsed = ParsedRef::parse(end_ref_str).ok_or_else(|| ErrorResponse {
             error: "ref_invalid".to_string(),
             message: format!("until_ref 格式无效: {end_ref_str}"),
             available: None,
         })?;
-        if !session_id.starts_with(&end_parsed.session_prefix) {
+        if !session_matches_ref(&session_id, &end_parsed.session_prefix) {
             return Err(ErrorResponse {
                 error: "ref_invalid".to_string(),
                 message: format!("until_ref 不属于当前 session: {end_ref_str}"),
                 available: Some(serde_json::json!({ "session": session_id })),
             });
         }
-        let end_line = end_parsed.line;
-        let end_pos = records
-            .iter()
-            .position(|m| m.line_num == end_line)
-            .ok_or_else(|| ErrorResponse {
-                error: "ref_not_found".to_string(),
-                message: format!("until_ref 不存在: {end_ref_str}"),
-                available: None,
-            })?;
-        if end_pos <= anchor_idx {
-            (end_pos, anchor_idx + 1)
-        } else {
-            (anchor_idx, end_pos + 1)
-        }
+        SessionRange::UntilRef { line: end_parsed.line }
     } else {
-        // before/after 计数模式
-        let mut start = anchor_idx;
-        let before = params.before.unwrap_or(20);
-        if before > 0 {
-            let mut count = 0usize;
-            for i in (0..anchor_idx).rev() {
-                let type_ok = message_type_matches(records[i].effective_type, &params.types)
-                    && message_subtype_matches(records[i].subtype, &params.subtypes);
-                let pat_ok = content_filter.matches(&records[i].content);
-                if type_ok && pat_ok {
-                    count += 1;
-                    start = i;
-                    if count >= before {
-                        break;
-                    }
-                }
-            }
+        SessionRange::Counts {
+            before: params.before.unwrap_or(20),
+            after: Some(params.after.unwrap_or(20)),
         }
-        let mut end = anchor_idx + 1;
-        let after = params.after.unwrap_or(20);
-        if after > 0 {
-            let mut count = 0usize;
-            for (i, msg) in records.iter().enumerate().skip(anchor_idx + 1) {
-                let type_ok = message_type_matches(msg.effective_type, &params.types)
-                    && message_subtype_matches(msg.subtype, &params.subtypes);
-                let pat_ok = content_filter.matches(&msg.content);
-                if type_ok && pat_ok {
-                    count += 1;
-                    end = i + 1;
-                    if count >= after {
-                        break;
-                    }
-                }
-            }
-        }
-        (start, end)
     };
-
+    let index = index_session_messages(
+        &path,
+        parsed_ref.line,
+        &content_filter,
+        params.redaction,
+        &params.types,
+        &params.subtypes,
+        range,
+    )?;
+    let anchor_idx = index.anchor_idx;
+    let indexed = &index.messages;
+    let records = load_session_window(&path, indexed, params.redaction)?;
+    if records
+        .iter()
+        .try_fold(0usize, |count, item| count.checked_add(tool_block_count(&item.record)))
+        .is_none_or(|count| count > MAX_TOOL_BLOCKS)
+    {
+        return Err(ErrorResponse {
+            error: "tool_association_limit".to_string(),
+            message: format!("选定范围内的工具调用超过 {MAX_TOOL_BLOCKS} 条，请缩小范围"),
+            available: None,
+        });
+    }
     let prefix = ref_prefix(&session_id);
     let mut messages = Vec::new();
-    let mut total_chars = 0;
     let mut truncated = false;
 
-    for (idx, item) in records.iter().enumerate().take(end).skip(start) {
+    for (idx, item) in records.iter().enumerate() {
         let is_anchor = idx == anchor_idx;
         if !is_anchor
             && (!message_type_matches(item.effective_type, &params.types)
@@ -234,16 +128,10 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         {
             continue;
         }
-        if !is_anchor && content_filter.has_filter() && !content_filter.matches(&item.content) {
+        if !is_anchor && !indexed[idx].matches_pattern {
             continue;
         }
         let (content, was_truncated) = truncate_content(&item.content, params.max_content);
-        let content_size = content.chars().count();
-        if total_chars + content_size > params.max_total && !messages.is_empty() {
-            truncated = true;
-            break;
-        }
-        total_chars += content_size;
         messages.push(TraceMessage {
             r#ref: format!("{}:{}", prefix, item.line_num),
             r#type: item.effective_type.to_string(),
@@ -257,8 +145,25 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         }
     }
 
-    let (mut tool_calls, association_issues, tool_call_redacted_count) =
-        build_tool_calls(&records[start..end], &prefix, params.redaction);
+    let block_count: usize = records
+        .iter()
+        .map(|item| {
+            item.record
+                .message
+                .as_ref()
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        })
+        .sum();
+    if block_count > 4096 {
+        return Err(ErrorResponse {
+            error: "session_tool_block_limit".to_string(),
+            message: "trace 范围的内容块超过 4096 个，请缩小范围".to_string(),
+            available: None,
+        });
+    }
+    let (mut tool_calls, association_issues) = build_tool_calls(&records, &prefix, params.redaction);
     // servers/tools 过滤
     if !params.servers.is_empty() || !params.tools.is_empty() {
         tool_calls.retain(|tc| {
@@ -278,8 +183,8 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         });
     }
 
-    parameter_warnings.extend(jsonl_read_warnings(read_errors, parse_errors));
-    let response = TraceResponse {
+    parameter_warnings.extend(index.warnings);
+    let mut response = TraceResponse {
         anchor_ref: params.r#ref.clone(),
         project: project_id,
         session: session_id,
@@ -299,25 +204,17 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             &format!("{safe_ref}_trace.txt"),
             &format!("{safe_ref}_trace_manifest.json"),
         )?;
-        let output_dir = output.directory;
-        let out_path = output.content;
-        let manifest_path = output.manifest;
-        let was_new = !output_dir.exists();
-        fs::create_dir_all(&output_dir).map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("无法创建输出目录: {e}"),
-            available: None,
-        })?;
-        if was_new {
-            set_private_permissions(&output_dir, 0o700)?;
-        }
-        let mut file = open_private_output_file(&out_path)?;
+        let retention = output.temp_output.then(|| TEMP_OUTPUT_RETENTION.to_string());
+        let transaction = OutputTransaction::begin(output, params.overwrite)?;
+        let out_path = transaction.content();
+        let manifest_path = transaction.manifest();
+        let mut file = open_private_output_file(&transaction.staging_content())?;
         let (written_messages, redacted_count) = write_filtered_message_export(
             &mut file,
             &prefix,
-            records.iter().enumerate().take(end).skip(start).map(|(idx, item)| {
+            records.iter().enumerate().map(|(offset, item)| {
                 (
-                    idx,
+                    offset,
                     ExportMessage {
                         line_num: item.line_num,
                         effective_type: item.effective_type,
@@ -360,261 +257,181 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
                 }
             }
         }
-        file.flush().map_err(|e| ErrorResponse {
+        file.sync_all().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
             message: format!("刷新 trace 输出失败: {e}"),
             available: None,
         })?;
-        let bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
-        let redacted_count = redacted_count.saturating_add(tool_call_redacted_count);
+        let bytes = file
+            .metadata()
+            .map_err(|e| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("无法获取 trace 导出大小: {e}"),
+                available: None,
+            })?
+            .len();
+        let redacted_count = redacted_count.saturating_add(
+            response
+                .tool_calls
+                .iter()
+                .map(|call| call.redacted_count)
+                .sum::<usize>(),
+        );
         let redaction = redaction_info(
             params.redaction,
             redacted_count,
             params.redaction == RedactionMode::Off || redacted_count > 0,
         );
         let manifest = serde_json::json!({
-            "schema": "mcp-claude-history.trace-output.v1",
+            "schema": "mcp-claude-history.trace-output.v2",
             "anchor_ref": response.anchor_ref,
             "project": response.project,
             "session": response.session,
             "content": &out_path,
             "bytes": bytes,
             "lines": written_messages,
-            "complete": true,
+            "complete": index.incomplete_reasons.is_empty(),
+            "incomplete_reasons": index.incomplete_reasons,
             "sample_kind": "selected_range",
             "redaction": &redaction,
         });
-        let mut manifest_file = open_private_output_file(&manifest_path)?;
-        manifest_file
-            .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
-            .map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写入 trace manifest 失败: {e}"),
-                available: None,
-            })?;
-        return Ok(TraceResponse {
-            anchor_ref: response.anchor_ref,
-            project: response.project,
-            session: response.session,
-            messages: response.messages,
-            tool_calls: response.tool_calls,
-            association_issues: response.association_issues,
-            truncated: response.truncated,
-            warnings: response.warnings,
-            output_path: Some(out_path.clone()),
-            output: Some(OutputInfo {
-                content: out_path,
-                manifest: manifest_path,
-                images: Vec::new(),
-                bytes,
-                lines: written_messages,
-                schema: "mcp-claude-history.trace-output.v1".to_string(),
-                complete: true,
-                sample_kind: "selected_range".to_string(),
-                redaction,
-            }),
+        let mut manifest_file = open_private_output_file(&transaction.staging_manifest())?;
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| ErrorResponse {
+            error: "serialize_error".to_string(),
+            message: format!("无法序列化 trace manifest: {e}"),
+            available: None,
+        })?;
+        manifest_file.write_all(&manifest_bytes).map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("写入 trace manifest 失败: {e}"),
+            available: None,
+        })?;
+        manifest_file.sync_all().map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("无法同步 trace manifest: {e}"),
+            available: None,
+        })?;
+        response.output_path = Some(out_path.clone());
+        response.output = Some(OutputInfo {
+            content: out_path,
+            manifest: manifest_path,
+            images: Vec::new(),
+            bytes,
+            lines: written_messages,
+            schema: "mcp-claude-history.trace-output.v2".to_string(),
+            complete: index.incomplete_reasons.is_empty(),
+            sample_kind: "selected_range".to_string(),
+            redaction,
+            retention,
         });
+        budget_trace_response(&mut response, params.max_total)?;
+        transaction.publish()?;
+        return Ok(response);
     }
 
+    budget_trace_response(&mut response, params.max_total)?;
     Ok(response)
+}
+
+fn budget_trace_response(response: &mut TraceResponse, max_total: usize) -> Result<(), ErrorResponse> {
+    loop {
+        let bytes = serde_json::to_vec(response)
+            .map_err(|e| invalid_arguments(format!("序列化 trace 失败: {e}")))?
+            .len();
+        if bytes <= max_total {
+            return Ok(());
+        }
+        response.truncated = Some(true);
+        // Keep the anchor and retain only complete tool-call summaries.
+        if response.tool_calls.pop().is_some() || response.association_issues.pop().is_some() {
+            continue;
+        }
+        if let Some(position) = response
+            .messages
+            .iter()
+            .rposition(|message| message.is_anchor != Some(true))
+        {
+            response.messages.remove(position);
+            continue;
+        }
+        return Err(ErrorResponse {
+            error: "response_too_large".to_string(),
+            message: format!("trace 响应超过 max_total={max_total} 字节；请增大预算或缩小范围"),
+            available: Some(serde_json::json!({"serialized_bytes": bytes, "max_total_bytes": max_total})),
+        });
+    }
 }
 
 const ASSOCIATION_ISSUE_CAP: usize = 20;
 
-type PendingToolCall = (usize, Option<String>, String);
-
 fn build_tool_calls(
-    records: &[TraceRecord],
+    records: &[WindowRecord],
     prefix: &str,
     redaction: RedactionMode,
-) -> (Vec<TraceToolCall>, Vec<TraceAssociationIssue>, usize) {
-    let mut calls: Vec<TraceToolCall> = Vec::new();
-    let mut pending: Vec<PendingToolCall> = Vec::new();
+) -> (Vec<TraceToolCall>, Vec<TraceAssociationIssue>) {
+    let mut tracker = ToolAssociationTracker::default();
+    let mut call_indices = std::collections::BTreeMap::new();
+    let mut calls = Vec::new();
     let mut issues = Vec::new();
-    let mut redacted_count = 0usize;
 
     for record in records {
-        for result in extract_tool_results(&record.record, redaction) {
-            let association = pending_tool_call_position(&pending, &result);
-            if let Some((pos, match_method)) = association.position.zip(association.match_method) {
-                let (call_idx, _, _) = pending.remove(pos);
-                calls[call_idx].status = "completed".to_string();
-                calls[call_idx].match_method = match_method;
-                calls[call_idx].result_ref = Some(format!("{}:{}", prefix, record.line_num));
-                calls[call_idx].result_preview = Some(result.preview);
-                redacted_count = redacted_count.saturating_add(result.redacted_count);
-            } else if issues.len() < ASSOCIATION_ISSUE_CAP {
-                issues.push(TraceAssociationIssue {
-                    result_ref: format!("{}:{}", prefix, record.line_num),
-                    kind: association.issue.unwrap_or_else(|| "unmatched".to_string()),
-                    tool_use_id: result.id,
-                    pending_count: pending.len(),
-                });
+        let blocks = tracker.observe_record(&record.record, false);
+        for block in blocks {
+            match block.kind {
+                ToolBlockKind::Use => {
+                    let call_idx = calls.len();
+                    calls.push(TraceToolCall {
+                        r#ref: format!("{}:{}", prefix, record.line_num),
+                        server: block.info.server,
+                        tool: block.info.tool,
+                        status: "pending".to_string(),
+                        match_method: "unmatched".to_string(),
+                        result_ref: None,
+                        result_preview: None,
+                        redacted_count: 0,
+                    });
+                    if let Some(call_key) = block.call_key {
+                        call_indices.insert(call_key, call_idx);
+                    }
+                }
+                ToolBlockKind::Result => {
+                    if let Some(call_idx) = block.call_key.and_then(|key| call_indices.get(&key).copied()) {
+                        let rendered = render_tool_block(&block, redaction);
+                        calls[call_idx].status = "completed".to_string();
+                        calls[call_idx].match_method = block.match_method.unwrap_or("unmatched").to_string();
+                        calls[call_idx].result_ref = Some(format!("{}:{}", prefix, record.line_num));
+                        calls[call_idx].result_preview = rendered.result.as_ref().map(tool_result_preview);
+                        calls[call_idx].redacted_count = rendered.redacted_count;
+                    } else if issues.len() < ASSOCIATION_ISSUE_CAP {
+                        issues.push(TraceAssociationIssue {
+                            result_ref: format!("{}:{}", prefix, record.line_num),
+                            kind: block.association_issue.unwrap_or("unmatched").to_string(),
+                            tool_use_id: block.tool_use_id,
+                            pending_count: block.pending_count,
+                        });
+                    }
+                }
             }
         }
-
-        for tool_use in extract_tool_uses(&record.record) {
-            let call_idx = calls.len();
-            calls.push(TraceToolCall {
-                r#ref: format!("{}:{}", prefix, record.line_num),
-                server: tool_use.server,
-                tool: tool_use.tool,
-                status: "pending".to_string(),
-                match_method: "unmatched".to_string(),
-                result_ref: None,
-                result_preview: None,
-            });
-            pending.push((call_idx, tool_use.id, tool_use.assistant_uuid));
-        }
     }
 
-    (calls, issues, redacted_count)
+    (calls, issues)
 }
 
-struct ToolAssociation {
-    position: Option<usize>,
-    match_method: Option<String>,
-    issue: Option<String>,
-}
-
-fn pending_tool_call_position(pending: &[PendingToolCall], result: &ToolResultRef) -> ToolAssociation {
-    if let Some(result_id) = result.id.as_deref() {
-        return pending
-            .iter()
-            .position(|(_, id, _)| id.as_deref() == Some(result_id))
-            .map_or(
-                ToolAssociation {
-                    position: None,
-                    match_method: None,
-                    issue: Some("unmatched".to_string()),
-                },
-                |position| ToolAssociation {
-                    position: Some(position),
-                    match_method: Some("tool_use_id".to_string()),
-                    issue: None,
-                },
-            );
-    }
-
-    for parent in [
-        result.source_tool_assistant_uuid.as_deref(),
-        result.parent_uuid.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let matches = pending
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, _, assistant_uuid))| assistant_uuid == parent)
-            .map(|(position, _)| position)
-            .collect::<Vec<_>>();
-        if matches.len() == 1 {
-            return ToolAssociation {
-                position: matches.first().copied(),
-                match_method: Some("parent".to_string()),
-                issue: None,
-            };
-        }
-    }
-
-    if pending.len() == 1 {
-        return ToolAssociation {
-            position: Some(0),
-            match_method: Some("legacy_single_pending".to_string()),
-            issue: None,
-        };
-    }
-    ToolAssociation {
-        position: None,
-        match_method: None,
-        issue: Some(if pending.len() > 1 { "ambiguous" } else { "unmatched" }.to_string()),
-    }
-}
-
-fn extract_tool_uses(record: &MessageRecord) -> Vec<ToolUseRef> {
-    let Some(content) = record
-        .message
-        .as_ref()
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut result = Vec::new();
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-            continue;
-        }
-        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-        let id = item.get("id").and_then(|id| id.as_str()).map(ToString::to_string);
-        let (server, tool) = split_tool_name(name);
-        result.push(ToolUseRef {
-            id,
-            assistant_uuid: record.uuid.clone(),
-            server,
-            tool,
-        });
-    }
-    result
-}
-
-fn extract_tool_results(record: &MessageRecord, redaction: RedactionMode) -> Vec<ToolResultRef> {
-    let Some(content) = record
-        .message
-        .as_ref()
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut results = Vec::new();
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
-            continue;
-        }
-        let id = item
-            .get("tool_use_id")
-            .and_then(|id| id.as_str())
-            .map(ToString::to_string);
-        let preview_source = item
-            .get("content")
-            .and_then(|content| content.as_str())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                item.get("content")
-                    .map(|content| content.to_string())
-                    .unwrap_or_default()
-            });
-        let redaction = redact_text_with_mode(&preview_source, redaction);
-        let (preview, _) = truncate_content(&redaction.text, 500);
-        results.push(ToolResultRef {
-            id,
-            source_tool_assistant_uuid: record.source_tool_assistant_uuid.clone(),
-            parent_uuid: record.parent_uuid.clone(),
-            preview,
-            redacted_count: redaction.count,
-        });
-    }
-    results
-}
-
-fn split_tool_name(name: &str) -> (Option<String>, Option<String>) {
-    let mut parts = name.splitn(3, "__");
-    let first = parts.next();
-    let second = parts.next();
-    let third = parts.next();
-    if let (Some("mcp"), Some(server), Some(tool)) = (first, second, third) {
-        return (Some(server.to_string()), Some(tool.to_string()));
-    }
-    (None, Some(name.to_string()))
+fn tool_result_preview(result: &serde_json::Value) -> String {
+    let content = result.get("content").unwrap_or(result);
+    let source = content
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| content.to_string());
+    truncate_content(&source, 500).0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TraceRecord = WindowRecord;
 
     fn record(line_num: usize, json: serde_json::Value) -> TraceRecord {
         let record: MessageRecord = serde_json::from_value(json).unwrap();
@@ -659,7 +476,7 @@ mod tests {
                 }),
             ),
         ];
-        let (calls, issues, _) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].result_ref.as_deref(), Some("session:3"));
         assert_eq!(calls[0].match_method, "tool_use_id");
@@ -692,7 +509,7 @@ mod tests {
                 }),
             ),
         ];
-        let (calls, issues, _) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
         assert!(calls.iter().all(|call| call.status == "pending"));
         assert_eq!(issues[0].kind, "ambiguous");
     }
@@ -720,7 +537,7 @@ mod tests {
                 }),
             ),
         ];
-        let (calls, issues, _) = build_tool_calls(&records, "session", RedactionMode::Auto);
+        let (calls, issues) = build_tool_calls(&records, "session", RedactionMode::Auto);
         assert!(issues.is_empty());
         assert_eq!(calls[0].match_method, "parent");
     }
@@ -802,6 +619,7 @@ mod tests {
                 direction: "forward".to_string(),
                 output: Some(output_name),
                 redaction: RedactionMode::Strict,
+                overwrite: false,
             },
         )
         .unwrap();
@@ -875,6 +693,7 @@ mod tests {
                 direction: "forward".to_string(),
                 output: None,
                 redaction: RedactionMode::Auto,
+                overwrite: false,
             },
         )
         .unwrap();
@@ -909,10 +728,135 @@ mod tests {
                 direction: "forward".to_string(),
                 output: None,
                 redaction: RedactionMode::Auto,
+                overwrite: false,
             },
         )
         .unwrap_err();
         assert_eq!(error.error, "invalid_arguments");
         assert!(error.message.contains("不能和 before/after 同时传入"));
+    }
+
+    #[test]
+    fn agent_until_ref_accepts_its_canonical_prefix() {
+        let tmp = std::env::temp_dir().join(format!("mcp-trace-agent-ref-test-{}", std::process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let sidechain = tmp.join("project").join("main-session").join("remote-agents");
+        fs::create_dir_all(&sidechain).unwrap();
+        let mut file = File::create(sidechain.join("agent-12345678abcdef.jsonl")).unwrap();
+        for line in 1..=2 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("user-{line}"),
+                    "type": "user",
+                    "timestamp": format!("2026-01-01T00:00:0{line}Z"),
+                    "message": {"content": format!("message-{line}")}
+                })
+            )
+            .unwrap();
+        }
+
+        let response = trace(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            TraceParams {
+                r#ref: "12345678:1".to_string(),
+                before: None,
+                after: None,
+                project: Some("project".to_string()),
+                max_content: 4000,
+                max_total: 40000,
+                types: Vec::new(),
+                subtypes: Vec::new(),
+                pattern: None,
+                regex: false,
+                case_sensitive: false,
+                servers: Vec::new(),
+                tools: Vec::new(),
+                until_type: None,
+                until_ref: Some("12345678:2".to_string()),
+                direction: "forward".to_string(),
+                output: None,
+                redaction: RedactionMode::Auto,
+                overwrite: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.messages.len(), 2);
+        assert_eq!(response.messages[1].r#ref, "12345678:2");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn trace_budget_includes_tool_calls_and_association_metadata() {
+        let tmp = std::env::temp_dir().join(format!("mcp-trace-budget-test-{}", std::process::id()));
+        let project = tmp.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("session-budget.jsonl")).unwrap();
+        let uses: Vec<_> = (0..12)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "tool_use", "id": format!("call-{i}"), "name": "mcp__fixture__test"
+                })
+            })
+            .collect();
+        let results: Vec<_> = (0..12)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "tool_result", "tool_use_id": format!("call-{i}"), "content": "中\\\"".repeat(100)
+                })
+            })
+            .collect();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "assistant-1", "type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": uses}
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "user-1", "type": "user", "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"content": results}
+            })
+        )
+        .unwrap();
+        let response = trace(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            TraceParams {
+                r#ref: "session-:1".to_string(),
+                before: Some(0),
+                after: Some(1),
+                project: Some("project".to_string()),
+                max_content: 200,
+                max_total: 900,
+                types: Vec::new(),
+                subtypes: Vec::new(),
+                pattern: None,
+                regex: false,
+                case_sensitive: false,
+                servers: Vec::new(),
+                tools: Vec::new(),
+                until_type: None,
+                until_ref: None,
+                direction: "forward".to_string(),
+                output: None,
+                overwrite: false,
+                redaction: RedactionMode::Auto,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.truncated, Some(true));
+        assert!(response.messages.iter().any(|msg| msg.is_anchor == Some(true)));
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 900);
+        fs::remove_dir_all(tmp).unwrap();
     }
 }

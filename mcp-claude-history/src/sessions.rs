@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 
 /// 列出项目的会话
 pub fn list_sessions(
@@ -57,27 +57,38 @@ pub fn list_sessions(
         };
 
         // 获取文件信息
-        let meta = entry.metadata().ok();
-        let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let size_bytes = entry
+            .metadata()
+            .map_err(|e| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("无法读取会话文件属性 {}: {e}", path.display()),
+                available: None,
+            })?
+            .len();
 
         // 统计行数并获取时间范围和主题
-        let (line_count, start_time, end_time, topic, topic_redacted_count) = get_session_stats(&path, redaction);
-        redacted_count += topic_redacted_count;
+        let stats = get_session_stats(&path, redaction)?;
+        redacted_count += stats.topic_redacted_count;
 
         sessions.push(SessionInfo {
             id: session_id.clone(),
             ref_prefix: ref_prefix(&session_id),
-            line_count,
-            start_time,
-            end_time,
+            line_count: stats.line_count,
+            start_time: stats.start_time,
+            end_time: stats.end_time,
             size_bytes,
-            topic,
-            topic_redacted_count,
+            topic: stats.topic,
+            topic_redacted_count: stats.topic_redacted_count,
+            skipped_oversized_lines: stats.skipped_oversized_lines,
         });
     }
 
     // 按结束时间排序（最新的在前）
-    sessions.sort_by(|a, b| b.end_time.cmp(&a.end_time));
+    sessions.sort_by(|a, b| {
+        parse_time(&b.end_time)
+            .cmp(&parse_time(&a.end_time))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     Ok(SessionsResponse {
         project: project_id,
@@ -91,14 +102,22 @@ pub fn list_sessions(
 }
 
 /// 获取会话统计信息
-fn get_session_stats(
-    path: &std::path::Path,
-    redaction_mode: RedactionMode,
-) -> (usize, String, String, Option<String>, usize) {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return (0, String::new(), String::new(), None, 0),
-    };
+#[derive(Debug)]
+struct SessionStats {
+    line_count: usize,
+    start_time: String,
+    end_time: String,
+    topic: Option<String>,
+    topic_redacted_count: usize,
+    skipped_oversized_lines: usize,
+}
+
+fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> Result<SessionStats, ErrorResponse> {
+    let file = File::open(path).map_err(|e| ErrorResponse {
+        error: "io_error".to_string(),
+        message: format!("无法读取会话文件 {}: {e}", path.display()),
+        available: None,
+    })?;
 
     let reader = BufReader::new(file);
     let mut line_count = 0;
@@ -106,11 +125,23 @@ fn get_session_stats(
     let mut end_time = String::new();
     let mut topic: Option<String> = None;
     let mut topic_redacted_count = 0usize;
+    let mut skipped_oversized_lines = 0usize;
 
-    for line in reader.lines() {
+    for line in bounded_jsonl_lines(reader) {
         let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
+            Ok(BoundedLine::Record(l)) => l,
+            Ok(BoundedLine::TooLarge) => {
+                skipped_oversized_lines += 1;
+                line_count += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(ErrorResponse {
+                    error: "io_error".to_string(),
+                    message: format!("读取会话文件 {} 失败: {e}", path.display()),
+                    available: None,
+                });
+            }
         };
         line_count += 1;
 
@@ -141,7 +172,14 @@ fn get_session_stats(
         }
     }
 
-    (line_count, start_time, end_time, topic, topic_redacted_count)
+    Ok(SessionStats {
+        line_count,
+        start_time,
+        end_time,
+        topic,
+        topic_redacted_count,
+        skipped_oversized_lines,
+    })
 }
 
 /// 从消息记录中提取文本内容（用于生成会话主题）
@@ -170,6 +208,19 @@ mod tests {
     use std::env;
     use std::io::Write;
     use std::process;
+
+    #[test]
+    fn missing_session_file_is_not_reported_as_an_empty_session() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("mcp-history-missing-session-{}-{nonce}.jsonl", process::id()));
+        assert_eq!(
+            get_session_stats(&path, RedactionMode::Auto).unwrap_err().error,
+            "io_error"
+        );
+    }
 
     #[test]
     fn session_topics_redact_before_truncation_for_string_and_content_block_messages() {

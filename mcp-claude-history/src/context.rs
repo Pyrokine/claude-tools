@@ -1,9 +1,11 @@
 use crate::config::Config;
-use crate::get::{find_session_file, resolve_output_files};
+use crate::get::{OutputTransaction, find_session_file, resolve_output_files};
+use crate::search::{MAX_CONTENT_LIMIT, MAX_TOTAL_LIMIT, MIN_CONTENT_LIMIT, MIN_TOTAL_LIMIT};
 use crate::types::*;
 use crate::utils::*;
+#[cfg(test)]
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 
 /// Context 参数
 pub struct ContextParams {
@@ -25,6 +27,7 @@ pub struct ContextParams {
     pub case_sensitive: bool,
     /// 导出到文件，支持 tmp: / cwd: 前缀
     pub output: Option<String>,
+    pub overwrite: bool,
     pub redaction: RedactionMode,
 }
 
@@ -46,23 +49,23 @@ impl Default for ContextParams {
             regex: false,
             case_sensitive: false,
             output: None,
+            overwrite: false,
             redaction: RedactionMode::Auto,
         }
     }
 }
 
-/// 消息 + 分类信息
-struct ClassifiedMessage {
-    line_num: usize,
-    effective_type: &'static str,
-    subtype: &'static str,
-    content: String,
-    redacted_count: usize,
-}
-
 /// 获取上下文
 pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse, ErrorResponse> {
     let mut params = params;
+    if !(MIN_CONTENT_LIMIT..=MAX_CONTENT_LIMIT).contains(&params.max_content)
+        || !(MIN_TOTAL_LIMIT..=MAX_TOTAL_LIMIT).contains(&params.max_total)
+    {
+        return Err(invalid_arguments("max_content 或 max_total 超出支持范围"));
+    }
+    if params.overwrite && params.output.is_none() {
+        return Err(invalid_arguments("overwrite=true 需要 output"));
+    }
     let filters = normalize_message_filters(&params.types, &params.subtypes, None)?;
     let mut parameter_warnings = filters.warnings;
     params.types = filters.types;
@@ -89,169 +92,49 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     let (_project_id, session_id, path) =
         find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
 
-    // 读取文件
-    let file = File::open(&path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法打开文件: {e}"),
-        available: None,
-    })?;
-
-    let reader = BufReader::new(file);
     let prefix = ref_prefix(&session_id);
-
-    // 收集所有消息（带分类信息）
-    let mut all_messages: Vec<ClassifiedMessage> = Vec::new();
-    let mut anchor_idx = None;
-    let mut read_errors = 0usize;
-    let mut parse_errors = 0usize;
-
-    for (line_num, line) in reader.lines().enumerate() {
-        let line_num = line_num + 1; // 1-based
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => {
-                read_errors += 1;
-                continue;
-            }
-        };
-
-        let record = match parse_message_record(&line) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-
-        let (effective_type, subtype) = classify_message(&record);
-        let redaction = redact_text_with_mode(
-            &replace_images_with_placeholders_with_mode(&record, params.redaction),
-            params.redaction,
-        );
-        all_messages.push(ClassifiedMessage {
-            line_num,
-            effective_type,
-            subtype,
-            content: redaction.text,
-            redacted_count: redaction.count,
-        });
-
-        if line_num == parsed_ref.line {
-            anchor_idx = Some(all_messages.len() - 1);
+    let range = if let Some(until_type) = &params.until_type {
+        SessionRange::UntilType {
+            effective_type: until_type,
+            backward: params.direction == "backward",
         }
-    }
-
-    let anchor_idx = anchor_idx.ok_or_else(|| ErrorResponse {
-        error: "ref_not_found".to_string(),
-        message: format!("ref 不存在: {}", params.r#ref),
-        available: None,
-    })?;
-
-    // 确定上下文范围
-    let (start_idx, end_idx) = if let Some(until_type) = &params.until_type {
-        // until_type 模式：遇到指定类型就停止
-        if params.direction == "backward" {
-            let mut start = anchor_idx;
-            for i in (0..anchor_idx).rev() {
-                if all_messages[i].effective_type == until_type.as_str() {
-                    start = i;
-                    break;
-                }
-            }
-            (start, anchor_idx + 1)
-        } else {
-            let mut end = anchor_idx + 1;
-            for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
-                if msg.effective_type == until_type.as_str() {
-                    end = i + 1;
-                    break;
-                }
-            }
-            (anchor_idx, end)
-        }
-    } else if let Some(ref end_ref_str) = params.until_ref {
-        // until_ref 模式：从 anchor 到另一个 ref 的行（含）
+    } else if let Some(end_ref_str) = &params.until_ref {
         let end_parsed = ParsedRef::parse(end_ref_str).ok_or_else(|| ErrorResponse {
             error: "ref_invalid".to_string(),
             message: format!("until_ref 格式无效: {end_ref_str}"),
             available: None,
         })?;
-        if !session_id.starts_with(&end_parsed.session_prefix) {
+        if !session_matches_ref(&session_id, &end_parsed.session_prefix) {
             return Err(ErrorResponse {
                 error: "ref_invalid".to_string(),
                 message: format!("until_ref 不属于当前 session: {end_ref_str}"),
                 available: Some(serde_json::json!({ "session": session_id })),
             });
         }
-        let end_line = end_parsed.line;
-        let end_pos = all_messages
-            .iter()
-            .position(|m| m.line_num == end_line)
-            .ok_or_else(|| ErrorResponse {
-                error: "ref_not_found".to_string(),
-                message: format!("until_ref 不存在: {end_ref_str}"),
-                available: None,
-            })?;
-        if end_pos <= anchor_idx {
-            (end_pos, anchor_idx + 1)
-        } else {
-            (anchor_idx, end_pos + 1)
-        }
+        SessionRange::UntilRef { line: end_parsed.line }
     } else {
-        // before/after 模式：按匹配类型计数，after=None 且 before=None 时扩展到末尾
-        let before = params.before.unwrap_or(0);
-        let after_count = params.after;
-
-        let mut start = anchor_idx;
-        if before > 0 {
-            let mut count = 0;
-            for i in (0..anchor_idx).rev() {
-                let type_ok = message_type_matches(all_messages[i].effective_type, &params.types)
-                    && message_subtype_matches(all_messages[i].subtype, &params.subtypes);
-                let pattern_ok = content_filter.matches(&all_messages[i].content);
-                if type_ok && pattern_ok {
-                    count += 1;
-                    start = i;
-                    if count >= before {
-                        break;
-                    }
-                }
-            }
+        SessionRange::Counts {
+            before: params.before.unwrap_or(0),
+            after: params.after.or_else(|| params.before.map(|_| 0)),
         }
-
-        let mut end = anchor_idx + 1;
-        if let Some(after) = after_count {
-            if after > 0 {
-                let mut count = 0;
-                for (i, msg) in all_messages.iter().enumerate().skip(anchor_idx + 1) {
-                    let type_ok = message_type_matches(msg.effective_type, &params.types)
-                        && message_subtype_matches(msg.subtype, &params.subtypes);
-                    let pattern_ok = content_filter.matches(&msg.content);
-                    if type_ok && pattern_ok {
-                        count += 1;
-                        end = i + 1;
-                        if count >= after {
-                            break;
-                        }
-                    }
-                }
-            }
-        } else if params.before.is_none() {
-            // before 和 after 都未指定时扩展到末尾（direction=forward 默认行为）
-            end = all_messages.len();
-        }
-
-        (start, end)
     };
-
+    let index = index_session_messages(
+        &path,
+        parsed_ref.line,
+        &content_filter,
+        params.redaction,
+        &params.types,
+        &params.subtypes,
+        range,
+    )?;
+    let anchor_idx = index.anchor_idx;
+    let window = load_session_window(&path, &index.messages, params.redaction)?;
     // 构建结果
     let mut messages = Vec::new();
-    let mut total_chars = 0;
-    let mut truncated_by_total = false;
+    let mut truncated_by_content = false;
 
-    for (i, msg) in all_messages.iter().enumerate().take(end_idx).skip(start_idx) {
-        let is_anchor = i == anchor_idx;
+    for (idx, msg) in window.iter().enumerate() {
+        let is_anchor = idx == anchor_idx;
         if !is_anchor
             && (!message_type_matches(msg.effective_type, &params.types)
                 || !message_subtype_matches(msg.subtype, &params.subtypes))
@@ -264,15 +147,8 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             continue;
         }
 
-        let (truncated_content, _) = truncate_content(&msg.content, params.max_content);
-        let truncated_len = truncated_content.chars().count();
-
-        if total_chars + truncated_len > params.max_total {
-            truncated_by_total = true;
-            break;
-        }
-        total_chars += truncated_len;
-
+        let (truncated_content, was_truncated) = truncate_content(&msg.content, params.max_content);
+        truncated_by_content |= was_truncated;
         messages.push(ContextMessage {
             r#ref: format!("{}:{}", prefix, msg.line_num),
             r#type: msg.effective_type.to_string(),
@@ -282,11 +158,11 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         });
     }
 
-    parameter_warnings.extend(jsonl_read_warnings(read_errors, parse_errors));
-    let response = ContextResponse {
+    parameter_warnings.extend(index.warnings);
+    let mut response = ContextResponse {
         anchor_ref: params.r#ref.clone(),
         messages,
-        truncated: if truncated_by_total { Some(true) } else { None },
+        truncated: truncated_by_content.then_some(true),
         warnings: parameter_warnings,
         output_path: None,
         output: None,
@@ -300,39 +176,26 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             &format!("{safe_ref}_context.txt"),
             &format!("{safe_ref}_context_manifest.json"),
         )?;
-        let output_dir = output.directory;
-        let out_path = output.content;
-        let manifest_path = output.manifest;
-        let was_new = !output_dir.exists();
-        fs::create_dir_all(&output_dir).map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("无法创建输出目录: {e}"),
-            available: None,
-        })?;
-        if was_new {
-            set_private_permissions(&output_dir, 0o700)?;
-        }
-        let mut file = open_private_output_file(&out_path)?;
+        let retention = output.temp_output.then(|| TEMP_OUTPUT_RETENTION.to_string());
+        let transaction = OutputTransaction::begin(output, params.overwrite)?;
+        let out_path = transaction.content();
+        let manifest_path = transaction.manifest();
+        let mut file = open_private_output_file(&transaction.staging_content())?;
         let (written_messages, redacted_count) = write_filtered_message_export(
             &mut file,
             &prefix,
-            all_messages
-                .iter()
-                .enumerate()
-                .take(end_idx)
-                .skip(start_idx)
-                .map(|(idx, msg)| {
-                    (
-                        idx,
-                        ExportMessage {
-                            line_num: msg.line_num,
-                            effective_type: msg.effective_type,
-                            subtype: msg.subtype,
-                            content: &msg.content,
-                            redacted_count: msg.redacted_count,
-                        },
-                    )
-                }),
+            window.iter().enumerate().map(|(offset, msg)| {
+                (
+                    offset,
+                    ExportMessage {
+                        line_num: msg.line_num,
+                        effective_type: msg.effective_type,
+                        subtype: msg.subtype,
+                        content: &msg.content,
+                        redacted_count: msg.redacted_count,
+                    },
+                )
+            }),
             anchor_idx,
             MessageExportFilters {
                 types: &params.types,
@@ -340,56 +203,96 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
                 content_filter: &content_filter,
             },
         )?;
-        file.flush().map_err(|e| ErrorResponse {
+        file.sync_all().map_err(|e| ErrorResponse {
             error: "io_error".to_string(),
             message: format!("刷新 context 输出失败: {e}"),
             available: None,
         })?;
-        let bytes = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        let bytes = file
+            .metadata()
+            .map_err(|e| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("无法获取 context 导出大小: {e}"),
+                available: None,
+            })?
+            .len();
         let redaction = redaction_info(
             params.redaction,
             redacted_count,
             params.redaction == RedactionMode::Off || redacted_count > 0,
         );
         let manifest = serde_json::json!({
-            "schema": "mcp-claude-history.context-output.v1",
+            "schema": "mcp-claude-history.context-output.v2",
             "anchor_ref": response.anchor_ref,
             "content": &out_path,
             "bytes": bytes,
             "lines": written_messages,
-            "complete": true,
+            "complete": index.incomplete_reasons.is_empty(),
+            "incomplete_reasons": index.incomplete_reasons,
             "sample_kind": "selected_range",
             "redaction": &redaction,
         });
-        let mut manifest_file = open_private_output_file(&manifest_path)?;
-        manifest_file
-            .write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
-            .map_err(|e| ErrorResponse {
-                error: "io_error".to_string(),
-                message: format!("写入 context manifest 失败: {e}"),
-                available: None,
-            })?;
-        return Ok(ContextResponse {
-            anchor_ref: response.anchor_ref,
-            messages: response.messages,
-            truncated: response.truncated,
-            warnings: response.warnings,
-            output_path: Some(out_path.clone()),
-            output: Some(OutputInfo {
-                content: out_path,
-                manifest: manifest_path,
-                images: Vec::new(),
-                bytes,
-                lines: written_messages,
-                schema: "mcp-claude-history.context-output.v1".to_string(),
-                complete: true,
-                sample_kind: "selected_range".to_string(),
-                redaction,
-            }),
+        let mut manifest_file = open_private_output_file(&transaction.staging_manifest())?;
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| ErrorResponse {
+            error: "serialize_error".to_string(),
+            message: format!("无法序列化 context manifest: {e}"),
+            available: None,
+        })?;
+        manifest_file.write_all(&manifest_bytes).map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("写入 context manifest 失败: {e}"),
+            available: None,
+        })?;
+        manifest_file.sync_all().map_err(|e| ErrorResponse {
+            error: "io_error".to_string(),
+            message: format!("无法同步 context manifest: {e}"),
+            available: None,
+        })?;
+        response.output_path = Some(out_path.clone());
+        response.output = Some(OutputInfo {
+            content: out_path,
+            manifest: manifest_path,
+            images: Vec::new(),
+            bytes,
+            lines: written_messages,
+            schema: "mcp-claude-history.context-output.v2".to_string(),
+            complete: index.incomplete_reasons.is_empty(),
+            sample_kind: "selected_range".to_string(),
+            redaction,
+            retention,
         });
+        budget_context_response(&mut response, params.max_total)?;
+        transaction.publish()?;
+        return Ok(response);
     }
 
+    budget_context_response(&mut response, params.max_total)?;
     Ok(response)
+}
+
+fn budget_context_response(response: &mut ContextResponse, max_total: usize) -> Result<(), ErrorResponse> {
+    loop {
+        let bytes = serde_json::to_vec(response)
+            .map_err(|e| invalid_arguments(format!("序列化 context 失败: {e}")))?
+            .len();
+        if bytes <= max_total {
+            return Ok(());
+        }
+        if let Some(position) = response
+            .messages
+            .iter()
+            .rposition(|message| message.is_anchor != Some(true))
+        {
+            response.messages.remove(position);
+            response.truncated = Some(true);
+        } else {
+            return Err(ErrorResponse {
+                error: "response_too_large".to_string(),
+                message: format!("context 响应超过 max_total={max_total} 字节；请增大预算或缩小范围"),
+                available: Some(serde_json::json!({"serialized_bytes": bytes, "max_total_bytes": max_total})),
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -460,5 +363,160 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.error, "invalid_arguments");
         assert!(error.message.contains("不能和 before/after 同时传入"));
+    }
+
+    #[test]
+    fn per_message_truncation_is_reported() {
+        let tmp = env::temp_dir().join(format!("mcp-context-truncation-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut file = File::create(project_dir.join("session-context-truncation.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "user-1",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": "FIVE"}
+            })
+        )
+        .unwrap();
+
+        let response = context(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            ContextParams {
+                r#ref: "session-:1".to_string(),
+                before: Some(0),
+                after: Some(0),
+                project: Some("project".to_string()),
+                max_content: 1,
+                ..ContextParams::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.messages[0].content, "F");
+        assert_eq!(response.truncated, Some(true));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn agent_until_ref_accepts_canonical_and_full_session_ids() {
+        let tmp = env::temp_dir().join(format!("mcp-context-agent-ref-test-{}", process::id()));
+        fs::remove_dir_all(&tmp).ok();
+        let project_dir = tmp.join("project");
+        let sidechain_dir = project_dir.join("main-session").join("subagents");
+        fs::create_dir_all(&sidechain_dir).unwrap();
+        let session_id = "agent-12345678abcdef";
+        let mut file = File::create(sidechain_dir.join(format!("{session_id}.jsonl"))).unwrap();
+        for line in 1..=2 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("user-{line}"),
+                    "type": "user",
+                    "timestamp": format!("2026-01-01T00:00:0{line}Z"),
+                    "message": {"content": format!("message-{line}")}
+                })
+            )
+            .unwrap();
+        }
+        let config = Config {
+            projects_dir: tmp.clone(),
+        };
+
+        for (anchor, until) in [
+            ("12345678:1".to_string(), "12345678:2".to_string()),
+            (format!("{session_id}:1"), format!("{session_id}:2")),
+        ] {
+            let response = context(
+                &config,
+                ContextParams {
+                    r#ref: anchor,
+                    until_ref: Some(until),
+                    project: Some("project".to_string()),
+                    ..ContextParams::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(response.messages.len(), 2);
+            assert_eq!(response.messages[1].r#ref, "12345678:2");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_budget_counts_full_json_metadata_and_retains_anchor() {
+        let tmp = env::temp_dir().join(format!("mcp-context-budget-test-{}", process::id()));
+        let project = tmp.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("session-budget.jsonl")).unwrap();
+        for i in 0..8 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("user-{i}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": "中\\\"".repeat(60)}
+                })
+            )
+            .unwrap();
+        }
+        let response = context(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            ContextParams {
+                r#ref: "session-:6".to_string(),
+                before: Some(5),
+                after: Some(2),
+                project: Some("project".to_string()),
+                max_total: 700,
+                ..ContextParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.truncated, Some(true));
+        assert!(response.messages.iter().any(|msg| msg.is_anchor == Some(true)));
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 700);
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn wide_context_window_fails_without_caching_entire_session() {
+        let tmp = env::temp_dir().join(format!("mcp-context-window-test-{}", process::id()));
+        let project = tmp.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("session-window.jsonl")).unwrap();
+        for i in 0..=MAX_SESSION_WINDOW {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("user-{i}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"content": "fixture"}
+                })
+            )
+            .unwrap();
+        }
+        let error = context(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            ContextParams {
+                r#ref: "session-:1".to_string(),
+                project: Some("project".to_string()),
+                ..ContextParams::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "session_window_limit");
+        fs::remove_dir_all(tmp).unwrap();
     }
 }

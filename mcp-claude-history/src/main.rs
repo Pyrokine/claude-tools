@@ -22,7 +22,7 @@ use trace::{TraceParams, trace};
 use types::{BuildIdentity, ErrorResponse};
 use utils::{
     parse_optional_line_ranges_param, parse_optional_message_slice_param, parse_optional_range_param,
-    parse_optional_redaction_mode_param, parse_optional_time_param, split_csv_param,
+    parse_optional_redaction_mode_param, parse_time_bounds, split_csv_param,
 };
 
 /// 把 domain Result<T, E> 序列化为 Result<String, String>:
@@ -31,8 +31,8 @@ use utils::{
 ///   - 序列化失败（本地不可能,T/E 都 derive Serialize）→ Err(serde 错误描述)
 fn serialize_result<T: serde::Serialize, E: serde::Serialize>(result: Result<T, E>) -> Result<String, String> {
     match result {
-        Ok(v) => serde_json::to_string_pretty(&v).map_err(|e| e.to_string()),
-        Err(e) => match serde_json::to_string_pretty(&e) {
+        Ok(v) => serde_json::to_string(&v).map_err(|e| e.to_string()),
+        Err(e) => match serde_json::to_string(&e) {
             Ok(s) => Err(s),
             Err(serde_err) => Err(serde_err.to_string()),
         },
@@ -42,6 +42,7 @@ fn serialize_result<T: serde::Serialize, E: serde::Serialize>(result: Result<T, 
 #[derive(Parser)]
 #[command(name = "claude-history")]
 #[command(about = "Claude Code conversation history search tool")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -121,6 +122,10 @@ enum Commands {
         #[arg(long)]
         output: Option<String>,
 
+        /// Replace an existing export bundle (requires --output)
+        #[arg(long)]
+        overwrite: bool,
+
         /// Output format for --output
         #[arg(long)]
         output_format: Option<String>,
@@ -183,6 +188,9 @@ enum Commands {
         /// Output directory (relative path defaults to controlled temp dir, use cwd: prefix to persist in repo)
         #[arg(long)]
         output: Option<String>,
+
+        #[arg(long)]
+        overwrite: bool,
 
         /// Project ID
         #[arg(long)]
@@ -250,6 +258,9 @@ enum Commands {
         /// Export context to output directory (supports tmp:/cwd: prefix)
         #[arg(long)]
         output: Option<String>,
+
+        #[arg(long)]
+        overwrite: bool,
 
         /// Redaction mode: auto, strict, off
         #[arg(long)]
@@ -330,6 +341,9 @@ enum Commands {
         #[arg(long)]
         output: Option<String>,
 
+        #[arg(long)]
+        overwrite: bool,
+
         /// Redaction mode: auto, strict, off
         #[arg(long)]
         redaction: Option<String>,
@@ -390,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
             tool_payload_errors,
             dry_run,
             output,
+            overwrite,
             output_format,
             redaction,
             lines,
@@ -404,13 +419,14 @@ async fn main() -> anyhow::Result<()> {
             max_total,
         } => {
             let parsed: Result<SearchParams, ErrorResponse> = (|| {
+                let (since, until) = parse_time_bounds(since.as_deref(), until.as_deref())?;
                 Ok(SearchParams {
                     pattern,
                     projects: project.unwrap_or_default(),
                     all_projects: all,
                     sessions: sessions.unwrap_or_default(),
-                    since: parse_optional_time_param(since.as_deref(), "since")?,
-                    until: parse_optional_time_param(until.as_deref(), "until")?,
+                    since,
+                    until,
                     types: split_csv_param(Some(types.as_str())),
                     subtypes: split_csv_param(subtypes.as_deref()),
                     servers: split_csv_param(servers.as_deref()),
@@ -433,6 +449,7 @@ async fn main() -> anyhow::Result<()> {
                     ignored_keys: Vec::new(),
                     warnings: Vec::new(),
                     output,
+                    overwrite,
                     output_format,
                     subagents,
                 })
@@ -448,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
             r#ref,
             range,
             output,
+            overwrite,
             project,
             redaction,
         } => match parse_optional_range_param(range.as_deref()) {
@@ -456,6 +474,7 @@ async fn main() -> anyhow::Result<()> {
                     r#ref,
                     range,
                     output,
+                    overwrite,
                     project,
                     redaction,
                 });
@@ -483,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
             max_content,
             max_total,
             output,
+            overwrite,
             redaction,
         } => match parse_optional_redaction_mode_param(redaction.as_deref()) {
             Ok(redaction) => {
@@ -502,6 +522,7 @@ async fn main() -> anyhow::Result<()> {
                     regex,
                     case_sensitive,
                     output,
+                    overwrite,
                     redaction,
                 };
 
@@ -528,6 +549,7 @@ async fn main() -> anyhow::Result<()> {
             until_ref,
             direction,
             output,
+            overwrite,
             redaction,
         } => match parse_optional_redaction_mode_param(redaction.as_deref()) {
             Ok(redaction) => {
@@ -549,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
                     until_ref,
                     direction,
                     output,
+                    overwrite,
                     redaction,
                 };
                 serialize_result(trace(&config, params))
@@ -575,5 +598,26 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("{output}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn cli_version_and_build_info_are_available() {
+        assert_eq!(
+            Cli::try_parse_from(["claude-history", "--version"])
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::DisplayVersion
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["claude-history", "build-info"]).unwrap().command,
+            Some(Commands::BuildInfo)
+        ));
     }
 }

@@ -20,6 +20,25 @@ Claude Code 对话历史搜索工具
 - **浏览**：列出项目和会话
 - **静态二进制**：musl 静态链接，可在大多数 Linux x86_64 发行版上运行
 
+## 迁移到 2.0
+
+`history_get`、`history_search`、`history_context` 和 `history_trace` 导出时发布 bundle 目录，请求的文件名不再是最终文件路径
+默认创建唯一目录，例如 `results.export-<唯一后缀>/results.jsonl`；`overwrite=true` 使用带归属标记的固定目标
+读取返回的 `output.content`（search 为 `output.results`）、`output.manifest` 或提供的 `output_path`，不要按请求拼接路径，也不要假定 manifest 位于请求文件旁
+
+导出 manifest 使用 schema v2：`mcp-claude-history.get-output.v2`、`mcp-claude-history.search-results.v2`、
+`mcp-claude-history.context-output.v2` 和 `mcp-claude-history.trace-output.v2`
+消费方应检查 `schema`，使用返回路径、完整性、字节数和脱敏元数据
+
+context 和 trace 的 `max_total` 限制最终紧凑 JSON 响应的 UTF-8 字节数，包含元数据和 trace 的 `tool_calls`，不含 JSON-RPC 与 MCP framing
+不能用字符数或消息文本长度代替这个预算，无法保留锚点和必要元数据时返回 `response_too_large`
+
+仅传日期的 `until=YYYY-MM-DD` 使用次日 UTC 00:00 的排他边界，因此包含指定 UTC 日期全天；`today` 按 UTC 日历解释
+RFC3339 `until` 仍包含指定瞬间
+
+`history_get.range` 使用原始提取消息的 Unicode 字符半开坐标，脱敏会先检查完整消息，再选择 range，与敏感值任何部分相交就返回标记
+不要按脱敏预览计算 range 坐标，`redaction=off` 返回对应的完整原文范围
+
 ## 安装
 
 ### 下载二进制（推荐）
@@ -90,7 +109,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 每个项目返回权威 `id`、展示用
 `path`、`path_approximate`、会话数和最后活动时间。现存本地路径会根据文件系统还原，保留连字符、下划线、点号和空格。无法唯一解析到现存路径时，`path`
-使用可读的近似值并返回 `path_approximate=true`；调用其他工具时应使用 `id`
+使用可读的近似值并返回 `path_approximate=true`；调用其他工具时应使用 `id`。Windows 下现存的盘符路径和 UNC 路径也可作为项目参数，先 canonicalize，再按大小写不敏感规则匹配；多个项目对应同一路径时返回 `project_ambiguous`
 
 ### history_sessions
 
@@ -109,8 +128,8 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `project`                 | string  | 当前项目               | 项目 ID（逗号分隔）                                |
 | `all`                     | boolean | false                  | 搜索所有项目                                       |
 | `sessions`                | string  | -                      | 会话 ID（逗号分隔）                                |
-| `since`                   | string  | -                      | 起始时间，支持 RFC3339 或 YYYY-MM-DD               |
-| `until`                   | string  | -                      | 结束时间，支持 RFC3339 或 YYYY-MM-DD               |
+| `since`                   | string  | -                      | 起始时间：RFC3339、UTC 日期或 `today`（含边界）    |
+| `until`                   | string  | -                      | 结束时间：RFC3339、UTC 日期或 `today`（含边界）    |
 | `types`                   | string  | assistant,user,summary | 消息类型，逗号分隔                                 |
 | `subtypes`                | string  | -                      | 消息子类型，逗号分隔                               |
 | `servers`                 | string  | -                      | MCP server 过滤，逗号分隔                          |
@@ -124,7 +143,8 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `dry_run`                 | boolean | false                  | 只预览项目、会话和文件，不读取消息正文             |
 | `failed_tool_results`     | boolean | false                  | 只返回 harness 标记 `is_error=true` 的 tool_result |
 | `tool_payload_errors`     | boolean | false                  | 只返回 JSON payload 自身报告错误的 tool_result     |
-| `output`                  | string  | -                      | 写结果文件，相对路径默认走受控临时目录             |
+| `output`                  | string  | -                      | 导出结果目录，相对路径默认走受控临时目录           |
+| `overwrite`               | boolean | false                  | 覆盖已存在且带归属标记的导出目录                   |
 | `output_format`           | string  | jsonl                  | `jsonl`                                            |
 | `redaction`               | string  | auto                   | `auto`、`strict` 或 `off`                          |
 | `offset`                  | number  | 0                      | 跳过前 N 条，不能和 `slice` 同用                   |
@@ -133,6 +153,11 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 | `max_content`             | number  | 4000                   | 普通结果预览的最大字符数（1 至 1,000,000）         |
 | `max_content_tool_result` | number  | 500                    | tool result 独立预览上限（1 至 1,000,000）         |
 | `max_total`               | number  | 40000                  | 紧凑响应上限（512 至 10,000,000 字节）             |
+
+`subagents=false`（默认值）只搜索主 JSONL 文件，`true` 还包括 `<session>/subagents/` 和 `<session>/remote-agents/` 下的文件
+`sessions` 匹配各文件自身 ID，选择父会话 ID 不会自动包含子会话
+普通、summary、aggregate、dry_run 和导出响应始终返回 `stats.effective_filters.subagents`，包括 false
+该字段表示有效配置，实际文件范围查看 coverage 或 `dry_run`，续查保持相同范围
 
 默认 `types` 包含 `summary`，会检索上下文压缩摘要，只看原始对话时使用 `types=assistant,user`。合法 type 为
 `assistant`、`user`、`summary`、`system`、`other`。合法 subtype 为 `human`、`tool_result`、`meta`、`text`、
@@ -144,21 +169,52 @@ record。这是分类启发式，不能证明消息由真人输入。为兼容�
 用于查找工具结果成功返回但正文 JSON 中包含 `success=false` 或 `error` 的记录。非 regex 的 `pattern`
 以空格表示 AND，`a|b` 表示一组 OR，`!term` 排除命中； `regex=true` 时 `pattern` 作为一个正则表达式。设置 `since` 或
 `until` 后，时间戳无法解析的 record 不匹配，并通过 `stats.skipped_invalid_timestamps` 和 `incomplete_reasons`
-说明。`since` 不能晚于 `until`
+说明。日期按 UTC 解释：`since=YYYY-MM-DD` 从当日 UTC 00:00 开始，`until=YYYY-MM-DD` 包含该 UTC 日期全天；`today` 为当前 UTC 日期。RFC3339 显式时区偏移按 UTC 瞬间比较；`since` 不能晚于 `until`
+
+搜索会在完整提取的消息上匹配 `pattern`，包括超出响应预览上限的 tool input。单条 record 含多个 tool block
+时，server、tool、harness error 和 payload error 条件必须由同一个 block 同时满足，返回的 tool name、input、result 和
+error 字段也来自该 block 及其关联的 `tool_use_id`
+
+`tools` 中的名称按 OR 匹配，完整名称 `mcp__server__tool` 绑定同一个工具块的 server 和 tool，短名跨 server 匹配 tool
+可以混合本地工具名（如 `Bash`）和完整 MCP 工具名
+显式 `servers` 与 `tools` 按 AND 组合，完整工具名不会增加全局 server 过滤条件
+`stats.effective_filters` 和 `next_query` 保留完整工具名，不再返回原有的自动拆分 warning
+
+搜索完整性与工具归因分别报告，只有匹配内容、类型、时间和行范围的记录才会计入
+`stats.attribution_incomplete_reasons`，命中记录继续保留 `metadata_incomplete_reason`
+缺少工具关联不会把普通正文搜索标为不完整；按 `servers` 或 `tools` 筛选时，无法确认归属的记录会使
+`incomplete_reasons` 包含 `tool_filter_unverifiable`，导出 manifest 包含相同的归因原因
+普通、summary、aggregate 和 output 搜索在 `incomplete_reasons` 非空时都返回 `total_matches_exact=false`，包括超大 JSONL 行、读取或解析缺口及容量停止
+纯归因缺口继续独立，工具名称筛选无法验证时才影响正文计数精确性
+
+`coverage.searched_files` 是尝试扫描的会话文件的稳定前缀，包含打开失败或扫描中途停止的当前文件，缺口由 `incomplete_reasons` 说明
+`skipped_files` 是尚未尝试的后缀，两者不重叠；关键词命中在 `results` 中
+响应超出 `max_total` 时，优先缩减扫描路径等附属信息，再缩减命中消息；`dry_run` 不读取正文，只列计划文件范围
 
 搜索输出默认使用 `redaction=auto` 处理消息正文、`tool_use` 预览和结构化 tool 字段，`auto` 覆盖 Authorization
 header，以及常见 password、token、cookie、API key、secret、private key、key path 字段，`strict` 还会处理 private key
 block、private host name 和 URL，`off` 返回原始内容并在 manifest 中记录 `enabled=false`，被处理的结果会返回
 `redacted=true` 和 `raw_available=true` ，JSONL manifest 会记录 redaction 元数据
+JSON 字段名按解码后的字符串语义识别，覆盖 Unicode 转义和内嵌转义 JSON；字段名中的字面反斜杠不会被反复解码
+替换沿用原文值的位置，非敏感文本和格式保持原样
 
-`output` 支持文件路径或目录，`tmp:relative/path` 写入受控临时目录，`cwd:relative/path`
-持久化到当前工作目录，未加前缀的相对路径也写入受控临时目录，以 `.jsonl`、`.json` 或 `.txt`
-等扩展名结尾时按文件处理，manifest 写在该文件旁边
+未加引号的赋值名称或命名参数使用有界 RHS 扫描，保留不含值字符串字面量的完整调用、属性链、下标和 lambda，例如
+`token = text(node, 1)`、`sorted(values, key=lambda x: x['durationNs'])` 和 `process_key = path.name.rsplit('.', 1)[0]`
+字符串例外按语法位置判断：下标中形如标识符的字段名，以及方法 `(分隔符, 整数)[下标]` 中只含标点的分隔符
+不使用函数名称白名单，不对代码块整体豁免
+普通字符串参数、返回字符串的 lambda、拼接、无法分类的表达式和超过 32 层的嵌套会遮蔽整个候选 RHS；未闭合或超深嵌套会覆盖剩余候选文本
+保留表达式后仍扫描内层敏感字段与 Authorization/Cookie，带引号的 JSON 键和结构化敏感字段保持整值脱敏
+这只是有限语法识别，纯文本 `token=foo(bar)` 无法证明值是代码还是凭证
+`off` 保留原文，各消息工具与导出共享这些规则，range 在全文脱敏判定后按原始 Unicode 坐标选取
+
+`output` 接受文件路径或目录，`tmp:relative/path` 写入受控临时目录，`cwd:relative/path` 持久化到当前工作目录；未加前缀的相对路径也写入受控临时目录。每次导出发布一个目录，包含正文、manifest 和图片。默认给目录名增加唯一后缀；显式文件名 `results.jsonl` 对应 `results.export-<唯一后缀>/results.jsonl`，设置 `overwrite=true` 后目标固定为 `results.export/results.jsonl`。要覆盖某次唯一文件导出，可将返回的正文路径作为 `output`，并设置 `overwrite=true`。search 的正文路径为 `output.results`，其他工具为 `output.content`；它们与 `output.manifest`、提供的 `output_path` 都是实际路径。只有 `overwrite=true`（CLI 为 `--overwrite`）才允许替换带归属标记的旧导出目录，不能覆盖无关目录。文件在目标目录同级暂存并同步后发布。覆盖过程被中断时，下次使用 `overwrite=true` 会恢复目录；其他进程留下的恢复记录须超过 30 秒，且能确认原进程已退出，否则返回 `output_busy`；新目录尚未发布则恢复旧目录，已确认发布则保留新目录并清理旧备份；状态无法确认时返回 `output_restore_failed`，不删除两个目录。Windows 输出路径拒绝 ADS、保留设备名、非法字符和末尾空格或点号；私有 ACL 创建或校验失败返回 `privacy_not_enforced_on_windows`。MCP 服务启动或首次使用临时输出时，只清理归属标记匹配、超过 24 小时且原进程已退出的临时会话，旧版目录、无标记目录及 `cwd:` 输出保留。成功导出到 `tmp:` 后，响应的 `output.retention` 给出清理条件；`cwd:` 响应不带该字段。每次临时会话最多 256 项、128 MiB
+
+搜索导出与内联结果使用相同过滤、时间排序和去重，导出最多 20,000 条、16 MiB；v2 manifest 记录实际条数、字节数、`complete` 和 `incomplete_reasons`。超过 8 MiB 的单行 JSONL 会跳过并计数；context 和 trace 的窗口超过 2,000 条或 32 MiB 时分别返回 `session_window_limit`、`session_window_memory_limit`，不缓存整个会话
 
 `slice` 按 Python 半开范围规则工作，在全部过滤和按时间排序后执行，`[-10:]` 返回最近 10 条匹配消息，`[-10:-1]`
 排除最新消息，最多返回 9 条，`max_total` 删除部分切片结果时，`next_query`
-会携带剩余范围对应的归一化正数 slice，连续续查不会离开原切片；预算无法容纳任何结果且 continuation 无法前进时返回
-`response_too_large`，不会重复返回同一个 slice
+会携带剩余范围对应的归一化正数 slice，连续续查不会离开原切片。分页也会保留 `lines`，包括排除范围和开放范围。预算无法容纳任何结果且
+continuation 无法前进时返回 `response_too_large`，不会重复返回同一个 slice
 
 `max_total` 统计 `history_search` 返回的紧凑 UTF-8 JSON 文本，不包含 JSON-RPC 和 MCP transport framing，响应会返回
 `serialized_bytes`、`max_total_bytes`、`limits_applied` 和 `complete`，导出的 JSONL 内容不受对话响应预算缩减，
@@ -171,11 +227,13 @@ block、private host name 和 URL，`off` 返回原始内容并在 manifest 中�
 | `ref`       | string | 必填，消息定位（session前8位:行号）                                               |
 | `range`     | string | Unicode 字符的半开范围（如 `0-100000`）                                           |
 | `output`    | string | 输出文件或目录（自动提取图片，相对路径默认走受控临时目录，持久化请显式写 `cwd:`） |
+| `overwrite` | bool   | 覆盖已存在且带归属标记的导出目录                                             |
 | `project`   | string | 项目 ID                                                                           |
 | `redaction` | string | `auto`、`strict` 或 `off`，默认 `auto`                                            |
 
 直接返回过大时会返回 `content_too_large`，包含 `content_size`、`valid_range`、`parsed_range`、`head`、`tail`、
-`range_suggestion` 和 `output_suggestion`
+`range_suggestion` 和 `output_suggestion`。range 使用原始消息的 Unicode 字符位置。auto 和 strict 会先检查完整消息，再渲染
+range，只要 range 与敏感值有交集就返回脱敏标记。`redaction=off` 返回对应的原始 range，包括完整 tool input
 
 ### history_context
 
@@ -190,22 +248,31 @@ block、private host name 和 URL，`off` 返回原始内容并在 manifest 中�
 | `types`          | string  | -       | 要包含的消息类型（逗号分隔）                              |
 | `subtypes`       | string  | -       | 要包含的消息子类型（逗号分隔）                            |
 | `project`        | string  | -       | 项目 ID                                                   |
-| `output`         | string  | -       | 导出选中上下文到文本文件，并返回 `output_path`            |
+| `output`         | string  | -       | 导出选中上下文并返回 `output_path`                        |
+| `overwrite`      | boolean | false   | 覆盖已存在且带归属标记的导出目录                          |
 | `redaction`      | string  | auto    | `auto`、`strict` 或 `off`                                 |
 | `max_content`    | number  | 4000    | 单条最大字符数                                            |
-| `max_total`      | number  | 40000   | 总最大字符数                                              |
+| `max_total`      | number  | 40000   | 完整紧凑 JSON 响应的 UTF-8 字节上限                       |
 | `pattern`        | string  | -       | 内容过滤 pattern，仅计数/返回匹配该 pattern 的消息        |
 | `regex`          | boolean | false   | 是否使用正则匹配                                          |
 | `case_sensitive` | boolean | false   | 是否区分大小写                                            |
 
-**说明**：锚点消息（由 `ref` 指定）始终包含在结果中，不受 `types` 和 `pattern` 过滤影响；设置 `pattern`
-后，`before`/`after` 的计数仅统计匹配该 pattern 的消息，合法 JSONL session metadata
-record 会被忽略且不产生解析警告，损坏 JSON 和不完整消息 record 仍会产生警告，`history_trace` 使用相同的 record 处理规则
+锚点消息（由 `ref` 指定）始终包含，`before`/`after` 只计数同时匹配 `types`、`subtypes` 和脱敏后 pattern 的消息
+两项计数均未指定时，context 扩展到 EOF；仅指定 `before` 时，`after` 为零
 
-ref 必须是非空 session prefix 加正整数行号，例如 `c86bc677:1234`。`direction` 仅支持 `forward` 或 `backward`，且只用于
-`until_type`。`until_type`
-只接受有效消息 type。范围模式三选一：`before`/`after`、`until_type`、`until_ref`。`until_type` 和 `until_ref`
-不能同时传入，也都不能与 `before`/`after` 同用
+局部 context 和 trace 查询支持超过 100000 条消息的会话，限制按选定跨度计算
+跨度内的全部有效消息，包括展示过滤排除的消息，都计入 2,000 条和 32 MiB 上限，超限分别返回
+`session_window_limit`、`session_window_memory_limit`
+诊断只涵盖已扫描前缀，不检查未扫描后缀；合法 JSONL session metadata record 不产生警告，损坏 JSON、不完整消息和超大行产生警告
+
+单条消息超过 `max_content` 或完整 UTF-8 JSON 响应超过 `max_total` 时返回 `truncated=true`
+连锚点与元数据也装不下时返回 `response_too_large`
+
+ref 必须是非空 session prefix 加正整数行号，例如 `c86bc677:1234`
+`direction` 仅支持 `forward` 或 `backward`，且只用于 `until_type`，`until_type` 只接受有效消息 type
+范围模式三选一：`before`/`after`、`until_type`、`until_ref`，不能混用
+`until_type` 包含指定方向最近的边界，不受展示过滤影响，不将锚点自身作为边界；没有边界时只选择锚点
+`until_ref` 双向包含两个端点，端点不存在时返回 `ref_not_found`
 
 ### history_trace
 
@@ -225,10 +292,11 @@ ref 必须是非空 session prefix 加正整数行号，例如 `c86bc677:1234`�
 | `until_type`     | string  | -       | 持续到指定消息类型                              |
 | `until_ref`      | string  | -       | 持续到同一 session 内的另一个 ref               |
 | `direction`      | string  | forward | `until_type` 的 forward/backward                |
-| `output`         | string  | -       | 导出选中 trace 到文本文件，并返回 `output_path` |
+| `output`         | string  | -       | 导出选中 trace 并返回 `output_path`            |
+| `overwrite`      | boolean | false   | 覆盖已存在且带归属标记的导出目录               |
 | `redaction`      | string  | auto    | `auto`、`strict` 或 `off`                       |
 | `max_content`    | number  | 4000    | 单条最大字符数                                  |
-| `max_total`      | number  | 40000   | messages 总最大字符数                           |
+| `max_total`      | number  | 40000   | 完整紧凑 JSON 响应的 UTF-8 字节上限            |
 
 `history_trace` 返回附近消息，并在 `tool_calls` 中列出识别到的 tool 调用和对应 tool_result，有 `tool_use_id`
 的 result 只匹配相同 ID；没有 ID 时先匹配 assistant parent UUID，再在仅有一个 pending
@@ -241,7 +309,8 @@ object，trace 导出使用同一份脱敏 preview。未设置 `until_type` 或 
 
 返回当前运行二进制的 package
 version、commit、target、profile、UTC 构建时间、dirty 状态和构建身份是否可复现，本地 dirty 构建不会标记为可复现，CLI 对应命令为
-`mcp-claude-history build-info`
+`mcp-claude-history build-info`，CLI 还支持 `mcp-claude-history --version`
+MCP redaction schema 列出 `auto`、`strict`、`off`，旧参数 `none` 和 `raw` 仍按 `off` 解析
 
 ## 使用示例
 
@@ -350,7 +419,9 @@ ref = session前8位:行号
 例如：c86bc677:1234
 ```
 
-session 前 8 位取自完整的 session ID（如 `c86bc677-9f5f-4e49-8e16-5e175a059610`）
+主 session 的 prefix 是完整 session ID 的前 8 位（如 `c86bc677-9f5f-4e49-8e16-5e175a059610`）。
+`agent-<id>` session 的规范 prefix 是去掉 `agent-` 后的前 8 位。`ref`、session 过滤和 `until_ref` 均接受规范 prefix 或完整
+session ID
 
 ## 许可证
 

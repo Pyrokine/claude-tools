@@ -42,9 +42,8 @@ impl Config {
     /// 获取当前项目 ID（从 CWD 推断）
     pub fn current_project_id(&self) -> Option<String> {
         let cwd = env::current_dir().ok()?;
-        let project_id = project_path_to_id(&cwd.to_string_lossy());
-
-        if self.projects_dir.join(&project_id).exists() {
+        let project_id = self.normalize_project_id(&cwd.to_string_lossy()).ok()?;
+        if self.projects_dir.join(&project_id).is_dir() {
             Some(project_id)
         } else {
             None
@@ -58,18 +57,30 @@ impl Config {
     }
 
     pub fn normalize_project_id(&self, raw: &str) -> Result<String, ErrorResponse> {
-        if validate_project_id(raw).is_ok() {
+        if validate_project_id(raw).is_ok() && self.projects_dir.join(raw).is_dir() {
             return Ok(raw.to_string());
         }
 
-        let normalized = project_path_to_id(raw);
+        let requested_path = normalize_input_path(raw);
+        let normalized = project_path_to_id(&requested_path);
         let candidates: Vec<_> = self
             .list_project_dirs()
-            .unwrap_or_default()
+            .map_err(|error| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("无法读取项目目录: {error}"),
+                available: None,
+            })?
             .into_iter()
             .filter_map(|(id, _)| {
                 let display = self.project_display_path(&id);
-                if id == normalized || (!display.approximate && display.path == raw) {
+                let id_matches = if cfg!(windows) || looks_like_windows_path(raw) {
+                    id.eq_ignore_ascii_case(&normalized) || id.eq_ignore_ascii_case(raw)
+                } else {
+                    id == normalized || id == raw
+                };
+                let path_matches =
+                    !display.approximate && paths_equal(&display.path, &requested_path, looks_like_windows_path(raw));
+                if id_matches || path_matches {
                     Some(serde_json::json!({
                         "id": id,
                         "path": display.path,
@@ -87,6 +98,11 @@ impl Config {
             return Ok(id.to_string());
         }
 
+        if candidates.is_empty() && validate_project_id(raw).is_ok() {
+            return Ok(raw.to_string());
+        }
+
+        let ambiguous = candidates.len() > 1;
         let mut available = serde_json::Map::new();
         available.insert(
             "candidate_project_id".to_string(),
@@ -99,8 +115,13 @@ impl Config {
         );
 
         Err(ErrorResponse {
-            error: "invalid_project_id".to_string(),
-            message: format!("project 参数既不是有效 project id，也不能唯一映射到已存在 project: {raw}"),
+            error: if ambiguous {
+                "project_ambiguous"
+            } else {
+                "invalid_project_id"
+            }
+            .to_string(),
+            message: format!("project 不能唯一映射到已存在 project: {raw}"),
             available: Some(serde_json::Value::Object(available)),
         })
     }
@@ -149,7 +170,77 @@ impl Config {
     }
 }
 
+fn looks_like_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with("\\\\")
+        || path.starts_with("//")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+fn normalize_input_path(raw: &str) -> String {
+    let path = if looks_like_windows_path(raw) {
+        let path = raw.replace('/', "\\");
+        if path
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("\\\\?\\UNC\\"))
+        {
+            format!("\\\\{}", &path[8..])
+        } else {
+            path.strip_prefix("\\\\?\\").unwrap_or(&path).to_string()
+        }
+    } else {
+        raw.to_string()
+    };
+    let canonical = fs::canonicalize(&path)
+        .map(|canonical| canonical.to_string_lossy().to_string())
+        .unwrap_or(path);
+    if let Some(rest) = canonical.strip_prefix("\\\\?\\") {
+        if rest.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\")) {
+            return format!("\\\\{}", &rest[4..]);
+        }
+        return rest.to_string();
+    }
+    canonical
+}
+
+fn paths_equal(left: &str, right: &str, windows_path: bool) -> bool {
+    if windows_path {
+        normalize_input_path(left).eq_ignore_ascii_case(&normalize_input_path(right))
+    } else {
+        normalize_input_path(left) == normalize_input_path(right)
+    }
+}
+
 fn resolve_existing_project_path(project_id: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(unc) = project_id.strip_prefix("--") {
+        let parts: Vec<_> = unc.split('-').collect();
+        let mut matches = Vec::new();
+        for server_end in 1..parts.len() {
+            let server = parts[..server_end].join("-");
+            if server.len() > 253 {
+                break;
+            }
+            for share_end in server_end + 1..=parts.len() {
+                let share = parts[server_end..share_end].join("-");
+                if share.len() > 255 {
+                    break;
+                }
+                let root = PathBuf::from(format!(r"\\{server}\{share}"));
+                if root.is_dir() {
+                    if share_end == parts.len() {
+                        matches.push(root);
+                    } else {
+                        resolve_path_components(&root, &parts[share_end..].join("-"), &mut matches);
+                    }
+                }
+                if matches.len() > 1 {
+                    return None;
+                }
+            }
+        }
+        return (matches.len() == 1).then(|| matches.remove(0));
+    }
     let (root, remaining) = project_root_and_remaining(project_id)?;
     if remaining.is_empty() {
         return None;
@@ -175,8 +266,20 @@ fn resolve_path_components(current: &Path, remaining: &str, matches: &mut Vec<Pa
         if encoded_name.is_empty() {
             continue;
         }
-        let next_remaining = if remaining == encoded_name {
+        let same_name = if cfg!(windows) {
+            remaining.eq_ignore_ascii_case(&encoded_name)
+        } else {
+            remaining == encoded_name
+        };
+        let next_remaining = if same_name {
             Some("")
+        } else if cfg!(windows)
+            && remaining.len() > encoded_name.len()
+            && remaining
+                .get(..encoded_name.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&encoded_name))
+        {
+            remaining[encoded_name.len()..].strip_prefix('-')
         } else {
             remaining
                 .strip_prefix(&encoded_name)
@@ -279,5 +382,55 @@ mod tests {
         let display = config.project_display_path(&project_id);
         assert!(display.approximate);
         assert_eq!(display.path, project_id_to_display_path(&project_id));
+    }
+
+    #[test]
+    fn windows_path_aliases_match_existing_ids_and_reject_ambiguity() {
+        let root = env::temp_dir().join(format!("mcp-project-alias-test-{}", process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        fs::create_dir_all(root.join("C--Work-Repo")).unwrap();
+        fs::create_dir_all(root.join("--Server-Share-Repo")).unwrap();
+        assert_eq!(config.normalize_project_id(r"c:\work\repo").unwrap(), "C--Work-Repo");
+        assert_eq!(
+            config.normalize_project_id("//server/share/repo").unwrap(),
+            "--Server-Share-Repo"
+        );
+        assert_eq!(
+            config.normalize_project_id(r"\\?\UNC\SERVER\SHARE\REPO").unwrap(),
+            "--Server-Share-Repo"
+        );
+
+        #[cfg(not(windows))]
+        {
+            fs::create_dir_all(root.join("c--work-repo")).unwrap();
+            assert_eq!(
+                config.normalize_project_id(r"c:\work\repo").unwrap_err().error,
+                "project_ambiguous"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_alias_is_canonicalized_before_project_lookup() {
+        let root = env::temp_dir().join(format!("mcp-project-canonical-test-{}", process::id()));
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        let id = project_path_to_id(&root.join("real").to_string_lossy());
+        fs::create_dir_all(root.join("projects").join(&id)).unwrap();
+        let config = Config {
+            projects_dir: root.join("projects"),
+        };
+        assert_eq!(
+            config
+                .normalize_project_id(&root.join("alias").to_string_lossy())
+                .unwrap(),
+            id
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
