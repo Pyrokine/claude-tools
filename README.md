@@ -1,31 +1,23 @@
 # claude-tools
 
-MCP tools for Claude Code / Claude Code MCP 工具集
+[中文](./README_zh.md)
 
-## Tools / 工具列表
+MCP servers and skills for Claude Code.
 
-| Tool                                           | Type       | Description                                                                 |
-|------------------------------------------------|------------|-----------------------------------------------------------------------------|
-| [mcp-ssh](./mcp-ssh)                           | MCP Server | SSH connection, command execution, file operations                          |
-| [mcp-chrome](./mcp-chrome)                     | MCP Server | Chrome browser automation (Extension + CDP)                                 |
-| [mcp-claude-history](./mcp-claude-history)     | MCP Server | Conversation history search                                                 |
-| [skill-elenchus](./skill-elenchus)             | Skill      | Multi-perspective dialectical analysis (code review + deep thinking)        |
-| [skill-cc-session-fix](./skill-cc-session-fix) | Skill      | Diagnose & repair Claude Code session jsonl (resume failures, wrong anchor) |
+## Tools
 
-| 工具                                           | 类型       | 功能                                                          |
-|------------------------------------------------|------------|---------------------------------------------------------------|
-| [mcp-ssh](./mcp-ssh)                           | MCP Server | SSH 远程连接、命令执行、文件操作                              |
-| [mcp-chrome](./mcp-chrome)                     | MCP Server | Chrome 浏览器自动化（Extension + CDP）                        |
-| [mcp-claude-history](./mcp-claude-history)     | MCP Server | 对话历史搜索                                                  |
-| [skill-elenchus](./skill-elenchus)             | Skill      | 辩证分析方法论（评审 + 深度思辨）                             |
-| [skill-cc-session-fix](./skill-cc-session-fix) | Skill      | Claude Code session jsonl 诊断与修复（resume 失败、恢复错位） |
+| Tool                                           | Type       | Description                                                                   |
+| ---------------------------------------------- | ---------- | ----------------------------------------------------------------------------- |
+| [mcp-claude-history](./mcp-claude-history)     | MCP Server | Search, inspect, and export conversation history                              |
+| [mcp-chrome](./mcp-chrome)                     | MCP Server | Chrome browser automation through Extension or CDP                            |
+| [mcp-ssh](./mcp-ssh)                           | MCP Server | SSH connections, command execution, and file transfers                        |
+| [skill-cc-session-fix](./skill-cc-session-fix) | Skill      | Diagnose and repair session JSONL files for resume failures and wrong anchors |
+| [skill-elenchus](./skill-elenchus)             | Skill      | Multi-perspective dialectical analysis for code review and reasoning          |
 
-## Installation / 安装
+## Installation
 
-TypeScript MCP servers require Node.js 20.19 or newer. Rust history server requires Rust 1.88 or the prebuilt release
-binary.
-
-TypeScript MCP Server 需要 Node.js 20.19 或更新版本。Rust history server 需要 Rust 1.88，或直接使用 Release 里的预编译二进制。
+The TypeScript MCP servers require Node.js 20.19 or newer. Build the history server with Rust 1.88 or newer, or use a
+prebuilt release binary.
 
 ### mcp-ssh
 
@@ -45,20 +37,28 @@ npm root -g
 For Extension mode, open `chrome://extensions/`, enable Developer mode, click "Load unpacked", and select
 `<npm-root>/@pyrokine/mcp-chrome/extension/dist`.
 
-Extension 模式需要打开 `chrome://extensions/`，启用开发者模式，点击“加载已解压的扩展程序”，选择
-`<npm-root>/@pyrokine/mcp-chrome/extension/dist`。
-
 ### mcp-claude-history
 
-Download the latest binary from [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases), then configure
-Claude Code:
+Download a binary from [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases), place it on `PATH`, and
+configure Claude Code:
 
 ```bash
 claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 ```
 
-下载 [GitHub Releases](https://github.com/Pyrokine/claude-tools/releases) 里的最新二进制后，按上面的命令配置 Claude Code。
+Each subdirectory README includes source build instructions and client-specific JSON configuration.
 
-See each subdirectory README for source builds and client-specific JSON configuration.
+## Major-version migration
 
-源码构建和其他 MCP 客户端 JSON 配置见各子目录 README。
+Module versions are independent of the repository release tag.
+
+- **mcp-chrome 3.0**: `manage(action="closePage")` requires `targetId`. Adopt existing browser tabs before operating on
+  them; supplying `targetId` alone does not grant page-reading permission. Relative output paths use session-owned
+  `tmp:` storage; use `cwd:` for persistent output.
+- **mcp-ssh 3.0**: `maxOutputSize` and PTY `bufferSize` measure raw UTF-8 bytes. Apply byte budgets when consuming
+  output and inspect truncation metadata. PTY raw reads report counters before clearing the buffer.
+- **mcp-claude-history 2.0**: Exports use unique bundle directories and manifest v2. Read the actual paths returned by
+  the tool instead of assuming that `output` is a single file. `max_total` limits the UTF-8 bytes of the final compact
+  JSON response.
+
+See the module READMEs for parameter contracts and migration examples.

@@ -1,5 +1,130 @@
 # Changelog
 
+## v1.17.0 - Unreleased
+
+## Versions
+
+- mcp-claude-history: 1.9.2 → 2.0.0
+- mcp-chrome: 2.4.4 → 3.0.0
+- mcp-chrome Extension: 2.4.4 → 3.0.0
+- mcp-ssh: 2.4.3 → 3.0.0
+
+## What's Changed
+
+### mcp-claude-history
+
+- breaking: Create a unique bundle for each export and use manifest v2; consumers must use the returned output paths
+- breaking: Apply `max_total` to the final compact JSON response in UTF-8 bytes and report `serialized_bytes`
+- fix: Match local and full MCP tool names together without excluding local tools or mixing server/tool pairs;
+  preserve full names in effective filters and continuation queries
+- fix: Read local context and trace windows in sessions above 100,000 messages while retaining selected-span limits,
+  redaction, tool association, and export semantics
+- fix: Redact Unicode-escaped sensitive JSON keys while preserving original character ranges and literal backslash keys
+- fix: Separate message completeness from tool attribution; capacity and read gaps make match counts inexact in every
+  search mode
+- fix: Report attempted files and unscanned files separately, and reduce coverage metadata before discarding search
+  matches
+- fix: Preserve bounded code expressions during text redaction while masking sensitive literal arguments and incomplete expressions
+- fix: Echo `subagents` in effective filters and document matching by each main or agent file's own session ID
+- fix: Recalculate the complete export quota after concurrent directory removal, with bounded retries and visible failure
+
+### mcp-chrome
+
+- breaking: Require an explicit `targetId` for `closePage`; selecting a target does not grant access to an existing user
+  page
+- feat: Add `expectedUrl` and `expectedRevision` checks to page actions and return `pageContext` with the affected
+  target and before/after state
+- fix: Preserve completed actions and original errors when restoring a temporary target fails; report restoration
+  separately and clear stale CDP attachment state
+- fix: Keep target selection, action execution and page snapshots in one request scope; format asynchronous
+  browse/manage failures consistently
+- fix: Resolve stale iframe contexts only under the explicit read-only retry contract, and report browser error pages
+  and unavailable navigation history
+- fix: Fix Extension content reads and iframe selection failing on unserializable injection arguments; preserve URL
+  authorization checks and explicit zero-valued options
+- fix: Keep RPC transport time separate from default page-load waits when creating, navigating or refreshing a page
+- fix: Enforce screenshot/output budgets and private Windows output permissions; retain background automatic Extension
+  connection
+- fix: Restore CDP role lookup, state text, offscreen input focus, editor targets, and repeated key events
+- fix: Apply force and coverage checks to click variants, reject force without an element target, and honor humanized click movement
+- fix: Apply mobile density and touch emulation in CDP, and keep injected User-Agent reads current after browser overrides
+- fix: Use page dispatch for same-page challenge buttons and immediate scrolling before reading challenge click coordinates
+- fix: Wait for CSS-hidden CDP elements to become visible without failing on an unavailable box model
+
+### mcp-ssh
+
+- breaking: Measure `maxOutputSize` and PTY `bufferSize` in raw UTF-8 bytes; raw reads report counts before clearing the
+  buffer
+- feat: Support explicit Windows remote platform, shell and path conventions with bounded transfer verification
+- fix: Check Windows upload name collisions before SFTP or rsync writes using the target directory's case rules
+- fix: Reject zero-progress text pages and invalid EOF encodings; compute line-range metadata from returned bytes
+- fix: Honor `IdentityAgent none` across config inheritance, jump hosts, reconnect and external rsync without
+  environment-agent fallback
+- fix: Preserve transfer targets and report cleanup/timeout uncertainty; retain the operation-start timeout test
+  stability change
+
+### Dependencies and documentation
+
+- chore: Update the existing MCP SDK to 1.32.1 and compatible security revisions; `braces` 3.0.3 remains an affected
+  development dependency without a patched release
+- docs: Add a separate root Chinese README and synchronize module migration notes and reusable regression guidance
+
+---
+
+## 版本
+
+- mcp-claude-history: 1.9.2 → 2.0.0
+- mcp-chrome: 2.4.4 → 3.0.0
+- mcp-chrome Extension: 2.4.4 → 3.0.0
+- mcp-ssh: 2.4.3 → 3.0.0
+
+## 更新内容
+
+### mcp-claude-history
+
+- breaking: 每次导出创建独立 bundle 并使用 manifest v2，调用方使用响应返回的 output 路径
+- breaking: `max_total` 按最终紧凑 JSON 的 UTF-8 字节数限制，返回 `serialized_bytes`
+- fix: 混合查询本地与完整 MCP 工具名时保留本地结果和 server/tool 配对，有效过滤条件与续查保留完整名称
+- fix: 支持在超过 100000 条消息的会话中读取局部 context 和 trace，保留选定跨度限制、脱敏、工具关联与导出语义
+- fix: 脱敏 Unicode 转义的敏感 JSON key，保留原文字符范围和字面反斜杠字段的语义
+- fix: 分别报告正文完整性与工具归因，容量和读取缺口使各搜索模式的命中计数标为非精确
+- fix: 分别列出已尝试扫描和未扫描文件，响应预算先缩减 coverage，保留命中消息
+- fix: 文本脱敏保留有限语法内的代码表达式，敏感字面量参数和不完整表达式仍整体遮蔽
+- fix: 有效过滤条件回显 `subagents`，明确主文件与 agent 文件按各自 session ID 匹配
+- fix: 并发删除导出目录时重新计算完整配额，重试有上限，仍无法读取时返回错误
+
+### mcp-chrome
+
+- breaking: `closePage` 必须显式传 `targetId`，选择目标不授予已有用户页面的访问权限
+- feat: 页面动作支持 `expectedUrl` 和 `expectedRevision`，`pageContext` 返回实际目标及动作前后状态
+- fix: 临时目标恢复失败时保留已完成动作和原错误，单独报告恢复状态，清除失效的 CDP 附着状态
+- fix: 目标选择、动作和页面快照使用同一请求作用域，browse/manage 的异步失败使用统一错误格式
+- fix: 只有显式只读重试允许重新解析 stale iframe context，明确报告浏览器错误页及不可用的导航历史
+- fix: 修复 Extension 内容读取和 iframe 定位因注入参数不可序列化而失败，保留 URL 授权校验和显式零值参数
+- fix: 创建、导航和刷新页面时，为默认加载等待保留 RPC 传输时间，避免请求提前超时
+- fix: 限制截图与输出预算，校验 Windows 输出权限，保留 Extension 后台自动连接
+- fix: 恢复 CDP 角色定位、状态文本、视口外输入聚焦、编辑器目标和长按重复事件
+- fix: 点击各分支执行 force 与遮挡检查，无元素 target 时拒绝 force，humanize 点击执行鼠标移动
+- fix: CDP 设备模拟设置像素密度与触摸能力，注入的 User-Agent 读取随浏览器覆盖值更新
+- fix: 同页模拟挑战按钮使用页面点击，读取挑战点击坐标前立即完成滚动
+- fix: CDP 等待 CSS 隐藏元素变为可见时，不再因缺少 box model 提前失败
+
+### mcp-ssh
+
+- breaking: `maxOutputSize` 和 PTY `bufferSize` 按原始 UTF-8 字节计算，raw 读取返回清理前计数
+- feat: 支持显式 Windows 远端平台、shell 和路径格式，对传输校验设置边界
+- fix: SFTP 和 rsync 写入前按目标目录的大小写规则检查 Windows 上传名称碰撞
+- fix: 拒绝零进度文本分页和 EOF 无效编码，行范围 metadata 按实际返回字节计算
+- fix: `IdentityAgent none` 在配置继承、跳板机、重连和外部 rsync 中保持禁用，不使用环境 agent
+- fix: 保留传输目标，明确报告清理与超时的未知状态，保留 operation start timeout 测试稳定性改动
+
+### 依赖和文档
+
+- chore: 更新现有 MCP SDK 至 1.32.1 及兼容的安全修订，`braces` 3.0.3 开发依赖仍受公告影响且没有修订版本
+- docs: 新增独立的根中文 README，同步模块迁移说明和可复用回归指导
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.16.2...v1.17.0
+
 ## v1.16.2 - 2026-09-10
 
 ## Versions
