@@ -17,6 +17,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { devices, formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import type { CacheType } from '../core/types.js'
+import { withPageResponse } from './page-context.js'
+import { pageConditionSchema } from './schema.js'
 
 function invalidArgument(
     message: string,
@@ -58,9 +60,11 @@ function formatAffectedResponse(
 }
 
 const manageSchema = z.object({
+    ...pageConditionSchema,
     action: z
         .enum([
             'newPage',
+            'pageMetadata',
             'closePage',
             'adoptPage',
             'releasePage',
@@ -114,6 +118,8 @@ const manageSchema = z.object({
     height: z.number().optional().describe('视口高度（viewport）'),
     userAgent: z.string().optional().describe('User-Agent 字符串（userAgent）'),
     device: z.string().optional().describe('设备名称（emulate），如 iPhone 13, iPad Pro'),
+    taskHint: z.string().max(120).nullable().optional().describe('pageMetadata：任务提示，null 清除'),
+    note: z.string().max(1000).nullable().optional().describe('pageMetadata：页面备注，null 清除'),
 })
 
 type ManageArgs = z.infer<typeof manageSchema>
@@ -134,18 +140,88 @@ async function handleManage(args: ManageArgs): Promise<ManageResponse> {
     try {
         const unifiedSession = getUnifiedSession()
         const mode = unifiedSession.getMode()
-        return await manageHandlers[args.action]({ unifiedSession, mode }, args)
+        const handler = async () => manageHandlers[args.action]({ unifiedSession, mode }, args)
+        const pageActions: ManageArgs['action'][] = [
+            'closePage',
+            'adoptPage',
+            'releasePage',
+            'movePage',
+            'reorderPage',
+            'pinPage',
+            'unpinPage',
+            'activatePage',
+            'viewport',
+            'userAgent',
+            'emulate',
+            'stealth',
+            'cdp',
+        ]
+        const conditional = args.expectedUrl !== undefined || args.expectedRevision !== undefined
+        if (args.action === 'newPage' && args.targetId) {
+            return invalidArgument('newPage 创建新页面，不接受已有 targetId')
+        }
+        if (conditional && !pageActions.includes(args.action)) {
+            return invalidArgument(`${args.action} 不支持页面条件，未执行操作`)
+        }
+        if (
+            conditional &&
+            args.action === 'cdp' &&
+            (!args.cdpMethod || /^(Target|Browser|SystemInfo|DeviceAccess|IO)\./.test(args.cdpMethod))
+        ) {
+            return invalidArgument('browser-level CDP 命令不支持页面条件，未执行操作')
+        }
+        const targetSelectionActions: ManageArgs['action'][] = ['viewport', 'userAgent', 'emulate', 'stealth', 'cdp']
+        const run = () =>
+            conditional
+                ? targetSelectionActions.includes(args.action)
+                    ? unifiedSession.withTabId(args.targetId, () => unifiedSession.withPageCondition(args, handler))
+                    : unifiedSession.withPageCondition(args, handler)
+                : handler()
+        if (
+            pageActions.includes(args.action) ||
+            ['newPage', 'newWindow', 'pageMetadata', 'clearCache'].includes(args.action)
+        ) {
+            return await withPageResponse(
+                unifiedSession,
+                args.targetId,
+                run,
+                args.action === 'newPage' || args.action === 'newWindow'
+            )
+        }
+        return await run()
     } catch (error) {
         return formatErrorResponse(error)
     }
 }
 
-async function handleNewPage({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+async function handleNewPage({ unifiedSession }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
     const target = await unifiedSession.newPage(args.url)
-    return formatResponse({ success: true, action: 'newPage', target, mode })
+    return formatResponse({
+        success: true,
+        action: 'newPage',
+        target,
+        createdTargetId: target.targetId,
+        metadata: unifiedSession.getPageMetadata(target.targetId),
+        mode: unifiedSession.getMode(),
+    })
+}
+
+async function handlePageMetadata({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (!args.targetId) {
+        return invalidArgument('pageMetadata 需要 targetId 参数')
+    }
+    await unifiedSession.getPageSnapshot(args.targetId)
+    const metadata =
+        args.taskHint !== undefined || args.note !== undefined
+            ? await unifiedSession.setPageMetadata(args.targetId, { taskHint: args.taskHint, note: args.note })
+            : unifiedSession.getPageMetadata(args.targetId)
+    return formatResponse({ success: true, action: 'pageMetadata', targetId: args.targetId, mode, metadata })
 }
 
 async function handleClosePage({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (!args.targetId) {
+        return invalidArgument('closePage 需要 targetId 参数，未关闭页面')
+    }
     const affected = await unifiedSession.closePage(args.targetId)
     return formatResponse({
         success: true,
@@ -267,7 +343,13 @@ async function handleNewWindow({ unifiedSession, mode }: ManageContext, args: Ma
         height: args.height,
         state: args.windowState,
     })
-    return formatAffectedResponse('newWindow', mode, affected)
+    return formatResponse({
+        success: true,
+        action: 'newWindow',
+        mode,
+        affected,
+        createdTargetId: affected.targetId ?? null,
+    })
 }
 
 async function handleCloseWindow({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
@@ -279,7 +361,7 @@ async function handleCloseWindow({ unifiedSession, mode }: ManageContext, args: 
 }
 
 async function handleClearCache({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
-    return unifiedSession.withTabId(undefined, async () => {
+    return unifiedSession.withTabId(args.targetId, async () => {
         const cacheType = (args.cacheType ?? 'all') as CacheType
         if (mode === 'extension') {
             return {
@@ -311,30 +393,25 @@ async function handleClearCache({ unifiedSession, mode }: ManageContext, args: M
 }
 
 async function handleViewport({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
-    return unifiedSession.withTabId(undefined, async () => {
+    return unifiedSession.withTabId(args.targetId, async () => {
         if (args.width === undefined || args.height === undefined) {
             return invalidArgument('设置视口需要 width 和 height 参数')
         }
-        if (mode === 'extension') {
-            await unifiedSession.sendCdpCommand('Emulation.setDeviceMetricsOverride', {
-                width: args.width,
-                height: args.height,
-                deviceScaleFactor: 1,
-                mobile: false,
-            })
-            await unifiedSession.sendCdpCommand('Emulation.setPageScaleFactor', { pageScaleFactor: 1 })
-            await unifiedSession.sendCdpCommand('Emulation.setTouchEmulationEnabled', { enabled: false })
-        } else {
-            const session = getSession()
-            await session.setViewport(args.width, args.height)
-        }
+        await unifiedSession.sendCdpCommand('Emulation.setDeviceMetricsOverride', {
+            width: args.width,
+            height: args.height,
+            deviceScaleFactor: 1,
+            mobile: false,
+        })
+        await unifiedSession.sendCdpCommand('Emulation.setPageScaleFactor', { pageScaleFactor: 1 })
+        await unifiedSession.sendCdpCommand('Emulation.setTouchEmulationEnabled', { enabled: false })
         await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))')
         return formatResponse({ success: true, action: 'viewport', width: args.width, height: args.height, mode })
     })
 }
 
 async function handleUserAgent({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
-    return unifiedSession.withTabId(undefined, async () => {
+    return unifiedSession.withTabId(args.targetId, async () => {
         if (!args.userAgent) {
             return invalidArgument('设置 User-Agent 需要 userAgent 参数')
         }
@@ -366,7 +443,7 @@ function handleInputMode({ unifiedSession, mode }: ManageContext, args: ManageAr
 }
 
 async function handleEmulate({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
-    return unifiedSession.withTabId(undefined, async () => {
+    return unifiedSession.withTabId(args.targetId, async () => {
         if (!args.device) {
             return formatResponse({ success: true, action: 'emulate', availableDevices: Object.keys(devices) })
         }
@@ -374,24 +451,18 @@ async function handleEmulate({ unifiedSession, mode }: ManageContext, args: Mana
         if (!device) {
             return invalidArgument(`未知设备: ${args.device}`, `可用设备: ${Object.keys(devices).join(', ')}`)
         }
-        if (mode === 'extension') {
-            await unifiedSession.sendCdpCommand('Emulation.setDeviceMetricsOverride', {
-                width: device.viewport.width,
-                height: device.viewport.height,
-                deviceScaleFactor: device.viewport.deviceScaleFactor || 1,
-                mobile: device.viewport.isMobile || false,
-            })
-            await unifiedSession.sendCdpCommand('Emulation.setPageScaleFactor', { pageScaleFactor: 1 })
-            await unifiedSession.sendCdpCommand('Emulation.setTouchEmulationEnabled', {
-                enabled: device.viewport.hasTouch,
-                maxTouchPoints: device.viewport.hasTouch ? 1 : 0,
-            })
-            await unifiedSession.sendCdpCommand('Emulation.setUserAgentOverride', { userAgent: device.userAgent })
-        } else {
-            const session = getSession()
-            await session.setViewport(device.viewport.width, device.viewport.height)
-            await session.setUserAgent(device.userAgent)
-        }
+        await unifiedSession.sendCdpCommand('Emulation.setDeviceMetricsOverride', {
+            width: device.viewport.width,
+            height: device.viewport.height,
+            deviceScaleFactor: device.viewport.deviceScaleFactor || 1,
+            mobile: device.viewport.isMobile || false,
+        })
+        await unifiedSession.sendCdpCommand('Emulation.setPageScaleFactor', { pageScaleFactor: 1 })
+        await unifiedSession.sendCdpCommand('Emulation.setTouchEmulationEnabled', {
+            enabled: device.viewport.hasTouch,
+            maxTouchPoints: device.viewport.hasTouch ? 1 : 0,
+        })
+        await unifiedSession.sendCdpCommand('Emulation.setUserAgentOverride', { userAgent: device.userAgent })
         await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))')
         return formatResponse({
             success: true,
@@ -403,15 +474,15 @@ async function handleEmulate({ unifiedSession, mode }: ManageContext, args: Mana
     })
 }
 
-async function handleStealth({ unifiedSession, mode }: ManageContext): Promise<ManageResponse> {
-    return unifiedSession.withTabId(undefined, async () => {
+async function handleStealth({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    return unifiedSession.withTabId(args.targetId, async () => {
         await unifiedSession.injectStealth()
         return formatResponse({ success: true, action: 'stealth', mode, note: '已注入反检测脚本' })
     })
 }
 
 async function handleCdp({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
-    return unifiedSession.withTabId(undefined, async () => {
+    return unifiedSession.withTabId(args.targetId, async () => {
         if (!args.cdpMethod) {
             return invalidArgument(
                 '缺少 cdpMethod 参数',
@@ -453,6 +524,7 @@ async function handleCdp({ unifiedSession, mode }: ManageContext, args: ManageAr
 
 const manageHandlers: Record<ManageArgs['action'], ManageHandler> = {
     newPage: handleNewPage,
+    pageMetadata: handlePageMetadata,
     closePage: handleClosePage,
     adoptPage: handleAdoptPage,
     releasePage: handleReleasePage,

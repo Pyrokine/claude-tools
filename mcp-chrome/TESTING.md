@@ -27,8 +27,8 @@ Code 会话内由 agent 按用例 ID 顺序执行；所有必跑用例 PASS，�
 - 所有浏览操作保持 `activated=false` 并在后台执行；常规回归不调用
   `browse activate=true`、`manage activatePage`、`manage focusWindow` 或 `manage newWindow`
 - 清理只针对测试 tab 和 `mcp_test_*` 前缀的 cookie，严禁 `cookies clear` 无过滤
-- output 相对路径默认写入 mcp-chrome 受控临时目录；需要保留在仓库内时使用 `cwd:test-output/...`，跑前确认 `test-output`
-  存在，跑后可清空
+- output 相对路径默认写入当前 server 会话的受控临时目录；需要保留在仓库内时使用 `cwd:test-output/...`，跑前确认
+  `test-output` 存在，跑后仅清理本次用例创建的文件
 
 ### 0.2 测试载体
 
@@ -91,6 +91,41 @@ for each tool chapter:
 - `err-stealth-commands-01`
 
 FAIL 时只需报 ID + 失败断言即可
+
+### 0.7 隔离自动回归
+
+无需连接真实浏览器的行为回归使用以下命令：
+
+```bash
+npm test
+npm run test:extension
+```
+
+验收标准：
+
+- server smoke 必须通过 SDK stdio transport 完成 initialize 和 tools/list，并精确返回
+  `browse`、`input`、`extract`、`wait`、`cookies`、`logs`、`evaluate`、`manage` 八个工具
+- Extension 创建、导航和刷新在默认 30 秒页面等待之外保留 5 秒 RPC 传输余量，显式 `timeout=0`
+  不替换成默认值；导航错误原样返回，不重放动作
+- CDP 导航只接受当前主 frame loader 的目标生命周期事件；同文档 `networkidle`
+  必须等待导航后发起的请求结束并持续静默 500ms
+- Extension 跨文档导航只接受本次主文档的 `documentId`；同文档导航还必须匹配动作前的 `documentId`
+  和规范化后的目标 URL；事件先完成后 action 失败仍须返回 action 错误
+- Extension evaluate 必须等待 Promise；显式 timeout 到期后，未完成的 Promise 返回 `Evaluation timeout after <N>ms`
+- Chrome scripting 注入参数必须可 JSON 序列化，普通读取和 iframe 定位不传入 `undefined`；分别验证缺省参数、
+  `matchIndex=0` 和 `timeout=0`，未指定 URL 时允许读取，实际 URL 不匹配时仍拒绝读取
+- 连接策略变化必须立即取消 health check、CONNECTING WebSocket 和重连 timer；旧 socket 的 close 不能删除同端口的新连接
+- fallback console 并发读取必须按 tab 串行并原子清空注入缓冲；Service
+  Worker 重启后 debugger 恢复仍须卸载旧 hook，同一日志不重复，页面后装的 console wrapper 不被覆盖
+- 超过 60 秒但未收到 `loadingFinished` 或 `loadingFailed` 的请求仍保持 pending；容量丢失或 debugger
+  detach 后，`networkidle` 必须保持 timeout，直到新 root Document 开始或 tab cleanup
+- PNG 解码必须拒绝重复 IHDR、IEND 后附加 chunk、超量解压和 scanline 缺失，并保留合法 RGB/RGBA 输入
+- `tmp:` 输出位于带归属标记的单次 server 会话目录，超过 256 项或 128 MiB 时拒绝写入；成功写入 `tmp:` 的响应包含
+  `retention` 清理条件，`cwd:`
+  响应不包含；启动清理只删除归属已确认、超过 24 小时且所属进程已退出的会话，不删除旧版文件或 `cwd:` 文件
+- 输出路径中的 Windows
+  ADS、保留设备名、非法字符及组件末尾空格/点号必须在创建目录前被拒绝；Windows 上文件内容写入前必须验证私有 DACL，缺少 PowerShell 或校验失败时返回
+  `privacy_not_enforced_on_windows`
 
 ---
 
@@ -200,7 +235,8 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：`browse { action: "back" }`
 - 断言：`success=true`，当前 URL 回到 `#page-a`
 - 载体：test-page
-- 备注：`chrome.tabs.goBack` 在 `chrome.tabs.update` 产生的历史栈上可能失败，实现里用 `history.back()` fallback
+- 备注：`chrome.tabs.goBack` 明确返回无历史错误时，只在可注入且非错误页的文档上尝试
+  `history.back()`；其他原生错误不触发脚本
 
 ### browse-forward-01
 
@@ -208,6 +244,24 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：`browse { action: "forward" }`
 - 断言：`success=true`，当前 URL 回到 `#page-b`
 - 载体：test-page
+
+### browse-history-errors-01
+
+- 载体：Extension handler 单测，`npm run test:extension`
+- 操作：对 back/forward 分别模拟普通页及 `chrome://`
+  页的原生导航成功、无历史、普通原生错误；无历史分支覆盖普通文档、`chrome://`、浏览器错误页、不存在的主 frame 和注入时文档变为错误页
+- 断言：原生成功不注入脚本；仅明确无历史且文档可注入时执行一次页面历史；受限 URL、错误页和不存在的主 frame 不注入，无历史返回
+  `navigated=false`；其他原生失败保留原错误；注入拒绝保持失败，失败后定时器和导航监听立即清理
+
+### extension-operation-errors-01
+
+- 载体：Extension handler 单测，`npm run test:extension`
+- 操作：让 `debugger_send` 返回 `Cannot find context with specified id`；对
+  `get_text`、`viewport_metrics`、`challenge_inspect` 和截图尺寸预读分别模拟注入 Promise 拒绝，覆盖
+  `Frame with ID 0 is showing error page` 与 `Cannot access a chrome:// URL`；每个入口重复普通程序异常负例
+- 断言：这些浏览器条件均抛出
+  `ExpectedOperationError`，保留错误消息，每次只执行一次调用、不返回假成功；截图尺寸预读失败后不附加 debugger；后台按既有策略记录 warning 并发送失败响应，真实程序异常保留原错误对象
+- 实际浏览器验收：只在受控测试页制造导航竞态或网络错误，检查失败响应和 Extension console，不在用户页面上操作
 
 ### browse-refresh-01
 
@@ -506,13 +560,16 @@ FAIL 时只需报 ID + 失败断言即可
     3. `logs type=console` 读取 T2 的唯一 warning
     4. `extract type=text` 读取 T2 独有文本
 - 断言：input 返回 `mode === "extension"` 且 post-condition
-  matched，wait、logs、extract 都命中 T2；T1 的 title、输入值和页面文本不变；每项操作后分别对 T1、T2 提取目标元素并截图，确认没有切换或写错 tab
+  matched，wait、logs、extract 都命中 T2；T1 的 title、输入值和页面文本不变；每项操作后分别对 T1、T2 提取目标元素，确认没有改变默认目标或写错 tab
+- 截图条件：仅在两个测试页均具备可用 compositor
+  frame 时增加截图核验；后台 Extension 页明确返回不可见错误时记录原因，不激活用户页面，目标隔离断言仍必须执行
 - 载体：两个 test-page managed tab
 - 清理：关闭 T1、T2
 
 ### evaluate-diagnostics-01
 
-- 操作：`evaluate { script: "console.warn('mcp_diag_warn'); fetch('/mcp_diag_404')", diagnostics: true }`
+- 前置：自有 HTTP 测试页面的 `/mcp_diag_404` 明确返回 404
+- 操作：`evaluate { script: "(async () => { console.warn('mcp_diag_warn'); const response = await fetch('/mcp_diag_404'); await response.text(); return response.status })()", diagnostics: true }`
 - 断言：返回 `diagnostics.console` 含 warning，`diagnostics.failedRequests` 含失败请求摘要
 - 载体：test-page
 
@@ -534,25 +591,25 @@ FAIL 时只需报 ID + 失败断言即可
 - 操作：`extract { type: "text" }`
 - 断言：
     - `success=true`
-    - `result` 字符串包含 "MCP Chrome 测试页面"、"ID 定位按钮"、"拖拽我"
+    - `content` 字符串包含 "MCP Chrome 测试页面"、"ID 定位按钮"、"拖拽我"
 - 载体：test-page
 
 ### extract-text-02-css
 
 - 操作：`extract { type: "text", target: { css: "#btn-id" } }`
-- 断言：`result === "ID 定位按钮"`
+- 断言：`content === "ID 定位按钮"`
 - 载体：test-page
 
 ### extract-text-03-role
 
 - 操作：`extract { type: "text", target: { role: "button", name: "TestId 定位按钮" } }`
-- 断言：`result === "TestId 定位按钮"`
+- 断言：`content === "TestId 定位按钮"`
 - 载体：test-page
 
 ### extract-text-04-text
 
 - 操作：`extract { type: "text", target: { text: "文本链接测试" } }`
-- 断言：`result` 包含 "文本链接测试"
+- 断言：`content` 包含 "文本链接测试"
 - 载体：test-page
 
 ### extract-text-05-label
@@ -582,13 +639,13 @@ FAIL 时只需报 ID + 失败断言即可
 ### extract-text-09-testid
 
 - 操作：`extract { type: "text", target: { testId: "test-button" } }`
-- 断言：`result === "TestId 定位按钮"`
+- 断言：`content === "TestId 定位按钮"`
 - 载体：test-page
 
 ### extract-text-10-xpath
 
 - 操作：`extract { type: "text", target: { xpath: "//button[@id='btn-id']" } }`
-- 断言：`result === "ID 定位按钮"`
+- 断言：`content === "ID 定位按钮"`
 - 载体：test-page
 
 ### extract-text-11-nth
@@ -601,7 +658,7 @@ FAIL 时只需报 ID + 失败断言即可
 ### extract-text-12-css-text-combo
 
 - 操作：`extract { type: "text", target: { css: "button", text: "单击测试" } }`
-- 断言：`result === "单击测试"`
+- 断言：`content === "单击测试"`
 - 载体：test-page
 
 ### extract-text-13-coords
@@ -619,19 +676,19 @@ FAIL 时只需报 ID + 失败断言即可
     ```
 
 - 操作：`extract { type: "text", target: { x: <X>, y: <Y> } }`
-- 断言：`result === "ID 定位按钮"`
+- 断言：`content === "ID 定位按钮"`
 - 载体：test-page
 
 ### extract-html-01-whole
 
 - 操作：`extract { type: "html" }`
-- 断言：`result` 含 `<html`、`<body`、`id="btn-id"`
+- 断言：`content` 含 `<html`、`<body`、`id="btn-id"`
 - 载体：test-page
 
 ### extract-html-02-element
 
 - 操作：`extract { type: "html", target: { css: "#btn-id" } }`
-- 断言：`result` 以 `<button` 开头，含 `id="btn-id"`
+- 断言：`content` 以 `<button` 开头，含 `id="btn-id"`
 - 载体：test-page
 
 ### extract-html-03-images-info
@@ -652,13 +709,13 @@ FAIL 时只需报 ID + 失败断言即可
 ### extract-attribute-01
 
 - 操作：`extract { type: "attribute", target: { css: "#test-link" }, attribute: "href" }`
-- 断言：`result === "https://example.com"`
+- 断言：`value === "https://example.com"`
 - 载体：test-page
 
 ### extract-attribute-02-not-found
 
 - 操作：`extract { type: "attribute", target: { css: "#btn-id" }, attribute: "data-nonexistent" }`
-- 断言：`result === null` 或空字符串（按实现）
+- 断言：`value === null`
 - 载体：test-page
 
 ### extract-screenshot-01-viewport
@@ -787,7 +844,7 @@ FAIL 时只需报 ID + 失败断言即可
 ### extract-frame-01
 
 - 操作：`extract { type: "text", target: { css: "#frame-btn" }, frame: "iframe#test-frame" }`
-- 断言：`result === "Frame Button"`
+- 断言：`content === "Frame Button"`
 - 载体：test-page
 
 ### extract-frameHtml-01
@@ -848,7 +905,7 @@ FAIL 时只需报 ID + 失败断言即可
 ### input-click-08-force
 
 - 前置：test-page region 12 应有一个被遮挡的 button（z-index overlay）
-- 操作：`input { events: [{type:"click", target:{css:"#covered-btn"}, force:true}] }`
+- 操作：`input { events: [{type:"click", target:{css:"#covered-btn"}, force:true, forceReason:"验证覆盖层下按钮的强制点击行为"}] }`
 - 断言：click 触发（跳过 actionability 检查）
 
 ### input-click-08-actionability-diagnostics
@@ -1173,8 +1230,9 @@ FAIL 时只需报 ID + 失败断言即可
 ### input-timeout-01
 
 - 操作：`input { timeout: 500, events: [{type:"click", target:{css:"#nonexistent"}}] }`
-- 断言：在 500ms+ε 内抛错，错误 `code` 为 `TARGET_NOT_FOUND` 或 timeout 类错误，`context` 含
-  `target/matchCount/nth/page.activeElement/page.selection/page.candidates`
+- 断言：在 500ms+ε 内抛错；Extension 返回 `TARGET_NOT_FOUND` 或 timeout 类错误，未找到目标时 `context` 含
+  `locator/matchCount/nth/currentUrl/candidates`；CDP 保留 `ELEMENT_NOT_FOUND` 及 `target/timeout/url` 诊断
+- 两端均验证 `eventsExecuted=0`、`actionExecuted=false`，计时记录工具执行时间，另列传输开销
 
 ---
 
@@ -1369,9 +1427,13 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### manage-emulate-01-iphone
 
+- 前置：记录测试页的 UA 和视口尺寸；页面含 `width=device-width` 的 viewport meta
 - 操作：`manage { action:"emulate", device:"iPhone 13" }`
-- 断言：`evaluate "navigator.userAgent"` 含 "iPhone"，`navigator.maxTouchPoints` 为 1，`visualViewport.width` 与
-  `document.documentElement.clientWidth` 约 390
+- 断言：`evaluate "navigator.userAgent"` 含 "iPhone"，`navigator.maxTouchPoints` 为 1，`devicePixelRatio`
+  为 3，`visualViewport.width` 与 `document.documentElement.clientWidth` 约 390
+- 恢复：调用 `manage viewport` 恢复原尺寸，验证
+  `devicePixelRatio=1`、`navigator.maxTouchPoints=0`；UA 仍为 iPhone，再调用 `manage userAgent` 恢复原 UA
+- 覆盖：分别验证 Extension 与 CDP
 
 ### manage-emulate-02-list
 
@@ -1381,10 +1443,12 @@ FAIL 时只需报 ID + 失败断言即可
 ### manage-inputMode-01
 
 - 操作：`manage { action:"inputMode", inputMode:"stealth" }`
-- 断言：`success=true`，`currentMode="stealth"`；随后 `manage inputMode` 无参返回 "stealth"
+- 断言：设置返回 `success=true`、`inputMode="stealth"`；随后 `manage { action:"inputMode" }` 返回
+  `currentMode="stealth"`
 
 ### manage-stealth-01
 
+- 前置：Extension 模式，CDP 的注入等级在 `browse connect/launch` 时设置
 - 操作：`manage { action:"stealth", stealth:"safe" }`（反检测等级切换）
 - 断言：`success=true`
 
@@ -1396,6 +1460,8 @@ FAIL 时只需报 ID + 失败断言即可
 ---
 
 ## 8. wait
+
+计时用例在同一调用进程内用单调时钟记录 MCP 请求发送与响应接收时间；保留实际测量值和传输开销，参数回显不作为耗时证据，两个手工工具调用之间的间隔不计入工具执行时间
 
 ### wait-time-01
 
@@ -1412,16 +1478,19 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### wait-idle-02-timeout
 
-- 前置：attach test-page，执行 evaluate 创建 Web Worker，每 50ms 更新一次 `#burst-mutation-target`，2s 后停止
+- 前置：attach test-page，执行 evaluate 创建 Web Worker，每 50ms 更新一次
+  `#burst-mutation-target`，最多 60s 后停止；记录最后一次 mutation 时间，覆盖工具调用间隔
 - 操作：`wait { for:"idle", ms:500, timeout:1200 }`
 - 断言：返回 timeout 错误，消息包含 `DOM 未达到 500ms 静默`
+- 清理：取得结果后立即终止该 Worker，验证等待期间 mutation 未停止
 - 载体：test-page
 
 ### wait-element-01-visible
 
-- 前置：attach test-page，click "5 秒后显示元素" 按钮
+- 前置：刷新本任务 test-page，确认 `#show-later-target` 为 `display:none`，click "5 秒后显示元素" 按钮后立即发送 wait
 - 操作：`wait { for:"element", target:{css:"#show-later-target"}, state:"visible", timeout:6000 }`
-- 断言：在约 5s 后返回成功
+- 断言：在约 5s 后返回成功，CDP 不因隐藏元素没有 box model 提前失败；CDP 另验 `visibility:hidden/collapse`
+  与零尺寸不满足 visible，hidden 状态立即成功
 - 载体：test-page
 
 ### wait-element-02-hidden
@@ -1541,7 +1610,7 @@ FAIL 时只需报 ID + 失败断言即可
 
 - 前置：attach 到 test-page
 - 操作：`extract { type:"screenshot", diffOutput:"tmp:diff.png" }`
-- 断言：返回 `INVALID_ARGUMENT`，消息包含 `diffOutput 需要 compareWith`
+- 断言：SDK 参数校验返回 JSON-RPC `-32602`，消息包含 `diffOutput 需要 compareWith`，不执行截图
 - 载体：test-page
 
 ### manage-clearCache-extension-01
@@ -1608,13 +1677,17 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### err-output-outside-allowed-roots-01
 
-- 操作：`evaluate { script:"'x'", output:"/etc/passwd" }`
-- 断言：抛错，消息含允许范围或 outside
+- 前置：在仓库与 MCP 会话临时根目录之外创建本次测试专用目录和无害文本文件，记录内容与 hash
+- 操作：`evaluate { script:"'x'", output:"<测试文件的绝对路径>" }`
+- 断言：抛错，消息含允许范围或 outside；文件内容和 hash 未变
+- 清理：只删除本次测试创建的目录和文件
 
 ### err-scriptFile-outside-allowed-roots-01
 
-- 操作：`evaluate { scriptFile:"/etc/passwd" }`
+- 前置：在允许根目录之外创建本次测试专用文件，内容为 `1+1`
+- 操作：`evaluate { scriptFile:"<测试文件的绝对路径>" }`
 - 断言：抛错，路径越界拒绝
+- 清理：只删除本次测试创建的目录和文件
 
 ### err-drag-no-source-01
 
@@ -1624,7 +1697,7 @@ FAIL 时只需报 ID + 失败断言即可
 ### err-iframe-offset-01
 
 - 前置：attach test-page，region 10 的 iframe#test-frame
-- 操作：`input { events:[{type:"click", target:{css:"#frame-btn"}, frame:"iframe#test-frame"}] }`
+- 操作：`input { frame:"iframe#test-frame", events:[{type:"click", target:{css:"#frame-btn"}}] }`
 - 断言：iframe 内的 `#frame-btn` textContent 变为 "Clicked"（iframe 坐标 offset 正确处理）
 - 载体：test-page
 
@@ -1759,3 +1832,98 @@ test-page.html 现有 region（供用例引用）：
   `originResponsePending=true`；隐藏成功文案和仍显示的 Turnstile 勾选框不算过盾，也不把目标页写成已加载
 
 无需浏览器的聚焦测试执行 `npm test`，真实 MCP runtime 回归仍需按本文件用例顺序在受控测试 tab 中执行
+
+## 页面恢复与响应错误专项
+
+聚焦自动化用例位于 `test/finding-regressions.test.js` 的 C-R1/C-R2/C-R3，运行
+`npm test`，模拟 driver 的证据只验证服务器作用域和响应，不代替真实浏览器回归
+
+### page-restoration-01
+
+- 前置：隔离测试环境有默认页 A 和显式目标 B，并可对恢复阶段的 `listTargets`、`selectPage`、detach 注入失败
+- 操作：分别在 Extension/CDP 执行 B 的动作，覆盖恢复成功、列表查询失败、重新选择失败、A 在动作期间关闭、原先无默认目标，以及主动作和恢复同时失败
+- 断言：主结果或原错误保留，`pageContext.targetRestoration` 分别报告 `restored`、`failed`、`previous_target_closed` 或
+  `cleared`；恢复失败后默认目标为 null，CDP
+  detach 失败也不残留 session/target；下一缺省调用不使用 B，不携带上一请求的恢复信息
+
+### page-restoration-input-01
+
+- 前置：隔离测试页有可观测的输入计数，默认页 A 与目标 B 分开
+- 操作：对 B 输入一次并让恢复查询失败；再分别在输入完成、部分事件完成及派发超时后注入外层清理失败
+- 断言：输入只派发一次，已完成结果保持 `actionExecuted=true` 与 `actionStatus=completed`；部分与 `unknown`
+  状态不报成功，`eventsExecuted` 反映完成事件数，响应不泄露输入文本
+
+### page-context-concurrency-01
+
+- 前置：默认页 A、显式页 B 与持久目标 C，动作可用 Promise 门控制完成时机
+- 操作：暂停 B 的显式动作并提交缺省动作；恢复后检查二者响应；再分别暂停 `browse attach` 与 `manage adoptPage`
+  选择 C，并提交缺省动作
+- 断言：第一组缺省动作及 before/after 都属于 A，默认目标前后为 A；第二组缺省动作及快照属于 C，持久选择响应的默认目标由 A 变为 C；同一请求嵌套不死锁，`creatingPage`
+  的 created/reused/unconfirmed 语义保留
+
+### page-response-errors-01
+
+- 前置：独立测试页的当前 URL/revision 已记录
+- 操作：通过公开注册 callback 对 `browse refresh` 与 `manage closePage` 分别提交旧 revision、无读取授权和已消失目标；对
+  `manage` 非页面 handler 注入异步拒绝
+- 断言：响应保持结构化 `error.code` 和 `pageContext`，旧 revision 错误包含
+  `actualUrl`/`actualRevision`，拒绝前不发生输入或关闭；非页面 handler 使用既有错误格式，异步 rejection 不泄漏为纯文本
+
+## Windows 兼容与页面授权专项
+
+以下用例只使用新建的独立测试页。不得导航、关闭或激活用户原有 Tab；C4 的授权负例只在独立测试 Chrome
+profile 中执行。无需浏览器的回归由 `npm test` 和 `npm run test:extension` 覆盖；Windows 原生行为只有在 Windows
+runner/主机实际执行后才算完成。
+
+### win-page-target-01（C1、C2）
+
+- 前置：在独立 Extension 测试环境创建 T1/T2，默认目标保持 T1；在独立 CDP 测试环境创建 P1/P2
+- 操作：分别用 `evaluate`、`extract`、`input`、`wait`、`logs` 的 `targetId=T2/P2` 读取或修改测试页；随后
+  `browse list`；再传旧版 `tabId`，以及同时传入冲突的 `tabId`/`targetId`
+- 断言：两种 backend 都命中显式目标，不改变浏览器焦点与默认目标；响应 `pageContext`
+  列出实际 ID、来源、操作前后 URL/revision、默认目标前后状态；动作失败的响应也包含
+  `pageContext`，但目标状态读取失败时前后快照为 null；Extension 报告 Chrome 活动目标，CDP 标记为 unavailable；冲突 ID 在执行前被拒绝
+- 负例：`browse close` 和 `manage closePage` 缺少 targetId 时均不关闭页面；指定 ID 只关闭指定的测试页
+
+### win-page-condition-01（C3）
+
+- 前置：在独立测试页记录 `browse list` 的 URL/revision，并保存输入框原始值
+- 操作：对 `input` 和 `evaluate` 传不匹配的 `expectedUrl` 或过期 `expectedRevision`；对
+  `browse back/forward/refresh/close` 与可用的 `manage` 页面动作重复负例；最后用新快照执行多事件 input
+- 断言：不匹配时返回 `ACTION_PRECONDITION_FAILED`，响应的
+  `error.context.actionExecuted=false`（input/evaluate 顶层同时返回
+  `actionExecuted=false`、`actionStatus=not_started`），输入框、导航历史和测试页均未变化；匹配时首个变更动作执行，多事件不因自身 revision 增加而中止；导航或操作后获取的新 revision 与旧值不同
+- 说明：revision 不覆盖网页自主的所有 DOM 修改；服务进程或 Extension Service Worker 重启后旧 epoch 必须失效
+
+### win-read-grant-01（C4）
+
+- 前置：只在隔离 Chrome profile 中创建普通测试页 U 和由 Extension 创建的 T，保持 U 为活动 Tab，Extension
+  popup 已连接两个测试服务器实例
+- 操作：授权前用 U 的 targetId 尝试普通读取；在 popup 仅向服务器 A 授予 U 的只读权限；分别通过服务器 A/B 对 U 执行带 target 的 text、HTML（含 images=info）、attribute、computed:color、state 提取及 JS、截图、输入；重启 Service
+  Worker 后读取同一文档，再导航 U 并重复读取
+- 断言：授权前两台服务器均不能读取；授权后仅 A 可做普通读取，含 CSS+text、XPath、坐标和 nth 定位；找不到 state 目标时不能返回整页；B 仍被拒绝；JS/debugger、截图、输入及写动作不因授权开放；同一连接和文档保持不变时 Service
+  Worker 重启仍可读取，导航和关闭后权限失效；对 U 调用 adoptPage 不等于读取授权；T 可按原有受控页行为操作
+- 限制：popup 必须由使用者在隔离测试环境中操作；Cookie 工具的独立作用范围按现有过滤规则测试，不把 popup 授权当成 Cookie 权限
+
+### win-page-metadata-01（C5）
+
+- 前置：新建独立测试页 T，并从 `browse list` 获取 ID
+- 操作：调用 `manage(pageMetadata, targetId=T, taskHint="demo", note="test")`，再次读取并关闭 T
+- 断言：列表与元数据响应显示创建时间、创建来源和最近使用时间；`taskHint/note`
+  可读取与清除；关闭后清理，不参与页面读取权限判定；服务器重启后进程内元数据不声称持久化
+
+### win-chrome-launch-01（C6；仅 Windows）
+
+- 前置：Windows 主机上可用 Chrome 或 Chromium；准备独立的无登录 profile
+- 操作：分别核查 App Paths、PATH、已安装 Chrome channels、Chrome for
+  Testing 与受控便携目录的可执行文件发现；在 PowerShell 使用
+  `scripts/start-chrome.ps1 -Port 9222 -ProfileDir <独立目录>`，随后对受控 CDP 端口调用 `browse connect`
+- 断言：找到正确可执行文件；带空格路径可启动并连接；Chrome 收到 signal 而提前退出时立即报告信号及 stderr，不等待通用超时；清理独立测试进程和 profile
+
+### win-screenshot-budget-01（C7）
+
+- 前置：独立受控测试页，准备超过 25 MiB 的测试 PNG 基准文件与可截取的安全小区域
+- 操作：分别请求超过单边 16,384、总计 12,000,000 像素或 48
+  MiB 估算内存的截图；传入超大 PNG 基准；最后对小区域执行截图和比较
+- 断言：尺寸超预算在 capture 前拒绝，超大基准在读取和解码前返回
+  `baseline PNG 超过 26214400 字节`；普通截图与对比使用同一预算；小区域截图及 PNG 对比正常

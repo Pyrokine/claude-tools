@@ -5,7 +5,7 @@
  */
 
 import { ExpectedOperationError } from '../types/expected-errors'
-import type { ActionContext } from './action-utils'
+import { assertCreatedTab, getTargetTabId, type ActionContext } from './action-utils'
 import { ContentHandler } from './content-handler'
 import { CookieHandler } from './cookie-handler'
 import { DebuggerHandler } from './debugger-handler'
@@ -14,14 +14,83 @@ import { FrameResolver } from './frame-resolver'
 import { InputEventHandler } from './input-event-handler'
 import { LogEventHandler } from './log-event-handler'
 import { LogManager } from './log-manager'
+import { advancePageRevision, assertPageCondition, forgetPageRevision, pageSnapshot } from './page-revision'
 import { NavigationHandler } from './navigation-handler'
 import { StealthHandler } from './stealth-handler'
 import { TabHandler } from './tab-handler'
 
 type ActionFunction = (params: unknown, context: ActionContext) => Promise<unknown>
 
+const PAGE_MUTATIONS = new Set([
+    'tabs_close',
+    'tabs_activate',
+    'tabs_activate_managed',
+    'tabs_adopt',
+    'tabs_release',
+    'tabs_move',
+    'tabs_reorder',
+    'tabs_pin',
+    'navigate',
+    'go_back',
+    'go_forward',
+    'reload',
+    'click',
+    'actionable_click',
+    'dispatch_input',
+    'drag_and_drop',
+    'type',
+    'scroll',
+    'evaluate',
+    'evaluate_in_frame',
+    'debugger_send',
+    'input_key',
+    'input_mouse',
+    'input_touch',
+    'input_type',
+    'stealth_click',
+    'stealth_type',
+    'stealth_key',
+    'stealth_mouse',
+    'stealth_inject',
+])
+
+const CREATED_PAGE_ONLY = new Set([
+    'screenshot',
+    'evaluate',
+    'evaluate_in_frame',
+    'challenge_inspect',
+    'viewport_metrics',
+    'debugger_attach',
+    'debugger_detach',
+    'debugger_send',
+    'input_key',
+    'input_mouse',
+    'input_touch',
+    'input_type',
+    'stealth_click',
+    'stealth_type',
+    'stealth_key',
+    'stealth_mouse',
+    'stealth_inject',
+    'click',
+    'actionable_click',
+    'dispatch_input',
+    'drag_and_drop',
+    'type',
+    'scroll',
+    'check_actionability',
+    'console_enable',
+    'console_get',
+    'console_clear',
+    'network_enable',
+    'network_get',
+    'network_clear',
+    'network_challenge_state',
+])
+
 export class ActionHandler {
     private actions: Map<string, ActionFunction> = new Map()
+    private actionLocks = new Map<number, Promise<void>>()
     private logManager = new LogManager()
     private debuggerManager = new DebuggerManager(this.logManager)
     private navigationHandler = new NavigationHandler(this.logManager)
@@ -51,6 +120,45 @@ export class ActionHandler {
                 })
             )
         }
+        if (PAGE_MUTATIONS.has(action)) {
+            const request = params as { tabId?: number; expectedUrl?: string; expectedRevision?: string } | null
+            const tabId = await getTargetTabId(request?.tabId)
+            const previous = this.actionLocks.get(tabId) ?? Promise.resolve()
+            const operation = previous
+                .catch(() => {})
+                .then(async () => {
+                    await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
+                    if (CREATED_PAGE_ONLY.has(action)) {
+                        await assertCreatedTab(tabId, action)
+                    }
+                    try {
+                        const result = await handler(params, context)
+                        if (action === 'tabs_close') {
+                            forgetPageRevision(tabId)
+                        }
+                        return result
+                    } finally {
+                        if (action !== 'tabs_close') {
+                            advancePageRevision(tabId)
+                        }
+                    }
+                })
+            const settled = operation.then(
+                () => {},
+                () => {}
+            )
+            this.actionLocks.set(tabId, settled)
+            try {
+                return await operation
+            } finally {
+                if (this.actionLocks.get(tabId) === settled) {
+                    this.actionLocks.delete(tabId)
+                }
+            }
+        }
+        if (CREATED_PAGE_ONLY.has(action)) {
+            await assertCreatedTab(await getTargetTabId((params as { tabId?: number } | null)?.tabId), action)
+        }
         return handler(params, context)
     }
 
@@ -65,6 +173,13 @@ export class ActionHandler {
 
     private registerActions() {
         // Tab 操作
+        this.actions.set('page_snapshot', async (params) => {
+            const tabId = (params as { tabId?: number } | null)?.tabId
+            if (!Number.isSafeInteger(tabId) || tabId! < 0) {
+                throw new ExpectedOperationError('page_snapshot 需要有效 tabId')
+            }
+            return pageSnapshot(tabId!)
+        })
         this.actions.set('tabs_list', this.tabHandler.tabsList.bind(this.tabHandler))
         this.actions.set('tabs_topology', this.tabHandler.tabsTopology.bind(this.tabHandler))
         this.actions.set('tabs_create', this.tabHandler.tabsCreate.bind(this.tabHandler))

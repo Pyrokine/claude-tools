@@ -16,6 +16,7 @@ export interface TabInfo {
     incognito: boolean
     managed: boolean // 是否属于 MCP Chrome 分组
     status: string
+    revision?: string
 }
 
 export interface ManagedTabChangeResult {
@@ -135,6 +136,7 @@ export interface DisconnectMessage {
 
 export interface GetStatusMessage {
     type: 'GET_STATUS'
+    tabId?: number
 }
 
 export interface SetPairingTokenMessage {
@@ -144,6 +146,13 @@ export interface SetPairingTokenMessage {
 
 export interface SetAllowInsecureNoTokenMessage {
     type: 'SET_ALLOW_INSECURE_NO_TOKEN'
+    allow: boolean
+}
+
+export interface SetReadAccessMessage {
+    type: 'SET_READ_ACCESS'
+    port: number
+    tabId: number
     allow: boolean
 }
 
@@ -160,6 +169,7 @@ export type InternalMessage =
     | GetStatusMessage
     | SetPairingTokenMessage
     | SetAllowInsecureNoTokenMessage
+    | SetReadAccessMessage
     | FrameProbeMessage
 
 // ==================== Debugger (CDP) 操作 ====================

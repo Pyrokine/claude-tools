@@ -87,7 +87,7 @@ export class DebuggerManager {
                 return
             }
             this.cleanupTab(source.tabId)
-            this.logManager.cleanupTab(source.tabId)
+            this.logManager.handleDebuggerDetach(source.tabId)
             console.log(`[MCP] Debugger detached from tab ${source.tabId}: ${reason}`)
         })
 

@@ -29,6 +29,38 @@ import { type ExtensionConnectionInfo, ExtensionHttpServer } from './http-server
 const RPC_MARGIN = 5000
 /** goBack/goForward 信号窗口（毫秒）：Extension 等待导航开始的上限 */
 const NAV_SIGNAL_WINDOW = 5000
+const CONDITIONAL_ACTIONS = new Set([
+    'tabs_close',
+    'tabs_activate',
+    'tabs_activate_managed',
+    'tabs_adopt',
+    'tabs_release',
+    'tabs_move',
+    'tabs_reorder',
+    'tabs_pin',
+    'navigate',
+    'go_back',
+    'go_forward',
+    'reload',
+    'click',
+    'actionable_click',
+    'dispatch_input',
+    'drag_and_drop',
+    'type',
+    'scroll',
+    'evaluate',
+    'evaluate_in_frame',
+    'debugger_send',
+    'input_key',
+    'input_mouse',
+    'input_touch',
+    'input_type',
+    'stealth_click',
+    'stealth_type',
+    'stealth_key',
+    'stealth_mouse',
+    'stealth_inject',
+])
 
 interface SimplePageState {
     url: string
@@ -48,6 +80,7 @@ interface ExtensionTabSummary {
     incognito?: boolean
     managed?: boolean
     status?: string
+    revision?: string
 }
 
 interface ExtensionManagedPageResult {
@@ -75,26 +108,32 @@ export class ExtensionBridge implements IBrowserDriver {
     private currentTabId: number | null = null
     private currentFrameId: number = 0
     private state: SimplePageState | null = null
+    private pendingPageCondition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null = null
 
     constructor(options: ExtensionBridgeOptions = {}) {
         this.httpServer = new ExtensionHttpServer({
             port: options.port,
             autoPort: true,
         })
+        this.httpServer.setActionConditionProvider((action, params) => {
+            const condition = this.pendingPageCondition
+            if (!condition || !CONDITIONAL_ACTIONS.has(action)) {
+                return undefined
+            }
+            const tabId = (params as { tabId?: number } | null)?.tabId
+            if (tabId === undefined || String(tabId) !== condition.targetId) {
+                throw new DriverCapabilityError('条件动作的目标与请求目标不一致，未执行动作')
+            }
+            this.pendingPageCondition = null
+            return {
+                ...(condition.expectedUrl !== undefined ? { expectedUrl: condition.expectedUrl } : {}),
+                ...(condition.expectedRevision !== undefined ? { expectedRevision: condition.expectedRevision } : {}),
+            }
+        })
     }
 
     async start(): Promise<void> {
         await this.httpServer.start()
-
-        // Extension 重连后自动恢复 attach 状态
-        this.httpServer.on('connected', () => {
-            if (this.currentTabId !== null) {
-                const tabId = this.currentTabId
-                this.httpServer.sendCommand('debugger_attach', { tabId }).catch((err: Error) => {
-                    console.error('[Bridge] 重连后 debugger re-attach 失败:', err.message)
-                })
-            }
-        })
     }
 
     async stop(): Promise<void> {
@@ -154,7 +193,7 @@ export class ExtensionBridge implements IBrowserDriver {
         url?: string,
         timeout?: number
     ): Promise<{ id: number; url: string; title: string; managed?: boolean }> {
-        const rpcTimeout = timeout !== undefined ? timeout + RPC_MARGIN : undefined
+        const rpcTimeout = (timeout ?? 30000) + RPC_MARGIN
         const result = await this.httpServer.sendCommand(
             'tabs_create',
             {
@@ -193,13 +232,12 @@ export class ExtensionBridge implements IBrowserDriver {
         return this.normalizePageChange(result)
     }
 
-    /** IBrowserDriver 接口：关闭页面（targetId 是 chrome tab id 的字符串形式，省略时关闭当前 tab） */
-    async closePage(targetId?: string): Promise<PageManagementResult> {
-        const tabId = targetId !== undefined ? this.parseTargetId(targetId) : this.currentTabId
-        if (tabId === null) {
-            throw new DriverCapabilityError('没有可关闭的页面，请指定 targetId')
+    /** IBrowserDriver 接口：只能关闭明确指定的 tab */
+    async closePage(targetId: string): Promise<PageManagementResult> {
+        if (!targetId) {
+            throw new DriverCapabilityError('closePage 需要显式 targetId，未关闭页面')
         }
-        return this.closeTab(tabId)
+        return this.closeTab(this.parseTargetId(targetId))
     }
 
     async adoptPage(targetId: string): Promise<ManagedPageResult> {
@@ -334,6 +372,18 @@ export class ExtensionBridge implements IBrowserDriver {
         return this.currentTabId !== null ? String(this.currentTabId) : null
     }
 
+    getPageSnapshot(targetId: string): Promise<{ targetId: string; url: string; revision: string }> {
+        return this.httpServer.sendCommand('page_snapshot', { tabId: this.parseTargetId(targetId) }) as Promise<{
+            targetId: string
+            url: string
+            revision: string
+        }>
+    }
+
+    setPageCondition(condition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null): void {
+        this.pendingPageCondition = condition
+    }
+
     /** IBrowserDriver 接口：设置当前操作目标 ID */
     setCurrentTargetId(targetId: string | null): void {
         this.currentTabId = targetId !== null ? this.parseTargetId(targetId) : null
@@ -346,7 +396,7 @@ export class ExtensionBridge implements IBrowserDriver {
         if (this.currentTabId === null) {
             throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
         }
-        const rpcTimeout = options?.timeout !== undefined ? options.timeout + RPC_MARGIN : undefined
+        const rpcTimeout = (options?.timeout ?? 30000) + RPC_MARGIN
         const params = {
             tabId: this.requireCurrentTabId(),
             url,
@@ -409,7 +459,7 @@ export class ExtensionBridge implements IBrowserDriver {
         if (this.currentTabId === null) {
             throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
         }
-        const rpcTimeout = timeout !== undefined ? timeout + RPC_MARGIN : undefined
+        const rpcTimeout = (timeout ?? 30000) + RPC_MARGIN
         const params = {
             tabId: this.requireCurrentTabId(),
             ignoreCache,
@@ -564,7 +614,9 @@ export class ExtensionBridge implements IBrowserDriver {
         selector?: string,
         text?: string,
         xpath?: string,
-        timeout?: number
+        timeout?: number,
+        point?: { x: number; y: number },
+        matchIndex?: number
     ): Promise<
         Array<{
             refId: string
@@ -581,6 +633,8 @@ export class ExtensionBridge implements IBrowserDriver {
                 selector,
                 text,
                 xpath,
+                point,
+                matchIndex,
             },
             timeout
         )) as Array<{
@@ -591,21 +645,23 @@ export class ExtensionBridge implements IBrowserDriver {
         }>
     }
 
-    async getText(selector?: string): Promise<string> {
+    async getText(selector?: string, refId?: string): Promise<string> {
         const result = (await this.httpServer.sendCommand('get_text', {
             tabId: this.requireCurrentTabId(),
             frameId: this.currentFrameId || undefined,
             selector,
+            refId,
         })) as { text: string }
         return result.text
     }
 
-    async getHtml(selector?: string, outer = true): Promise<string> {
+    async getHtml(selector?: string, outer = true, refId?: string): Promise<string> {
         const result = (await this.httpServer.sendCommand('get_html', {
             tabId: this.requireCurrentTabId(),
             frameId: this.currentFrameId || undefined,
             selector,
             outer,
+            refId,
         })) as { html: string }
         return result.html
     }
@@ -652,7 +708,8 @@ export class ExtensionBridge implements IBrowserDriver {
 
     async getHtmlWithImages(
         selector?: string,
-        outer = true
+        outer = true,
+        refId?: string
     ): Promise<{
         html: string
         images: Array<{
@@ -671,6 +728,7 @@ export class ExtensionBridge implements IBrowserDriver {
             frameId: this.currentFrameId || undefined,
             selector,
             outer,
+            refId,
         })) as {
             html: string
             images: Array<{
@@ -1150,8 +1208,11 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     private parseTargetId(targetId: string): number {
-        const parsed = parseInt(targetId, 10)
-        if (isNaN(parsed)) {
+        if (!/^(0|[1-9]\d*)$/.test(targetId)) {
+            throw new DriverCapabilityError(`无效的 Tab ID: ${targetId}`)
+        }
+        const parsed = Number(targetId)
+        if (!Number.isSafeInteger(parsed)) {
             throw new DriverCapabilityError(`无效的 Tab ID: ${targetId}`)
         }
         return parsed
@@ -1172,6 +1233,7 @@ export class ExtensionBridge implements IBrowserDriver {
             incognito: tab.incognito,
             managed: tab.managed,
             status: tab.status,
+            revision: tab.revision,
         }
     }
 

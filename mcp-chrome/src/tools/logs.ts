@@ -20,6 +20,8 @@ import {
     writePrivateFile,
 } from '../core/index.js'
 import { sanitizeUrlRecord, sanitizeUrlRecords } from './network-sanitizer.js'
+import { withPageContext } from './page-context.js'
+import { pageTargetIdSchema, resolvePageTargetId } from './schema.js'
 
 /**
  * logs 参数 schema
@@ -34,12 +36,8 @@ const logsSchema = z.object({
         .string()
         .optional()
         .describe(`输出文件路径，相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}`),
-    tabId: z
-        .string()
-        .optional()
-        .describe(
-            '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
-        ),
+    targetId: pageTargetIdSchema.describe('目标页面 ID（Extension 或 CDP），优先于默认操作目标'),
+    tabId: pageTargetIdSchema.describe('旧版目标 Tab ID，与 targetId 相同语义，保留兼容'),
 })
 
 const DEFAULT_LOG_LIMIT = 100
@@ -142,7 +140,7 @@ async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
         const unifiedSession = getUnifiedSession()
         const responseLimit = args.limit ?? DEFAULT_LOG_LIMIT
 
-        return await unifiedSession.withTabId(args.tabId, async () => {
+        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
             const mode = unifiedSession.getMode()
             switch (args.type) {
                 case 'console': {

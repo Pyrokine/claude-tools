@@ -4,10 +4,10 @@
  * 负责启动 Chrome 浏览器进程并获取 CDP 端点
  */
 
-import { ChildProcess, spawn } from 'child_process'
+import { ChildProcess, spawn, spawnSync } from 'child_process'
 import { existsSync, mkdirSync } from 'fs'
 import { homedir, platform } from 'os'
-import { join } from 'path'
+import { join, win32 } from 'path'
 import { BrowserNotFoundError, TimeoutError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT, type LaunchOptions } from '../core/types.js'
 
@@ -31,26 +31,74 @@ const CHROME_PATHS: Record<string, string[]> = {
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         '/Applications/Chromium.app/Contents/MacOS/Chromium',
     ],
-    win32: [
-        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-        ...(process.env.LOCALAPPDATA ? [`${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`] : []),
-    ],
+    win32: [],
 }
 
 /**
  * 查找 Chrome 可执行文件
  */
-export function findChrome(): string | null {
-    const paths = CHROME_PATHS[platform()] ?? []
+const WINDOWS_CHANNELS = [
+    'Google\\Chrome\\Application\\chrome.exe',
+    'Google\\Chrome Beta\\Application\\chrome.exe',
+    'Google\\Chrome Dev\\Application\\chrome.exe',
+    'Google\\Chrome SxS\\Application\\chrome.exe',
+    'Chromium\\Application\\chrome.exe',
+    'Google\\Chrome for Testing\\chrome-win64\\chrome.exe',
+    'Google\\Chrome for Testing\\chrome-win32\\chrome.exe',
+]
 
-    for (const p of paths) {
-        if (existsSync(p)) {
-            return p
+/** Windows App Paths is consulted by ShellExecute, not by Node spawn; query it explicitly. */
+function readWindowsAppPaths(): string[] {
+    const paths: string[] = []
+    for (const hive of ['HKCU', 'HKLM']) {
+        for (const view of ['32', '64']) {
+            for (const name of ['chrome.exe', 'chromium.exe']) {
+                const key = `${hive}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${name}`
+                const result = spawnSync('reg.exe', ['query', key, '/ve', `/reg:${view}`], {
+                    encoding: 'utf8',
+                    windowsHide: true,
+                    timeout: 2000,
+                })
+                if (result.status === 0) {
+                    const value = result.stdout.match(/REG_(?:EXPAND_)?SZ\s+([^\r\n]+)/i)?.[1]?.trim()
+                    if (value) {
+                        paths.push(value.replace(/%([^%]+)%/g, (raw, key: string) => process.env[key] ?? raw))
+                    }
+                }
+            }
         }
     }
+    return paths
+}
 
-    return null
+/** Injectable candidates keep Windows discovery testable without a Windows host. */
+export function windowsChromeCandidates(
+    env: NodeJS.ProcessEnv = process.env,
+    registryPaths: string[] = readWindowsAppPaths()
+): string[] {
+    const roots = [env.PROGRAMFILES, env['PROGRAMFILES(X86)'], env.LOCALAPPDATA].filter(
+        (value): value is string => !!value
+    )
+    const pathEntries = (env.Path ?? env.PATH ?? '').split(';').filter(Boolean)
+    const portableRoots = [
+        env.MCP_CHROME_PORTABLE_DIR,
+        win32.join(env.USERPROFILE ?? homedir(), '.mcp-chrome', 'portable'),
+    ].filter((value): value is string => !!value)
+    return [
+        ...registryPaths,
+        ...pathEntries.flatMap((dir) => ['chrome.exe', 'chromium.exe'].map((name) => win32.join(dir, name))),
+        ...roots.flatMap((root) => WINDOWS_CHANNELS.map((channel) => win32.join(root, channel))),
+        ...portableRoots.flatMap((root) => [
+            win32.join(root, 'chrome.exe'),
+            win32.join(root, 'chrome-win64', 'chrome.exe'),
+            win32.join(root, 'chrome-win32', 'chrome.exe'),
+        ]),
+    ]
+}
+
+export function findChrome(): string | null {
+    const paths = platform() === 'win32' ? windowsChromeCandidates() : (CHROME_PATHS[platform()] ?? [])
+    return paths.find((path) => existsSync(path)) ?? null
 }
 
 /**
@@ -206,6 +254,7 @@ export class BrowserLauncher {
 
             let settled = false
             let stderr = ''
+            let stderrLineBuffer = ''
             const stderrStream = this.process.stderr
             const timer = setTimeout(() => {
                 fail(new TimeoutError(`等待浏览器启动超时 (${timeout}ms)`), true)
@@ -238,24 +287,41 @@ export class BrowserLauncher {
                 reject(error)
             }
             const onStderr = (data: Buffer) => {
-                stderr += data.toString()
+                const chunk = data.toString()
+                stderr += chunk
+                stderrLineBuffer += chunk
 
-                // 解析 DevTools listening on ws://...
-                const match = stderr.match(/DevTools listening on (?<url>ws:\/\/\S+)/)
-                if (match) {
-                    // 解析端口
-                    const portMatch = match.groups!.url.match(/:(?<port>\d+)\//)
-                    if (portMatch) {
-                        this._port = parseInt(portMatch.groups!.port, 10)
+                let newlineIndex = stderrLineBuffer.indexOf('\n')
+                while (newlineIndex >= 0) {
+                    const line = stderrLineBuffer.slice(0, newlineIndex).replace(/\r$/, '')
+                    stderrLineBuffer = stderrLineBuffer.slice(newlineIndex + 1)
+                    const match = line.match(/DevTools listening on (?<url>ws:\/\/\S+)\s*$/)
+                    if (match) {
+                        try {
+                            const endpoint = new URL(match.groups!.url)
+                            if (
+                                endpoint.protocol === 'ws:' &&
+                                endpoint.port &&
+                                /^\/devtools\/browser\/[^/]+$/.test(endpoint.pathname)
+                            ) {
+                                this._port = parseInt(endpoint.port, 10)
+                                finish(endpoint.href)
+                                return
+                            }
+                        } catch {
+                            // 忽略不完整或无效的 endpoint 行，继续等待下一条完整 stderr 行
+                        }
                     }
-                    finish(match.groups!.url)
+                    newlineIndex = stderrLineBuffer.indexOf('\n')
                 }
             }
             const onError = (error: Error) => {
                 fail(error)
             }
-            const onExit = (code: number | null) => {
-                if (code === 0) {
+            const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+                if (signal) {
+                    fail(new Error(`浏览器进程收到信号 ${signal} 后退出\n${stderr}`))
+                } else if (code === 0) {
                     // Chrome 退出码 0：通常是把请求委托给了已运行的实例后自行退出，
                     // 此时没有 DevTools 端点可连接
                     fail(

@@ -6,6 +6,7 @@
  * 2. CDP 模式：通过 Chrome DevTools Protocol 操作（Fallback）
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { ExtensionBridge, type ExtensionConnectionInfo } from '../extension/index.js'
 import {
     type ActionableClickResult,
@@ -20,7 +21,7 @@ import {
     type SetCookieParams,
     type StaleContextRetryPolicy,
 } from './browser-driver.js'
-import { OsMouseError } from './errors.js'
+import { OsMouseError, PagePreconditionError } from './errors.js'
 import { isExtensionDisconnected } from './extension-errors.js'
 import {
     asViewportMetrics,
@@ -74,6 +75,23 @@ interface UnifiedSessionState {
     managed?: boolean
 }
 
+interface PageMetadata {
+    createdBy: 'mcp-chrome' | 'unknown'
+    createdAt: string | null
+    lastUsedAt: string | null
+    taskHint?: string
+    note?: string
+}
+
+interface TargetRestoration {
+    status: 'restored' | 'cleared' | 'previous_target_closed' | 'failed'
+    previousTargetId: string | null
+    temporaryTargetId: string
+    currentTargetId: string | null
+    error?: string
+    cleanupError?: string
+}
+
 class UnifiedSessionManager {
     private static instance: UnifiedSessionManager
     private static readonly CONNECTION_COOLDOWN = 30000 // 连接失败后 30 秒内不重试
@@ -93,9 +111,15 @@ class UnifiedSessionManager {
     private extensionChallengeStateUnsupported = false
     private unsupportedChallengeStateBundleHash: string | null = null
     private tabSwitchLock: Promise<void> = Promise.resolve() // 串行化 tab 切换，防止并发竞态
+    private readonly tabLockContext = new AsyncLocalStorage<{
+        session: UnifiedSessionManager
+        targetRestoration?: TargetRestoration
+    }>()
+
     private requireExtension = false // 指定 tabId 或 frame 时为 true，禁止 CDP 回退
     private currentFrameOffset: { x: number; y: number } | null = null // iframe 在主页面的偏移量（withFrame 期间有效）
     private lastEvaluationMetadata: EvaluationMetadata | undefined
+    private readonly pageMetadata = new Map<string, PageMetadata>()
 
     private constructor() {}
 
@@ -169,6 +193,40 @@ class UnifiedSessionManager {
             return getCdpSession().getCurrentTargetId()
         }
         return null
+    }
+
+    getPageMetadata(targetId: string): PageMetadata {
+        return (
+            this.pageMetadata.get(this.metadataKey(targetId)) ?? {
+                createdBy: 'unknown',
+                createdAt: null,
+                lastUsedAt: null,
+            }
+        )
+    }
+
+    async setPageMetadata(
+        targetId: string,
+        updates: { taskHint?: string | null; note?: string | null }
+    ): Promise<PageMetadata> {
+        await this.getPageSnapshot(targetId)
+        const metadata = { ...this.getPageMetadata(targetId) }
+        if (updates.taskHint !== undefined) {
+            if (updates.taskHint === null) {
+                delete metadata.taskHint
+            } else {
+                metadata.taskHint = updates.taskHint
+            }
+        }
+        if (updates.note !== undefined) {
+            if (updates.note === null) {
+                delete metadata.note
+            } else {
+                metadata.note = updates.note
+            }
+        }
+        this.pageMetadata.set(this.metadataKey(targetId), metadata)
+        return metadata
     }
 
     /**
@@ -247,6 +305,7 @@ class UnifiedSessionManager {
             })
             this.activeMode = 'extension'
             this.cdpExplicitlySelected = false
+            this.recordPageUse(result.targetId, true)
             return {
                 targetId: result.targetId,
                 type: result.type ?? 'page',
@@ -261,6 +320,7 @@ class UnifiedSessionManager {
         const target = await getCdpSession().launch(options)
         this.activeMode = 'cdp'
         this.cdpExplicitlySelected = false
+        this.recordPageUse(target.targetId, target.targetCreated ?? target.reused !== true)
         return {
             ...target,
             mode: 'cdp',
@@ -281,6 +341,8 @@ class UnifiedSessionManager {
                 pinned?: boolean
                 incognito?: boolean
                 status?: string
+                revision?: string
+                metadata: PageMetadata
             }
         >
     > {
@@ -290,14 +352,22 @@ class UnifiedSessionManager {
         }
         const driver = await this.getDriver()
         const targets = await driver.listTargets()
+        const liveKeys = new Set(targets.map((t) => `${mode}:${t.targetId ?? String(t.id)}`))
+        for (const key of this.pageMetadata.keys()) {
+            if (key.startsWith(`${mode}:`) && !liveKeys.has(key)) {
+                this.pageMetadata.delete(key)
+            }
+        }
         return targets.map((t) => ({
             targetId: t.targetId ?? String(t.id),
             type: t.type ?? 'page',
             url: t.url,
             title: t.title,
             mode,
-            isActive: t.active ?? false,
+            ...(mode === 'extension' ? { isActive: t.active ?? false } : {}),
             managed: t.managed,
+            revision: t.revision,
+            metadata: this.getPageMetadata(t.targetId ?? String(t.id)),
             windowId: t.windowId,
             index: t.index,
             pinned: t.pinned,
@@ -323,7 +393,7 @@ class UnifiedSessionManager {
         if (!driver.adoptPage) {
             throw new DriverCapabilityError('adoptPage 仅支持 Extension 模式')
         }
-        return driver.adoptPage(targetId)
+        return this.withTabLock(() => driver.adoptPage!(targetId))
     }
 
     async releasePage(targetId: string): Promise<ManagedPageResult> {
@@ -331,7 +401,7 @@ class UnifiedSessionManager {
         if (!driver.releasePage) {
             throw new DriverCapabilityError('releasePage 仅支持 Extension 模式')
         }
-        return driver.releasePage(targetId)
+        return this.withTabLock(() => driver.releasePage!(targetId))
     }
 
     async movePage(targetId: string, options: MovePageOptions): Promise<PageManagementResult> {
@@ -390,7 +460,13 @@ class UnifiedSessionManager {
         if (!driver.newWindow) {
             throw new DriverCapabilityError('newWindow 仅支持 Extension 模式')
         }
-        return this.withTabLock(() => driver.newWindow!(options))
+        return this.withTabLock(async () => {
+            const result = await driver.newWindow!(options)
+            if (result.targetId) {
+                this.recordPageUse(result.targetId, true)
+            }
+            return result
+        })
     }
 
     async closeWindow(windowId: number): Promise<PageManagementResult> {
@@ -398,7 +474,15 @@ class UnifiedSessionManager {
         if (!driver.closeWindow) {
             throw new DriverCapabilityError('closeWindow 仅支持 Extension 模式')
         }
-        return this.withTabLock(() => driver.closeWindow!(windowId))
+        return this.withTabLock(async () => {
+            const result = await driver.closeWindow!(windowId)
+            if (result.before && 'tabs' in result.before) {
+                for (const tab of result.before.tabs) {
+                    this.pageMetadata.delete(this.metadataKey(tab.targetId ?? String(tab.id)))
+                }
+            }
+            return result
+        })
     }
 
     /**
@@ -406,7 +490,8 @@ class UnifiedSessionManager {
      */
     async navigate(url: string, options: { wait?: WaitUntil; timeout?: number } = {}): Promise<void> {
         const driver = await this.getDriver(options.timeout)
-        await this.withTabLock(() => driver.navigate(url, { wait: options.wait, timeout: options.timeout }))
+        const navigate = () => driver.navigate(url, { wait: options.wait, timeout: options.timeout })
+        await (this.getMode() === 'extension' ? this.withTabLock(navigate) : navigate())
     }
 
     async goBack(timeout?: number): Promise<{ navigated: boolean }> {
@@ -465,9 +550,27 @@ class UnifiedSessionManager {
      *
      * 返回结构化结果，让调用方知道操作是否真正生效
      */
-    async actionableClick(refId: string, force?: boolean): Promise<ActionableClickResult> {
+    async actionableClick(
+        refId: string,
+        force = false,
+        button: 'left' | 'middle' | 'right' | 'back' | 'forward' = 'left',
+        clickCount = 1
+    ): Promise<ActionableClickResult> {
         const driver = await this.getDriver()
-        return driver.actionableClick(refId, force)
+        if (button === 'left' && clickCount === 1) {
+            return driver.actionableClick(refId, force)
+        }
+        if (!force) {
+            const result = await driver.checkActionability(refId)
+            if (!result.success) return result
+        }
+        if (force) {
+            const { x, y } = this.currentMousePosition
+            await driver.stealthClick(x, y, button, clickCount, refId)
+        } else {
+            await this.mouseClick(button, clickCount, refId)
+        }
+        return { success: true }
     }
 
     /**
@@ -620,6 +723,30 @@ class UnifiedSessionManager {
         return (await this.getDriver()).getPageHtml(selector, outer)
     }
 
+    async getTextByRef(refId: string): Promise<string> {
+        return this.extensionReadBridge().getText(undefined, refId)
+    }
+
+    async getHtmlByRef(refId: string, outer = true): Promise<string> {
+        return this.extensionReadBridge().getHtml(undefined, outer, refId)
+    }
+
+    async getAttributeByRef(refId: string, attribute: string): Promise<string | null> {
+        return this.extensionReadBridge().getAttribute(undefined, refId, attribute)
+    }
+
+    async getComputedStyleByRef(refId: string, prop: string): Promise<string | null> {
+        return this.extensionReadBridge().getComputedStyle(refId, prop)
+    }
+
+    async findAtPoint(x: number, y: number, matchIndex?: number, timeout?: number) {
+        return this.extensionReadBridge().find(undefined, undefined, undefined, timeout, { x, y }, matchIndex)
+    }
+
+    async getHtmlWithImagesByRef(refId: string) {
+        return this.extensionReadBridge().getHtmlWithImages(undefined, true, refId)
+    }
+
     /**
      * 获取页面 HTML + 图片元信息
      */
@@ -721,7 +848,8 @@ class UnifiedSessionManager {
         selector?: string,
         text?: string,
         xpath?: string,
-        timeout?: number
+        timeout?: number,
+        matchIndex?: number
     ): Promise<
         Array<{
             refId: string
@@ -730,6 +858,9 @@ class UnifiedSessionManager {
             rect: { x: number; y: number; width: number; height: number }
         }>
     > {
+        if (matchIndex !== undefined) {
+            return this.extensionReadBridge().find(selector, text, xpath, timeout, undefined, matchIndex)
+        }
         if (timeout !== undefined) {
             // 轮询上下文：快速失败，端到端预算受控
             if (this.isExtensionConnected()) {
@@ -807,6 +938,7 @@ class UnifiedSessionManager {
         const isExt = this.isExtensionConnected()
         const op = async (): Promise<TargetInfo> => {
             const result = await driver.newPage(url)
+            this.recordPageUse(result.targetId, true)
             return {
                 targetId: result.targetId,
                 type: result.type ?? 'page',
@@ -822,10 +954,17 @@ class UnifiedSessionManager {
     /**
      * 关闭页面
      */
-    async closePage(targetId?: string): Promise<void | PageManagementResult> {
+    async closePage(targetId: string): Promise<void | PageManagementResult> {
+        if (!targetId) {
+            throw new DriverCapabilityError('closePage 需要显式 targetId，未关闭页面')
+        }
         const driver = await this.getDriver()
         const isExt = this.isExtensionConnected()
-        const op = () => driver.closePage(targetId)
+        const op = async () => {
+            const result = await driver.closePage(targetId)
+            this.pageMetadata.delete(this.metadataKey(targetId))
+            return result
+        }
         if (isExt) {
             return this.withTabLock(op)
         }
@@ -858,6 +997,30 @@ class UnifiedSessionManager {
         } else {
             await op()
         }
+        this.recordPageUse(targetId)
+    }
+
+    /**
+     * 串行化所有 tab 切换操作，防止并发请求互相覆盖 currentTabId，
+     * 调用者：selectPage/activatePage/adoptPage/releasePage/newPage/closePage/navigate/reload/launch/withTabId
+     *
+     * 同一请求内的嵌套调用可重入，恢复状态只保存在当前请求的 AsyncLocalStorage 中
+     */
+    async withTabLock<T>(fn: () => Promise<T>): Promise<T> {
+        if (this.tabLockContext.getStore()?.session === this) {
+            return fn()
+        }
+        const previousLock = this.tabSwitchLock
+        let releaseLock: () => void
+        this.tabSwitchLock = new Promise<void>((resolve) => {
+            releaseLock = resolve
+        })
+        try {
+            await previousLock
+            return await this.tabLockContext.run({ session: this }, fn)
+        } finally {
+            releaseLock!()
+        }
     }
 
     /**
@@ -869,42 +1032,170 @@ class UnifiedSessionManager {
      * 即使不传 tabId，也需要加锁：fn() 内调用 bridge 方法会读取 currentTabId，
      * 不加锁则并发的 withTabId(someId, ...) 可能在 fn() 执行中途修改 currentTabId
      */
-    async withTabId<T>(tabId: string | undefined, fn: () => Promise<T>): Promise<T> {
-        // Extension 未连接时不需要锁和 tab 切换（CDP 模式无 currentTabId 竞态）
-        if (!this.extensionBridge?.isConnected()) {
-            if (tabId) {
+    async withTabId<T>(targetId: string | undefined, fn: () => Promise<T>): Promise<T> {
+        return this.withTabLock(async () => {
+            const mode = this.getMode()
+            if (!targetId) {
+                const current = this.getCurrentTargetId()
+                if (current) {
+                    this.recordPageUse(current)
+                }
                 const previousRequireExtension = this.requireExtension
-                this.requireExtension = true
+                const previousCdpSelection = this.cdpExplicitlySelected
+                if (mode === 'extension') {
+                    this.requireExtension = true
+                } else if (mode === 'cdp') {
+                    this.cdpExplicitlySelected = true
+                }
                 try {
-                    this.assertCdpFallbackAllowed()
+                    return await fn()
                 } finally {
                     this.requireExtension = previousRequireExtension
+                    this.cdpExplicitlySelected = previousCdpSelection
                 }
             }
-            return fn()
-        }
-
-        if (!tabId) {
-            // 不切换 tab，但需要加锁保护 currentTabId 不被并发修改
-            return this.withTabLock(fn)
-        }
-
-        const driver = this.extensionBridge!
-        return this.withTabLock(async () => {
-            const previousTargetId = driver.getCurrentTargetId()
-            // 临时切换用 setCurrentTargetId，跳过 managed 校验（tabId 仅用于读取/执行，不改变持久 attach 目标）
-            driver.setCurrentTargetId(tabId)
-            // tabId 明确指定时，禁止 CDP 回退（CDP 不感知 Extension tab）
+            if (mode === 'none') {
+                throw new DriverCapabilityError('浏览器未连接，无法选择目标页面')
+            }
+            const driver = mode === 'extension' ? this.extensionBridge! : getCdpSession()
+            const targets = await driver.listTargets()
+            if (!targets.some((target) => (target.targetId ?? String(target.id)) === targetId)) {
+                throw new DriverCapabilityError(`目标页面 ${targetId} 不存在于当前 ${mode} 连接`)
+            }
+            const previousId = driver.getCurrentTargetId()
             const previousRequireExtension = this.requireExtension
-            const previousActiveMode = this.activeMode
-            this.requireExtension = true
-            this.activeMode = 'extension'
+            const previousCdpSelection = this.cdpExplicitlySelected
+            const previousMode = this.activeMode
+            if (mode === 'extension') {
+                this.requireExtension = true
+            } else {
+                this.cdpExplicitlySelected = true
+            }
             try {
+                if (targetId !== previousId) {
+                    await driver.selectPage(targetId)
+                }
+                this.activeMode = mode
+                this.recordPageUse(targetId)
                 return await fn()
             } finally {
                 this.requireExtension = previousRequireExtension
-                this.activeMode = previousActiveMode
-                driver.setCurrentTargetId(previousTargetId)
+                this.cdpExplicitlySelected = previousCdpSelection
+                this.activeMode = previousMode
+                if (targetId !== previousId) {
+                    const restoration: TargetRestoration = {
+                        status: previousId ? 'restored' : 'cleared',
+                        previousTargetId: previousId,
+                        temporaryTargetId: targetId,
+                        currentTargetId: null,
+                    }
+                    let clearTarget = true
+                    try {
+                        if (previousId) {
+                            const targets = await driver.listTargets()
+                            if (targets.some((target) => (target.targetId ?? String(target.id)) === previousId)) {
+                                await driver.selectPage(previousId)
+                                clearTarget = false
+                            } else {
+                                restoration.status = 'previous_target_closed'
+                            }
+                        }
+                    } catch (error) {
+                        restoration.status = 'failed'
+                        restoration.error = error instanceof Error ? error.message : String(error)
+                    }
+                    if (clearTarget) {
+                        try {
+                            if (mode === 'extension') {
+                                driver.setCurrentTargetId(null)
+                            } else {
+                                await getCdpSession().deselectPage()
+                            }
+                        } catch (error) {
+                            const message = error instanceof Error ? error.message : String(error)
+                            if (restoration.error) {
+                                restoration.cleanupError = message
+                            } else {
+                                restoration.status = 'failed'
+                                restoration.error = message
+                            }
+                        }
+                    }
+                    restoration.currentTargetId = driver.getCurrentTargetId()
+                    this.tabLockContext.getStore()!.targetRestoration = restoration
+                }
+            }
+        })
+    }
+
+    getTargetRestoration(): TargetRestoration | undefined {
+        return this.tabLockContext.getStore()?.targetRestoration
+    }
+
+    async getPageSnapshot(targetId?: string): Promise<{ targetId: string; url: string; revision: string }> {
+        const mode = this.getMode()
+        if (mode === 'none') {
+            throw new DriverCapabilityError('浏览器未连接，无法读取页面状态')
+        }
+        const id = targetId ?? this.getCurrentTargetId()
+        if (!id) {
+            throw new DriverCapabilityError('没有操作目标，请先选择页面')
+        }
+        const snapshot =
+            mode === 'extension'
+                ? await this.extensionBridge!.getPageSnapshot(id)
+                : await getCdpSession().getPageSnapshot(id)
+        this.recordPageUse(id)
+        return snapshot
+    }
+
+    async withPageCondition<T>(
+        condition: { targetId?: string; expectedUrl?: string; expectedRevision?: string },
+        fn: () => Promise<T>
+    ): Promise<T> {
+        if (condition.expectedUrl === undefined && condition.expectedRevision === undefined) {
+            return fn()
+        }
+        return this.withTabLock(async () => {
+            const mode = this.getMode()
+            const targetId = condition.targetId ?? this.getCurrentTargetId()
+            if (mode === 'none' || !targetId) {
+                throw new DriverCapabilityError('没有操作目标，请先选择页面')
+            }
+            const driver = mode === 'extension' ? this.extensionBridge! : getCdpSession()
+            const previousRequireExtension = this.requireExtension
+            const previousCdpSelection = this.cdpExplicitlySelected
+            const previousMode = this.activeMode
+            if (mode === 'extension') {
+                this.requireExtension = true
+            } else {
+                this.cdpExplicitlySelected = true
+            }
+            try {
+                const snapshot = await driver.getPageSnapshot(targetId)
+                if (
+                    (condition.expectedUrl !== undefined && snapshot.url !== condition.expectedUrl) ||
+                    (condition.expectedRevision !== undefined && snapshot.revision !== condition.expectedRevision)
+                ) {
+                    throw new PagePreconditionError({
+                        targetId,
+                        expectedUrl: condition.expectedUrl ?? null,
+                        expectedRevision: condition.expectedRevision ?? null,
+                        actualUrl: snapshot.url,
+                        actualRevision: snapshot.revision,
+                    })
+                }
+                driver.setPageCondition({
+                    targetId,
+                    expectedUrl: condition.expectedUrl,
+                    expectedRevision: condition.expectedRevision,
+                })
+                return await fn()
+            } finally {
+                driver.setPageCondition(null)
+                this.requireExtension = previousRequireExtension
+                this.cdpExplicitlySelected = previousCdpSelection
+                this.activeMode = previousMode
             }
         })
     }
@@ -1009,6 +1300,13 @@ class UnifiedSessionManager {
         const isRepeat = this.pressedKeys.has(key)
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers | MODIFIER_KEYS[key] : this.modifiers
 
+        if (!isExt) {
+            await getCdpSession().keyDown(key, commands, { rawKeyDown: isRepeat, autoRepeat: isRepeat })
+            this.modifiers = nextModifiers
+            this.pressedKeys.add(key)
+            return
+        }
+
         if (isExt && this.inputMode === 'stealth') {
             await driver.stealthKey(key, 'down', this.getModifierNames(nextModifiers))
             this.modifiers = nextModifiers
@@ -1038,7 +1336,9 @@ class UnifiedSessionManager {
         const isExt = this.isExtensionConnected()
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers & ~MODIFIER_KEYS[key] : this.modifiers
 
-        if (isExt && this.inputMode === 'stealth') {
+        if (!isExt) {
+            await getCdpSession().keyUp(key)
+        } else if (this.inputMode === 'stealth') {
             await driver.stealthKey(key, 'up', this.getModifierNames(nextModifiers))
         } else {
             const def = getKeyDefinition(key)
@@ -1156,6 +1456,11 @@ class UnifiedSessionManager {
                     '页面未返回可点击的 Turnstile 坐标',
                     '重新检查页面状态后再重试；交互式验证码无法自动完成'
                 )
+            }
+            if (this.isExtensionConnected()) {
+                const driver = await this.getDriver()
+                await driver.stealthClick(point.x, point.y, 'left', 1)
+                return
             }
             const frameOffset = this.currentFrameOffset
             const clickPoint =
@@ -1400,6 +1705,27 @@ class UnifiedSessionManager {
     async sendCdpCommand(method: string, params?: Record<string, unknown>): Promise<unknown> {
         const driver = await this.getDriver()
         return driver.debuggerSend(method, params)
+    }
+
+    private extensionReadBridge(): ExtensionBridge {
+        if (this.getMode() !== 'extension' || !this.extensionBridge?.isConnected()) {
+            throw new DriverCapabilityError('定向读取需要已连接的 Extension')
+        }
+        return this.extensionBridge
+    }
+
+    private metadataKey(targetId: string): string {
+        return `${this.getMode()}:${targetId}`
+    }
+
+    private recordPageUse(targetId: string, created = false): void {
+        const metadata = this.getPageMetadata(targetId)
+        this.pageMetadata.set(this.metadataKey(targetId), {
+            ...metadata,
+            createdBy: created ? 'mcp-chrome' : metadata.createdBy,
+            createdAt: created ? new Date().toISOString() : metadata.createdAt,
+            lastUsedAt: new Date().toISOString(),
+        })
     }
 
     private evaluateViaCdp<T>(script: string, args: unknown[] | undefined, timeout?: number): Promise<T> {
@@ -1862,27 +2188,6 @@ class UnifiedSessionManager {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', {
                 objectId: globalObjectId,
             }).catch(() => {})
-        }
-    }
-
-    /**
-     * 串行化所有 tab 切换操作，防止并发请求互相覆盖 currentTabId，
-     * 调用者：selectPage/activatePage/newPage/closePage/navigate/reload/launch/withTabId
-     *
-     * 注意：此锁不可重入，fn() 内禁止调用任何使用 withTabLock 的方法，否则会死锁，
-     * 当前所有 fn() 只调用 bridge 的原子操作（createTab/navigate/evaluate 等），不存在此问题
-     */
-    private async withTabLock<T>(fn: () => Promise<T>): Promise<T> {
-        const previousLock = this.tabSwitchLock
-        let releaseLock: () => void
-        this.tabSwitchLock = new Promise<void>((resolve) => {
-            releaseLock = resolve
-        })
-        try {
-            await previousLock
-            return await fn()
-        } finally {
-            releaseLock!()
         }
     }
 

@@ -12,6 +12,8 @@ import { isExpectedOperationError } from '../types/expected-errors'
 import { recordDomFrameProbe } from './action-utils'
 import { ActionHandler } from './actions'
 import { HttpClient } from './http-client'
+import { advancePageRevision, forgetPageRevision } from './page-revision'
+import { hasReadGrant, revokeReadGrants, revokeTabReadGrants, setReadGrant } from './read-grants'
 import {
     getMcpTabGroupId,
     getMcpWindowId,
@@ -19,12 +21,16 @@ import {
     setMcpTabGroupId,
     setMcpWindowId,
     unmarkManagedTab,
+    isCreatedTab,
 } from './tab-state'
 
 // ==================== 全局状态 ====================
 
 const httpClient = new HttpClient()
 const actionHandler = new ActionHandler()
+httpClient.onConnectionClosed((instanceId) => {
+    void revokeReadGrants(instanceId).catch((error) => console.error('[MCP] Read grant cleanup failed:', error))
+})
 
 function sanitizeErrorMessage(message: string): string {
     return message.replace(/chrome-extension:\/\/[a-z0-9]{32}\/[^\s)"']*/g, 'chrome-extension://<redacted>/<redacted>')
@@ -51,6 +57,7 @@ httpClient.onMessage(async (message, port) => {
         const result = await actionHandler.execute(action, params, {
             mcpTabGroupId: getMcpTabGroupId(),
             mcpWindowId: getMcpWindowId(),
+            serverInstanceId: httpClient.getServerInstanceId(port),
         })
         httpClient.sendResponse(id, true, result, undefined, port)
     } catch (error) {
@@ -74,7 +81,9 @@ httpClient.onStatusChange((status, count) => {
 // ==================== 内部消息处理 ====================
 
 chrome.runtime.onMessage.addListener((message: InternalMessage, sender, sendResponse) => {
-    handleInternalMessage(message, sender).then(sendResponse)
+    handleInternalMessage(message, sender)
+        .then(sendResponse)
+        .catch((error) => sendResponse({ error: error instanceof Error ? error.message : String(error) }))
     return true // 异步响应
 })
 
@@ -95,13 +104,51 @@ async function handleInternalMessage(message: InternalMessage, sender: chrome.ru
             await httpClient.setAllowInsecureNoToken(message.allow)
             return { success: true }
 
-        case 'GET_STATUS':
+        case 'GET_STATUS': {
+            const servers = httpClient.getConnectedServers()
+            const readAccess = Number.isSafeInteger(message.tabId)
+                ? await Promise.all(
+                      servers.map(async (server) => ({
+                          port: server.port,
+                          allowed: await hasReadGrant(server.instanceId, message.tabId!),
+                      }))
+                  )
+                : []
             return {
                 connected: httpClient.isConnected(),
                 ports: httpClient.getConnectedPorts(),
+                readAccess,
                 pairingTokenConfigured: await httpClient.hasPairingToken(),
                 allowInsecureNoToken: await httpClient.isAllowInsecureNoToken(),
             }
+        }
+
+        case 'SET_READ_ACCESS': {
+            if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('src/popup/popup.html')) {
+                throw new Error('只读权限只能从 Extension popup 修改')
+            }
+            if (
+                !Number.isSafeInteger(message.tabId) ||
+                !Number.isSafeInteger(message.port) ||
+                typeof message.allow !== 'boolean'
+            ) {
+                throw new Error('tabId、port 或 allow 无效')
+            }
+            const instanceId = httpClient.getServerInstanceId(message.port)
+            if (!instanceId) {
+                throw new Error('目标 MCP Server 未连接或未提供连接身份')
+            }
+            const tab = await chrome.tabs.get(message.tabId)
+            const window = await chrome.windows.getLastFocused()
+            if (tab.windowId !== window.id || !tab.active) {
+                throw new Error('只能从 popup 授权当前窗口的活动页面')
+            }
+            if (isCreatedTab(tab.id!)) {
+                throw new Error('由扩展创建的页面无需只读授权')
+            }
+            await setReadGrant(instanceId, tab.id!, message.allow)
+            return { success: true, allowed: message.allow }
+        }
 
         case 'MCP_FRAME_PROBE':
             return recordDomFrameProbe(message, sender)
@@ -160,6 +207,8 @@ chrome.windows.onRemoved.addListener((windowId) => {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
     // 清理 ActionHandler 中的 per-tab 内存（防止长时间运行后内存泄漏）
     actionHandler.cleanupTab(tabId)
+    forgetPageRevision(tabId)
+    void revokeTabReadGrants(tabId).catch((error) => console.warn('[MCP] Read grant cleanup failed:', error))
     void unmarkManagedTab(tabId).catch((error) => {
         console.warn('[MCP] managed tab storage cleanup failed:', error)
     })
@@ -193,6 +242,32 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     }
 })
 
+// revision 仅追踪导航事件与 MCP 发起的动作，不观察页面自主的 DOM 变更
+chrome.webNavigation.onCommitted.addListener((details) => {
+    if (details.frameId === 0) {
+        advancePageRevision(details.tabId)
+        void revokeTabReadGrants(details.tabId).catch((error) =>
+            console.warn('[MCP] Read grant navigation cleanup failed:', error)
+        )
+    }
+})
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+    if (details.frameId === 0) {
+        advancePageRevision(details.tabId)
+        void revokeTabReadGrants(details.tabId).catch((error) =>
+            console.warn('[MCP] Read grant navigation cleanup failed:', error)
+        )
+    }
+})
+chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
+    if (details.frameId === 0) {
+        advancePageRevision(details.tabId)
+        void revokeTabReadGrants(details.tabId).catch((error) =>
+            console.warn('[MCP] Read grant navigation cleanup failed:', error)
+        )
+    }
+})
+
 // ==================== Keep-Alive 机制 ====================
 
 // 使用 chrome.alarms 定期唤醒 Service Worker 并保持连接
@@ -215,5 +290,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Service Worker 启动时恢复 managed tab 集合并尝试连接所有 MCP Server
 setTimeout(() => {
     void restoreManagedTabs()
-    void httpClient.connect()
+        .catch((error) => console.error('[MCP] Failed to restore managed pages:', error))
+        .then(() => httpClient.connect())
 }, 500)

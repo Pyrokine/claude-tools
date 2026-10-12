@@ -25,12 +25,16 @@ import {
 import {
     type ActionContext,
     assertManagedTab,
+    assertReadableTab,
     assertScriptable,
     getFrameOffset,
     getTargetTabId,
     isRestrictedUrl,
 } from './action-utils'
 import { DebuggerBlockedError, DebuggerManager } from './debugger-manager'
+import { assertScreenshotBase64Budget, assertScreenshotBudget } from './screenshot-budget'
+import { readGrantDocumentId } from './read-grants'
+import { isCreatedTab } from './tab-state'
 import {
     type ActionabilityResult,
     checkActionability,
@@ -54,7 +58,7 @@ import {
 } from './page-scripts'
 
 // 注入函数类型：chrome.scripting 在运行时通过 JSON 序列化传参，类型层用 unknown 兜底
-type InjectableFunc<R> = (...args: never[]) => R
+type InjectableFunc<R> = (...args: never[]) => R | Promise<R>
 
 // 页面注入脚本可能抛出的预期错误模式
 // page-scripts.ts 在页面上下文执行，无法 import ExpectedOperationError
@@ -64,13 +68,15 @@ const EXPECTED_INJECTION_PATTERNS = [
     /Invalid XPath/,
     /Element with refId .* not found/,
     /Cannot access/,
+    /Frame with ID \d+ is showing error page/i,
 ]
 
-function wrapInjectionError(msg: string): Error {
+function wrapInjectionError(error: unknown): Error {
+    const msg = error instanceof Error ? error.message : String(error)
     if (EXPECTED_INJECTION_PATTERNS.some((p) => p.test(msg))) {
         return new ExpectedOperationError(msg)
     }
-    return new Error(msg)
+    return error instanceof Error ? error : new Error(msg)
 }
 
 function structuredOperationError(
@@ -87,16 +93,29 @@ export class ContentHandler {
 
     async readPage(params: unknown, context: ActionContext): Promise<ReadPageResult> {
         const p = ReadPageSchema.parse(params) ?? {}
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'read_page')
-        const result = await this.injectScript<ReadPageResult>(tabId, p.frameId, generateAccessibilityTree, [
-            p.filter || 'all',
-            p.depth ?? 15,
-            p.maxLength ?? null,
-            p.refId ?? null,
-        ])
+        const { tabId, documentId, expectedUrl } = await this.getReadableScriptableTabId(
+            p.tabId,
+            context,
+            'read_page',
+            p.frameId
+        )
+        const result = await this.injectScript<ReadPageResult>(
+            tabId,
+            p.frameId,
+            generateAccessibilityTree,
+            [
+                p.filter || 'all',
+                p.depth ?? 15,
+                p.maxLength ?? null,
+                p.refId ?? null,
+                documentId ? (expectedUrl ?? null) : null,
+            ],
+            documentId
+        )
         if (result === undefined || result === null) {
             throw new Error('Failed to read page')
         }
+        await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'read_page')
         if (p.frameId !== undefined && result.interactiveElements) {
             result.interactiveElements = result.interactiveElements.map((item) => ({ ...item, frameId: p.frameId }))
         }
@@ -106,6 +125,27 @@ export class ContentHandler {
     async screenshot(params: unknown, context: ActionContext): Promise<ScreenshotResult> {
         const p = ScreenshotSchema.parse(params) ?? {}
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'screenshot')
+        if (p.clip) {
+            assertScreenshotBudget(p.clip.width, p.clip.height, p.scale ?? 1)
+        } else {
+            const dimensions = await chrome.scripting
+                .executeScript({
+                    target: { tabId, frameIds: [0] },
+                    func: (fullPage: boolean) => ({
+                        width: fullPage ? document.documentElement.scrollWidth : window.innerWidth,
+                        height: fullPage ? document.documentElement.scrollHeight : window.innerHeight,
+                    }),
+                    args: [p.fullPage ?? false],
+                })
+                .catch((error: unknown) => {
+                    throw wrapInjectionError(error)
+                })
+            const size = dimensions[0]?.result
+            if (!size) {
+                throw new Error('screenshot: 无法读取页面尺寸，未执行截图')
+            }
+            assertScreenshotBudget(size.width, size.height, p.fullPage ? (p.scale ?? 1) : 1)
+        }
 
         try {
             // 使用 debugger API 截图（不需要 tab 在前台）
@@ -150,6 +190,7 @@ export class ContentHandler {
                 throw new Error('无法获取页面尺寸，document.documentElement 可能不可用')
             }
 
+            assertScreenshotBudget(width, height, p.scale ?? 1)
             // 临时设置视口为页面完整尺寸
             await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
                 width,
@@ -164,6 +205,7 @@ export class ContentHandler {
                     format: effectiveFormat,
                     ...(p.quality !== undefined && effectiveFormat !== 'png' ? { quality: p.quality } : {}),
                 })) as { data: string }
+                assertScreenshotBase64Budget(result.data)
                 return { data: result.data, format: effectiveFormat }
             } finally {
                 try {
@@ -181,6 +223,7 @@ export class ContentHandler {
             ...(p.clip ? { clip: { ...p.clip, scale: p.scale ?? 1 }, captureBeyondViewport: true } : {}),
         })) as { data: string }
 
+        assertScreenshotBase64Budget(result.data)
         return {
             data: result.data,
             format: p.format || 'png',
@@ -278,8 +321,28 @@ export class ContentHandler {
 
     async getComputedStyleAction(params: unknown, context: ActionContext): Promise<string | null> {
         const p = GetComputedStyleSchema.parse(params)
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_computed_style')
-        return this.injectScript<string | null>(tabId, p.frameId, getComputedStyleFromElement, [p.refId, p.prop ?? ''])
+        const { tabId, documentId, expectedUrl } = await this.getReadableScriptableTabId(
+            p.tabId,
+            context,
+            'get_computed_style',
+            p.frameId
+        )
+        const value = await this.injectScript<string | null>(
+            tabId,
+            p.frameId,
+            getComputedStyleFromElement,
+            [p.refId, p.prop ?? '', documentId ? (expectedUrl ?? null) : null],
+            documentId
+        )
+        await this.assertReadableDocumentUnchanged(
+            tabId,
+            p.frameId,
+            documentId,
+            expectedUrl,
+            context,
+            'get_computed_style'
+        )
+        return value
     }
 
     async type(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
@@ -315,6 +378,7 @@ export class ContentHandler {
         // world: 'MAIN' 在页面上下文中执行（绕过 Extension CSP，但页面 CSP 仍可拦截）
         return this.injectScript<{ success: boolean; result?: string; error?: string }>(tabId, p.frameId, executeCode, [
             p.code,
+            ...(p.timeout !== undefined ? [p.timeout] : []),
         ])
     }
 
@@ -332,19 +396,23 @@ export class ContentHandler {
     }> {
         const p = ViewportMetricsSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'viewport_metrics')
-        const results = await chrome.scripting.executeScript({
-            target: { tabId, frameIds: [p.frameId ?? 0] },
-            world: 'ISOLATED',
-            func: () => ({
-                screenX: Number(window.screenX),
-                screenY: Number(window.screenY),
-                innerWidth: Number(window.innerWidth),
-                innerHeight: Number(window.innerHeight),
-                outerWidth: Number(window.outerWidth),
-                outerHeight: Number(window.outerHeight),
-                devicePixelRatio: Number(window.devicePixelRatio || 1),
-            }),
-        })
+        const results = await chrome.scripting
+            .executeScript({
+                target: { tabId, frameIds: [p.frameId ?? 0] },
+                world: 'ISOLATED',
+                func: () => ({
+                    screenX: Number(window.screenX),
+                    screenY: Number(window.screenY),
+                    innerWidth: Number(window.innerWidth),
+                    innerHeight: Number(window.innerHeight),
+                    outerWidth: Number(window.outerWidth),
+                    outerHeight: Number(window.outerHeight),
+                    devicePixelRatio: Number(window.devicePixelRatio || 1),
+                }),
+            })
+            .catch((error: unknown) => {
+                throw wrapInjectionError(error)
+            })
         const injectionError = (results[0] as { error?: { message?: string } })?.error
         if (injectionError) {
             throw wrapInjectionError(injectionError.message || String(injectionError))
@@ -383,23 +451,27 @@ export class ContentHandler {
     }> {
         const p = ChallengeInspectSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'challenge_inspect')
-        const results = await chrome.scripting.executeScript({
-            target: { tabId, frameIds: [p.frameId ?? 0] },
-            world: 'ISOLATED',
-            func: inspectChallengePage,
-            args: [
-                {
-                    challengeSelectors: p.challengeSelectors,
-                    deniedSelectors: p.deniedSelectors,
-                    widgetSelectors: p.widgetSelectors,
-                    verifyButtonSelectors: p.verifyButtonSelectors,
-                    frameSelectors: p.frameSelectors,
-                    titleNeedles: p.titleNeedles,
-                    textMarkers: p.textMarkers,
-                    originResponsePendingTextMarkers: p.originResponsePendingTextMarkers,
-                },
-            ],
-        })
+        const results = await chrome.scripting
+            .executeScript({
+                target: { tabId, frameIds: [p.frameId ?? 0] },
+                world: 'ISOLATED',
+                func: inspectChallengePage,
+                args: [
+                    {
+                        challengeSelectors: p.challengeSelectors,
+                        deniedSelectors: p.deniedSelectors,
+                        widgetSelectors: p.widgetSelectors,
+                        verifyButtonSelectors: p.verifyButtonSelectors,
+                        frameSelectors: p.frameSelectors,
+                        titleNeedles: p.titleNeedles,
+                        textMarkers: p.textMarkers,
+                        originResponsePendingTextMarkers: p.originResponsePendingTextMarkers,
+                    },
+                ],
+            })
+            .catch((error: unknown) => {
+                throw wrapInjectionError(error)
+            })
         const injectionError = (results[0] as { error?: { message?: string } })?.error
         if (injectionError) {
             throw wrapInjectionError(injectionError.message || String(injectionError))
@@ -413,8 +485,8 @@ export class ContentHandler {
 
     async find(params: unknown, context: ActionContext): Promise<ElementInfo[]> {
         const p = FindSchema.parse(params) ?? {}
-        const tabId = await this.getManagedTabId(p.tabId, context, 'find')
         const frameId = p.frameId ?? 0
+        const { tabId, documentId, expectedUrl } = await this.getReadableTabId(p.tabId, context, 'find', frameId)
 
         // 受限 URL 返回空数组（而非抛异常，避免 auto-wait 轮询时大量错误）
         const tab = await chrome.tabs.get(tabId)
@@ -426,7 +498,15 @@ export class ContentHandler {
             tabId,
             frameId,
             findElements,
-            [p.selector ?? null, p.text ?? null, p.xpath ?? null]
+            [
+                p.selector ?? null,
+                p.text ?? null,
+                p.xpath ?? null,
+                documentId ? (expectedUrl ?? null) : null,
+                p.point ?? null,
+                ...(p.matchIndex !== undefined ? [p.matchIndex] : []),
+            ],
+            documentId
         )
 
         if (data === undefined || data === null) {
@@ -456,17 +536,24 @@ export class ContentHandler {
             }
         }
 
+        await this.assertReadableDocumentUnchanged(tabId, frameId, documentId, expectedUrl, context, 'find')
         return elements
     }
 
     async getText(params: unknown, context: ActionContext): Promise<{ text: string }> {
         const p = GetTextSchema.parse(params) ?? {}
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_text')
+        const { tabId, documentId, expectedUrl } = await this.getReadableScriptableTabId(
+            p.tabId,
+            context,
+            'get_text',
+            p.frameId
+        )
         const data = await this.injectScript<{ text: string; error?: string } | undefined>(
             tabId,
             p.frameId,
             extractText,
-            [p.selector ?? null]
+            [p.selector ?? null, documentId ? (expectedUrl ?? null) : null, p.refId ?? null],
+            documentId
         )
         if (data === undefined || data === null) {
             throw new Error(`extractText 脚本未返回结果（selector="${p.selector ?? ''}"），可能是 frame 不可注入`)
@@ -474,17 +561,24 @@ export class ContentHandler {
         if (data.error) {
             throw wrapInjectionError(data.error)
         }
+        await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_text')
         return { text: data.text }
     }
 
     async getHtml(params: unknown, context: ActionContext): Promise<{ html: string }> {
         const p = GetHtmlSchema.parse(params) ?? {}
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_html')
+        const { tabId, documentId, expectedUrl } = await this.getReadableScriptableTabId(
+            p.tabId,
+            context,
+            'get_html',
+            p.frameId
+        )
         const data = await this.injectScript<{ html: string; error?: string } | undefined>(
             tabId,
             p.frameId,
             extractHtml,
-            [p.selector ?? null, p.outer ?? true]
+            [p.selector ?? null, p.outer ?? true, documentId ? (expectedUrl ?? null) : null, p.refId ?? null],
+            documentId
         )
         if (data === undefined || data === null) {
             throw new Error(`extractHtml 脚本未返回结果（selector="${p.selector ?? ''}"），可能是 frame 不可注入`)
@@ -492,6 +586,7 @@ export class ContentHandler {
         if (data.error) {
             throw wrapInjectionError(data.error)
         }
+        await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_html')
         return { html: data.html }
     }
 
@@ -512,8 +607,13 @@ export class ContentHandler {
         }>
     }> {
         const p = GetHtmlWithImagesSchema.parse(params) ?? {}
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_html_with_images')
-        return this.injectScript<{
+        const { tabId, documentId, expectedUrl } = await this.getReadableScriptableTabId(
+            p.tabId,
+            context,
+            'get_html_with_images',
+            p.frameId
+        )
+        const data = await this.injectScript<{
             html: string
             images: Array<{
                 index: number
@@ -525,29 +625,114 @@ export class ContentHandler {
                 naturalWidth: number
                 naturalHeight: number
             }>
-        }>(tabId, p.frameId, extractHtmlWithImages, [p.selector ?? null, p.outer ?? true])
+        }>(
+            tabId,
+            p.frameId,
+            extractHtmlWithImages,
+            [p.selector ?? null, p.outer ?? true, documentId ? (expectedUrl ?? null) : null, p.refId ?? null],
+            documentId
+        )
+        await this.assertReadableDocumentUnchanged(
+            tabId,
+            p.frameId,
+            documentId,
+            expectedUrl,
+            context,
+            'get_html_with_images'
+        )
+        return data
     }
 
     async getAttribute(params: unknown, context: ActionContext): Promise<{ value: string | null }> {
         const p = GetAttributeSchema.parse(params)
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_attribute')
-        const data = await this.injectScript<{ value: string | null } | undefined>(tabId, p.frameId, extractAttribute, [
-            p.selector ?? null,
-            p.refId ?? null,
-            p.attribute,
-        ])
+        const { tabId, documentId, expectedUrl } = await this.getReadableScriptableTabId(
+            p.tabId,
+            context,
+            'get_attribute',
+            p.frameId
+        )
+        const data = await this.injectScript<{ value: string | null } | undefined>(
+            tabId,
+            p.frameId,
+            extractAttribute,
+            [p.selector ?? null, p.refId ?? null, p.attribute, documentId ? (expectedUrl ?? null) : null],
+            documentId
+        )
         if (data === undefined || data === null) {
             throw new Error(
                 `extractAttribute 脚本未返回结果（selector="${p.selector ?? ''}" attribute="${p.attribute}"），可能是 selector 非法`
             )
         }
+        await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_attribute')
         return data
     }
 
     async getMetadata(params: unknown, context: ActionContext): Promise<Record<string, unknown>> {
         const p = GetMetadataSchema.parse(params) ?? {}
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_metadata')
-        return this.injectScript<Record<string, unknown>>(tabId, p.frameId, extractMetadata, [])
+        const { tabId, documentId, expectedUrl } = await this.getReadableScriptableTabId(
+            p.tabId,
+            context,
+            'get_metadata',
+            p.frameId
+        )
+        const data = await this.injectScript<Record<string, unknown>>(
+            tabId,
+            p.frameId,
+            extractMetadata,
+            [documentId ? (expectedUrl ?? null) : null],
+            documentId
+        )
+        await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_metadata')
+        return data
+    }
+
+    private async assertReadableDocumentUnchanged(
+        tabId: number,
+        frameId: number | undefined,
+        documentId: string | undefined,
+        expectedUrl: string | undefined,
+        context: ActionContext,
+        operation: string
+    ): Promise<void> {
+        if (!documentId) {
+            return
+        }
+        const current = await this.getReadableTabId(tabId, context, operation, frameId)
+        if (current.documentId !== documentId || current.expectedUrl !== expectedUrl) {
+            throw new ExpectedOperationError(`${operation} 页面或授权已变化，未读取`)
+        }
+    }
+
+    private async getReadableTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string,
+        frameId = 0
+    ): Promise<{ tabId: number; documentId?: string; expectedUrl?: string }> {
+        const resolvedTabId = await getTargetTabId(tabId)
+        const readable = await assertReadableTab(resolvedTabId, context, operation)
+        if (!readable.documentId || frameId === 0) {
+            return { tabId: resolvedTabId, documentId: readable.documentId, expectedUrl: readable.tab.url }
+        }
+        const frame = await chrome.webNavigation.getFrame({ tabId: resolvedTabId, frameId })
+        if (
+            !frame?.documentId ||
+            (await readGrantDocumentId(context.serverInstanceId, resolvedTabId)) !== readable.documentId
+        ) {
+            throw new ExpectedOperationError(`${operation} 页面或 iframe 已变化，未读取`)
+        }
+        return { tabId: resolvedTabId, documentId: frame.documentId, expectedUrl: frame.url }
+    }
+
+    private async getReadableScriptableTabId(
+        tabId: number | undefined,
+        context: ActionContext,
+        operation: string,
+        frameId = 0
+    ): Promise<{ tabId: number; documentId?: string; expectedUrl?: string }> {
+        const target = await this.getReadableTabId(tabId, context, operation, frameId)
+        await assertScriptable(target.tabId)
+        return target
     }
 
     private async getManagedTabId(
@@ -578,14 +763,19 @@ export class ContentHandler {
         tabId: number,
         frameId: number | undefined,
         func: InjectableFunc<R>,
-        args: unknown[]
+        args: unknown[],
+        documentId?: string
     ): Promise<R> {
-        const results = await chrome.scripting.executeScript({
-            target: { tabId, frameIds: [frameId ?? 0] },
-            func: func as (...a: unknown[]) => R,
-            args: args as never[],
-            world: 'MAIN',
-        })
+        const results = await chrome.scripting
+            .executeScript({
+                target: documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [frameId ?? 0] },
+                func: func as (...a: unknown[]) => R,
+                args: args as never[],
+                world: isCreatedTab(tabId) ? 'MAIN' : 'ISOLATED',
+            })
+            .catch((error: unknown) => {
+                throw wrapInjectionError(error)
+            })
         const injectionError = (results[0] as { error?: { message?: string } })?.error
         if (injectionError) {
             throw wrapInjectionError(injectionError.message || String(injectionError))
@@ -644,6 +834,7 @@ export class ContentHandler {
             quality: p?.quality,
         })
         const data = dataUrl.split(',')[1]
+        assertScreenshotBase64Budget(data)
         return {
             data,
             format,

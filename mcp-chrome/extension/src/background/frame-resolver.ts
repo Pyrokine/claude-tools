@@ -3,11 +3,13 @@ import { EvaluateInFrameSchema, GetAllFramesSchema, ResolveFrameSchema } from '.
 import {
     type ActionContext,
     assertManagedTab,
+    assertReadableTab,
     assertScriptable,
     getDomFrameSnapshot,
     getTargetTabId,
 } from './action-utils.js'
 import type { DebuggerManager } from './debugger-manager.js'
+import { readGrantDocumentId } from './read-grants.js'
 
 export class FrameResolver {
     constructor(private debuggerManager: DebuggerManager) {}
@@ -18,9 +20,17 @@ export class FrameResolver {
     ): Promise<{ frameId: number; offset: { x: number; y: number } | null }> {
         const p = ResolveFrameSchema.parse(params)
 
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'resolve_frame')
+        const tabId = await getTargetTabId(p.tabId)
+        const readable = await assertReadableTab(tabId, context, 'resolve_frame')
+        await assertScriptable(tabId)
 
-        const snapshot = await getDomFrameSnapshot(tabId, 0, p.frame)
+        const snapshot = await getDomFrameSnapshot(tabId, 0, p.frame, readable.documentId, readable.tab.url)
+        if (
+            readable.documentId &&
+            (await readGrantDocumentId(context.serverInstanceId, tabId)) !== readable.documentId
+        ) {
+            throw new ExpectedOperationError('resolve_frame 页面已变化，未读取')
+        }
         if (snapshot.selectionStatus !== 'found' || snapshot.selectedIndex === null) {
             const desc = typeof p.frame === 'number' ? `index ${p.frame}` : `selector "${p.frame}"`
             const detail = snapshot.selectionError ? `: ${snapshot.selectionError}` : ''
@@ -66,14 +76,22 @@ export class FrameResolver {
         }>
     }> {
         const p = GetAllFramesSchema.parse(params) ?? {}
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'get_all_frames')
+        const tabId = await getTargetTabId(p.tabId)
+        const readable = await assertReadableTab(tabId, context, 'get_all_frames')
+        await assertScriptable(tabId)
 
         const frames = await chrome.webNavigation.getAllFrames({ tabId })
         if (!frames) {
             throw new Error('Failed to get frames')
         }
 
-        const snapshot = await getDomFrameSnapshot(tabId, 0)
+        const snapshot = await getDomFrameSnapshot(tabId, 0, undefined, readable.documentId, readable.tab.url)
+        if (
+            readable.documentId &&
+            (await readGrantDocumentId(context.serverInstanceId, tabId)) !== readable.documentId
+        ) {
+            throw new ExpectedOperationError('get_all_frames 页面已变化，未读取')
+        }
         const domFramesByFrameId = new Map(
             snapshot.frames
                 .filter((frame): frame is typeof frame & { frameId: number } => frame.frameId !== null)

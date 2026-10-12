@@ -10,11 +10,37 @@ const pairingTokenInput = document.getElementById('pairingTokenInput') as HTMLIn
 const saveTokenBtn = document.getElementById('saveTokenBtn') as HTMLButtonElement
 const allowInsecureNoTokenInput = document.getElementById('allowInsecureNoTokenInput') as HTMLInputElement
 const authHelp = document.getElementById('authHelp')!
+const readServer = document.getElementById('readServer') as HTMLSelectElement
+const readAccess = document.getElementById('readAccess') as HTMLInputElement
+const readHelp = document.getElementById('readHelp')!
+let activeTabId: number | undefined
 
 // 获取状态
 async function updateStatus() {
     try {
-        const response = await chrome.runtime.sendMessage({ type: 'GET_STATUS' })
+        const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+        activeTabId = activeTab?.id
+        const response = await chrome.runtime.sendMessage({ type: 'GET_STATUS', tabId: activeTabId })
+        const selectedPort = readServer.value
+        readServer.replaceChildren(
+            ...(response.ports ?? []).map((port: number) => {
+                const option = document.createElement('option')
+                option.value = String(port)
+                option.textContent = `MCP Server ${port}`
+                return option
+            })
+        )
+        if ((response.ports ?? []).some((port: number) => String(port) === selectedPort)) {
+            readServer.value = selectedPort
+        }
+        const granted = (response.readAccess ?? []).find(
+            (item: { port: number; allowed: boolean }) => String(item.port) === readServer.value
+        )
+        readAccess.checked = granted?.allowed === true
+        readAccess.disabled = !activeTabId || !readServer.value
+        readHelp.textContent = activeTabId
+            ? `页面 ${activeTabId}：仅允许文字、HTML 和元信息读取；脚本、截图及写操作始终不可用`
+            : '当前窗口没有可授权的活动页面'
 
         if (response.connected) {
             const ports: number[] = response.ports ?? []
@@ -49,6 +75,30 @@ async function updateStatus() {
         statusText.textContent = '未连接'
     }
 }
+
+readServer.addEventListener('change', () => {
+    void updateStatus()
+})
+readAccess.addEventListener('change', async () => {
+    const tabId = activeTabId
+    const port = Number(readServer.value)
+    const allow = readAccess.checked
+    readAccess.disabled = true
+    try {
+        if (tabId === undefined || !Number.isSafeInteger(port)) {
+            throw new Error('未选择活动页面或 MCP Server')
+        }
+        const result = await chrome.runtime.sendMessage({ type: 'SET_READ_ACCESS', port, tabId, allow })
+        if (!result?.success) {
+            throw new Error(result?.error ?? '只读授权失败')
+        }
+        await updateStatus()
+    } catch (error) {
+        readAccess.checked = !allow
+        readHelp.textContent = error instanceof Error ? error.message : String(error)
+        readAccess.disabled = false
+    }
+})
 
 // 连接
 connectBtn.addEventListener('click', async () => {

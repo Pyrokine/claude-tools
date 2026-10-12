@@ -243,6 +243,7 @@ export const EvaluateSchema = z.object({
     tabId: tabIdOpt,
     frameId: frameIdOpt,
     code: z.string().min(1),
+    timeout: z.number().nonnegative().optional(),
 })
 
 export const ViewportMetricsSchema = z.object({
@@ -270,6 +271,8 @@ export const FindSchema = z
         selector: z.string().optional(),
         text: z.string().optional(),
         xpath: z.string().optional(),
+        point: z.object({ x: z.number().finite(), y: z.number().finite() }).optional(),
+        matchIndex: z.number().int().nonnegative().optional(),
     })
     .partial()
     .optional()
@@ -281,6 +284,7 @@ export const GetTextSchema = z
         tabId: tabIdOpt,
         frameId: frameIdOpt,
         selector: z.string().optional(),
+        refId: refIdOpt,
     })
     .partial()
     .optional()
@@ -291,6 +295,7 @@ export const GetHtmlSchema = z
         frameId: frameIdOpt,
         selector: z.string().optional(),
         outer: z.boolean().optional(),
+        refId: refIdOpt,
     })
     .partial()
     .optional()

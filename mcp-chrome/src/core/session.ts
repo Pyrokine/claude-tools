@@ -8,7 +8,9 @@
  * - 日志收集
  */
 
+import { randomUUID } from 'node:crypto'
 import { BehaviorSimulator, getAntiDetectionScript } from '../anti-detection/index.js'
+import { assertScreenshotBase64Budget, assertScreenshotBudget } from '../tools/png.js'
 import { BrowserLauncher, CDPClient, getBrowserWSEndpoint, getTargets } from '../cdp/index.js'
 import { AutoWait } from './auto-wait.js'
 import {
@@ -36,7 +38,13 @@ import {
     type SetCookieParams,
     type StaleContextRetryPolicy,
 } from './browser-driver.js'
-import { NavigationError, NavigationTimeoutError, SessionNotFoundError, TargetNotFoundError } from './errors.js'
+import {
+    NavigationError,
+    NavigationTimeoutError,
+    PagePreconditionError,
+    SessionNotFoundError,
+    TargetNotFoundError,
+} from './errors.js'
 import { Locator } from './locator.js'
 import {
     type CdpResultObject,
@@ -138,6 +146,9 @@ class SessionManager implements IBrowserDriver {
     private sessionId: string | null = null
     private currentTargetId: string | null = null
     private state: SessionState | null = null
+    private revisionEpoch = randomUUID()
+    private revisions = new Map<string, number>()
+    private pendingPageCondition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null = null
     private behaviorSimulator = new BehaviorSimulator()
     private stealthMode: 'off' | 'safe' | 'aggressive' = 'safe'
     /** 当前按下的修饰键位掩码 */
@@ -151,6 +162,7 @@ class SessionManager implements IBrowserDriver {
     private challengeRequired = false
     private runtimeEnabled = false
     private mainFrameId: string | null = null
+    private mainFrameLoaderId: string | null = null
     private requestMap = new Map<
         string,
         {
@@ -224,6 +236,7 @@ class SessionManager implements IBrowserDriver {
                         return {
                             ...newTarget,
                             reused: true,
+                            targetCreated: true,
                         }
                     }
 
@@ -233,6 +246,7 @@ class SessionManager implements IBrowserDriver {
                         url: pageTarget.url,
                         title: pageTarget.title,
                         reused: true,
+                        targetCreated: false,
                     }
                 } catch {
                     // 连接失败，继续启动新浏览器
@@ -338,7 +352,7 @@ class SessionManager implements IBrowserDriver {
                 url: t.url,
                 title: t.title,
                 type: t.type,
-                active: t.targetId === this.currentTargetId,
+                revision: `${this.revisionEpoch}:${this.revisions.get(t.targetId) ?? 0}`,
             }))
     }
 
@@ -357,29 +371,31 @@ class SessionManager implements IBrowserDriver {
             this.ensureSession()
 
             const { wait = 'load', timeout = DEFAULT_TIMEOUT } = options
+            const abortController = new AbortController()
+            const navigationWait = this.startNavigationWait(wait, timeout, abortController.signal, false)
+            navigationWait.promise.catch(() => {})
+            navigationWait.markActionStarted()
 
-            // networkidle：先注册监听器再 navigate，避免 navigate 返回和监听器注册之间的竞态窗口
-            // noinspection ES6MissingAwait — 故意不 await，Promise 在 navigate 完成后才消费
-            const networkIdlePromise = wait === 'networkidle' ? this.startNetworkIdleWatcher(timeout) : null
-
-            // 导航（传 timeout 防止 CDP 默认 30s 截断用户预算）
-            const { errorText } = (await this.send('Page.navigate', { url }, timeout)) as {
-                errorText?: string
+            try {
+                const { frameId, loaderId, errorText } = (await this.send('Page.navigate', { url }, timeout)) as {
+                    frameId: string
+                    loaderId?: string
+                    errorText?: string
+                }
+                if (errorText) {
+                    throw new NavigationError(url, errorText)
+                }
+                if (loaderId) {
+                    navigationWait.setExpectedLoader(frameId, loaderId)
+                } else {
+                    navigationWait.setExpectedSameDocument(frameId)
+                }
+            } catch (error) {
+                abortController.abort(error)
+                throw error
             }
 
-            if (errorText) {
-                throw new NavigationError(url, errorText)
-            }
-
-            // 根据 wait 类型等待
-            if (networkIdlePromise) {
-                await networkIdlePromise
-            } else {
-                const eventName = wait === 'domcontentloaded' ? 'Page.domContentEventFired' : 'Page.loadEventFired'
-                await this.cdp!.waitForEvent(eventName, undefined, timeout, this.sessionId!)
-            }
-
-            // 更新状态
+            await navigationWait.promise
             await this.updateState()
         })
     }
@@ -457,16 +473,28 @@ class SessionManager implements IBrowserDriver {
     /**
      * 刷新
      */
-    async reload(ignoreCache = false, _waitUntil?: string, timeout = DEFAULT_TIMEOUT): Promise<void> {
+    async reload(ignoreCache = false, waitUntil: string = 'load', timeout = DEFAULT_TIMEOUT): Promise<void> {
         return this.withLock(async () => {
             this.ensureSession()
 
-            const waitPromise = this.cdp!.waitForEvent('Page.loadEventFired', undefined, timeout, this.sessionId!)
-            waitPromise.catch(() => {})
+            const abortController = new AbortController()
+            const navigationWait = this.startNavigationWait(
+                waitUntil as WaitUntil,
+                timeout,
+                abortController.signal,
+                true
+            )
+            navigationWait.promise.catch(() => {})
+            navigationWait.markActionStarted()
 
-            await this.send('Page.reload', { ignoreCache }, timeout)
+            try {
+                await this.send('Page.reload', { ignoreCache }, timeout)
+            } catch (error) {
+                abortController.abort(error)
+                throw error
+            }
 
-            await waitPromise
+            await navigationWait.promise
             await this.updateState()
         })
     }
@@ -573,13 +601,11 @@ class SessionManager implements IBrowserDriver {
         options?: { rawKeyDown?: boolean; autoRepeat?: boolean }
     ): Promise<void> {
         this.ensureSession()
-        if (MODIFIER_KEYS[key]) {
-            this.modifiers |= MODIFIER_KEYS[key]
-        }
+        const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers | MODIFIER_KEYS[key] : this.modifiers
         const keyDefinition = getKeyDefinition(key)
         const params: Record<string, unknown> = {
             type: options?.rawKeyDown ? 'rawKeyDown' : 'keyDown',
-            modifiers: this.modifiers,
+            modifiers: nextModifiers,
             ...keyDefinition,
         }
         if (commands && commands.length > 0) {
@@ -590,6 +616,7 @@ class SessionManager implements IBrowserDriver {
             params.autoRepeat = true
         }
         await this.send('Input.dispatchKeyEvent', params)
+        this.modifiers = nextModifiers
     }
 
     /**
@@ -721,6 +748,7 @@ class SessionManager implements IBrowserDriver {
                 throw new Error(`screenshot: 无法解析页面尺寸: ${result.value}`)
             }
 
+            assertScreenshotBudget(width, height, scale ?? 1)
             // 设置视口
             await this.send('Emulation.setDeviceMetricsOverride', {
                 width,
@@ -731,6 +759,7 @@ class SessionManager implements IBrowserDriver {
 
             try {
                 const { data } = (await this.send('Page.captureScreenshot', captureParams)) as { data: string }
+                assertScreenshotBase64Budget(data)
                 return { data, format: effectiveFormat }
             } finally {
                 try {
@@ -741,7 +770,21 @@ class SessionManager implements IBrowserDriver {
             }
         }
 
+        if (clip) {
+            assertScreenshotBudget(clip.width, clip.height, scale ?? 1)
+        } else {
+            const metrics = (await this.send('Page.getLayoutMetrics')) as {
+                cssVisualViewport?: { clientWidth: number; clientHeight: number }
+                cssLayoutViewport?: { clientWidth: number; clientHeight: number }
+            }
+            const viewport = metrics.cssVisualViewport ?? metrics.cssLayoutViewport
+            if (!viewport) {
+                throw new Error('screenshot: 浏览器未返回 CSS 视口尺寸，未执行截图')
+            }
+            assertScreenshotBudget(viewport.clientWidth, viewport.clientHeight, 1)
+        }
         const { data } = (await this.send('Page.captureScreenshot', captureParams)) as { data: string }
+        assertScreenshotBase64Budget(data)
         return { data, format: effectiveFormat }
     }
 
@@ -916,7 +959,7 @@ class SessionManager implements IBrowserDriver {
                     el.getAttribute('placeholder') ||
                     el.textContent ||
                     ''
-                ).replace(new RegExp('\\s+', 'g'), ' ').trim().slice(0, 160);
+                ).replace(/\\s+/g, ' ').trim().slice(0, 160);
             }
             var selector = [
                 'button,a[href],input,textarea,select,[role]',
@@ -1294,6 +1337,51 @@ class SessionManager implements IBrowserDriver {
         return this.currentTargetId
     }
 
+    async deselectPage(): Promise<void> {
+        try {
+            if (this.sessionId && this.cdp?.isConnected) {
+                await this.cdp.send('Target.detachFromTarget', { sessionId: this.sessionId })
+            }
+        } finally {
+            this.clearAttachedTargetState()
+        }
+    }
+
+    async getPageSnapshot(targetId: string): Promise<{ targetId: string; url: string; revision: string }> {
+        this.ensureConnected()
+        const { targetInfo } = await this.sendBrowserCommand<{
+            targetInfo: { targetId: string; url?: string; type: string }
+        }>('Target.getTargetInfo', { targetId })
+        if (targetInfo.type !== 'page' || targetInfo.targetId !== targetId) {
+            throw new TargetNotFoundError(targetId)
+        }
+        return {
+            targetId,
+            url: targetInfo.url ?? '',
+            revision: `${this.revisionEpoch}:${this.revisions.get(targetId) ?? 0}`,
+        }
+    }
+
+    setPageCondition(condition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null): void {
+        this.pendingPageCondition = condition
+    }
+
+    async assertPageCondition(targetId: string, expectedUrl?: string, expectedRevision?: string): Promise<void> {
+        const snapshot = await this.getPageSnapshot(targetId)
+        if (
+            (expectedUrl !== undefined && snapshot.url !== expectedUrl) ||
+            (expectedRevision !== undefined && snapshot.revision !== expectedRevision)
+        ) {
+            throw new PagePreconditionError({
+                targetId,
+                expectedUrl: expectedUrl ?? null,
+                expectedRevision: expectedRevision ?? null,
+                actualUrl: snapshot.url,
+                actualRevision: snapshot.revision,
+            })
+        }
+    }
+
     /** IBrowserDriver 接口：设置当前操作目标 ID（attach 到指定 target） */
     setCurrentTargetId(targetId: string | null): void {
         // CDP 路径不支持同步 setCurrentTargetId（attach 是异步的）;
@@ -1346,7 +1434,7 @@ class SessionManager implements IBrowserDriver {
      * tabId 在 CDP 模式下忽略（CDP 单 session 概念不区分 tab）；
      * browser-level 域（Target/Browser/SystemInfo/DeviceAccess/IO）走 sendBrowserCommand
      */
-    debuggerSend(
+    async debuggerSend(
         method: string,
         params?: Record<string, unknown>,
         _tabId?: number,
@@ -1355,7 +1443,27 @@ class SessionManager implements IBrowserDriver {
         const domain = method.split('.')[0]
         const browserLevelDomains = ['Target', 'Browser', 'SystemInfo', 'DeviceAccess', 'IO']
         if (browserLevelDomains.includes(domain)) {
+            if (this.pendingPageCondition) {
+                throw new DriverCapabilityError('浏览器级 CDP 命令不支持页面条件，未执行动作')
+            }
             return this.sendBrowserCommand(method, params)
+        }
+        if (this.pendingPageCondition) {
+            const condition = this.pendingPageCondition
+            if (condition.targetId !== this.currentTargetId) {
+                throw new PagePreconditionError({ targetId: condition.targetId, actualTargetId: this.currentTargetId })
+            }
+            await this.assertPageCondition(condition.targetId, condition.expectedUrl, condition.expectedRevision)
+            this.pendingPageCondition = null
+            if (
+                this.currentTargetId &&
+                method !== 'Runtime.evaluate' &&
+                method !== 'Runtime.callFunctionOn' &&
+                !method.startsWith('Input.') &&
+                !method.startsWith('Emulation.')
+            ) {
+                this.revisions.set(this.currentTargetId, (this.revisions.get(this.currentTargetId) ?? 0) + 1)
+            }
         }
         return this.send(method, params, timeout)
     }
@@ -1653,16 +1761,27 @@ class SessionManager implements IBrowserDriver {
     /**
      * 关闭页面
      */
-    async closePage(targetId?: string): Promise<void> {
+    async closePage(targetId: string): Promise<void> {
+        if (!targetId) {
+            throw new TargetNotFoundError('targetId is required')
+        }
         return this.withLock(async () => {
             this.ensureConnected()
-
-            const id = targetId ?? this.currentTargetId
-            if (!id) {
-                throw new TargetNotFoundError('unknown')
+            const targets = await this.listTargets()
+            if (!targets.some((target) => target.targetId === targetId)) {
+                throw new TargetNotFoundError(targetId)
             }
-
-            await this.cdp!.send('Target.closeTarget', { targetId: id })
+            const id = targetId
+            if (this.pendingPageCondition) {
+                const condition = this.pendingPageCondition
+                await this.assertPageCondition(id, condition.expectedUrl, condition.expectedRevision)
+                this.pendingPageCondition = null
+            }
+            const result = (await this.cdp!.send('Target.closeTarget', { targetId: id })) as { success: boolean }
+            if (!result.success) {
+                throw new TargetNotFoundError(targetId)
+            }
+            this.revisions.delete(id)
 
             // 如果关闭的是当前页面，清除会话状态
             if (id === this.currentTargetId) {
@@ -1728,9 +1847,31 @@ class SessionManager implements IBrowserDriver {
      * 多步操作（type 循环、fullPage 截图等）的 await 间隙可能被 close() 打断，
      * ensureSession() 确保在当前 tick 内 this.cdp 非空
      */
-    send<T>(method: string, params?: object, timeout?: number): Promise<T> {
+    async send<T>(method: string, params?: object, timeout?: number): Promise<T> {
         this.ensureSession()
-        return this.cdp!.send(method, params, this.sessionId ?? undefined, timeout)
+        const mutation =
+            method === 'Page.navigate' ||
+            method === 'Page.navigateToHistoryEntry' ||
+            method === 'Page.reload' ||
+            method === 'Runtime.evaluate' ||
+            method === 'Runtime.callFunctionOn' ||
+            method.startsWith('Input.') ||
+            method.startsWith('Emulation.')
+        const condition = mutation ? this.pendingPageCondition : null
+        if (condition) {
+            if (condition.targetId !== this.currentTargetId) {
+                throw new PagePreconditionError({
+                    targetId: condition.targetId,
+                    actualTargetId: this.currentTargetId,
+                })
+            }
+            await this.assertPageCondition(condition.targetId, condition.expectedUrl, condition.expectedRevision)
+            this.pendingPageCondition = null
+        }
+        if (mutation && this.currentTargetId) {
+            this.revisions.set(this.currentTargetId, (this.revisions.get(this.currentTargetId) ?? 0) + 1)
+        }
+        return this.cdp!.send<T>(method, params, this.sessionId ?? undefined, timeout)
     }
 
     /**
@@ -1758,13 +1899,208 @@ class SessionManager implements IBrowserDriver {
         }
     }
 
-    /**
-     * 在调用 navigate 之前注册网络空闲监听器，返回等待 idle 的 Promise
-     * 预先注册避免 Page.navigate 返回和监听器注册之间遗漏早期请求
-     */
-    private startNetworkIdleWatcher(timeout: number, idleTime: number = 500): Promise<void> {
+    /** 在触发导航前注册相应等待器，并按主 frame loader 过滤生命周期事件 */
+    private startNavigationWait(
+        wait: WaitUntil,
+        timeout: number,
+        signal: AbortSignal | undefined,
+        bindFromFrameNavigation: boolean
+    ): {
+        promise: Promise<void>
+        markActionStarted: () => void
+        setExpectedLoader: (frameId: string, loaderId: string) => void
+        setExpectedSameDocument: (frameId: string) => void
+    } {
         this.ensureSession()
-        return this.buildNetworkIdlePromise(this.cdp!, timeout, idleTime)
+        const cdp = this.cdp!
+        const sessionId = this.sessionId!
+        const baselineLoaderId = this.mainFrameLoaderId
+        const lifecycleName =
+            wait === 'domcontentloaded' ? 'DOMContentLoaded' : wait === 'load' ? 'load' : 'networkIdle'
+        const seenLifecycle = new Set<string>()
+        const seenSameDocumentFrames = new Set<string>()
+        const sameDocumentPendingRequests = new Set<string>()
+        let actionStarted = false
+        let expectedFrameId: string | null = null
+        let expectedLoaderId: string | null = null
+        let expectedSameDocumentFrameId: string | null = null
+        let sameDocumentIdleTimer: NodeJS.Timeout | null = null
+        let settled = false
+        let finish: () => void = () => {}
+        let fail: (error: Error) => void = () => {}
+
+        const lifecycleKey = (frameId: string, loaderId: string, name: string) =>
+            JSON.stringify([frameId, loaderId, name])
+        const completeIfSeen = () => {
+            if (
+                expectedFrameId !== null &&
+                expectedLoaderId !== null &&
+                seenLifecycle.has(lifecycleKey(expectedFrameId, expectedLoaderId, lifecycleName))
+            ) {
+                finish()
+            }
+        }
+        const checkSameDocumentIdle = () => {
+            if (
+                settled ||
+                expectedSameDocumentFrameId === null ||
+                !seenSameDocumentFrames.has(expectedSameDocumentFrameId)
+            ) {
+                return
+            }
+            if (sameDocumentPendingRequests.size > 0) {
+                if (sameDocumentIdleTimer !== null) {
+                    clearTimeout(sameDocumentIdleTimer)
+                    sameDocumentIdleTimer = null
+                }
+                return
+            }
+            if (sameDocumentIdleTimer === null) {
+                sameDocumentIdleTimer = setTimeout(() => finish(), 500)
+            }
+        }
+        const completeSameDocumentIfSeen = () => {
+            if (expectedSameDocumentFrameId === null || !seenSameDocumentFrames.has(expectedSameDocumentFrameId)) {
+                return
+            }
+            if (wait === 'networkidle') {
+                checkSameDocumentIdle()
+            } else {
+                finish()
+            }
+        }
+        const setExpectedLoader = (frameId: string, loaderId: string) => {
+            if (settled || !loaderId) {
+                return
+            }
+            expectedSameDocumentFrameId = null
+            if (sameDocumentIdleTimer !== null) {
+                clearTimeout(sameDocumentIdleTimer)
+                sameDocumentIdleTimer = null
+            }
+            expectedFrameId = frameId
+            expectedLoaderId = loaderId
+            completeIfSeen()
+        }
+        const setExpectedSameDocument = (frameId: string) => {
+            if (settled) {
+                return
+            }
+            expectedSameDocumentFrameId = frameId
+            completeSameDocumentIfSeen()
+        }
+
+        const promise = new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timeoutId)
+                if (sameDocumentIdleTimer !== null) {
+                    clearTimeout(sameDocumentIdleTimer)
+                    sameDocumentIdleTimer = null
+                }
+                signal?.removeEventListener('abort', onAbort)
+                cdp.offEvent('Page.frameNavigated', onFrameNavigated)
+                cdp.offEvent('Page.lifecycleEvent', onLifecycleEvent)
+                cdp.offEvent('Page.navigatedWithinDocument', onNavigatedWithinDocument)
+                cdp.offEvent('Network.requestWillBeSent', onRequestStarted)
+                cdp.offEvent('Network.loadingFinished', onRequestFinished)
+                cdp.offEvent('Network.loadingFailed', onRequestFinished)
+                cdp.removeListener('disconnected', onDisconnected)
+            }
+            finish = () => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                cleanup()
+                resolve()
+            }
+            fail = (error: Error) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                cleanup()
+                reject(error)
+            }
+            const onFrameNavigated = (params: unknown, eventSessionId?: string) => {
+                if (!actionStarted || !bindFromFrameNavigation || eventSessionId !== sessionId) {
+                    return
+                }
+                const frame = (params as { frame?: { id?: string; parentId?: string; loaderId?: string } }).frame
+                if (frame?.id && !frame.parentId && frame.loaderId && frame.loaderId !== baselineLoaderId) {
+                    setExpectedLoader(frame.id, frame.loaderId)
+                }
+            }
+            const onLifecycleEvent = (params: unknown, eventSessionId?: string) => {
+                if (!actionStarted || eventSessionId !== sessionId) {
+                    return
+                }
+                const event = params as { frameId?: string; loaderId?: string; name?: string }
+                if (!event.frameId || !event.loaderId || !event.name) {
+                    return
+                }
+                seenLifecycle.add(lifecycleKey(event.frameId, event.loaderId, event.name))
+                completeIfSeen()
+            }
+            const onNavigatedWithinDocument = (params: unknown, eventSessionId?: string) => {
+                if (!actionStarted || eventSessionId !== sessionId) {
+                    return
+                }
+                const frameId = (params as { frameId?: string }).frameId
+                if (frameId && frameId === this.mainFrameId) {
+                    seenSameDocumentFrames.add(frameId)
+                    completeSameDocumentIfSeen()
+                }
+            }
+            const onRequestStarted = (params: unknown, eventSessionId?: string) => {
+                if (!actionStarted || eventSessionId !== sessionId) {
+                    return
+                }
+                const requestId = (params as { requestId?: string }).requestId
+                if (requestId) {
+                    sameDocumentPendingRequests.add(requestId)
+                    checkSameDocumentIdle()
+                }
+            }
+            const onRequestFinished = (params: unknown, eventSessionId?: string) => {
+                if (!actionStarted || eventSessionId !== sessionId) {
+                    return
+                }
+                const requestId = (params as { requestId?: string }).requestId
+                if (requestId) {
+                    sameDocumentPendingRequests.delete(requestId)
+                    checkSameDocumentIdle()
+                }
+            }
+            const onAbort = () => {
+                fail(signal?.reason instanceof Error ? signal.reason : new Error('导航等待已取消'))
+            }
+            const onDisconnected = () => fail(new Error('CDP 连接已关闭'))
+            const timeoutId = setTimeout(() => fail(new NavigationTimeoutError(wait, timeout)), timeout)
+
+            cdp.onEvent('Page.frameNavigated', onFrameNavigated)
+            cdp.onEvent('Page.lifecycleEvent', onLifecycleEvent)
+            cdp.onEvent('Page.navigatedWithinDocument', onNavigatedWithinDocument)
+            if (wait === 'networkidle') {
+                cdp.onEvent('Network.requestWillBeSent', onRequestStarted)
+                cdp.onEvent('Network.loadingFinished', onRequestFinished)
+                cdp.onEvent('Network.loadingFailed', onRequestFinished)
+            }
+            cdp.once('disconnected', onDisconnected)
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+            }
+        })
+
+        return {
+            promise,
+            markActionStarted: () => {
+                actionStarted = true
+            },
+            setExpectedLoader,
+            setExpectedSameDocument,
+        }
     }
 
     /**
@@ -1773,7 +2109,12 @@ class SessionManager implements IBrowserDriver {
      * 捕获 cdp 引用防止 close() 并发置 null，用局部 Set 追踪请求避免污染成员变量
      * close() 时通过 'disconnected' 信号立即 reject
      */
-    private buildNetworkIdlePromise(cdp: CDPClient, timeout: number, idleTime: number): Promise<void> {
+    private buildNetworkIdlePromise(
+        cdp: CDPClient,
+        timeout: number,
+        idleTime: number,
+        signal?: AbortSignal
+    ): Promise<void> {
         const localPendingRequests = new Set<string>()
         const sessionId = this.sessionId!
 
@@ -1822,10 +2163,16 @@ class SessionManager implements IBrowserDriver {
                 if (timeoutTimer !== null) {
                     clearTimeout(timeoutTimer)
                 }
+                signal?.removeEventListener('abort', onAbort)
                 cdp.offEvent('Network.requestWillBeSent', onRequestStart)
                 cdp.offEvent('Network.loadingFinished', onRequestEnd)
                 cdp.offEvent('Network.loadingFailed', onRequestEnd)
                 cdp.removeListener('disconnected', onDisconnected)
+            }
+
+            const onAbort = () => {
+                cleanup()
+                reject(signal?.reason instanceof Error ? signal.reason : new Error('网络空闲等待已取消'))
             }
 
             timeoutTimer = setTimeout(() => {
@@ -1842,6 +2189,11 @@ class SessionManager implements IBrowserDriver {
             cdp.onEvent('Network.requestWillBeSent', onRequestStart)
             cdp.onEvent('Network.loadingFinished', onRequestEnd)
             cdp.onEvent('Network.loadingFailed', onRequestEnd)
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+                return
+            }
 
             checkIdle()
         })
@@ -1909,6 +2261,7 @@ class SessionManager implements IBrowserDriver {
         this.challengeRequired = false
         this.runtimeEnabled = false
         this.mainFrameId = null
+        this.mainFrameLoaderId = null
         this.modifiers = 0
         this.sessionId = null
         this.currentTargetId = null
@@ -1937,6 +2290,9 @@ class SessionManager implements IBrowserDriver {
         }
 
         this.clearAttachedTargetState()
+        this.revisionEpoch = randomUUID()
+        this.revisions.clear()
+        this.pendingPageCondition = null
         this.behaviorSimulator.setCurrentPosition({ x: 0, y: 0 })
         this.listenersInstalled = false
         this.connectedPort = 0
@@ -2024,8 +2380,12 @@ class SessionManager implements IBrowserDriver {
             this.send('Network.enable'),
             this.send('Log.enable'),
         ])
-        const { frameTree } = await this.send<{ frameTree: { frame: { id: string } } }>('Page.getFrameTree')
+        await this.send('Page.setLifecycleEventsEnabled', { enabled: true })
+        const { frameTree } = await this.send<{ frameTree: { frame: { id: string; loaderId?: string } } }>(
+            'Page.getFrameTree'
+        )
         this.mainFrameId = frameTree.frame.id
+        this.mainFrameLoaderId = frameTree.frame.loaderId ?? null
 
         // 根据 stealth 模式注入反检测脚本。不在当前文档 Runtime.evaluate，避免干扰 Cloudflare JS Challenge
         if (this.stealthMode !== 'off') {
@@ -2055,9 +2415,18 @@ class SessionManager implements IBrowserDriver {
             if (!this.isCurrentSessionEvent(eventSessionId)) {
                 return
             }
-            const frame = (params as { frame?: { id?: string; parentId?: string } }).frame
+            const frame = (params as { frame?: { id?: string; parentId?: string; loaderId?: string } }).frame
             if (frame?.id && !frame.parentId) {
                 this.mainFrameId = frame.id
+                this.mainFrameLoaderId = frame.loaderId ?? null
+                if (this.currentTargetId) {
+                    this.revisions.set(this.currentTargetId, (this.revisions.get(this.currentTargetId) ?? 0) + 1)
+                }
+            }
+        })
+        this.cdp!.onEvent('Page.navigatedWithinDocument', (_params: unknown, eventSessionId?: string) => {
+            if (this.isCurrentSessionEvent(eventSessionId) && this.currentTargetId) {
+                this.revisions.set(this.currentTargetId, (this.revisions.get(this.currentTargetId) ?? 0) + 1)
             }
         })
 

@@ -4,7 +4,8 @@
  * 封装与 mcp-chrome 的 JSON-RPC 通信
  */
 
-import { spawn } from 'child_process';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -15,173 +16,74 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 export class McpClient {
     constructor() {
-        this.process = null;
-        this.requestId = 0;
-        this.pending = new Map(); // id -> {resolve, reject}
-        this.buffer = Buffer.alloc(0);
+        this.client = null;
+        this.transport = null;
     }
 
     /**
-     * 启动 MCP Server 进程
+     * 启动 MCP Server 并使用官方 SDK 完成初始化握手
      */
     async start() {
         const serverPath = resolve(__dirname, '..', 'dist', 'index.js');
-        this.process = spawn('node', [serverPath], {
-            stdio: ['pipe', 'pipe', 'pipe'],
+        const env = Object.fromEntries(Object.entries(process.env).filter((entry) => entry[1] !== undefined));
+        this.transport = new StdioClientTransport({
+            command: process.execPath,
+            args: [serverPath],
+            env,
+            stderr: 'pipe',
         });
-
-        // 解析 stdout 的 JSON-RPC 消息
-        this.process.stdout.on('data', (chunk) => {
-            this.buffer = Buffer.concat([this.buffer, chunk]);
-            this._processBuffer();
-        });
-
-        // stderr 输出日志（不影响协议）
-        this.process.stderr.on('data', (chunk) => {
-            // 静默，除非调试
+        this.transport.stderr?.on('data', (chunk) => {
             if (process.env.DEBUG) {
                 process.stderr.write(`[server] ${chunk}`);
             }
         });
-
-        this.process.on('exit', (code) => {
-            // 拒绝所有 pending 请求
-            for (const [, { reject }] of this.pending) {
-                reject(new Error(`Server exited with code ${code}`));
-            }
-            this.pending.clear();
-        });
-
-        // 等待进程启动
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        this.client = new Client({ name: 'mcp-chrome-test', version: '1.0.0' });
+        await this.client.connect(this.transport);
     }
 
     /**
-     * MCP 初始化握手
+     * 返回 SDK 握手结果，并等待 Extension 自动连接
      */
     async initialize() {
-        const result = await this.request('initialize', {
-            protocolVersion: '2024-11-05',
-            capabilities: {},
-            clientInfo: { name: 'mcp-chrome-test', version: '1.0.0' },
-        });
-
-        // 发送 initialized 通知
-        this.notify('notifications/initialized', {});
-
-        // 等待 Extension 连接
+        if (!this.client) {
+            throw new Error('MCP client has not started');
+        }
         await new Promise((resolve) => setTimeout(resolve, 2000));
+        return {
+            capabilities: this.client.getServerCapabilities(),
+            serverInfo: this.client.getServerVersion(),
+            instructions: this.client.getInstructions(),
+        };
+    }
 
-        return result;
+    /**
+     * 列出 MCP 工具
+     */
+    async listTools() {
+        if (!this.client) {
+            throw new Error('MCP client has not started');
+        }
+        return this.client.listTools();
     }
 
     /**
      * 调用 MCP 工具
      */
     async callTool(name, args = {}) {
-        return this.request('tools/call', { name, arguments: args });
-    }
-
-    /**
-     * 发送 JSON-RPC 请求
-     */
-    request(method, params) {
-        return new Promise((resolve, reject) => {
-            const id = ++this.requestId;
-            this.pending.set(id, { resolve, reject });
-
-            const message = JSON.stringify({
-                jsonrpc: '2.0',
-                id,
-                method,
-                params,
-            });
-
-            this._send(message);
-
-            // 超时
-            setTimeout(() => {
-                if (this.pending.has(id)) {
-                    this.pending.delete(id);
-                    reject(new Error(`Request timeout: ${method}`));
-                }
-            }, 30000);
-        });
-    }
-
-    /**
-     * 发送 JSON-RPC 通知（无 id，无响应）
-     */
-    notify(method, params) {
-        const message = JSON.stringify({
-            jsonrpc: '2.0',
-            method,
-            params,
-        });
-        this._send(message);
+        if (!this.client) {
+            throw new Error('MCP client has not started');
+        }
+        return this.client.callTool({ name, arguments: args });
     }
 
     /**
      * 关闭连接
      */
     async close() {
-        if (this.process) {
-            this.process.kill();
-            this.process = null;
-        }
-    }
-
-    // ==================== 内部方法 ====================
-
-    _send(message) {
-        const header = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n`;
-        this.process.stdin.write(header + message);
-    }
-
-    _processBuffer() {
-        while (true) {
-            const headerEnd = this.buffer.indexOf(Buffer.from('\r\n\r\n'));
-            if (headerEnd === -1) {
-                break;
-            }
-
-            const header = this.buffer.subarray(0, headerEnd).toString('ascii');
-            const match = header.match(/Content-Length:\s*(?<len>\d+)/i);
-            if (!match) {
-                this.buffer = this.buffer.subarray(headerEnd + 4);
-                continue;
-            }
-
-            const contentLength = parseInt(match.groups.len, 10);
-            const bodyStart = headerEnd + 4;
-            const bodyEnd = bodyStart + contentLength;
-
-            if (this.buffer.length < bodyEnd) {
-                break;
-            }
-
-            const body = this.buffer.subarray(bodyStart, bodyEnd).toString('utf8');
-            this.buffer = this.buffer.subarray(bodyEnd);
-
-            try {
-                const message = JSON.parse(body);
-                this._handleMessage(message);
-            } catch {
-                // 解析失败，忽略
-            }
-        }
-    }
-
-    _handleMessage(message) {
-        if (message.id !== undefined && this.pending.has(message.id)) {
-            const { resolve, reject } = this.pending.get(message.id);
-            this.pending.delete(message.id);
-
-            if (message.error) {
-                reject(new Error(message.error.message || JSON.stringify(message.error)));
-            } else {
-                resolve(message.result);
-            }
+        if (this.client) {
+            await this.client.close();
+            this.client = null;
+            this.transport = null;
         }
     }
 }

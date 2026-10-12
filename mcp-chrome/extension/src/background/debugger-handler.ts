@@ -12,6 +12,8 @@ const EXPECTED_DEBUGGER_PATTERNS = [
     /Inspected target navigated or closed/i,
     /No tab with given id/i,
     /Detached while handling command/i,
+    /Cannot find context with specified id/i,
+    /Execution context was destroyed/i,
 ]
 
 function wrapDebuggerError(err: unknown): Error {
@@ -56,7 +58,7 @@ export class DebuggerHandler {
         // 走集中清理：cleanupTab 同时清 attachedTabs / debuggerBlocked* / executionContexts / pendingAttach
         // 避免逐个 Map 漏清导致后续 evaluate/screenshot 用到旧 contextId
         this.debuggerManager.cleanupTab(tabId)
-        this.logManager.cleanupTab(tabId)
+        this.logManager.handleDebuggerDetach(tabId)
 
         return { success: true }
     }

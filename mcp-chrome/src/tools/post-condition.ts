@@ -126,8 +126,16 @@ async function checkPostCondition(
         checks.push({ name: 'urlIncludes', matched: url.includes(condition.urlIncludes), actual: url.slice(0, 500) })
     }
     if (condition.script !== undefined) {
-        const value = await unifiedSession.evaluate<unknown>(condition.script, mode, nextTimeout())
-        checks.push({ name: 'script', matched: Boolean(value), actual: value })
+        const matched = await unifiedSession.evaluate<boolean>(
+            `async (source) => {
+                const value = (0, eval)(source)
+                return Boolean(await (typeof value === 'function' ? value() : value))
+            }`,
+            mode,
+            nextTimeout(),
+            [condition.script]
+        )
+        checks.push({ name: 'script', matched, actual: matched })
     }
     return checks
 }

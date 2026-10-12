@@ -2,6 +2,40 @@ import { deflateSync, inflateSync } from 'zlib'
 
 export const MAX_COMPARE_PNG_BYTES = 25 * 1024 * 1024
 export const MAX_COMPARE_PIXELS = 12_000_000
+export const MAX_SCREENSHOT_DIMENSION = 16384
+export const MAX_SCREENSHOT_ESTIMATED_BYTES = 48 * 1024 * 1024
+
+export function assertScreenshotBudget(width: number, height: number, scale = 1): void {
+    const scaledWidth = Math.ceil(width * scale)
+    const scaledHeight = Math.ceil(height * scale)
+    if (
+        !Number.isFinite(scaledWidth) ||
+        !Number.isFinite(scaledHeight) ||
+        scaledWidth <= 0 ||
+        scaledHeight <= 0 ||
+        scaledWidth > MAX_SCREENSHOT_DIMENSION ||
+        scaledHeight > MAX_SCREENSHOT_DIMENSION ||
+        scaledWidth * scaledHeight > MAX_COMPARE_PIXELS ||
+        scaledWidth * scaledHeight * 4 > MAX_SCREENSHOT_ESTIMATED_BYTES
+    ) {
+        throw new Error(
+            `screenshot 尺寸 ${scaledWidth}x${scaledHeight} 超出预算（单边 ${MAX_SCREENSHOT_DIMENSION}、` +
+                `像素 ${MAX_COMPARE_PIXELS}、预计 RGBA ${MAX_SCREENSHOT_ESTIMATED_BYTES} 字节），请用 clip 或 scale 缩小截图`
+        )
+    }
+}
+
+export function assertScreenshotBase64Budget(data: string): void {
+    if (Math.floor((data.length * 3) / 4) > MAX_COMPARE_PNG_BYTES) {
+        throw new Error(`screenshot 数据超过 ${MAX_COMPARE_PNG_BYTES} 字节，请用 clip 或 scale 缩小截图`)
+    }
+}
+
+export function assertPngFileBudget(size: number): void {
+    if (size > MAX_COMPARE_PNG_BYTES) {
+        throw new Error(`baseline PNG 超过 ${MAX_COMPARE_PNG_BYTES} 字节，请更换较小的基准图`)
+    }
+}
 
 interface DecodedPng {
     width: number
@@ -74,10 +108,15 @@ export function readPngHeader(buffer: Buffer): { width: number; height: number }
     if (!buffer.subarray(0, 8).equals(signature)) {
         throw new Error('screenshot compare 需要 PNG 文件')
     }
-    if (buffer.length < 33 || buffer.toString('ascii', 12, 16) !== 'IHDR') {
+    if (buffer.length < 33 || buffer.readUInt32BE(8) !== 13 || buffer.toString('ascii', 12, 16) !== 'IHDR') {
         throw new Error('screenshot compare 需要有效 PNG IHDR')
     }
-    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) }
+    const width = buffer.readUInt32BE(16)
+    const height = buffer.readUInt32BE(20)
+    if (width === 0 || height === 0) {
+        throw new Error('screenshot compare PNG 尺寸必须大于 0')
+    }
+    return { width, height }
 }
 
 function assertPngCompareWithinLimits(buffer: Buffer, label: string): void {
@@ -85,55 +124,89 @@ function assertPngCompareWithinLimits(buffer: Buffer, label: string): void {
         throw new Error(`${label} PNG 超过 ${MAX_COMPARE_PNG_BYTES} 字节，请使用 clip 或 scale 缩小截图`)
     }
     const header = readPngHeader(buffer)
-    const pixels = header.width * header.height
-    if (pixels > MAX_COMPARE_PIXELS) {
-        throw new Error(`${label} PNG 像素数 ${pixels} 超过 ${MAX_COMPARE_PIXELS}，请使用 clip 或 scale 缩小截图`)
-    }
+    assertScreenshotBudget(header.width, header.height)
 }
 
 function decodePng(buffer: Buffer): DecodedPng {
-    readPngHeader(buffer)
+    const header = readPngHeader(buffer)
 
     let offset = 8
-    let width = 0
-    let height = 0
     let colorType = 0
+    let sawIhdr = false
+    let sawIdat = false
+    let sawIend = false
     const idat: Buffer[] = []
     while (offset < buffer.length) {
+        if (offset + 12 > buffer.length) {
+            throw new Error('screenshot compare PNG chunk 数据不完整')
+        }
         const length = buffer.readUInt32BE(offset)
         const type = buffer.toString('ascii', offset + 4, offset + 8)
+        const chunkEnd = offset + 12 + length
+        if (chunkEnd > buffer.length) {
+            throw new Error(`screenshot compare PNG ${type || 'unknown'} chunk 数据不完整`)
+        }
         const data = buffer.subarray(offset + 8, offset + 8 + length)
-        offset += 12 + length
         if (type === 'IHDR') {
-            width = data.readUInt32BE(0)
-            height = data.readUInt32BE(4)
+            if (sawIhdr || offset !== 8 || length !== 13) {
+                throw new Error('screenshot compare PNG 只能包含一个首块 IHDR')
+            }
+            sawIhdr = true
+            if (data.readUInt32BE(0) !== header.width || data.readUInt32BE(4) !== header.height) {
+                throw new Error('screenshot compare PNG IHDR 尺寸不一致')
+            }
             const bitDepth = data[8]
             colorType = data[9]
             const interlace = data[12]
             if (bitDepth !== 8 || interlace !== 0 || (colorType !== 2 && colorType !== 6)) {
                 throw new Error('screenshot compare 仅支持 8-bit non-interlaced RGB/RGBA PNG')
             }
+        } else if (!sawIhdr) {
+            throw new Error('screenshot compare PNG IHDR 必须是首个 chunk')
         } else if (type === 'IDAT') {
+            sawIdat = true
             idat.push(data)
         } else if (type === 'IEND') {
+            if (length !== 0) {
+                throw new Error('screenshot compare PNG IEND chunk 无效')
+            }
+            sawIend = true
+            offset = chunkEnd
             break
         }
+        offset = chunkEnd
+    }
+    if (!sawIhdr || !sawIdat || !sawIend) {
+        throw new Error('screenshot compare PNG 缺少必要 chunk')
+    }
+    if (offset !== buffer.length) {
+        throw new Error('screenshot compare PNG IEND 必须是最后一个 chunk')
     }
 
+    const pixels = header.width * header.height
+    if (pixels > MAX_COMPARE_PIXELS) {
+        throw new Error(`screenshot compare PNG 像素数 ${pixels} 超过 ${MAX_COMPARE_PIXELS}`)
+    }
     const bytesPerPixel = colorType === 6 ? 4 : 3
-    const stride = width * bytesPerPixel
-    const raw = inflateSync(Buffer.concat(idat))
-    const rgba = Buffer.alloc(width * height * 4)
+    const stride = header.width * bytesPerPixel
+    const expectedRawLength = (stride + 1) * header.height
+    const raw = inflateSync(Buffer.concat(idat), { maxOutputLength: expectedRawLength })
+    if (raw.length !== expectedRawLength) {
+        throw new Error(
+            `screenshot compare PNG scanline 数据长度无效: expected ${expectedRawLength}, got ${raw.length}`
+        )
+    }
+    const rgba = Buffer.alloc(pixels * 4)
     let input = 0
     let prev = Buffer.alloc(stride)
-    for (let y = 0; y < height; y++) {
+    for (let y = 0; y < header.height; y++) {
         const filter = raw[input++]
         const row = Buffer.from(raw.subarray(input, input + stride))
         input += stride
         unfilterRow(row, prev, bytesPerPixel, filter)
-        for (let x = 0; x < width; x++) {
+        for (let x = 0; x < header.width; x++) {
             const src = x * bytesPerPixel
-            const dst = (y * width + x) * 4
+            const dst = (y * header.width + x) * 4
             rgba[dst] = row[src]
             rgba[dst + 1] = row[src + 1]
             rgba[dst + 2] = row[src + 2]
@@ -141,7 +214,7 @@ function decodePng(buffer: Buffer): DecodedPng {
         }
         prev = row
     }
-    return { width, height, rgba }
+    return { width: header.width, height: header.height, rgba }
 }
 
 function unfilterRow(row: Buffer, prev: Buffer, bpp: number, filter: number): void {

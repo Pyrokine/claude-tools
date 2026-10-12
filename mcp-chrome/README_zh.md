@@ -12,7 +12,7 @@ Chrome 浏览器自动化 MCP Server，双模式架构： **Extension 模式**�
 
 - **双模式**：Extension 模式共享登录状态；CDP 模式用于无头/隔离场景
 - **8 个统一工具**：基于 action 的设计，覆盖浏览、输入、提取、等待、执行、管理、Cookie、日志
-- **多 Tab 并行**：`tabId` 参数支持对任意 Tab 操作，无需切换焦点
+- **多页面定位**：`targetId` 在两种 backend 中指定操作页面，无需切换浏览器焦点；`tabId` 保留为兼容别名
 - **iframe 穿透**：`frame` 参数支持操作 iframe 内元素（CSS 选择器或索引，Extension 模式）
 - **语义化定位**：11 种元素定位方式（role、text、label、css、css+文本组合、xpath、坐标等）
 - **自动等待**：内置可点击性、可输入性检测，基于 deadline 的超时预算机制
@@ -21,6 +21,17 @@ Chrome 浏览器自动化 MCP Server，双模式架构： **Extension 模式**�
 - **多服务器**：Extension 自动发现并同时连接多个 MCP Server 实例
 - **反检测**：可选的指纹伪装和行为模拟
 - **结构化错误**：每个错误包含 code、message、suggestion、context
+
+## 迁移到 3.0
+
+- `manage(action="closePage")` 必须显式传入 `targetId`，不再关闭缺省页面
+- Extension 模式的 `adoptPage`
+  只标记受控页面，不授予内容读取、脚本或写权限；普通读取需在 popup 获取单页授权，测试操作可用 `newPage` 创建页面
+- 单页普通读取授权覆盖 text、HTML、attribute、computed
+  style 与 state，不开放任意 JavaScript、CDP/debugger、input 或 screenshot
+- `tmp:` 文件只属于当前 MCP server 会话；重启后需重新生成，需保留的文件应在服务器退出前保存到 `cwd:`
+
+本地零配置自动连接保持不变，刷新 Extension 或重启 MCP client 后不需要手动点击“连接”
 
 ## 兼容客户端
 
@@ -60,6 +71,20 @@ claude mcp add chrome -- node "$PWD/dist/index.js"
 ```
 
 Extension 模式需要在 Chrome 中加载 `extension/dist`。
+
+### Windows CDP 启动
+
+Chrome 自动查找 Windows App Paths、`PATH`、已安装的 Chrome channels、Chromium、Chrome for Testing，以及
+`MCP_CHROME_PORTABLE_DIR` 或 `%USERPROFILE%\\.mcp-chrome\\portable`，也可以在 PowerShell 中启动独立的 CDP 浏览器：
+
+```powershell
+& '<npm-root>\@pyrokine\mcp-chrome\scripts\start-chrome.ps1' -Port 9222
+# 也可显式指定便携版可执行文件和独立 profile：
+& '<npm-root>\@pyrokine\mcp-chrome\scripts\start-chrome.ps1' -Port 9222 -ExecutablePath 'C:\Browsers\chrome.exe' -ProfileDir 'C:\Temp\mcp-chrome-profile'
+```
+
+随后调用
+`browse(action="connect", port=9222)`。脚本让 Chrome 进程保持前台运行，并报告退出码；使用独立 profile，避免请求被已有 Chrome 实例接管。
 
 ## 快速开始
 
@@ -121,7 +146,8 @@ MCP_CHROME_PAIRING_TOKEN="your-token" node /path/to/mcp-chrome/dist/index.js
 ```
 
 需要强制配对 token 时，在 server 设置 `MCP_CHROME_ALLOW_INSECURE_NO_TOKEN=0`，并在 Extension
-popup 关闭“允许无 token本地连接”，
+popup 关闭“允许无 token 本地连接”。关闭后会立即取消进行中的 health
+check、WebSocket 握手和已安排的重连，旧的无 token 连接尝试不会在策略更新后重新连入，
 
 ### 模式二：CDP 模式（回退）
 
@@ -158,12 +184,50 @@ browse(action="open", url="https://example.com")
 | `close`   | 关闭 `targetId` 指定的页面                   |
 
 Extension 特有：`list` 返回 flat `targets` 数组和树状 `windows`，每个 target 含 `managed`（Tab 是否由 MCP
-Chrome 受控）、 `isActive`（是否为当前操作目标）、
-`windowId`、`index`、`pinned`、`incognito`、`status`（`loading`/`complete`），树状结构含
-`windowCount`、`focusedWindowId`、 `activeTargetId` 和每个窗口按顺序排列的 `tabs`，可区分每个窗口内的 active
-tab 和当前人眼看到的 focused window 页面，`open` 自动创建 Tab 分组（cyan 色），`open`、`back`、`forward`、`refresh` 支持
-`diagnostics=true`，返回动作期间新增的 console warning/error 和失败网络请求摘要，也覆盖首次 `open`
-自动创建页面的场景，`close` 必须传 `targetId`，且只关闭该页面，不会关闭整个 CDP 连接，
+Chrome 受控）、`isActive`（该窗口中 Chrome 的活动 Tab）、`windowId`、`index`、`pinned`、`incognito`、`status`（`loading`/`complete`），树状结构含
+`windowCount`、`focusedWindowId`、`activeTargetId` 和每个窗口按顺序排列的 `tabs`。`defaultTargetId`
+是默认操作目标，CDP 不用选中的操作目标推断浏览器前台页面，`open`
+自动创建 Tab 分组（cyan 色），`open`、`back`、`forward`、`refresh` 支持 `diagnostics=true`，返回动作期间新增的 console
+warning/error 和失败网络请求摘要，也覆盖首次 `open` 自动创建页面的场景。两个 driver 的 `open` 和 `refresh` 都支持
+`wait="load"`、`wait="domcontentloaded"` 和
+`wait="networkidle"`。等待器会在命令前建立，并绑定命令产生的新主文档，上一导航的迟到生命周期事件不会提前完成等待。CDP模式的
+`networkidle` 等待当前主 frame loader 的 `networkIdle`
+事件；Extension 模式会等待当前文档完成、所有已跟踪响应 body 结束和 500
+ms 静默窗口。请求跟踪发生丢失时返回超时，不会误报空闲。`close` 必须传
+`targetId`，且只关闭该页面，不会关闭整个 CDP 连接，
+
+Extension 模式的 `back/forward`
+优先使用浏览器原生历史，只有原生 API 明确报告无历史时才允许尝试页面脚本；受限 URL 和浏览器错误页不注入没有可用历史时返回
+`navigated=false`，其他原生错误保留；execution
+context 失效或浏览器拒绝向错误页注入时，仍返回操作失败，Extension 将其记录为预期操作警告；任意 debugger 命令不自动重放
+
+页面类工具在两种 backend 中都接受 `targetId`，旧版 `tabId`
+仍可用；同时提供时两者必须一致。显式目标只作用于当前操作，结束后恢复原默认目标。`browse.close` 和 `manage.closePage`
+必须显式指定 ID。页面动作成功或失败时，响应中的 `pageContext`
+包含实际目标及来源（`explicit`、`default`、`created`、`reused`、`unconfirmed`）、前后 URL/revision、默认目标前后状态，以及 Extension 报告的浏览器活动目标；创建页面失败且未返回创建 ID 时标为
+`unconfirmed`。CDP 的活动状态标为不可用，不把操作目标当作前台页面。
+
+临时目标的恢复结果通过 `pageContext.targetRestoration` 单独报告，`restored` 表示恢复原默认目标，`cleared`
+表示原先无默认目标并清除临时选择，`previous_target_closed` 表示原默认页已关闭并清除选择，`failed`
+表示恢复或清理失败并清除临时选择；`error` 与 `cleanupError` 分别保存对应错误信息
+
+主动作结果或原错误保留，已完成的输入不会重放，也不会报为未执行；`browse attach` 与 `manage adoptPage`
+继续持久选择默认目标，并发响应记录各自实际操作的页面
+
+`browse.list` 返回各页面的 revision 和元数据。revision 由 backend
+epoch 与单页计数构成；Extension 跟踪主 frame 导航和 MCP 动作，CDP 跟踪已附加页面的导航，并保守计入发出的变更命令，包括 evaluate。网页自身的任意 DOM 更改不在跟踪范围内，条件动作前应重新获取 URL/revision。`browse`
+导航/关闭、`input`、`evaluate` 及适用的 `manage` 页面动作接受 `expectedUrl` 和
+`expectedRevision`；backend 检查不符时返回
+`ACTION_PRECONDITION_FAILED`，不发送对应页面动作，复合动作在首个变更命令前检查，不在每个事件前重复检查；失败或超时后如已产生部分效果，revision 仍可能变化
+
+`browse` 仅 `open`、`back`、`forward`、`refresh`、`close` 接受这两个条件，`attach` 等其他动作在改变目标前返回
+`INVALID_ARGUMENT`
+
+Extension popup 可为一个非创建页面向当前连接的单个服务器实例授予普通读取权限，同一连接和文档未变化时，Service
+Worker 重启后仍可读取；导航、关闭页面或断开连接后授权失效。`targetId` 和 `adoptPage`
+均不能代替读取授权。授权覆盖定向文本、HTML、属性、计算样式及页面状态读取；任意脚本、debugger、截图、输入和 Cookie 访问不继承授权，现有 Cookie 工具仍按独立的 URL/name 过滤规则执行。`manage(action="pageMetadata", targetId=...)`
+可以读取或更新
+`taskHint`、`note`，列表还会显示创建与最近使用时间。这些元数据只在服务器进程中保存，关闭页面时删除，不参与内容读取授权。
 
 ### 访问验证
 
@@ -196,7 +260,7 @@ iframe 不算等待中，缓存标题不参与判定。不会调用 CAPTCHA solv
 的标题）不算过盾，可见 Turnstile 勾选框仍视为等待中。Challenge 成功和失败响应都含 `mode`。超时返回 `CHALLENGE_TIMEOUT`
 且 `retryable=true`，并带 `clickedTurnstile` 和实际观察到的 `challengeKind`（点过 Turnstile 时不会报成 `js`）。Access
 denied 返回 `CHALLENGE_DENIED`。交互式验证码、Bot Fight
-Mode 和 IP 声誉检查无法靠等待或点击 checkbox 完成。之后的正常主文档响应才会清掉 header 标记，清空网络日志不会清掉它，
+Mode 和 IP 声誉检查无法靠等待或点击 checkbox 完成。之后的正常主文档响应才会清掉 header 标记，普通 iframe 文档响应和清空网络日志都不会清掉它，
 
 ### input - 键鼠输入
 
@@ -222,17 +286,21 @@ Mode 和 IP 声誉检查无法靠等待或点击 checkbox 完成。之后的正�
 `events` 至少需要一个事件。参数：`humanize` 启用贝塞尔曲线移动和随机延迟，`diagnostics=true` 返回动作后新增 console
 warning/error 和失败网络请求， `postCondition`
 会在事件发送后等待页面状态，便于区分输入事件已发送和页面业务状态已完成，`postCondition.timeout` 默认 3000 ms、最大 60000
-ms，`postCondition.interval` 默认 100 ms、范围 50-5000 ms，`tabId` 指定目标 Tab，`frame`
-指定目标 iframe（CSS 选择器或索引），均限 Extension 模式，传入任一作用域时，动作、诊断和 post-condition 使用该目标作用域选定的同一个 backend，
+ms，`postCondition.interval` 默认 100 ms、范围 50-5000 ms。`postCondition.script` 可传表达式、函数、async
+function 或 Promise 表达式；函数会被调用，最终 Promise 值会被等待后再判定，抛错或 reject 会让检查失败。`targetId`（或旧版
+`tabId`）在两种 backend 中指定页面；`frame`
+在 Extension 模式中指定 iframe（CSS 选择器或索引），传入任一作用域时，动作、诊断和 post-condition 使用该目标作用域选定的同一个 backend，
 
-**`click` 专属参数**：`force: true` 跳过可操作性检查（适用于测试隐藏元素等场景），可操作性失败返回
+**`click` 专属参数**：`force: true` 必须提供 `forceReason` 和非坐标型元素
+`target`，它会跳过可操作性检查（适用于测试隐藏元素等场景），但仍只分发标准 DOM 鼠标事件序列，不会直接调用框架私有 handler 中键、右键和多击采用同一检查规则，坐标型或省略 target 的点击不能使用 force，可操作性失败返回
 `ACTIONABILITY_FAILED`，包含 `rect`、`clickPoint`、遮挡元素、候选遮挡物和修复建议， **`type`
 专属参数**：`mode="controlled"` 或 `dispatch: true` 直接设置 `.value` 并触发 `input`/`change`
 事件，兼容 React/Vue 等框架的受控组件（键盘事件无法触发状态更新时使用），需要非坐标型
-`target`，仅限 Extension 模式，受控输入和目标查找失败时返回结构化 context，包含 `target`、`matchCount`、`nth`、
-`activeElement`、`selection` 和候选控件，password input 的 value 不进入失败诊断， 失败响应也会脱敏 input 事件传入的
-`find` 和替换 `text`，`select` 和 `replace` 的事件级 `nth` 表示文本第 N 次出现，嵌套的 `target.nth`
-表示第 N 个目标元素，两者都从 0 开始并可同时使用，CDP 模式的 locator target 不依赖 Extension refId，
+`target`，仅限 Extension 模式，受控输入和目标查找失败时返回结构化 context，包含 `locator`、`matchCount`、`nth`
+和有数量上限的 `candidates`，选区相关错误另含编辑器与选区状态，password
+input 的 value 不进入失败诊断，失败响应也会脱敏 input 事件传入的 `find` 和替换 `text`，`select` 和 `replace` 的事件级
+`nth` 表示文本第 N 次出现，嵌套的 `target.nth` 表示第 N 个目标元素，两者都从 0 开始并可同时使用，CDP 模式的 locator
+target 不依赖 Extension refId，
 
 **`keydown` 专属参数**：
 
@@ -258,12 +326,14 @@ ms，`postCondition.interval` 默认 100 ms、范围 50-5000 ms，`tabId` 指定
 差异图输出，`diffOutput` 必须同时传 `compareWith`。指定 `target` 的截图未匹配、`nth`
 越界或尺寸为零时返回目标错误，不会静默返回视口截图，截图响应包含
 `metadata.format`、`width`、`height`、`dimensionSource`、`byteSize`、`fullPage`、`scale`、`clip` 和
-`capabilities`，PNG 对比在解码前限制为单个 PNG 25 MiB 和 12,000,000 像素，超出时使用 `clip` 或 `scale`
-缩小截图，Extension hidden tab 截图返回 `HIDDEN_TAB_SCREENSHOT`，不会自动切前台，`state` 返回
+`capabilities`。截图在执行前限制单边 16,384 像素、总计 12,000,000 像素、预计 RGBA 内存 48 MiB 和编码数据 25
+MiB；基准 PNG 在读取前检查文件大小，对比在解码前限制单个 PNG 25
+MiB 和 12,000,000 像素，解压时按已校验尺寸限制输出，并要求 scanline 长度精确匹配；损坏或异常膨胀的 PNG 会被拒绝，较大截图应使用
+`clip` 或 `scale` 缩小。Extension hidden tab 截图返回 `HIDDEN_TAB_SCREENSHOT`，不会自动切前台，`state` 返回
 `interactiveElements`，Extension 和 CDP 模式下 `metadata` 都返回
 `frames`，如果其他 debugger 占用 precise 截图路径，可视区域 fallback 会返回 `degraded`、`fallback` 和
-`limitations`；fallback 不支持的参数返回结构化 `SCREENSHOT_FALLBACK_UNSUPPORTED`，`tabId` 指定目标 Tab，`frame`
-指定目标 iframe，均限 Extension 模式，
+`limitations`；fallback 不支持的参数返回结构化 `SCREENSHOT_FALLBACK_UNSUPPORTED`，`targetId`（或旧版
+`tabId`）在两种 backend 中指定页面，`frame` 仅在 Extension 模式中指定 iframe，
 
 **`attribute` 特殊前缀**：`computed:<属性名>` 返回 computed CSS 样式值（如 `computed:color`、`computed:font-size`），
 `computed:*` 返回全部计算样式（300+ 属性，建议配合 `output` 写文件），
@@ -281,7 +351,10 @@ style 的扁平节点数组，便于二次处理），
 | `time`       | 固定延迟                                     |
 | `idle`       | 等待 DOM 或网络静默期                        |
 
-参数：`tabId` 指定目标 Tab，`frame` 指定目标 iframe，均限 Extension 模式，
+参数：`targetId`（或旧版 `tabId`）在两种 backend 中指定页面，`frame` 在 Extension 模式中指定 iframe，
+
+CDP 模式的 `visible` 要求 DOM 矩形宽高非零，且 CSS 不隐藏元素（`display:none` 或 `visibility:hidden/collapse`） `hidden`
+接受这些隐藏状态或元素不存在，`attached` 和 `detached` 只检查元素是否存在
 
 **`idle` 说明**：Extension 模式会在 `readyState === 'complete'` 后注入 `MutationObserver`，等待 `ms`
 毫秒内无 DOM 变更；CDP 模式等待网络静默。两种模式的默认 `ms` 都是 500ms，响应返回 `idleKind` 和
@@ -291,19 +364,19 @@ style 的扁平节点数组，便于二次处理），
 
 在页面上下文执行 JavaScript，
 
-| 参数                | 描述                                                    |
-| ------------------- | ------------------------------------------------------- |
-| `script`            | JavaScript 代码，裸 `return` 语句自动包裹 IIFE          |
-| `scriptFile`        | 从本地文件读取脚本，与 `script` 二选一                  |
-| `args`              | 传递给脚本的参数，script 须为函数表达式                 |
-| `mode`              | `precise`（默认，debugger API）或 `stealth`（JS 注入）  |
-| `staleContextRetry` | iframe stale context 策略，`never`（默认）或 `readOnly` |
-| `output`            | 将结果保存到文件                                        |
-| `tabId`             | 指定目标 Tab（Extension 模式）                          |
-| `frame`             | 指定目标 iframe（CSS 选择器或索引，Extension 模式）     |
-| `timeout`           | 端到端超时预算（毫秒）                                  |
-| `diagnostics`       | 执行后返回新增 console warning/error 和失败网络请求摘要 |
-| `postCondition`     | 执行后等待文本、selector、URL 片段或脚本结果匹配        |
+| 参数                 | 描述                                                    |
+| -------------------- | ------------------------------------------------------- |
+| `script`             | JavaScript 代码，裸 `return` 语句自动包裹 IIFE          |
+| `scriptFile`         | 从本地文件读取脚本，与 `script` 二选一                  |
+| `args`               | 传递给脚本的参数，script 须为函数表达式                 |
+| `mode`               | `precise`（默认，debugger API）或 `stealth`（JS 注入）  |
+| `staleContextRetry`  | iframe stale context 策略，`never`（默认）或 `readOnly` |
+| `output`             | 将结果保存到文件                                        |
+| `targetId` / `tabId` | 在两种 backend 中指定页面（`tabId` 为兼容别名）         |
+| `frame`              | 指定目标 iframe（CSS 选择器或索引，Extension 模式）     |
+| `timeout`            | 端到端超时预算（毫秒）                                  |
+| `diagnostics`        | 执行后返回新增 console warning/error 和失败网络请求摘要 |
+| `postCondition`      | 执行后等待文本、selector、URL 片段或脚本结果匹配        |
 
 `script` 和 `scriptFile` 至少提供一个，互斥使用，相对 `scriptFile` 和 `output` 路径默认写到 `mcp-chrome`
 管理的系统临时目录，需要把文件留在当前工作目录时，用 `cwd:relative/path` 显式指定，相对路径会拒绝
@@ -325,6 +398,7 @@ precise 执行默认不在 execution context 失效后重放脚本，只有脚�
 | Action         | 描述                                             |
 | -------------- | ------------------------------------------------ |
 | `newPage`      | 新建受控页面/Tab                                 |
+| `pageMetadata` | 读取或设置页面的 `taskHint`、`note`              |
 | `closePage`    | 关闭受控页面并返回 `affected.before/after`       |
 | `adoptPage`    | 将已有 Tab 标记为受控页，不切前台                |
 | `releasePage`  | 将受控页移出管理，不关闭页面                     |
@@ -349,7 +423,11 @@ Tab/window 管理动作仅支持 Extension 模式，改变浏览器可见状态�
 `affected.before/after`。Extension 模式不支持 `clearCache`，会返回 `UNSUPPORTED_MODE` 且不清除任何内容；清 Cookie 请用带
 `url` 或 `domain` 过滤的 `cookies(action="clear")`，清 storage 或 cache 请改用 CDP 模式。`focusWindow`
 只有在观测到目标窗口已聚焦后才返回成功，否则返回 `WINDOW_FOCUS_NOT_OBSERVED`，`closeWindow`
-遇到混有非托管 tab 的窗口会返回 `WINDOW_HAS_UNMANAGED_TABS`
+遇到混有非托管 tab 的窗口会返回 `WINDOW_HAS_UNMANAGED_TABS`。持久的 `adoptPage`、`releasePage`
+目标变更与指定 tab 的操作串行执行，并发多事件 input 会始终留在指定 tab，持久目标变更会在该操作结束后生效
+
+`emulate` 在两个 backend 中设置设备视口、像素密度、触摸能力和 User-Agent，`viewport`
+恢复桌面视口与页面缩放并关闭触摸模拟，User-Agent 通过 `userAgent` 单独恢复
 
 **Stealth 模式档位**（CDP launch 参数，通过 `browse action=launch stealth=...` 设置）：
 
@@ -365,8 +443,12 @@ Tab/window 管理动作仅支持 Extension 模式，改变浏览器可见状态�
 | `network` | 网络请求日志（支持 URL 过滤） |
 
 参数：`output` 将结果保存到文件，console 日志统一返回公开级别 `error`、`warning`、`info`、`debug`，浏览器原始的 `warn`、
-`log` 等级会在过滤和返回前转换，network 日志包含已完成请求、HTTP 4xx/5xx 响应和加载失败请求，尽量返回
-`errorText`、`method`、 `url`、`status`、`timestamp`、`duration`，URL
+`log` 等级会在过滤和返回前转换。清空 fallback
+console 日志会保留 hook。debugger 采集恢复后，fallback 采集会停用；仍指向 MCP
+wrapper 的 console 方法会恢复，页面之后安装的 wrapper 保持不变。network 日志在 `loadingFinished` 或 `loadingFailed`
+时才完成记录，不会在收到 headers 时提前结束，因此 body 失败会同时保留 HTTP status 和
+`errorText`，传输中的 body 也会继续计入 `networkidle`。日志尽量返回 `method`、
+`url`、`status`、`timestamp`、`duration`，URL
 query 中常见的认证、签名、密码和 token 参数会在内联响应、diagnostics 和 显式 `output` 文件中替换为 `[REDACTED]`，并返回
 `urlRedacted`、`urlOriginalLength` 和
 `redactedQueryParameters`，内联 network 结果会把脱敏后的单条 URL 限制为 2048 字符，截断时返回 `urlLength` 和
@@ -382,7 +464,8 @@ query 中常见的认证、签名、密码和 token 参数会在内联响应、d
 | `delete` | 删除 Cookie                                            |
 | `clear`  | 在 URL 或域名范围内删除 Cookie，可用 `name` 进一步过滤 |
 
-**说明**：`clear` 必须指定 `url` 或 `domain`。`name` 只能在该范围内进一步过滤，避免误删其他站点的同名 Cookie
+**说明**：`clear` 必须指定 `url` 或 `domain`。`name` 只能在该范围内进一步过滤，避免误删其他站点的同名 Cookie。返回的
+`count` 只统计 Chrome 确认已删除的 Cookie；列出后、删除前已消失的 Cookie 不计数
 
 ## Target：统一元素定位器
 
@@ -490,11 +573,16 @@ extract(type="html", target={ css: ".article" }, images="info")
 
 // 获取 HTML + 图片数据，保存到目录
 extract(type="html", images="data", output="tmp:page")
-// 生成：<系统临时目录>/claude-tools/mcp-chrome/page/content.html, images/*, index.json
+// 生成：<系统临时目录>/claude-tools/mcp-chrome/session-<id>/page/content.html, images/*, index.json
 
 // 获取 HTML + 图片数据（内联返回，最多 20 张）
 extract(type="html", target={ css: ".card" }, images="data")
 ```
+
+`tmp:` 路径属于当前 server 会话。临时输出整个会话最多 256 项、128
+MiB；启动时只清理超过 24 小时且所属进程已退出的带归属标记目录。成功写入 `tmp:` 文件或目录的响应会返回 `retention`
+清理条件，`cwd:` 响应不带此字段。重启后仍需通过 MCP 访问的文件使用
+`cwd:`。输出路径拒绝 Windows 保留设备名、ADS、非法字符以及末尾空格或点号；Windows 上写入敏感内容前须验证私有 DACL。
 
 ### 页面元信息
 
@@ -654,7 +742,8 @@ input 和 evaluate 返回值追加 `actionExecuted`、`actionStatus`、`verifica
 `retryable`。验证状态分为
 `matched`、`not_matched`、`unavailable`、`error`；debugger 超时且无法证明脚本已停止时，动作状态为
 `unknown`。页面脚本抛异常时返回 `actionExecuted=true` 和 `actionStatus="failed"`；结果展开或序列化失败时返回
-`actionStatus="completed"` 和 `failureStage="output"`。diagnostics 是附加能力，失败时返回
+`actionStatus="completed"` 和 `failureStage="output"`。页面前置条件不符时，input 和 evaluate 返回
+`actionExecuted=false`、`actionStatus="not_started"`。diagnostics 是附加能力，失败时返回
 `diagnosticsStatus`，不会覆盖主动作结果。browse 和 wait 的主动作失败时，也会保留失败前已收集的 diagnostics。目标诊断会读取当前 tab 的实时状态，不依赖 attach 时缓存的 URL 和标题。
 
 `replace` 仅对 `textarea` 以及 `text`、`search`、`tel`、`url`、`password`

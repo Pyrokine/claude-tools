@@ -5,9 +5,13 @@ type PendingRequest = {
     method: string
     type: string
     timestamp: number
+    frameId?: string
+    status?: number
+    challenge?: boolean
     _monotonic: number
-    /** wallclock 添加时间,用于超龄回收 */
+    /** wallclock 添加时间,用于超龄诊断 */
     _addedAt: number
+    _ttlWarned?: boolean
 }
 
 const PENDING_TTL_MS = 60_000
@@ -30,7 +34,9 @@ export class LogManager {
     private consoleSequences = new Map<number, number>()
     private networkSequences = new Map<number, number>()
     private challengeRequired = new Map<number, boolean>()
+    private mainFrameIds = new Map<number, string>()
     private pendingRequests = new Map<number, Map<string, PendingRequest>>()
+    private pendingUncertain = new Set<number>()
     private sweepTimer: ReturnType<typeof setInterval> | null = null
 
     constructor() {
@@ -69,6 +75,10 @@ export class LogManager {
         return this.challengeRequired.get(tabId) === true
     }
 
+    setMainFrameId(tabId: number, frameId: string): void {
+        this.mainFrameIds.set(tabId, frameId)
+    }
+
     /** 替换 network 请求列表 */
     setNetwork(tabId: number, requests: NetworkRequest[]): void {
         this.assignNetworkSequences(tabId, requests)
@@ -78,6 +88,18 @@ export class LogManager {
     /** 取 pending 请求 Map（navigation-handler 用于过滤进行中的请求） */
     getPending(tabId: number): Map<string, PendingRequest> | undefined {
         return this.pendingRequests.get(tabId)
+    }
+
+    /** pending 跟踪曾丢失，networkidle 不能据此判定为空闲 */
+    isPendingUncertain(tabId: number): boolean {
+        return this.pendingUncertain.has(tabId)
+    }
+
+    /** debugger 断开后请求结束事件不可恢复，保持不确定状态直到新主文档或 tab cleanup */
+    handleDebuggerDetach(tabId: number): void {
+        this.pendingRequests.delete(tabId)
+        this.pendingUncertain.add(tabId)
+        this.mainFrameIds.delete(tabId)
     }
 
     handleEvent(tabId: number, method: string, params: unknown): void {
@@ -141,14 +163,24 @@ export class LogManager {
                 type: string
                 timestamp: number
                 wallTime: number
+                frameId?: string
             }
             let tabPending = this.pendingRequests.get(tabId)
-            if (!tabPending) {
+            const beginsMainDocument =
+                p.type.toLowerCase() === 'document' &&
+                p.frameId !== undefined &&
+                p.frameId === this.mainFrameIds.get(tabId) &&
+                !tabPending?.has(p.requestId)
+            if (beginsMainDocument) {
+                tabPending = new Map()
+                this.pendingRequests.set(tabId, tabPending)
+                this.pendingUncertain.delete(tabId)
+            } else if (!tabPending) {
                 tabPending = new Map()
                 this.pendingRequests.set(tabId, tabPending)
             }
-            // 容量上限：超过 PENDING_MAX_PER_TAB 时删除最旧（按 _addedAt 升序）
-            if (tabPending.size >= PENDING_MAX_PER_TAB) {
+            // 保留有界的请求详情；一旦丢失进行中请求，networkidle 必须保持不确定状态
+            if (!tabPending.has(p.requestId) && tabPending.size >= PENDING_MAX_PER_TAB) {
                 let oldestKey: string | null = null
                 let oldestAt = Infinity
                 for (const [k, v] of tabPending) {
@@ -159,6 +191,13 @@ export class LogManager {
                 }
                 if (oldestKey !== null) {
                     tabPending.delete(oldestKey)
+                    const wasUncertain = this.pendingUncertain.has(tabId)
+                    this.pendingUncertain.add(tabId)
+                    if (!wasUncertain) {
+                        console.warn(
+                            `[MCP] Pending request tracking exceeded ${PENDING_MAX_PER_TAB} entries for tab ${tabId}; networkidle will remain unavailable until tab cleanup`
+                        )
+                    }
                 }
             }
             tabPending.set(p.requestId, {
@@ -166,61 +205,47 @@ export class LogManager {
                 method: p.request.method,
                 type: p.type,
                 timestamp: Math.round(p.wallTime * 1000),
+                frameId: p.frameId,
                 _monotonic: p.timestamp,
                 _addedAt: Date.now(),
             })
+        }
+
+        if (method === 'Page.frameNavigated') {
+            const p = params as { frame: { id: string; parentId?: string } }
+            if (!p.frame.parentId) {
+                this.mainFrameIds.set(tabId, p.frame.id)
+            }
         }
 
         if (method === 'Network.responseReceived') {
             const p = params as {
                 requestId: string
                 response: { status: number; headers?: Record<string, unknown> }
-                timestamp: number
             }
-            const tabPending = this.pendingRequests.get(tabId)
-            const pending = tabPending?.get(p.requestId)
+            const pending = this.pendingRequests.get(tabId)?.get(p.requestId)
             if (pending) {
-                const { _monotonic, _addedAt: _, ...requestData } = pending
-                const challenge = isCloudflareChallenge(p.response.headers)
-                if (requestData.type.toLowerCase() === 'document') {
-                    // 只有新的主文档响应可以解除已知 Challenge，清空网络日志不能解除该状态
-                    this.challengeRequired.set(tabId, challenge)
+                pending.status = p.response.status
+                pending.challenge = isCloudflareChallenge(p.response.headers)
+                if (
+                    pending.type.toLowerCase() === 'document' &&
+                    pending.frameId !== undefined &&
+                    pending.frameId === this.mainFrameIds.get(tabId)
+                ) {
+                    // 只有主 frame 的新文档响应可以解除已知 Challenge
+                    this.challengeRequired.set(tabId, pending.challenge)
                 }
-                const requests = this.networkRequests.get(tabId) || []
-                requests.push({
-                    ...requestData,
-                    status: p.response.status,
-                    challenge,
-                    duration: Math.round((p.timestamp - _monotonic) * 1000),
-                })
-                this.assignNetworkSequences(tabId, requests.slice(-1))
-                if (requests.length > 1100) {
-                    requests.splice(0, requests.length - 1000)
-                }
-                this.networkRequests.set(tabId, requests)
-                tabPending!.delete(p.requestId)
             }
+        }
+
+        if (method === 'Network.loadingFinished') {
+            const p = params as { requestId: string; timestamp: number }
+            this.finalizeRequest(tabId, p.requestId, p.timestamp)
         }
 
         if (method === 'Network.loadingFailed') {
             const p = params as { requestId: string; timestamp: number; errorText?: string }
-            const tabPending = this.pendingRequests.get(tabId)
-            const pending = tabPending?.get(p.requestId)
-            if (pending) {
-                const { _monotonic, _addedAt: _, ...requestData } = pending
-                const requests = this.networkRequests.get(tabId) || []
-                requests.push({
-                    ...requestData,
-                    errorText: p.errorText,
-                    duration: Math.round((p.timestamp - _monotonic) * 1000),
-                })
-                this.assignNetworkSequences(tabId, requests.slice(-1))
-                if (requests.length > 1100) {
-                    requests.splice(0, requests.length - 1000)
-                }
-                this.networkRequests.set(tabId, requests)
-            }
-            tabPending?.delete(p.requestId)
+            this.finalizeRequest(tabId, p.requestId, p.timestamp, p.errorText)
         }
     }
 
@@ -230,7 +255,38 @@ export class LogManager {
         this.consoleSequences.delete(tabId)
         this.networkSequences.delete(tabId)
         this.challengeRequired.delete(tabId)
+        this.mainFrameIds.delete(tabId)
         this.pendingRequests.delete(tabId)
+        this.pendingUncertain.delete(tabId)
+    }
+
+    private finalizeRequest(tabId: number, requestId: string, timestamp: number, errorText?: string): void {
+        const tabPending = this.pendingRequests.get(tabId)
+        const pending = tabPending?.get(requestId)
+        if (!pending) {
+            return
+        }
+
+        const requests = this.networkRequests.get(tabId) || []
+        requests.push({
+            url: pending.url,
+            method: pending.method,
+            type: pending.type,
+            timestamp: pending.timestamp,
+            status: pending.status,
+            challenge: pending.challenge,
+            errorText,
+            duration: Math.round((timestamp - pending._monotonic) * 1000),
+        })
+        this.assignNetworkSequences(tabId, requests.slice(-1))
+        if (requests.length > 1100) {
+            requests.splice(0, requests.length - 1000)
+        }
+        this.networkRequests.set(tabId, requests)
+        tabPending!.delete(requestId)
+        if (tabPending!.size === 0) {
+            this.pendingRequests.delete(tabId)
+        }
     }
 
     private assignConsoleSequences(tabId: number, messages: ConsoleMessage[]): void {
@@ -267,17 +323,14 @@ export class LogManager {
 
     private sweepPending(): void {
         const now = Date.now()
-        for (const [tabId, tabPending] of this.pendingRequests) {
+        for (const tabPending of this.pendingRequests.values()) {
             for (const [requestId, req] of tabPending) {
-                if (now - req._addedAt > PENDING_TTL_MS) {
-                    tabPending.delete(requestId)
+                if (now - req._addedAt > PENDING_TTL_MS && !req._ttlWarned) {
+                    req._ttlWarned = true
                     console.warn(
-                        `[MCP] Pending request ${requestId} (${req.url}) ttl exceeded ${PENDING_TTL_MS}ms, cleaning`
+                        `[MCP] Pending request ${requestId} (${req.url}) has remained active for more than ${PENDING_TTL_MS}ms`
                     )
                 }
-            }
-            if (tabPending.size === 0) {
-                this.pendingRequests.delete(tabId)
             }
         }
     }

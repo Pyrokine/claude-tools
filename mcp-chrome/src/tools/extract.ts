@@ -12,7 +12,7 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { readFile } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
 import { basename, extname, join } from 'path'
 import { z } from 'zod'
 import {
@@ -27,8 +27,17 @@ import {
 } from '../core/index.js'
 import type { Target } from '../core/types.js'
 import { sanitizeUrlRecords } from './network-sanitizer.js'
-import { comparePngImages, MAX_COMPARE_PIXELS, MAX_COMPARE_PNG_BYTES, readPngHeader } from './png.js'
-import { targetToFindParams, targetZodSchema } from './schema.js'
+import { withPageContext } from './page-context.js'
+import {
+    assertPngFileBudget,
+    assertScreenshotBase64Budget,
+    assertScreenshotBudget,
+    comparePngImages,
+    MAX_COMPARE_PIXELS,
+    MAX_COMPARE_PNG_BYTES,
+    readPngHeader,
+} from './png.js'
+import { pageTargetIdSchema, resolvePageTargetId, targetToFindParams, targetZodSchema } from './schema.js'
 import { buildTargetDiagnostics, TargetNotFoundError, TargetTimeoutError } from './target-diagnostics.js'
 
 /** 图片元信息 */
@@ -103,12 +112,8 @@ const extractSchema = z
             .describe(
                 `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，images=data 时作为输出目录路径`
             ),
-        tabId: z
-            .string()
-            .optional()
-            .describe(
-                '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
-            ),
+        targetId: pageTargetIdSchema.describe('目标页面 ID（Extension 或 CDP），优先于默认操作目标'),
+        tabId: pageTargetIdSchema.describe('旧版目标 Tab ID，与 targetId 相同语义，保留兼容'),
         depth: z
             .number()
             .int()
@@ -161,7 +166,7 @@ async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
         const unifiedSession = getUnifiedSession()
 
         // 多 tab 并行：临时切换到指定 tab
-        return await unifiedSession.withTabId(args.tabId, async () => {
+        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
                 const useExtension = unifiedSession.getMode() === 'extension'
                 const frameHtmlError = validateFrameHtmlArgs(args, useExtension)
@@ -238,7 +243,7 @@ async function handleTextExtract(
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
     const text = useExtension
-        ? await extractTextExtension(unifiedSession, args.target)
+        ? await extractTextExtension(unifiedSession, args.target, args.timeout)
         : await extractText(session, args.target, args.timeout)
     if (args.output) {
         const outputPath = await writeOutputFile(args.output, text, 'utf-8')
@@ -254,7 +259,7 @@ async function handleHtmlExtract(context: ExtractContext, args: ExtractArgs): Pr
     }
 
     const html = useExtension
-        ? await extractHtmlExtension(unifiedSession, args.target)
+        ? await extractHtmlExtension(unifiedSession, args.target, true, args.timeout)
         : await extractHTML(session, args.target, args.timeout)
     if (args.output) {
         const outputPath = await writeOutputFile(args.output, html, 'utf-8')
@@ -267,7 +272,7 @@ async function handleFrameHtmlExtract(
     { unifiedSession }: ExtractContext,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
-    const html = await extractHtmlExtension(unifiedSession, args.target)
+    const html = await extractHtmlExtension(unifiedSession, args.target, true, args.timeout)
     if (args.output) {
         const outputPath = await writeOutputFile(args.output, html, 'utf-8')
         return formatResponse({
@@ -293,7 +298,7 @@ async function handleAttributeExtract(
     }
 
     const value = useExtension
-        ? await extractAttributeExtension(unifiedSession, args.target, args.attribute)
+        ? await extractAttributeExtension(unifiedSession, args.target, args.attribute, args.timeout)
         : await extractAttribute(session, args.target, args.attribute, args.timeout)
     return formatResponse({ success: true, type: 'attribute', attribute: args.attribute, value })
 }
@@ -306,8 +311,27 @@ async function handleScreenshotExtract(
     if (args.target && !args.clip) {
         const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
         const nth = nthParam ?? 0
-        const found = await unifiedSession.find(selector, text, xpath, args.timeout)
-        const target = found[nth]
+        const pointTarget = 'x' in args.target && 'y' in args.target ? args.target : null
+        const found = pointTarget
+            ? useExtension
+                ? await unifiedSession.findAtPoint(pointTarget.x, pointTarget.y, nth, args.timeout)
+                : await unifiedSession
+                      .evaluate<Awaited<ReturnType<typeof unifiedSession.find>>[number] | null>(
+                          `(() => {
+                          const element = document.elementFromPoint(${pointTarget.x}, ${pointTarget.y});
+                          if (!element) return null;
+                          const rect = element.getBoundingClientRect();
+                          return {
+                              refId: '', tag: element.tagName.toLowerCase(), text: '',
+                              rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+                          };
+                      })()`,
+                          undefined,
+                          args.timeout
+                      )
+                      .then((element) => (element && nth === 0 ? [element] : []))
+            : await unifiedSession.find(selector, text, xpath, args.timeout)
+        const target = found[pointTarget ? 0 : nth]
         if (!target || target.rect.width <= 0 || target.rect.height <= 0) {
             throw new TargetNotFoundError(
                 await buildTargetDiagnostics(unifiedSession, args.target, {
@@ -323,10 +347,9 @@ async function handleScreenshotExtract(
 
         const scrollOffset =
             args.frame === undefined ? await getPageScrollOffset(unifiedSession, args.timeout) : { x: 0, y: 0 }
-        const frameOffset = unifiedSession.getFrameOffset()
         clip = {
-            x: target.rect.x + scrollOffset.x + (frameOffset?.x ?? 0),
-            y: target.rect.y + scrollOffset.y + (frameOffset?.y ?? 0),
+            x: target.rect.x + scrollOffset.x,
+            y: target.rect.y + scrollOffset.y,
             width: target.rect.width,
             height: target.rect.height,
         }
@@ -335,6 +358,9 @@ async function handleScreenshotExtract(
     clip = args.clip ?? clip
     const fullPage = clip ? false : (args.fullPage ?? false)
     const scale = args.scale ?? 1
+    if (clip) {
+        assertScreenshotBudget(clip.width, clip.height, scale)
+    }
     const screenshot = await unifiedSession.screenshot({
         fullPage,
         scale: args.scale,
@@ -342,6 +368,7 @@ async function handleScreenshotExtract(
         quality: args.quality,
         clip,
     })
+    assertScreenshotBase64Budget(screenshot.data)
     const screenshotBuffer = Buffer.from(screenshot.data, 'base64')
     const encodedDimensions = readImageDimensions(screenshotBuffer, screenshot.format)
     const fallbackDimensions = encodedDimensions
@@ -365,7 +392,9 @@ async function handleScreenshotExtract(
             throw new Error('screenshot compare 仅支持 png 格式')
         }
         const baselinePath = await resolveScopedOutputPath(args.compareWith, 'mcp-chrome')
+        assertPngFileBudget((await stat(baselinePath.absolutePath)).size)
         const baseline = await readFile(baselinePath.absolutePath)
+        assertPngFileBudget(baseline.length)
         const comparison = comparePngImages(baseline, screenshotBuffer)
         metadata.comparison = {
             pixelDiffRatio: comparison.pixelDiffRatio,
@@ -405,11 +434,28 @@ async function handleStateExtract(
 
     let refId: string | undefined
     if (args.target && useExtension) {
-        const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
-        const nth = nthParam ?? 0
-        const elements = await unifiedSession.find(selector, text, xpath)
-        if (elements.length > 0 && nth < elements.length) {
-            refId = elements[nth].refId
+        refId = await findTargetRefExtension(unifiedSession, args.target, args.timeout)
+        if (!refId) {
+            const {
+                selector,
+                text,
+                xpath,
+                nth: nthParam,
+            } = targetToFindParams(args.target as Target & { nth?: number })
+            const candidates =
+                'x' in args.target && 'y' in args.target
+                    ? await unifiedSession.findAtPoint(args.target.x, args.target.y)
+                    : await unifiedSession.find(selector, text, xpath, args.timeout)
+            throw new TargetNotFoundError(
+                await buildTargetDiagnostics(unifiedSession, args.target, {
+                    nth: nthParam ?? 0,
+                    timeout: args.timeout,
+                    frame: args.frame,
+                    matchCount: candidates.length,
+                    lastState: 'not-found',
+                    candidates,
+                })
+            )
         }
     }
 
@@ -747,20 +793,39 @@ async function handleHtmlWithImages(
     if (args.target) {
         const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
         const nth = nthParam ?? 0
-        const matches = await unifiedSession.find(selector, text, xpath, args.timeout)
-        if (matches.length <= nth) {
-            throw new TargetNotFoundError(
-                await buildTargetDiagnostics(unifiedSession, args.target, {
-                    nth,
-                    timeout: args.timeout,
-                    matchCount: matches.length,
-                    lastState: 'not-found',
-                    candidates: matches,
-                })
-            )
+        if (useExtension) {
+            const refId = await findTargetRefExtension(unifiedSession, args.target, args.timeout)
+            if (!refId) {
+                const matches =
+                    'x' in args.target && 'y' in args.target
+                        ? await unifiedSession.findAtPoint(args.target.x, args.target.y)
+                        : await unifiedSession.find(selector, text, xpath, args.timeout)
+                throw new TargetNotFoundError(
+                    await buildTargetDiagnostics(unifiedSession, args.target, {
+                        nth,
+                        timeout: args.timeout,
+                        matchCount: matches.length,
+                        lastState: 'not-found',
+                        candidates: matches,
+                    })
+                )
+            }
+            result = await unifiedSession.getHtmlWithImagesByRef(refId)
+        } else {
+            const matches = await unifiedSession.find(selector, text, xpath, args.timeout)
+            if (matches.length <= nth) {
+                throw new TargetNotFoundError(
+                    await buildTargetDiagnostics(unifiedSession, args.target, {
+                        nth,
+                        timeout: args.timeout,
+                        matchCount: matches.length,
+                        lastState: 'not-found',
+                        candidates: matches,
+                    })
+                )
+            }
+            result = await extractHtmlWithImagesByTarget(unifiedSession, selector, text, xpath, nth, args.timeout)
         }
-
-        result = await extractHtmlWithImagesByTarget(unifiedSession, selector, text, xpath, nth, args.timeout)
     } else {
         result = useExtension
             ? await unifiedSession.getHtmlWithImages()
@@ -1256,62 +1321,33 @@ async function extractAttribute(
   }`)
 }
 
+async function findTargetRefExtension(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    target: Target,
+    timeout?: number
+): Promise<string | undefined> {
+    const { selector, text, xpath, nth } = targetToFindParams(target as Target & { nth?: number })
+    const matches =
+        'x' in target && 'y' in target
+            ? await unifiedSession.findAtPoint(target.x, target.y, nth ?? 0, timeout)
+            : await unifiedSession.find(selector, text, xpath, timeout, nth ?? 0)
+    return matches[0]?.refId
+}
+
 /**
  * Extension 模式：提取文本
  * 支持所有 Target 形式（css/xpath/text/role/label 等）
  */
 async function extractTextExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
-    target?: Target
+    target?: Target,
+    timeout?: number
 ): Promise<string> {
     if (!target) {
         return unifiedSession.getText()
     }
-    if ('x' in target && 'y' in target && typeof target.x === 'number' && typeof target.y === 'number') {
-        const expr =
-            '(function(x, y) { var el = document.elementFromPoint(x, y); ' +
-            "return el ? (el.textContent || '') : '' })"
-        return unifiedSession.evaluate<string>(expr, undefined, undefined, [target.x, target.y])
-    }
-    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
-    const nth = nthParam ?? 0
-
-    if (selector) {
-        if (text) {
-            const expr =
-                '(function(s, t, n) { var els = Array.from(document.querySelectorAll(s))' +
-                '.filter(function(e) { return (e.textContent || "").includes(t); }); ' +
-                "return n < els.length ? (els[n].textContent || '') : '' })"
-            return unifiedSession.evaluate<string>(expr, undefined, undefined, [selector, text, nth])
-        }
-        if (nth > 0) {
-            const expr =
-                '(function(s, n) { var els = document.querySelectorAll(s); ' +
-                "return n < els.length ? (els[n].textContent || '') : '' })"
-            return unifiedSession.evaluate<string>(expr, undefined, undefined, [selector, nth])
-        }
-        return unifiedSession.getText(selector)
-    }
-
-    // xpath/text 定位：通过 evaluate 在页面上下文中查找
-    if (xpath) {
-        const expr =
-            '(function(xp, n) { var r = document.evaluate(xp, document, null, ' +
-            'XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); ' +
-            "return n < r.snapshotLength ? (r.snapshotItem(n).textContent || '') : '' })"
-        return unifiedSession.evaluate<string>(expr, undefined, undefined, [xpath, nth])
-    }
-    if (text) {
-        const expr =
-            '(function(t, n) { var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT); ' +
-            'var found = []; var seen = new WeakSet(); var node; ' +
-            'while ((node = walker.nextNode())) { if (node.textContent && node.textContent.includes(t) ' +
-            '&& node.parentElement && !seen.has(node.parentElement)) { ' +
-            'seen.add(node.parentElement); found.push(node.parentElement); } } ' +
-            "return n < found.length ? (found[n].textContent || '') : '' })"
-        return unifiedSession.evaluate<string>(expr, undefined, undefined, [text, nth])
-    }
-    return unifiedSession.getText()
+    const refId = await findTargetRefExtension(unifiedSession, target, timeout)
+    return refId ? unifiedSession.getTextByRef(refId) : ''
 }
 
 /**
@@ -1321,55 +1357,14 @@ async function extractTextExtension(
 async function extractHtmlExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target?: Target,
-    outer = true
+    outer = true,
+    timeout?: number
 ): Promise<string> {
     if (!target) {
         return unifiedSession.getHtml(undefined, outer)
     }
-    const prop = outer ? 'outerHTML' : 'innerHTML'
-    if ('x' in target && 'y' in target && typeof target.x === 'number' && typeof target.y === 'number') {
-        const expr =
-            '(function(x, y, p) { var el = document.elementFromPoint(x, y); ' + "return el ? (el[p] || '') : '' })"
-        return unifiedSession.evaluate<string>(expr, undefined, undefined, [target.x, target.y, prop])
-    }
-    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
-    const nth = nthParam ?? 0
-
-    if (selector) {
-        if (text) {
-            const expr =
-                '(function(s, t, n, p) { var els = Array.from(document.querySelectorAll(s))' +
-                '.filter(function(e) { return (e.textContent || "").includes(t); }); ' +
-                "return n < els.length ? (els[n][p] || '') : '' })"
-            return unifiedSession.evaluate<string>(expr, undefined, undefined, [selector, text, nth, prop])
-        }
-        if (nth > 0) {
-            const expr =
-                '(function(s, n, p) { var els = document.querySelectorAll(s); ' +
-                "return n < els.length ? (els[n][p] || '') : '' })"
-            return unifiedSession.evaluate<string>(expr, undefined, undefined, [selector, nth, prop])
-        }
-        return unifiedSession.getHtml(selector, outer)
-    }
-
-    if (xpath) {
-        const expr =
-            '(function(xp, n, p) { var r = document.evaluate(xp, document, null, ' +
-            'XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); ' +
-            "return n < r.snapshotLength ? (r.snapshotItem(n)[p] || '') : '' })"
-        return unifiedSession.evaluate<string>(expr, undefined, undefined, [xpath, nth, prop])
-    }
-    if (text) {
-        const expr =
-            '(function(t, n, p) { var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT); ' +
-            'var found = []; var seen = new WeakSet(); var node; ' +
-            'while ((node = walker.nextNode())) { if (node.textContent && node.textContent.includes(t) ' +
-            '&& node.parentElement && !seen.has(node.parentElement)) { ' +
-            'seen.add(node.parentElement); found.push(node.parentElement); } } ' +
-            "return n < found.length ? (found[n][p] || '') : '' })"
-        return unifiedSession.evaluate<string>(expr, undefined, undefined, [text, nth, prop])
-    }
-    return unifiedSession.getHtml(undefined, outer)
+    const refId = await findTargetRefExtension(unifiedSession, target, timeout)
+    return refId ? unifiedSession.getHtmlByRef(refId, outer) : ''
 }
 
 /**
@@ -1378,83 +1373,17 @@ async function extractHtmlExtension(
 async function extractAttributeExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
-    attribute: string
+    attribute: string,
+    timeout?: number
 ): Promise<string | null> {
-    if ('x' in target && 'y' in target && typeof target.x === 'number' && typeof target.y === 'number') {
-        if (attribute.startsWith('computed:')) {
-            const prop = attribute.slice('computed:'.length)
-            const expr =
-                '(function(x, y, p) { var el = document.elementFromPoint(x, y); ' +
-                'return el ? window.getComputedStyle(el).getPropertyValue(p) : null })'
-            return unifiedSession.evaluate<string | null>(expr, undefined, undefined, [target.x, target.y, prop])
-        }
-        const expr =
-            '(function(x, y, a) { var el = document.elementFromPoint(x, y); ' +
-            'return el ? el.getAttribute(a) : null })'
-        return unifiedSession.evaluate<string | null>(expr, undefined, undefined, [target.x, target.y, attribute])
+    const refId = await findTargetRefExtension(unifiedSession, target, timeout)
+    if (!refId) {
+        return null
     }
-    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
-
-    // computed style: computed:color → getComputedStyle(el)
     if (attribute.startsWith('computed:')) {
-        const prop = attribute.slice('computed:'.length)
-        return extractComputedStyleExtension(unifiedSession, selector, text, xpath, nthParam ?? 0, prop)
+        return unifiedSession.getComputedStyleByRef(refId, attribute.slice('computed:'.length))
     }
-
-    // xpath 定位（含 text+xpath）或 text 且无 selector 时：先 find 得到 refId，再获取属性
-    if (xpath || (text && !selector)) {
-        const elements = await unifiedSession.find(selector, text, xpath)
-        if (elements.length > 0) {
-            const nth = nthParam ?? 0
-            if (nth >= elements.length) {
-                throw new Error(`第 ${nth} 个匹配元素不存在（共 ${elements.length} 个）`)
-            }
-            return unifiedSession.getAttribute(undefined, elements[nth].refId, attribute)
-        }
-        return null
-    }
-
-    if (selector) {
-        const nth = nthParam ?? 0
-        if (text) {
-            // selector + text 组合：find 已实现 AND 过滤
-            const elements = await unifiedSession.find(selector, text, undefined)
-            if (nth >= elements.length) {
-                return null
-            }
-            return unifiedSession.getAttribute(undefined, elements[nth].refId, attribute)
-        }
-        if (nth > 0) {
-            const expr =
-                '(function(s, n, a) { var els = document.querySelectorAll(s); ' +
-                'return n < els.length ? els[n].getAttribute(a) : null })'
-            return unifiedSession.evaluate<string | null>(expr, undefined, undefined, [selector, nth, attribute])
-        }
-        return unifiedSession.getAttribute(selector, undefined, attribute)
-    }
-
-    return null
-}
-
-/**
- * Extension 模式：提取 computed style
- */
-async function extractComputedStyleExtension(
-    unifiedSession: ReturnType<typeof getUnifiedSession>,
-    selector: string | undefined,
-    text: string | undefined,
-    xpath: string | undefined,
-    nth: number,
-    prop: string
-): Promise<string | null> {
-    const elements = await unifiedSession.find(selector, text, xpath)
-    if (elements.length === 0 || nth >= elements.length) {
-        return null
-    }
-    const refId = elements[nth].refId
-
-    // 通过 Extension ISOLATED 世界执行（访问 __mcpElementMap），避免 MAIN 世界找不到 refId
-    return unifiedSession.getComputedStyle(refId, prop)
+    return unifiedSession.getAttributeByRef(refId, attribute)
 }
 
 /**
@@ -1509,10 +1438,11 @@ async function waitForTargetExtension(
         }
 
         try {
-            const elements = await unifiedSession.find(selector, text, xpath, remaining)
+            const indexed = nth >= 50
+            const elements = await unifiedSession.find(selector, text, xpath, remaining, indexed ? nth : undefined)
             matchCount = elements.length
             candidates = elements
-            if (elements.length > nth) {
+            if (indexed ? elements.length > 0 : elements.length > nth) {
                 return
             }
         } catch (err) {

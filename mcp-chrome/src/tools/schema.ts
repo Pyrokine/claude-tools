@@ -8,6 +8,23 @@ import { z } from 'zod'
 import type { Target } from '../core/types.js'
 import { escapeXPathString } from '../core/utils.js'
 
+export const pageTargetIdSchema = z.string().min(1).optional()
+export const pageConditionSchema = {
+    expectedUrl: z.string().optional().describe('动作执行前要求页面 URL 与此值一致；不一致时不执行'),
+    expectedRevision: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('动作执行前要求页面 revision 与此值一致；从 browse list 获取'),
+}
+
+export function resolvePageTargetId(args: { targetId?: string; tabId?: string }): string | undefined {
+    if (args.targetId !== undefined && args.tabId !== undefined && args.targetId !== args.tabId) {
+        throw new Error('targetId 与 tabId 不一致，未执行页面操作')
+    }
+    return args.targetId ?? args.tabId
+}
+
 /**
  * Target Zod Schema（运行时校验）
  *

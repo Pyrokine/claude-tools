@@ -17,6 +17,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { readFileSync } from 'node:fs'
 
 import { getUnifiedSession } from './core/index.js'
+import { getControlledTempRoot } from './core/utils.js'
 import {
     registerBrowseTool,
     registerCookiesTool,
@@ -86,6 +87,11 @@ async function main(): Promise<void> {
 
     // 启动 Extension HTTP/WebSocket 服务器
     await getUnifiedSession().startExtensionServer()
+    try {
+        await getControlledTempRoot('mcp-chrome')
+    } catch (error) {
+        console.warn('[mcp-chrome] 受控临时目录初始化失败:', error)
+    }
 
     const server = createServer()
     const transport = new StdioServerTransport()

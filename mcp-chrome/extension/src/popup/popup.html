@@ -39,6 +39,16 @@
                 <p class="auth-help" id="authHelp">默认自动连接本地 MCP Server，可用 pairing token 加固</p>
             </div>
 
+            <div class="auth-section">
+                <label class="auth-label" for="readServer">当前页面只读授权</label>
+                <select class="auth-input" id="readServer" aria-label="选择 MCP Server"></select>
+                <label class="auth-checkbox">
+                    <input id="readAccess" type="checkbox" disabled />
+                    允许所选 MCP Server 读取当前页面
+                </label>
+                <p class="auth-help" id="readHelp">只允许读取页面文字、HTML 和元信息，不允许截图、脚本或写操作</p>
+            </div>
+
             <div class="info-section">
                 <p class="info-text">通过 WebSocket 与 MCP Server 通信</p>
                 <p class="info-text">服务端口范围：19222-19299</p>

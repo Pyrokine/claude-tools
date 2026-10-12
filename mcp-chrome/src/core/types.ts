@@ -375,6 +375,8 @@ export interface TargetInfo {
     managed?: boolean
     /** 是否复用了已运行的浏览器（launch 时如果连接到已有浏览器则为 true） */
     reused?: boolean
+    /** 本次 launch 是否创建了页面，与浏览器是否复用分别记录 */
+    targetCreated?: boolean
 }
 
 /**

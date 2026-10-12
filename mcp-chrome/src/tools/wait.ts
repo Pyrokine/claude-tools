@@ -19,7 +19,8 @@ import {
 } from '../core/index.js'
 import { DEFAULT_TIMEOUT, type ElementState, type Target } from '../core/types.js'
 import { withDiagnosticsResponse } from './diagnostics.js'
-import { targetToFindParams, targetZodSchema } from './schema.js'
+import { withPageContext } from './page-context.js'
+import { pageTargetIdSchema, resolvePageTargetId, targetToFindParams, targetZodSchema } from './schema.js'
 import { buildTargetDiagnostics, type TargetCandidate, TargetTimeoutError } from './target-diagnostics.js'
 
 /** 轮询间隔（毫秒） */
@@ -80,12 +81,8 @@ const waitSchema = z.object({
         .optional()
         .describe('毫秒（time：等待时长；idle：Extension 为 DOM mutation 静默期，CDP 为网络静默期，默认 500ms）'),
     diagnostics: z.boolean().optional().describe('执行后返回新增 console error/warning 和失败网络请求摘要'),
-    tabId: z
-        .string()
-        .optional()
-        .describe(
-            '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
-        ),
+    targetId: pageTargetIdSchema.describe('目标页面 ID（Extension 或 CDP），优先于默认操作目标'),
+    tabId: pageTargetIdSchema.describe('旧版目标 Tab ID，与 targetId 相同语义，保留兼容'),
     timeout: z.number().optional().describe('超时'),
     frame: z
         .union([z.string(), z.number()])
@@ -106,7 +103,7 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
         const unifiedSession = getUnifiedSession()
         const timeout = args.timeout ?? DEFAULT_TIMEOUT
 
-        return await unifiedSession.withTabId(args.tabId, async () => {
+        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
             return await unifiedSession.withFrame(args.frame, async () => {
                 const mode = unifiedSession.getMode()
                 switch (args.for) {
@@ -560,33 +557,28 @@ async function waitForElement(
 
             switch (state) {
                 case 'attached':
-                case 'visible': {
-                    // 尝试找到元素
+                case 'detached': {
                     await locator.find()
-
-                    if (state === 'visible') {
-                        // 还需要检查可见性
-                        const box = await locator.getBoundingBox()
-                        if (box.width > 0 && box.height > 0) {
-                            return // 元素可见
-                        }
-                    } else {
+                    if (state === 'attached') {
                         return // 元素存在
                     }
+                    // 元素仍然存在，继续等待
                     break
                 }
 
-                case 'detached':
+                case 'visible':
                 case 'hidden': {
-                    await locator.find()
-                    if (state === 'hidden') {
-                        // 元素存在，检查是否隐藏
-                        const box = await locator.getBoundingBox()
-                        if (box.width === 0 || box.height === 0) {
-                            return // 元素隐藏
-                        }
+                    // display:none 没有 CDP box model，DOMRect 仍可用于检查尺寸
+                    const visible = await locator.evaluateOn<boolean>(`function() {
+                        const style = getComputedStyle(this);
+                        const rect = this.getBoundingClientRect();
+                        return style.display !== 'none' &&
+                            style.visibility !== 'hidden' && style.visibility !== 'collapse' &&
+                            rect.width > 0 && rect.height > 0;
+                    }`)
+                    if (visible === (state === 'visible')) {
+                        return
                     }
-                    // 元素仍然存在，继续等待
                     break
                 }
             }

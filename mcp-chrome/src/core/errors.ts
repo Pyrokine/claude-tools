@@ -17,6 +17,14 @@ export interface ErrorContext {
     [key: string]: unknown
 }
 
+const errorPageContexts = new WeakMap<object, ErrorContext>()
+
+export function setErrorPageContext(error: unknown, pageContext: ErrorContext): unknown {
+    const value = error !== null && typeof error === 'object' ? error : new Error(String(error))
+    errorPageContexts.set(value, pageContext)
+    return value
+}
+
 /**
  * 浏览器错误基类
  */
@@ -55,6 +63,30 @@ export abstract class BrowserError extends Error {
         }
 
         return result
+    }
+}
+
+export class StructuredToolError extends Error {
+    constructor(
+        readonly code: string,
+        message: string,
+        readonly suggestion: string,
+        readonly context: Record<string, unknown>
+    ) {
+        super(message)
+        this.name = 'StructuredToolError'
+    }
+
+    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
+    toJSON(): object {
+        return {
+            error: {
+                code: this.code,
+                message: this.message,
+                suggestion: this.suggestion,
+                context: this.context,
+            },
+        }
     }
 }
 
@@ -104,6 +136,17 @@ export class SessionNotFoundError extends BrowserError {
 /**
  * 页面/Target 不存在错误
  */
+export class PagePreconditionError extends BrowserError {
+    readonly code = 'ACTION_PRECONDITION_FAILED'
+    readonly suggestion = '重新读取 browse list 中的页面 URL/revision 后再提交动作'
+    override readonly context: ErrorContext
+
+    constructor(context: ErrorContext) {
+        super('页面 URL 或 revision 已变化，未执行动作')
+        this.context = { ...context, actionExecuted: false }
+    }
+}
+
 export class TargetNotFoundError extends BrowserError {
     readonly code = 'TARGET_NOT_FOUND'
     readonly suggestion = '请使用 browse(action="list") 查看可用页面'
@@ -296,6 +339,8 @@ export function formatErrorResponse(error: unknown): {
     content: Array<{ type: 'text'; text: string }>
     isError: boolean
 } {
+    const pageContext = error !== null && typeof error === 'object' ? errorPageContexts.get(error) : undefined
+
     // 处理 ZodError
     if (isZodError(error)) {
         const fieldErrors = error.issues.map((issue) => ({
@@ -314,6 +359,7 @@ export function formatErrorResponse(error: unknown): {
                                 message: '参数验证失败',
                                 fields: fieldErrors,
                             },
+                            ...(pageContext ? { pageContext } : {}),
                         },
                         null,
                         2
@@ -339,6 +385,9 @@ export function formatErrorResponse(error: unknown): {
     const hint = detectVisibilityHint(errorMessage)
     if (hint) {
         ;(errorJson as Record<string, unknown>).hint = hint
+    }
+    if (pageContext) {
+        ;(errorJson as Record<string, unknown>).pageContext = pageContext
     }
 
     return {

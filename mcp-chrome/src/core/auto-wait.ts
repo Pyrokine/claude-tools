@@ -10,6 +10,7 @@
  */
 
 import type { CDPClient } from '../cdp/client.js'
+import { StructuredToolError } from './errors.js'
 import { withRetry } from './retry.js'
 import { DEFAULT_TIMEOUT } from './types.js'
 
@@ -189,17 +190,56 @@ export class AutoWait {
         await this.waitForEnabled(nodeId)
         await this.waitForStableBoundingBox(nodeId)
         await this.ensureInViewport(nodeId)
+        await withRetry(
+            async () => {
+                const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
+                    object: { objectId: string }
+                }
+                const { result } = (await this.send('Runtime.callFunctionOn', {
+                    objectId: object.objectId,
+                    functionDeclaration: `function() {
+                    const rect = this.getBoundingClientRect();
+                    const clickPoint = {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
+                    const top = document.elementFromPoint(clickPoint.x, clickPoint.y);
+                    const describe = el => el.tagName.toLowerCase() + (el.id ? '#' + CSS.escape(el.id) : '');
+                    const plainRect = r => ({x: r.x, y: r.y, width: r.width, height: r.height});
+                    const covered = top !== this && !(top && this.contains(top));
+                    return {
+                        actionable: this.isConnected && !covered,
+                        reason: !this.isConnected ? 'not-connected' : !top ? 'not-in-viewport' : 'covered',
+                        rect: plainRect(rect), clickPoint,
+                        coveringElement: covered && top ? describe(top).slice(0, 500) : undefined,
+                        candidates: document.elementsFromPoint(clickPoint.x, clickPoint.y).slice(0, 10).map(el => ({
+                            tag: el.tagName.toLowerCase(), selector: describe(el).slice(0, 500),
+                            text: (el.textContent || '').trim().slice(0, 160), rect: plainRect(el.getBoundingClientRect())
+                        }))
+                    };
+                }`,
+                    returnByValue: true,
+                })) as { result: { value: Record<string, unknown> & { actionable: boolean } } }
+                if (!result.value.actionable) {
+                    throw new StructuredToolError(
+                        'ACTIONABILITY_FAILED',
+                        '点击目标无法接收鼠标事件，未执行点击',
+                        '请根据 rect、clickPoint 和 coveringElement 关闭遮罩或调整 target；直接触发目标事件需明确使用 force',
+                        result.value
+                    )
+                }
+            },
+            { timeout: this.remaining() }
+        )
     }
 
     /**
      * 执行输入前的所有等待检查
      *
-     * 包括：enabled + stableBoundingBox
+     * 包括：visible + enabled + stableBoundingBox + inViewport
      */
     async waitForInputReady(nodeId: number): Promise<void> {
         await this.waitForVisible(nodeId)
         await this.waitForEnabled(nodeId)
         await this.waitForStableBoundingBox(nodeId)
+        await this.ensureInViewport(nodeId)
     }
 
     /**

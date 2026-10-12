@@ -6,11 +6,14 @@
 
 import type { FrameProbeMessage } from '../types'
 import { ExpectedOperationError } from '../types/expected-errors'
-import { isManagedTab } from './tab-state'
+import { pageRevision } from './page-revision'
+import { readGrantDocumentId } from './read-grants'
+import { isCreatedTab, isManagedTab } from './tab-state'
 
 export interface ActionContext {
     mcpTabGroupId: number | null
     mcpWindowId: number | null
+    serverInstanceId?: string | null
 }
 
 export function isRestrictedUrl(url: string | undefined): boolean {
@@ -64,6 +67,7 @@ export function tabToInfo(tab: chrome.tabs.Tab, context: ActionContext) {
         incognito: tab.incognito,
         managed: isManagedTab(tab, context),
         status: tab.status || 'unknown',
+        revision: pageRevision(tab.id!),
     }
 }
 
@@ -93,6 +97,33 @@ export async function assertManagedTab(
         )
     }
     return tab
+}
+
+export async function assertCreatedTab(tabId: number, operation: string): Promise<void> {
+    await getTargetTabId(tabId)
+    if (!isCreatedTab(tabId)) {
+        throw new ExpectedOperationError(
+            `${operation} 拒绝对非创建页面 ${tabId} 使用脚本、debugger 或截图；adoptPage 和只读授权不允许此操作`
+        )
+    }
+}
+
+export async function assertReadableTab(
+    tabId: number,
+    context: ActionContext,
+    operation: string
+): Promise<{ tab: chrome.tabs.Tab; documentId?: string }> {
+    const tab = await chrome.tabs.get(tabId)
+    if (isCreatedTab(tabId)) {
+        return { tab }
+    }
+    const documentId = await readGrantDocumentId(context.serverInstanceId, tabId)
+    if (documentId) {
+        return { tab, documentId }
+    }
+    throw new ExpectedOperationError(
+        `${operation} 拒绝读取非托管 tab ${tabId}，须从 Extension popup 为该页面和当前连接授予只读权限`
+    )
 }
 
 export type DomFrameSelectionStatus =
@@ -163,7 +194,9 @@ export function recordDomFrameProbe(
 export async function getDomFrameSnapshot(
     tabId: number,
     parentFrameId: number,
-    selection?: string | number
+    selection?: string | number,
+    documentId?: string,
+    expectedUrl?: string
 ): Promise<DomFrameSnapshot> {
     const token = crypto.randomUUID()
     const pendingProbe: PendingDomFrameProbe = { tabId, frameIdsByIndex: new Map() }
@@ -171,8 +204,16 @@ export async function getDomFrameSnapshot(
 
     try {
         const parentResults = await chrome.scripting.executeScript({
-            target: { tabId, frameIds: [parentFrameId] },
-            func: async (probeToken: string, requestedSelection: string | number | null, timeoutMs: number) => {
+            target: documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [parentFrameId] },
+            func: async (
+                probeToken: string,
+                requestedSelection: string | number | null,
+                timeoutMs: number,
+                url?: string
+            ) => {
+                if (url !== undefined && location.href !== url) {
+                    throw new Error('页面 URL 已变化，未读取')
+                }
                 const iframes = Array.from(document.querySelectorAll('iframe, frame')) as HTMLIFrameElement[]
                 let selectedIndex: number | null = null
                 let selectionStatus: DomFrameSelectionStatus = 'not-requested'
@@ -240,6 +281,9 @@ export async function getDomFrameSnapshot(
                     )
                 )
 
+                if (url !== undefined && location.href !== url) {
+                    throw new Error('页面 URL 已变化，未读取')
+                }
                 return {
                     parent: {
                         title: document.title || null,
@@ -268,7 +312,10 @@ export async function getDomFrameSnapshot(
                     selectionError,
                 }
             },
-            args: [token, selection ?? null, FRAME_PROBE_TIMEOUT_MS],
+            args:
+                documentId && expectedUrl !== undefined
+                    ? [token, selection ?? null, FRAME_PROBE_TIMEOUT_MS, expectedUrl]
+                    : [token, selection ?? null, FRAME_PROBE_TIMEOUT_MS],
         })
 
         const parentResult = parentResults[0]?.result as

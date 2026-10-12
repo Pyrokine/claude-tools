@@ -183,7 +183,8 @@ export class CDPClient extends EventEmitter {
         event: string,
         predicate?: (params: T) => boolean,
         timeout = DEFAULT_TIMEOUT,
-        sessionId?: string
+        sessionId?: string,
+        signal?: AbortSignal
     ): Promise<T> {
         return new Promise((resolve, reject) => {
             const listener: CDPEventListener = (params, eventSessionId) => {
@@ -194,6 +195,10 @@ export class CDPClient extends EventEmitter {
                     cleanup()
                     resolve(params as T)
                 }
+            }
+            const onAbort = () => {
+                cleanup()
+                reject(signal?.reason instanceof Error ? signal.reason : new Error(`等待事件已取消: ${event}`))
             }
 
             const waiter: EventWaiter = {
@@ -208,12 +213,17 @@ export class CDPClient extends EventEmitter {
 
             const cleanup = () => {
                 clearTimeout(waiter.timer)
+                signal?.removeEventListener('abort', onAbort)
                 this.offEvent(event, listener)
                 this.activeEventWaiters.delete(waiter)
             }
 
             this.activeEventWaiters.add(waiter)
             this.onEvent(event, listener)
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+            }
         })
     }
 
@@ -329,22 +339,23 @@ async function cdpHttpFetch<T>(host: string, port: number, path: string, timeout
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeout)
 
-    let response: Response
     try {
-        response = await fetch(url, { signal: controller.signal })
+        const response = await fetch(url, { signal: controller.signal })
+        if (!response.ok) {
+            throw new ConnectionRefusedError(host, port)
+        }
+        return (await response.json()) as T
     } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
             throw new TimeoutError(`连接超时: ${host}:${port} (${timeout}ms)`)
+        }
+        if (error instanceof ConnectionRefusedError || error instanceof SyntaxError) {
+            throw error
         }
         throw new ConnectionRefusedError(host, port)
     } finally {
         clearTimeout(timeoutId)
     }
-
-    if (!response.ok) {
-        throw new ConnectionRefusedError(host, port)
-    }
-    return (await response.json()) as T
 }
 
 /**

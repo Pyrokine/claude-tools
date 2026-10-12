@@ -3,10 +3,16 @@
  */
 
 const STORAGE_KEY = 'mcp_managed_tab_ids'
+const CREATED_KEY = 'mcp_created_tab_ids'
 
 let mcpTabGroupId: number | null = null
 let mcpWindowId: number | null = null
 const managedTabIds = new Set<number>()
+const createdTabIds = new Set<number>()
+
+export function isCreatedTab(tabId: number): boolean {
+    return createdTabIds.has(tabId)
+}
 
 export function getMcpTabGroupId(): number | null {
     return mcpTabGroupId
@@ -24,14 +30,24 @@ export function setMcpWindowId(windowId: number | null): void {
     mcpWindowId = windowId
 }
 
-export async function markManagedTab(tabId: number): Promise<void> {
+export async function markManagedTab(tabId: number, created = false): Promise<void> {
     managedTabIds.add(tabId)
-    await chrome.storage.local.set({ [STORAGE_KEY]: [...managedTabIds] })
+    if (created) {
+        createdTabIds.add(tabId)
+    }
+    await chrome.storage.session.set({
+        [STORAGE_KEY]: [...managedTabIds],
+        [CREATED_KEY]: [...createdTabIds],
+    })
 }
 
 export async function unmarkManagedTab(tabId: number): Promise<void> {
     managedTabIds.delete(tabId)
-    await chrome.storage.local.set({ [STORAGE_KEY]: [...managedTabIds] })
+    createdTabIds.delete(tabId)
+    await chrome.storage.session.set({
+        [STORAGE_KEY]: [...managedTabIds],
+        [CREATED_KEY]: [...createdTabIds],
+    })
 }
 
 export function isManagedTab(
@@ -46,10 +62,14 @@ export function isManagedTab(
 
 /** Extension 启动时调用，从 storage 恢复 managed tab 集合 */
 export async function restoreManagedTabs(): Promise<void> {
-    const result = await chrome.storage.local.get(STORAGE_KEY)
+    const result = await chrome.storage.session.get([STORAGE_KEY, CREATED_KEY])
     const stored: number[] = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : []
+    const created: number[] = Array.isArray(result[CREATED_KEY]) ? result[CREATED_KEY] : []
     for (const id of stored) {
         managedTabIds.add(id)
+    }
+    for (const id of created) {
+        createdTabIds.add(id)
     }
     // 清理 storage 中已关闭的 tab
     const tabs = await chrome.tabs.query({})
@@ -59,5 +79,10 @@ export async function restoreManagedTabs(): Promise<void> {
             managedTabIds.delete(id)
         }
     }
-    await chrome.storage.local.set({ [STORAGE_KEY]: [...managedTabIds] })
+    for (const id of createdTabIds) {
+        if (!existingIds.has(id)) {
+            createdTabIds.delete(id)
+        }
+    }
+    await chrome.storage.session.set({ [STORAGE_KEY]: [...managedTabIds], [CREATED_KEY]: [...createdTabIds] })
 }

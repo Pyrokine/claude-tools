@@ -146,6 +146,9 @@ export class ExtensionHttpServer extends EventEmitter {
     // 本地零配置自动连接是默认契约；pairing token 只用于共享环境加固
     private readonly allowUnauthenticatedExtension = process.env.MCP_CHROME_ALLOW_INSECURE_NO_TOKEN !== '0'
     private readonly authChallenges = new Map<string, AuthChallenge>()
+    private readonly instanceId = randomBytes(16).toString('hex')
+    private actionConditionProvider: ((action: string, params: unknown) => Record<string, string> | undefined) | null =
+        null
 
     constructor(private options: HttpServerOptions = {}) {
         super()
@@ -162,6 +165,12 @@ export class ExtensionHttpServer extends EventEmitter {
             const port = this.options.port ?? DEFAULT_PORT
             this.tryListen(port, resolve, reject)
         })
+    }
+
+    setActionConditionProvider(
+        provider: ((action: string, params: unknown) => Record<string, string> | undefined) | null
+    ): void {
+        this.actionConditionProvider = provider
     }
 
     /**
@@ -200,7 +209,12 @@ export class ExtensionHttpServer extends EventEmitter {
 
         return new Promise((resolve, reject) => {
             const messageId = this.generateId()
-            const message = { id: messageId, action, params }
+            const condition = this.actionConditionProvider?.(action, params)
+            const message = {
+                id: messageId,
+                action,
+                params: condition ? { ...(params as object), ...condition } : params,
+            }
 
             const timeout = setTimeout(() => {
                 this.messageHandlers.delete(messageId)
@@ -479,6 +493,7 @@ export class ExtensionHttpServer extends EventEmitter {
                     JSON.stringify({
                         status: 'ok',
                         port: this.port,
+                        instanceId: this.instanceId,
                         authRequired: true,
                         auth: this.createAuthChallenge(clientNonce),
                     })
@@ -487,7 +502,15 @@ export class ExtensionHttpServer extends EventEmitter {
             }
             if (this.allowUnauthenticatedExtension) {
                 res.writeHead(200)
-                res.end(JSON.stringify({ status: 'ok', port: this.port, authRequired: false, insecure: true }))
+                res.end(
+                    JSON.stringify({
+                        status: 'ok',
+                        port: this.port,
+                        instanceId: this.instanceId,
+                        authRequired: false,
+                        insecure: true,
+                    })
+                )
                 return
             }
             res.writeHead(401)

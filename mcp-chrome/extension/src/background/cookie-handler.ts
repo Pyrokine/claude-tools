@@ -98,8 +98,10 @@ export class CookieHandler {
             const domain = cookie.domain.startsWith('.') ? cookie.domain.slice(1) : cookie.domain
             const url = `${protocol}//${domain}${cookie.path}`
             try {
-                await chrome.cookies.remove({ url, name: cookie.name })
-                count++
+                const removed = await chrome.cookies.remove({ url, name: cookie.name })
+                if (removed) {
+                    count++
+                }
             } catch (err) {
                 console.warn('[MCP] cookie 删除失败:', cookie.name, err)
             }

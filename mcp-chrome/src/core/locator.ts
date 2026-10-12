@@ -232,9 +232,10 @@ export class Locator {
         // 启用可访问性
         await this.send('Accessibility.enable')
 
-        // queryAXTree 比 getFullAXTree 更高效：仅返回匹配 role/name 的节点
-        const queryParams: Record<string, unknown> = { role }
-        if (name !== undefined) {
+        // queryAXTree 必须指定根节点，accessibleName 仅用于精确匹配
+        const { root } = (await this.send('DOM.getDocument')) as { root: { nodeId: number } }
+        const queryParams: Record<string, unknown> = { nodeId: root.nodeId, role }
+        if (exact && name !== undefined) {
             queryParams.accessibleName = name
         }
         const { nodes } = (await this.send('Accessibility.queryAXTree', queryParams)) as {
@@ -246,7 +247,11 @@ export class Locator {
             }>
         }
 
-        const matchingNodes = exact && name !== undefined ? nodes.filter((node) => node.name?.value === name) : nodes
+        const matchingNodes = nodes.filter(
+            (node) =>
+                node.role.value === role &&
+                (name === undefined || (exact ? node.name?.value === name : node.name?.value.includes(name)))
+        )
 
         // 对所有匹配节点计数（含无 backendDOMNodeId 的节点），确保 nth 语义正确
         let matchCount = 0

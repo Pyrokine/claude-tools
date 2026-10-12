@@ -13,11 +13,19 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { generateBezierPath, getMouseMoveDelay, getTypingDelay, randomDelay } from '../anti-detection/index.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
+import { StructuredToolError } from '../core/errors.js'
 import type { InputEvent, Target } from '../core/types.js'
 import { ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
+import { withPageContext } from './page-context.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
-import { targetToFindParams, targetZodSchema } from './schema.js'
+import {
+    pageConditionSchema,
+    pageTargetIdSchema,
+    resolvePageTargetId,
+    targetToFindParams,
+    targetZodSchema,
+} from './schema.js'
 import { buildTargetDiagnostics } from './target-diagnostics.js'
 
 const INPUT_WAIT_MAX_MS = 60_000
@@ -150,6 +158,7 @@ const inputEventSchema = z.object({
  * input 参数 schema
  */
 const inputSchema = z.object({
+    ...pageConditionSchema,
     events: z.array(inputEventSchema).describe('事件序列'),
     humanize: z.boolean().optional().describe('启用人类行为模拟（贝塞尔曲线移动、随机延迟）'),
     diagnostics: z
@@ -161,12 +170,8 @@ const inputSchema = z.object({
     postCondition: postConditionSchema
         .optional()
         .describe('动作执行后要验证的页面状态；不传时 success 只表示事件已发出，不表示业务结果已达成'),
-    tabId: z
-        .string()
-        .optional()
-        .describe(
-            '目标 Tab ID（可选，仅 Extension 模式），不指定则使用当前 attach 的 tab，可操作非当前 attach 的 tab，CDP 模式下不支持此参数'
-        ),
+    targetId: pageTargetIdSchema.describe('目标页面 ID（Extension 或 CDP），优先于默认操作目标'),
+    tabId: pageTargetIdSchema.describe('旧版目标 Tab ID，与 targetId 相同语义，保留兼容'),
     timeout: z.number().optional().describe('超时毫秒，含 Cloudflare Challenge 等待和事件派发'),
     frame: z
         .union([z.string(), z.number()])
@@ -175,30 +180,6 @@ const inputSchema = z.object({
             'iframe 定位（可选，仅 Extension 模式），CSS 选择器（如 "iframe#main"）或索引（如 0），不指定则在主框架操作'
         ),
 })
-
-class StructuredToolError extends Error {
-    constructor(
-        private readonly code: string,
-        message: string,
-        private readonly suggestion: string,
-        private readonly context: Record<string, unknown>
-    ) {
-        super(message)
-        this.name = 'StructuredToolError'
-    }
-
-    // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
-    toJSON(): object {
-        return {
-            error: {
-                code: this.code,
-                message: this.message,
-                suggestion: this.suggestion,
-                context: this.context,
-            },
-        }
-    }
-}
 
 type InputToolResponse = {
     content: Array<{ type: 'text'; text: string }>
@@ -229,6 +210,12 @@ function sanitizeInputFailureResponse(
  * input 工具处理器
  */
 async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputToolResponse> {
+    let eventsExecuted = 0
+    let actionMayHaveExecuted = false
+    const progress: { actionStatus: 'not_started' | 'failed' | 'unknown' | 'completed' } = {
+        actionStatus: 'not_started',
+    }
+    let failureStage: 'action' | 'verification' | 'context' = 'action'
     try {
         if (args.events.length === 0) {
             return {
@@ -251,109 +238,129 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
         const unifiedSession = getUnifiedSession()
         const humanize = args.humanize ?? false
 
-        return await unifiedSession.withTabId(args.tabId, async () => {
-            return await unifiedSession.withFrame(args.frame, async () => {
-                const mode = unifiedSession.getMode()
-                const inputStartedAt = Date.now()
-                await resolveChallenge(unifiedSession, 'input', 'not_started', args.timeout)
-                const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
-                const warnings: string[] = []
-                const eventResults: unknown[] = []
-                const session = mode === 'cdp' ? getSession() : undefined
-                let eventsExecuted = 0
-
-                try {
-                    for (const event of args.events) {
-                        const eventTimeout =
-                            args.timeout === undefined
-                                ? undefined
-                                : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
-                        if (eventTimeout !== undefined && eventTimeout <= 0) {
-                            throwInputTimeoutError(args.timeout!)
-                        }
-                        const result = await executeInputEvent(
-                            { unifiedSession, session, mode, humanize, timeout: eventTimeout, frame: args.frame },
-                            event as InputEvent
-                        )
-                        ++eventsExecuted
-                        if (typeof result === 'string') {
-                            warnings.push(result)
-                        } else if (result) {
-                            eventResults.push(result)
-                        }
+        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
+            return unifiedSession.withPageCondition(args, () =>
+                unifiedSession.withFrame(args.frame, async () => {
+                    const mode = unifiedSession.getMode()
+                    const inputStartedAt = Date.now()
+                    if (args.expectedUrl === undefined && args.expectedRevision === undefined) {
+                        await resolveChallenge(unifiedSession, 'input', 'not_started', args.timeout)
                     }
-                } catch (error) {
-                    const response = formatErrorResponse(error)
-                    const text = response.content[0]?.text
-                    if ((error instanceof ChallengeTimeoutError || error instanceof ChallengeDeniedError) && text) {
-                        try {
-                            const payload = JSON.parse(text) as Record<string, unknown>
-                            Object.assign(payload, {
-                                eventsExecuted,
-                                remainingEventsNotExecuted: args.events.length - eventsExecuted,
-                                verificationRequested: Boolean(args.postCondition),
-                            })
-                            appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
-                            response.content[0].text = JSON.stringify(payload, null, 2)
-                        } catch {
-                            // 保留原始 Challenge 错误响应
+                    const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
+                    const warnings: string[] = []
+                    const eventResults: unknown[] = []
+                    const session = mode === 'cdp' ? getSession() : undefined
+
+                    try {
+                        for (const event of args.events) {
+                            const eventTimeout =
+                                args.timeout === undefined
+                                    ? undefined
+                                    : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
+                            if (eventTimeout !== undefined && eventTimeout <= 0) {
+                                throwInputTimeoutError(args.timeout!)
+                            }
+                            progress.actionStatus = 'failed'
+                            const result = await executeInputEvent(
+                                { unifiedSession, session, mode, humanize, timeout: eventTimeout, frame: args.frame },
+                                event as InputEvent
+                            )
+                            ++eventsExecuted
+                            if (typeof result === 'string') {
+                                warnings.push(result)
+                            } else if (result) {
+                                eventResults.push(result)
+                            }
+                        }
+                    } catch (error) {
+                        const response = formatErrorResponse(error)
+                        const text = response.content[0]?.text
+                        if ((error instanceof ChallengeTimeoutError || error instanceof ChallengeDeniedError) && text) {
+                            try {
+                                const payload = JSON.parse(text) as Record<string, unknown>
+                                Object.assign(payload, {
+                                    eventsExecuted,
+                                    remainingEventsNotExecuted: args.events.length - eventsExecuted,
+                                    verificationRequested: Boolean(args.postCondition),
+                                })
+                                appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                                response.content[0].text = JSON.stringify(payload, null, 2)
+                            } catch {
+                                // 保留原始 Challenge 错误响应
+                            }
+                            return sanitizeInputFailureResponse(response, args.events)
+                        }
+                        if (text) {
+                            try {
+                                const payload = JSON.parse(text) as Record<string, unknown>
+                                const message = error instanceof Error ? error.message : String(error)
+                                const timedOut = /timeout|超时/i.test(message)
+                                const preActionTimeout = /timeout before event dispatch|超过 input 剩余 timeout/i.test(
+                                    message
+                                )
+                                actionMayHaveExecuted = timedOut && !preActionTimeout
+                                const preconditionFailed =
+                                    error !== null &&
+                                    typeof error === 'object' &&
+                                    'code' in error &&
+                                    error.code === 'ACTION_PRECONDITION_FAILED'
+                                actionMayHaveExecuted = actionMayHaveExecuted && !preconditionFailed
+                                progress.actionStatus =
+                                    preconditionFailed && eventsExecuted === 0
+                                        ? 'not_started'
+                                        : actionMayHaveExecuted
+                                          ? 'unknown'
+                                          : 'failed'
+                                payload.eventsExecuted = eventsExecuted
+                                payload.actionExecuted = eventsExecuted > 0 || actionMayHaveExecuted
+                                payload.actionStatus = progress.actionStatus
+                                payload.verificationRequested = Boolean(args.postCondition)
+                                payload.verificationStatus = 'unavailable'
+                                payload.failureStage = 'action'
+                                payload.retryable = /timeout|超时|disconnect|未连接|context|debugger/i.test(message)
+                                appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                                response.content[0].text = JSON.stringify(payload, null, 2)
+                            } catch {
+                                // 保留原始错误响应
+                            }
                         }
                         return sanitizeInputFailureResponse(response, args.events)
                     }
-                    if (text) {
-                        try {
-                            const payload = JSON.parse(text) as Record<string, unknown>
-                            const message = error instanceof Error ? error.message : String(error)
-                            const timedOut = /timeout|超时/i.test(message)
-                            const preActionTimeout = /timeout before event dispatch|超过 input 剩余 timeout/i.test(
-                                message
-                            )
-                            const actionMayHaveExecuted = timedOut && !preActionTimeout
-                            payload.eventsExecuted = eventsExecuted
-                            payload.actionExecuted = eventsExecuted > 0 || actionMayHaveExecuted
-                            payload.actionStatus = actionMayHaveExecuted ? 'unknown' : 'failed'
-                            payload.verificationRequested = Boolean(args.postCondition)
-                            payload.verificationStatus = 'unavailable'
-                            payload.failureStage = 'action'
-                            payload.retryable = /timeout|超时|disconnect|未连接|context|debugger/i.test(message)
-                            appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
-                            response.content[0].text = JSON.stringify(payload, null, 2)
-                        } catch {
-                            // 保留原始错误响应
+
+                    progress.actionStatus = 'completed'
+                    failureStage = 'context'
+                    const result: Record<string, unknown> = {
+                        success: true,
+                        eventsExecuted,
+                        mode,
+                        actionExecuted: true,
+                        actionStatus: 'completed',
+                        verificationRequested: Boolean(args.postCondition),
+                        verificationStatus: 'unavailable',
+                        retryable: false,
+                    }
+                    if (warnings.length > 0) {
+                        result.warnings = warnings
+                    }
+                    if (eventResults.length > 0) {
+                        result.eventResults = eventResults
+                    }
+                    if (args.postCondition) {
+                        failureStage = 'verification'
+                        const postCondition = await waitForPostCondition(unifiedSession, args.postCondition, 'input')
+                        failureStage = 'context'
+                        result.postCondition = postCondition
+                        result.verificationStatus = postCondition.verificationStatus
+                        result.retryable = postCondition.retryable
+                        if (postCondition.verificationStatus !== 'matched') {
+                            result.success = false
+                            result.failureStage = 'verification'
                         }
                     }
-                    return sanitizeInputFailureResponse(response, args.events)
-                }
-
-                const result: Record<string, unknown> = {
-                    success: true,
-                    eventsExecuted,
-                    mode,
-                    actionExecuted: true,
-                    actionStatus: 'completed',
-                    verificationRequested: Boolean(args.postCondition),
-                    verificationStatus: 'unavailable',
-                    retryable: false,
-                }
-                if (warnings.length > 0) {
-                    result.warnings = warnings
-                }
-                if (eventResults.length > 0) {
-                    result.eventResults = eventResults
-                }
-                if (args.postCondition) {
-                    const postCondition = await waitForPostCondition(unifiedSession, args.postCondition, 'input')
-                    result.postCondition = postCondition
-                    result.verificationStatus = postCondition.verificationStatus
-                    result.retryable = postCondition.retryable
-                    if (postCondition.verificationStatus !== 'matched') {
-                        result.success = false
-                        result.failureStage = 'verification'
-                    }
-                }
-                appendDiagnostics(result, await finishDiagnostics(unifiedSession, diagnostics))
-                return formatResponse(result)
-            }) // withFrame
+                    appendDiagnostics(result, await finishDiagnostics(unifiedSession, diagnostics))
+                    return formatResponse(result)
+                })
+            ) // withPageCondition, withFrame
         }) // withTabId
     } catch (error) {
         const response = formatErrorResponse(error)
@@ -362,17 +369,34 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
             try {
                 const payload = JSON.parse(text) as Record<string, unknown>
                 const message = error instanceof Error ? error.message : String(error)
+                const preconditionFailed =
+                    error !== null &&
+                    typeof error === 'object' &&
+                    'code' in error &&
+                    error.code === 'ACTION_PRECONDITION_FAILED'
                 Object.assign(payload, {
-                    actionExecuted: false,
-                    actionStatus: 'failed',
+                    eventsExecuted,
+                    actionExecuted: eventsExecuted > 0 || actionMayHaveExecuted,
+                    actionStatus:
+                        preconditionFailed && eventsExecuted === 0
+                            ? 'not_started'
+                            : progress.actionStatus === 'not_started'
+                              ? 'failed'
+                              : progress.actionStatus,
                     verificationRequested: Boolean(args.postCondition),
                     verificationStatus: 'unavailable',
-                    failureStage: 'action',
-                    retryable: /timeout|超时|disconnect|未连接|context|debugger|attach/i.test(message),
+                    failureStage,
+                    retryable:
+                        progress.actionStatus !== 'completed' &&
+                        !preconditionFailed &&
+                        /timeout|超时|disconnect|未连接|context|debugger|attach/i.test(message),
                     diagnosticsStatus: args.diagnostics ? 'unavailable' : 'disabled',
                 })
                 if (args.diagnostics) {
-                    payload.diagnosticsError = 'diagnostics 未能在 tab/frame 初始化失败前启动'
+                    payload.diagnosticsError =
+                        eventsExecuted > 0 || actionMayHaveExecuted
+                            ? 'input 执行后未能取得 diagnostics'
+                            : 'diagnostics 未能在 tab/frame 初始化失败前启动'
                 }
                 response.content[0].text = JSON.stringify(payload, null, 2)
             } catch {
@@ -429,6 +453,8 @@ interface InputExecutionContext {
 }
 
 const unifiedOnlyEventTypes = new Set<InputEvent['type']>([
+    'keydown',
+    'keyup',
     'select',
     'replace',
     'editorContext',
@@ -480,6 +506,10 @@ async function focusTargetForCommands(
         const point = await getTargetPointExtension(unifiedSession, target, timeout, frame)
         await unifiedSession.mouseMove(point.x, point.y)
         await unifiedSession.mouseClick('left')
+        return
+    }
+    if (unifiedSession.getMode() === 'cdp') {
+        await focusCdpTarget(getSession(), target, timeout)
         return
     }
     const params = targetToFindParams(target as Target & { nth?: number })
@@ -1039,6 +1069,14 @@ function requiredEventParam(event: InputEvent, name: keyof InputEvent): never {
 }
 
 function validateEvent(event: InputEvent): void {
+    if (event.force && (event.type !== 'click' || !event.target || 'x' in event.target)) {
+        throw new StructuredToolError(
+            'INVALID_ARGUMENT',
+            'force 仅支持带元素 target 的 click 事件，不能使用坐标或省略 target',
+            '请指定 CSS、role、文本或其他元素定位方式',
+            { actionExecuted: false }
+        )
+    }
     if (event.commands && event.commands.length > 0 && event.type !== 'keydown') {
         throw new Error(
             `events[].commands 只能用于 keydown 事件，当前事件类型为 ${event.type}，如需触发编辑命令，请把 commands 放在 keydown 事件上`
@@ -1150,7 +1188,12 @@ async function handleUnifiedKeyDown(
     { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    if (unifiedSession.getInputMode() === 'stealth' && event.commands && event.commands.length > 0) {
+    if (
+        unifiedSession.isExtensionConnected() &&
+        unifiedSession.getInputMode() === 'stealth' &&
+        event.commands &&
+        event.commands.length > 0
+    ) {
         throw new Error(
             'commands 参数不支持 stealth 输入模式，请先调用 manage action=inputMode inputMode=precise 切换后重试'
         )
@@ -1171,7 +1214,7 @@ async function handleUnifiedKeyUp(
 }
 
 async function handleUnifiedClick(
-    { unifiedSession, timeout, frame }: UnifiedInputContext,
+    { unifiedSession, humanize, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
     const button = event.button ?? 'left'
@@ -1181,40 +1224,29 @@ async function handleUnifiedClick(
         return undefined
     }
 
-    if ('x' in event.target && 'y' in event.target) {
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
-        await unifiedSession.mouseMove(point.x, point.y)
-        await unifiedSession.mouseClick(button, clickCount)
-        return undefined
-    }
-
-    if (button === 'left' && clickCount === 1) {
-        const {
-            selector,
-            text: searchText,
-            xpath,
-            nth: nthParam,
-        } = targetToFindParams(event.target as Target & { nth?: number })
-        const elements = await unifiedSession.find(selector, searchText, xpath, timeout)
-        const nth = nthParam ?? 0
-        if (elements.length > 0 && nth < elements.length) {
-            const result = await unifiedSession.actionableClick(elements[nth].refId, event.force === true)
-            if (!result.success) {
-                throw new StructuredToolError(
-                    'ACTIONABILITY_FAILED',
-                    result.error || 'Click failed',
-                    result.suggestions?.[0] ??
-                        '请根据 context.rect、context.clickPoint 和 context.coveringElement 调整 target',
-                    result as unknown as Record<string, unknown>
-                )
-            }
-            return undefined
+    const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame, !event.force)
+    if (humanize) {
+        for (const p of generateBezierPath(unifiedSession.getMousePosition(), point, event.steps)) {
+            await unifiedSession.mouseMove(p.x, p.y)
+            await randomDelay(getMouseMoveDelay(), getMouseMoveDelay() * 2)
         }
+    } else {
+        await unifiedSession.mouseMove(point.x, point.y)
     }
-
-    const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
-    await unifiedSession.mouseMove(point.x, point.y)
-    await unifiedSession.mouseClick(button, clickCount, typeof point.refId === 'string' ? point.refId : undefined)
+    if (point.refId) {
+        const result = await unifiedSession.actionableClick(point.refId, event.force === true, button, clickCount)
+        if (!result.success) {
+            throw new StructuredToolError(
+                'ACTIONABILITY_FAILED',
+                result.error || 'Click failed',
+                result.suggestions?.[0] ??
+                    '请根据 context.rect、context.clickPoint 和 context.coveringElement 调整 target',
+                result as unknown as Record<string, unknown>
+            )
+        }
+    } else {
+        await unifiedSession.mouseClick(button, clickCount)
+    }
     return undefined
 }
 
@@ -1298,19 +1330,18 @@ async function handleUnifiedTouchEnd({ unifiedSession }: UnifiedInputContext): P
     return undefined
 }
 
-async function handleUnifiedType(
-    { unifiedSession, humanize, timeout, frame }: UnifiedInputContext,
-    event: InputEvent
-): Promise<InputEventResult> {
+async function handleUnifiedType(context: UnifiedInputContext, event: InputEvent): Promise<InputEventResult> {
+    const { unifiedSession, humanize, timeout, frame } = context
     if (event.mode === 'controlled' || event.dispatch) {
         await inputControlled(unifiedSession, event, timeout, frame)
         return undefined
     }
 
     if (event.target) {
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
-        await unifiedSession.mouseMove(point.x, point.y)
-        await unifiedSession.mouseClick('left')
+        await handleUnifiedClick(context, { type: 'click', target: event.target })
+        if (!('x' in event.target)) {
+            await focusTargetForCommands(unifiedSession, event.target, timeout, frame)
+        }
     } else {
         const hasActiveFocus = await unifiedSession.evaluate<boolean>(
             '!!document.activeElement && ' +
@@ -1819,7 +1850,8 @@ async function getTargetPointExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
     timeout?: number,
-    frame?: string | number
+    frame?: string | number,
+    scroll = true
 ): Promise<{ x: number; y: number; refId?: string }> {
     const frameOffset = unifiedSession.getFrameOffset()
     const isStealth = unifiedSession.getInputMode() === 'stealth'
@@ -1884,7 +1916,7 @@ async function getTargetPointExtension(
             const el = ref?.deref();
             if (!el) return null;
             const r = el.getBoundingClientRect();
-            if (r.top < 0 || r.bottom > window.innerHeight || r.left < 0 || r.right > window.innerWidth) {
+            if (${scroll} && (r.top < 0 || r.bottom > window.innerHeight || r.left < 0 || r.right > window.innerWidth)) {
                 el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
             }
             const r2 = el.getBoundingClientRect();
@@ -1892,14 +1924,13 @@ async function getTargetPointExtension(
         })()`
     )
 
-    // refId 失效等异常：fallback 到原始 find rect（父视口绝对）
     if (!iframeRelRect) {
-        const rect = elements[nth].rect
-        const point = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }
-        if (frameOffset && isStealth) {
-            return { x: point.x - frameOffset.x, y: point.y - frameOffset.y, refId }
-        }
-        return { ...point, refId }
+        throw new StructuredToolError(
+            'TARGET_NOT_FOUND',
+            '目标元素引用已失效，未使用旧坐标派发事件',
+            '请重新读取页面并确认 target',
+            { target, refId, actionExecuted: false }
+        )
     }
 
     // 主 frame：iframeRelRect 就是父视口绝对
@@ -1951,8 +1982,6 @@ async function executeCdpEvent(
 }
 
 const cdpInputHandlers: Partial<Record<InputEvent['type'], CdpInputHandler>> = {
-    keydown: handleCdpKeyDown,
-    keyup: handleCdpKeyUp,
     click: handleCdpClick,
     mousedown: handleCdpMouseDown,
     mouseup: handleCdpMouseUp,
@@ -1966,15 +1995,31 @@ const cdpInputHandlers: Partial<Record<InputEvent['type'], CdpInputHandler>> = {
     drag: handleCdpDrag,
 }
 
-async function handleCdpKeyDown({ session }: CdpInputContext, event: InputEvent): Promise<void> {
-    await session.keyDown(event.key!, event.commands)
-}
-
-async function handleCdpKeyUp({ session }: CdpInputContext, event: InputEvent): Promise<void> {
-    await session.keyUp(event.key!)
-}
-
 async function handleCdpClick({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
+    if (event.force) {
+        const locator = session.createLocator(event.target!, { timeout })
+        await locator.evaluateOn(`function() {
+            if (!this.isConnected) throw new Error('目标元素已移除，未执行点击');
+            const button = ${JSON.stringify(event.button ?? 'left')};
+            const count = ${event.clickCount ?? 1};
+            const codes = {left: 0, middle: 1, right: 2, back: 3, forward: 4};
+            const masks = {left: 1, middle: 4, right: 2, back: 8, forward: 16};
+            const rect = this.getBoundingClientRect();
+            const base = {bubbles: true, cancelable: true, composed: true, view: window,
+                button: codes[button], clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2};
+            for (let detail = 1; detail <= count; ++detail) {
+                const down = this.dispatchEvent(new MouseEvent('mousedown', {...base, detail, buttons: masks[button]}));
+                if (down && button === 'left' && typeof this.focus === 'function') this.focus();
+                this.dispatchEvent(new MouseEvent('mouseup', {...base, detail, buttons: 0}));
+                const type = button === 'left' ? 'click' : button === 'right' ? 'contextmenu' : 'auxclick';
+                this.dispatchEvent(new MouseEvent(type, {...base, detail, buttons: 0}));
+                if (button === 'left' && detail === 2) {
+                    this.dispatchEvent(new MouseEvent('dblclick', {...base, detail, buttons: 0}));
+                }
+            }
+        }`)
+        return
+    }
     if (event.target) {
         await moveToTarget(session, event.target, humanize, timeout)
     }
@@ -2040,6 +2085,9 @@ async function handleCdpType({ session, humanize, timeout }: CdpInputContext, ev
         await moveToTarget(session, event.target, humanize, timeout, undefined, 'input')
         await session.mouseDown('left')
         await session.mouseUp('left')
+        if (!('x' in event.target)) {
+            await focusCdpTarget(session, event.target, timeout)
+        }
     } else {
         const hasActiveFocus = await session.evaluate<boolean>(
             '!!document.activeElement && ' +

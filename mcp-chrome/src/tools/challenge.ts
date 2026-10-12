@@ -223,7 +223,7 @@ export const CHALLENGE_INSPECT_SCRIPT = `(() => {
   };
   const bringIntoView = (el) => {
     if (!el || typeof el.scrollIntoView !== 'function') return;
-    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+    el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
   };
   const hits = (selectors) => selectors.filter((selector) => {
     try { return Array.from(document.querySelectorAll(selector)).some(isVisible); } catch { return false; }

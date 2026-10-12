@@ -212,6 +212,7 @@ export interface ListedTarget {
     incognito?: boolean
     managed?: boolean
     status?: string
+    revision?: string
 }
 
 export interface BrowserWindowInfo {
@@ -385,11 +386,13 @@ export interface IBrowserDriver {
     newWindow?(options: NewWindowOptions): Promise<PageManagementResult>
     closeWindow?(windowId: number): Promise<PageManagementResult>
     newPage(url?: string, timeout?: number): Promise<NewTabResult>
-    closePage(targetId?: string): Promise<void | PageManagementResult>
+    closePage(targetId: string): Promise<void | PageManagementResult>
     activatePage(targetId: string): Promise<void>
     selectPage(targetId: string): Promise<void>
     getCurrentTargetId(): string | null
     setCurrentTargetId(targetId: string | null): void
+    getPageSnapshot(targetId: string): Promise<{ targetId: string; url: string; revision: string }>
+    setPageCondition(condition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null): void
     getState(): DriverState | null
 
     // ---- iframe（仅 Extension） ----

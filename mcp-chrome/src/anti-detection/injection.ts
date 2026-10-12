@@ -57,10 +57,10 @@ const COMMON_BODY = `
   // 3. 修改 navigator.userAgent 中的 Headless 标识
   // ============================================
   try {
-    const originalUserAgent = navigator.userAgent;
-    if (originalUserAgent.includes('HeadlessChrome')) {
+    const userAgentGetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator), 'userAgent')?.get;
+    if (userAgentGetter && userAgentGetter.call(navigator).includes('HeadlessChrome')) {
       Object.defineProperty(navigator, 'userAgent', {
-        get: () => originalUserAgent.replace('HeadlessChrome', 'Chrome'),
+        get: () => userAgentGetter.call(navigator).replace('HeadlessChrome', 'Chrome'),
         configurable: true,
       });
     }

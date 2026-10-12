@@ -19,6 +19,7 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
+import { TEMP_OUTPUT_RETENTION } from '../core/utils.js'
 
 /**
  * cookies 参数 schema
@@ -97,13 +98,14 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                 }>
 
                 if (args.output) {
-                    const outputPath = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
-                    await writePrivateFile(outputPath, JSON.stringify(cookies, null, 2), 'utf-8')
+                    const output = await resolveScopedOutputPath(args.output, 'mcp-chrome')
+                    await writePrivateFile(output.absolutePath, JSON.stringify(cookies, null, 2), 'utf-8')
                     return formatResponse({
                         success: true,
                         action: 'get',
-                        output: outputPath,
+                        output: output.absolutePath,
                         count: cookies.length,
+                        ...(output.scope === 'tmp' ? { retention: TEMP_OUTPUT_RETENTION } : {}),
                     })
                 }
 

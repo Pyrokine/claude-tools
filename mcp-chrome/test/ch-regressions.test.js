@@ -422,10 +422,15 @@ test('CH-05 backend selection happens inside the active tab and frame scopes', a
 
     const assertScoped = (source, handler, backendMarker, hasFrame) => {
         const handlerIndex = source.indexOf(handler);
-        const tabIndex = source.indexOf('withTabId(args.tabId', handlerIndex);
+        const tabIndex = source.indexOf('withPageContext(unifiedSession, resolvePageTargetId(args)', handlerIndex);
         const frameIndex = hasFrame ? source.indexOf('withFrame(args.frame', tabIndex) : tabIndex;
         const backendIndex = source.indexOf(backendMarker, frameIndex);
-        assert.ok(handlerIndex >= 0 && tabIndex > handlerIndex && backendIndex > frameIndex);
+        assert.ok(handlerIndex >= 0);
+        assert.ok(tabIndex > handlerIndex);
+        if (hasFrame) {
+            assert.ok(frameIndex > tabIndex);
+        }
+        assert.ok(backendIndex > frameIndex);
     };
 
     assertScoped(inputSource, 'async function handleInput', 'const mode = unifiedSession.getMode()', true);
@@ -456,7 +461,7 @@ test('CH-06 DOM iframe identity does not depend on webNavigation frame ordering'
         readFile(new URL('../extension/src/content/content.ts', import.meta.url), 'utf8'),
     ]);
 
-    assert.match(resolverSource, /getDomFrameSnapshot\(tabId, 0, p\.frame\)/);
+    assert.match(resolverSource, /getDomFrameSnapshot\(tabId, 0, p\.frame, readable\.documentId, readable\.tab\.url\)/);
     assert.doesNotMatch(resolverSource, /directChildFrames\[info\.index\]/);
     assert.match(actionUtilsSource, /mcp-frame-probe/);
     assert.match(actionUtilsSource, /recordDomFrameProbe/);
@@ -1421,7 +1426,9 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
         /this\.send\('Page.enable'\),\s*this\.send\('DOM.enable'\),\s*this\.send\('Runtime.enable'\)/
     );
     assert.match(logManagerSource, /private challengeRequired = new Map<number, boolean>\(\)/);
-    assert.match(logManagerSource, /this\.challengeRequired\.set\(tabId, challenge\)/);
+    assert.match(logManagerSource, /private mainFrameIds = new Map<number, string>\(\)/);
+    assert.match(logManagerSource, /pending\.frameId === this\.mainFrameIds\.get\(tabId\)/);
+    assert.match(logManagerSource, /this\.challengeRequired\.set\(tabId, pending\.challenge\)/);
     assert.match(handlerSource, /networkChallengeState/);
     assert.match(bridgeSource, /network_challenge_state/);
     assert.match(bridgeSource, /viewport_metrics/);
@@ -1486,7 +1493,9 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     assert.doesNotMatch(unifiedSessionSource, /await this\.focusWindow\(/);
     assert.match(challengeSource, /host\.getMode\(\) === 'extension'/);
     assert.match(challengeSource, /pageTitle\.live/);
-    assert.match(challengeSource, /el\.scrollIntoView\(\{ block: 'center', inline: 'nearest' \}\)/);
+    for (const source of [challengeSource, pageScriptsSource]) {
+        assert.match(source, /el\.scrollIntoView\(\{ block: 'center', inline: 'nearest', behavior: 'instant' \}\)/);
+    }
     assert.match(challengeSource, /请稍候/);
     assert.match(challengeSource, /正在进行安全验证/);
     assert.doesNotMatch(challengeSource, /snapshot\.clickPoint && !clickedTurnstile/);

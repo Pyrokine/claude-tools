@@ -30,6 +30,7 @@ interface VerifiedAuth {
 
 interface HealthResponse {
     status?: string
+    instanceId?: string
     authRequired?: boolean
     auth?: {
         clientNonce?: string
@@ -98,12 +99,17 @@ async function hmacHex(token: string, payload: string): Promise<string> {
 export class HttpClient {
     private connections = new Map<number, ServerConnection>()
     private verifiedAuth = new Map<number, VerifiedAuth>()
+    private verifiedInstanceIds = new Map<number, string>()
+    private connectionClosedHandler: ((instanceId: string) => void) | null = null
     private messageHandler: MessageHandler | null = null
     private statusHandler: StatusHandler | null = null
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null
     private reconnectAttempts = 0
     private shouldReconnect = true
-    private connecting = false
+    private generation = 0
+    private connectingGeneration: number | null = null
+    private pendingHealthChecks = new Set<AbortController>()
+    private pendingSockets = new Set<WebSocket>()
     private pairingToken: string | null = null
     private pairingTokenLoaded = false
     private allowInsecureNoToken: boolean | null = null
@@ -117,12 +123,28 @@ export class HttpClient {
         this.statusHandler = handler
     }
 
+    onConnectionClosed(handler: (instanceId: string) => void): void {
+        this.connectionClosedHandler = handler
+    }
+
+    getConnectedServers(): Array<{ port: number; instanceId: string | null }> {
+        return this.getConnectedPorts().map((port) => ({
+            port,
+            instanceId: this.verifiedInstanceIds.get(port) ?? null,
+        }))
+    }
+
+    getServerInstanceId(port: number): string | null {
+        return this.connections.has(port) ? (this.verifiedInstanceIds.get(port) ?? null) : null
+    }
+
     async setPairingToken(token: string): Promise<void> {
         this.pairingToken = token.trim()
         this.pairingTokenLoaded = true
-        await chrome.storage.local.set({ [PAIRING_TOKEN_STORAGE_KEY]: this.pairingToken })
         this.disconnect()
-        if (this.pairingToken) {
+        const generation = this.generation
+        await chrome.storage.local.set({ [PAIRING_TOKEN_STORAGE_KEY]: this.pairingToken })
+        if (generation === this.generation && this.pairingToken) {
             await this.connect()
         }
     }
@@ -133,9 +155,10 @@ export class HttpClient {
 
     async setAllowInsecureNoToken(allow: boolean): Promise<void> {
         this.allowInsecureNoToken = allow
-        await chrome.storage.local.set({ [ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY]: allow })
         this.disconnect()
-        if (allow) {
+        const generation = this.generation
+        await chrome.storage.local.set({ [ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY]: allow })
+        if (generation === this.generation && allow) {
             await this.connect()
         }
     }
@@ -148,12 +171,13 @@ export class HttpClient {
      * 扫描所有端口，连接所有健康的 MCP Server（跳过已连接的）
      */
     async connect(): Promise<{ connected: number; ports: number[] }> {
-        if (this.connecting) {
+        const generation = this.generation
+        if (this.connectingGeneration === generation) {
             return { connected: this.connections.size, ports: this.getConnectedPorts() }
         }
 
         this.stopReconnect()
-        this.connecting = true
+        this.connectingGeneration = generation
         this.shouldReconnect = true
 
         const wasConnected = this.connections.size > 0
@@ -163,7 +187,10 @@ export class HttpClient {
         }
 
         try {
-            const healthyPorts = await this.discoverServers()
+            const healthyPorts = await this.discoverServers(generation)
+            if (!this.isGenerationActive(generation)) {
+                return { connected: this.connections.size, ports: this.getConnectedPorts() }
+            }
 
             if (healthyPorts.length === 0 && this.connections.size === 0) {
                 this.statusHandler?.('disconnected', 0)
@@ -173,7 +200,10 @@ export class HttpClient {
 
             // 连接所有尚未连接的健康端口
             const newPorts = healthyPorts.filter((p) => !this.connections.has(p))
-            const results = await Promise.allSettled(newPorts.map((port) => this.connectToPort(port)))
+            const results = await Promise.allSettled(newPorts.map((port) => this.connectToPort(port, generation)))
+            if (!this.isGenerationActive(generation)) {
+                return { connected: this.connections.size, ports: this.getConnectedPorts() }
+            }
 
             const successCount = results.filter((r) => r.status === 'fulfilled' && r.value).length
             const failedPorts = newPorts.filter(
@@ -199,20 +229,42 @@ export class HttpClient {
 
             return { connected: ports.length, ports }
         } finally {
-            this.connecting = false
+            if (this.connectingGeneration === generation) {
+                this.connectingGeneration = null
+            }
         }
     }
 
     disconnect(): void {
         this.shouldReconnect = false
+        this.generation += 1
+        this.connectingGeneration = null
         this.stopReconnect()
+
+        for (const controller of this.pendingHealthChecks) {
+            controller.abort()
+        }
+        this.pendingHealthChecks.clear()
+        for (const ws of this.pendingSockets) {
+            try {
+                ws.close()
+            } catch {
+                // CONNECTING 状态的 socket 仍会由 generation 检查拒绝登记
+            }
+        }
+        this.pendingSockets.clear()
 
         for (const [port, conn] of this.connections) {
             this.stopHeartbeat(port)
+            const instanceId = this.verifiedInstanceIds.get(port)
+            if (instanceId) {
+                this.connectionClosedHandler?.(instanceId)
+            }
             conn.ws.close()
         }
         this.connections.clear()
         this.verifiedAuth.clear()
+        this.verifiedInstanceIds.clear()
         this.statusHandler?.('disconnected', 0)
     }
 
@@ -260,10 +312,13 @@ export class HttpClient {
         return this.allowInsecureNoToken
     }
 
-    private async connectToPort(port: number): Promise<boolean> {
+    private async connectToPort(port: number, generation: number): Promise<boolean> {
         // 已连接则跳过
         if (this.connections.has(port)) {
             return true
+        }
+        if (!this.isGenerationActive(generation)) {
+            return false
         }
 
         return new Promise((resolve) => {
@@ -276,31 +331,34 @@ export class HttpClient {
                     : ''
                 const url = `ws://127.0.0.1:${port}/${authQuery}`
                 const ws = new WebSocket(url)
+                this.pendingSockets.add(ws)
                 let opened = false
                 let resolved = false
 
-                const rejectCandidate = (): void => {
-                    if (!resolved) {
-                        resolved = true
-                        resolve(false)
+                const finishCandidate = (result: boolean): void => {
+                    if (resolved) {
+                        return
                     }
+                    resolved = true
+                    clearTimeout(connectionTimeout)
+                    this.pendingSockets.delete(ws)
+                    resolve(result)
                 }
 
                 const connectionTimeout = setTimeout(() => {
                     if (ws.readyState !== WebSocket.OPEN) {
-                        rejectCandidate()
+                        finishCandidate(false)
                         ws.close()
                     }
                 }, 5000)
 
                 ws.onopen = () => {
-                    clearTimeout(connectionTimeout)
-                    if (resolved) {
+                    if (!this.isGenerationActive(generation) || resolved) {
+                        finishCandidate(false)
                         ws.close()
                         return
                     }
                     opened = true
-                    resolved = true
 
                     const conn: ServerConnection = {
                         ws,
@@ -311,7 +369,7 @@ export class HttpClient {
 
                     // 版本与活动后台 bundle 握手；hash 读取失败时保持旧版 version-only 协议
                     void getBackgroundBundleHash().then((backgroundBundleHash) => {
-                        if (ws.readyState !== WebSocket.OPEN) {
+                        if (!this.isGenerationActive(generation) || ws.readyState !== WebSocket.OPEN) {
                             return
                         }
                         ws.send(
@@ -325,32 +383,32 @@ export class HttpClient {
 
                     console.log(`[HTTP] Connected to MCP Server at port ${port} (total: ${this.connections.size})`)
                     this.statusHandler?.('connected', this.connections.size)
-
-                    resolve(true)
+                    finishCandidate(true)
                 }
 
                 ws.onmessage = (event) => {
-                    this.handleMessage(event.data, port)
+                    if (this.isGenerationActive(generation)) {
+                        this.handleMessage(event.data, port)
+                    }
                 }
 
                 ws.onclose = () => {
-                    clearTimeout(connectionTimeout)
+                    this.pendingSockets.delete(ws)
                     if (!opened) {
-                        rejectCandidate()
+                        finishCandidate(false)
                         return
                     }
                     console.log(`[HTTP] WebSocket closed for port ${port}`)
-                    this.removeConnection(port)
+                    this.removeConnection(port, ws)
                 }
 
                 ws.onerror = (error) => {
-                    clearTimeout(connectionTimeout)
                     if (opened) {
                         console.error(`[HTTP] Established WebSocket error for port ${port}:`, error)
-                        this.removeConnection(port)
+                        this.removeConnection(port, ws)
                         return
                     }
-                    rejectCandidate()
+                    finishCandidate(false)
                 }
             } catch {
                 resolve(false)
@@ -361,15 +419,20 @@ export class HttpClient {
     /**
      * 清理单个连接及其资源
      */
-    private removeConnection(port: number): void {
+    private removeConnection(port: number, expectedSocket?: WebSocket): void {
         const conn = this.connections.get(port)
-        if (!conn) {
+        if (!conn || (expectedSocket !== undefined && conn.ws !== expectedSocket)) {
             return
         }
 
         this.stopHeartbeat(port)
         this.connections.delete(port)
         this.verifiedAuth.delete(port)
+        const instanceId = this.verifiedInstanceIds.get(port)
+        this.verifiedInstanceIds.delete(port)
+        if (instanceId) {
+            this.connectionClosedHandler?.(instanceId)
+        }
 
         if (this.connections.size > 0) {
             this.statusHandler?.('connected', this.connections.size)
@@ -386,12 +449,15 @@ export class HttpClient {
      *
      * 完整扫描整段范围，保证多 CC 并存时新启动的 server 能被发现
      */
-    private async discoverServers(): Promise<number[]> {
+    private async discoverServers(generation: number): Promise<number[]> {
         const checks = []
         for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
-            checks.push(this.checkPort(port).then((result) => ({ port, result })))
+            checks.push(this.checkPort(port, generation).then((result) => ({ port, result })))
         }
         const results = await Promise.all(checks)
+        if (!this.isGenerationActive(generation)) {
+            return []
+        }
         const healthyPorts = results.filter(({ result }) => result.healthy).map(({ port }) => port)
         const selectedFailures = results.filter(({ result }) => result.failureKind)
 
@@ -422,23 +488,38 @@ export class HttpClient {
         return healthyPorts.sort((a, b) => a - b)
     }
 
-    private async checkPort(port: number): Promise<PortCheckResult> {
+    private async checkPort(port: number, generation: number): Promise<PortCheckResult> {
         const controller = new AbortController()
+        this.pendingHealthChecks.add(controller)
         const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT)
         try {
             const token = await this.getPairingToken()
+            if (!this.isGenerationActive(generation)) {
+                return { healthy: false }
+            }
             const clientNonce = randomHex()
             const response = await fetch(`http://127.0.0.1:${port}/api/health?clientNonce=${clientNonce}`, {
                 signal: controller.signal,
             })
+            if (!this.isGenerationActive(generation)) {
+                return { healthy: false }
+            }
 
             if (!response.ok) {
                 return { healthy: false }
             }
 
             const health = (await response.json().catch(() => null)) as HealthResponse | null
+            if (!this.isGenerationActive(generation)) {
+                return { healthy: false }
+            }
             if (!health || typeof health.authRequired !== 'boolean') {
                 return { healthy: false }
+            }
+            if (typeof health.instanceId === 'string' && /^[0-9a-f]{32}$/.test(health.instanceId)) {
+                this.verifiedInstanceIds.set(port, health.instanceId)
+            } else {
+                this.verifiedInstanceIds.delete(port)
             }
             if (health.authRequired) {
                 if (!token) {
@@ -451,10 +532,14 @@ export class HttpClient {
                 if (expected !== health.auth.serverProof) {
                     return { healthy: false, failureKind: 'authentication', reason: 'server proof mismatch' }
                 }
+                const clientProof = await hmacHex(token, `client:${clientNonce}:${health.auth.serverNonce}`)
+                if (!this.isGenerationActive(generation)) {
+                    return { healthy: false }
+                }
                 this.verifiedAuth.set(port, {
                     clientNonce,
                     serverNonce: health.auth.serverNonce,
-                    clientProof: await hmacHex(token, `client:${clientNonce}:${health.auth.serverNonce}`),
+                    clientProof,
                 })
                 return { healthy: true }
             }
@@ -469,6 +554,9 @@ export class HttpClient {
             if (!(await this.getAllowInsecureNoToken())) {
                 return { healthy: false, failureKind: 'authentication', reason: 'local no-token policy disabled' }
             }
+            if (!this.isGenerationActive(generation)) {
+                return { healthy: false }
+            }
             this.verifiedAuth.delete(port)
             return health.status === 'ok'
                 ? { healthy: true }
@@ -477,7 +565,12 @@ export class HttpClient {
             return { healthy: false }
         } finally {
             clearTimeout(timeoutId)
+            this.pendingHealthChecks.delete(controller)
         }
+    }
+
+    private isGenerationActive(generation: number): boolean {
+        return generation === this.generation && this.shouldReconnect
     }
 
     private handleMessage(data: string, port: number): void {
@@ -540,9 +633,10 @@ export class HttpClient {
 
         console.log(`[HTTP] Scheduling reconnect in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts})`)
 
+        const generation = this.generation
         this.reconnectTimer = setTimeout(async () => {
             this.reconnectTimer = null
-            if (this.shouldReconnect) {
+            if (this.isGenerationActive(generation)) {
                 await this.connect()
             }
         }, delay)

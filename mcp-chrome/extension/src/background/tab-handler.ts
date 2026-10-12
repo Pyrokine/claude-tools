@@ -153,6 +153,7 @@ export class TabHandler {
         }
 
         let initialTabIdToCleanup: number | undefined
+        let effectiveGroupId: number | null = context.mcpTabGroupId
 
         if (p.windowId) {
             createProps.windowId = p.windowId
@@ -180,6 +181,7 @@ export class TabHandler {
                 // 新建 MCP 专属 window 时必须同步重置 mcpTabGroupId
                 // 否则旧 group 在别的 window 时，chrome.tabs.group 会把新 tab 静默拽到旧 group 所在 window（破坏隔离）
                 setMcpTabGroupId(null)
+                effectiveGroupId = null
                 const newWindow = await chrome.windows.create({
                     type: 'normal',
                     focused: false,
@@ -213,8 +215,8 @@ export class TabHandler {
         let actualGroupId = tab.groupId ?? -1
         let managed = false
         if (tab.id) {
-            await markManagedTab(tab.id)
-            let groupId: number | null = p.groupId ?? context.mcpTabGroupId
+            await markManagedTab(tab.id, true)
+            let groupId: number | null = p.groupId ?? effectiveGroupId
             if (groupId !== null && groupId !== undefined) {
                 try {
                     await chrome.tabs.group({ tabIds: [tab.id], groupId })
@@ -254,18 +256,11 @@ export class TabHandler {
             await this.navigationHandler.waitForNavigation(tab.id, p.waitUntil, p.timeout)
         }
 
+        const currentTab = await chrome.tabs.get(tab.id!)
         return {
-            id: tab.id!,
-            url: tab.url || '',
-            title: tab.title || '',
-            active: tab.active,
-            windowId: tab.windowId,
-            index: tab.index,
-            groupId: actualGroupId,
-            pinned: tab.pinned,
-            incognito: tab.incognito,
-            managed: managed || isManagedTab(tab, context),
-            status: tab.status || 'unknown',
+            ...tabToInfo(currentTab, context),
+            groupId: currentTab.groupId ?? actualGroupId,
+            managed: managed || isManagedTab(currentTab, context),
         }
     }
 
@@ -434,7 +429,7 @@ export class TabHandler {
         setMcpWindowId(window.id)
         const tabId = window.tabs?.[0]?.id
         if (tabId !== undefined) {
-            await markManagedTab(tabId)
+            await markManagedTab(tabId, true)
         }
         const after = p.focused ? await waitForWindowFocus(window.id, context) : await getWindowInfo(window.id, context)
         return {

@@ -5,7 +5,8 @@ export function generateAccessibilityTree(
     filter: string,
     maxDepth: number,
     maxLength: number | null,
-    refId: string | null
+    refId: string | null,
+    expectedUrl?: string | null
 ): {
     pageContent: string
     viewport: { width: number; height: number }
@@ -22,6 +23,9 @@ export function generateAccessibilityTree(
     }>
     error?: string
 } {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
     // 初始化元素映射
     const win = window as Window & {
         __mcpElementMap?: Record<string, WeakRef<Element>>
@@ -545,7 +549,10 @@ export function performScroll(
 }
 
 // 代码执行
-export function executeCode(code: string): { success: boolean; result?: string; error?: string } {
+export async function executeCode(
+    code: string,
+    timeout?: number
+): Promise<{ success: boolean; result?: string; error?: string }> {
     function evaluateSerializationError(message: string, suggestion: string, context: Record<string, unknown>): string {
         return JSON.stringify({
             error: {
@@ -600,7 +607,27 @@ export function executeCode(code: string): { success: boolean; result?: string; 
 
     try {
         const fn = new Function(`return (${code})`)
-        return serializeEvaluateResult(fn())
+        const result = fn()
+        if (timeout === undefined) {
+            return serializeEvaluateResult(await result)
+        }
+
+        const timedOut = Symbol('evaluate-timeout')
+        let timeoutId: ReturnType<typeof setTimeout> | undefined
+        const timeoutResult = new Promise<typeof timedOut>((resolve) => {
+            timeoutId = setTimeout(() => resolve(timedOut), timeout)
+        })
+        try {
+            const settled = await Promise.race([Promise.resolve(result), timeoutResult])
+            if (settled === timedOut) {
+                return { success: false, error: `Evaluation timeout after ${timeout}ms` }
+            }
+            return serializeEvaluateResult(settled)
+        } finally {
+            if (timeoutId !== undefined) {
+                clearTimeout(timeoutId)
+            }
+        }
     } catch (error) {
         const errorMsg = error instanceof Error ? error.message : 'Unknown error'
         if (errorMsg.includes('Content Security Policy') || errorMsg.includes("'unsafe-eval'")) {
@@ -614,7 +641,19 @@ export function executeCode(code: string): { success: boolean; result?: string; 
 }
 
 // 提取文本
-export function extractText(selector: string | null): { text: string; error?: string } {
+export function extractText(
+    selector: string | null,
+    expectedUrl?: string | null,
+    refId?: string | null
+): { text: string; error?: string } {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
+    if (refId) {
+        const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+        const element = win.__mcpElementMap?.[refId]?.deref()
+        return { text: element?.isConnected ? (element.textContent ?? '') : '' }
+    }
     if (selector) {
         let element: Element | null
         try {
@@ -633,7 +672,20 @@ export function extractText(selector: string | null): { text: string; error?: st
 }
 
 // 提取 HTML
-export function extractHtml(selector: string | null, outer: boolean): { html: string; error?: string } {
+export function extractHtml(
+    selector: string | null,
+    outer: boolean,
+    expectedUrl?: string | null,
+    refId?: string | null
+): { html: string; error?: string } {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
+    if (refId) {
+        const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+        const element = win.__mcpElementMap?.[refId]?.deref()
+        return { html: element?.isConnected ? (outer ? element.outerHTML : element.innerHTML) : '' }
+    }
     if (selector) {
         let element: Element | null
         try {
@@ -658,7 +710,9 @@ export function extractHtml(selector: string | null, outer: boolean): { html: st
 // 提取 HTML + 图片元信息
 export function extractHtmlWithImages(
     selector: string | null,
-    outer: boolean
+    outer: boolean,
+    expectedUrl?: string | null,
+    refId?: string | null
 ): {
     html: string
     images: Array<{
@@ -672,8 +726,15 @@ export function extractHtmlWithImages(
         naturalHeight: number
     }>
 } {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
     let root: Element | null
-    if (selector) {
+    if (refId) {
+        const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
+        const element = win.__mcpElementMap?.[refId]?.deref()
+        root = element?.isConnected ? element : null
+    } else if (selector) {
         try {
             root = document.querySelector(selector)
         } catch (e) {
@@ -692,7 +753,7 @@ export function extractHtmlWithImages(
 
     // 读取元素 innerHTML（提取 HTML 内容，非 XSS 写入）
     // noinspection InnerHTMLJS
-    const html = selector ? (outer ? root.outerHTML : root.innerHTML) : document.documentElement.outerHTML
+    const html = selector || refId ? (outer ? root.outerHTML : root.innerHTML) : document.documentElement.outerHTML
 
     // 收集范围内所有 <img> 元素（文档顺序），含 root 自身
     const imgList: HTMLImageElement[] = []
@@ -725,7 +786,10 @@ export function extractHtmlWithImages(
 }
 
 // 提取页面元信息
-export function extractMetadata(): Record<string, unknown> {
+export function extractMetadata(expectedUrl?: string | null): Record<string, unknown> {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
     const meta = (name: string): string | undefined =>
         (document.querySelector(`meta[name="${name}"],meta[property="${name}"]`) as HTMLMetaElement | null)?.content ||
         undefined
@@ -777,8 +841,12 @@ export function extractMetadata(): Record<string, unknown> {
 export function extractAttribute(
     selector: string | null,
     refId: string | null,
-    attribute: string
+    attribute: string,
+    expectedUrl?: string | null
 ): { value: string | null } {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
     let element: Element | null = null
 
     if (refId) {
@@ -819,7 +887,10 @@ export function extractAttribute(
 export function findElements(
     selector: string | null,
     text: string | null,
-    xpath: string | null
+    xpath: string | null,
+    expectedUrl?: string | null,
+    point?: { x: number; y: number } | null,
+    matchIndex?: number
 ):
     | Array<{
           refId: string
@@ -828,6 +899,9 @@ export function findElements(
           rect: { x: number; y: number; width: number; height: number }
       }>
     | { error: string } {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
     const win = window as Window & {
         __mcpElementMap?: Record<string, WeakRef<Element>>
         __mcpElementToRefId?: WeakMap<Element, string>
@@ -846,7 +920,10 @@ export function findElements(
 
     let elements: Element[]
 
-    if (xpath) {
+    if (point) {
+        const element = document.elementFromPoint(point.x, point.y)
+        elements = element ? [element] : []
+    } else if (xpath) {
         // XPath 查询
         elements = []
         const xpathResult = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null)
@@ -878,11 +955,17 @@ export function findElements(
                 (node as Text).data?.includes(text) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT,
         })
         let n: Node | null = walker.nextNode()
-        while (n && elements.length < 200) {
+        let textMatchIndex = 0
+        while (n && (matchIndex !== undefined || elements.length < 200)) {
             const parent = (n as Text).parentElement
             if (parent && !seen.has(parent)) {
                 seen.add(parent)
-                elements.push(parent)
+                if (matchIndex === undefined || textMatchIndex++ === matchIndex) {
+                    elements.push(parent)
+                    if (matchIndex !== undefined) {
+                        break
+                    }
+                }
             }
             n = walker.nextNode()
         }
@@ -891,12 +974,16 @@ export function findElements(
         return { error: 'find requires at least one of: selector, xpath, text' }
     }
 
+    let matched = 0
     for (const element of elements) {
         if (text) {
             const elementText = element.textContent || ''
             if (!elementText.includes(text)) {
                 continue
             }
+        }
+        if (matchIndex !== undefined && (selector || xpath || point) && matched++ !== matchIndex) {
+            continue
         }
 
         // 查找或创建 refId（用 WeakMap 反向索引避免 O(N×M)）
@@ -919,7 +1006,7 @@ export function findElements(
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
         })
 
-        if (results.length >= 50) {
+        if (matchIndex !== undefined || results.length >= 50) {
             break
         }
     }
@@ -1537,61 +1624,10 @@ export function performActionableClick(
             clientY: cy,
             view: window,
         }
-        const reactHandlers = Object.keys(el)
-            .filter((key) => key.startsWith('__reactProps'))
-            .map((key) => {
-                const props = (el as unknown as Record<string, Record<string, unknown>>)[key]
-                const handler = props?.onClick
-                if (typeof handler !== 'function') {
-                    return null
-                }
-                let called = false
-                props.onClick = function (...args: unknown[]) {
-                    called = true
-                    return handler.apply(this, args)
-                }
-                return { props, handler, wasCalled: () => called }
-            })
-            .filter(
-                (
-                    item
-                ): item is {
-                    props: Record<string, unknown>
-                    handler: (...args: unknown[]) => unknown
-                    wasCalled: () => boolean
-                } => item !== null
-            )
-
-        try {
-            el.dispatchEvent(new MouseEvent('mousedown', opts))
-            el.focus()
-            el.dispatchEvent(new MouseEvent('mouseup', { ...opts, buttons: 0 }))
-            const clickEvent = new MouseEvent('click', { ...opts, buttons: 0 })
-            el.dispatchEvent(clickEvent)
-            for (const item of reactHandlers) {
-                if (!item.wasCalled()) {
-                    // noinspection JSUnusedGlobalSymbols — React synthetic event contract
-                    item.handler.call(el, {
-                        type: 'click',
-                        target: el,
-                        currentTarget: el,
-                        nativeEvent: clickEvent,
-                        clientX: cx,
-                        clientY: cy,
-                        button: 0,
-                        buttons: 0,
-                        preventDefault: () => clickEvent.preventDefault(),
-                        stopPropagation: () => clickEvent.stopPropagation(),
-                        isDefaultPrevented: () => clickEvent.defaultPrevented,
-                        isPropagationStopped: () => false,
-                    })
-                }
-            }
-        } finally {
-            for (const item of reactHandlers) {
-                item.props.onClick = item.handler
-            }
-        }
+        el.dispatchEvent(new MouseEvent('mousedown', opts))
+        el.focus()
+        el.dispatchEvent(new MouseEvent('mouseup', { ...opts, buttons: 0 }))
+        el.dispatchEvent(new MouseEvent('click', { ...opts, buttons: 0 }))
     }
 
     // force 模式：跳过所有检查，直接点击
@@ -1715,7 +1751,10 @@ export function dispatchInputToElement(refId: string, val: string): { success: b
  * 获取元素的 computed style
  * prop = '*' 返回全部属性 JSON；否则返回指定属性值
  */
-export function getComputedStyleFromElement(refId: string, prop: string): string | null {
+export function getComputedStyleFromElement(refId: string, prop: string, expectedUrl?: string | null): string | null {
+    if (expectedUrl != null && location.href !== expectedUrl) {
+        throw new Error('页面 URL 已变化，未读取')
+    }
     const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
     const ref = win.__mcpElementMap?.[refId]
     const el = ref?.deref()
@@ -1785,7 +1824,7 @@ export function inspectChallengePage(options: {
         if (!el || typeof el.scrollIntoView !== 'function') {
             return
         }
-        el.scrollIntoView({ block: 'center', inline: 'nearest' })
+        el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })
     }
     const hits = (selectors: string[]) =>
         selectors.filter((selector) => {

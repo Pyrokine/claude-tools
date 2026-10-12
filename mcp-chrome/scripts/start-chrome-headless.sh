@@ -3,7 +3,11 @@
 # MCP Browser - Chrome 无头模式启动脚本
 # 启动无头 Chrome（适合服务器环境）
 
-PORT="${1:-9222}"
+PORT="9222"
+if [[ $# -gt 0 ]]; then
+    PORT="$1"
+    shift
+fi
 
 echo "Starting Chrome in headless mode on port $PORT..."
 

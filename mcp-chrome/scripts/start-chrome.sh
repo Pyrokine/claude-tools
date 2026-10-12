@@ -3,7 +3,11 @@
 # MCP Browser - Chrome 启动脚本
 # 启动带远程调试端口的 Chrome 浏览器
 
-PORT="${1:-9222}"
+PORT="9222"
+if [[ $# -gt 0 ]]; then
+    PORT="$1"
+    shift
+fi
 PROFILE_DIR="${HOME}/.chrome-mcp-profile"
 
 echo "Starting Chrome with remote debugging on port $PORT..."

@@ -1,12 +1,13 @@
 {
     "name": "mcp-chrome-extension",
-    "version": "2.4.4",
+    "version": "3.0.0",
     "private": true,
     "type": "module",
     "scripts": {
         "dev": "vite build --watch",
         "build": "tsc && vite build",
         "typecheck": "tsc --noEmit",
+        "test": "vite build --config vite.test.config.ts && node test/run-tests.mjs",
         "lint:css": "stylelint \"src/**/*.css\""
     },
     "dependencies": {
