@@ -72,7 +72,7 @@ const extractSchema = z
         target: targetZodSchema
             .optional()
             .describe(
-                '目标元素（attribute 必填；text/html 可选，省略则提取整个页面；' +
+                '目标元素（attribute 必填；text/html 可选，省略则提取整个页面；text 对 HTML 使用 innerText，SVG/XML 使用 textContent；' +
                     'screenshot 可选用于元素截图；state 可选（仅 Extension）用于返回目标子树；metadata 不需要）'
             ),
         attribute: z.string().optional().describe('属性名（attribute）'),
@@ -385,7 +385,7 @@ async function handleScreenshotExtract(
         clip,
         size: screenshotBuffer.length,
         byteSize: screenshotBuffer.length,
-        capabilities: screenshotCapabilities(useExtension),
+        capabilities: screenshotCapabilities(),
     }
     if (args.compareWith) {
         if (screenshot.format !== 'png') {
@@ -509,7 +509,7 @@ async function handleDomSnapshotState(
 }
 
 async function handleDiagnosticBundleExtract(
-    { unifiedSession, useExtension }: ExtractContext,
+    { unifiedSession }: ExtractContext,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
     const state = await unifiedSession.getLiveState().catch(() => null)
@@ -539,7 +539,7 @@ async function handleDiagnosticBundleExtract(
         },
         capabilities: {
             screenshot: true,
-            hiddenTabScreenshot: useExtension,
+            hiddenTabScreenshot: false,
             frames: true,
         },
     }
@@ -663,13 +663,13 @@ async function getScreenshotFallbackDimensions(
     }
 }
 
-function screenshotCapabilities(useExtension: boolean): Record<string, unknown> {
+function screenshotCapabilities(): Record<string, unknown> {
     return {
         formats: ['png', 'jpeg', 'webp'],
         clip: true,
         fullPage: true,
         scale: true,
-        hiddenTabScreenshot: useExtension,
+        hiddenTabScreenshot: false,
         compare: {
             formats: ['png'],
             maxBytes: MAX_COMPARE_PNG_BYTES,
@@ -1266,7 +1266,7 @@ async function extractText(session: ReturnType<typeof getSession>, target?: Targ
     if (target) {
         const locator = session.createLocator(target, timeout !== undefined ? { timeout } : undefined)
         const text = await locator.evaluateOn<string>(`function() {
-      return this.textContent ?? '';
+      return this instanceof HTMLElement ? this.innerText : (this.textContent ?? '');
     }`)
         return text ?? ''
     }

@@ -1,5 +1,41 @@
 // ==================== 注入到页面的函数 ====================
 
+export function installFrameProbeListener(): void {
+    const probeWindow = window as Window & { __mcpFrameProbeListenerInstalled?: boolean }
+    if (probeWindow.__mcpFrameProbeListenerInstalled) {
+        return
+    }
+    window.addEventListener('message', (event: MessageEvent) => {
+        const data = event.data as { type?: string; token?: string; index?: number } | null
+        if (
+            event.source !== window.parent ||
+            data?.type !== 'mcp-frame-probe' ||
+            typeof data.token !== 'string' ||
+            data.token.length > 100 ||
+            !Number.isInteger(data.index) ||
+            (data.index ?? -1) < 0
+        ) {
+            return
+        }
+        const source = event.source as Window
+        void chrome.runtime
+            .sendMessage({ type: 'MCP_FRAME_PROBE', token: data.token, index: data.index })
+            .then((response: { accepted?: boolean } | undefined) => {
+                if (!response?.accepted) {
+                    return
+                }
+                source.postMessage({ type: 'mcp-frame-probe-ack', token: data.token, index: data.index }, '*')
+            })
+            .catch((error) => {
+                console.warn(
+                    '[MCP] iframe identity probe failed:',
+                    error instanceof Error ? error.message : String(error)
+                )
+            })
+    })
+    probeWindow.__mcpFrameProbeListenerInstalled = true
+}
+
 // Accessibility Tree 生成
 export function generateAccessibilityTree(
     filter: string,
@@ -138,7 +174,7 @@ export function generateAccessibilityTree(
             if (inputType === 'submit' && input.value?.trim()) {
                 return input.value.trim()
             }
-            if (input.value && input.value.length < 50) {
+            if (inputType !== 'password' && input.value && input.value.length < 50) {
                 return input.value.trim()
             }
         }
@@ -652,7 +688,13 @@ export function extractText(
     if (refId) {
         const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
         const element = win.__mcpElementMap?.[refId]?.deref()
-        return { text: element?.isConnected ? (element.textContent ?? '') : '' }
+        return {
+            text: element?.isConnected
+                ? element instanceof HTMLElement
+                    ? element.innerText
+                    : (element.textContent ?? '')
+                : '',
+        }
     }
     if (selector) {
         let element: Element | null
@@ -666,7 +708,7 @@ export function extractText(
             }
             throw e
         }
-        return { text: element?.textContent || '' }
+        return { text: element instanceof HTMLElement ? element.innerText : (element?.textContent ?? '') }
     }
     return { text: document.body.innerText }
 }
@@ -1110,7 +1152,12 @@ export function simulateMouseClick(
 }
 
 // 模拟键盘输入
-export async function simulateKeyboardType(text: string, delay: number): Promise<{ success: boolean; error?: string }> {
+export async function simulateKeyboardType(
+    text: string,
+    delay: number,
+    deadline?: number
+): Promise<{ success: boolean; error?: string }> {
+    const expired = () => deadline !== undefined && Date.now() >= deadline
     const activeElement = document.activeElement as HTMLElement | null
 
     if (!activeElement) {
@@ -1140,10 +1187,19 @@ export async function simulateKeyboardType(text: string, delay: number): Promise
         }
     }
 
-    for (const char of text) {
+    let firstCharacter = true
+    for (const char of text.replace(/\r\n?/g, '\n')) {
+        if (expired()) {
+            return { success: false, error: 'input timeout during typing' }
+        }
         // chrome.scripting.executeScript 支持异步函数，会 await 返回的 Promise
-        if (delay > 0) {
-            await new Promise((r) => setTimeout(r, delay))
+        // 首字符前不等待按键间隔
+        if (delay > 0 && !firstCharacter) {
+            const remaining = deadline === undefined ? delay : Math.max(0, deadline - Date.now())
+            await new Promise((r) => setTimeout(r, Math.min(delay, remaining)))
+        }
+        if (expired()) {
+            return { success: false, error: 'input timeout during typing' }
         }
 
         const keyEventOptions = {
@@ -1185,8 +1241,12 @@ export async function simulateKeyboardType(text: string, delay: number): Promise
         )
 
         activeElement.dispatchEvent(new KeyboardEvent('keyup', keyEventOptions))
+        firstCharacter = false
     }
 
+    if (expired()) {
+        return { success: false, error: 'input timeout during typing' }
+    }
     activeElement.dispatchEvent(new Event('change', { bubbles: true }))
 
     return { success: true }
@@ -1222,7 +1282,16 @@ export function simulateKeyEvent(key: string, type: string, modifiers: string[])
 }
 
 // 模拟鼠标事件
-export function simulateMouseEvent(type: string, x: number, y: number, button: string): { success: boolean } {
+export function simulateMouseEvent(
+    type: string,
+    x: number,
+    y: number,
+    button: string,
+    deadline?: number
+): { success: boolean } {
+    if (deadline !== undefined && Date.now() >= deadline) {
+        throw new Error('input timeout before mouse event dispatch')
+    }
     const element = document.elementFromPoint(x, y) || document.body
     // W3C 标准：button 字段 left=0/middle=1/right=2；buttons 位掩码 left=1/middle=4/right=2
     const buttonCode = button === 'right' ? 2 : button === 'middle' ? 1 : 0
@@ -1885,7 +1954,12 @@ export function inspectChallengePage(options: {
         )
     }
     const turnstileBox = findVisibleTurnstileBox()
-    const hostVerify = Array.from(document.querySelectorAll(options.verifyButtonSelectors.join(','))).find(isVisible)
+    const hostVerify =
+        Array.from(document.querySelectorAll(options.verifyButtonSelectors.join(','))).find(isVisible) ||
+        Array.from(document.querySelectorAll('button')).find((el) => {
+            const text = (el.textContent || '').trim()
+            return isVisible(el) && (text === 'Verify you are human' || text === '请验证您是真人')
+        })
     const useIframeClick =
         cloudflareFramePresent ||
         (!hostVerify && interstitialPending && Boolean(document.querySelector('input[name="cf-turnstile-response"]')))
@@ -1940,19 +2014,6 @@ export function inspectChallengePage(options: {
         const widget = Array.from(document.querySelectorAll(options.widgetSelectors.join(','))).find(isVisible)
         if (widget) {
             setClickTarget(widget, 'widget')
-        }
-    }
-    if (!clickPoint && turnstilePresent) {
-        const nodes = Array.from(document.querySelectorAll('div'))
-        for (const node of nodes) {
-            if (!isVisible(node)) {
-                continue
-            }
-            const rect = node.getBoundingClientRect()
-            if (rect.width >= 280 && rect.width <= 320 && rect.height >= 50 && rect.height <= 80) {
-                setClickTarget(node, 'widget')
-                break
-            }
         }
     }
     if (!clickPoint && turnstileBox) {

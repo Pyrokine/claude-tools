@@ -190,6 +190,7 @@ export type StaleContextRetryPolicy = 'never' | 'readOnly'
 export interface FrameResolveResult {
     frameId: number
     offset: { x: number; y: number } | null
+    frameContext?: Record<string, unknown>
 }
 
 export interface DriverState {
@@ -209,6 +210,21 @@ export interface ListedTarget {
     index?: number
     groupId?: number
     pinned?: boolean
+    highlighted?: boolean
+    autoDiscardable?: boolean
+    muted?: boolean
+    mutedInfo?: { muted: boolean; reason?: string; extensionId?: string }
+    audible?: boolean
+    discarded?: boolean
+    frozen?: boolean
+    openerTabId?: number
+    pendingUrl?: string
+    favIconUrl?: string
+    lastAccessed?: number
+    width?: number
+    height?: number
+    splitViewId?: number
+    warnings?: string[]
     incognito?: boolean
     managed?: boolean
     status?: string
@@ -236,12 +252,63 @@ export interface BrowserTopology {
     focusedWindowId?: number
     activeTargetId?: string
     windows: BrowserWindowInfo[]
+    groups: BrowserTabGroupInfo[]
+}
+
+export interface BrowserTabGroupInfo {
+    id: number
+    title: string
+    color: string
+    windowId: number
+    collapsed: boolean
+    shared?: boolean
+    index?: number
+    tabIds: number[]
+    targetIds: string[]
+}
+
+export interface GroupManagementResult {
+    groupId?: number
+    before: BrowserTabGroupInfo[]
+    after: BrowserTabGroupInfo[]
+    tabsBefore: ListedTarget[]
+    tabsAfter: ListedTarget[]
+}
+
+export interface GroupPagesOptions {
+    groupId?: number
+    windowId?: number
+    title?: string
+    color?: 'blue' | 'cyan' | 'green' | 'grey' | 'orange' | 'pink' | 'purple' | 'red' | 'yellow'
+    collapsed?: boolean
+}
+
+export type UpdateGroupOptions = Pick<GroupPagesOptions, 'title' | 'color' | 'collapsed'>
+
+export interface NewPageOptions {
+    windowId?: number
+    index?: number
+    groupId?: number
+    active?: boolean
+    pinned?: boolean
+    openerTabId?: number
+}
+
+export interface UpdatePageOptions {
+    url?: string
+    active?: boolean
+    pinned?: boolean
+    highlighted?: boolean
+    muted?: boolean
+    autoDiscardable?: boolean
+    openerTabId?: number
 }
 
 export interface ManagedPageResult {
     target: ListedTarget
     managedBefore: boolean
     managedAfter: boolean
+    warnings?: string[]
 }
 
 export interface PageManagementResult {
@@ -252,7 +319,10 @@ export interface PageManagementResult {
 }
 
 export interface NewWindowOptions {
-    url?: string
+    url?: string | string[]
+    targetId?: string
+    type?: 'normal' | 'popup'
+    setSelfAsOpener?: boolean
     focused?: boolean
     incognito?: boolean
     left?: number
@@ -268,6 +338,8 @@ export interface ResizeWindowOptions {
     width?: number
     height?: number
     state?: string
+    focused?: boolean
+    drawAttention?: boolean
 }
 
 export interface MovePageOptions {
@@ -276,7 +348,7 @@ export interface MovePageOptions {
     activate?: boolean
 }
 
-export interface NewTabResult {
+export interface NewTabResult extends Omit<ListedTarget, 'id'> {
     targetId: string
     url: string
     title: string
@@ -333,15 +405,22 @@ export interface IBrowserDriver {
 
     // ---- 输入（precise） ----
     inputKey(type: InputKeyType, options?: InputKeyOptions): Promise<void>
-    inputMouse(type: InputMouseType, x: number, y: number, options?: InputMouseOptions): Promise<void>
+    inputMouse(type: InputMouseType, x: number, y: number, options?: InputMouseOptions, timeout?: number): Promise<void>
     inputTouch(type: InputTouchType, touchPoints: InputTouchPoint[]): Promise<void>
-    inputType(text: string, delay?: number): Promise<void>
+    inputType(text: string, delay?: number, timeout?: number): Promise<void>
 
     // ---- Stealth (仅 Extension，CDP 实现 throw) ----
     stealthKey(key: string, type: 'down' | 'up' | 'press', modifiers: string[]): Promise<void>
-    stealthClick(x: number, y: number, button?: string, clickCount?: number, refId?: string): Promise<void>
-    stealthMouse(type: string, x: number, y: number, button?: string): Promise<void>
-    stealthType(text: string, delay?: number): Promise<void>
+    stealthClick(
+        x: number,
+        y: number,
+        button?: string,
+        clickCount?: number,
+        refId?: string,
+        timeout?: number
+    ): Promise<void>
+    stealthMouse(type: string, x: number, y: number, button?: string, timeout?: number): Promise<void>
+    stealthType(text: string, delay?: number, timeout?: number): Promise<void>
     stealthInject(): Promise<void>
 
     // ---- Cookie ----
@@ -374,10 +453,12 @@ export interface IBrowserDriver {
     getChallengeState(): Promise<boolean>
 
     // ---- Tab / 状态 ----
-    listTargets(): Promise<ListedTarget[]>
-    listWindows?(): Promise<BrowserTopology>
+    listTargets(timeout?: number): Promise<ListedTarget[]>
+    listWindows?(timeout?: number): Promise<BrowserTopology>
+    setReadAccess?(targetId: string, allow: boolean): Promise<Record<string, unknown>>
     adoptPage?(targetId: string): Promise<ManagedPageResult>
     releasePage?(targetId: string): Promise<ManagedPageResult>
+    updatePage?(targetId: string, options: UpdatePageOptions): Promise<PageManagementResult>
     movePage?(targetId: string, options: MovePageOptions): Promise<PageManagementResult>
     reorderPage?(targetId: string, index: number): Promise<PageManagementResult>
     pinPage?(targetId: string, pinned: boolean): Promise<PageManagementResult>
@@ -385,13 +466,21 @@ export interface IBrowserDriver {
     resizeWindow?(windowId: number, options: ResizeWindowOptions): Promise<PageManagementResult>
     newWindow?(options: NewWindowOptions): Promise<PageManagementResult>
     closeWindow?(windowId: number): Promise<PageManagementResult>
-    newPage(url?: string, timeout?: number): Promise<NewTabResult>
+    updateWindow?(windowId: number, options: ResizeWindowOptions): Promise<PageManagementResult>
+    groupPages?(targetIds: string[], options: GroupPagesOptions): Promise<GroupManagementResult>
+    ungroupPages?(targetIds: string[]): Promise<GroupManagementResult>
+    updateGroup?(groupId: number, options: UpdateGroupOptions): Promise<GroupManagementResult>
+    moveGroup?(groupId: number, options: Pick<MovePageOptions, 'windowId' | 'index'>): Promise<GroupManagementResult>
+    newPage(url?: string, timeout?: number, options?: NewPageOptions): Promise<NewTabResult>
     closePage(targetId: string): Promise<void | PageManagementResult>
     activatePage(targetId: string): Promise<void>
-    selectPage(targetId: string): Promise<void>
+    selectPage(targetId: string, timeout?: number): Promise<void>
     getCurrentTargetId(): string | null
     setCurrentTargetId(targetId: string | null): void
-    getPageSnapshot(targetId: string): Promise<{ targetId: string; url: string; revision: string }>
+    getPageSnapshot(
+        targetId: string,
+        timeout?: number
+    ): Promise<{ targetId: string; url: string; revision: string | null; warning?: string }>
     setPageCondition(condition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null): void
     getState(): DriverState | null
 

@@ -34,7 +34,7 @@ import {
 import { DebuggerBlockedError, DebuggerManager } from './debugger-manager'
 import { assertScreenshotBase64Budget, assertScreenshotBudget } from './screenshot-budget'
 import { readGrantDocumentId } from './read-grants'
-import { isCreatedTab } from './tab-state'
+import { remainingNavigationTimeout } from './navigation-handler'
 import {
     type ActionabilityResult,
     checkActionability,
@@ -71,8 +71,32 @@ const EXPECTED_INJECTION_PATTERNS = [
     /Frame with ID \d+ is showing error page/i,
 ]
 
-function wrapInjectionError(error: unknown): Error {
+function wrapInjectionError(error: unknown, context?: Record<string, unknown>): Error {
     const msg = error instanceof Error ? error.message : String(error)
+    if (context) {
+        const code = /Invalid CSS selector|Invalid XPath/.test(msg)
+            ? 'INVALID_SELECTOR'
+            : /context.*(?:destroyed|not found|invalid)|Cannot find context|Execution context/i.test(msg)
+              ? 'FRAME_STALE_CONTEXT'
+              : /Frame.*(?:not found|removed|does not exist)/i.test(msg)
+                ? 'FRAME_NOT_FOUND'
+                : /Cannot access|not allowed|permission/i.test(msg)
+                  ? 'FRAME_INJECTION_DENIED'
+                  : context.phase === 'script_result'
+                    ? 'FRAME_SCRIPT_FAILED'
+                    : 'FRAME_INJECTION_FAILED'
+        const message = JSON.stringify({
+            error: {
+                code,
+                message: msg.slice(0, 500),
+                suggestion: '重新读取 iframe 元素与页面状态，并检查 selector；工具不会重放脚本',
+                context,
+            },
+        })
+        return EXPECTED_INJECTION_PATTERNS.some((p) => p.test(msg))
+            ? new ExpectedOperationError(message)
+            : new Error(message, { cause: error })
+    }
     if (EXPECTED_INJECTION_PATTERNS.some((p) => p.test(msg))) {
         return new ExpectedOperationError(msg)
     }
@@ -110,11 +134,9 @@ export class ContentHandler {
                 p.refId ?? null,
                 documentId ? (expectedUrl ?? null) : null,
             ],
-            documentId
+            documentId,
+            true
         )
-        if (result === undefined || result === null) {
-            throw new Error('Failed to read page')
-        }
         await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'read_page')
         if (p.frameId !== undefined && result.interactiveElements) {
             result.interactiveElements = result.interactiveElements.map((item) => ({ ...item, frameId: p.frameId }))
@@ -451,6 +473,9 @@ export class ContentHandler {
     }> {
         const p = ChallengeInspectSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'challenge_inspect')
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
+        }
         const results = await chrome.scripting
             .executeScript({
                 target: { tabId, frameIds: [p.frameId ?? 0] },
@@ -494,7 +519,7 @@ export class ContentHandler {
             return []
         }
 
-        const data = await this.injectScript<ElementInfo[] | { error: string } | undefined>(
+        const data = await this.injectScript<ElementInfo[] | { error: string }>(
             tabId,
             frameId,
             findElements,
@@ -506,18 +531,9 @@ export class ContentHandler {
                 p.point ?? null,
                 ...(p.matchIndex !== undefined ? [p.matchIndex] : []),
             ],
-            documentId
+            documentId,
+            true
         )
-
-        if (data === undefined || data === null) {
-            throw new Error(
-                `find 脚本未返回结果（selector="${p.selector ?? ''}" text="${p.text ?? ''}" ` +
-                    `xpath="${p.xpath ?? ''}"），可能是 selector 非法或 frame 不可注入`
-            )
-        }
-        if (typeof data === 'object' && !Array.isArray(data) && 'error' in data) {
-            throw new Error(data.error)
-        }
         let elements = data as ElementInfo[]
 
         // iframe 坐标修正：将 iframe 内相对坐标转为页面绝对坐标
@@ -548,19 +564,14 @@ export class ContentHandler {
             'get_text',
             p.frameId
         )
-        const data = await this.injectScript<{ text: string; error?: string } | undefined>(
+        const data = await this.injectScript<{ text: string }>(
             tabId,
             p.frameId,
             extractText,
             [p.selector ?? null, documentId ? (expectedUrl ?? null) : null, p.refId ?? null],
-            documentId
+            documentId,
+            true
         )
-        if (data === undefined || data === null) {
-            throw new Error(`extractText 脚本未返回结果（selector="${p.selector ?? ''}"），可能是 frame 不可注入`)
-        }
-        if (data.error) {
-            throw wrapInjectionError(data.error)
-        }
         await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_text')
         return { text: data.text }
     }
@@ -573,19 +584,14 @@ export class ContentHandler {
             'get_html',
             p.frameId
         )
-        const data = await this.injectScript<{ html: string; error?: string } | undefined>(
+        const data = await this.injectScript<{ html: string }>(
             tabId,
             p.frameId,
             extractHtml,
             [p.selector ?? null, p.outer ?? true, documentId ? (expectedUrl ?? null) : null, p.refId ?? null],
-            documentId
+            documentId,
+            true
         )
-        if (data === undefined || data === null) {
-            throw new Error(`extractHtml 脚本未返回结果（selector="${p.selector ?? ''}"），可能是 frame 不可注入`)
-        }
-        if (data.error) {
-            throw wrapInjectionError(data.error)
-        }
         await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_html')
         return { html: data.html }
     }
@@ -630,7 +636,8 @@ export class ContentHandler {
             p.frameId,
             extractHtmlWithImages,
             [p.selector ?? null, p.outer ?? true, documentId ? (expectedUrl ?? null) : null, p.refId ?? null],
-            documentId
+            documentId,
+            true
         )
         await this.assertReadableDocumentUnchanged(
             tabId,
@@ -651,18 +658,14 @@ export class ContentHandler {
             'get_attribute',
             p.frameId
         )
-        const data = await this.injectScript<{ value: string | null } | undefined>(
+        const data = await this.injectScript<{ value: string | null }>(
             tabId,
             p.frameId,
             extractAttribute,
             [p.selector ?? null, p.refId ?? null, p.attribute, documentId ? (expectedUrl ?? null) : null],
-            documentId
+            documentId,
+            true
         )
-        if (data === undefined || data === null) {
-            throw new Error(
-                `extractAttribute 脚本未返回结果（selector="${p.selector ?? ''}" attribute="${p.attribute}"），可能是 selector 非法`
-            )
-        }
         await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_attribute')
         return data
     }
@@ -680,7 +683,8 @@ export class ContentHandler {
             p.frameId,
             extractMetadata,
             [documentId ? (expectedUrl ?? null) : null],
-            documentId
+            documentId,
+            true
         )
         await this.assertReadableDocumentUnchanged(tabId, p.frameId, documentId, expectedUrl, context, 'get_metadata')
         return data
@@ -764,23 +768,37 @@ export class ContentHandler {
         frameId: number | undefined,
         func: InjectableFunc<R>,
         args: unknown[],
-        documentId?: string
+        documentId?: string,
+        requireResult = false
     ): Promise<R> {
+        const context = { tabId, frameId: frameId ?? 0, documentId, phase: 'injection' }
         const results = await chrome.scripting
             .executeScript({
                 target: documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [frameId ?? 0] },
                 func: func as (...a: unknown[]) => R,
                 args: args as never[],
-                world: isCreatedTab(tabId) ? 'MAIN' : 'ISOLATED',
+                world: documentId ? 'ISOLATED' : 'MAIN',
             })
             .catch((error: unknown) => {
-                throw wrapInjectionError(error)
+                throw wrapInjectionError(error, context)
             })
         const injectionError = (results[0] as { error?: { message?: string } })?.error
         if (injectionError) {
-            throw wrapInjectionError(injectionError.message || String(injectionError))
+            throw wrapInjectionError(injectionError.message || String(injectionError), context)
         }
-        return results[0]?.result as R
+        if (!results[0] || (requireResult && (results[0].result === undefined || results[0].result === null))) {
+            throw structuredOperationError(
+                'FRAME_SCRIPT_NO_RESULT',
+                '脚本注入未返回可读取的结果',
+                '重新读取 iframe 元素与页面状态；无结果不能证明 selector 非法，工具不会重放脚本',
+                { ...context, phase: 'script_result', resultCount: results.length }
+            )
+        }
+        const data = results[0].result
+        if (requireResult && data && typeof data === 'object' && 'error' in data && typeof data.error === 'string') {
+            throw wrapInjectionError(data.error, { ...context, phase: 'script_result' })
+        }
+        return data as R
     }
 
     /** debugger 被占用时通过 captureVisibleTab 截图（仅可视区域） */

@@ -53,10 +53,13 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 子模块版本独立于仓库的 Release tag
 
 - **mcp-chrome 3.0**：`manage(action="closePage")` 必须指定 `targetId`，操作已有浏览器页面前需 adopt；仅指定 `targetId`
-  不授予页面读取权限，相对输出路径使用本会话所有的 `tmp:` 目录，持久输出使用 `cwd:`
+  不授予权限，显式 adopt 后获得完整受控能力，`manage` 和 `browse list`
+  支持原生页面、窗口、分组配置与成员状态，相对输出路径使用本会话所有的 `tmp:` 目录，持久输出使用 `cwd:`
 - **mcp-ssh 3.0**：`maxOutputSize` 和 PTY `bufferSize`
   按原始 UTF-8 字节计量，消费输出时按字节设置预算并检查截断信息；PTY raw 读取返回清理前的计数
 - **mcp-claude-history 2.0**：导出使用独立 bundle 目录和 manifest v2，请使用工具返回的实际路径，不再假定 `output`
   对应单个文件；`max_total` 限制最终紧凑 JSON 响应的 UTF-8 字节数
+  全集遍历使用 `history_search(mode="scan")` 及绑定当前进程的 `next_query`，随后读取并释放 `history_scan_metadata`
+  normal 保留排序、UUID 去重、regex 和 slice；精确 `source` 与 `history_get` 工具视图用于读取同名来源和超大记录
 
 参数合同和迁移示例见各模块 README

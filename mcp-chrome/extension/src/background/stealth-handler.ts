@@ -1,3 +1,4 @@
+import { ExpectedOperationError } from '../types/expected-errors'
 import {
     StealthClickSchema,
     StealthInjectSchema,
@@ -6,6 +7,7 @@ import {
     StealthTypeSchema,
 } from '../types/schemas'
 import { type ActionContext, assertManagedTab, assertScriptable, getTargetTabId } from './action-utils'
+import { remainingNavigationTimeout } from './navigation-handler'
 import {
     injectStealthScripts,
     simulateKeyboardType,
@@ -18,6 +20,9 @@ export class StealthHandler {
     async stealthClick(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthClickSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_click')
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
+        }
 
         const args: [number, number, string, number?, string?] =
             typeof p.refId === 'string'
@@ -42,10 +47,14 @@ export class StealthHandler {
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
             func: simulateKeyboardType,
-            args: [p.text, p.delay || 0],
+            args: p.deadline === undefined ? [p.text, p.delay ?? 0] : [p.text, p.delay ?? 0, p.deadline],
         })
 
-        return results[0].result as { success: boolean }
+        const result = results[0]?.result as { success: boolean; error?: string } | undefined
+        if (!result?.success) {
+            throw new ExpectedOperationError(result?.error ?? 'stealth_type 未返回成功结果')
+        }
+        return result
     }
 
     async stealthKey(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
@@ -65,12 +74,18 @@ export class StealthHandler {
     async stealthMouse(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthMouseSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_mouse')
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
+        }
 
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
             func: simulateMouseEvent,
-            args: [p.type, p.x, p.y, p.button || 'left'],
+            args:
+                p.deadline === undefined
+                    ? [p.type, p.x, p.y, p.button || 'left']
+                    : [p.type, p.x, p.y, p.button || 'left', p.deadline],
         })
 
         return results[0].result as { success: boolean }

@@ -3,6 +3,7 @@ import { DebuggerAttachSchema, DebuggerDetachSchema, DebuggerSendSchema } from '
 import { type ActionContext, assertManagedTab, assertScriptable, getTargetTabId } from './action-utils'
 import { DebuggerManager } from './debugger-manager'
 import { LogManager } from './log-manager'
+import { remainingNavigationTimeout } from './navigation-handler'
 
 // chrome.debugger 透传的预期错误（异步竞态、目标受限），不是 bug，避免污染 Extension 错误面板
 const EXPECTED_DEBUGGER_PATTERNS = [
@@ -45,6 +46,9 @@ export class DebuggerHandler {
         const p = DebuggerDetachSchema.parse(params) ?? {}
         const tabId = await getTargetTabId(p.tabId)
         await assertManagedTab(tabId, context, 'debugger_detach')
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
+        }
 
         if (!this.debuggerManager.isAttached(tabId)) {
             return { success: true }

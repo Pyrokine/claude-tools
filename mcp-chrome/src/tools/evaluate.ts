@@ -13,14 +13,16 @@ import {
     formatErrorResponse,
     formatResponse,
     getUnifiedSession,
+    isNativeExecutionResultUnknown,
     resolveScopedInputPath,
     resolveScopedOutputPath,
+    StructuredToolError,
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
 import { EvaluateResultTooLargeError, NonSerializableEvaluateResultError } from '../core/types.js'
 import type { InputMode } from '../core/unified-session.js'
-import { ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
+import { challengeResultFields, ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { withPageContext } from './page-context.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
@@ -41,12 +43,14 @@ const evaluateSchema = z.object({
     args: z
         .array(z.unknown())
         .optional()
-        .describe('传递给脚本的参数，使用时 script 必须是函数表达式，如 "(x, y) => x + y"，参数通过 IIFE 调用传入'),
+        .describe(
+            '函数参数，传入时 script 必须是函数表达式，如 "(x, y) => x + y"；args=[] 调用零参函数，省略 args 按原脚本语义执行'
+        ),
     output: z
         .string()
         .optional()
         .describe(
-            `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，字符串结果直接写原始文本，其他类型写 JSON`
+            `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，字符串结果直接写原始文本，其他类型写 JSON；Extension precise 主 frame 的对象结果字符预算为 16 Mi，深度 8、节点 2000 上限不变，临时输出仍受配额约束`
         ),
     timeout: z
         .number()
@@ -160,11 +164,15 @@ export function classifyEvaluateActionError(error: unknown): {
             message
         )
     const executionStatusUnknown =
-        timedOut || /FRAME_STALE_CONTEXT|FRAME_EVALUATION_FAILED|Execution context became stale/i.test(message)
+        isNativeExecutionResultUnknown(error) ||
+        timedOut ||
+        /FRAME_STALE_CONTEXT|FRAME_EVALUATION_FAILED|Execution context became stale/i.test(message)
     return {
         actionExecuted: executionStatusUnknown || pageEvaluationStarted,
         actionStatus: executionStatusUnknown ? 'unknown' : 'failed',
-        retryable: /timeout|timed out|超时|disconnect|未连接|context|debugger|attach/i.test(message),
+        retryable:
+            !executionStatusUnknown &&
+            /timeout|timed out|超时|disconnect|未连接|context|debugger|attach/i.test(message),
     }
 }
 
@@ -200,16 +208,23 @@ function appendEvaluateFailureMetadata(
     }
     try {
         const payload = JSON.parse(text) as Record<string, unknown>
+        const unavailableCondition =
+            error instanceof StructuredToolError &&
+            error.code === 'DRIVER_CAPABILITY_ERROR' &&
+            error.context.actionExecuted === false &&
+            error.context.actionStatus === 'not_started' &&
+            error.context.failureStage === 'precondition'
         const preconditionFailed =
-            error !== null &&
-            typeof error === 'object' &&
-            'code' in error &&
-            error.code === 'ACTION_PRECONDITION_FAILED'
+            unavailableCondition ||
+            (error !== null &&
+                typeof error === 'object' &&
+                'code' in error &&
+                error.code === 'ACTION_PRECONDITION_FAILED')
         const failure = preconditionFailed
             ? {
                   actionExecuted: false,
                   actionStatus: 'not_started',
-                  failureStage: 'action',
+                  failureStage: unavailableCondition ? 'precondition' : 'action',
                   retryable: false,
                   verificationStatus: 'unavailable',
               }
@@ -266,6 +281,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
         return invalidEvaluateInputResponse('script 或 scriptFile 必须提供其一')
     }
 
+    let challengeFields: Record<string, unknown> = {}
     try {
         const unifiedSession = getUnifiedSession()
 
@@ -274,7 +290,9 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                 unifiedSession.withFrame(args.frame, async () => {
                     const startedAt = Date.now()
                     if (args.expectedUrl === undefined && args.expectedRevision === undefined) {
-                        await resolveChallenge(unifiedSession, 'evaluate', 'not_started', args.timeout)
+                        challengeFields = challengeResultFields(
+                            await resolveChallenge(unifiedSession, 'evaluate', 'not_started', args.timeout)
+                        )
                     }
                     const remainingTimeout =
                         args.timeout === undefined ? undefined : Math.max(0, args.timeout - (Date.now() - startedAt))
@@ -291,6 +309,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                             args.args as unknown[],
                             {
                                 staleContextRetry,
+                                fileOutput: outputPath !== undefined,
                             }
                         )
                         evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
@@ -298,6 +317,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                         evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
                         const response = formatEvaluateErrorResponse(error)
                         const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition), {
+                            ...challengeFields,
                             staleContextRetry,
                             ...(evaluationMetadata ?? {}),
                         })
@@ -313,6 +333,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                         ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate', evaluationMode)
                         : undefined
                     const payload: Record<string, unknown> = {
+                        ...challengeFields,
                         success: postCondition ? postCondition.verificationStatus === 'matched' : true,
                         mode: unifiedSession.getMode(),
                         actionExecuted: true,
@@ -360,6 +381,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
                     } catch (error) {
                         const response = formatEvaluateErrorResponse(error)
                         const failurePayload = appendEvaluateFailureMetadata(response, error, Boolean(postCondition), {
+                            ...challengeFields,
                             actionExecuted: true,
                             actionStatus: 'completed',
                             verificationStatus: postCondition?.verificationStatus ?? 'unavailable',
@@ -380,7 +402,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
         }) // withTabId
     } catch (error) {
         const response = formatEvaluateErrorResponse(error)
-        const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition))
+        const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition), challengeFields)
         if (payload) {
             payload.diagnosticsStatus = args.diagnostics ? 'unavailable' : 'disabled'
             if (args.diagnostics) {

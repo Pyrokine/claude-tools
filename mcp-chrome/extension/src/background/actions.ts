@@ -5,7 +5,8 @@
  */
 
 import { ExpectedOperationError } from '../types/expected-errors'
-import { assertCreatedTab, getTargetTabId, type ActionContext } from './action-utils'
+import type { TabInfo } from '../types'
+import { assertManagedTab, getTargetTabId, type ActionContext } from './action-utils'
 import { ContentHandler } from './content-handler'
 import { CookieHandler } from './cookie-handler'
 import { DebuggerHandler } from './debugger-handler'
@@ -14,10 +15,19 @@ import { FrameResolver } from './frame-resolver'
 import { InputEventHandler } from './input-event-handler'
 import { LogEventHandler } from './log-event-handler'
 import { LogManager } from './log-manager'
-import { advancePageRevision, assertPageCondition, forgetPageRevision, pageSnapshot } from './page-revision'
-import { NavigationHandler } from './navigation-handler'
+import {
+    advancePageRevision,
+    assertPageCondition,
+    forgetPageRevision,
+    pageRevision,
+    pageSnapshot,
+} from './page-revision'
+import { NavigationHandler, remainingNavigationTimeout } from './navigation-handler'
 import { StealthHandler } from './stealth-handler'
 import { TabHandler } from './tab-handler'
+import { hasReadGrant, setReadGrant } from './read-grants'
+import { isManagedTab } from './tab-state'
+import { TabsReadAccessSchema } from '../types/schemas'
 
 type ActionFunction = (params: unknown, context: ActionContext) => Promise<unknown>
 
@@ -30,6 +40,7 @@ const PAGE_MUTATIONS = new Set([
     'tabs_move',
     'tabs_reorder',
     'tabs_pin',
+    'tabs_update',
     'navigate',
     'go_back',
     'go_forward',
@@ -54,7 +65,18 @@ const PAGE_MUTATIONS = new Set([
     'stealth_inject',
 ])
 
-const CREATED_PAGE_ONLY = new Set([
+const MANAGED_PAGE_ONLY = new Set([
+    'tabs_close',
+    'tabs_activate',
+    'tabs_activate_managed',
+    'tabs_move',
+    'tabs_reorder',
+    'tabs_pin',
+    'tabs_update',
+    'navigate',
+    'go_back',
+    'go_forward',
+    'reload',
     'screenshot',
     'evaluate',
     'evaluate_in_frame',
@@ -86,6 +108,20 @@ const CREATED_PAGE_ONLY = new Set([
     'network_get',
     'network_clear',
     'network_challenge_state',
+])
+
+const PAGE_READS = new Set([
+    'tabs_read_access',
+    'read_page',
+    'find',
+    'get_text',
+    'get_html',
+    'get_html_with_images',
+    'get_attribute',
+    'get_metadata',
+    'get_computed_style',
+    'resolve_frame',
+    'get_all_frames',
 ])
 
 export class ActionHandler {
@@ -120,26 +156,88 @@ export class ActionHandler {
                 })
             )
         }
-        if (PAGE_MUTATIONS.has(action)) {
-            const request = params as { tabId?: number; expectedUrl?: string; expectedRevision?: string } | null
+        const mutating = PAGE_MUTATIONS.has(action)
+        if (mutating || MANAGED_PAGE_ONLY.has(action) || PAGE_READS.has(action)) {
+            const request = params as {
+                tabId?: number
+                expectedUrl?: string
+                expectedRevision?: string
+                deadline?: number
+            } | null
             const tabId = await getTargetTabId(request?.tabId)
             const previous = this.actionLocks.get(tabId) ?? Promise.resolve()
             const operation = previous
                 .catch(() => {})
                 .then(async () => {
-                    await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
-                    if (CREATED_PAGE_ONLY.has(action)) {
-                        await assertCreatedTab(tabId, action)
+                    if (request?.deadline !== undefined) {
+                        const deadline = (params as { deadline?: unknown } | null)?.deadline
+                        if (deadline !== undefined && (typeof deadline !== 'number' || !Number.isFinite(deadline))) {
+                            throw new ExpectedOperationError(
+                                JSON.stringify({
+                                    error: {
+                                        code: 'INVALID_ARGUMENT',
+                                        message: 'Action deadline must be a finite number',
+                                        context: { actionExecuted: false },
+                                    },
+                                })
+                            )
+                        }
+                        if (typeof deadline === 'number') {
+                            remainingNavigationTimeout(deadline)
+                        }
                     }
+                    await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
+                    if (MANAGED_PAGE_ONLY.has(action)) {
+                        await assertManagedTab(tabId, context, action)
+                    }
+                    if (request?.deadline !== undefined) {
+                        remainingNavigationTimeout(request.deadline)
+                    }
+                    const warnings: string[] = []
+                    if (action === 'tabs_release' && this.debuggerManager.isAttached(tabId)) {
+                        try {
+                            await this.debuggerHandler.debuggerDetach({ tabId }, context)
+                        } catch (error) {
+                            warnings.push(
+                                `debugger 清理失败：${error instanceof Error ? error.message : String(error)}`
+                            )
+                        }
+                    }
+                    let result: unknown
+                    let actionExecuted = true
                     try {
-                        const result = await handler(params, context)
+                        result = await handler(params, context)
                         if (action === 'tabs_close') {
                             forgetPageRevision(tabId)
                         }
+                        if (action === 'tabs_release') {
+                            if (
+                                (result as { managedBefore: boolean }).managedBefore &&
+                                !(await this.logEventHandler.flushAndUninstallConsoleHook(tabId))
+                            ) {
+                                warnings.push('console 监听清理失败，请检查 Extension 日志')
+                            }
+                            this.cleanupTab(tabId)
+                            if (warnings.length) {
+                                return { ...(result as object), warnings }
+                            }
+                        }
                         return result
+                    } catch (error) {
+                        actionExecuted = !(error instanceof ExpectedOperationError && error.actionExecuted === false)
+                        throw error
                     } finally {
-                        if (action !== 'tabs_close') {
+                        if (mutating && actionExecuted && action !== 'tabs_close') {
                             advancePageRevision(tabId)
+                            if (action.startsWith('tabs_') || action === 'navigate') {
+                                const info = result as
+                                    | { id?: number; revision?: string; tab?: TabInfo; after?: TabInfo | null }
+                                    | undefined
+                                const after = info?.tab ?? info?.after ?? info
+                                if (after?.id === tabId) {
+                                    after.revision = pageRevision(tabId)
+                                }
+                            }
                         }
                     }
                 })
@@ -155,9 +253,6 @@ export class ActionHandler {
                     this.actionLocks.delete(tabId)
                 }
             }
-        }
-        if (CREATED_PAGE_ONLY.has(action)) {
-            await assertCreatedTab(await getTargetTabId((params as { tabId?: number } | null)?.tabId), action)
         }
         return handler(params, context)
     }
@@ -188,11 +283,35 @@ export class ActionHandler {
         this.actions.set('tabs_activate_managed', this.tabHandler.tabsActivateManaged.bind(this.tabHandler))
         this.actions.set('tabs_adopt', this.tabHandler.tabsAdopt.bind(this.tabHandler))
         this.actions.set('tabs_release', this.tabHandler.tabsRelease.bind(this.tabHandler))
+        this.actions.set('tabs_read_access', async (params, context) => {
+            const { tabId, allow } = TabsReadAccessSchema.parse(params)
+            if (!context.serverInstanceId) {
+                throw new ExpectedOperationError('缺少服务器实例身份，未修改只读权限')
+            }
+            const before = await pageSnapshot(tabId)
+            await setReadGrant(context.serverInstanceId, tabId, allow, before)
+            const allowed = await hasReadGrant(context.serverInstanceId, tabId)
+            if (allowed !== allow) {
+                throw new ExpectedOperationError('页面身份已变化，未授予只读权限')
+            }
+            return {
+                success: true,
+                targetId: String(tabId),
+                allowed,
+                managed: isManagedTab(await chrome.tabs.get(tabId)),
+                scope: 'ordinary-read',
+                serverInstanceId: context.serverInstanceId,
+                url: before.url,
+                revision: before.revision,
+            }
+        })
         this.actions.set('tabs_move', this.tabHandler.tabsMove.bind(this.tabHandler))
         this.actions.set('tabs_reorder', this.tabHandler.tabsReorder.bind(this.tabHandler))
         this.actions.set('tabs_pin', this.tabHandler.tabsPin.bind(this.tabHandler))
+        this.actions.set('tabs_update', this.tabHandler.tabsUpdate.bind(this.tabHandler))
         this.actions.set('window_focus', this.tabHandler.windowFocus.bind(this.tabHandler))
         this.actions.set('window_resize', this.tabHandler.windowResize.bind(this.tabHandler))
+        this.actions.set('window_update', this.tabHandler.windowUpdate.bind(this.tabHandler))
         this.actions.set('window_create', this.tabHandler.windowCreate.bind(this.tabHandler))
         this.actions.set('window_close', this.tabHandler.windowClose.bind(this.tabHandler))
 
@@ -236,6 +355,9 @@ export class ActionHandler {
         // Tab Groups
         this.actions.set('tabgroup_create', this.tabHandler.tabGroupCreate.bind(this.tabHandler))
         this.actions.set('tabgroup_add', this.tabHandler.tabGroupAdd.bind(this.tabHandler))
+        this.actions.set('tabgroup_remove', this.tabHandler.tabGroupRemove.bind(this.tabHandler))
+        this.actions.set('tabgroup_update', this.tabHandler.tabGroupUpdate.bind(this.tabHandler))
+        this.actions.set('tabgroup_move', this.tabHandler.tabGroupMove.bind(this.tabHandler))
 
         // Debugger (CDP) 操作 - precise 模式
         this.actions.set('debugger_attach', this.debuggerHandler.debuggerAttach.bind(this.debuggerHandler))

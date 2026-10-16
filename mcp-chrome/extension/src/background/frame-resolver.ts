@@ -17,7 +17,7 @@ export class FrameResolver {
     async resolveFrame(
         params: unknown,
         context: ActionContext
-    ): Promise<{ frameId: number; offset: { x: number; y: number } | null }> {
+    ): Promise<{ frameId: number; offset: { x: number; y: number } | null; frameContext?: Record<string, unknown> }> {
         const p = ResolveFrameSchema.parse(params)
 
         const tabId = await getTargetTabId(p.tabId)
@@ -34,7 +34,21 @@ export class FrameResolver {
         if (snapshot.selectionStatus !== 'found' || snapshot.selectedIndex === null) {
             const desc = typeof p.frame === 'number' ? `index ${p.frame}` : `selector "${p.frame}"`
             const detail = snapshot.selectionError ? `: ${snapshot.selectionError}` : ''
-            throw new ExpectedOperationError(`iframe not found: ${desc} (${snapshot.selectionStatus})${detail}`)
+            throw this.frameEvaluationError(
+                snapshot.selectionStatus === 'invalid-selector'
+                    ? 'INVALID_FRAME_SELECTOR'
+                    : snapshot.selectionStatus === 'not-frame'
+                      ? 'FRAME_NOT_IFRAME'
+                      : 'FRAME_NOT_FOUND',
+                `iframe not found: ${desc} (${snapshot.selectionStatus})${detail}`,
+                {
+                    tabId,
+                    phase: 'frame_resolution',
+                    selection: p.frame,
+                    selectionStatus: snapshot.selectionStatus,
+                    domFrameCount: snapshot.frames.length,
+                }
+            )
         }
 
         const selected = snapshot.frames.find((frame) => frame.index === snapshot.selectedIndex)
@@ -57,7 +71,16 @@ export class FrameResolver {
             )
         }
 
-        return { frameId: selected.frameId, offset: selected.contentOffset }
+        const identity = await this.getExtensionFrameIdentity(tabId, selected.frameId)
+        return {
+            frameId: selected.frameId,
+            offset: selected.contentOffset,
+            frameContext: {
+                tabId,
+                ...this.frameIdentitySummary(identity),
+                domIndex: selected.index,
+            },
+        }
     }
 
     async getAllFrames(
@@ -162,7 +185,7 @@ export class FrameResolver {
                     }
                 )
             }
-            const resolved = await this.resolveCdpFrame(tabId, identity.url)
+            const resolved = await this.resolveCdpFrame(tabId, identity)
             let contexts = this.debuggerManager.getExecutionContexts(tabId)
             if (contexts.length === 0 || attempt > 0) {
                 await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
@@ -219,10 +242,8 @@ export class FrameResolver {
                     staleContextRetry: p.staleContextRetry,
                     frameContext: {
                         tabId,
-                        extensionFrameId: identity.frameId,
-                        parentFrameId: identity.parentFrameId,
-                        url: identity.url.slice(0, 500),
-                        originalUrl: originalFrame.url.slice(0, 500),
+                        ...this.frameIdentitySummary(identity),
+                        originalUrl: this.frameUrlSummary(originalFrame.url).url,
                         urlChanged: identity.url !== originalFrame.url,
                         cdpFrameId: resolved.cdpFrameId,
                         executionContextId: targetCtx.id,
@@ -282,7 +303,25 @@ export class FrameResolver {
         return {
             extensionFrameId: frame.frameId,
             parentFrameId: frame.parentFrameId,
-            url: frame.url.slice(0, 500),
+            documentId: frame.documentId ?? null,
+            ...this.frameUrlSummary(frame.url),
+        }
+    }
+
+    private frameUrlSummary(value: string): { url: string | null; urlStatus: 'filtered' | 'unavailable' } {
+        try {
+            const parsed = new URL(value)
+            parsed.username = ''
+            parsed.password = ''
+            parsed.search = ''
+            parsed.hash = ''
+            const url =
+                parsed.protocol === 'data:' || parsed.protocol === 'javascript:'
+                    ? parsed.protocol
+                    : parsed.href.slice(0, 500)
+            return { url, urlStatus: 'filtered' }
+        } catch {
+            return { url: null, urlStatus: 'unavailable' }
         }
     }
 
@@ -310,30 +349,62 @@ export class FrameResolver {
         const frames = await chrome.webNavigation.getAllFrames({ tabId })
         const frame = frames?.find((candidate) => candidate.frameId === frameId)
         if (!frame) {
-            throw new ExpectedOperationError(`Frame ${frameId} not found`)
+            throw this.frameEvaluationError('FRAME_NOT_FOUND', `Frame ${frameId} not found`, {
+                tabId,
+                extensionFrameId: frameId,
+                phase: 'frame_identity',
+            })
         }
         return frame
     }
 
-    private async resolveCdpFrame(tabId: number, targetUrl: string): Promise<{ cdpFrameId: string }> {
+    private async resolveCdpFrame(
+        tabId: number,
+        frame: chrome.webNavigation.GetAllFrameResultDetails
+    ): Promise<{ cdpFrameId: string }> {
+        const targetUrl = frame.url
         const treeResult = (await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree')) as {
-            frameTree: { frame: { id: string; url: string }; childFrames?: Array<unknown> }
+            frameTree: { frame: { id: string; url: string; urlFragment?: string }; childFrames?: Array<unknown> }
         }
         const candidates = this.findCdpFrameIds(treeResult.frameTree, targetUrl)
         if (candidates.length === 0) {
             throw this.frameEvaluationError('FRAME_CDP_UNAVAILABLE', 'Cannot resolve CDP frame for URL', {
                 tabId,
-                url: targetUrl.slice(0, 500),
+                ...this.frameUrlSummary(targetUrl),
                 candidateCount: 0,
             })
         }
         if (candidates.length > 1) {
+            if (frame.parentFrameId === 0) {
+                const parent = await this.getExtensionFrameIdentity(tabId, 0)
+                const snapshot = await getDomFrameSnapshot(tabId, 0, undefined, parent.documentId, parent.url)
+                const selected = snapshot.frames.filter((item) => item.frameId === frame.frameId)
+                if (selected.length === 1) {
+                    const document = (await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument', {
+                        depth: 1,
+                    })) as { root: { nodeId: number } }
+                    const elements = (await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelectorAll', {
+                        nodeId: document.root.nodeId,
+                        selector: 'iframe, frame',
+                    })) as { nodeIds: number[] }
+                    const nodeId = elements.nodeIds[selected[0].index]
+                    if (nodeId && elements.nodeIds.length === snapshot.frames.length) {
+                        const owner = (await chrome.debugger.sendCommand({ tabId }, 'DOM.describeNode', {
+                            nodeId,
+                            depth: 1,
+                        })) as { node: { frameId?: string } }
+                        if (owner.node.frameId && candidates.includes(owner.node.frameId)) {
+                            return { cdpFrameId: owner.node.frameId }
+                        }
+                    }
+                }
+            }
             throw this.frameEvaluationError(
                 'FRAME_AMBIGUOUS',
                 'Multiple CDP frames match the same URL; refusing to guess target',
                 {
                     tabId,
-                    url: targetUrl.slice(0, 500),
+                    ...this.frameUrlSummary(targetUrl),
                     candidateCount: candidates.length,
                     candidates: candidates.slice(0, 10),
                 }
@@ -355,11 +426,11 @@ export class FrameResolver {
 
     /** 在 CDP frame tree 中递归收集所有匹配 URL 的 frameId */
     private findCdpFrameIds(
-        node: { frame: { id: string; url: string }; childFrames?: Array<unknown> },
+        node: { frame: { id: string; url: string; urlFragment?: string }; childFrames?: Array<unknown> },
         targetUrl: string
     ): string[] {
         const results: string[] = []
-        if (node.frame.url === targetUrl) {
+        if (node.frame.url + (node.frame.urlFragment ?? '') === targetUrl) {
             results.push(node.frame.id)
         }
         for (const child of (node.childFrames || []) as Array<typeof node>) {

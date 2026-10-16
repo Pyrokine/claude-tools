@@ -12,6 +12,7 @@ pub struct TraceParams {
     pub before: Option<usize>,
     pub after: Option<usize>,
     pub project: Option<String>,
+    pub source: Option<String>,
     pub max_content: usize,
     pub max_total: usize,
     // 消息类型过滤（空表示不过滤）
@@ -66,8 +67,12 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
         available: None,
     })?;
 
-    let (project_id, session_id, path) =
-        find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
+    let (project_id, session_id, path) = find_session_file(
+        config,
+        &parsed_ref.session_prefix,
+        params.project.as_deref(),
+        params.source.as_deref(),
+    )?;
     let range = if let Some(until_type) = &params.until_type {
         SessionRange::UntilType {
             effective_type: until_type,
@@ -104,7 +109,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
     )?;
     let anchor_idx = index.anchor_idx;
     let indexed = &index.messages;
-    let records = load_session_window(&path, indexed, params.redaction)?;
+    let records = load_session_window(&path, &index, params.redaction)?;
     if records
         .iter()
         .try_fold(0usize, |count, item| count.checked_add(tool_block_count(&item.record)))
@@ -174,11 +179,10 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
                     .map(|s| params.servers.iter().any(|f| f == s))
                     .unwrap_or(false);
             let tool_ok = params.tools.is_empty()
-                || tc
-                    .tool
-                    .as_deref()
-                    .map(|t| params.tools.iter().any(|f| f == t))
-                    .unwrap_or(false);
+                || params.tools.iter().any(|filter| {
+                    let requested = parse_mcp_tool_name(filter);
+                    requested.tool == tc.tool && (requested.server.is_none() || requested.server == tc.server)
+                });
             server_ok && tool_ok
         });
     }
@@ -396,12 +400,17 @@ fn build_tool_calls(
                 }
                 ToolBlockKind::Result => {
                     if let Some(call_idx) = block.call_key.and_then(|key| call_indices.get(&key).copied()) {
-                        let rendered = render_tool_block(&block, redaction);
                         calls[call_idx].status = "completed".to_string();
                         calls[call_idx].match_method = block.match_method.unwrap_or("unmatched").to_string();
                         calls[call_idx].result_ref = Some(format!("{}:{}", prefix, record.line_num));
-                        calls[call_idx].result_preview = rendered.result.as_ref().map(tool_result_preview);
-                        calls[call_idx].redacted_count = rendered.redacted_count;
+                        if let Some((preview, count)) = record.result_previews.get(&block.block_index) {
+                            calls[call_idx].result_preview = Some(preview.clone());
+                            calls[call_idx].redacted_count = *count;
+                        } else {
+                            let rendered = render_tool_block(&block, redaction);
+                            calls[call_idx].result_preview = rendered.result.as_ref().map(tool_result_preview);
+                            calls[call_idx].redacted_count = rendered.redacted_count;
+                        }
                     } else if issues.len() < ASSOCIATION_ISSUE_CAP {
                         issues.push(TraceAssociationIssue {
                             result_ref: format!("{}:{}", prefix, record.line_num),
@@ -437,6 +446,7 @@ mod tests {
         let record: MessageRecord = serde_json::from_value(json).unwrap();
         TraceRecord {
             line_num,
+            result_previews: std::collections::BTreeMap::new(),
             record,
             effective_type: "assistant",
             subtype: "tool_use",
@@ -605,6 +615,7 @@ mod tests {
                 before: Some(0),
                 after: Some(1),
                 project: Some("project".to_string()),
+                source: None,
                 max_content: 4000,
                 max_total: 40000,
                 types: Vec::new(),
@@ -679,6 +690,7 @@ mod tests {
                 before: Some(0),
                 after: Some(0),
                 project: Some("project".to_string()),
+                source: None,
                 max_content: 4000,
                 max_total: 40000,
                 types: Vec::new(),
@@ -714,6 +726,7 @@ mod tests {
                 before: Some(0),
                 after: None,
                 project: None,
+                source: None,
                 max_content: 4000,
                 max_total: 40000,
                 types: Vec::new(),
@@ -766,6 +779,7 @@ mod tests {
                 before: None,
                 after: None,
                 project: Some("project".to_string()),
+                source: None,
                 max_content: 4000,
                 max_total: 40000,
                 types: Vec::new(),
@@ -836,6 +850,7 @@ mod tests {
                 before: Some(0),
                 after: Some(1),
                 project: Some("project".to_string()),
+                source: None,
                 max_content: 200,
                 max_total: 900,
                 types: Vec::new(),

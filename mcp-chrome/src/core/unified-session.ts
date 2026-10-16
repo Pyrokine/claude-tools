@@ -12,16 +12,30 @@ import {
     type ActionableClickResult,
     type BrowserTopology,
     DriverCapabilityError,
+    type GroupManagementResult,
+    type GroupPagesOptions,
     type IBrowserDriver,
+    type ListedTarget,
     type ManagedPageResult,
     type MovePageOptions,
     type NewWindowOptions,
+    type NewPageOptions,
+    type NewTabResult,
     type PageManagementResult,
     type ResizeWindowOptions,
     type SetCookieParams,
     type StaleContextRetryPolicy,
+    type UpdateGroupOptions,
+    type UpdatePageOptions,
 } from './browser-driver.js'
-import { OsMouseError, PagePreconditionError } from './errors.js'
+import {
+    OsMouseError,
+    PagePreconditionError,
+    setErrorPageContext,
+    StructuredToolError,
+    TargetNotFoundError,
+    TimeoutError,
+} from './errors.js'
 import { isExtensionDisconnected } from './extension-errors.js'
 import {
     asViewportMetrics,
@@ -31,7 +45,8 @@ import {
     type ViewportMetrics,
 } from './os-mouse.js'
 import { getKeyDefinition, getSession as getCdpSession } from './session.js'
-import type { CdpResultObject, ChallengeState, TargetInfo, WaitUntil } from './types.js'
+import { DEFAULT_TIMEOUT, type CdpResultObject, type ChallengeState, type TargetInfo, type WaitUntil } from './types.js'
+import { remainingNavigationTimeout, waitForNavigationQueue, withNavigationBudget } from './utils.js'
 import {
     EvaluateResultTooLargeError,
     extractCdpValue,
@@ -47,6 +62,7 @@ export type InputMode = 'stealth' | 'precise' // stealth=JS模拟, precise=debug
 
 export interface EvaluateOptions {
     staleContextRetry?: StaleContextRetryPolicy
+    fileOutput?: boolean
 }
 
 export interface EvaluationMetadata {
@@ -67,6 +83,7 @@ interface CdpMaterializeState {
     seen: Set<string>
     nodes: number
     chars: number
+    maxChars: number
 }
 
 interface UnifiedSessionState {
@@ -98,6 +115,7 @@ class UnifiedSessionManager {
     private static readonly CDP_MATERIALIZE_MAX_DEPTH = 8
     private static readonly CDP_MATERIALIZE_MAX_NODES = 2000
     private static readonly CDP_MATERIALIZE_MAX_CHARS = 1_000_000
+    private static readonly CDP_MATERIALIZE_MAX_FILE_CHARS = 16 * 1024 * 1024
     private extensionBridge: ExtensionBridge | null = null
     private inputMode: InputMode = 'precise' // 默认使用 precise 模式，可绕过 CSP 限制
     private currentMousePosition: { x: number; y: number } = { x: 0, y: 0 } // 跟踪鼠标位置
@@ -330,62 +348,67 @@ class UnifiedSessionManager {
     /**
      * 列出所有页面
      */
-    async listTargets(): Promise<
+    async listTargets(timeout?: number): Promise<
         Array<
-            TargetInfo & {
-                mode: ConnectionMode
-                managed?: boolean
-                isActive?: boolean
-                windowId?: number
-                index?: number
-                pinned?: boolean
-                incognito?: boolean
-                status?: string
-                revision?: string
-                metadata: PageMetadata
-            }
+            TargetInfo &
+                Omit<ListedTarget, 'id'> & {
+                    mode: ConnectionMode
+                    managed?: boolean
+                    isActive?: boolean
+                    windowId?: number
+                    index?: number
+                    pinned?: boolean
+                    incognito?: boolean
+                    status?: string
+                    revision?: string
+                    metadata: PageMetadata
+                }
         >
     > {
         const mode = this.getMode()
         if (mode === 'none') {
             return []
         }
-        const driver = await this.getDriver()
-        const targets = await driver.listTargets()
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        const driver = await this.getDriver(timeout)
+        const targets = await driver.listTargets(
+            deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+        )
         const liveKeys = new Set(targets.map((t) => `${mode}:${t.targetId ?? String(t.id)}`))
         for (const key of this.pageMetadata.keys()) {
             if (key.startsWith(`${mode}:`) && !liveKeys.has(key)) {
                 this.pageMetadata.delete(key)
             }
         }
-        return targets.map((t) => ({
-            targetId: t.targetId ?? String(t.id),
-            type: t.type ?? 'page',
-            url: t.url,
-            title: t.title,
+        return targets.map(({ id, ...target }) => ({
+            ...target,
+            targetId: target.targetId ?? String(id),
+            type: target.type ?? 'page',
             mode,
-            ...(mode === 'extension' ? { isActive: t.active ?? false } : {}),
-            managed: t.managed,
-            revision: t.revision,
-            metadata: this.getPageMetadata(t.targetId ?? String(t.id)),
-            windowId: t.windowId,
-            index: t.index,
-            pinned: t.pinned,
-            incognito: t.incognito,
-            status: t.status,
+            ...(mode === 'extension' ? { isActive: target.active ?? false } : {}),
+            metadata: this.getPageMetadata(target.targetId ?? String(id)),
         }))
     }
 
-    async listTopology(): Promise<BrowserTopology | null> {
+    async listTopology(timeout?: number): Promise<BrowserTopology | null> {
         const mode = this.getMode()
         if (mode === 'none') {
             return null
         }
-        const driver = await this.getDriver()
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        const driver = await this.getDriver(timeout)
         if (!driver.listWindows) {
             return null
         }
-        return driver.listWindows()
+        return driver.listWindows(deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
+    }
+
+    async setReadAccess(targetId: string, allow: boolean): Promise<Record<string, unknown>> {
+        const driver = await this.getDriver()
+        if (!driver.setReadAccess) {
+            throw new DriverCapabilityError('普通只读授权仅支持 Extension 模式，未执行')
+        }
+        return this.withTabLock(() => driver.setReadAccess!(targetId, allow))
     }
 
     async adoptPage(targetId: string): Promise<ManagedPageResult> {
@@ -410,6 +433,49 @@ class UnifiedSessionManager {
             throw new DriverCapabilityError('movePage 仅支持 Extension 模式')
         }
         return driver.movePage(targetId, options)
+    }
+
+    async updatePage(targetId: string, options: UpdatePageOptions): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.updatePage) {
+            throw new DriverCapabilityError('updatePage 原生 tab 配置仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.updatePage!(targetId, options))
+    }
+
+    async groupPages(targetIds: string[], options: GroupPagesOptions): Promise<GroupManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.groupPages) {
+            throw new DriverCapabilityError('groupPages 仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.groupPages!(targetIds, options))
+    }
+
+    async ungroupPages(targetIds: string[]): Promise<GroupManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.ungroupPages) {
+            throw new DriverCapabilityError('ungroupPages 仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.ungroupPages!(targetIds))
+    }
+
+    async updateGroup(groupId: number, options: UpdateGroupOptions): Promise<GroupManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.updateGroup) {
+            throw new DriverCapabilityError('updateGroup 仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.updateGroup!(groupId, options))
+    }
+
+    async moveGroup(
+        groupId: number,
+        options: Pick<MovePageOptions, 'windowId' | 'index'>
+    ): Promise<GroupManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.moveGroup) {
+            throw new DriverCapabilityError('moveGroup 仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.moveGroup!(groupId, options))
     }
 
     async reorderPage(targetId: string, index: number): Promise<PageManagementResult> {
@@ -455,6 +521,14 @@ class UnifiedSessionManager {
         return driver.resizeWindow(windowId, options)
     }
 
+    async updateWindow(windowId: number, options: ResizeWindowOptions): Promise<PageManagementResult> {
+        const driver = await this.getDriver()
+        if (!driver.updateWindow) {
+            throw new DriverCapabilityError('updateWindow 仅支持 Extension 模式')
+        }
+        return this.withTabLock(() => driver.updateWindow!(windowId, options))
+    }
+
     async newWindow(options: NewWindowOptions): Promise<PageManagementResult> {
         const driver = await this.getDriver()
         if (!driver.newWindow) {
@@ -462,8 +536,13 @@ class UnifiedSessionManager {
         }
         return this.withTabLock(async () => {
             const result = await driver.newWindow!(options)
-            if (result.targetId) {
-                this.recordPageUse(result.targetId, true)
+            if (result.after && 'tabs' in result.after) {
+                for (const tab of result.after.tabs) {
+                    const targetId = tab.targetId ?? String(tab.id)
+                    this.recordPageUse(targetId, targetId !== options.targetId)
+                }
+            } else if (result.targetId) {
+                this.recordPageUse(result.targetId, options.targetId === undefined)
             }
             return result
         })
@@ -489,26 +568,34 @@ class UnifiedSessionManager {
      * 导航到 URL
      */
     async navigate(url: string, options: { wait?: WaitUntil; timeout?: number } = {}): Promise<void> {
-        const driver = await this.getDriver(options.timeout)
-        const navigate = () => driver.navigate(url, { wait: options.wait, timeout: options.timeout })
-        await (this.getMode() === 'extension' ? this.withTabLock(navigate) : navigate())
+        const deadline = Date.now() + (options.timeout ?? DEFAULT_TIMEOUT)
+        const driver = await this.getDriver(remainingNavigationTimeout(deadline))
+        const navigate = () =>
+            driver.navigate(url, { wait: options.wait, timeout: remainingNavigationTimeout(deadline) })
+        await (this.getMode() === 'extension' ? this.withTabLock(navigate, deadline) : navigate())
     }
 
-    async goBack(timeout?: number): Promise<{ navigated: boolean }> {
-        const driver = await this.getDriver(timeout)
-        const result = await this.withTabLock(() => driver.goBack(timeout))
+    async goBack(timeout = DEFAULT_TIMEOUT): Promise<{ navigated: boolean }> {
+        const deadline = Date.now() + timeout
+        const driver = await this.getDriver(remainingNavigationTimeout(deadline))
+        const result = await this.withTabLock(() => driver.goBack(remainingNavigationTimeout(deadline)), deadline)
         return { navigated: result.navigated }
     }
 
-    async goForward(timeout?: number): Promise<{ navigated: boolean }> {
-        const driver = await this.getDriver(timeout)
-        const result = await this.withTabLock(() => driver.goForward(timeout))
+    async goForward(timeout = DEFAULT_TIMEOUT): Promise<{ navigated: boolean }> {
+        const deadline = Date.now() + timeout
+        const driver = await this.getDriver(remainingNavigationTimeout(deadline))
+        const result = await this.withTabLock(() => driver.goForward(remainingNavigationTimeout(deadline)), deadline)
         return { navigated: result.navigated }
     }
 
     async reload(options: { ignoreCache?: boolean; waitUntil?: string; timeout?: number } = {}): Promise<void> {
-        const driver = await this.getDriver(options.timeout)
-        await this.withTabLock(() => driver.reload(options.ignoreCache, options.waitUntil, options.timeout))
+        const deadline = Date.now() + (options.timeout ?? DEFAULT_TIMEOUT)
+        const driver = await this.getDriver(remainingNavigationTimeout(deadline))
+        await this.withTabLock(
+            () => driver.reload(options.ignoreCache, options.waitUntil, remainingNavigationTimeout(deadline)),
+            deadline
+        )
     }
 
     /**
@@ -646,7 +733,7 @@ class UnifiedSessionManager {
         const entryStart = Date.now()
         this.lastEvaluationMetadata = undefined
         const effectiveMode = mode ?? this.inputMode
-        const hasArgs = args && args.length > 0
+        const hasArgs = args !== undefined
 
         // stealth 模式：args 只能通过字符串拼接（chrome.scripting 不支持协议级参数传递）
         let expression = code
@@ -673,13 +760,7 @@ class UnifiedSessionManager {
 
             // Extension 路径
             if (effectiveMode === 'precise') {
-                return this.evaluateViaExtensionPrecise<T>(
-                    code,
-                    expression,
-                    args,
-                    timeout,
-                    options.staleContextRetry ?? 'never'
-                )
+                return this.evaluateViaExtensionPrecise<T>(code, expression, args, timeout, options)
             }
             return this.evaluateViaExtensionStealth<T>(expression, timeout)
         } catch (err) {
@@ -775,7 +856,13 @@ class UnifiedSessionManager {
      */
     async getMetadata(): Promise<Record<string, unknown>> {
         const driver = await this.getDriver()
-        return driver.getMetadata()
+        const targetId = this.getCurrentTargetId()
+        const metadata = await driver.getMetadata()
+        const target = (await this.listTargets()).find((page) => page.targetId === targetId)
+        if (!target) {
+            throw new TargetNotFoundError(targetId ?? 'current')
+        }
+        return { ...metadata, managed: target.managed ?? false, metadata: target.metadata }
     }
 
     /**
@@ -933,13 +1020,14 @@ class UnifiedSessionManager {
     /**
      * 创建新页面
      */
-    async newPage(url?: string): Promise<TargetInfo> {
+    async newPage(url?: string, options?: NewPageOptions, timeout?: number): Promise<TargetInfo & NewTabResult> {
         const driver = await this.getDriver()
         const isExt = this.isExtensionConnected()
-        const op = async (): Promise<TargetInfo> => {
-            const result = await driver.newPage(url)
+        const op = async (): Promise<TargetInfo & NewTabResult> => {
+            const result = await driver.newPage(url, timeout, options)
             this.recordPageUse(result.targetId, true)
             return {
+                ...result,
                 targetId: result.targetId,
                 type: result.type ?? 'page',
                 url: result.url,
@@ -1006,8 +1094,11 @@ class UnifiedSessionManager {
      *
      * 同一请求内的嵌套调用可重入，恢复状态只保存在当前请求的 AsyncLocalStorage 中
      */
-    async withTabLock<T>(fn: () => Promise<T>): Promise<T> {
+    async withTabLock<T>(fn: () => Promise<T>, deadline?: number): Promise<T> {
         if (this.tabLockContext.getStore()?.session === this) {
+            if (deadline !== undefined) {
+                remainingNavigationTimeout(deadline)
+            }
             return fn()
         }
         const previousLock = this.tabSwitchLock
@@ -1015,11 +1106,17 @@ class UnifiedSessionManager {
         this.tabSwitchLock = new Promise<void>((resolve) => {
             releaseLock = resolve
         })
+        let acquired = false
         try {
-            await previousLock
+            await waitForNavigationQueue(previousLock, deadline)
+            acquired = true
             return await this.tabLockContext.run({ session: this }, fn)
         } finally {
-            releaseLock!()
+            if (acquired) {
+                releaseLock!()
+            } else {
+                void previousLock.then(releaseLock!, releaseLock!)
+            }
         }
     }
 
@@ -1032,8 +1129,9 @@ class UnifiedSessionManager {
      * 即使不传 tabId，也需要加锁：fn() 内调用 bridge 方法会读取 currentTabId，
      * 不加锁则并发的 withTabId(someId, ...) 可能在 fn() 执行中途修改 currentTabId
      */
-    async withTabId<T>(targetId: string | undefined, fn: () => Promise<T>): Promise<T> {
+    async withTabId<T>(targetId: string | undefined, fn: () => Promise<T>, deadline?: number): Promise<T> {
         return this.withTabLock(async () => {
+            const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
             const mode = this.getMode()
             if (!targetId) {
                 const current = this.getCurrentTargetId()
@@ -1058,7 +1156,7 @@ class UnifiedSessionManager {
                 throw new DriverCapabilityError('浏览器未连接，无法选择目标页面')
             }
             const driver = mode === 'extension' ? this.extensionBridge! : getCdpSession()
-            const targets = await driver.listTargets()
+            const targets = await driver.listTargets(remaining())
             if (!targets.some((target) => (target.targetId ?? String(target.id)) === targetId)) {
                 throw new DriverCapabilityError(`目标页面 ${targetId} 不存在于当前 ${mode} 连接`)
             }
@@ -1073,7 +1171,7 @@ class UnifiedSessionManager {
             }
             try {
                 if (targetId !== previousId) {
-                    await driver.selectPage(targetId)
+                    await driver.selectPage(targetId, remaining())
                 }
                 this.activeMode = mode
                 this.recordPageUse(targetId)
@@ -1092,9 +1190,9 @@ class UnifiedSessionManager {
                     let clearTarget = true
                     try {
                         if (previousId) {
-                            const targets = await driver.listTargets()
+                            const targets = await driver.listTargets(remaining())
                             if (targets.some((target) => (target.targetId ?? String(target.id)) === previousId)) {
-                                await driver.selectPage(previousId)
+                                await driver.selectPage(previousId, remaining())
                                 clearTarget = false
                             } else {
                                 restoration.status = 'previous_target_closed'
@@ -1109,7 +1207,9 @@ class UnifiedSessionManager {
                             if (mode === 'extension') {
                                 driver.setCurrentTargetId(null)
                             } else {
-                                await getCdpSession().deselectPage()
+                                await getCdpSession().deselectPage(
+                                    deadline === undefined ? undefined : Math.max(0, deadline - Date.now())
+                                )
                             }
                         } catch (error) {
                             const message = error instanceof Error ? error.message : String(error)
@@ -1125,14 +1225,17 @@ class UnifiedSessionManager {
                     this.tabLockContext.getStore()!.targetRestoration = restoration
                 }
             }
-        })
+        }, deadline)
     }
 
     getTargetRestoration(): TargetRestoration | undefined {
         return this.tabLockContext.getStore()?.targetRestoration
     }
 
-    async getPageSnapshot(targetId?: string): Promise<{ targetId: string; url: string; revision: string }> {
+    async getPageSnapshot(
+        targetId?: string,
+        timeout?: number
+    ): Promise<{ targetId: string; url: string; revision: string | null; warning?: string }> {
         const mode = this.getMode()
         if (mode === 'none') {
             throw new DriverCapabilityError('浏览器未连接，无法读取页面状态')
@@ -1143,15 +1246,16 @@ class UnifiedSessionManager {
         }
         const snapshot =
             mode === 'extension'
-                ? await this.extensionBridge!.getPageSnapshot(id)
-                : await getCdpSession().getPageSnapshot(id)
+                ? await this.extensionBridge!.getPageSnapshot(id, timeout)
+                : await getCdpSession().getPageSnapshot(id, timeout)
         this.recordPageUse(id)
         return snapshot
     }
 
     async withPageCondition<T>(
         condition: { targetId?: string; expectedUrl?: string; expectedRevision?: string },
-        fn: () => Promise<T>
+        fn: () => Promise<T>,
+        deadline?: number
     ): Promise<T> {
         if (condition.expectedUrl === undefined && condition.expectedRevision === undefined) {
             return fn()
@@ -1172,7 +1276,18 @@ class UnifiedSessionManager {
                 this.cdpExplicitlySelected = true
             }
             try {
-                const snapshot = await driver.getPageSnapshot(targetId)
+                const snapshot = await driver.getPageSnapshot(
+                    targetId,
+                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                )
+                if (snapshot.revision === null) {
+                    throw new StructuredToolError(
+                        'DRIVER_CAPABILITY_ERROR',
+                        '当前 Extension 不支持原子页面条件，未执行操作',
+                        '更新 Extension 后再使用 expectedUrl 或 expectedRevision',
+                        { targetId, actionExecuted: false, actionStatus: 'not_started', failureStage: 'precondition' }
+                    )
+                }
                 if (
                     (condition.expectedUrl !== undefined && snapshot.url !== condition.expectedUrl) ||
                     (condition.expectedRevision !== undefined && snapshot.revision !== condition.expectedRevision)
@@ -1197,7 +1312,7 @@ class UnifiedSessionManager {
                 this.cdpExplicitlySelected = previousCdpSelection
                 this.activeMode = previousMode
             }
-        })
+        }, deadline)
     }
 
     /**
@@ -1219,7 +1334,7 @@ class UnifiedSessionManager {
         }
 
         const driver = this.extensionBridge!
-        const { frameId, offset } = await driver.resolveFrame(frame)
+        const { frameId, offset, frameContext } = await driver.resolveFrame(frame)
         const previousFrameId = driver.getCurrentFrameId()
         const previousFrameOffset = this.currentFrameOffset
         const previousRequireExtension = this.requireExtension
@@ -1230,6 +1345,10 @@ class UnifiedSessionManager {
         this.activeMode = 'extension'
         try {
             return await fn()
+        } catch (error) {
+            throw setErrorPageContext(error, {
+                frameContext: { selection: frame, frameId, ...frameContext },
+            })
         } finally {
             // 字段赋值不会 throw,driver.setCurrentFrameId 是同步函数也不会 throw,无需嵌套 try
             this.requireExtension = previousRequireExtension
@@ -1356,27 +1475,34 @@ class UnifiedSessionManager {
     /**
      * 输入文本
      */
-    async typeText(text: string, delay = 0): Promise<void> {
+    async typeText(text: string, delay = 0, timeout?: number): Promise<void> {
+        const startedAt = Date.now()
         const driver = await this.getDriver()
+        const remaining = timeout === undefined ? undefined : Math.max(0, timeout - (Date.now() - startedAt))
         const isExt = this.isExtensionConnected()
         if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthType(text, delay)
+            await driver.stealthType(text, delay, remaining)
         } else {
-            await driver.inputType(text, delay)
+            await driver.inputType(text, delay, remaining)
         }
     }
 
     /**
      * 鼠标移动
      */
-    async mouseMove(x: number, y: number): Promise<void> {
+    async mouseMove(x: number, y: number, timeout?: number): Promise<void> {
+        const startedAt = Date.now()
+        const driver = await this.getDriver(timeout)
+        const remaining = timeout === undefined ? undefined : timeout - (Date.now() - startedAt)
+        if (remaining !== undefined && remaining <= 0) {
+            throw new TimeoutError('input timeout before mouse movement')
+        }
         this.currentMousePosition = { x, y } // 更新位置
-        const driver = await this.getDriver()
         const isExt = this.isExtensionConnected()
         if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthMouse('mousemove', x, y)
+            await driver.stealthMouse('mousemove', x, y, undefined, remaining)
         } else {
-            await driver.inputMouse('mouseMoved', x, y, { modifiers: this.modifiers })
+            await driver.inputMouse('mouseMoved', x, y, { modifiers: this.modifiers }, remaining)
         }
     }
 
@@ -1447,7 +1573,9 @@ class UnifiedSessionManager {
      * Turnstile 点击：同页控件走页面鼠标；Cloudflare iframe 只在已聚焦窗口的活动受控 tab 上使用系统鼠标
      */
     // noinspection JSUnusedGlobalSymbols — resolveChallenge 通过 ChallengeHost 结构类型调用
-    async clickTurnstile(snapshot: TurnstileOsClickInput): Promise<void> {
+    async clickTurnstile(snapshot: TurnstileOsClickInput, timeout?: number): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
         if (snapshot.clickSource !== 'iframe') {
             const point = snapshot.clickPoint
             if (!point) {
@@ -1457,9 +1585,12 @@ class UnifiedSessionManager {
                     '重新检查页面状态后再重试；交互式验证码无法自动完成'
                 )
             }
+            const driver = await withNavigationBudget(() => this.getDriver(remaining()), deadline)
             if (this.isExtensionConnected()) {
-                const driver = await this.getDriver()
-                await driver.stealthClick(point.x, point.y, 'left', 1)
+                await withNavigationBudget(
+                    () => driver.stealthClick(point.x, point.y, 'left', 1, undefined, remaining()),
+                    deadline
+                )
                 return
             }
             const frameOffset = this.currentFrameOffset
@@ -1467,8 +1598,27 @@ class UnifiedSessionManager {
                 frameOffset && this.inputMode !== 'stealth'
                     ? { x: point.x + frameOffset.x, y: point.y + frameOffset.y }
                     : point
-            await this.mouseMove(clickPoint.x, clickPoint.y)
-            await this.mouseClick('left')
+            this.currentMousePosition = clickPoint
+            await withNavigationBudget(
+                () => driver.inputMouse('mouseMoved', clickPoint.x, clickPoint.y, { modifiers: this.modifiers }),
+                deadline
+            )
+            await withNavigationBudget(
+                () =>
+                    getCdpSession().inputMouse(
+                        'mousePressed',
+                        clickPoint.x,
+                        clickPoint.y,
+                        {
+                            button: 'left',
+                            clickCount: 1,
+                            modifiers: this.modifiers,
+                            releaseAfterPress: true,
+                        },
+                        remaining()
+                    ),
+                deadline
+            )
             return
         }
         if (this.getMode() !== 'extension' || !this.extensionBridge) {
@@ -1487,7 +1637,7 @@ class UnifiedSessionManager {
                 '先 browse attach 到受控测试页，把该页放到已经聚焦的窗口并保持为活动 tab 后重试'
             )
         }
-        const topology = await this.listTopology()
+        const topology = await this.listTopology(remaining())
         const windowInfo = topology?.windows.find((item) =>
             item.tabs.some((tab) => String(tab.id) === targetId || tab.targetId === targetId)
         )
@@ -1521,9 +1671,9 @@ class UnifiedSessionManager {
                 '先把受控测试页设为该窗口的活动 tab，且窗口已经聚焦后再重试'
             )
         }
-        await this.extensionBridge.debuggerDetach()
-        const viewport = await this.readViewportMetrics(0)
-        const refreshedTopology = await this.listTopology()
+        await withNavigationBudget(() => this.extensionBridge!.debuggerDetach(undefined, remaining()), deadline)
+        const viewport = await withNavigationBudget(() => this.readViewportMetrics(0), deadline)
+        const refreshedTopology = await this.listTopology(remaining())
         const refreshedWindow = refreshedTopology?.windows.find((item) =>
             item.tabs.some((candidate) => String(candidate.id) === targetId || candidate.targetId === targetId)
         )
@@ -1548,13 +1698,20 @@ class UnifiedSessionManager {
             snapshot.clickPoint && frameOffset
                 ? { x: snapshot.clickPoint.x + frameOffset.x, y: snapshot.clickPoint.y + frameOffset.y }
                 : snapshot.clickPoint
-        const screen = await resolveTurnstileOsClickPoint({
-            ...snapshot,
-            clickPoint,
-            screenPoint: null,
-            viewport,
-        })
-        await osLeftClick(screen.x, screen.y)
+        const screen = await withNavigationBudget(
+            () =>
+                resolveTurnstileOsClickPoint(
+                    {
+                        ...snapshot,
+                        clickPoint,
+                        screenPoint: null,
+                        viewport,
+                    },
+                    { deadline }
+                ),
+            deadline
+        )
+        await withNavigationBudget(() => osLeftClick(screen.x, screen.y, { deadline }), deadline)
     }
 
     // noinspection JSUnusedGlobalSymbols — resolveChallenge 通过 ChallengeHost 结构类型调用
@@ -1574,8 +1731,19 @@ class UnifiedSessionManager {
         if (this.getMode() !== 'extension' || !this.extensionBridge) {
             throw new Error('challenge_inspect 仅在 Extension 模式可用')
         }
-        await this.extensionBridge.debuggerDetach()
-        return this.extensionBridge.inspectChallenge(options, timeout)
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        await withNavigationBudget(
+            () =>
+                this.extensionBridge!.debuggerDetach(
+                    undefined,
+                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                ),
+            deadline
+        )
+        return this.extensionBridge.inspectChallenge(
+            options,
+            deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+        )
     }
 
     /**
@@ -1737,14 +1905,15 @@ class UnifiedSessionManager {
         expression: string,
         args: unknown[] | undefined,
         timeout?: number,
-        staleContextRetry: StaleContextRetryPolicy = 'never'
+        options: EvaluateOptions = {}
     ): Promise<T> {
-        const hasArgs = args !== undefined && args.length > 0
+        const hasArgs = args !== undefined
         const currentFrameId = this.extensionBridge!.getCurrentFrameId()
+        const staleContextRetry = options.staleContextRetry ?? 'never'
 
         // precise + args + 主 frame：使用 callFunctionOn 避免大 payload 字符串拼接
         if (hasArgs && currentFrameId === 0) {
-            return this.callFunctionOn<T>(code, args!, timeout)
+            return this.callFunctionOn<T>(code, args!, timeout, options)
         }
 
         if (currentFrameId !== 0) {
@@ -1793,7 +1962,7 @@ class UnifiedSessionManager {
         if (result.exceptionDetails) {
             throw new Error(formatCdpException(result.exceptionDetails))
         }
-        return this.materializeCdpResult<T>(result.result, timeout)
+        return this.materializeCdpResult<T>(result.result, timeout, options.fileOutput)
     }
 
     private async evaluateViaExtensionStealth<T>(expression: string, timeout?: number): Promise<T> {
@@ -1882,12 +2051,28 @@ class UnifiedSessionManager {
         return extractCdpValue<T>(result.result)
     }
 
-    private async materializeCdpResult<T>(result: CdpResultObject<T> | undefined, timeout?: number): Promise<T> {
+    private async materializeCdpResult<T>(
+        result: CdpResultObject<T> | undefined,
+        timeout?: number,
+        fileOutput = false
+    ): Promise<T> {
         if (!result?.objectId) {
             return extractCdpValue<T>(result)
         }
         try {
-            return await this.materializeRemoteObject<T>(result, timeout, { seen: new Set(), nodes: 0, chars: 0 }, 0)
+            return await this.materializeRemoteObject<T>(
+                result,
+                timeout,
+                {
+                    seen: new Set(),
+                    nodes: 0,
+                    chars: 0,
+                    maxChars: fileOutput
+                        ? UnifiedSessionManager.CDP_MATERIALIZE_MAX_FILE_CHARS
+                        : UnifiedSessionManager.CDP_MATERIALIZE_MAX_CHARS,
+                },
+                0
+            )
         } finally {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId: result.objectId }).catch(() => {})
         }
@@ -2020,7 +2205,7 @@ class UnifiedSessionManager {
         if (
             depth > UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH ||
             state.nodes > UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES ||
-            state.chars > UnifiedSessionManager.CDP_MATERIALIZE_MAX_CHARS
+            state.chars > state.maxChars
         ) {
             this.throwMaterializeLimit(state, depth, result)
         }
@@ -2040,7 +2225,7 @@ class UnifiedSessionManager {
             chars: state.chars,
             maxDepth: UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH,
             maxNodes: UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES,
-            maxChars: UnifiedSessionManager.CDP_MATERIALIZE_MAX_CHARS,
+            maxChars: state.maxChars,
             type: result?.type,
             subtype: result?.subtype,
             className: result?.className,
@@ -2140,7 +2325,12 @@ class UnifiedSessionManager {
      * 参数通过 CDP 协议结构化传递，避免大 payload 字符串拼接导致的长度限制和转义问题，
      * 要求 code 必须是函数表达式（如 "(x) => x + 1"）
      */
-    private async callFunctionOn<T>(code: string, args: unknown[], timeout?: number): Promise<T> {
+    private async callFunctionOn<T>(
+        code: string,
+        args: unknown[],
+        timeout?: number,
+        options: EvaluateOptions = {}
+    ): Promise<T> {
         const buildFallbackExpression = () => `(${code})(${args.map((a) => JSON.stringify(a)).join(', ')})`
         const globalResult = (await this.extensionBridge!.debuggerSend(
             'Runtime.evaluate',
@@ -2155,7 +2345,13 @@ class UnifiedSessionManager {
         if (!globalObjectId) {
             console.warn('[MCP] Runtime.evaluate 未返回 globalThis objectId，改用表达式传递 evaluate args')
             const fallbackExpression = buildFallbackExpression()
-            return this.evaluateViaExtensionPrecise<T>(fallbackExpression, fallbackExpression, undefined, timeout)
+            return this.evaluateViaExtensionPrecise<T>(
+                fallbackExpression,
+                fallbackExpression,
+                undefined,
+                timeout,
+                options
+            )
         }
 
         try {
@@ -2183,7 +2379,7 @@ class UnifiedSessionManager {
             if (result.exceptionDetails) {
                 throw new Error(formatCdpException(result.exceptionDetails))
             }
-            return await this.materializeCdpResult<T>(result.result, timeout)
+            return await this.materializeCdpResult<T>(result.result, timeout, options.fileOutput)
         } finally {
             this.extensionBridge!.debuggerSend('Runtime.releaseObject', {
                 objectId: globalObjectId,

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback } from 'node:child_process'
+import { exec as execCallback, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -85,6 +85,79 @@ function fixtureSftp() {
     }
 }
 
+test('directory exclude glob matching preserves literals and avoids repeated-wildcard backtracking', () => {
+    for (const [relativePath, pattern, expected] of [
+        ['sub/cache/file.txt', '*.txt', true],
+        ['sub/cache/file.txt', 'sub/*/*.txt', true],
+        ['sub/cache/file.txt', 'sub/**', true],
+        ['sub/cache/file.txt', 'sub/*', false],
+        ['sub/cache/file.txt', '*/file.txt', false],
+        ['./sub/a.txt', '/sub/?.txt', true],
+        ['a.txt', '?.txt', true],
+        ['ab.txt', '?.txt', false],
+        ['a+b[1].txt', 'a+b[1].txt', true],
+        ['ab1.txt', 'a+b[1].txt', false],
+        ['{a,b}.txt', '{a,b}.txt', true],
+        ['a.txt', '{a,b}.txt', false],
+        ['a\nb', 'a*b', true],
+        ['a\nb', 'a**b', false],
+        ['😀.txt', '??.txt', true],
+    ]) {
+        assert.equal(matchesDirectoryExclude(relativePath, [pattern]), expected, `${relativePath}: ${pattern}`)
+    }
+    assert.equal(matchesDirectoryExclude('file.txt', undefined), false)
+    const moduleUrl = new URL('../dist/directory-verification.js', import.meta.url).href
+    const script = `import { matchesDirectoryExclude } from ${JSON.stringify(moduleUrl)};
+        console.log(matchesDirectoryExclude('a'.repeat(80) + 'c', ['*a'.repeat(8) + 'b']));`
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+        encoding: 'utf8',
+        timeout: 5000,
+    })
+    assert.ifError(result.error)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout.trim(), 'false')
+})
+
+test('SSH key and config validators reject nonregular inputs before synchronous reads', (t) => {
+    const directory = makeTempDir(t)
+    fs.writeFileSync(path.join(directory, 'regular'), 'Host fixture\n  HostName example.com\n')
+    fs.mkdirSync(path.join(directory, 'directory'))
+    const rejected = [path.join(directory, 'directory')]
+    if (process.platform !== 'win32') {
+        const fifo = path.join(directory, 'fifo')
+        const created = spawnSync('mkfifo', [fifo], { encoding: 'utf8', timeout: 3000 })
+        assert.ifError(created.error)
+        assert.equal(created.status, 0, created.stderr)
+        rejected.push(fifo)
+        fs.symlinkSync(path.join(directory, 'regular'), path.join(directory, 'regular-link'))
+    }
+    const securityUrl = new URL('../dist/security.js', import.meta.url).href
+    const configUrl = new URL('../dist/ssh-config.js', import.meta.url).href
+    const script = `import assert from 'node:assert/strict';
+        import { validateKeyFile, validateConfigFile } from ${JSON.stringify(securityUrl)};
+        import { parseSSHConfig } from ${JSON.stringify(configUrl)};
+        for (const validate of [validateKeyFile, validateConfigFile]) {
+            validate(${JSON.stringify(path.join(directory, 'regular'))});
+            ${process.platform !== 'win32' ? `validate(${JSON.stringify(path.join(directory, 'regular-link'))});` : ''}
+            for (const input of ${JSON.stringify(rejected)}) {
+                assert.throws(() => validate(input), /regular file/);
+            }
+        }
+        assert.equal(parseSSHConfig(${JSON.stringify(path.join(directory, 'regular'))}).length, 1);
+        for (const input of ${JSON.stringify(rejected)}) {
+            assert.throws(() => parseSSHConfig(input), /regular file/);
+        }
+        console.log('nonregular-inputs-rejected');`
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+        encoding: 'utf8',
+        timeout: 5000,
+        env: { ...process.env, SSH_MCP_ALLOWED_KEY_DIRS: directory },
+    })
+    assert.ifError(result.error)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout.trim(), 'nonregular-inputs-rejected')
+})
+
 test('SSH port schemas reject out-of-range and fractional values', () => {
     for (const invalid of [-1, 0, 65536, 22.5]) {
         assert.equal(sshPortSchema.safeParse(invalid).success, false)
@@ -107,6 +180,252 @@ test('command risk keeps bounded read-only pipelines below high and flags destru
     assert.equal(classifyCommandRisk('rm -rf /tmp/example')?.level, 'high')
     assert.equal(classifyCommandRisk('rm -fr /tmp/example')?.level, 'high')
     assert.equal(classifyCommandRisk('systemctl restart example')?.level, 'high')
+})
+
+test('command risk ignores quoted scripts, escaped expansions, and literal ampersands', () => {
+    const commands = [
+        "printf '%s\\n' 'rm -rf /tmp/example'",
+        'printf "%s\\n" "rm -rf /tmp/example"',
+        "python -c 'print(oct(0o100600 & 0o777))'",
+        'python -c "print(oct(0o100600 & 0o777))"',
+        "printf '%s\\n' '$(rm -rf /tmp/example)'",
+        'printf "%s\\n" "\\$(rm -rf /tmp/example)"',
+        'printf "%s\\n" "\\`rm -rf /tmp/example\\`"',
+        'printf x\\&y',
+        'printf "%s\\n" "<<EOF"',
+        'grep -F "rm -rf & background_task" /tmp/example.log | head -20',
+    ]
+    for (const command of commands) {
+        assert.equal(classifyCommandRisk(command, 30_000), undefined, command)
+    }
+})
+
+test('command risk ignores here-doc input and resumes Shell scanning after the exact delimiter', () => {
+    const commands = [
+        "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY",
+        "cat <<'EOF'\nrm -rf /tmp/example &\nit's only input\n$(rm -rf /tmp/example)\nEOF",
+        'cat <<"EOF"\nrm -rf /tmp/example &\n`rm -rf /tmp/example`\nEOF',
+        "cat <<E'OF'\nrm -rf /tmp/example &\n$(rm -rf /tmp/example)\nEOF",
+        'cat <<E"OF"\nrm -rf /tmp/example &\n$(rm -rf /tmp/example)\nEOF',
+        'cat <<\\EOF\nrm -rf /tmp/example &\n$(rm -rf /tmp/example)\nEOF',
+        "cat <<''\nrm -rf /tmp/example &\n\n",
+        "cat <<-'EOF'\n\trm -rf /tmp/example &\n\tEOF",
+        'cat <<EOF\nrm -rf /tmp/example &\nit\'s input with "quotes"\nEOF',
+        'cat <<EOF\n\\$(rm -rf /tmp/example)\n\\`rm -rf /tmp/example\\`\nEOF',
+        'cat <<EOF\n$((0100600 & 0777))\nEOF',
+        "cat <<'FIRST' <<SECOND\nrm -rf /tmp/example &\nFIRST\nrm -rf /tmp/example &\nSECOND",
+        "cat <<'EOF'\neof\nsleep 1 &\nEOF",
+        "cat <<'EOF'\nEOF trailing\nsleep 1 &\nEOF",
+        "cat <<'EOF'\n EOF\nsleep 1 &\nEOF",
+        "cat <<-'EOF'\n EOF\nsleep 1 &\n\tEOF",
+        "cat <<'EOF' \\\n; printf done\nrm -rf /tmp/example &\nEOF",
+        "cat <<'EOF'\nunclosed input rm -rf /tmp/example &",
+        "cat <<'EOF'\nE\\\nOF\nsleep 1 &\nEOF",
+        'cat <<$EOF\nrm -rf /tmp/example &\n$EOF',
+        "cat <<'$(rm -rf /tmp/example)'\nrm -rf &\n$(rm -rf /tmp/example)",
+        "cat <<'EOF' # <<IGNORED \"\nrm -rf &\nEOF",
+        'printf "%s" "$(cat <<EOF\nrm -rf &\nEOF\n)"',
+        'cat <<<"rm -rf /tmp/example &"',
+    ]
+    for (const command of commands) {
+        assert.equal(classifyCommandRisk(command, 30_000), undefined, command)
+    }
+    for (const command of [
+        "cat <<'EOF'\nit's input\nEOF\nsleep 1 &",
+        'cat <<EOF\nit\'s input with "quotes"\nEOF\nsleep 1 &',
+        "cat <<-'EOF'\t; printf done\n\tit's input\n\tEOF\nsleep 1 &",
+        "cat <<'FIRST' <<SECOND\nit's input\nFIRST\nrm -rf &\nSECOND\nsleep 1 &",
+        'cat <<EOF &\nrm -rf /tmp/example &\nEOF',
+        'cat <<EOF\nE\\\nOF\nsleep 1 &',
+        'cat <<\\\n  EOF\nrm -rf &\nEOF\nsleep 1 &',
+    ]) {
+        const risk = classifyCommandRisk(command, 30_000)
+        assert.equal(risk?.level, 'high', command)
+        assert.deepEqual(risk.categories, ['process-control'], command)
+        assert.deepEqual(risk.signals, ['background_task'], command)
+    }
+    assert.deepEqual(classifyCommandRisk("cat <<'EOF'\nit's input\nEOF\nrm -rf /tmp/example", 30_000)?.signals, [
+        'destructive_command',
+    ])
+})
+
+test('command risk detects real substitutions in double quotes and expandable here-docs', () => {
+    const commands = [
+        'printf "%s\\n" "$(rm -rf /tmp/example)"',
+        'printf "%s\\n" "`rm -rf /tmp/example`"',
+        'printf "%s\\n" "$(printf x; rm -rf /tmp/example)"',
+        'printf "%s\\n" "$(printf "%s" "$(rm -rf /tmp/example)")"',
+        'cat <<EOF\n$(rm -rf /tmp/example)\nEOF',
+        'cat <<EOF\n`rm -rf /tmp/example`\nEOF',
+        "cat <<EOF\n'$(rm -rf /tmp/example)'\nEOF",
+        'cat <<EOF\n"$(rm -rf /tmp/example)"\nEOF',
+        'cat <<EOF\n$((1 + $(rm -rf /tmp/example)))\nEOF',
+        "cat <<'FIRST' <<SECOND\n$(rm -rf /tmp/example)\nFIRST\n$(rm -rf /tmp/example)\nSECOND",
+        'cat <<EOF\n\\\\$(rm -rf /tmp/example)\nEOF',
+        'cat <<E\\\nOF\n$(rm -rf /tmp/example)\nEOF',
+        "printf '%s' \"$(cat <<'EOF'\nit's input\nEOF\nrm -rf /tmp/example)\"",
+    ]
+    for (const command of commands) {
+        const risk = classifyCommandRisk(command, 30_000)
+        assert.equal(risk?.level, 'high', command)
+        assert.deepEqual(risk.categories, ['destructive'], command)
+        assert.deepEqual(risk.signals, ['destructive_command'], command)
+    }
+    for (const command of [
+        'printf "%s\\n" "$(sleep 1 &)"',
+        'cat <<EOF\n$(sleep 1 &)\nEOF',
+        'cat <<EOF\n`sleep 1 &`\nEOF',
+    ]) {
+        assert.deepEqual(classifyCommandRisk(command, 30_000)?.signals, ['background_task'], command)
+    }
+})
+
+test('command risk recognizes real background operators after quoted and escaped arguments', () => {
+    const commands = [
+        'sleep 1 &',
+        'sleep 1 & ',
+        'sleep 1 &\n',
+        'sleep 1 &\t',
+        'sleep 1 2>&1 &\n',
+        "printf '%s\\n' 'rm &'; sleep 1 &\n",
+        'printf "%s\\n" "\\&"; sleep 1 &\n',
+        'printf "%s\\n" "<<EOF"; sleep 1 &\n',
+        'printf \\<\\<EOF; sleep 1 &\n',
+    ]
+    for (const command of commands) {
+        const risk = classifyCommandRisk(command, 30_000)
+        assert.equal(risk?.level, 'high', command)
+        assert.deepEqual(risk.categories, ['process-control'], command)
+        assert.deepEqual(risk.signals, ['background_task'], command)
+    }
+})
+
+test('command risk distinguishes background operators from conjunctions, redirection, and quoted arithmetic', () => {
+    const commands = [
+        'true && printf done',
+        'printf x 2>&1',
+        'printf x &>/tmp/example.log',
+        'printf x 3<&0',
+        'printf x >&2',
+        'printf x >>/tmp/example.log',
+        'printf "%s\\n" "$((0100600 & 0777))"',
+        'printf "%s\\n" "https://example.com/?a=1&b=2"',
+    ]
+    for (const command of commands) {
+        assert.equal(classifyCommandRisk(command, 30_000), undefined, command)
+    }
+})
+
+test('command risk preserves the inclusive bounded-search timeout boundary', () => {
+    for (const command of ['find /tmp/example -name file', 'grep -R pattern /tmp/example']) {
+        for (const timeout of [1, 30_000, 300_000]) {
+            assert.equal(classifyCommandRisk(command, timeout), undefined, `${command}: ${timeout}`)
+        }
+        for (const timeout of [undefined, 0, 300_001]) {
+            const risk = classifyCommandRisk(command, timeout)
+            assert.equal(risk?.level, 'medium', `${command}: ${timeout}`)
+            assert.deepEqual(risk.categories, ['long-running'])
+            assert.deepEqual(risk.signals, ['unbounded_search'])
+        }
+    }
+})
+
+test('ssh_exec command risk is diagnostic-only and preserves mocked execution results for each shell', async (t) => {
+    const handlers = new Map()
+    registerExecTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+    const originalExec = sessionManager.exec
+    const originalShell = sessionManager.getCommandShell
+    t.after(() => {
+        sessionManager.exec = originalExec
+        sessionManager.getCommandShell = originalShell
+    })
+
+    for (const [shell, command, category, signal] of [
+        ['posix', 'rm -rf /tmp/example', 'destructive', 'destructive_command'],
+        ['cmd', 'del C:\\Data\\file.txt', 'destructive', 'destructive_command'],
+        ['powershell', 'Remove-Item -Recurse C:\\Data', 'destructive', 'destructive_command'],
+        ['posix', "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY"],
+        ['posix', "cat <<'EOF'\nit's input\nEOF\nsleep 1 &", 'process-control', 'background_task'],
+        ['posix', 'cat <<EOF\n$(rm -rf /tmp/example)\nEOF', 'destructive', 'destructive_command'],
+        ['posix', 'printf "%s" "$(rm -rf /tmp/example)"', 'destructive', 'destructive_command'],
+    ]) {
+        sessionManager.getCommandShell = () => shell
+        for (const success of [true, false]) {
+            const calls = []
+            const execution = {
+                success,
+                stdout: 'mock output',
+                stderr: success ? '' : 'mock execution failure',
+                exitCode: success ? 0 : 1,
+            }
+            sessionManager.exec = async (alias, receivedCommand, options) => {
+                calls.push({ alias, command: receivedCommand, timeout: options.timeout })
+                return execution
+            }
+            const response = await handlers.get('ssh_exec')({ alias: 'risk-fixture', command, timeout: 30_000 })
+            const result = JSON.parse(response.content[0].text)
+            const { commandRisk, ...returnedExecution } = result
+            assert.deepEqual(returnedExecution, execution)
+            if (category) {
+                assert.equal(commandRisk.level, 'high', command)
+                assert.deepEqual(commandRisk.categories, [category], command)
+                assert.deepEqual(commandRisk.signals, [signal], command)
+            } else {
+                assert.equal(commandRisk, undefined, command)
+            }
+            assert.deepEqual(calls, [{ alias: 'risk-fixture', command, timeout: 30_000 }])
+        }
+    }
+})
+
+test('ssh_exec_batch command risk does not stop a successful mocked batch or replace execution failures', async (t) => {
+    const handlers = new Map()
+    registerExecTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+    const originalExec = sessionManager.exec
+    const originalShell = sessionManager.getCommandShell
+    const commands = [
+        'rm -rf /tmp/example',
+        'printf done',
+        "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY",
+        "cat <<'EOF'\nit's input\nEOF\nsleep 1 &",
+    ]
+    const calls = []
+    sessionManager.getCommandShell = () => 'posix'
+    sessionManager.exec = async (_alias, command) => {
+        calls.push(command)
+        return { success: true, stdout: 'mock output', stderr: '', exitCode: 0 }
+    }
+    t.after(() => {
+        sessionManager.exec = originalExec
+        sessionManager.getCommandShell = originalShell
+    })
+
+    const handler = handlers.get('ssh_exec_batch')
+    const success = JSON.parse((await handler({ alias: 'risk-fixture', commands })).content[0].text)
+    assert.equal(success.success, true)
+    assert.equal(success.executed, commands.length)
+    assert.deepEqual(calls, commands)
+    assert.deepEqual(success.results[0].commandRisk.signals, ['destructive_command'])
+    assert.equal(success.results[1].commandRisk, undefined)
+    assert.equal(success.results[2].commandRisk, undefined)
+    assert.deepEqual(success.results[3].commandRisk.signals, ['background_task'])
+
+    sessionManager.exec = async () => {
+        throw new Error('injected execution failure')
+    }
+    const failure = JSON.parse((await handler({ alias: 'risk-fixture', commands })).content[0].text)
+    assert.equal(failure.success, false)
+    assert.equal(failure.executed, 1)
+    assert.equal(failure.results[0].error, 'injected execution failure')
+    assert.deepEqual(failure.results[0].commandRisk.signals, ['destructive_command'])
 })
 
 test('transfer outcome makes mismatched and skipped verification fail top-level success', () => {
@@ -1515,6 +1834,160 @@ test('rsync probe and transport reject results from an invalidated SSH session g
     assert.equal(freshProbe.status, 'available')
     assert.equal(execCalls, 2)
 })
+
+test(
+    'POSIX operation cancellation preserves identity checks and native Shell signals',
+    { skip: process.platform !== 'linux', timeout: 15_000 },
+    async (t) => {
+        const directory = makeTempDir(t)
+        const manager = new SessionManager(path.join(directory, 'cancellation.json'))
+        t.after(() => manager.operationManager.close())
+        manager.getRemotePlatform = () => 'posix'
+
+        for (const shell of ['/bin/sh', '/bin/bash']) {
+            for (const processGroup of [false, true]) {
+                await t.test(`${shell} processGroup=${processGroup}`, async (t) => {
+                    const marker = 'b'.repeat(64)
+                    const child = spawn(shell, ['-c', 'exec sleep 30'], {
+                        cwd: directory,
+                        detached: true,
+                        env: { PATH: process.env.PATH, HOME: directory, MCP_SSH_OPERATION_MARKER: marker },
+                        stdio: 'ignore',
+                    })
+                    const closed = new Promise((resolve) => child.once('close', resolve))
+                    t.after(async () => {
+                        if (child.exitCode === null && child.signalCode === null) {
+                            process.kill(-child.pid, 'SIGTERM')
+                        }
+                        await closed
+                    })
+                    await new Promise((resolve, reject) => {
+                        child.once('spawn', resolve)
+                        child.once('error', reject)
+                    })
+                    manager.exec = async (_alias, command) => {
+                        try {
+                            const output = await exec(command, { shell, cwd: directory, timeout: 5_000 })
+                            return { ...output, success: true, exitCode: 0 }
+                        } catch (error) {
+                            return { success: false, stdout: error.stdout, stderr: error.stderr, exitCode: error.code }
+                        }
+                    }
+
+                    const rejected = await manager.cancelRemoteOperation(
+                        'owned-operation',
+                        child.pid,
+                        'c'.repeat(64),
+                        processGroup,
+                        {}
+                    )
+                    assert.equal(rejected.success, false)
+                    assert.match(rejected.error, /operation marker mismatch/)
+                    assert.equal(child.exitCode, null)
+                    assert.equal(child.signalCode, null)
+                    const cancelled = await manager.cancelRemoteOperation(
+                        'owned-operation',
+                        child.pid,
+                        marker,
+                        processGroup,
+                        {}
+                    )
+                    assert.equal(cancelled.success, true, cancelled.error)
+                    await closed
+                    assert.equal(child.signalCode, 'SIGTERM')
+                })
+            }
+        }
+    }
+)
+
+test(
+    'tracked POSIX operations preserve command exit codes across process groups',
+    { skip: process.platform !== 'linux', timeout: 15_000 },
+    async (t) => {
+        const directory = makeTempDir(t)
+        const withoutSetsid = path.join(directory, 'without-setsid')
+        fs.mkdirSync(withoutSetsid)
+        fs.symlinkSync(fs.realpathSync('/usr/bin/env'), path.join(withoutSetsid, 'env'))
+        fs.symlinkSync(fs.realpathSync('/bin/sh'), path.join(withoutSetsid, 'sh'))
+        await exec('command -v setsid')
+
+        for (const scenario of ['ordinary', 'session-leader', 'without-setsid']) {
+            await t.test(scenario, async (t) => {
+                const manager = new SessionManager(path.join(directory, `${scenario}.json`))
+                const children = new Set()
+                t.after(async () => {
+                    for (const child of children) {
+                        const closed = new Promise((resolve) => child.once('close', resolve))
+                        child.kill('SIGTERM')
+                        await closed
+                    }
+                    await manager.disconnectAll()
+                    manager.operationManager.close()
+                })
+                manager.sessions.set('owned-operation', {
+                    client: {
+                        end() {},
+                        exec(command, _options, callback) {
+                            const stream = new Readable({ read() {} })
+                            stream.stderr = new Readable({ read() {} })
+                            const child = spawn('/bin/sh', ['-c', command], {
+                                cwd: directory,
+                                detached: scenario === 'session-leader',
+                                env: {
+                                    PATH: scenario === 'without-setsid' ? withoutSetsid : process.env.PATH,
+                                    HOME: directory,
+                                    TMPDIR: directory,
+                                },
+                                stdio: ['ignore', 'pipe', 'pipe'],
+                            })
+                            children.add(child)
+                            child.stdout.on('data', (data) => stream.push(data))
+                            child.stderr.on('data', (data) => stream.stderr.push(data))
+                            child.on('error', (error) => stream.emit('error', error))
+                            child.once('close', (code, signal) => {
+                                children.delete(child)
+                                stream.emit('close', code, signal)
+                                stream.push(null)
+                                stream.stderr.push(null)
+                            })
+                            callback(null, stream)
+                        },
+                    },
+                    config: { host: '127.0.0.1', port: 22, username: 'tester', remotePlatform: 'posix' },
+                    connected: true,
+                    connectedAt: Date.now(),
+                    lastUsedAt: Date.now(),
+                    reconnectAttempts: 0,
+                    manualClose: false,
+                })
+
+                for (const code of [0, 7]) {
+                    const operation = await manager.operationStart(
+                        'owned-operation',
+                        `printf owned-stdout; printf owned-stderr >&2; exit ${code}`
+                    )
+                    const deadline = Date.now() + 5_000
+                    let status = manager.operationStatus(operation.operationId)
+                    while (status.finishedAt === null && Date.now() < deadline) {
+                        await new Promise((resolve) => setTimeout(resolve, 10))
+                        status = manager.operationStatus(operation.operationId)
+                    }
+                    assert.notEqual(status.finishedAt, null)
+                    assert.equal(status.markerVerified, true)
+                    assert.equal(status.processGroup, scenario !== 'without-setsid')
+                    assert.equal(status.status, code === 0 ? 'completed' : 'failed')
+                    assert.equal(status.exitCode, code)
+                    const output = manager.operationRead(operation.operationId)
+                    assert.equal(output.status, status.status)
+                    assert.equal(output.exitCode, code)
+                    assert.equal(output.stdout, 'owned-stdout')
+                    assert.equal(output.stderr, 'owned-stderr')
+                }
+            })
+        }
+    }
+)
 
 test('session summaries stay brief while internal transfer capability retains route decisions', (t) => {
     const directory = makeTempDir(t)

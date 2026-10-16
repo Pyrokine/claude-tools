@@ -1,4 +1,5 @@
 import type { ConsoleMessage, NetworkRequest } from '../types'
+import { ExpectedOperationError } from '../types/expected-errors'
 import {
     ConsoleClearSchema,
     ConsoleEnableSchema,
@@ -129,44 +130,28 @@ export class LogEventHandler {
 
         let requests = this.logManager.getNetwork(tabId)
 
-        if (requests.length === 0) {
-            try {
-                const tab = await chrome.tabs.get(tabId)
-                if (!isRestrictedUrl(tab.url)) {
-                    const results = await chrome.scripting.executeScript({
-                        target: { tabId, frameIds: [0] },
-                        func: () => {
-                            const resources = performance.getEntriesByType('resource') as PerformanceResourceTiming[]
-                            const navigation = performance.getEntriesByType(
-                                'navigation'
-                            ) as PerformanceNavigationTiming[]
-                            return [
-                                ...navigation.map((e) => ({
-                                    url: e.name,
-                                    method: 'GET',
-                                    type: 'Document',
-                                    status: 0,
-                                    timestamp: Math.round(performance.timeOrigin),
-                                    duration: Math.round(e.duration),
-                                })),
-                                ...resources.map((e) => ({
-                                    url: e.name,
-                                    method: '',
-                                    type: e.initiatorType,
-                                    status: 0,
-                                    timestamp: Math.round(e.startTime + performance.timeOrigin),
-                                    duration: Math.round(e.duration),
-                                })),
-                            ]
-                        },
-                        world: 'MAIN',
-                    })
-                    requests = (results[0]?.result as NetworkRequest[]) ?? []
-                    this.logManager.setNetwork(tabId, requests)
-                }
-            } catch (e) {
-                console.warn('[logs] network fallback (executeScript) failed:', e)
+        const performanceSource = !this.debuggerManager.isAttached(tabId)
+        if (performanceSource) {
+            const latest = await this.readPerformanceNetwork(tabId, p.clear === true)
+            const key = (request: NetworkRequest) =>
+                JSON.stringify([request.url, request.type, request.timestamp, request.duration, request.status])
+            const previous = new Map<string, NetworkRequest[]>()
+            for (const request of requests.filter((item) => item.source === 'performance')) {
+                const identity = key(request)
+                const matches = previous.get(identity) ?? []
+                matches.push(request)
+                previous.set(identity, matches)
             }
+            for (const request of latest) {
+                const existing = previous.get(key(request))?.shift()
+                if (existing) {
+                    request.sequence = existing.sequence
+                }
+            }
+            requests = [...requests.filter((item) => item.source !== 'performance'), ...latest].slice(-1000)
+            this.logManager.setNetwork(tabId, requests)
+        } else if (p.clear && !isRestrictedUrl((await chrome.tabs.get(tabId)).url)) {
+            await this.readPerformanceNetwork(tabId, true)
         }
 
         // 按 URL 通配符过滤，* 匹配任意字符，? 匹配单个字符
@@ -184,9 +169,10 @@ export class LogEventHandler {
     async networkClear(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = NetworkClearSchema.parse(params) ?? {}
         const tabId = await this.getManagedTabId(p.tabId, context, 'network_clear')
-
+        if (!isRestrictedUrl((await chrome.tabs.get(tabId)).url)) {
+            await this.readPerformanceNetwork(tabId, true)
+        }
         this.logManager.setNetwork(tabId, [])
-
         return { success: true }
     }
 
@@ -194,6 +180,97 @@ export class LogEventHandler {
         const p = NetworkChallengeStateSchema.parse(params) ?? {}
         const tabId = await this.getManagedTabId(p.tabId, context, 'network_challenge_state')
         return { challengeRequired: this.logManager.isChallengeRequired(tabId) }
+    }
+
+    /** 卸载 fallback console hook，把残留日志合并到 logManager，并报告清理结果 */
+    async flushAndUninstallConsoleHook(tabId: number): Promise<boolean> {
+        try {
+            const tab = await chrome.tabs.get(tabId)
+            if (isRestrictedUrl(tab.url)) {
+                return true
+            }
+            const results = await chrome.scripting.executeScript({
+                target: { tabId, frameIds: [0] },
+                func: () => {
+                    type ConsoleFn = (...args: unknown[]) => void
+                    type ConsoleRecord = Record<string, ConsoleFn>
+                    type ConsoleHookState = {
+                        active: boolean
+                        logs: unknown[]
+                        originals: ConsoleRecord
+                        wrappers: ConsoleRecord
+                    }
+                    type McpWindow = Window & { __mcpConsoleHook?: ConsoleHookState }
+                    const mcpWin = window as McpWindow
+                    const state = mcpWin.__mcpConsoleHook
+                    if (!state) {
+                        return []
+                    }
+                    const residual = state.logs.splice(0, state.logs.length)
+                    state.active = false
+                    for (const level of ['log', 'warn', 'error', 'info', 'debug'] as const) {
+                        const current = (console as unknown as ConsoleRecord)[level]
+                        if (current === state.wrappers[level] && typeof state.originals[level] === 'function') {
+                            Reflect.set(console, level, state.originals[level])
+                        }
+                    }
+                    Reflect.deleteProperty(mcpWin, '__mcpConsoleHook')
+                    return residual
+                },
+                world: 'MAIN',
+            })
+            const residual = (results[0]?.result as ConsoleMessage[]) ?? []
+            const injectionError = (results[0] as { error?: { message?: string } } | undefined)?.error
+            if (injectionError) {
+                throw new Error(injectionError.message ?? String(injectionError))
+            }
+            if (residual.length > 0) {
+                const existing = this.logManager.getConsole(tabId) ?? []
+                this.logManager.setConsole(tabId, [...existing, ...residual])
+            }
+            return true
+        } catch (e) {
+            console.warn('[logs] flush console hook failed:', e)
+            return false
+        }
+    }
+
+    private async readPerformanceNetwork(tabId: number, clear: boolean): Promise<NetworkRequest[]> {
+        await assertScriptable(tabId)
+        const results = await chrome.scripting.executeScript({
+            target: { tabId, frameIds: [0] },
+            world: 'ISOLATED',
+            func: (clear: boolean) => {
+                const state = window as Window & { __mcpNetworkClearedBefore?: number }
+                const clearedBefore = state.__mcpNetworkClearedBefore ?? -1
+                const navigation = performance.getEntriesByType('navigation') as PerformanceNavigationTiming[]
+                const resources = performance.getEntriesByType('resource') as PerformanceResourceTiming[]
+                const requests = [
+                    ...navigation.map((entry) => ({ entry, method: 'GET', type: 'Document' })),
+                    ...resources.map((entry) => ({ entry, method: '', type: entry.initiatorType })),
+                ]
+                    .filter(({ entry }) => entry.startTime > clearedBefore)
+                    .slice(-1000)
+                    .map(({ entry, method, type }) => ({
+                        source: 'performance' as const,
+                        url: entry.name,
+                        method,
+                        type,
+                        status: (entry as PerformanceResourceTiming & { responseStatus?: number }).responseStatus ?? 0,
+                        timestamp: Math.round(entry.startTime + performance.timeOrigin),
+                        duration: Math.round(entry.duration),
+                    }))
+                if (clear) {
+                    state.__mcpNetworkClearedBefore = performance.now()
+                }
+                return requests
+            },
+            args: [clear],
+        })
+        if (!Array.isArray(results[0]?.result)) {
+            throw new ExpectedOperationError('Performance network read did not return request records')
+        }
+        return results[0].result as NetworkRequest[]
     }
 
     private async enableConsole(tabId: number): Promise<{ success: boolean }> {
@@ -389,53 +466,6 @@ export class LogEventHandler {
             })
         } catch (e) {
             console.warn('[logs] console clear fallback (executeScript) failed:', e)
-        }
-    }
-
-    /** 卸载 fallback console hook,把残留 logs 合并到 logManager,清空注入数组 */
-    private async flushAndUninstallConsoleHook(tabId: number): Promise<void> {
-        try {
-            const tab = await chrome.tabs.get(tabId)
-            if (isRestrictedUrl(tab.url)) {
-                return
-            }
-            const results = await chrome.scripting.executeScript({
-                target: { tabId, frameIds: [0] },
-                func: () => {
-                    type ConsoleFn = (...args: unknown[]) => void
-                    type ConsoleRecord = Record<string, ConsoleFn>
-                    type ConsoleHookState = {
-                        active: boolean
-                        logs: unknown[]
-                        originals: ConsoleRecord
-                        wrappers: ConsoleRecord
-                    }
-                    type McpWindow = Window & { __mcpConsoleHook?: ConsoleHookState }
-                    const mcpWin = window as McpWindow
-                    const state = mcpWin.__mcpConsoleHook
-                    if (!state) {
-                        return []
-                    }
-                    const residual = state.logs.splice(0, state.logs.length)
-                    state.active = false
-                    for (const level of ['log', 'warn', 'error', 'info', 'debug'] as const) {
-                        const current = (console as unknown as ConsoleRecord)[level]
-                        if (current === state.wrappers[level] && typeof state.originals[level] === 'function') {
-                            Reflect.set(console, level, state.originals[level])
-                        }
-                    }
-                    Reflect.deleteProperty(mcpWin, '__mcpConsoleHook')
-                    return residual
-                },
-                world: 'MAIN',
-            })
-            const residual = (results[0]?.result as ConsoleMessage[]) ?? []
-            if (residual.length > 0) {
-                const existing = this.logManager.getConsole(tabId) ?? []
-                this.logManager.setConsole(tabId, [...existing, ...residual])
-            }
-        } catch (e) {
-            console.warn('[logs] flush console hook failed:', e)
         }
     }
 }

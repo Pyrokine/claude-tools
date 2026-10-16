@@ -142,12 +142,15 @@ impl Config {
     /// 列出所有项目目录
     pub fn list_project_dirs(&self) -> std::io::Result<Vec<(String, PathBuf)>> {
         let mut dirs = Vec::new();
-        for entry in fs::read_dir(&self.projects_dir)?.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        for entry in fs::read_dir(&self.projects_dir)? {
+            crate::record_reader::check_work().map_err(|error| std::io::Error::other(error.message))?;
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
                 let id = entry.file_name().to_string_lossy().to_string();
                 dirs.push((id, entry.path()));
             }
         }
+        dirs.sort();
         Ok(dirs)
     }
 

@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::types::*;
 use crate::utils::*;
+#[cfg(test)]
 use std::fs::{self, File};
 use std::io::BufReader;
 
@@ -36,29 +37,14 @@ pub fn list_sessions(
         });
     }
 
-    let entries = fs::read_dir(&project_dir).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法读取项目目录: {e}"),
-        available: None,
-    })?;
-
+    let sources = crate::session_files::collect_session_files(&[(project_id.clone(), project_dir)], &[], false)?;
     let mut sessions = Vec::new();
     let mut redacted_count = 0usize;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-            continue;
-        }
-
-        let filename = entry.file_name().to_string_lossy().to_string();
-        let Some(session_id) = session_id_from_filename(&filename) else {
-            continue;
-        };
-
+    for (_, session_id, path) in sources {
         // 获取文件信息
-        let size_bytes = entry
-            .metadata()
+        let size_bytes = crate::session_files::open_session_file(&path)
+            .and_then(|file| file.metadata())
             .map_err(|e| ErrorResponse {
                 error: "io_error".to_string(),
                 message: format!("无法读取会话文件属性 {}: {e}", path.display()),
@@ -113,7 +99,7 @@ struct SessionStats {
 }
 
 fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> Result<SessionStats, ErrorResponse> {
-    let file = File::open(path).map_err(|e| ErrorResponse {
+    let file = crate::session_files::open_session_file(path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("无法读取会话文件 {}: {e}", path.display()),
         available: None,

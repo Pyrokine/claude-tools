@@ -9,7 +9,8 @@ import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 import { generateBezierPath, getMouseMoveDelay } from '../anti-detection/behavior.js'
 import { sanitizeErrorMessage } from './error-sanitizer.js'
-import { OsMouseError } from './errors.js'
+import { OsMouseError, TimeoutError } from './errors.js'
+import { remainingNavigationTimeout, withNavigationBudget } from './utils.js'
 
 const execFileDefault = promisify(execFileCallback)
 const EXEC_TIMEOUT_MS = 5_000
@@ -40,6 +41,12 @@ export interface ScreenClickPoint {
     y: number
 }
 
+interface FocusedWindowGeometry extends ScreenClickPoint {
+    width: number
+    height: number
+    insets: { left: number; right: number; bottom: number } | null
+}
+
 export type TurnstileClickSource = 'page' | 'iframe'
 
 export interface TurnstileOsClickInput {
@@ -51,6 +58,7 @@ export interface TurnstileOsClickInput {
 }
 
 export interface OsLeftClickDeps {
+    deadline?: number
     platform?: NodeJS.Platform
     execFile?: ExecFileFn
     sleep?: SleepFn
@@ -140,13 +148,28 @@ export function cssClientToScreen(
 export function composeWindowClickPoint(
     clickPoint: ScreenClickPoint,
     metrics: ViewportMetrics,
-    windowOrigin: ScreenClickPoint
+    windowOrigin: FocusedWindowGeometry
 ): ScreenClickPoint {
-    const { left, top } = chromeInsets(metrics)
     const scale = metrics.devicePixelRatio > 0 ? metrics.devicePixelRatio : 1
+    const insets = windowOrigin.insets ?? { left: 0, right: 0, bottom: 0 }
+    const contentWidth = windowOrigin.width - insets.left - insets.right
+    const contentTop = windowOrigin.height - metrics.innerHeight * scale - insets.bottom
+    if (
+        Math.abs(contentWidth - metrics.innerWidth * scale) > 2 ||
+        contentTop < 0 ||
+        insets.left < 0 ||
+        insets.right < 0 ||
+        insets.bottom < 0
+    ) {
+        throw new OsMouseError(
+            'TURNSTILE_OS_CLICK_UNAVAILABLE',
+            'X11 窗口尺寸或边距与页面视口不符，拒绝系统鼠标点击',
+            '重新检查受控页的窗口和缩放状态后再重试'
+        )
+    }
     return roundScreenPoint(
-        windowOrigin.x + (left + clickPoint.x) * scale,
-        windowOrigin.y + (top + clickPoint.y) * scale
+        windowOrigin.x + insets.left + clickPoint.x * scale,
+        windowOrigin.y + contentTop + clickPoint.y * scale
     )
 }
 
@@ -210,7 +233,10 @@ function toolMissing(tool: string, suggestion: string): OsMouseError {
     return new OsMouseError('OS_MOUSE_UNAVAILABLE', `未找到系统鼠标工具 ${tool}`, suggestion, { tool })
 }
 
-function wrapExecError(tool: string, error: unknown, suggestion: string): OsMouseError {
+function wrapExecError(tool: string, error: unknown, suggestion: string): OsMouseError | TimeoutError {
+    if (error instanceof TimeoutError) {
+        return error
+    }
     if (isEnoent(error)) {
         return toolMissing(tool, suggestion)
     }
@@ -265,6 +291,20 @@ export function buildOsMovePath(from: ScreenClickPoint, to: ScreenClickPoint): S
     return points
 }
 
+function budgetedExecFile(execFile: ExecFileFn, deadline?: number): ExecFileFn {
+    if (deadline === undefined) {
+        return execFile
+    }
+    return (file, args, options) =>
+        withNavigationBudget(
+            () =>
+                execFile(file, args, {
+                    timeout: Math.min(options?.timeout ?? EXEC_TIMEOUT_MS, remainingNavigationTimeout(deadline)),
+                }),
+            deadline
+        )
+}
+
 async function getLinuxPointer(execFile: ExecFileFn): Promise<ScreenClickPoint> {
     try {
         const { stdout } = await execFile('xdotool', ['getmouselocation', '--shell'], { timeout: EXEC_TIMEOUT_MS })
@@ -276,10 +316,10 @@ async function getLinuxPointer(execFile: ExecFileFn): Promise<ScreenClickPoint> 
 }
 
 export async function getFocusedWindowOrigin(
-    deps: { platform?: NodeJS.Platform; execFile?: ExecFileFn; pageTitle?: string | null } = {}
-): Promise<ScreenClickPoint> {
+    deps: { platform?: NodeJS.Platform; execFile?: ExecFileFn; pageTitle?: string | null; deadline?: number } = {}
+): Promise<FocusedWindowGeometry> {
     const platform = deps.platform ?? process.platform
-    const execFile = deps.execFile ?? execFileDefault
+    const execFile = budgetedExecFile(deps.execFile ?? execFileDefault, deps.deadline)
     const pageTitle = deps.pageTitle?.trim() ?? ''
     if (platform !== 'linux') {
         throw new OsMouseError(
@@ -322,20 +362,52 @@ export async function getFocusedWindowOrigin(
             '先把只含该受控测试页的 Chrome 窗口聚焦，再重试；混合窗口不会调用 focusWindow'
         )
     }
+    let geometry: Record<string, string>
     try {
         const { stdout } = await execFile('xdotool', ['getwindowgeometry', '--shell', windowId], {
             timeout: EXEC_TIMEOUT_MS,
         })
-        const parsed = parseXdotoolShell(stdout)
-        return roundScreenPoint(Number(parsed.X), Number(parsed.Y))
+        geometry = parseXdotoolShell(stdout)
     } catch (error) {
         throw wrapExecError('xdotool', error, 'Linux 需要可用的 xdotool，且当前会话是 X11')
+    }
+    const origin = roundScreenPoint(Number(geometry.X), Number(geometry.Y))
+    const width = Number(geometry.WIDTH)
+    const height = Number(geometry.HEIGHT)
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+        throw new OsMouseError(
+            'TURNSTILE_OS_CLICK_UNAVAILABLE',
+            'X11 活动窗口缺少有效尺寸，拒绝系统鼠标点击',
+            '重新检查受控页窗口后再重试'
+        )
+    }
+    let frameProperties: string
+    try {
+        frameProperties = (
+            await execFile('xprop', ['-id', windowId, '_GTK_FRAME_EXTENTS'], { timeout: EXEC_TIMEOUT_MS })
+        ).stdout
+    } catch (error) {
+        throw wrapExecError('xprop', error, 'Linux 需要可用的 xprop 才能核对 X11 窗口边距')
+    }
+    const extents = frameProperties.match(/^_GTK_FRAME_EXTENTS\(CARDINAL\) = (\d+), (\d+), (\d+), (\d+)\s*$/m)
+    if (!extents && !/^_GTK_FRAME_EXTENTS:\s+(?:not found\.|no such atom on any window\.)\s*$/m.test(frameProperties)) {
+        throw new OsMouseError(
+            'TURNSTILE_OS_CLICK_UNAVAILABLE',
+            'X11 窗口边距无法核实，拒绝系统鼠标点击',
+            '重新检查 xprop 和受控页窗口后再重试'
+        )
+    }
+    return {
+        ...origin,
+        width,
+        height,
+        insets: extents ? { left: Number(extents[1]), right: Number(extents[2]), bottom: Number(extents[4]) } : null,
     }
 }
 
 export async function resolveTurnstileOsClickPoint(
     input: TurnstileOsClickInput,
-    deps: { platform?: NodeJS.Platform; execFile?: ExecFileFn } = {}
+    deps: { platform?: NodeJS.Platform; execFile?: ExecFileFn; deadline?: number } = {}
 ): Promise<ScreenClickPoint> {
     const platform = deps.platform ?? process.platform
     if (input.clickPoint && input.viewport) {
@@ -452,8 +524,15 @@ async function resolveMovePath(
 export async function osLeftClick(x: number, y: number, deps: OsLeftClickDeps = {}): Promise<void> {
     const point = roundScreenPoint(x, y)
     const platform = deps.platform ?? process.platform
-    const execFile = deps.execFile ?? execFileDefault
-    const sleep = deps.sleep ?? defaultSleep
+    const execFile = budgetedExecFile(deps.execFile ?? execFileDefault, deps.deadline)
+    const sleep: SleepFn = (ms) =>
+        withNavigationBudget(
+            () =>
+                (deps.sleep ?? defaultSleep)(
+                    deps.deadline === undefined ? ms : Math.min(ms, remainingNavigationTimeout(deps.deadline))
+                ),
+            deps.deadline
+        )
     const warn = deps.warn ?? console.warn
     const path = await resolveMovePath(point, { ...deps, platform }, execFile)
     if (platform === 'linux') {

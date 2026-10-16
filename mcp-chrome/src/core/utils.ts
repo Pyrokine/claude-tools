@@ -4,6 +4,70 @@ import { chmod, lstat, mkdir, open, opendir, readFile, realpath, rename, rm } fr
 import { tmpdir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 import { promisify } from 'util'
+import { StructuredToolError, TimeoutError } from './errors.js'
+
+function navigationBudgetExpired(): TimeoutError {
+    const error = new TimeoutError('navigation timeout: request budget exhausted')
+    Object.assign(error.context, { actionExecuted: 'unknown', actionStatus: 'unknown', retryable: false })
+    return error
+}
+
+export function remainingNavigationTimeout(deadline: number): number {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+        throw navigationBudgetExpired()
+    }
+    return remaining
+}
+
+export async function withNavigationBudget<T>(operation: () => Promise<T>, deadline?: number): Promise<T> {
+    if (deadline === undefined) {
+        return operation()
+    }
+    const remaining = remainingNavigationTimeout(deadline)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+        const result = await Promise.race([
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => reject(navigationBudgetExpired()), remaining)
+            }),
+            operation(),
+        ])
+        remainingNavigationTimeout(deadline)
+        return result
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+export async function waitForNavigationQueue(previous: Promise<void>, deadline?: number): Promise<void> {
+    if (deadline === undefined) {
+        return previous
+    }
+    const expired = () =>
+        new StructuredToolError('TIMEOUT', 'navigation timeout while waiting for an operation', '请回读页面状态', {
+            actionExecuted: false,
+            actionStatus: 'failed',
+            failureStage: 'queue',
+            retryable: false,
+        })
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+        throw expired()
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+        await new Promise<void>((resolve, reject) => {
+            timer = setTimeout(() => reject(expired()), remaining)
+            previous.then(resolve, reject)
+        })
+        if (Date.now() >= deadline) {
+            throw expired()
+        }
+    } finally {
+        clearTimeout(timer)
+    }
+}
 
 export const TMP_PATH_PREFIX = 'tmp:'
 export const CWD_PATH_PREFIX = 'cwd:'
@@ -285,8 +349,11 @@ async function countMissingDirectories(root: string, parent: string): Promise<nu
     let current = resolve(parent)
     let missing = 0
     while (current !== root) {
-        if (!isWithinRoot(current, root) || missing > TEMP_MAX_ENTRIES) {
-            throw new Error('受控临时会话输出路径超出目录范围或配额')
+        if (!isWithinRoot(current, root)) {
+            throw new Error('受控临时会话输出路径超出目录范围')
+        }
+        if (missing > TEMP_MAX_ENTRIES) {
+            return missing
         }
         try {
             const info = await lstat(current)
@@ -305,11 +372,40 @@ async function countMissingDirectories(root: string, parent: string): Promise<nu
 }
 
 async function checkTempQuota(root: string, path: string, dataSize: number, additionalDirs: number): Promise<void> {
-    if (dataSize > TEMP_MAX_BYTES) {
-        throw new Error(`受控临时会话单文件超过 ${TEMP_MAX_BYTES} 字节上限`)
-    }
     let entries = 0
     let bytes = 0
+    const rejectQuota = (dimension: string, complete: boolean, replacedBytes = 0, extraEntry = 1): never => {
+        throw new StructuredToolError(
+            'TEMP_OUTPUT_QUOTA_EXCEEDED',
+            `受控临时会话超过 ${TEMP_MAX_ENTRIES} 项或 ${TEMP_MAX_BYTES} 字节上限`,
+            '使用 cwd: 指定仓库内路径保存后续输出；已有输出保留，勿自动重放已执行脚本',
+            {
+                scope: 'tmp',
+                dimension,
+                limits: { entries: TEMP_MAX_ENTRIES, bytes: TEMP_MAX_BYTES },
+                usage: { entries, bytes, complete },
+                remaining: complete
+                    ? { entries: Math.max(0, TEMP_MAX_ENTRIES - entries), bytes: Math.max(0, TEMP_MAX_BYTES - bytes) }
+                    : null,
+                requested: {
+                    bytes: dataSize,
+                    additionalDirectories: additionalDirs,
+                    additionalDirectoriesExact: additionalDirs <= TEMP_MAX_ENTRIES,
+                    additionalEntries: extraEntry,
+                    replacedBytes,
+                },
+                projected: complete
+                    ? {
+                          entries: entries + additionalDirs + extraEntry,
+                          bytes: bytes - replacedBytes + dataSize + additionalDirs * 4096,
+                      }
+                    : null,
+            }
+        )
+    }
+    if (dataSize > TEMP_MAX_BYTES) {
+        rejectQuota('single_file_bytes', false)
+    }
     const pending = [root]
     while (pending.length > 0) {
         const directory = pending.pop()!
@@ -320,12 +416,13 @@ async function checkTempQuota(root: string, path: string, dataSize: number, addi
             if (stats.isSymbolicLink() || (!stats.isDirectory() && !stats.isFile())) {
                 throw new Error('受控临时会话包含无法计入配额的文件类型')
             }
-            if (++entries > TEMP_MAX_ENTRIES) {
-                throw new Error(`受控临时会话超过 ${TEMP_MAX_ENTRIES} 个文件或目录`)
-            }
+            ++entries
             bytes += stats.size
+            if (entries > TEMP_MAX_ENTRIES) {
+                rejectQuota('entries', false)
+            }
             if (bytes > TEMP_MAX_BYTES) {
-                throw new Error(`受控临时会话超过 ${TEMP_MAX_BYTES} 字节上限`)
+                rejectQuota('bytes', false)
             }
             if (stats.isDirectory()) {
                 pending.push(item)
@@ -346,11 +443,11 @@ async function checkTempQuota(root: string, path: string, dataSize: number, addi
             throw error
         }
     }
-    if (
-        entries + additionalDirs + extraEntry > TEMP_MAX_ENTRIES ||
-        bytes - previousSize + dataSize + additionalDirs * 4096 > TEMP_MAX_BYTES
-    ) {
-        throw new Error(`受控临时会话超过 ${TEMP_MAX_ENTRIES} 项或 ${TEMP_MAX_BYTES} 字节上限`)
+    if (entries + additionalDirs + extraEntry > TEMP_MAX_ENTRIES) {
+        rejectQuota('entries', true, previousSize, extraEntry)
+    }
+    if (bytes - previousSize + dataSize + additionalDirs * 4096 > TEMP_MAX_BYTES) {
+        rejectQuota('bytes', true, previousSize, extraEntry)
     }
 }
 
@@ -403,6 +500,15 @@ export async function writePrivateFile(path: string, data: string | Buffer, enco
     }
 }
 
+function pathArgumentError(rawPath: string, message: string): StructuredToolError {
+    return new StructuredToolError(
+        'INVALID_ARGUMENT',
+        message,
+        '使用 tmp: 或 cwd: 指定允许目录内的相对路径，不包含 .. 组件',
+        { path: rawPath, cwd: process.cwd() }
+    )
+}
+
 function validatePortableOutputPath(rawPath: string): void {
     if (
         rawPath !== rawPath.trim() ||
@@ -410,23 +516,26 @@ function validatePortableOutputPath(rawPath: string): void {
         [...rawPath].some((character) => character.charCodeAt(0) < 32) ||
         /^[/\\]{2}[.?][/\\]/.test(rawPath)
     ) {
-        throw new Error('路径包含 Windows 不支持的字符或设备前缀')
+        throw pathArgumentError(rawPath, '路径包含 Windows 不支持的字符或设备前缀')
     }
     const prefixed = rawPath.startsWith(TMP_PATH_PREFIX) || rawPath.startsWith(CWD_PATH_PREFIX)
     const value = rawPath.replace(/^(?:tmp:|cwd:)/, '')
     const drive = !prefixed && isAbsolute(value) && /^[a-zA-Z]:[\\/]/.test(value)
     const components = value.split(/[\\/]+/).filter(Boolean)
+    if (components.includes('..')) {
+        throw pathArgumentError(rawPath, '路径不允许包含 .. 组件')
+    }
     for (let i = 0; i < components.length; i++) {
         const part = components[i]
-        if (i === 0 && drive && /^[a-zA-Z]:$/.test(part)) {
+        if (part === '.' || (i === 0 && drive && /^[a-zA-Z]:$/.test(part))) {
             continue
         }
         if (part.endsWith(' ') || part.endsWith('.') || part.includes(':')) {
-            throw new Error(`路径包含 Windows 不支持的组件: ${part}`)
+            throw pathArgumentError(rawPath, `路径包含 Windows 不支持的组件: ${part}`)
         }
         const base = part.split('.')[0].toUpperCase()
         if (/^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$)$/.test(base) || /^(?:COM|LPT)(?:[1-9¹²³])$/.test(base)) {
-            throw new Error(`路径包含 Windows 保留设备名: ${part}`)
+            throw pathArgumentError(rawPath, `路径包含 Windows 保留设备名: ${part}`)
         }
     }
 }
@@ -434,7 +543,7 @@ function validatePortableOutputPath(rawPath: string): void {
 async function resolveScopedPath(rawPath: string, serverName: string): Promise<ResolvedScopedPath> {
     validatePortableOutputPath(rawPath)
     if (!rawPath) {
-        throw new Error('路径不能为空')
+        throw pathArgumentError(rawPath, '路径不能为空')
     }
     const cwdRoot = await realpath(process.cwd())
     if (rawPath.startsWith(CWD_PATH_PREFIX)) {
@@ -456,14 +565,15 @@ async function resolveRelativeScopedPath(
     scope: ScopedPathScope,
     prefix?: 'cwd:' | 'tmp:'
 ): Promise<ResolvedScopedPath> {
+    const rawPath = `${prefix ?? ''}${relativePath}`
     if (!relativePath) {
-        throw new Error(prefix ? `${prefix} 后面必须跟相对路径` : '路径不能为空')
+        throw pathArgumentError(rawPath, prefix ? `${prefix} 后面必须跟相对路径` : '路径不能为空')
     }
     if (isAbsolute(relativePath)) {
-        throw new Error(prefix ? `${prefix} 只接受相对路径` : '相对路径不能是绝对路径')
+        throw pathArgumentError(rawPath, prefix ? `${prefix} 只接受相对路径` : '相对路径不能是绝对路径')
     }
     if (relativePath.split(/[\\/]+/).some((segment) => segment === '..')) {
-        throw new Error(prefix ? `${prefix} 路径不允许包含 .. 组件` : '相对路径不允许包含 .. 组件')
+        throw pathArgumentError(rawPath, prefix ? `${prefix} 路径不允许包含 .. 组件` : '相对路径不允许包含 .. 组件')
     }
 
     const candidate = resolve(root, relativePath)
@@ -484,7 +594,12 @@ async function resolveAbsoluteScopedPath(
     if (isWithinRoot(canonicalCandidate, cwdRoot)) {
         return { absolutePath, scope: 'cwd', root: cwdRoot }
     }
-    throw new Error(`路径超出允许范围: ${absolutePath}，仅允许受控临时目录或当前工作目录`)
+    throw new StructuredToolError(
+        'PATH_NOT_ALLOWED',
+        `路径超出允许范围: ${absolutePath}，仅允许受控临时目录或当前工作目录`,
+        '使用 tmp: 或 cwd: 指定允许目录内的相对路径；允许根目录见 error.context',
+        { path: absolutePath, cwd: cwdRoot, allowedRoots: [cwdRoot, tempRoot] }
+    )
 }
 
 async function canonicalizeOrAncestor(path: string): Promise<string> {
@@ -516,7 +631,12 @@ async function canonicalizeOrAncestor(path: string): Promise<string> {
 
 function assertWithinRoot(path: string, root: string): void {
     if (!isWithinRoot(path, root)) {
-        throw new Error(`路径超出允许范围: ${path}，仅允许受控临时目录或当前工作目录`)
+        throw new StructuredToolError(
+            'PATH_NOT_ALLOWED',
+            `路径超出允许范围: ${path}，仅允许受控临时目录或当前工作目录`,
+            '使用 tmp: 或 cwd: 指定允许目录内的相对路径；允许根目录见 error.context',
+            { path, cwd: process.cwd(), allowedRoots: [root] }
+        )
     }
 }
 

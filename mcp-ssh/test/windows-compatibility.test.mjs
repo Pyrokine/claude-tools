@@ -442,6 +442,102 @@ test('S13/S14: atomic overwrite rejects missing negotiated extension and shell-s
     assert.ok(execution.get('ssh_quick_exec').schema.inputSchema.shape.remotePlatform)
 })
 
+test('S14: cmd command risk preserves literal quotes, caret escapes, and command separators', () => {
+    const commands = [
+        'findstr /C:"del C:\\Data\\file.txt" logfile',
+        'findstr /C:"taskkill /F /PID 123" logfile',
+        'findstr /C:"--token" logfile',
+        'echo ^&',
+        'echo hello & echo done',
+        'echo "$(sleep 1 &)"',
+        'del /?',
+        'rmdir /?',
+        'format /?',
+    ]
+    for (const command of commands) {
+        assert.equal(classifyCommandRisk(command, 30_000, 'cmd'), undefined, command)
+    }
+})
+
+test('S14: cmd command risk keeps destructive, process-control, and privilege signals', () => {
+    const cases = [
+        ['del C:\\Data\\file.txt', 'destructive', 'destructive_command'],
+        ['erase C:\\Data\\file.txt', 'destructive', 'destructive_command'],
+        ['rmdir /S C:\\Data', 'destructive', 'destructive_command'],
+        ['rd /S C:\\Data', 'destructive', 'destructive_command'],
+        ['format C:', 'destructive', 'destructive_command'],
+        ['taskkill /F /PID 123', 'process-control', 'process_control'],
+        ['runas /user:Administrator whoami', 'privilege-escalation', 'privileged_command'],
+    ]
+    for (const [command, category, signal] of cases) {
+        const risk = classifyCommandRisk(command, 30_000, 'cmd')
+        assert.equal(risk?.level, 'high', command)
+        assert.deepEqual(risk.categories, [category], command)
+        assert.deepEqual(risk.signals, [signal], command)
+    }
+})
+
+test('S14: PowerShell command risk ignores quoted search patterns and escaped expansions', () => {
+    const commands = [
+        "Select-String -Pattern 'Remove-Item -Recurse C:\\Data' -Path logfile",
+        "Select-String -Pattern 'it''s Stop-Process -Id 123' -Path logfile",
+        "Write-Output '$(Stop-Process -Id 123)'",
+        "Write-Output 'rm & del'",
+        'Write-Output "a`"&b"',
+        'Write-Output "`$(Remove-Item -Recurse C:\\Data)"',
+        'Write-Output "taskkill /F /PID 123"',
+    ]
+    for (const command of commands) {
+        assert.equal(classifyCommandRisk(command, 30_000, 'powershell'), undefined, command)
+    }
+})
+
+test('S14: PowerShell command risk keeps destructive, process-control, and privilege signals', () => {
+    const cases = [
+        ['Remove-Item -Recurse C:\\Data', 'destructive', 'destructive_command'],
+        ['Clear-Content -LiteralPath C:\\Data\\file.txt', 'destructive', 'destructive_command'],
+        ['Format-Volume -DriveLetter D', 'destructive', 'destructive_command'],
+        ['Stop-Process -Id 123', 'process-control', 'process_control'],
+        ['Stop-Service Example', 'process-control', 'process_control'],
+        ['Restart-Service Example', 'process-control', 'process_control'],
+        ['Start-Process notepad -Verb RunAs', 'privilege-escalation', 'privileged_command'],
+    ]
+    for (const [command, category, signal] of cases) {
+        const risk = classifyCommandRisk(command, 30_000, 'powershell')
+        assert.equal(risk?.level, 'high', command)
+        assert.deepEqual(risk.categories, [category], command)
+        assert.deepEqual(risk.signals, [signal], command)
+    }
+})
+
+test('S14: Windows command risk preserves timeout bounds and credential diagnostics', () => {
+    for (const [shell, command] of [
+        ['cmd', 'dir /s C:\\Data'],
+        ['powershell', 'Get-ChildItem -Recurse C:\\Data'],
+    ]) {
+        for (const timeout of [1, 30_000, 300_000]) {
+            assert.equal(classifyCommandRisk(command, timeout, shell), undefined, `${shell}: ${timeout}`)
+        }
+        for (const timeout of [undefined, 0, 300_001]) {
+            const risk = classifyCommandRisk(command, timeout, shell)
+            assert.equal(risk?.level, 'medium', `${shell}: ${timeout}`)
+            assert.deepEqual(risk.categories, ['long-running'])
+            assert.deepEqual(risk.signals, ['unbounded_search'])
+        }
+    }
+    for (const [shell, command] of [
+        ['cmd', 'set "TOKEN=placeholder"'],
+        ['powershell', "$env:TOKEN = 'placeholder'"],
+        ['cmd', 'curl --token=placeholder https://example.com'],
+        ['powershell', 'curl --token=placeholder https://example.com'],
+    ]) {
+        const risk = classifyCommandRisk(command, 30_000, shell)
+        assert.equal(risk?.level, 'medium', command)
+        assert.deepEqual(risk.categories, ['credential-bearing'], command)
+        assert.deepEqual(risk.signals, ['credential_argument'], command)
+    }
+})
+
 test('S4: Windows script refuses to send content before ACL verification and cleans its empty SFTP file', async (t) => {
     const alias = 'windows-script-fixture'
     const manager = sessionManager

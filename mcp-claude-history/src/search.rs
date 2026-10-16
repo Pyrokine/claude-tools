@@ -4,15 +4,15 @@ use crate::types::*;
 use crate::utils::*;
 use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn compare_results(a: &SearchResult, b: &SearchResult) -> std::cmp::Ordering {
-    parse_time(&a.timestamp)
-        .cmp(&parse_time(&b.timestamp))
-        .then_with(|| a.project.cmp(&b.project))
+    a.project
+        .cmp(&b.project)
         .then_with(|| a.session.cmp(&b.session))
         .then_with(|| a.line.cmp(&b.line))
         .then_with(|| a.timestamp.cmp(&b.timestamp))
@@ -23,11 +23,13 @@ fn utc_day(timestamp: &str) -> Option<String> {
 }
 
 /// 搜索参数
+#[derive(Clone)]
 pub struct SearchParams {
     pub pattern: String,
     pub projects: Vec<String>,
     pub all_projects: bool,
     pub sessions: Vec<String>,
+    pub source: Option<String>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<UntilBound>,
     pub types: Vec<String>,
@@ -57,6 +59,7 @@ pub struct SearchParams {
     pub overwrite: bool,
     /// 是否包含 agent 子会话（默认 false）
     pub subagents: bool,
+    pub structured: Option<String>,
 }
 
 impl Default for SearchParams {
@@ -66,6 +69,7 @@ impl Default for SearchParams {
             projects: Vec::new(),
             all_projects: false,
             sessions: Vec::new(),
+            source: None,
             since: None,
             until: None,
             types: vec!["assistant".to_string(), "user".to_string(), "summary".to_string()],
@@ -93,6 +97,7 @@ impl Default for SearchParams {
             output_format: None,
             overwrite: false,
             subagents: false,
+            structured: None,
         }
     }
 }
@@ -186,12 +191,13 @@ fn normalize_filters(mut params: SearchParams) -> Result<SearchParams, ErrorResp
     Ok(params)
 }
 
-fn effective_filters(params: &SearchParams) -> EffectiveFilters {
+pub(crate) fn effective_filters(params: &SearchParams) -> EffectiveFilters {
     EffectiveFilters {
         pattern: params.pattern.clone(),
         projects: params.projects.clone(),
         all_projects: params.all_projects,
         sessions: params.sessions.clone(),
+        source: params.source.clone(),
         subagents: params.subagents,
         since: params.since.map(|v| v.to_rfc3339()),
         until: params.until.map(UntilBound::query_value),
@@ -225,11 +231,11 @@ fn broad_pattern_warning(params: &SearchParams) -> Option<String> {
 
 type SearchFile = (String, String, PathBuf);
 
-struct SearchInputs {
+pub(crate) struct SearchInputs {
     project_dirs: Vec<(String, PathBuf)>,
-    files: Vec<SearchFile>,
+    pub(crate) files: Vec<SearchFile>,
     regex: Option<Regex>,
-    search_pattern: Option<SearchPattern>,
+    pub(crate) search_pattern: Option<SearchPattern>,
 }
 
 struct SearchCollection {
@@ -243,7 +249,7 @@ struct SearchCollection {
 }
 
 struct SearchWindow {
-    selected_results: Vec<SearchResult>,
+    range: std::ops::Range<usize>,
     slice_info: Option<SearchSliceInfo>,
     selected_count: usize,
 }
@@ -288,19 +294,26 @@ pub fn search(config: &Config, params: SearchParams) -> Result<SearchResponse, E
             &inputs.files,
             inputs.regex.as_ref(),
             inputs.search_pattern.as_ref(),
-        );
+        )?;
         build_search_response(params, inputs.files, collection, start)
     }?;
     apply_response_budget(response, max_total, continuation_query)
 }
 
-fn prepare_search_params(params: SearchParams) -> Result<SearchParams, ErrorResponse> {
+pub(crate) fn prepare_search_params(params: SearchParams) -> Result<SearchParams, ErrorResponse> {
     let params = normalize_filters(params)?;
     validate_search_params(&params)?;
     Ok(params)
 }
 
 fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
+    if params
+        .structured
+        .as_deref()
+        .is_some_and(|mode| mode != "preview" && mode != "full")
+    {
+        return Err(invalid_arguments("structured 仅支持 preview 或 full"));
+    }
     if params.overwrite && params.output.is_none() {
         return Err(invalid_arguments("overwrite=true 需要 output"));
     }
@@ -354,9 +367,37 @@ fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
     Ok(())
 }
 
-fn prepare_search_inputs(config: &Config, params: &SearchParams) -> Result<SearchInputs, ErrorResponse> {
-    let project_dirs = get_project_dirs(config, params)?;
-    let mut files = collect_jsonl_files(&project_dirs, &params.sessions, params.subagents)?;
+pub(crate) fn prepare_search_inputs(config: &Config, params: &SearchParams) -> Result<SearchInputs, ErrorResponse> {
+    let (project_dirs, mut files) = if let Some(source) = &params.source {
+        let session = Path::new(source)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid_arguments("source 没有合法会话文件名"))?;
+        let file = crate::get::find_session_file(config, session, None, Some(source))?;
+        let project_dirs = if params.projects.is_empty() && !params.all_projects {
+            vec![(file.0.clone(), config.project_dir(&file.0)?)]
+        } else {
+            get_project_dirs(config, params)?
+        };
+        let project_dir = project_dirs
+            .iter()
+            .find(|(project, _)| project == &file.0)
+            .ok_or_else(|| crate::record_reader::reader_error("source_not_found", "source 不属于指定项目范围"))?
+            .1
+            .canonicalize()
+            .map_err(|error| crate::record_reader::reader_error("source_unavailable", error.to_string()))?;
+        if !params.subagents && file.2.parent() != Some(project_dir.as_path()) {
+            return Err(crate::record_reader::reader_error(
+                "source_not_found",
+                "子会话 source 需要 subagents=true",
+            ));
+        }
+        (project_dirs, vec![file])
+    } else {
+        let project_dirs = get_project_dirs(config, params)?;
+        let files = collect_jsonl_files(&project_dirs, &params.sessions, params.subagents)?;
+        (project_dirs, files)
+    };
     files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
     ensure_session_filters_unambiguous(&files, &params.sessions)?;
     let regex = build_search_regex(params)?;
@@ -427,6 +468,7 @@ fn build_dry_run_response(
             effective_filters: effective_filters(params),
             ignored_keys: params.ignored_keys.clone(),
             warnings: params.warnings.clone(),
+            metadata_dimensions: BTreeMap::new(),
             truncated_global: None,
         },
         results: Vec::new(),
@@ -447,7 +489,7 @@ fn collect_search_results(
     files: &[SearchFile],
     regex: Option<&Regex>,
     search_pattern: Option<&SearchPattern>,
-) -> SearchCollection {
+) -> Result<SearchCollection, ErrorResponse> {
     let mut results = Vec::new();
     let mut files_scanned = 0;
     let mut lines_scanned = 0;
@@ -461,6 +503,7 @@ fn collect_search_results(
     let mut remaining_bytes = MAX_SEARCH_RESULTS_BYTES;
 
     for (project_id, session_id, path) in files {
+        crate::record_reader::check_work()?;
         let file_result = search_file(
             project_id,
             session_id,
@@ -472,7 +515,7 @@ fn collect_search_results(
                 max_matches: GLOBAL_RESULT_CAP,
                 max_bytes: remaining_bytes,
             },
-        );
+        )?;
         files_scanned += 1;
         lines_scanned += file_result.lines_scanned;
         if file_result.truncated {
@@ -511,10 +554,21 @@ fn collect_search_results(
         incomplete_reasons.push(format!("oversized_jsonl_lines={oversized_lines}"));
     }
 
-    results.sort_by(compare_results);
-
+    let mut ordered = Vec::with_capacity(results.len());
+    for result in results {
+        crate::record_reader::check_work()?;
+        ordered.push((parse_time(&result.timestamp), result));
+    }
+    ordered.sort_by(|(a_time, a), (b_time, b)| a_time.cmp(b_time).then_with(|| compare_results(a, b)));
+    crate::record_reader::check_work()?;
     let mut seen_uuids = HashSet::new();
-    results.retain(|r| r.uuid.is_empty() || seen_uuids.insert(r.uuid.clone()));
+    let mut results = Vec::with_capacity(ordered.len());
+    for (_, result) in ordered {
+        crate::record_reader::check_work()?;
+        if result.uuid.is_empty() || seen_uuids.insert(result.uuid.clone()) {
+            results.push(result);
+        }
+    }
 
     let truncated_global = !params.aggregate && results.len() > GLOBAL_RESULT_CAP;
     if truncated_global {
@@ -522,7 +576,7 @@ fn collect_search_results(
         results.truncate(GLOBAL_RESULT_CAP);
     }
 
-    SearchCollection {
+    Ok(SearchCollection {
         files_scanned,
         lines_scanned,
         invalid_timestamps,
@@ -530,50 +584,39 @@ fn collect_search_results(
         incomplete_reasons,
         attribution_issues,
         truncated_global,
-    }
+    })
 }
 
-fn select_search_window(params: &SearchParams, all_results: &[SearchResult]) -> SearchWindow {
-    let capped_total = all_results.len();
+fn select_search_window(params: &SearchParams, capped_total: usize) -> SearchWindow {
     if let Some(slice) = &params.slice {
-        let (start_idx, end_idx) = normalize_message_slice(slice, capped_total);
-        let total_after_slice = end_idx.saturating_sub(start_idx);
-        let slice_info = SearchSliceInfo {
-            raw: slice.raw.clone(),
-            start: start_idx,
-            end: end_idx,
-            total_before_slice: capped_total,
-            total_after_slice,
-        };
+        let (start, end) = normalize_message_slice(slice, capped_total);
+        let total_after_slice = end.saturating_sub(start);
         return SearchWindow {
-            selected_results: all_results
-                .iter()
-                .skip(start_idx)
-                .take(total_after_slice)
-                .cloned()
-                .collect(),
-            slice_info: Some(slice_info),
+            range: start..end,
+            slice_info: Some(SearchSliceInfo {
+                raw: slice.raw.clone(),
+                start,
+                end,
+                total_before_slice: capped_total,
+                total_after_slice,
+            }),
             selected_count: total_after_slice,
         };
     }
-
     if params.aggregate && params.output.is_none() {
         return SearchWindow {
-            selected_results: Vec::new(),
+            range: 0..0,
             slice_info: None,
             selected_count: 0,
         };
     }
-
+    let start = params.offset.min(capped_total);
+    let selected_count = capped_total.saturating_sub(params.offset);
+    let end = start + selected_count.min(params.limit.unwrap_or(usize::MAX));
     SearchWindow {
-        selected_results: all_results
-            .iter()
-            .skip(params.offset)
-            .take(params.limit.unwrap_or(usize::MAX))
-            .cloned()
-            .collect(),
+        range: start..end,
         slice_info: None,
-        selected_count: capped_total.saturating_sub(params.offset),
+        selected_count,
     }
 }
 
@@ -605,8 +648,18 @@ fn build_search_response(
     start: Instant,
 ) -> Result<SearchResponse, ErrorResponse> {
     let total_matches = collection.results.len();
-    let window = select_search_window(&params, &collection.results);
-    let final_results = truncate_selected_results(&params, window.selected_results);
+    let window = select_search_window(&params, total_matches);
+    let coverage = build_coverage(&collection.results, &files, collection.files_scanned)?;
+    let summary = (params.summary || params.aggregate)
+        .then(|| build_summary(&collection.results))
+        .transpose()?;
+    let selected_results = collection
+        .results
+        .into_iter()
+        .skip(window.range.start)
+        .take(window.range.len())
+        .collect();
+    let final_results = truncate_selected_results(&params, selected_results);
     let has_more = !params.aggregate && final_results.len() < window.selected_count;
     if has_more {
         collection.incomplete_reasons.push("has_more".to_string());
@@ -619,12 +672,10 @@ fn build_search_response(
     } else {
         params.offset + final_results.len()
     };
-    let coverage = build_coverage(&collection.results, &files, collection.files_scanned);
-    let summary = (params.summary || params.aggregate).then(|| build_summary(&collection.results));
     let returned_results = if params.aggregate { Vec::new() } else { final_results };
     let returned_count = returned_results.len();
     let next_query = has_more.then(|| build_next_query(&params, next_offset));
-    let total_matches_exact = collection.incomplete_reasons.is_empty();
+    let total_matches_exact = collection.incomplete_reasons.iter().all(|reason| reason == "has_more");
     let warning = build_response_warning(&collection.incomplete_reasons, &collection.attribution_issues, &params);
 
     Ok(SearchResponse {
@@ -645,6 +696,7 @@ fn build_search_response(
             effective_filters: effective_filters(&params),
             ignored_keys: params.ignored_keys,
             warnings: params.warnings,
+            metadata_dimensions: BTreeMap::new(),
             truncated_global: collection.truncated_global.then_some(true),
         },
         results: returned_results,
@@ -661,13 +713,14 @@ fn build_search_response(
 }
 
 fn compact_response_size(response: &SearchResponse) -> Result<usize, ErrorResponse> {
-    serde_json::to_vec(response)
-        .map(|bytes| bytes.len())
-        .map_err(|e| ErrorResponse {
-            error: "serialize_error".to_string(),
-            message: format!("序列化搜索响应失败: {e}"),
-            available: None,
-        })
+    crate::record_reader::serialize_json(std::io::sink(), response, false)
+}
+
+fn fixed_response_size(response: &mut SearchResponse) -> Result<usize, ErrorResponse> {
+    let results = std::mem::take(&mut response.results);
+    let size = compact_response_size(response);
+    response.results = results;
+    size
 }
 
 fn update_serialized_size(response: &mut SearchResponse) -> Result<usize, ErrorResponse> {
@@ -694,100 +747,207 @@ fn mark_budget_limit(response: &mut SearchResponse) {
         response.stats.incomplete_reasons.push("max_total".to_string());
     }
     response.stats.incomplete = true;
-    response.stats.total_matches_exact = false;
     response.complete = false;
 }
 
-fn trim_summary(response: &mut SearchResponse) -> bool {
-    let Some(summary) = response.stats.summary.as_mut() else {
-        return false;
+fn trim_metadata_values<T: serde::Serialize>(
+    values: &mut Vec<T>,
+    dimension: &str,
+    dimensions: &mut BTreeMap<String, SearchMetadataDimension>,
+    estimated: &mut usize,
+    max_total: usize,
+) -> Result<(), ErrorResponse> {
+    if *estimated <= max_total || values.is_empty() {
+        return Ok(());
+    }
+    let total = values.len();
+    let old_dimensions = if dimensions.is_empty() {
+        0
+    } else {
+        crate::record_reader::serialize_json(std::io::sink(), dimensions, false)? + "metadata_dimensions".len() + 4
     };
-    for buckets in [
-        &mut summary.by_day,
-        &mut summary.by_tool,
-        &mut summary.by_server,
-        &mut summary.by_session,
-        &mut summary.by_project,
-        &mut summary.by_type,
-    ] {
-        if buckets.pop().is_some() {
-            return true;
+    if !dimensions.contains_key(dimension) {
+        let mut omitted = dimensions.clone();
+        omitted.insert(
+            dimension.to_string(),
+            SearchMetadataDimension {
+                total,
+                returned: 0,
+                omitted: total,
+            },
+        );
+        let diagnostic_bytes =
+            crate::record_reader::serialize_json(std::io::sink(), &omitted, false)? + "metadata_dimensions".len() + 4
+                - old_dimensions;
+        let field_bytes = if matches!(
+            dimension,
+            "coverage.searched_files" | "coverage.skipped_files" | "warnings" | "ignored_keys"
+        ) {
+            dimension.rsplit('.').next().expect("dimension name").len() + 4
+        } else {
+            0
+        };
+        let removable_bytes =
+            crate::record_reader::serialize_json(std::io::sink(), values, false)?.saturating_sub(2) + field_bytes;
+        if removable_bytes <= diagnostic_bytes {
+            return Ok(());
         }
     }
-    false
-}
-
-fn trim_response_metadata(response: &mut SearchResponse) -> bool {
-    if response.stats.coverage.searched_files.pop().is_some()
-        || response.stats.coverage.skipped_files.pop().is_some()
-        || response.stats.warnings.pop().is_some()
-        || response.stats.ignored_keys.pop().is_some()
-    {
-        return true;
+    dimensions
+        .entry(dimension.to_string())
+        .or_insert(SearchMetadataDimension {
+            total,
+            returned: total,
+            omitted: 0,
+        });
+    let inserted_dimensions =
+        crate::record_reader::serialize_json(std::io::sink(), dimensions, false)? + "metadata_dimensions".len() + 4;
+    *estimated += inserted_dimensions - old_dimensions;
+    while *estimated > max_total {
+        let Some(value) = values.pop() else {
+            break;
+        };
+        let bytes = crate::record_reader::serialize_json(std::io::sink(), &value, false)?;
+        *estimated = estimated.saturating_sub(bytes + usize::from(!values.is_empty()));
     }
-    trim_summary(response)
+    let entry = dimensions.get_mut(dimension).expect("dimension was inserted");
+    entry.returned = values.len();
+    entry.omitted = entry.total - entry.returned;
+    let final_dimensions =
+        crate::record_reader::serialize_json(std::io::sink(), dimensions, false)? + "metadata_dimensions".len() + 4;
+    *estimated = estimated
+        .saturating_sub(inserted_dimensions)
+        .saturating_add(final_dimensions);
+    Ok(())
 }
 
-fn replace_structured_value_with_preview(value: &mut Option<serde_json::Value>) -> bool {
+fn trim_response_metadata(
+    response: &mut SearchResponse,
+    estimated: &mut usize,
+    max_total: usize,
+) -> Result<(), ErrorResponse> {
+    let dimensions = &mut response.stats.metadata_dimensions;
+    for (name, values) in [
+        ("coverage.searched_files", &mut response.stats.coverage.searched_files),
+        ("coverage.skipped_files", &mut response.stats.coverage.skipped_files),
+        ("warnings", &mut response.stats.warnings),
+        ("ignored_keys", &mut response.stats.ignored_keys),
+    ] {
+        trim_metadata_values(values, name, dimensions, estimated, max_total)?;
+    }
+    if let Some(summary) = response.stats.summary.as_mut() {
+        for (name, values) in [
+            ("summary.by_day", &mut summary.by_day),
+            ("summary.by_tool", &mut summary.by_tool),
+            ("summary.by_server", &mut summary.by_server),
+            ("summary.by_session", &mut summary.by_session),
+            ("summary.by_project", &mut summary.by_project),
+            ("summary.by_type", &mut summary.by_type),
+        ] {
+            trim_metadata_values(values, name, dimensions, estimated, max_total)?;
+        }
+    }
+    for (name, values) in [
+        ("coverage.sessions", &mut response.stats.coverage.sessions),
+        ("coverage.projects", &mut response.stats.coverage.projects),
+    ] {
+        trim_metadata_values(values, name, dimensions, estimated, max_total)?;
+    }
+    Ok(())
+}
+
+fn structured_get_query(result: &SearchResult, view: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ref": format!("{}:{}", result.session, result.line),
+        "project": result.project,
+        "source": result.source,
+        "view": view,
+        "block": result.block,
+    })
+}
+
+fn replace_structured_value_with_preview(
+    value: &mut Option<serde_json::Value>,
+    get: serde_json::Value,
+    structured_preview: bool,
+) -> Result<bool, ErrorResponse> {
     let Some(original) = value.take() else {
-        return false;
+        return Ok(false);
     };
-    if original.get("budget_preview").and_then(serde_json::Value::as_bool) == Some(true) {
+    if original.get("budget_preview").and_then(serde_json::Value::as_bool) == Some(true)
+        && original.get("get") == Some(&get)
+    {
         *value = Some(original);
-        return false;
+        return Ok(false);
     }
-    let serialized = serde_json::to_string(&original).expect("serde_json::Value serialization cannot fail");
-    let (preview, _) = truncate_content(&serialized, 100);
+    let mut serialized = Vec::new();
+    crate::record_reader::serialize_json(&mut serialized, &original, false)?;
+    let (preview, _) = truncate_content(std::str::from_utf8(&serialized).expect("JSON is UTF-8"), 100);
     *value = Some(serde_json::json!({
         "preview": preview,
         "truncated": true,
         "budget_preview": true,
-        "original_bytes": serialized.len()
+        "original_bytes": if structured_preview { original.get("original_bytes").and_then(serde_json::Value::as_u64).unwrap_or(serialized.len() as u64) } else { serialized.len() as u64 },
+        "get": get,
     }));
-    true
+    Ok(true)
 }
 
-fn trim_last_result_metadata(response: &mut SearchResponse) -> bool {
+fn trim_last_result_metadata(response: &mut SearchResponse, query: &serde_json::Value) -> Result<bool, ErrorResponse> {
     let Some(result) = response.results.last_mut() else {
-        return false;
+        return Ok(false);
     };
-    if replace_structured_value_with_preview(&mut result.tool_result_redacted)
-        || replace_structured_value_with_preview(&mut result.tool_input_redacted)
-    {
-        result.truncated = true;
-        return true;
+    if query.get("structured").and_then(serde_json::Value::as_str) != Some("full") {
+        let mut result_get = structured_get_query(result, "tool_result");
+        let mut input_get = structured_get_query(result, "tool_input");
+        if let Some(redaction) = query.get("redaction") {
+            result_get["redaction"] = redaction.clone();
+            input_get["redaction"] = redaction.clone();
+        }
+        let structured_preview = query.get("structured").and_then(serde_json::Value::as_str) == Some("preview");
+        if replace_structured_value_with_preview(&mut result.tool_result_redacted, result_get, structured_preview)?
+            || replace_structured_value_with_preview(&mut result.tool_input_redacted, input_get, structured_preview)?
+        {
+            result.truncated = true;
+            return Ok(true);
+        }
     }
     if !result.images.is_empty() {
         result.images.clear();
         result.truncated = true;
-        return true;
+        return Ok(true);
     }
     if result.matched_filters.pop().is_some() {
         result.truncated = true;
-        return true;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
-fn shorten_last_result(response: &mut SearchResponse, max_total: usize) -> Result<bool, ErrorResponse> {
-    let Some(last_index) = response.results.len().checked_sub(1) else {
+fn shorten_last_result(
+    response: &mut SearchResponse,
+    max_total: usize,
+    other_bytes: usize,
+) -> Result<bool, ErrorResponse> {
+    let Some(result) = response.results.last_mut() else {
         return Ok(false);
     };
-    let original = response.results[last_index].content.clone();
+    let original = std::mem::take(&mut result.content);
     if original.is_empty() {
         return Ok(false);
     }
+    let original_truncated = result.truncated;
     let mut low = 0usize;
     let mut high = original.chars().count();
     let mut best = None;
     while low <= high {
+        crate::record_reader::check_work()?;
         let mid = low + (high - low) / 2;
-        let (preview, _) = truncate_content(&original, mid);
-        response.results[last_index].content = preview;
-        response.results[last_index].truncated = true;
-        let size = update_serialized_size(response)?;
-        if size <= max_total {
-            best = Some(response.results[last_index].content.clone());
+        result.content = truncate_content(&original, mid).0;
+        result.truncated = true;
+        let size = crate::record_reader::serialize_json(std::io::sink(), result, false)?;
+        if other_bytes.saturating_add(size) <= max_total {
+            best = Some(result.content.clone());
             low = mid.saturating_add(1);
         } else if mid == 0 {
             break;
@@ -796,22 +956,57 @@ fn shorten_last_result(response: &mut SearchResponse, max_total: usize) -> Resul
         }
     }
     if let Some(content) = best {
-        response.results[last_index].content = content;
-        update_serialized_size(response)?;
+        result.content = content;
         return Ok(true);
     }
-    response.results[last_index].content = original;
+    result.content = original;
+    result.truncated = original_truncated;
     Ok(false)
 }
 
-fn response_too_large_error(response: &SearchResponse, max_total: usize) -> ErrorResponse {
+fn response_too_large_error(
+    response: &SearchResponse,
+    max_total: usize,
+    mut query: serde_json::Value,
+) -> ErrorResponse {
+    let redaction = query.get("redaction").cloned();
+    let next_query = if response.serialized_bytes <= MAX_TOTAL_LIMIT {
+        query["max_total"] = serde_json::json!(
+            response
+                .serialized_bytes
+                .saturating_add(64)
+                .clamp(MIN_TOTAL_LIMIT, MAX_TOTAL_LIMIT)
+        );
+        Some(query)
+    } else {
+        None
+    };
+    let get = response.results.first().map(|result| {
+        let view = if result.tool_result_redacted.is_some() {
+            "tool_result"
+        } else if result.tool_input_redacted.is_some() {
+            "tool_input"
+        } else {
+            "content"
+        };
+        let mut get = structured_get_query(result, view);
+        if let Some(redaction) = &redaction {
+            get["redaction"] = redaction.clone();
+        }
+        get
+    });
     ErrorResponse {
         error: "response_too_large".to_string(),
-        message: "搜索响应无法在 max_total 字节预算内返回任何结果，请缩小搜索范围或提高 max_total".to_string(),
+        message: "搜索响应无法在 max_total 字节预算内返回任何结果，请使用恢复查询或 history_get 读取目标记录"
+            .to_string(),
         available: Some(serde_json::json!({
             "serialized_bytes": response.serialized_bytes,
+            "required_bytes": response.serialized_bytes,
             "max_total_bytes": max_total,
             "limits_applied": response.limits_applied,
+            "metadata_dimensions": response.stats.metadata_dimensions,
+            "next_query": next_query,
+            "get": get,
             "complete": false
         })),
     }
@@ -834,14 +1029,22 @@ fn apply_response_budget(
     }
 
     mark_budget_limit(&mut response);
+    let original_has_more = response.has_more;
+    let mut row_sizes = response
+        .results
+        .iter()
+        .map(|result| crate::record_reader::serialize_json(std::io::sink(), result, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut row_bytes: usize = row_sizes.iter().sum();
     loop {
+        crate::record_reader::check_work()?;
         response.stats.returned_count = response.results.len();
         response.next_offset = base_offset.saturating_add(response.results.len());
         let budget_removed_results = response.results.len() < original_result_count;
         response.has_more = if let Some((_, slice_end)) = slice_bounds {
             budget_removed_results && response.next_offset < slice_end
         } else {
-            response.has_more || budget_removed_results
+            original_has_more || budget_removed_results
         };
         if response.has_more {
             let next_query = response
@@ -864,22 +1067,60 @@ fn apply_response_budget(
         } else {
             response.next_query = None;
         }
-        if update_serialized_size(&mut response)? <= max_total {
-            if response.has_more && response.results.is_empty() && response.next_offset == base_offset {
-                return Err(response_too_large_error(&response, max_total));
-            }
+        let mut estimated = fixed_response_size(&mut response)?
+            .saturating_add(row_bytes)
+            .saturating_add(response.results.len().saturating_sub(1));
+        if estimated <= max_total && update_serialized_size(&mut response)? <= max_total {
             return Ok(response);
         }
-        if trim_response_metadata(&mut response) {
+        trim_response_metadata(&mut response, &mut estimated, max_total)?;
+        let fixed = fixed_response_size(&mut response)?;
+        estimated = fixed
+            .saturating_add(row_bytes)
+            .saturating_add(response.results.len().saturating_sub(1));
+        if estimated <= max_total && update_serialized_size(&mut response)? <= max_total {
+            return Ok(response);
+        }
+        let before = response.results.len();
+        while estimated > max_total && response.results.len() > 1 {
+            crate::record_reader::check_work()?;
+            response.results.pop();
+            let removed = row_sizes.pop().expect("one size per result");
+            row_bytes -= removed;
+            estimated = estimated.saturating_sub(removed + 1);
+        }
+        if response.results.len() != before {
             continue;
         }
-        if shorten_last_result(&mut response, max_total)? || trim_last_result_metadata(&mut response) {
+        let Some(last_bytes) = row_sizes.last().copied() else {
+            update_serialized_size(&mut response)?;
+            return Err(response_too_large_error(&response, max_total, continuation_query));
+        };
+        let other_bytes = fixed + row_bytes - last_bytes + response.results.len().saturating_sub(1);
+        if shorten_last_result(&mut response, max_total, other_bytes)?
+            || trim_last_result_metadata(&mut response, &continuation_query)?
+        {
+            let updated = crate::record_reader::serialize_json(
+                std::io::sink(),
+                response.results.last().expect("result exists"),
+                false,
+            )?;
+            row_bytes = row_bytes - last_bytes + updated;
+            *row_sizes.last_mut().expect("size exists") = updated;
             continue;
         }
-        if response.results.pop().is_some() {
-            continue;
+        update_serialized_size(&mut response)?;
+        let mut recovery = continuation_query;
+        if let Some((_, end)) = slice_bounds {
+            if let Some(query) = recovery.as_object_mut() {
+                query.remove("offset");
+                query.remove("limit");
+                query.insert("slice".to_string(), serde_json::json!(format!("[{base_offset}:{end}]")));
+            }
+        } else {
+            recovery["offset"] = serde_json::json!(base_offset);
         }
-        return Err(response_too_large_error(&response, max_total));
+        return Err(response_too_large_error(&response, max_total, recovery));
     }
 }
 
@@ -912,7 +1153,7 @@ fn build_response_warning(
     Some(parts.join("；"))
 }
 
-fn ensure_session_filters_unambiguous(
+pub(crate) fn ensure_session_filters_unambiguous(
     files: &[(String, String, PathBuf)],
     sessions: &[String],
 ) -> Result<(), ErrorResponse> {
@@ -922,9 +1163,10 @@ fn ensure_session_filters_unambiguous(
 
     for filter in sessions {
         let mut matches = BTreeSet::new();
-        for (project, session, _) in files {
+        for (project, session, source) in files {
+            crate::record_reader::check_work()?;
             if session_matches_ref(session, filter) {
-                matches.insert(format!("{project}:{session}"));
+                matches.insert((project, session, source));
             }
         }
         if matches.is_empty() {
@@ -937,8 +1179,13 @@ fn ensure_session_filters_unambiguous(
         if matches.len() > 1 {
             return Err(ErrorResponse {
                 error: "session_ambiguous".to_string(),
-                message: format!("session 过滤条件不唯一: {filter}，请使用完整 session id 或指定 project"),
-                available: Some(serde_json::json!({ "candidates": matches.into_iter().collect::<Vec<_>>() })),
+                message: format!(
+                    "session 过滤条件不唯一: {filter}；请使用完整 session id、project 或返回的 source 精确选择来源"
+                ),
+                available: Some(serde_json::json!({
+                    "candidates": matches.iter().map(|(project, session, _)| format!("{project}:{session}")).collect::<Vec<_>>(),
+                    "sources": matches.iter().map(|(project, session, source)| serde_json::json!({"project": project, "session": session, "source": source})).collect::<Vec<_>>()
+                })),
             });
         }
     }
@@ -946,8 +1193,11 @@ fn ensure_session_filters_unambiguous(
     Ok(())
 }
 
-fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Value {
+pub(crate) fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Value {
     let mut query = serde_json::Map::new();
+    if let Some(source) = &params.source {
+        query.insert("source".to_string(), serde_json::json!(source));
+    }
     if !params.pattern.is_empty() {
         query.insert("pattern".to_string(), serde_json::Value::String(params.pattern.clone()));
     }
@@ -1005,6 +1255,19 @@ fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Va
     if params.summary {
         query.insert("summary".to_string(), serde_json::Value::Bool(true));
     }
+    if params.aggregate {
+        query.insert("aggregate".to_string(), serde_json::Value::Bool(true));
+    }
+    if params.dry_run {
+        query.insert("dry_run".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(structured) = &params.structured {
+        query.insert("structured".to_string(), serde_json::json!(structured));
+    }
+    if let Some(slice) = &params.slice {
+        query.remove("offset");
+        query.insert("slice".to_string(), serde_json::json!(slice.raw));
+    }
     if params.failed_tool_results {
         query.insert("failed_tool_results".to_string(), serde_json::Value::Bool(true));
     }
@@ -1026,14 +1289,20 @@ fn build_next_query(params: &SearchParams, next_offset: usize) -> serde_json::Va
             serde_json::Value::String(params.redaction.as_str().to_string()),
         );
     }
-    query.insert("offset".to_string(), serde_json::json!(next_offset));
+    if params.slice.is_none() {
+        query.insert("offset".to_string(), serde_json::json!(next_offset));
+    }
     if let Some(limit) = params.limit {
-        query.insert("limit".to_string(), serde_json::json!(limit));
+        query.insert("limit".to_string(), serde_json::json!(limit.max(1)));
     }
     serde_json::Value::Object(query)
 }
 
-fn build_coverage(results: &[SearchResult], files: &[SearchFile], files_scanned: usize) -> SearchCoverage {
+fn build_coverage(
+    results: &[SearchResult],
+    files: &[SearchFile],
+    files_scanned: usize,
+) -> Result<SearchCoverage, ErrorResponse> {
     let (attempted, skipped) = files.split_at(files_scanned);
     let mut projects = BTreeSet::new();
     let mut sessions = BTreeSet::new();
@@ -1041,6 +1310,7 @@ fn build_coverage(results: &[SearchResult], files: &[SearchFile], files_scanned:
     let mut end: Option<String> = None;
 
     for result in results {
+        crate::record_reader::check_work()?;
         projects.insert(result.project.clone());
         sessions.insert(result.session.clone());
         if start
@@ -1057,14 +1327,15 @@ fn build_coverage(results: &[SearchResult], files: &[SearchFile], files_scanned:
         }
     }
 
-    SearchCoverage {
+    crate::record_reader::check_work()?;
+    Ok(SearchCoverage {
         start,
         end,
         projects: projects.into_iter().collect(),
         sessions: sessions.into_iter().collect(),
         searched_files: searched_files(attempted),
         skipped_files: searched_files(skipped),
-    }
+    })
 }
 
 fn buckets(map: BTreeMap<String, usize>) -> Vec<SummaryBucket> {
@@ -1073,7 +1344,7 @@ fn buckets(map: BTreeMap<String, usize>) -> Vec<SummaryBucket> {
         .collect()
 }
 
-fn build_summary(results: &[SearchResult]) -> SearchSummary {
+fn build_summary(results: &[SearchResult]) -> Result<SearchSummary, ErrorResponse> {
     let mut by_project = BTreeMap::new();
     let mut by_session = BTreeMap::new();
     let mut by_type = BTreeMap::new();
@@ -1082,6 +1353,7 @@ fn build_summary(results: &[SearchResult]) -> SearchSummary {
     let mut by_day = BTreeMap::new();
 
     for result in results {
+        crate::record_reader::check_work()?;
         *by_project.entry(result.project.clone()).or_insert(0) += 1;
         *by_session.entry(result.session.clone()).or_insert(0) += 1;
         *by_type
@@ -1098,14 +1370,15 @@ fn build_summary(results: &[SearchResult]) -> SearchSummary {
         }
     }
 
-    SearchSummary {
+    crate::record_reader::check_work()?;
+    Ok(SearchSummary {
         by_project: buckets(by_project),
         by_session: buckets(by_session),
         by_type: buckets(by_type),
         by_server: buckets(by_server),
         by_tool: buckets(by_tool),
         by_day: buckets(by_day),
-    }
+    })
 }
 
 fn resolve_search_output_paths(raw_output: &str) -> Result<ResolvedOutputFiles, ErrorResponse> {
@@ -1279,16 +1552,7 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         "redaction": &redaction,
     });
     let mut manifest_file = open_private_output_file(ctx.staging_manifest)?;
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| ErrorResponse {
-        error: "serialize_error".to_string(),
-        message: format!("无法序列化 search manifest: {e}"),
-        available: None,
-    })?;
-    manifest_file.write_all(&manifest_bytes).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("写入搜索 manifest 失败: {e}"),
-        available: None,
-    })?;
+    crate::record_reader::serialize_json(&mut manifest_file, &manifest, true)?;
     manifest_file.sync_all().map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("同步搜索 manifest 失败: {e}"),
@@ -1315,7 +1579,10 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
 }
 
 /// 获取要搜索的项目目录
-fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(String, PathBuf)>, ErrorResponse> {
+pub(crate) fn get_project_dirs(
+    config: &Config,
+    params: &SearchParams,
+) -> Result<Vec<(String, PathBuf)>, ErrorResponse> {
     if params.all_projects && !params.projects.is_empty() {
         return Err(ErrorResponse {
             error: "invalid_arguments".to_string(),
@@ -1366,74 +1633,13 @@ fn get_project_dirs(config: &Config, params: &SearchParams) -> Result<Vec<(Strin
     })
 }
 
-/// 检查 session 是否匹配过滤条件
-fn session_matches_filter(session_id: &str, sessions: &[String]) -> bool {
-    if sessions.is_empty() {
-        return true;
-    }
-    sessions.iter().any(|session| session_matches_ref(session_id, session))
-}
-
 /// 收集所有 jsonl 文件
 fn collect_jsonl_files(
     project_dirs: &[(String, PathBuf)],
     sessions: &[String],
     include_subagents: bool,
 ) -> Result<Vec<(String, String, PathBuf)>, ErrorResponse> {
-    let mut files = Vec::new();
-
-    for (project_id, dir) in project_dirs {
-        for entry in fs::read_dir(dir).map_err(search_io_error)? {
-            let entry = entry.map_err(search_io_error)?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "jsonl") {
-                if let Some(session_id) = session_id_from_filename(&entry.file_name().to_string_lossy())
-                    && session_matches_filter(&session_id, sessions)
-                {
-                    files.push((project_id.clone(), session_id, path));
-                }
-                continue;
-            }
-            if !include_subagents || !entry.file_type().map_err(search_io_error)?.is_dir() {
-                continue;
-            }
-            for sidechain_dir in SIDECHAIN_SESSION_DIRS {
-                let subdir = path.join(sidechain_dir);
-                let sub_entries = match fs::read_dir(&subdir) {
-                    Ok(entries) => entries,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(search_io_error(e)),
-                };
-                for sub_entry in sub_entries {
-                    let sub_entry = sub_entry.map_err(search_io_error)?;
-                    let path = sub_entry.path();
-                    if path.extension().is_none_or(|ext| ext != "jsonl") {
-                        continue;
-                    }
-                    let filename = sub_entry.file_name().to_string_lossy().to_string();
-                    if let Some(session_id) = filename
-                        .strip_prefix("agent-")
-                        .and_then(|name| name.strip_suffix(".jsonl"))
-                    {
-                        let session_id = format!("agent-{session_id}");
-                        if session_matches_filter(&session_id, sessions) {
-                            files.push((project_id.clone(), session_id, path));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(files)
-}
-
-fn search_io_error(error: std::io::Error) -> ErrorResponse {
-    ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("枚举会话失败: {error}"),
-        available: None,
-    }
+    crate::session_files::collect_session_files(project_dirs, sessions, include_subagents)
 }
 
 fn search_aggregate_streaming(
@@ -1457,14 +1663,16 @@ fn search_aggregate_streaming(
     let mut oversized_lines = 0usize;
 
     'files: for (project_id, session_id, path) in files {
+        crate::record_reader::check_work()?;
         files_scanned += 1;
-        let Ok(input) = File::open(path) else {
+        let Ok(input) = crate::session_files::open_session_file(path) else {
             read_errors += 1;
             continue;
         };
         let prefix = ref_prefix(session_id);
         let mut tool_tracker = ToolAssociationTracker::default();
         for (line_num, line) in bounded_jsonl_lines(BufReader::new(input)).enumerate() {
+            crate::record_reader::check_work()?;
             let line_num = line_num + 1;
             lines_scanned += 1;
             let in_range = line_in_ranges(line_num, &params.lines);
@@ -1516,12 +1724,13 @@ fn search_aggregate_streaming(
             let ctx = RecordBuildContext {
                 project_id,
                 session_id,
+                source: path,
                 prefix: &prefix,
                 params,
                 regex,
                 pattern,
             };
-            let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues)
+            let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues)?
             else {
                 continue;
             };
@@ -1558,6 +1767,7 @@ fn search_aggregate_streaming(
     }
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
+    crate::record_reader::check_work()?;
     let summary_value = Some(aggregation.summary());
     let coverage = aggregation.coverage(files, files_scanned);
     let warning = build_response_warning(&incomplete_reasons, &attribution_issues, params);
@@ -1580,6 +1790,7 @@ fn search_aggregate_streaming(
             effective_filters: effective_filters(params),
             ignored_keys: params.ignored_keys.clone(),
             warnings: params.warnings.clone(),
+            metadata_dimensions: BTreeMap::new(),
             truncated_global: None,
         },
         results: Vec::new(),
@@ -1602,14 +1813,22 @@ fn search_to_output_bounded(
     pattern: Option<&SearchPattern>,
     start: Instant,
 ) -> Result<SearchResponse, ErrorResponse> {
-    let collection = collect_search_results(params, files, regex, pattern);
+    let collection = collect_search_results(params, files, regex, pattern)?;
     let total_matches = collection.results.len();
-    let window = select_search_window(params, &collection.results);
-    let selected_results = truncate_selected_results(params, window.selected_results);
+    let window = select_search_window(params, total_matches);
     let mut incomplete_reasons = collection.incomplete_reasons;
     let attribution_issues = collection.attribution_issues;
-    let coverage = build_coverage(&collection.results, files, collection.files_scanned);
-    let summary = (params.summary || params.aggregate).then(|| build_summary(&collection.results));
+    let coverage = build_coverage(&collection.results, files, collection.files_scanned)?;
+    let summary = (params.summary || params.aggregate)
+        .then(|| build_summary(&collection.results))
+        .transpose()?;
+    let selected_results = collection
+        .results
+        .into_iter()
+        .skip(window.range.start)
+        .take(window.range.len())
+        .collect();
+    let selected_results = truncate_selected_results(params, selected_results);
 
     let resolved = resolve_search_output_paths(params.output.as_deref().expect("output checked by caller"))?;
     let temp_output = resolved.temp_output;
@@ -1626,21 +1845,20 @@ fn search_to_output_bounded(
             push_unique(&mut incomplete_reasons, "export_record_cap");
             break;
         }
-        let line = serde_json::to_string(&result).map_err(|e| ErrorResponse {
-            error: "serialize_error".to_string(),
-            message: format!("序列化搜索结果失败: {e}"),
-            available: None,
-        })?;
+        let mut line = Vec::new();
+        crate::record_reader::serialize_json(&mut line, &result, false)?;
         let next_bytes = bytes.saturating_add(line.len() as u64 + 1);
         if next_bytes > MAX_EXPORT_BYTES {
             push_unique(&mut incomplete_reasons, "export_byte_cap");
             break;
         }
-        writeln!(file, "{line}").map_err(|e| ErrorResponse {
-            error: "io_error".to_string(),
-            message: format!("写入搜索结果失败: {e}"),
-            available: None,
-        })?;
+        file.write_all(&line)
+            .and_then(|_| file.write_all(b"\n"))
+            .map_err(|e| ErrorResponse {
+                error: "io_error".to_string(),
+                message: format!("写入搜索结果失败: {e}"),
+                available: None,
+            })?;
         bytes = next_bytes;
         written_count += 1;
         content_truncated_count += usize::from(result.truncated);
@@ -1697,6 +1915,7 @@ fn search_to_output_bounded(
             effective_filters: effective_filters(params),
             ignored_keys: params.ignored_keys.clone(),
             warnings: params.warnings.clone(),
+            metadata_dimensions: BTreeMap::new(),
             truncated_global: collection.truncated_global.then_some(true),
         },
         results: Vec::new(),
@@ -1711,20 +1930,22 @@ fn search_to_output_bounded(
         complete,
     };
     let response = apply_response_budget(response, params.max_total, build_next_query(params, params.offset))?;
+    crate::record_reader::check_work()?;
     transaction.publish()?;
     Ok(response)
 }
 
-struct RecordBuildContext<'a> {
-    project_id: &'a str,
-    session_id: &'a str,
-    prefix: &'a str,
-    params: &'a SearchParams,
-    regex: Option<&'a Regex>,
-    pattern: Option<&'a SearchPattern>,
+pub(crate) struct RecordBuildContext<'a> {
+    pub project_id: &'a str,
+    pub session_id: &'a str,
+    pub source: &'a Path,
+    pub prefix: &'a str,
+    pub params: &'a SearchParams,
+    pub regex: Option<&'a Regex>,
+    pub pattern: Option<&'a SearchPattern>,
 }
 
-fn tool_block_matches(block: &AssociatedToolBlock, params: &SearchParams) -> bool {
+pub(crate) fn tool_block_matches(block: &AssociatedToolBlock, params: &SearchParams) -> bool {
     let server_matches = params.servers.is_empty()
         || block
             .info
@@ -1741,7 +1962,7 @@ fn tool_block_matches(block: &AssociatedToolBlock, params: &SearchParams) -> boo
     server_matches && tool_matches && failed_matches && payload_matches
 }
 
-fn has_tool_filter(params: &SearchParams) -> bool {
+pub(crate) fn has_tool_filter(params: &SearchParams) -> bool {
     !params.servers.is_empty() || !params.tools.is_empty() || params.failed_tool_results || params.tool_payload_errors
 }
 
@@ -1751,7 +1972,10 @@ fn push_attribution_filter_reason(params: &SearchParams, reasons: &mut Vec<Strin
     }
 }
 
-fn select_tool_block<'a>(blocks: &'a [AssociatedToolBlock], params: &SearchParams) -> Option<&'a AssociatedToolBlock> {
+pub(crate) fn select_tool_block<'a>(
+    blocks: &'a [AssociatedToolBlock],
+    params: &SearchParams,
+) -> Option<&'a AssociatedToolBlock> {
     if has_tool_filter(params) {
         blocks.iter().find(|block| tool_block_matches(block, params))
     } else {
@@ -1759,26 +1983,63 @@ fn select_tool_block<'a>(blocks: &'a [AssociatedToolBlock], params: &SearchParam
     }
 }
 
-fn build_search_result(
+pub(crate) fn matched_filters(
+    params: &SearchParams,
+    project: &str,
+    session: &str,
+    effective_type: &str,
+    subtype: &str,
+    tool_info: &ToolInfo,
+) -> Vec<String> {
+    let mut filters = vec![
+        format!("project={project}"),
+        format!("session={session}"),
+        format!("type={effective_type}"),
+        format!("subtype={subtype}"),
+    ];
+    if let Some(source) = &params.source {
+        filters.push(format!("source={source}"));
+    }
+    if params.since.is_some() || params.until.is_some() {
+        filters.push("time=true".to_string());
+    }
+    if let Some(server) = &tool_info.server {
+        filters.push(format!("server={server}"));
+    }
+    if let Some(tool) = &tool_info.tool {
+        filters.push(format!("tool={tool}"));
+    }
+    if params.failed_tool_results {
+        filters.push("failed_tool_results=true".to_string());
+    }
+    if params.tool_payload_errors {
+        filters.push("tool_payload_errors=true".to_string());
+    }
+    filters
+}
+
+pub(crate) fn build_search_result(
     ctx: &RecordBuildContext<'_>,
     line_num: usize,
     record: MessageRecord,
     tool_blocks: &[AssociatedToolBlock],
     attribution_issues: &mut Vec<String>,
-) -> Option<SearchResult> {
+) -> Result<Option<SearchResult>, ErrorResponse> {
+    crate::record_reader::check_work()?;
     let (effective_type, subtype) = classify_message(&record);
     if !ctx.params.types.iter().any(|t| t == effective_type) {
-        return None;
+        return Ok(None);
     }
     if !ctx.params.subtypes.is_empty() && !ctx.params.subtypes.iter().any(|s| s == subtype) {
-        return None;
+        return Ok(None);
     }
     if time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref()) != TimeRangeMatch::Matches
     {
-        return None;
+        return Ok(None);
     }
 
     let (raw_content, images) = extract_and_replace_images(&record);
+    crate::record_reader::check_work()?;
     let (matches, match_pos) = if ctx.params.pattern.is_empty() {
         (true, None)
     } else if let Some(regex) = ctx.regex {
@@ -1790,11 +2051,13 @@ fn build_search_result(
     } else {
         (true, None)
     };
+    crate::record_reader::check_work()?;
     if !matches {
-        return None;
+        return Ok(None);
     }
 
     for block in tool_blocks {
+        crate::record_reader::check_work()?;
         if (!ctx.params.failed_tool_results || block.result_is_error == Some(true))
             && (!ctx.params.tool_payload_errors || block.result_has_error_payload == Some(true))
             && let Some(issue) = &block.metadata_incomplete_reason
@@ -1804,42 +2067,53 @@ fn build_search_result(
     }
     let selected_tool_block = select_tool_block(tool_blocks, ctx.params);
     if has_tool_filter(ctx.params) && selected_tool_block.is_none() {
-        return None;
+        return Ok(None);
     }
     let tool_info = selected_tool_block.map(|block| block.info.clone()).unwrap_or(ToolInfo {
         server: None,
         tool: None,
     });
     let metadata_incomplete_reason = selected_tool_block.and_then(|block| block.metadata_incomplete_reason.clone());
-    let rendered_tool_block = selected_tool_block.map(|block| render_tool_block(block, ctx.params.redaction));
+    let rendered_tool_block = selected_tool_block.map(|block| {
+        let mut rendered = render_tool_block(block, ctx.params.redaction);
+        crate::record_reader::check_work()?;
+        if ctx.params.structured.as_deref() == Some("preview") {
+            for (value, view, limit) in [
+                (&mut rendered.input, "tool_input", ctx.params.max_content),
+                (&mut rendered.result, "tool_result", ctx.params.max_content_tool_result),
+            ] {
+                if let Some(full) = value.take() {
+                    let mut serialized = Vec::new();
+                    crate::record_reader::serialize_json(&mut serialized, &full, false)?;
+                    let (preview, truncated) = truncate_content(std::str::from_utf8(&serialized).expect("JSON is UTF-8"), limit);
+                    *value = Some(serde_json::json!({
+                        "preview": preview, "truncated": truncated, "original_bytes": serialized.len(),
+                        "get": {"ref": format!("{}:{}", ctx.session_id, line_num), "project": ctx.project_id, "source": ctx.source, "view": view, "block": block.block_index, "redaction": ctx.params.redaction.as_str()}
+                    }));
+                }
+            }
+        }
+        Ok::<_, ErrorResponse>(rendered)
+    }).transpose()?;
     let text_redaction = redact_text_with_mode(&raw_content, ctx.params.redaction);
+    crate::record_reader::check_work()?;
     let content_redacted = text_redaction.count > 0;
     let content = text_redaction.text;
     let content_size = raw_content.chars().count();
     let image_count = images.len();
-    let mut matched_filters = vec![
-        format!("project={}", ctx.project_id),
-        format!("session={}", ctx.session_id),
-        format!("type={}", effective_type),
-        format!("subtype={}", subtype),
-    ];
-    if ctx.params.since.is_some() || ctx.params.until.is_some() {
-        matched_filters.push("time=true".to_string());
-    }
-    if let Some(server) = &tool_info.server {
-        matched_filters.push(format!("server={server}"));
-    }
-    if let Some(tool) = &tool_info.tool {
-        matched_filters.push(format!("tool={tool}"));
-    }
-    if ctx.params.failed_tool_results {
-        matched_filters.push("failed_tool_results=true".to_string());
-    }
-    if ctx.params.tool_payload_errors {
-        matched_filters.push("tool_payload_errors=true".to_string());
-    }
-
-    Some(SearchResult {
+    let matched_filters = matched_filters(
+        ctx.params,
+        ctx.project_id,
+        ctx.session_id,
+        effective_type,
+        subtype,
+        &tool_info,
+    );
+    let (tool_input_redacted, tool_result_redacted, raw_available, redacted) = rendered_tool_block
+        .map_or((None, None, false, false), |block| {
+            (block.input, block.result, block.raw_available, block.redacted)
+        });
+    Ok(Some(SearchResult {
         r#ref: format!("{}:{}", ctx.prefix, line_num),
         session: ctx.session_id.to_string(),
         line: line_num,
@@ -1853,20 +2127,20 @@ fn build_search_result(
         image_count,
         images,
         project: ctx.project_id.to_string(),
+        source: Some(ctx.source.to_string_lossy().into_owned()),
+        block: selected_tool_block.map(|block| block.block_index),
         server: tool_info.server,
         tool: tool_info.tool,
         metadata_incomplete_reason,
-        tool_input_redacted: rendered_tool_block.as_ref().and_then(|block| block.input.clone()),
-        tool_result_redacted: rendered_tool_block.as_ref().and_then(|block| block.result.clone()),
+        tool_input_redacted,
+        tool_result_redacted,
         tool_result_is_error: selected_tool_block.and_then(|block| block.result_is_error),
         tool_result_has_error_payload: selected_tool_block.and_then(|block| block.result_has_error_payload),
-        raw_available: (rendered_tool_block.as_ref().is_some_and(|block| block.raw_available) || content_redacted)
-            .then_some(true),
-        redacted: (rendered_tool_block.as_ref().is_some_and(|block| block.redacted) || content_redacted)
-            .then_some(true),
+        raw_available: (raw_available || content_redacted).then_some(true),
+        redacted: (redacted || content_redacted).then_some(true),
         matched_filters,
         match_pos: (!content_redacted).then_some(match_pos).flatten(),
-    })
+    }))
 }
 
 /// 搜索单个文件
@@ -1878,7 +2152,8 @@ fn search_file(
     regex: Option<&Regex>,
     pattern: Option<&SearchPattern>,
     limits: FileSearchLimits,
-) -> FileSearchResult {
+) -> Result<FileSearchResult, ErrorResponse> {
+    crate::record_reader::check_work()?;
     let mut results = Vec::new();
     let mut lines_scanned = 0;
     let mut truncated = false;
@@ -1892,10 +2167,11 @@ fn search_file(
     let mut memory_capped = false;
     let mut oversized_lines = 0usize;
 
-    let file = match File::open(path) {
+    let file = match crate::session_files::open_session_file(path) {
         Ok(f) => f,
         Err(_) => {
-            return FileSearchResult {
+            crate::record_reader::check_work()?;
+            return Ok(FileSearchResult {
                 lines_scanned: 0,
                 results,
                 truncated: false,
@@ -1908,7 +2184,7 @@ fn search_file(
                 result_bytes: 0,
                 memory_capped: false,
                 oversized_lines: 0,
-            };
+            });
         }
     };
 
@@ -1917,6 +2193,7 @@ fn search_file(
     let mut tool_tracker = ToolAssociationTracker::default();
 
     for (line_num, line) in bounded_jsonl_lines(reader).enumerate() {
+        crate::record_reader::check_work()?;
         let line_num = line_num + 1; // 1-based
         lines_scanned += 1;
 
@@ -1971,17 +2248,18 @@ fn search_file(
         let ctx = RecordBuildContext {
             project_id,
             session_id,
+            source: path,
             prefix: &prefix,
             params,
             regex,
             pattern,
         };
-        if let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues) {
+        if let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues)? {
             if results.len() == limits.max_matches {
                 truncated = true;
                 break;
             }
-            let bytes = serde_json::to_vec(&result).map_or(MAX_SEARCH_RESULTS_BYTES + 1, |json| json.len());
+            let bytes = crate::record_reader::serialize_json(std::io::sink(), &result, false)?;
             if bytes > limits.max_bytes.saturating_sub(result_bytes) {
                 memory_capped = true;
                 break;
@@ -1991,7 +2269,8 @@ fn search_file(
         }
     }
 
-    FileSearchResult {
+    crate::record_reader::check_work()?;
+    Ok(FileSearchResult {
         lines_scanned,
         results,
         truncated,
@@ -2004,7 +2283,7 @@ fn search_file(
         result_bytes,
         memory_capped,
         oversized_lines,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2114,6 +2393,100 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    #[ignore = "explicit synthetic phase measurement"]
+    fn normal_summary_phase_measurement() {
+        for count in [200, 1000] {
+            let owner = format!(
+                "{}-{}",
+                process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let root = env::temp_dir().join(format!("history-summary-measurement-{owner}"));
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join(".owner"), &owner).unwrap();
+            let directory = root.join("-summary-fixture");
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("summary0.jsonl");
+            let mut output = std::io::BufWriter::new(File::create(&path).unwrap());
+            for index in 0..count {
+                let record = serde_json::json!({"uuid":format!("summary-{index}"), "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":format!("call-{index}"), "name":format!("mcp__fixture__probe_{index}"), "input":{"note":"x".repeat(1500), "password":"synthetic-not-a-credential"}}]}});
+                writeln!(output, "{record}").unwrap();
+            }
+            output.flush().unwrap();
+            drop(output);
+            let read = Instant::now();
+            let raw = fs::read_to_string(&path).unwrap();
+            let read_ms = read.elapsed().as_secs_f64() * 1000.0;
+            let parse = Instant::now();
+            let records: Vec<_> = raw
+                .lines()
+                .map(|line| parse_message_record(line).unwrap().unwrap())
+                .collect();
+            let parse_ms = parse.elapsed().as_secs_f64() * 1000.0;
+            let redaction = Instant::now();
+            for record in &records {
+                std::hint::black_box(redact_text_with_mode(
+                    &replace_images_with_placeholders(record),
+                    RedactionMode::Auto,
+                ));
+            }
+            let redaction_ms = redaction.elapsed().as_secs_f64() * 1000.0;
+            let config = Config {
+                projects_dir: root.clone(),
+            };
+            let (since, until) =
+                parse_time_bounds(Some("2026-07-14T00:00:00Z"), Some("2026-10-12T12:33:55.391Z")).unwrap();
+            let params = prepare_search_params(SearchParams {
+                all_projects: true,
+                summary: true,
+                since,
+                until,
+                limit: None,
+                max_total: 38000,
+                ..SearchParams::default()
+            })
+            .unwrap();
+            let files = vec![("-summary-fixture".to_string(), "summary0".to_string(), path)];
+            let collect = Instant::now();
+            let collection = collect_search_results(&params, &files, None, None).unwrap();
+            let collect_ms = collect.elapsed().as_secs_f64() * 1000.0;
+            let summary = Instant::now();
+            std::hint::black_box(build_summary(&collection.results).unwrap());
+            let summary_ms = summary.elapsed().as_secs_f64() * 1000.0;
+            let response = build_search_response(params.clone(), files, collection, Instant::now()).unwrap();
+            let serialize = Instant::now();
+            let full_bytes = compact_response_size(&response).unwrap();
+            let serialize_full_ms = serialize.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "{}",
+                serde_json::json!({"phase":"before_budget", "records":count, "source_bytes":raw.len(), "full_response_bytes":full_bytes, "read_ms":read_ms, "parse_ms":parse_ms, "redaction_ms":redaction_ms, "collect_ms":collect_ms, "summary_ms":summary_ms, "serialize_full_ms":serialize_full_ms})
+            );
+            let budget = Instant::now();
+            let budgeted = apply_response_budget(response, params.max_total, build_next_query(&params, 0)).unwrap();
+            let budget_ms = budget.elapsed().as_secs_f64() * 1000.0;
+            assert!(budgeted.serialized_bytes <= 38000);
+            assert_eq!(budgeted.stats.total_matches, count);
+            assert!(budgeted.stats.total_matches_exact);
+            assert!(budgeted.has_more);
+            assert_eq!(budgeted.next_offset, budgeted.results.len());
+            let query = Instant::now();
+            let response = search(&config, params).unwrap();
+            let query_ms = query.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(response.stats.total_matches, count);
+            assert!(!response.results.is_empty());
+            println!(
+                "{}",
+                serde_json::json!({"records":count, "source_bytes":raw.len(), "full_response_bytes":full_bytes, "response_bytes":response.serialized_bytes, "returned":response.results.len(), "read_ms":read_ms, "parse_ms":parse_ms, "redaction_ms":redaction_ms, "collect_ms":collect_ms, "summary_ms":summary_ms, "serialize_full_ms":serialize_full_ms, "budget_ms":budget_ms, "query_ms":query_ms})
+            );
+            assert_eq!(fs::read_to_string(root.join(".owner")).unwrap(), owner);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     fn response_with_content(content: String) -> SearchResponse {
         SearchResponse {
             stats: SearchStats {
@@ -2140,6 +2513,7 @@ mod tests {
                 effective_filters: effective_filters(&SearchParams::default()),
                 ignored_keys: Vec::new(),
                 warnings: Vec::new(),
+                metadata_dimensions: BTreeMap::new(),
                 truncated_global: None,
             },
             results: vec![SearchResult {
@@ -2156,6 +2530,8 @@ mod tests {
                 image_count: 0,
                 images: Vec::new(),
                 project: "project".to_string(),
+                source: None,
+                block: None,
                 server: None,
                 tool: None,
                 metadata_incomplete_reason: None,
@@ -2181,6 +2557,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_result_summary_query_keeps_exact_counts_and_a_progressing_next_query() {
+        let params = SearchParams {
+            limit: Some(0),
+            summary: true,
+            structured: Some("preview".to_string()),
+            ..SearchParams::default()
+        };
+        let collection = SearchCollection {
+            files_scanned: 0,
+            lines_scanned: 0,
+            invalid_timestamps: 0,
+            results: response_with_content("fixture".to_string()).results,
+            incomplete_reasons: Vec::new(),
+            attribution_issues: Vec::new(),
+            truncated_global: false,
+        };
+        let response = build_search_response(params, Vec::new(), collection, Instant::now()).unwrap();
+        assert!(response.results.is_empty());
+        assert!(response.has_more);
+        assert_eq!(response.stats.total_matches, 1);
+        assert!(response.stats.total_matches_exact);
+        let next = response.next_query.unwrap();
+        assert_eq!(next["offset"], 0);
+        assert_eq!(next["limit"], 1);
+        assert_eq!(next["structured"], "preview");
+        assert_eq!(next["summary"], true);
+    }
+
+    #[test]
     fn final_response_budget_counts_compact_json_bytes() {
         let response = response_with_content("\\\"中文".repeat(2_000));
         let continuation = build_next_query(&SearchParams::default(), 0);
@@ -2194,11 +2599,163 @@ mod tests {
     }
 
     #[test]
+    fn budget_metadata_reports_each_omitted_dimension_without_changing_exact_counts() {
+        let mut response = response_with_content("fixture".to_string());
+        let buckets = (0..200)
+            .map(|index| SummaryBucket {
+                key: format!("bucket-中文-\\\"-{index:04}-{}", "x".repeat(40)),
+                count: index + 1,
+            })
+            .collect::<Vec<_>>();
+        response.stats.summary = Some(SearchSummary {
+            by_project: buckets.clone(),
+            by_session: buckets.clone(),
+            by_type: buckets.clone(),
+            by_server: buckets.clone(),
+            by_tool: buckets.clone(),
+            by_day: buckets,
+        });
+        response.stats.total_matches = 200;
+        let budgeted = apply_response_budget(response, 8_192, build_next_query(&SearchParams::default(), 0)).unwrap();
+        let body = serde_json::to_value(&budgeted).unwrap();
+        for name in ["by_project", "by_session", "by_type", "by_server", "by_tool", "by_day"] {
+            let returned = body["stats"]["summary"][name].as_array().unwrap().len();
+            if returned < 200 {
+                let dimension = &body["stats"]["metadata_dimensions"][format!("summary.{name}")];
+                assert_eq!(dimension["total"], 200);
+                assert_eq!(dimension["returned"], returned);
+                assert_eq!(dimension["omitted"], 200 - returned);
+            }
+        }
+        assert_eq!(budgeted.stats.total_matches, 200);
+        assert!(budgeted.stats.total_matches_exact);
+        assert!(budgeted.stats.incomplete);
+        assert!(!budgeted.complete);
+        assert_eq!(budgeted.serialized_bytes, serde_json::to_vec(&budgeted).unwrap().len());
+        assert!(budgeted.serialized_bytes <= 8_192);
+    }
+
+    #[test]
+    fn budget_full_structured_rejection_has_exact_source_and_executable_query() {
+        let mut response = response_with_content("fixture".to_string());
+        response.results[0].tool_input_redacted = Some(serde_json::json!({"payload":"x".repeat(20_000)}));
+        response.results[0].source = Some("/fixture/project/session.jsonl".to_string());
+        response.results[0].block = Some(3);
+        let params = SearchParams {
+            structured: Some("full".to_string()),
+            redaction: RedactionMode::Strict,
+            summary: true,
+            ..SearchParams::default()
+        };
+        let error = apply_response_budget(response.clone(), 2_000, build_next_query(&params, 0)).unwrap_err();
+        let available = error.available.unwrap();
+        assert_eq!(error.error, "response_too_large");
+        assert_eq!(available["get"]["source"], "/fixture/project/session.jsonl");
+        assert_eq!(available["get"]["view"], "tool_input");
+        assert_eq!(available["get"]["block"], 3);
+        assert_eq!(available["next_query"]["structured"], "full");
+        assert_eq!(available["next_query"]["redaction"], "strict");
+        assert_eq!(available["next_query"]["summary"], true);
+        let next = available["next_query"].clone();
+        let max_total = next["max_total"].as_u64().unwrap() as usize;
+        let recovered = apply_response_budget(response, max_total, next).unwrap();
+        assert!(
+            recovered.results[0]
+                .tool_input_redacted
+                .as_ref()
+                .unwrap()
+                .get("budget_preview")
+                .is_none()
+        );
+        assert!(recovered.stats.total_matches_exact);
+        assert!(recovered.serialized_bytes <= max_total);
+    }
+
+    #[test]
+    fn budget_and_json_serialization_stop_during_cpu_work() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let control = crate::record_reader::WorkControl::from_checkpoint(move |_| {
+            if observed.fetch_add(1, Ordering::SeqCst) >= 10 {
+                return Err(crate::record_reader::reader_error("cancelled", "fixture cancellation"));
+            }
+            Ok(())
+        });
+        let response = response_with_content("x".repeat(1_000_000));
+        let error = control
+            .run(|| apply_response_budget(response, 2_000, build_next_query(&SearchParams::default(), 0)))
+            .unwrap_err();
+        assert_eq!(error.error, "cancelled");
+        assert_eq!(calls.load(Ordering::SeqCst), 11);
+        assert!(crate::record_reader::check_work().is_ok());
+    }
+
+    #[test]
+    fn normal_and_aggregate_cancelled_reads_stop_without_becoming_read_errors() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let owner = format!(
+            "{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = env::temp_dir().join(format!("history-normal-cancel-{owner}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(".owner"), &owner).unwrap();
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
+        write_jsonl(&project, "cancel-session.jsonl", 1000);
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        for aggregate in [false, true] {
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let observed = bytes.clone();
+            let control = crate::record_reader::WorkControl::from_checkpoint(move |count| {
+                if observed.fetch_add(count, Ordering::SeqCst).saturating_add(count) >= 16_384 {
+                    return Err(crate::record_reader::reader_error(
+                        "cancelled",
+                        "fixture byte cancellation",
+                    ));
+                }
+                Ok(())
+            });
+            let error = control
+                .run(|| {
+                    search(
+                        &config,
+                        SearchParams {
+                            projects: vec!["project".to_string()],
+                            aggregate,
+                            summary: true,
+                            ..SearchParams::default()
+                        },
+                    )
+                })
+                .unwrap_err();
+            assert_eq!(error.error, "cancelled");
+            assert!((16_384..32_768).contains(&bytes.load(Ordering::SeqCst)));
+        }
+        assert_eq!(fs::read_to_string(root.join(".owner")).unwrap(), owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn budget_preserves_query_and_bounded_structured_tool_preview() {
         let mut response = response_with_content("short".to_string());
         response.results[0].subtype = "tool_result".to_string();
         response.results[0].tool_result_redacted = Some(serde_json::json!({
-            "payload": "x".repeat(20_000)
+            "payload": "x".repeat(20_000), "original_bytes": 1, "budget_preview": true,
+            "get": {"ref":"unrelated:1", "source":"/outside/history.jsonl"}
         }));
         let params = SearchParams {
             pattern: "needle".to_string(),
@@ -2209,6 +2766,9 @@ mod tests {
         let budgeted = apply_response_budget(response, 2_000, build_next_query(&params, 0)).unwrap();
         assert_eq!(budgeted.results.len(), 1);
         assert_eq!(budgeted.results[0].r#ref, "session:1");
+        let preview = budgeted.results[0].tool_result_redacted.as_ref().unwrap();
+        assert_eq!(preview["get"]["ref"], "session:1");
+        assert!(preview["original_bytes"].as_u64().unwrap() > 20_000);
         assert_eq!(
             budgeted.results[0]
                 .tool_result_redacted
@@ -2406,7 +2966,8 @@ mod tests {
                 max_matches: 10,
                 max_bytes: MAX_SEARCH_RESULTS_BYTES,
             },
-        );
+        )
+        .unwrap();
         assert!(result.metadata_issues.contains(&"tool_pending_bytes_cap".to_string()));
         assert_eq!(result.lines_scanned, 2);
         let aggregate = search(
@@ -2452,7 +3013,8 @@ mod tests {
                 max_matches: cap,
                 max_bytes: MAX_SEARCH_RESULTS_BYTES,
             },
-        );
+        )
+        .unwrap();
         let lines_scanned = file_result.lines_scanned;
         let results = file_result.results;
         assert!(
@@ -2536,7 +3098,8 @@ mod tests {
                 max_matches: 10,
                 max_bytes: MAX_SEARCH_RESULTS_BYTES,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.parse_errors, 0);
         assert_eq!(result.metadata_parse_errors, 0);
@@ -2768,6 +3331,8 @@ mod tests {
             image_count: 0,
             images: Vec::new(),
             project: "project".to_string(),
+            source: None,
+            block: None,
             server: None,
             tool: None,
             metadata_incomplete_reason: None,
@@ -2801,6 +3366,8 @@ mod tests {
             image_count: 0,
             images: Vec::new(),
             project: "project".to_string(),
+            source: None,
+            block: None,
             server: None,
             tool: Some("unique-tool".to_string()),
             metadata_incomplete_reason: None,
@@ -2847,7 +3414,8 @@ mod tests {
                 max_matches: 1000,
                 max_bytes: MAX_SEARCH_RESULTS_BYTES,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(file_result.results.len(), 30, "all 30 should be returned");
         assert_eq!(file_result.lines_scanned, 30);
         assert!(!file_result.truncated, "should not mark truncation under cap");
@@ -3237,7 +3805,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.results.len(), 1);
-        let found = crate::get::find_session_file(&config, "12345678", Some("project")).unwrap();
+        let found = crate::get::find_session_file(&config, "12345678", Some("project"), None).unwrap();
         assert_eq!(found.1, "agent-12345678abcdef");
         fs::remove_dir_all(root).unwrap();
     }
@@ -3602,8 +4170,26 @@ mod tests {
                 );
                 fs::remove_dir_all(output.results.parent().unwrap()).unwrap();
             } else {
-                let budgeted = apply_response_budget(response, 1400, serde_json::json!({})).unwrap();
-                assert!(serde_json::to_vec(&budgeted).unwrap().len() <= 1400);
+                let budgeted = match apply_response_budget(response.clone(), 1400, serde_json::json!({})) {
+                    Ok(budgeted) => {
+                        assert!(budgeted.serialized_bytes <= 1400);
+                        budgeted
+                    }
+                    Err(error) => {
+                        assert_eq!(error.error, "response_too_large");
+                        let available = error.available.unwrap();
+                        assert!(available["required_bytes"].as_u64().unwrap() > 1400);
+                        assert_eq!(available["get"]["source"], first.display().to_string());
+                        let next_query = available["next_query"].clone();
+                        assert_eq!(next_query["offset"], 0);
+                        let max_total = next_query["max_total"].as_u64().unwrap() as usize;
+                        let budgeted = apply_response_budget(response, max_total, next_query).unwrap();
+                        assert!(budgeted.serialized_bytes <= max_total);
+                        budgeted
+                    }
+                };
+                assert_eq!(budgeted.serialized_bytes, serde_json::to_vec(&budgeted).unwrap().len());
+                assert!(!budgeted.stats.total_matches_exact);
                 assert!(
                     budgeted.stats.coverage.searched_files.iter().all(|path| !budgeted
                         .stats
@@ -3716,7 +4302,7 @@ mod tests {
                 } else if mode == "output" {
                     search_to_output_bounded(&params, &files, None, None, Instant::now()).unwrap()
                 } else {
-                    let collection = collect_search_results(&params, &files, None, None);
+                    let collection = collect_search_results(&params, &files, None, None).unwrap();
                     build_search_response(params, files, collection, Instant::now()).unwrap()
                 };
                 assert_eq!(response.stats.files_scanned, paths.len());

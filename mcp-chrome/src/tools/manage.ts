@@ -15,7 +15,14 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { devices, formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
+import {
+    devices,
+    formatErrorResponse,
+    formatResponse,
+    getSession,
+    getUnifiedSession,
+    isNativeExecutionResultUnknown,
+} from '../core/index.js'
 import type { CacheType } from '../core/types.js'
 import { withPageResponse } from './page-context.js'
 import { pageConditionSchema } from './schema.js'
@@ -59,68 +66,236 @@ function formatAffectedResponse(
     })
 }
 
-const manageSchema = z.object({
-    ...pageConditionSchema,
-    action: z
-        .enum([
-            'newPage',
-            'pageMetadata',
-            'closePage',
-            'adoptPage',
-            'releasePage',
-            'movePage',
-            'reorderPage',
-            'pinPage',
-            'unpinPage',
-            'activatePage',
-            'focusWindow',
-            'resizeWindow',
-            'newWindow',
-            'closeWindow',
-            'clearCache',
-            'viewport',
-            'userAgent',
-            'emulate',
-            'inputMode',
-            'stealth',
-            'cdp',
-        ])
-        .describe('管理操作'),
-    inputMode: z
-        .enum(['stealth', 'precise'])
-        .optional()
-        .describe(
-            '输入模式（inputMode），precise=debugger API（默认，可绕过 CSP 但显示调试提示）；stealth=JS 事件模拟（不触发调试提示但受 CSP 限制，适用于反检测场景）'
-        ),
-    cdpMethod: z.string().optional().describe('CDP 方法名（cdp），如 Runtime.evaluate、Page.captureScreenshot'),
-    cdpParams: z.record(z.string(), z.unknown()).optional().describe('CDP 方法参数（cdp）'),
-    targetId: z
-        .string()
-        .optional()
-        .describe('目标页面 ID（closePage/adoptPage/releasePage/movePage/reorderPage/pinPage/unpinPage/activatePage）'),
-    windowId: z.number().int().optional().describe('窗口 ID（movePage/focusWindow/resizeWindow/closeWindow）'),
-    index: z.number().int().nonnegative().optional().describe('tab 顺序 index（movePage/reorderPage）'),
-    activate: z.boolean().optional().describe('movePage 后是否激活目标 tab'),
-    focused: z.boolean().optional().describe('newWindow 是否聚焦新窗口，默认 false'),
-    incognito: z.boolean().optional().describe('newWindow 是否创建隐身窗口'),
-    left: z.number().int().optional().describe('窗口左上角 x 坐标（newWindow/resizeWindow）'),
-    top: z.number().int().optional().describe('窗口左上角 y 坐标（newWindow/resizeWindow）'),
-    windowState: z
-        .enum(['normal', 'minimized', 'maximized', 'fullscreen', 'locked-fullscreen'])
-        .optional()
-        .describe('窗口状态（newWindow/resizeWindow）'),
-    url: z.string().optional().describe('newPage/newWindow 初始 URL'),
-    cacheType: z
-        .enum(['all', 'storage', 'cache'])
-        .optional()
-        .describe('清除类型（clearCache）；不再支持 cookies，请使用 cookies action=clear（强制 name/domain/url 过滤）'),
-    width: z.number().optional().describe('视口宽度（viewport）'),
-    height: z.number().optional().describe('视口高度（viewport）'),
-    userAgent: z.string().optional().describe('User-Agent 字符串（userAgent）'),
-    device: z.string().optional().describe('设备名称（emulate），如 iPhone 13, iPad Pro'),
-    taskHint: z.string().max(120).nullable().optional().describe('pageMetadata：任务提示，null 清除'),
-    note: z.string().max(1000).nullable().optional().describe('pageMetadata：页面备注，null 清除'),
-})
+const manageSchema = z
+    .object({
+        ...pageConditionSchema,
+        action: z
+            .enum([
+                'newPage',
+                'pageMetadata',
+                'closePage',
+                'adoptPage',
+                'releasePage',
+                'grantReadAccess',
+                'revokeReadAccess',
+                'updatePage',
+                'movePage',
+                'reorderPage',
+                'pinPage',
+                'unpinPage',
+                'activatePage',
+                'focusWindow',
+                'resizeWindow',
+                'newWindow',
+                'closeWindow',
+                'updateWindow',
+                'groupPages',
+                'ungroupPages',
+                'updateGroup',
+                'moveGroup',
+                'clearCache',
+                'viewport',
+                'userAgent',
+                'emulate',
+                'inputMode',
+                'stealth',
+                'cdp',
+            ])
+            .describe('管理操作'),
+        inputMode: z
+            .enum(['stealth', 'precise'])
+            .optional()
+            .describe(
+                '输入模式（inputMode），precise=debugger API（默认，可绕过 CSP 但显示调试提示）；stealth=JS 事件模拟（不触发调试提示但受 CSP 限制，适用于反检测场景）'
+            ),
+        cdpMethod: z.string().optional().describe('CDP 方法名（cdp），如 Runtime.evaluate、Page.captureScreenshot'),
+        cdpParams: z.record(z.string(), z.unknown()).optional().describe('CDP 方法参数（cdp）'),
+        targetId: z.string().optional().describe('目标页面 ID；newWindow 时将此受控页面移入新窗口'),
+        targetIds: z.array(z.string().min(1)).min(1).optional().describe('groupPages/ungroupPages 的受控页面 ID 列表'),
+        windowId: z
+            .number()
+            .int()
+            .optional()
+            .describe('窗口 ID；newPage/groupPages 指定所属窗口，movePage/moveGroup 指定目标窗口'),
+        index: z
+            .number()
+            .int()
+            .min(-1)
+            .optional()
+            .describe('页面或分组在窗口中的位置；移动时 -1 表示末尾，newPage 必须非负'),
+        groupId: z
+            .number()
+            .int()
+            .min(-1)
+            .optional()
+            .describe('分组 ID；newPage 的 -1 表示不分组，groupPages 省略时创建新组'),
+        title: z.string().optional().describe('groupPages/updateGroup 的分组名称，可设为空字符串'),
+        color: z
+            .enum(['blue', 'cyan', 'green', 'grey', 'orange', 'pink', 'purple', 'red', 'yellow'])
+            .optional()
+            .describe('groupPages/updateGroup 的分组颜色'),
+        collapsed: z.boolean().optional().describe('groupPages/updateGroup 是否折叠分组'),
+        active: z
+            .boolean()
+            .optional()
+            .describe('newPage 是否为窗口内活动页，默认 false；updatePage 只支持 true，不聚焦窗口'),
+        pinned: z.boolean().optional().describe('newPage/updatePage 是否固定页面'),
+        highlighted: z.boolean().optional().describe('updatePage 是否选中页面'),
+        muted: z.boolean().optional().describe('updatePage 是否静音页面'),
+        autoDiscardable: z.boolean().optional().describe('updatePage 是否允许浏览器自动丢弃页面内容'),
+        openerTabId: z
+            .number()
+            .int()
+            .nonnegative()
+            .optional()
+            .describe('newPage/updatePage 的来源 tab ID，必须位于同一窗口'),
+        activate: z.boolean().optional().describe('movePage 后是否激活目标 tab'),
+        focused: z
+            .boolean()
+            .optional()
+            .describe('newWindow/updateWindow/resizeWindow 是否聚焦窗口；newWindow 默认 false'),
+        drawAttention: z.boolean().optional().describe('updateWindow/resizeWindow 是否请求窗口提醒，不改变焦点'),
+        windowType: z
+            .enum(['normal', 'popup'])
+            .optional()
+            .describe('newWindow 的窗口类型，默认 normal；popup 只支持一个页面'),
+        setSelfAsOpener: z.boolean().optional().describe('newWindow 是否将窗口创建者设为 window.opener'),
+        incognito: z.boolean().optional().describe('newWindow 是否创建隐身窗口'),
+        left: z.number().int().optional().describe('窗口左上角 x 坐标（newWindow/resizeWindow）'),
+        top: z.number().int().optional().describe('窗口左上角 y 坐标（newWindow/resizeWindow）'),
+        windowState: z
+            .enum(['normal', 'minimized', 'maximized', 'fullscreen', 'locked-fullscreen'])
+            .optional()
+            .describe('窗口状态（newWindow/resizeWindow）'),
+        url: z.string().min(1).optional().describe('newPage/newWindow 初始 URL，或 updatePage 的导航 URL'),
+        urls: z
+            .array(z.string().min(1))
+            .min(1)
+            .optional()
+            .describe('newWindow 创建多个页面的初始 URL，与 url 互斥，可与 targetId 同时使用'),
+        timeout: z.number().positive().optional().describe('newPage 的页面加载超时毫秒'),
+        cacheType: z
+            .enum(['all', 'storage', 'cache'])
+            .optional()
+            .describe(
+                '清除类型（clearCache）；不再支持 cookies，请使用 cookies action=clear（强制 name/domain/url 过滤）'
+            ),
+        width: z.number().optional().describe('视口宽度（viewport）'),
+        height: z.number().optional().describe('视口高度（viewport）'),
+        userAgent: z.string().optional().describe('User-Agent 字符串（userAgent）'),
+        device: z.string().optional().describe('设备名称（emulate），如 iPhone 13, iPad Pro'),
+        taskHint: z.string().max(120).nullable().optional().describe('pageMetadata：任务提示，null 清除'),
+        note: z.string().max(1000).nullable().optional().describe('pageMetadata：页面备注，null 清除'),
+    })
+    .strict()
+    .superRefine((args, context) => {
+        const scopes: Record<string, string[]> = {
+            targetIds: ['groupPages', 'ungroupPages'],
+            groupId: ['newPage', 'groupPages', 'updateGroup', 'moveGroup'],
+            title: ['groupPages', 'updateGroup'],
+            color: ['groupPages', 'updateGroup'],
+            collapsed: ['groupPages', 'updateGroup'],
+            active: ['newPage', 'updatePage'],
+            pinned: ['newPage', 'updatePage'],
+            openerTabId: ['newPage', 'updatePage'],
+            highlighted: ['updatePage'],
+            muted: ['updatePage'],
+            autoDiscardable: ['updatePage'],
+            index: ['newPage', 'movePage', 'reorderPage', 'moveGroup'],
+            windowId: [
+                'newPage',
+                'movePage',
+                'groupPages',
+                'moveGroup',
+                'focusWindow',
+                'resizeWindow',
+                'updateWindow',
+                'closeWindow',
+            ],
+            focused: ['newWindow', 'updateWindow', 'resizeWindow'],
+            drawAttention: ['updateWindow', 'resizeWindow'],
+            windowType: ['newWindow'],
+            setSelfAsOpener: ['newWindow'],
+            incognito: ['newWindow'],
+            urls: ['newWindow'],
+            url: ['newPage', 'newWindow', 'updatePage'],
+            timeout: ['newPage'],
+            left: ['newWindow', 'resizeWindow', 'updateWindow'],
+            top: ['newWindow', 'resizeWindow', 'updateWindow'],
+            width: ['newWindow', 'resizeWindow', 'updateWindow', 'viewport'],
+            height: ['newWindow', 'resizeWindow', 'updateWindow', 'viewport'],
+            windowState: ['newWindow', 'resizeWindow', 'updateWindow'],
+        }
+        for (const [field, actions] of Object.entries(scopes)) {
+            if (args[field as keyof typeof args] !== undefined && !actions.includes(args.action)) {
+                context.addIssue({ code: 'custom', path: [field], message: `${args.action} 不支持 ${field}，未执行` })
+            }
+        }
+        if (args.action === 'newPage') {
+            if (args.index !== undefined && args.index < 0) {
+                context.addIssue({ code: 'custom', path: ['index'], message: 'newPage 的 index 必须非负' })
+            }
+            if (args.pinned && args.groupId !== undefined && args.groupId >= 0) {
+                context.addIssue({ code: 'custom', path: ['groupId'], message: 'pinned=true 与分组不兼容' })
+            }
+        } else if (args.groupId !== undefined && args.groupId < 0) {
+            context.addIssue({ code: 'custom', path: ['groupId'], message: '此操作需要现有分组 ID' })
+        }
+        if (
+            args.action === 'groupPages' &&
+            args.groupId !== undefined &&
+            [args.title, args.color, args.collapsed, args.windowId].some((value) => value !== undefined)
+        ) {
+            context.addIssue({
+                code: 'custom',
+                path: ['groupId'],
+                message: '加入已有分组仅接受页面列表与 groupId；修改分组请用 updateGroup/moveGroup',
+            })
+        }
+        if (args.action === 'newWindow' && args.url !== undefined && args.urls !== undefined) {
+            context.addIssue({ code: 'custom', message: 'newWindow 的 url 与 urls 互斥' })
+        }
+        if (args.action === 'updatePage' && args.active === false) {
+            context.addIssue({ code: 'custom', path: ['active'], message: 'updatePage 不支持 active=false，未执行' })
+        }
+        if (
+            args.action === 'newWindow' &&
+            args.windowType === 'popup' &&
+            (args.urls?.length ?? (args.url !== undefined ? 1 : 0)) + (args.targetId !== undefined ? 1 : 0) > 1
+        ) {
+            context.addIssue({
+                code: 'custom',
+                path: ['windowType'],
+                message: 'popup 只支持一个页面，请使用 normal 窗口',
+            })
+        }
+        if (['newWindow', 'updateWindow', 'resizeWindow'].includes(args.action)) {
+            for (const field of ['width', 'height'] as const) {
+                const value = args[field]
+                if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+                    context.addIssue({ code: 'custom', path: [field], message: '窗口尺寸必须是正整数' })
+                }
+            }
+            if (
+                ['minimized', 'maximized', 'fullscreen', 'locked-fullscreen'].includes(args.windowState ?? '') &&
+                [args.left, args.top, args.width, args.height].some((value) => value !== undefined)
+            ) {
+                context.addIssue({
+                    code: 'custom',
+                    path: ['windowState'],
+                    message: '非 normal 窗口状态不能与窗口位置或尺寸同时设置',
+                })
+            }
+            if (
+                args.action !== 'newWindow' &&
+                ((args.focused === true && args.windowState === 'minimized') ||
+                    (args.focused === false &&
+                        ['maximized', 'fullscreen', 'locked-fullscreen'].includes(args.windowState ?? '')))
+            ) {
+                context.addIssue({ code: 'custom', path: ['focused'], message: 'focused 与窗口状态冲突' })
+            }
+        }
+    })
 
 type ManageArgs = z.infer<typeof manageSchema>
 
@@ -142,9 +317,13 @@ async function handleManage(args: ManageArgs): Promise<ManageResponse> {
         const mode = unifiedSession.getMode()
         const handler = async () => manageHandlers[args.action]({ unifiedSession, mode }, args)
         const pageActions: ManageArgs['action'][] = [
+            'pageMetadata',
             'closePage',
             'adoptPage',
             'releasePage',
+            'grantReadAccess',
+            'revokeReadAccess',
+            'updatePage',
             'movePage',
             'reorderPage',
             'pinPage',
@@ -185,7 +364,7 @@ async function handleManage(args: ManageArgs): Promise<ManageResponse> {
                 unifiedSession,
                 args.targetId,
                 run,
-                args.action === 'newPage' || args.action === 'newWindow'
+                args.action === 'newPage' || (args.action === 'newWindow' && args.targetId === undefined)
             )
         }
         return await run()
@@ -195,7 +374,18 @@ async function handleManage(args: ManageArgs): Promise<ManageResponse> {
 }
 
 async function handleNewPage({ unifiedSession }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
-    const target = await unifiedSession.newPage(args.url)
+    const target = await unifiedSession.newPage(
+        args.url,
+        {
+            windowId: args.windowId,
+            index: args.index,
+            groupId: args.groupId,
+            active: args.active,
+            pinned: args.pinned,
+            openerTabId: args.openerTabId,
+        },
+        args.timeout
+    )
     return formatResponse({
         success: true,
         action: 'newPage',
@@ -252,6 +442,71 @@ async function handleReleasePage({ unifiedSession, mode }: ManageContext, args: 
     }
     const result = await unifiedSession.releasePage(args.targetId)
     return formatResponse({ success: true, action: 'releasePage', mode, targetId: args.targetId, ...result })
+}
+
+async function handleReadAccess({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (!args.targetId) {
+        return invalidArgument(`${args.action} 需要 targetId，未修改权限`)
+    }
+    const result = await unifiedSession.setReadAccess(args.targetId, args.action === 'grantReadAccess')
+    return formatResponse({ ...result, action: args.action, mode })
+}
+
+async function handleUpdatePage({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (!args.targetId) {
+        return invalidArgument('updatePage 需要 targetId 参数，未执行')
+    }
+    const affected = await unifiedSession.updatePage(args.targetId, {
+        url: args.url,
+        active: args.active,
+        pinned: args.pinned,
+        highlighted: args.highlighted,
+        muted: args.muted,
+        autoDiscardable: args.autoDiscardable,
+        openerTabId: args.openerTabId,
+    })
+    return formatAffectedResponse('updatePage', mode, affected)
+}
+
+async function handleGroupPages({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (!args.targetIds) {
+        return invalidArgument('groupPages 需要 targetIds 参数，未执行')
+    }
+    const affected = await unifiedSession.groupPages(args.targetIds, {
+        groupId: args.groupId,
+        windowId: args.windowId,
+        title: args.title,
+        color: args.color,
+        collapsed: args.collapsed,
+    })
+    return formatAffectedResponse('groupPages', mode, affected)
+}
+
+async function handleUngroupPages({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (!args.targetIds) {
+        return invalidArgument('ungroupPages 需要 targetIds 参数，未执行')
+    }
+    return formatAffectedResponse('ungroupPages', mode, await unifiedSession.ungroupPages(args.targetIds))
+}
+
+async function handleUpdateGroup({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (args.groupId === undefined) {
+        return invalidArgument('updateGroup 需要 groupId 参数，未执行')
+    }
+    const affected = await unifiedSession.updateGroup(args.groupId, {
+        title: args.title,
+        color: args.color,
+        collapsed: args.collapsed,
+    })
+    return formatAffectedResponse('updateGroup', mode, affected)
+}
+
+async function handleMoveGroup({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (args.groupId === undefined || args.index === undefined) {
+        return invalidArgument('moveGroup 需要 groupId 和 index 参数，未执行')
+    }
+    const affected = await unifiedSession.moveGroup(args.groupId, { windowId: args.windowId, index: args.index })
+    return formatAffectedResponse('moveGroup', mode, affected)
 }
 
 async function handleMovePage({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
@@ -328,13 +583,34 @@ async function handleResizeWindow({ unifiedSession, mode }: ManageContext, args:
         width: args.width,
         height: args.height,
         state: args.windowState,
+        focused: args.focused,
+        drawAttention: args.drawAttention,
     })
     return formatAffectedResponse('resizeWindow', mode, affected)
 }
 
+async function handleUpdateWindow({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (args.windowId === undefined) {
+        return invalidArgument('updateWindow 需要 windowId 参数，未执行')
+    }
+    const affected = await unifiedSession.updateWindow(args.windowId, {
+        left: args.left,
+        top: args.top,
+        width: args.width,
+        height: args.height,
+        state: args.windowState,
+        focused: args.focused,
+        drawAttention: args.drawAttention,
+    })
+    return formatAffectedResponse('updateWindow', mode, affected)
+}
+
 async function handleNewWindow({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
     const affected = await unifiedSession.newWindow({
-        url: args.url,
+        url: args.urls ?? args.url,
+        targetId: args.targetId,
+        type: args.windowType,
+        setSelfAsOpener: args.setSelfAsOpener,
         focused: args.focused,
         incognito: args.incognito,
         left: args.left,
@@ -348,7 +624,9 @@ async function handleNewWindow({ unifiedSession, mode }: ManageContext, args: Ma
         action: 'newWindow',
         mode,
         affected,
-        createdTargetId: affected.targetId ?? null,
+        ...(args.targetId === undefined
+            ? { createdTargetId: affected.targetId ?? null }
+            : { targetId: affected.targetId }),
     })
 }
 
@@ -517,7 +795,13 @@ async function handleCdp({ unifiedSession, mode }: ManageContext, args: ManageAr
                     isError: true,
                 }
             }
-            return formatErrorResponse(error)
+            const response = formatErrorResponse(error)
+            if (isNativeExecutionResultUnknown(error)) {
+                const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>
+                Object.assign(payload, { actionExecuted: true, actionStatus: 'unknown', retryable: false })
+                response.content[0]!.text = JSON.stringify(payload, null, 2)
+            }
+            return response
         }
     })
 }
@@ -528,6 +812,9 @@ const manageHandlers: Record<ManageArgs['action'], ManageHandler> = {
     closePage: handleClosePage,
     adoptPage: handleAdoptPage,
     releasePage: handleReleasePage,
+    grantReadAccess: handleReadAccess,
+    revokeReadAccess: handleReadAccess,
+    updatePage: handleUpdatePage,
     movePage: handleMovePage,
     reorderPage: handleReorderPage,
     pinPage: handlePinPage,
@@ -537,6 +824,11 @@ const manageHandlers: Record<ManageArgs['action'], ManageHandler> = {
     resizeWindow: handleResizeWindow,
     newWindow: handleNewWindow,
     closeWindow: handleCloseWindow,
+    updateWindow: handleUpdateWindow,
+    groupPages: handleGroupPages,
+    ungroupPages: handleUngroupPages,
+    updateGroup: handleUpdateGroup,
+    moveGroup: handleMoveGroup,
     clearCache: handleClearCache,
     viewport: handleViewport,
     userAgent: handleUserAgent,
@@ -550,7 +842,8 @@ export function registerManageTool(server: McpServer): void {
     server.registerTool(
         'manage',
         {
-            description: '页面与环境管理：新建页面、关闭页面、受控页 adopt/release、缓存、视口、UA、设备模拟',
+            description:
+                '页面、窗口与分组管理：创建、更新、移动、关闭，受控页 adopt/release，分组成员、名称、颜色和折叠；缓存、视口、UA、设备模拟',
             inputSchema: manageSchema,
         },
         (args) => handleManage(args)

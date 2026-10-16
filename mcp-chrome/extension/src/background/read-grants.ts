@@ -98,7 +98,12 @@ export async function hasReadGrant(instanceId: string | null | undefined, tabId:
     return (await readGrantDocumentId(instanceId, tabId)) !== null
 }
 
-export async function setReadGrant(instanceId: string, tabId: number, allow: boolean): Promise<void> {
+export async function setReadGrant(
+    instanceId: string,
+    tabId: number,
+    allow: boolean,
+    expected?: { url: string; revision: string }
+): Promise<void> {
     await update(instanceId, async () => {
         const grants = (revokedInstances.has(instanceId) ? [] : await getGrants(instanceId)).filter(
             (grant) => grant.tabId !== tabId
@@ -109,7 +114,18 @@ export async function setReadGrant(instanceId: string, tabId: number, allow: boo
             if (!frame?.documentId) {
                 throw new Error('无法确认当前页面身份，未授予只读权限')
             }
-            grants.push({ tabId, url: tab.url ?? '', documentId: frame.documentId, revision: pageRevision(tabId) })
+            const revision = pageRevision(tabId)
+            const currentTab = await chrome.tabs.get(tabId)
+            const currentFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
+            if (
+                currentTab.url !== tab.url ||
+                currentFrame?.documentId !== frame.documentId ||
+                pageRevision(tabId) !== revision ||
+                (expected && (expected.url !== tab.url || expected.revision !== revision))
+            ) {
+                throw new Error('页面身份已变化，未授予只读权限')
+            }
+            grants.push({ tabId, url: tab.url ?? '', documentId: frame.documentId, revision })
         }
         await chrome.storage.session.set({ [KEY_PREFIX + instanceId]: grants })
         if (allow) {

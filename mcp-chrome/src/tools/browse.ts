@@ -17,6 +17,7 @@ import { z } from 'zod'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import { StructuredToolError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT, type WaitUntil } from '../core/types.js'
+import { remainingNavigationTimeout } from '../core/utils.js'
 import { challengeResultFields, resolveChallenge } from './challenge.js'
 import { withDiagnosticsResponse } from './diagnostics.js'
 import { withPageContext, withPageResponse } from './page-context.js'
@@ -57,6 +58,12 @@ const browseSchema = z.object({
             '目标 ID（attach/close），从 list 结果中获取。close 必填，只关闭该页面。' +
                 'Extension 模式为数字 Tab ID，CDP 模式为 WebSocket target ID，仅在当前 mode 下有效'
         ),
+    details: z
+        .enum(['summary', 'full'])
+        .optional()
+        .describe('list 默认摘要；full 返回完整原生属性，窗口仅以 targetIds 引用页面'),
+    targetIds: z.array(z.string().min(1)).min(1).optional().describe('list 仅返回这些页面及其窗口/分组关系'),
+    managedOnly: z.boolean().optional().describe('list 仅返回 managed=true 的页面，默认 false'),
     activate: z.boolean().optional().describe('是否激活 Tab（attach），默认 false 只设置操作目标不切到前台'),
     url: z.string().optional().describe('目标 URL（open）'),
     wait: z.enum(['load', 'domcontentloaded', 'networkidle']).optional().describe('等待条件（open/refresh）'),
@@ -90,6 +97,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
     isError?: boolean
 }> {
     try {
+        const deadline = Date.now() + (args.timeout ?? DEFAULT_TIMEOUT)
         const unifiedSession = getUnifiedSession()
         const cdpSession = getSession()
 
@@ -229,41 +237,104 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
 
             case 'list': {
                 const mode = unifiedSession.getMode()
-                const targets = await unifiedSession.listTargets()
                 const topology = await unifiedSession.listTopology()
-                const windows = topology?.windows.map((window) => ({
-                    ...window,
-                    tabs: window.tabs.map((tab) => ({
-                        targetId: tab.targetId ?? String(tab.id),
-                        type: tab.type ?? 'page',
+                const allTargets = topology
+                    ? topology.windows.flatMap((window) =>
+                          window.tabs.map(({ id, ...tab }) => ({
+                              ...tab,
+                              targetId: tab.targetId ?? String(id),
+                              type: tab.type ?? 'page',
+                              mode,
+                              isActive: tab.active ?? false,
+                              metadata: unifiedSession.getPageMetadata(tab.targetId ?? String(id)),
+                          }))
+                      )
+                    : await unifiedSession.listTargets()
+                const requestedIds = args.targetIds ? new Set(args.targetIds) : null
+                const filtered = requestedIds !== null || args.managedOnly === true
+                const selected = allTargets.filter(
+                    (tab) =>
+                        (!requestedIds || requestedIds.has(tab.targetId)) && (!args.managedOnly || tab.managed === true)
+                )
+                const selectedIds = new Set(selected.map((tab) => tab.targetId))
+                const detail = args.details ?? 'summary'
+                const targets = selected.map((tab) => {
+                    const { favIconUrl, ...native } = tab
+                    const favicon = favIconUrl?.startsWith('data:')
+                        ? { favIconInline: true }
+                        : favIconUrl !== undefined
+                          ? { favIconUrl }
+                          : {}
+                    if (detail === 'full') return { ...native, ...favicon }
+                    return {
+                        targetId: tab.targetId,
+                        type: tab.type,
                         url: tab.url,
                         title: tab.title,
                         mode,
-                        isActive: tab.active ?? false,
-                        managed: tab.managed,
+                        managed: tab.managed ?? false,
+                        revision: tab.revision,
+                        status: tab.status,
+                        isActive: tab.isActive ?? false,
                         windowId: tab.windowId,
                         index: tab.index,
                         groupId: tab.groupId,
                         pinned: tab.pinned,
                         incognito: tab.incognito,
-                        status: tab.status,
-                        revision: tab.revision,
-                        metadata: unifiedSession.getPageMetadata(tab.targetId ?? String(tab.id)),
-                    })),
-                }))
+                        metadata: tab.metadata,
+                    }
+                })
+                const windows = topology?.windows
+                    .filter(
+                        (window) =>
+                            !filtered || window.tabs.some((tab) => selectedIds.has(tab.targetId ?? String(tab.id)))
+                    )
+                    .map(({ tabs, ...window }) => {
+                        const targetIds = tabs
+                            .map((tab) => tab.targetId ?? String(tab.id))
+                            .filter((id) => selectedIds.has(id))
+                        return {
+                            ...(detail === 'full'
+                                ? window
+                                : {
+                                      id: window.id,
+                                      focused: window.focused,
+                                      type: window.type,
+                                      state: window.state,
+                                      incognito: window.incognito,
+                                      activeTabId: window.activeTabId,
+                                  }),
+                            tabCount: targetIds.length,
+                            totalTabCount: window.tabCount,
+                            targetIds,
+                        }
+                    })
+                const groups = topology?.groups
+                    .filter((group) => !filtered || group.targetIds.some((id) => selectedIds.has(id)))
+                    .map((group) => ({
+                        ...group,
+                        targetIds: group.targetIds.filter((id) => selectedIds.has(id)),
+                        tabIds: group.tabIds.filter((id) => selectedIds.has(String(id))),
+                        totalTabCount: group.targetIds.length,
+                    }))
 
                 const result: Record<string, unknown> = {
                     success: true,
                     action: 'list',
                     mode,
+                    details: detail,
+                    targetCount: targets.length,
+                    totalTargetCount: allTargets.length,
                     targets,
                     defaultTargetId: unifiedSession.getCurrentTargetId(),
                     ...(topology
                         ? {
-                              windowCount: topology.windowCount,
+                              windowCount: windows!.length,
+                              totalWindowCount: topology.windowCount,
                               focusedWindowId: topology.focusedWindowId,
                               activeTargetId: topology.activeTargetId,
                               windows,
+                              groups,
                           }
                         : {}),
                 }
@@ -313,173 +384,216 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
             }
 
             case 'open': {
-                return await withPageContext(unifiedSession, args.targetId, async () => {
-                    if (!args.url) {
-                        return {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: JSON.stringify({
-                                        error: {
-                                            code: 'INVALID_ARGUMENT',
-                                            message: '缺少 url 参数',
-                                            suggestion: '请指定 url 参数',
-                                        },
-                                    }),
-                                },
-                            ],
-                            isError: true,
-                        }
-                    }
-                    const currentState = unifiedSession.getState()
-                    if (
-                        unifiedSession.getMode() === 'extension' &&
-                        currentState !== null &&
-                        currentState.managed !== true
-                    ) {
-                        return {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: JSON.stringify(
-                                        {
+                return await withPageContext(
+                    unifiedSession,
+                    args.targetId,
+                    async () => {
+                        if (!args.url) {
+                            return {
+                                content: [
+                                    {
+                                        type: 'text',
+                                        text: JSON.stringify({
                                             error: {
-                                                code: 'UNMANAGED_TAB',
-                                                message: 'open 拒绝导航非托管 tab',
-                                                suggestion:
-                                                    '请从 browse(action="list") 选择 managed=true 的 tab，' +
-                                                    '或用 manage(action="newPage") 创建受控页面',
-                                                context: {
-                                                    managed: currentState.managed ?? false,
-                                                    url: currentState.url,
-                                                    title: currentState.title,
+                                                code: 'INVALID_ARGUMENT',
+                                                message: '缺少 url 参数',
+                                                suggestion: '请指定 url 参数',
+                                            },
+                                        }),
+                                    },
+                                ],
+                                isError: true,
+                            }
+                        }
+                        const currentState = unifiedSession.getState()
+                        if (
+                            unifiedSession.getMode() === 'extension' &&
+                            currentState !== null &&
+                            currentState.managed !== true
+                        ) {
+                            return {
+                                content: [
+                                    {
+                                        type: 'text',
+                                        text: JSON.stringify(
+                                            {
+                                                error: {
+                                                    code: 'UNMANAGED_TAB',
+                                                    message: 'open 拒绝导航非托管 tab',
+                                                    suggestion:
+                                                        '请从 browse(action="list") 选择 managed=true 的 tab，' +
+                                                        '或用 manage(action="newPage") 创建受控页面',
+                                                    context: {
+                                                        managed: currentState.managed ?? false,
+                                                        url: currentState.url,
+                                                        title: currentState.title,
+                                                    },
                                                 },
                                             },
-                                        },
-                                        null,
-                                        2
-                                    ),
-                                },
-                            ],
-                            isError: true,
-                        }
-                    }
-                    if (currentState === null) {
-                        if (conditional) {
-                            throw new Error('没有操作目标，未执行条件导航')
-                        }
-                        await unifiedSession.newPage()
-                    }
-                    return unifiedSession.withPageCondition(args, () =>
-                        withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
-                            const timeout = args.timeout ?? DEFAULT_TIMEOUT
-                            const startedAt = Date.now()
-                            await unifiedSession.navigate(args.url!, {
-                                wait: args.wait as WaitUntil,
-                                timeout,
-                            })
-                            const challenge = await resolveChallenge(
-                                unifiedSession,
-                                'open',
-                                'completed',
-                                Math.max(0, timeout - (Date.now() - startedAt))
-                            )
-                            return {
-                                success: true,
-                                action: 'open',
-                                mode: unifiedSession.getMode(),
-                                ...pageStateMetadata(unifiedSession),
-                                ...challengeResultFields(challenge),
+                                            null,
+                                            2
+                                        ),
+                                    },
+                                ],
+                                isError: true,
                             }
-                        })
-                    )
-                })
+                        }
+                        if (currentState === null) {
+                            if (conditional) {
+                                throw new Error('没有操作目标，未执行条件导航')
+                            }
+                            await unifiedSession.newPage(undefined, undefined, remainingNavigationTimeout(deadline))
+                        }
+                        return unifiedSession.withPageCondition(
+                            args,
+                            () =>
+                                withDiagnosticsResponse(
+                                    unifiedSession,
+                                    args.diagnostics,
+                                    async () => {
+                                        await unifiedSession.navigate(args.url!, {
+                                            wait: args.wait as WaitUntil,
+                                            timeout: remainingNavigationTimeout(deadline),
+                                        })
+                                        const challenge = await resolveChallenge(
+                                            unifiedSession,
+                                            'open',
+                                            'completed',
+                                            Math.max(0, deadline - Date.now())
+                                        )
+                                        return {
+                                            success: true,
+                                            action: 'open',
+                                            mode: unifiedSession.getMode(),
+                                            ...pageStateMetadata(unifiedSession),
+                                            ...challengeResultFields(challenge),
+                                        }
+                                    },
+                                    deadline
+                                ),
+                            deadline
+                        )
+                    },
+                    deadline
+                )
             }
 
             case 'back': {
-                return await withPageContext(unifiedSession, args.targetId, () =>
-                    unifiedSession.withPageCondition(args, () =>
-                        withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
-                            const timeout = args.timeout ?? DEFAULT_TIMEOUT
-                            const startedAt = Date.now()
-                            const result = await unifiedSession.goBack(timeout)
-                            const challenge = result.navigated
-                                ? await resolveChallenge(
-                                      unifiedSession,
-                                      'back',
-                                      'completed',
-                                      Math.max(0, timeout - (Date.now() - startedAt))
-                                  )
-                                : undefined
-                            return {
-                                success: true,
-                                action: 'back',
-                                mode: unifiedSession.getMode(),
-                                navigated: result.navigated,
-                                ...pageStateMetadata(unifiedSession),
-                                ...(result.navigated ? {} : { note: '无后退历史' }),
-                                ...(challenge ? challengeResultFields(challenge) : {}),
-                            }
-                        })
-                    )
+                return await withPageContext(
+                    unifiedSession,
+                    args.targetId,
+                    () =>
+                        unifiedSession.withPageCondition(
+                            args,
+                            () =>
+                                withDiagnosticsResponse(
+                                    unifiedSession,
+                                    args.diagnostics,
+                                    async () => {
+                                        const result = await unifiedSession.goBack(remainingNavigationTimeout(deadline))
+                                        const challenge = result.navigated
+                                            ? await resolveChallenge(
+                                                  unifiedSession,
+                                                  'back',
+                                                  'completed',
+                                                  Math.max(0, deadline - Date.now())
+                                              )
+                                            : undefined
+                                        return {
+                                            success: true,
+                                            action: 'back',
+                                            mode: unifiedSession.getMode(),
+                                            navigated: result.navigated,
+                                            ...pageStateMetadata(unifiedSession),
+                                            ...(result.navigated ? {} : { note: '无后退历史' }),
+                                            ...(challenge ? challengeResultFields(challenge) : {}),
+                                        }
+                                    },
+                                    deadline
+                                ),
+                            deadline
+                        ),
+                    deadline
                 )
             }
 
             case 'forward': {
-                return await withPageContext(unifiedSession, args.targetId, () =>
-                    unifiedSession.withPageCondition(args, () =>
-                        withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
-                            const timeout = args.timeout ?? DEFAULT_TIMEOUT
-                            const startedAt = Date.now()
-                            const result = await unifiedSession.goForward(timeout)
-                            const challenge = result.navigated
-                                ? await resolveChallenge(
-                                      unifiedSession,
-                                      'forward',
-                                      'completed',
-                                      Math.max(0, timeout - (Date.now() - startedAt))
-                                  )
-                                : undefined
-                            return {
-                                success: true,
-                                action: 'forward',
-                                mode: unifiedSession.getMode(),
-                                navigated: result.navigated,
-                                ...pageStateMetadata(unifiedSession),
-                                ...(result.navigated ? {} : { note: '无前进历史' }),
-                                ...(challenge ? challengeResultFields(challenge) : {}),
-                            }
-                        })
-                    )
+                return await withPageContext(
+                    unifiedSession,
+                    args.targetId,
+                    () =>
+                        unifiedSession.withPageCondition(
+                            args,
+                            () =>
+                                withDiagnosticsResponse(
+                                    unifiedSession,
+                                    args.diagnostics,
+                                    async () => {
+                                        const result = await unifiedSession.goForward(
+                                            remainingNavigationTimeout(deadline)
+                                        )
+                                        const challenge = result.navigated
+                                            ? await resolveChallenge(
+                                                  unifiedSession,
+                                                  'forward',
+                                                  'completed',
+                                                  Math.max(0, deadline - Date.now())
+                                              )
+                                            : undefined
+                                        return {
+                                            success: true,
+                                            action: 'forward',
+                                            mode: unifiedSession.getMode(),
+                                            navigated: result.navigated,
+                                            ...pageStateMetadata(unifiedSession),
+                                            ...(result.navigated ? {} : { note: '无前进历史' }),
+                                            ...(challenge ? challengeResultFields(challenge) : {}),
+                                        }
+                                    },
+                                    deadline
+                                ),
+                            deadline
+                        ),
+                    deadline
                 )
             }
 
             case 'refresh': {
-                return await withPageContext(unifiedSession, args.targetId, () =>
-                    unifiedSession.withPageCondition(args, () =>
-                        withDiagnosticsResponse(unifiedSession, args.diagnostics, async () => {
-                            const timeout = args.timeout ?? DEFAULT_TIMEOUT
-                            const startedAt = Date.now()
-                            await unifiedSession.reload({
-                                ignoreCache: args.ignoreCache ?? false,
-                                waitUntil: args.wait,
-                                timeout,
-                            })
-                            const challenge = await resolveChallenge(
-                                unifiedSession,
-                                'refresh',
-                                'completed',
-                                Math.max(0, timeout - (Date.now() - startedAt))
-                            )
-                            return {
-                                success: true,
-                                action: 'refresh',
-                                mode: unifiedSession.getMode(),
-                                ...pageStateMetadata(unifiedSession),
-                                ...challengeResultFields(challenge),
-                            }
-                        })
-                    )
+                return await withPageContext(
+                    unifiedSession,
+                    args.targetId,
+                    () =>
+                        unifiedSession.withPageCondition(
+                            args,
+                            () =>
+                                withDiagnosticsResponse(
+                                    unifiedSession,
+                                    args.diagnostics,
+                                    async () => {
+                                        await unifiedSession.reload({
+                                            ignoreCache: args.ignoreCache ?? false,
+                                            waitUntil: args.wait,
+                                            timeout: remainingNavigationTimeout(deadline),
+                                        })
+                                        const challenge = await resolveChallenge(
+                                            unifiedSession,
+                                            'refresh',
+                                            'completed',
+                                            Math.max(0, deadline - Date.now())
+                                        )
+                                        return {
+                                            success: true,
+                                            action: 'refresh',
+                                            mode: unifiedSession.getMode(),
+                                            ...pageStateMetadata(unifiedSession),
+                                            ...challengeResultFields(challenge),
+                                        }
+                                    },
+                                    deadline
+                                ),
+                            deadline
+                        ),
+                    deadline
                 )
             }
 

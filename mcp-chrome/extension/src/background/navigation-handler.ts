@@ -15,28 +15,51 @@ function normalizeNavigationUrl(url: string | undefined): string | undefined {
     }
 }
 
+function navigationTimeout(actionExecuted: boolean): ExpectedOperationError {
+    return new ExpectedOperationError(
+        JSON.stringify({
+            error: {
+                code: 'TIMEOUT',
+                message: 'Navigation timeout',
+                context: { actionExecuted, actionStatus: actionExecuted ? 'unknown' : 'failed', retryable: false },
+            },
+        })
+    )
+}
+
+export function remainingNavigationTimeout(deadline: number, actionExecuted = false): number {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+        throw navigationTimeout(actionExecuted)
+    }
+    return remaining
+}
+
 export class NavigationHandler {
     constructor(private logManager: LogManager) {}
 
     async navigate(params: unknown, context: ActionContext): Promise<TabInfo> {
         const p = NavigateSchema.parse(params)
-
+        const deadline = p.deadline ?? Date.now() + (p.timeout ?? 30000)
+        remainingNavigationTimeout(deadline)
         const tabId = await getTargetTabId(p.tabId)
         await assertManagedTab(tabId, context, 'navigate')
         if (p.waitUntil) {
             await this.runNavigationAction(
                 tabId,
                 p.waitUntil,
-                p.timeout,
+                deadline,
                 () => chrome.tabs.update(tabId, { url: p.url }),
                 p.url
             )
         } else {
+            remainingNavigationTimeout(deadline)
             await chrome.tabs.update(tabId, { url: p.url })
         }
 
+        remainingNavigationTimeout(deadline, true)
         const tab = await chrome.tabs.get(tabId)
-        return tabToInfo(tab, context)
+        return tabToInfo(tab)
     }
 
     async goBack(
@@ -44,19 +67,22 @@ export class NavigationHandler {
         context: ActionContext
     ): Promise<{ url: string; title: string; navigated: boolean; managed: boolean }> {
         const p = GoBackSchema.parse(params) ?? {}
+        const deadline = p.deadline ?? Date.now() + (p.timeout ?? 30000)
+        remainingNavigationTimeout(deadline)
         const tabId = await getTargetTabId(p.tabId)
         await assertManagedTab(tabId, context, 'go_back')
         const beforeTab = await chrome.tabs.get(tabId)
         const beforeUrl = beforeTab.url
 
-        // 信号窗口：受 p.timeout 控制（上限 5s），默认 2s
-        const signalTimeout = Math.min(p.timeout ?? 2000, 5000)
-        const navigated = await this.navigateHistory(tabId, beforeUrl, signalTimeout, 'back')
+        // 信号窗口受剩余预算控制，上限 5s，未传 timeout 时为 2s
+        const signalTimeout = Math.min(p.timeout ?? 2000, 5000, remainingNavigationTimeout(deadline))
+        const navigated = await this.navigateHistory(tabId, beforeUrl, signalTimeout, 'back', deadline)
 
         if (navigated && p.waitUntil) {
-            await this.waitForNavigation(tabId, p.waitUntil, p.timeout)
+            await this.waitForNavigation(tabId, p.waitUntil, remainingNavigationTimeout(deadline, true))
         }
 
+        remainingNavigationTimeout(deadline, true)
         const tab = await chrome.tabs.get(tabId)
         return { url: tab.url || '', title: tab.title || '', navigated, managed: true }
     }
@@ -66,36 +92,43 @@ export class NavigationHandler {
         context: ActionContext
     ): Promise<{ url: string; title: string; navigated: boolean; managed: boolean }> {
         const p = GoForwardSchema.parse(params) ?? {}
+        const deadline = p.deadline ?? Date.now() + (p.timeout ?? 30000)
+        remainingNavigationTimeout(deadline)
         const tabId = await getTargetTabId(p.tabId)
         await assertManagedTab(tabId, context, 'go_forward')
         const beforeTab = await chrome.tabs.get(tabId)
         const beforeUrl = beforeTab.url
 
-        // 信号窗口：受 p.timeout 控制（上限 5s），默认 2s
-        const signalTimeout = Math.min(p.timeout ?? 2000, 5000)
-        const navigated = await this.navigateHistory(tabId, beforeUrl, signalTimeout, 'forward')
+        // 信号窗口受剩余预算控制，上限 5s，未传 timeout 时为 2s
+        const signalTimeout = Math.min(p.timeout ?? 2000, 5000, remainingNavigationTimeout(deadline))
+        const navigated = await this.navigateHistory(tabId, beforeUrl, signalTimeout, 'forward', deadline)
 
         if (navigated && p.waitUntil) {
-            await this.waitForNavigation(tabId, p.waitUntil, p.timeout)
+            await this.waitForNavigation(tabId, p.waitUntil, remainingNavigationTimeout(deadline, true))
         }
 
+        remainingNavigationTimeout(deadline, true)
         const tab = await chrome.tabs.get(tabId)
         return { url: tab.url || '', title: tab.title || '', navigated, managed: true }
     }
 
     async reload(params: unknown, context: ActionContext): Promise<{ url: string; title: string; managed: boolean }> {
         const p = ReloadSchema.parse(params) ?? {}
+        const deadline = p.deadline ?? Date.now() + (p.timeout ?? 30000)
+        remainingNavigationTimeout(deadline)
         const tabId = await getTargetTabId(p.tabId)
         await assertManagedTab(tabId, context, 'reload')
 
         if (p.waitUntil) {
-            await this.runNavigationAction(tabId, p.waitUntil, p.timeout, () =>
+            await this.runNavigationAction(tabId, p.waitUntil, deadline, () =>
                 chrome.tabs.reload(tabId, { bypassCache: p.ignoreCache ?? false })
             )
         } else {
+            remainingNavigationTimeout(deadline)
             await chrome.tabs.reload(tabId, { bypassCache: p.ignoreCache ?? false })
         }
 
+        remainingNavigationTimeout(deadline, true)
         const tab = await chrome.tabs.get(tabId)
         return { url: tab.url || '', title: tab.title || '', managed: true }
     }
@@ -139,7 +172,7 @@ export class NavigationHandler {
                 }
                 const remaining = timeout - (Date.now() - startedAt)
                 if (remaining <= 0) {
-                    fail(new ExpectedOperationError('Navigation timeout'))
+                    fail(navigationTimeout(true))
                     return
                 }
                 const pending = this.logManager.getPending(tabId)
@@ -181,7 +214,7 @@ export class NavigationHandler {
                     done()
                 }
             }
-            const timeoutId = setTimeout(() => fail(new ExpectedOperationError('Navigation timeout')), timeout)
+            const timeoutId = setTimeout(() => fail(navigationTimeout(true)), timeout)
 
             chrome.webNavigation.onCommitted.addListener(onCommitted)
             chrome.webNavigation.onDOMContentLoaded.addListener(onDOMContentLoaded)
@@ -213,12 +246,11 @@ export class NavigationHandler {
     private async runNavigationAction(
         tabId: number,
         waitUntil: WaitUntil,
-        timeout: number | undefined,
+        deadline: number,
         action: () => Promise<unknown>,
         expectedSameDocumentUrl?: string
     ): Promise<void> {
-        const budget = timeout ?? 30000
-        const startedAt = Date.now()
+        remainingNavigationTimeout(deadline)
         const normalizedSameDocumentUrl = normalizeNavigationUrl(expectedSameDocumentUrl)
         let baselineDocumentId: string | null = null
         if (expectedSameDocumentUrl && typeof chrome.webNavigation.getFrame === 'function') {
@@ -229,6 +261,7 @@ export class NavigationHandler {
                 // 无法识别当前 document 时不接受同文档完成信号，避免误用旧事件
             }
         }
+        remainingNavigationTimeout(deadline)
         let actionStarted = false
         let settled = false
         let currentDocumentId: string | null = null
@@ -269,9 +302,9 @@ export class NavigationHandler {
                 if (settled) {
                     return
                 }
-                const remaining = budget - (Date.now() - startedAt)
+                const remaining = deadline - Date.now()
                 if (remaining <= 0) {
-                    fail(new ExpectedOperationError('Navigation timeout'))
+                    fail(navigationTimeout(actionStarted))
                     return
                 }
                 const pending = this.logManager.getPending(tabId)
@@ -342,8 +375,8 @@ export class NavigationHandler {
                 }
             }
             const timeoutId = setTimeout(
-                () => fail(new ExpectedOperationError('Navigation timeout')),
-                Math.max(0, budget - (Date.now() - startedAt))
+                () => fail(navigationTimeout(actionStarted)),
+                remainingNavigationTimeout(deadline)
             )
 
             chrome.webNavigation.onCommitted.addListener(onCommitted)
@@ -354,12 +387,17 @@ export class NavigationHandler {
         })
         waitPromise.catch(() => {})
 
-        const remaining = () => Math.max(0, budget - (Date.now() - startedAt))
         const actionPromise = new Promise<void>((resolve, reject) => {
-            const timeoutId = setTimeout(() => reject(new ExpectedOperationError('Navigation timeout')), remaining())
-            actionStarted = true
+            const timeoutId = setTimeout(
+                () => reject(navigationTimeout(actionStarted)),
+                remainingNavigationTimeout(deadline)
+            )
             void Promise.resolve()
-                .then(action)
+                .then(() => {
+                    remainingNavigationTimeout(deadline)
+                    actionStarted = true
+                    return action()
+                })
                 .then(() => resolve(), reject)
                 .finally(() => clearTimeout(timeoutId))
         })
@@ -383,11 +421,17 @@ export class NavigationHandler {
         tabId: number,
         beforeUrl: string | undefined,
         timeout: number,
-        direction: 'back' | 'forward'
+        direction: 'back' | 'forward',
+        deadline: number
     ): Promise<boolean> {
-        const navigation = this.waitForNavigationSignal(tabId, beforeUrl, timeout)
+        const navigation = this.waitForNavigationSignal(
+            tabId,
+            beforeUrl,
+            Math.min(timeout, remainingNavigationTimeout(deadline))
+        )
         try {
             try {
+                remainingNavigationTimeout(deadline)
                 if (direction === 'back') {
                     await chrome.tabs.goBack(tabId)
                 } else {
@@ -403,6 +447,7 @@ export class NavigationHandler {
                     const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
                     if (frame && !frame.errorOccurred) {
                         // 原生历史不可用时，仅在可注入的文档上尝试页面历史
+                        remainingNavigationTimeout(deadline)
                         await chrome.scripting
                             .executeScript({
                                 target: { tabId },

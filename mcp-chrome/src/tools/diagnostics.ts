@@ -1,5 +1,6 @@
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
 import { formatErrorResponse, formatResponse, getUnifiedSession } from '../core/index.js'
+import { withNavigationBudget } from '../core/utils.js'
 import { sanitizeUrlRecords } from './network-sanitizer.js'
 
 export type DiagnosticsStatus = 'disabled' | 'collected' | 'unavailable' | 'error'
@@ -40,16 +41,17 @@ function entriesSince<T>(entries: T[], lastEntry: string | undefined): { entries
 
 export async function startDiagnostics(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
-    enabled: boolean | undefined
+    enabled: boolean | undefined,
+    deadline?: number
 ): Promise<{ start?: DiagnosticsStart; result: DiagnosticsResult }> {
     if (!enabled) {
         return { result: { diagnosticsStatus: 'disabled' } }
     }
     try {
-        await unifiedSession.enableConsole()
-        await unifiedSession.enableNetwork()
-        const consoleLogs = await unifiedSession.getConsoleLogs()
-        const network = await unifiedSession.getNetworkRequests()
+        await withNavigationBudget(() => unifiedSession.enableConsole(), deadline)
+        await withNavigationBudget(() => unifiedSession.enableNetwork(), deadline)
+        const consoleLogs = await withNavigationBudget(() => unifiedSession.getConsoleLogs(), deadline)
+        const network = await withNavigationBudget(() => unifiedSession.getNetworkRequests(), deadline)
         return {
             start: {
                 consoleLastEntry: consoleLogs.length > 0 ? entryMarker(consoleLogs[consoleLogs.length - 1]) : undefined,
@@ -69,14 +71,15 @@ export async function startDiagnostics(
 
 export async function finishDiagnostics(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
-    started: { start?: DiagnosticsStart; result: DiagnosticsResult }
+    started: { start?: DiagnosticsStart; result: DiagnosticsResult },
+    deadline?: number
 ): Promise<DiagnosticsResult> {
     if (!started.start) {
         return started.result
     }
     try {
-        const consoleLogs = await unifiedSession.getConsoleLogs()
-        const network = await unifiedSession.getNetworkRequests()
+        const consoleLogs = await withNavigationBudget(() => unifiedSession.getConsoleLogs(), deadline)
+        const network = await withNavigationBudget(() => unifiedSession.getNetworkRequests(), deadline)
         const consoleDelta = entriesSince(consoleLogs, started.start.consoleLastEntry)
         const networkDelta = entriesSince(network, started.start.networkLastEntry)
         return {
@@ -134,16 +137,17 @@ export function appendDiagnosticsToResponse(response: ToolResponse, result: Diag
 export async function withDiagnosticsResponse<T extends Record<string, unknown>>(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     enabled: boolean | undefined,
-    action: () => Promise<T>
+    action: () => Promise<T>,
+    deadline?: number
 ): Promise<ToolResponse> {
-    const diagnostics = await startDiagnostics(unifiedSession, enabled)
+    const diagnostics = await startDiagnostics(unifiedSession, enabled, deadline)
     try {
         const result = await action()
-        appendDiagnostics(result, await finishDiagnostics(unifiedSession, diagnostics))
+        appendDiagnostics(result, await finishDiagnostics(unifiedSession, diagnostics, deadline))
         return formatResponse(result)
     } catch (error) {
         const response = formatErrorResponse(error)
-        appendDiagnosticsToResponse(response, await finishDiagnostics(unifiedSession, diagnostics))
+        appendDiagnosticsToResponse(response, await finishDiagnostics(unifiedSession, diagnostics, deadline))
         return response
     }
 }

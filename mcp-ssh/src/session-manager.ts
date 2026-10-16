@@ -1002,7 +1002,7 @@ export class SessionManager {
         )
         const wrappedCommand =
             `if command -v setsid >/dev/null 2>&1; then ` +
-            `exec env ${markerEnv} setsid sh -c ${operationScript} sh 1; ` +
+            `exec env ${markerEnv} setsid -w sh -c ${operationScript} sh 1; ` +
             `else exec env ${markerEnv} sh -c ${operationScript} sh 0; fi`
         const runAs = options.useLoginUser ? undefined : (options.runAs ?? session.config.runAs)
         let fullCommand: string
@@ -1110,7 +1110,7 @@ export class SessionManager {
             'if [ ! -r "/proc/$pid/environ" ]; then printf "operation marker unavailable" >&2; exit 3; fi',
             'if ! tr "\\000" "\\n" < "/proc/$pid/environ" | grep -Fqx -- "$expected"; then ' +
                 'printf "operation marker mismatch" >&2; exit 4; fi',
-            `kill -TERM -- ${signalTarget}`,
+            `kill -TERM ${signalTarget}`,
         ].join('; ')
         try {
             const result = await this.exec(alias, command, {
@@ -1475,6 +1475,7 @@ export class SessionManager {
 
             try {
                 client.connect(connectConfig)
+                client.setNoDelay(true)
             } catch (error) {
                 rejectConnection(error)
             }
@@ -1675,8 +1676,7 @@ export class SessionManager {
                 await this.reconnect(alias)
             } catch (err) {
                 console.error(
-                    `Auto-reconnect failed for ${alias} (${attempt}/${this.maxReconnectAttempts}):`,
-                    (err as Error).message
+                    `Auto-reconnect failed for ${alias} (${attempt}/${this.maxReconnectAttempts}): ${(err as Error).message}`
                 )
                 if (this.sessions.get(alias) === session) {
                     this.scheduleReconnect(alias)

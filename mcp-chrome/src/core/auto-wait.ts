@@ -12,7 +12,7 @@
 import type { CDPClient } from '../cdp/client.js'
 import { StructuredToolError } from './errors.js'
 import { withRetry } from './retry.js'
-import { DEFAULT_TIMEOUT } from './types.js'
+import { DEFAULT_TIMEOUT, type Box } from './types.js'
 
 /**
  * AutoWait 选项
@@ -71,10 +71,10 @@ export class AutoWait {
     }
 
     /**
-     * 等待元素位置稳定（两帧对比）
+     * 等待元素位置稳定（两次采样对比）
      *
      * 参考：Puppeteer #waitForStableBoundingBoxIfNeeded
-     * 在两个连续的动画帧中，元素的边界框必须相同
+     * 采样间隔由 Node 计时，不依赖后台页面的动画帧
      */
     async waitForStableBoundingBox(nodeId: number): Promise<void> {
         await withRetry(
@@ -82,28 +82,27 @@ export class AutoWait {
                 const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
                     object: { objectId: string }
                 }
-
-                const { result } = (await this.send('Runtime.callFunctionOn', {
+                const params = {
                     objectId: object.objectId,
                     functionDeclaration: `function() {
-            return new Promise((resolve) => {
-              let rect1;
-              requestAnimationFrame(() => {
-                rect1 = this.getBoundingClientRect();
-                requestAnimationFrame(() => {
-                  const rect2 = this.getBoundingClientRect();
-                  const stable = rect1.x === rect2.x && rect1.y === rect2.y &&
-                                 rect1.width === rect2.width && rect1.height === rect2.height;
-                  resolve(stable);
-                });
-              });
-            });
-          }`,
+                        const { x, y, width, height } = this.getBoundingClientRect();
+                        return { x, y, width, height };
+                    }`,
                     returnByValue: true,
-                    awaitPromise: true,
-                })) as { result: { value: boolean } }
-
-                if (!result.value) {
+                }
+                const { result: first } = (await this.send('Runtime.callFunctionOn', params)) as {
+                    result: { value: Box }
+                }
+                await new Promise((resolve) => setTimeout(resolve, Math.min(32, this.remaining())))
+                const { result: second } = (await this.send('Runtime.callFunctionOn', params)) as {
+                    result: { value: Box }
+                }
+                if (
+                    first.value.x !== second.value.x ||
+                    first.value.y !== second.value.y ||
+                    first.value.width !== second.value.width ||
+                    first.value.height !== second.value.height
+                ) {
                     throw new Error('元素位置不稳定')
                 }
             },

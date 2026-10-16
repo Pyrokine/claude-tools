@@ -1,18 +1,13 @@
 /**
- * Managed tab/window 状态与 storage 恢复。
+ * Managed tab/window 状态与 storage 恢复
  */
 
 const STORAGE_KEY = 'mcp_managed_tab_ids'
-const CREATED_KEY = 'mcp_created_tab_ids'
 
 let mcpTabGroupId: number | null = null
 let mcpWindowId: number | null = null
+let storageUpdate: Promise<void> = Promise.resolve()
 const managedTabIds = new Set<number>()
-const createdTabIds = new Set<number>()
-
-export function isCreatedTab(tabId: number): boolean {
-    return createdTabIds.has(tabId)
-}
 
 export function getMcpTabGroupId(): number | null {
     return mcpTabGroupId
@@ -30,59 +25,50 @@ export function setMcpWindowId(windowId: number | null): void {
     mcpWindowId = windowId
 }
 
-export async function markManagedTab(tabId: number, created = false): Promise<void> {
-    managedTabIds.add(tabId)
-    if (created) {
-        createdTabIds.add(tabId)
-    }
-    await chrome.storage.session.set({
-        [STORAGE_KEY]: [...managedTabIds],
-        [CREATED_KEY]: [...createdTabIds],
+async function updateManagedTabs(update: (ids: Set<number>) => Promise<void> | void): Promise<void> {
+    const operation = storageUpdate
+        .catch(() => {})
+        .then(async () => {
+            const next = new Set(managedTabIds)
+            await update(next)
+            await chrome.storage.session.set({ [STORAGE_KEY]: [...next] })
+            managedTabIds.clear()
+            for (const id of next) {
+                managedTabIds.add(id)
+            }
+        })
+    storageUpdate = operation
+    await operation
+}
+
+export async function markManagedTab(tabId: number): Promise<void> {
+    await updateManagedTabs((ids) => {
+        ids.add(tabId)
     })
 }
 
 export async function unmarkManagedTab(tabId: number): Promise<void> {
-    managedTabIds.delete(tabId)
-    createdTabIds.delete(tabId)
-    await chrome.storage.session.set({
-        [STORAGE_KEY]: [...managedTabIds],
-        [CREATED_KEY]: [...createdTabIds],
+    await updateManagedTabs((ids) => {
+        ids.delete(tabId)
     })
 }
 
-export function isManagedTab(
-    tab: chrome.tabs.Tab,
-    context: { mcpTabGroupId: number | null; mcpWindowId: number | null }
-): boolean {
-    if (tab.id !== undefined && managedTabIds.has(tab.id)) {
-        return true
-    }
-    return context.mcpTabGroupId !== null && tab.groupId === context.mcpTabGroupId
+export function isManagedTab(tab: Pick<chrome.tabs.Tab, 'id'>): boolean {
+    return tab.id !== undefined && managedTabIds.has(tab.id)
 }
 
-/** Extension 启动时调用，从 storage 恢复 managed tab 集合 */
+/** Extension 启动时调用，只恢复当前浏览器会话中仍存在的受控 tab */
 export async function restoreManagedTabs(): Promise<void> {
-    const result = await chrome.storage.session.get([STORAGE_KEY, CREATED_KEY])
-    const stored: number[] = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : []
-    const created: number[] = Array.isArray(result[CREATED_KEY]) ? result[CREATED_KEY] : []
-    for (const id of stored) {
-        managedTabIds.add(id)
-    }
-    for (const id of created) {
-        createdTabIds.add(id)
-    }
-    // 清理 storage 中已关闭的 tab
-    const tabs = await chrome.tabs.query({})
-    const existingIds = new Set(tabs.map((t) => t.id).filter((id): id is number => id !== undefined))
-    for (const id of managedTabIds) {
-        if (!existingIds.has(id)) {
-            managedTabIds.delete(id)
+    await updateManagedTabs(async (ids) => {
+        const result = await chrome.storage.session.get(STORAGE_KEY)
+        const stored: unknown[] = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : []
+        const tabs = await chrome.tabs.query({})
+        const existingIds = new Set(tabs.map((tab) => tab.id))
+        ids.clear()
+        for (const id of stored) {
+            if (typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 && existingIds.has(id)) {
+                ids.add(id)
+            }
         }
-    }
-    for (const id of createdTabIds) {
-        if (!existingIds.has(id)) {
-            createdTabIds.delete(id)
-        }
-    }
-    await chrome.storage.session.set({ [STORAGE_KEY]: [...managedTabIds], [CREATED_KEY]: [...createdTabIds] })
+    })
 }

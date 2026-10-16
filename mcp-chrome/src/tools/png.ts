@@ -33,7 +33,7 @@ export function assertScreenshotBase64Budget(data: string): void {
 
 export function assertPngFileBudget(size: number): void {
     if (size > MAX_COMPARE_PNG_BYTES) {
-        throw new Error(`baseline PNG 超过 ${MAX_COMPARE_PNG_BYTES} 字节，请更换较小的基准图`)
+        throw new Error(`baseline PNG 超过 ${MAX_COMPARE_PNG_BYTES} 字节，请用 clip 或 scale 重新生成较小的基准图`)
     }
 }
 

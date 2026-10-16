@@ -19,9 +19,33 @@ export interface ErrorContext {
 
 const errorPageContexts = new WeakMap<object, ErrorContext>()
 
+export function isNativeExecutionResultUnknown(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error)
+    if (
+        message === 'Execution was terminated' ||
+        (error instanceof CDPError &&
+            /^Runtime\.(?:evaluate|callFunctionOn|runScript): (?:Execution was terminated|Internal error)$/.test(
+                message
+            ))
+    ) {
+        return true
+    }
+    try {
+        const payload = JSON.parse(message) as { code?: unknown; message?: unknown } | null
+        return payload?.code === -32000 && payload.message === 'Execution was terminated'
+    } catch {
+        return false
+    }
+}
+
 export function setErrorPageContext(error: unknown, pageContext: ErrorContext): unknown {
     const value = error !== null && typeof error === 'object' ? error : new Error(String(error))
-    errorPageContexts.set(value, pageContext)
+    const previous = errorPageContexts.get(value)
+    errorPageContexts.set(value, {
+        ...previous,
+        ...pageContext,
+        ...(previous?.frameContext ? { frameContext: previous.frameContext } : {}),
+    })
     return value
 }
 
@@ -64,6 +88,27 @@ export abstract class BrowserError extends Error {
 
         return result
     }
+}
+
+export function creationError(error: unknown, context: ErrorContext): StructuredToolError {
+    const body = JSON.parse(formatErrorResponse(error).content[0]!.text) as {
+        error: { code: string; message: string; suggestion?: string; context?: ErrorContext }
+    }
+    const facts = { ...context, ...body.error.context }
+    if (typeof facts.createdTargetId === 'string') {
+        facts.actionExecuted = body.error.context?.actionExecuted ?? true
+        facts.actionStatus = body.error.context?.actionStatus ?? 'partial'
+    }
+    return new StructuredToolError(
+        body.error.code === 'UNKNOWN_ERROR'
+            ? facts.actionStatus === 'unknown'
+                ? 'CREATE_RESULT_UNKNOWN'
+                : 'CREATE_INCOMPLETE'
+            : body.error.code,
+        body.error.message,
+        body.error.suggestion ?? '请用 browse list 核对实际页面，勿自动重复创建或删除',
+        facts
+    )
 }
 
 export class StructuredToolError extends Error {

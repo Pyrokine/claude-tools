@@ -3,7 +3,7 @@ use crate::types::*;
 use crate::utils::*;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
@@ -20,14 +20,26 @@ pub struct GetParams {
     pub range: Option<(usize, usize)>,
     pub output: Option<String>,
     pub project: Option<String>,
+    pub source: Option<String>,
     pub redaction: RedactionMode,
     pub overwrite: bool,
+    pub view: Option<String>,
+    pub block: Option<usize>,
 }
 
 /// 获取完整内容
 pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorResponse> {
     if params.overwrite && params.output.is_none() {
         return Err(invalid_arguments("overwrite=true 需要 output"));
+    }
+    let view = params.view.as_deref().unwrap_or("content");
+    if !matches!(view, "content" | "tool_input" | "tool_result" | "record") {
+        return Err(invalid_arguments(
+            "view 仅支持 content、tool_input、tool_result、record",
+        ));
+    }
+    if params.block.is_some() && !matches!(view, "tool_input" | "tool_result") {
+        return Err(invalid_arguments("block 需要 view=tool_input 或 tool_result"));
     }
     // 解析 ref
     let parsed_ref = ParsedRef::parse(&params.r#ref).ok_or_else(|| ErrorResponse {
@@ -37,50 +49,51 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     })?;
 
     // 查找 session 文件
-    let (_project_id, _session_id, path) =
-        find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
+    let (_project_id, _session_id, path) = find_session_file(
+        config,
+        &parsed_ref.session_prefix,
+        params.project.as_deref(),
+        params.source.as_deref(),
+    )?;
 
     // 读取指定行
-    let file = File::open(&path).map_err(|e| ErrorResponse {
+    let file = crate::session_files::open_session_file(&path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("无法打开文件: {e}"),
         available: None,
     })?;
 
-    let reader = BufReader::new(file);
-    let mut target_line = None;
-
-    for (line_num, line) in bounded_jsonl_lines(reader).enumerate() {
-        if line_num + 1 == parsed_ref.line {
-            target_line = Some(match line {
-                Ok(BoundedLine::Record(line)) => line,
-                Ok(BoundedLine::TooLarge) => {
-                    return Err(ErrorResponse {
-                        error: "record_too_large".to_string(),
-                        message: format!("ref 行超过 {MAX_JSONL_LINE_BYTES} 字节上限"),
-                        available: None,
-                    });
-                }
-                Err(e) => {
-                    return Err(ErrorResponse {
-                        error: "io_error".to_string(),
-                        message: format!("读取行失败: {e}"),
-                        available: None,
-                    });
-                }
-            });
-            break;
+    let snapshot_end = file.metadata().map_err(session_io_error)?.len();
+    let mut lines = crate::record_reader::RecordLines::new(file.try_clone().map_err(session_io_error)?, snapshot_end);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut remaining = u64::MAX;
+    let located = loop {
+        match lines.step(&mut remaining, deadline)? {
+            crate::record_reader::LineStep::Record(record) if record.line == parsed_ref.line => break record,
+            crate::record_reader::LineStep::Record(_) => {}
+            crate::record_reader::LineStep::Yield => {
+                return Err(crate::record_reader::reader_error(
+                    "deadline_exceeded",
+                    "定位消息超过执行时间",
+                ));
+            }
+            crate::record_reader::LineStep::End => {
+                return Err(crate::record_reader::reader_error(
+                    "ref_not_found",
+                    format!("ref 不存在: {}", params.r#ref),
+                ));
+            }
         }
+    };
+    if located.small.is_none() || params.view.as_deref().is_some_and(|view| view != "content") {
+        let span = located.span;
+        drop(located);
+        return get_indexed(file, span, params);
     }
-
-    let line = target_line.ok_or_else(|| ErrorResponse {
-        error: "ref_not_found".to_string(),
-        message: format!("ref 不存在: {}", params.r#ref),
-        available: None,
-    })?;
+    let line = located.small.expect("bounded message line");
 
     // 解析消息
-    let record: MessageRecord = serde_json::from_str(&line).map_err(|e| ErrorResponse {
+    let record: MessageRecord = serde_json::from_slice(&line).map_err(|e| ErrorResponse {
         error: "parse_error".to_string(),
         message: format!("解析消息失败: {e}"),
         available: None,
@@ -89,7 +102,11 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     // 提取内容和图片
     let (effective_type, _) = classify_message(&record);
     let raw_content = replace_images_with_placeholders(&record);
-    let images = extract_images(&record);
+    let images = if params.view.as_deref().is_none_or(|view| view == "content") {
+        extract_images(&record)
+    } else {
+        Vec::new()
+    };
     let image_count = images.len();
     let original_content_size = raw_content.chars().count();
 
@@ -163,6 +180,167 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     })
 }
 
+fn get_indexed(
+    file: File,
+    span: crate::record_reader::SourceSpan,
+    params: GetParams,
+) -> Result<GetResponse, ErrorResponse> {
+    use crate::record_reader::{TextBytes, check_work, index_record, reader_error, render_text_range};
+    let view = params.view.as_deref().unwrap_or("content");
+    let indexed = index_record(file.try_clone().map_err(session_io_error)?, span, view != "record")?;
+    let (effective_type, _) = indexed.classify(file.try_clone().map_err(session_io_error)?, span)?;
+    if indexed.metadata.is_none() && view != "record" {
+        return Err(reader_error("parse_error", "目标行不是消息记录"));
+    }
+    let projection = if view == "content" {
+        indexed.projection(file.try_clone().map_err(session_io_error)?, span, view, params.block)?
+    } else {
+        indexed.structured_projection(
+            file.try_clone().map_err(session_io_error)?,
+            span,
+            view,
+            params.block,
+            params.redaction,
+        )?
+    };
+    let images = if view == "content" {
+        indexed.image_sources(file.try_clone().map_err(session_io_error)?, span)?
+    } else {
+        Vec::new()
+    };
+    let image_count = images.len();
+    let mut text = TextBytes::new(projection.cursor(file.try_clone().map_err(session_io_error)?, span));
+    if let Some(output_raw) = params.output.as_deref() {
+        if image_count > 64 {
+            return Err(reader_error("export_image_limit", "单次导出最多包含 64 张图片"));
+        }
+        let resolved = resolve_output_files(
+            output_raw,
+            &format!("{}.txt", params.r#ref.replace(':', "_")),
+            "manifest.json",
+        )?;
+        let retention = resolved.temp_output.then(|| TEMP_OUTPUT_RETENTION.to_string());
+        let transaction = OutputTransaction::begin(resolved, params.overwrite)?;
+        let mut output = open_private_output_file(&transaction.staging_content())?;
+        let mut lines = 0;
+        let mut last = None;
+        let (original_content_size, content_size, redacted_count) =
+            render_text_range(&mut text, params.redaction, params.range, |chunk| {
+                check_work()?;
+                output.write_all(chunk).map_err(session_io_error)?;
+                lines += chunk.iter().filter(|byte| **byte == b'\n').count();
+                last = chunk.last().copied().or(last);
+                Ok(())
+            })?;
+        lines += usize::from(last.is_some_and(|byte| byte != b'\n'));
+        output.sync_all().map_err(session_io_error)?;
+        let bytes = output.metadata().map_err(session_io_error)?.len();
+        let mut image_paths = Vec::new();
+        for (index, projection, extension) in images {
+            check_work()?;
+            let name = format!("{}_img{index}.{extension}", params.r#ref.replace(':', "_"));
+            let mut image = open_private_output_file(&transaction.staging_dir().join(&name))?;
+            let cursor = projection.cursor(file.try_clone().map_err(session_io_error)?, span);
+            let mut decoder = base64::read::DecoderReader::new(cursor, &base64::engine::general_purpose::STANDARD);
+            std::io::copy(&mut decoder, &mut image).map_err(|error| {
+                reader_error(
+                    "image_export_failed",
+                    format!("图片 {index} 解码或写入失败，导出未发布: {error}"),
+                )
+            })?;
+            image.sync_all().map_err(session_io_error)?;
+            image_paths.push(transaction.final_dir().join(name));
+        }
+        let redaction = redaction_info(
+            params.redaction,
+            redacted_count,
+            params.redaction == RedactionMode::Off || redacted_count > 0,
+        );
+        let content_path = transaction.content();
+        let manifest_path = transaction.manifest();
+        let sample_kind = if params.range.is_some() { "range" } else { "all" }.to_string();
+        let manifest = serde_json::json!({
+            "schema": "mcp-claude-history.get-output.v2", "ref": params.r#ref, "view": view, "block": params.block,
+            "content_size": content_size, "original_content_size": original_content_size, "content": content_path,
+            "images": image_paths, "bytes": bytes, "lines": lines, "complete": true, "sample_kind": sample_kind, "redaction": redaction,
+        });
+        let mut manifest_file = open_private_output_file(&transaction.staging_manifest())?;
+        manifest_file
+            .write_all(
+                &serde_json::to_vec_pretty(&manifest)
+                    .map_err(|error| reader_error("serialize_error", error.to_string()))?,
+            )
+            .map_err(session_io_error)?;
+        manifest_file.sync_all().map_err(session_io_error)?;
+        check_work()?;
+        transaction.publish()?;
+        return Ok(GetResponse::Output {
+            r#ref: params.r#ref,
+            output: OutputInfo {
+                content: content_path,
+                manifest: manifest_path,
+                images: image_paths,
+                bytes,
+                lines,
+                schema: "mcp-claude-history.get-output.v2".to_string(),
+                complete: true,
+                sample_kind,
+                redaction,
+                retention,
+            },
+            content_size,
+            original_content_size,
+            image_count,
+        });
+    }
+    const MAX_DIRECT_SIZE: usize = 100_000;
+    let mut content = String::new();
+    let mut head = String::new();
+    let mut tail = std::collections::VecDeque::with_capacity(2000);
+    let mut collected = 0;
+    let (original_size, content_size, _) = render_text_range(&mut text, params.redaction, params.range, |chunk| {
+        let chunk = std::str::from_utf8(chunk).map_err(|_| reader_error("parse_error", "逻辑正文 UTF-8 无效"))?;
+        for character in chunk.chars() {
+            if collected < MAX_DIRECT_SIZE {
+                content.push(character);
+            }
+            if collected < 2000 {
+                head.push(character);
+            }
+            if tail.len() == 2000 {
+                tail.pop_front();
+            }
+            tail.push_back(character);
+            collected += 1;
+        }
+        Ok(())
+    })?;
+    check_work()?;
+    if content_size > MAX_DIRECT_SIZE {
+        return Ok(GetResponse::TooLarge {
+            error: "content_too_large".to_string(),
+            r#ref: params.r#ref,
+            size: content_size,
+            content_size,
+            valid_range: valid_range_label(original_size),
+            suggestion: "使用 output 导出或 range 分块读取".to_string(),
+            truncation_reason: format!("content_size {content_size} exceeds max direct response {MAX_DIRECT_SIZE}"),
+            output_suggestion: "output=tmp:export 或 output=cwd:export".to_string(),
+            range_suggestion: format!("0-{}", MAX_DIRECT_SIZE.min(original_size)),
+            parsed_range: params.range.map(|(start, end)| RangeInfo { start, end }),
+            head,
+            tail: tail.into_iter().collect(),
+        });
+    }
+    Ok(GetResponse::Success {
+        r#ref: params.r#ref,
+        r#type: effective_type.to_string(),
+        content,
+        content_size,
+        image_count,
+    })
+}
+
 fn tail_chars(content: &str, max_len: usize) -> String {
     let char_count = content.chars().count();
     if char_count <= max_len {
@@ -205,9 +383,39 @@ pub fn find_session_file(
     config: &Config,
     session_prefix: &str,
     project_id: Option<&str>,
+    source: Option<&str>,
 ) -> Result<(String, String, PathBuf), ErrorResponse> {
+    let source = source.map(Path::new);
+    let source_project = if let Some(source) = source {
+        if !source.is_absolute()
+            || source
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+        {
+            return Err(invalid_arguments(
+                "source 必须原样使用 search 或 scan metadata 返回的绝对来源路径",
+            ));
+        }
+        let root = config.projects_dir.canonicalize().map_err(session_io_error)?;
+        let relative = source
+            .strip_prefix(&config.projects_dir)
+            .or_else(|_| source.strip_prefix(&root))
+            .map_err(|_| invalid_arguments("source 不在当前历史目录内"))?;
+        let project = relative
+            .components()
+            .next()
+            .and_then(|part| match part {
+                Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .ok_or_else(|| invalid_arguments("source 没有合法项目标识"))?;
+        Some(project.to_string())
+    } else {
+        None
+    };
+    let selected_project = project_id.or(source_project.as_deref());
     // 确定要搜索的项目
-    let project_dirs: Vec<(String, PathBuf)> = if let Some(pid) = project_id {
+    let project_dirs: Vec<(String, PathBuf)> = if let Some(pid) = selected_project {
         let normalized = config.normalize_project_id(pid)?;
         let dir = config.project_dir(&normalized)?;
         if !dir.exists() {
@@ -226,7 +434,7 @@ pub fn find_session_file(
 
     let mut matches = search_sessions_in_dirs(&project_dirs, session_prefix)?;
 
-    if project_id.is_none() {
+    if selected_project.is_none() {
         let all_dirs = config.list_project_dirs().map_err(session_io_error)?;
         let remaining: Vec<_> = all_dirs
             .into_iter()
@@ -237,18 +445,31 @@ pub fn find_session_file(
         }
     }
 
+    if let Some(source) = source {
+        matches.retain(|(_, _, path)| path == source);
+        if matches.is_empty() {
+            return Err(ErrorResponse {
+                error: "source_not_found".to_string(),
+                message: "source 不属于已识别布局中与 ref/project 匹配的会话来源".to_string(),
+                available: None,
+            });
+        }
+    }
     if matches.len() == 1 {
         return Ok(matches.remove(0));
     }
     if matches.len() > 1 {
         return Err(ErrorResponse {
             error: "session_ambiguous".to_string(),
-            message: format!("session prefix 不唯一: {session_prefix}，请传 project 或完整 ref"),
+            message: format!(
+                "session prefix 不唯一: {session_prefix}，请用 project、完整 ref 或返回的 source 精确选择来源"
+            ),
             available: Some(serde_json::json!({
                 "candidates": matches
                     .iter()
                     .map(|(project, session, _)| format!("{project}:{session}"))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                "sources": matches.iter().map(|(project, session, path)| serde_json::json!({"project":project,"session":session,"source":path})).collect::<Vec<_>>()
             })),
         });
     }
@@ -273,48 +494,7 @@ fn search_sessions_in_dirs(
     project_dirs: &[(String, PathBuf)],
     session_prefix: &str,
 ) -> Result<Vec<(String, String, PathBuf)>, ErrorResponse> {
-    let mut matches = Vec::new();
-    for (project_id, dir) in project_dirs {
-        for entry in fs::read_dir(dir).map_err(session_io_error)? {
-            let entry = entry.map_err(session_io_error)?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "jsonl") {
-                let filename = entry.file_name().to_string_lossy().to_string();
-                if let Some(session_id) = session_id_from_filename(&filename)
-                    && session_matches_ref(&session_id, session_prefix)
-                {
-                    matches.push((project_id.clone(), session_id, path));
-                }
-                continue;
-            }
-            if !entry.file_type().map_err(session_io_error)?.is_dir() {
-                continue;
-            }
-            for sidechain_dir in SIDECHAIN_SESSION_DIRS {
-                let subdir = path.join(sidechain_dir);
-                let sub_entries = match fs::read_dir(&subdir) {
-                    Ok(entries) => entries,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(session_io_error(e)),
-                };
-                for sub_entry in sub_entries {
-                    let sub_entry = sub_entry.map_err(session_io_error)?;
-                    let path = sub_entry.path();
-                    if path.extension().is_none_or(|ext| ext != "jsonl") {
-                        continue;
-                    }
-                    let filename = sub_entry.file_name().to_string_lossy().to_string();
-                    if filename.starts_with("agent-") {
-                        let session_id = filename.strip_suffix(".jsonl").unwrap_or(&filename).to_string();
-                        if session_matches_ref(&session_id, session_prefix) {
-                            matches.push((project_id.clone(), session_id, path));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(matches)
+    crate::session_files::collect_session_files(project_dirs, &[session_prefix.to_string()], true)
 }
 
 #[derive(Debug)]
@@ -1737,12 +1917,190 @@ mod tests {
                 range: None,
                 output: None,
                 project: None,
+                source: None,
                 redaction: RedactionMode::Auto,
                 overwrite: true,
+                view: None,
+                block: None,
             },
         )
         .unwrap_err();
         assert_eq!(error.error, "invalid_arguments");
+    }
+
+    #[test]
+    fn large_record_range_uses_complete_sensitive_spans() {
+        let secret = "x".repeat(MAX_JSONL_LINE_BYTES + 1024);
+        let content = format!("前缀😀 password=\"{secret}\" 后缀");
+        let selected = (content.chars().count() - 1030, content.chars().count() - 5);
+        let expected = redact_text_range_with_mode(&content, RedactionMode::Strict, Some(selected));
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "large-range", "type": "user", "timestamp": "2026-10-12T00:00:00Z", "message": {"content": content}
+        }));
+        let response = get(
+            &config,
+            GetParams {
+                r#ref: reference,
+                range: Some(selected),
+                output: None,
+                project: Some("project".to_string()),
+                source: None,
+                redaction: RedactionMode::Strict,
+                overwrite: false,
+                view: None,
+                block: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(success_content(response), expected.text);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn get_structured_view_selects_original_block_and_normalizes_json() {
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "views", "type": "assistant", "timestamp": "2026-10-12T00:00:00Z",
+            "message": {"content": [{"type":"text", "text":"before"}, {"type":"tool_use", "name":"Bash", "id":"call", "input":{"z":1,"a":"中文😀"}}]}
+        }));
+        let response = get(
+            &config,
+            GetParams {
+                r#ref: reference,
+                range: None,
+                output: None,
+                project: Some("project".to_string()),
+                source: None,
+                redaction: RedactionMode::Off,
+                overwrite: false,
+                view: Some("tool_input".to_string()),
+                block: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(success_content(response), "{\"a\":\"中文😀\",\"z\":1}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn get_record_view_preserves_internal_objects_and_redacts_nested_values() {
+        for record in [
+            serde_json::json!({
+                "uuid":"progress-fixture", "type":"progress", "timestamp":"2026-10-01T00:00:00Z",
+                "parentUuid":"parent-fixture",
+                "data":{"text":"中文😀 RECORD-NEEDLE", "password":{"nested":["fixture-secret"]}}
+            }),
+            serde_json::json!({
+                "type":"file-history-snapshot",
+                "snapshot":{"text":"中文😀 RECORD-NEEDLE", "password":{"nested":["fixture-secret"]}}
+            }),
+            serde_json::json!({
+                "uuid":"internal-fixture", "type":"system",
+                "payload":{"text":"中文😀 RECORD-NEEDLE", "password":{"nested":["fixture-secret"]}}
+            }),
+        ] {
+            let original = record.to_string();
+            let (root, config, reference) = fixture(record.clone());
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let content = success_content(
+                    get(
+                        &config,
+                        GetParams {
+                            r#ref: reference.clone(),
+                            range: None,
+                            output: None,
+                            project: Some("project".to_string()),
+                            source: None,
+                            redaction: mode,
+                            overwrite: false,
+                            view: Some("record".to_string()),
+                            block: None,
+                        },
+                    )
+                    .unwrap(),
+                );
+                let mut expected = record.clone();
+                let payload = ["data", "snapshot", "payload"]
+                    .into_iter()
+                    .find(|key| expected.get(key).is_some())
+                    .unwrap();
+                if mode.enabled() {
+                    expected[payload]["password"] = serde_json::json!("[redacted]");
+                }
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&content).unwrap(), expected);
+                assert_eq!(content.contains("fixture-secret"), mode == RedactionMode::Off);
+                let start = original[..original.find("中文😀 RECORD-NEEDLE").unwrap()]
+                    .chars()
+                    .count();
+                let range = (start + 2, start + 2 + "😀 RECORD-NEEDLE".chars().count());
+                let content = success_content(
+                    get(
+                        &config,
+                        GetParams {
+                            r#ref: reference.clone(),
+                            range: Some(range),
+                            output: None,
+                            project: Some("project".to_string()),
+                            source: None,
+                            redaction: mode,
+                            overwrite: false,
+                            view: Some("record".to_string()),
+                            block: None,
+                        },
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(content, "😀 RECORD-NEEDLE");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn get_record_view_ranges_large_payload_and_rejects_tool_blocks() {
+        let secret = "x".repeat(MAX_JSONL_LINE_BYTES + 1024);
+        let record = serde_json::json!({"type":"progress", "data":{"password":secret, "text":"中文😀 RECORD-NEEDLE"}});
+        let original = record.to_string();
+        let start = original[..original.find(&secret).unwrap()].chars().count() + secret.chars().count() - 10;
+        let (root, config, reference) = fixture(record);
+        for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+            let content = success_content(
+                get(
+                    &config,
+                    GetParams {
+                        r#ref: reference.clone(),
+                        range: Some((start, start + 5)),
+                        output: None,
+                        project: Some("project".to_string()),
+                        source: None,
+                        redaction: mode,
+                        overwrite: false,
+                        view: Some("record".to_string()),
+                        block: None,
+                    },
+                )
+                .unwrap(),
+            );
+            assert_eq!(content, if mode.enabled() { "\"[redacted]\"" } else { "xxxxx" });
+        }
+        for (view, block) in [("record", Some(0)), ("content", Some(0)), ("unknown", None)] {
+            let error = get(
+                &config,
+                GetParams {
+                    r#ref: reference.clone(),
+                    range: None,
+                    output: None,
+                    project: Some("project".to_string()),
+                    source: None,
+                    redaction: RedactionMode::Strict,
+                    overwrite: false,
+                    view: Some(view.to_string()),
+                    block,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.error, "invalid_arguments");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1758,8 +2116,11 @@ mod tests {
                 range: None,
                 output: Some(format!("tmp:image-failure-{}", export_nonce())),
                 project: Some("project".to_string()),
+                source: None,
                 redaction: RedactionMode::Auto,
                 overwrite: false,
+                view: None,
+                block: None,
             },
         )
         .unwrap_err();
@@ -1784,8 +2145,11 @@ mod tests {
                     range: Some(range),
                     output: None,
                     project: Some("project".to_string()),
+                    source: None,
                     redaction: RedactionMode::Auto,
                     overwrite: false,
+                    view: None,
+                    block: None,
                 },
             )
             .unwrap();
@@ -1804,8 +2168,11 @@ mod tests {
                 range: Some((11, 20)),
                 output: Some(output_name),
                 project: Some("project".to_string()),
+                source: None,
                 redaction: RedactionMode::Strict,
                 overwrite: false,
+                view: None,
+                block: None,
             },
         )
         .unwrap();
@@ -1842,8 +2209,11 @@ mod tests {
                 range: Some((0, content.chars().count())),
                 output: Some(output_name),
                 project: Some("project".to_string()),
+                source: None,
                 redaction: RedactionMode::Auto,
                 overwrite: false,
+                view: None,
+                block: None,
             },
         )
         .unwrap();
@@ -1880,8 +2250,11 @@ mod tests {
                     range: None,
                     output: None,
                     project: Some("project".to_string()),
+                    source: None,
                     redaction: RedactionMode::Auto,
                     overwrite: false,
+                    view: None,
+                    block: None,
                 },
             )
             .unwrap(),
@@ -1897,8 +2270,11 @@ mod tests {
                     range: None,
                     output: None,
                     project: Some("project".to_string()),
+                    source: None,
                     redaction: RedactionMode::Off,
                     overwrite: false,
+                    view: None,
+                    block: None,
                 },
             )
             .unwrap(),
@@ -1930,8 +2306,11 @@ mod tests {
                     range: None,
                     output: None,
                     project: Some("project".to_string()),
+                    source: None,
                     redaction: RedactionMode::Off,
                     overwrite: false,
+                    view: None,
+                    block: None,
                 },
             )
             .unwrap(),
@@ -1949,8 +2328,11 @@ mod tests {
                         range: None,
                         output: None,
                         project: Some("project".to_string()),
+                        source: None,
                         redaction: mode,
                         overwrite: false,
+                        view: None,
+                        block: None,
                     },
                 )
                 .unwrap(),
@@ -1972,8 +2354,11 @@ mod tests {
                 range: None,
                 output: Some(output_name),
                 project: Some("project".to_string()),
+                source: None,
                 redaction: RedactionMode::Off,
                 overwrite: false,
+                view: None,
+                block: None,
             },
         )
         .unwrap();

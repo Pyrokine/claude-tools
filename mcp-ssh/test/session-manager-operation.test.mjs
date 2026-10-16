@@ -7,7 +7,8 @@ import path from 'node:path'
 import net from 'node:net'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
-import { promisify } from 'node:util'
+import { format, promisify } from 'node:util'
+import ssh2 from 'ssh2'
 import { SessionManager } from '../dist/session-manager.js'
 
 const exec = promisify(execCallback)
@@ -82,6 +83,37 @@ function pendingConnect(manager, alias, port) {
         readyTimeout: 5000,
     })
 }
+
+test('new direct and jump connections disable Nagle after socket creation', async (t) => {
+    const { manager } = createManager(t)
+    const port = await createBlackholeServer(t)
+    const calls = []
+    const original = ssh2.Client.prototype.setNoDelay
+    t.mock.method(ssh2.Client.prototype, 'setNoDelay', function (enabled) {
+        calls.push({ enabled, socketCreated: Boolean(this._sock) })
+        return original.call(this, enabled)
+    })
+
+    for (const jumpHost of [undefined, { host: '127.0.0.1', port, username: 'tester' }]) {
+        await assert.rejects(
+            manager.connect({
+                alias: jumpHost ? 'jumped' : 'direct',
+                host: '127.0.0.1',
+                port,
+                username: 'tester',
+                agent: 'none',
+                readyTimeout: 30,
+                jumpHost,
+            })
+        )
+    }
+
+    assert.deepEqual(calls, [
+        { enabled: true, socketCreated: true },
+        { enabled: true, socketCreated: true },
+    ])
+    assert.equal(manager.pendingConnections.size, 0)
+})
 
 test('buildCommand gates shell operators behind successful cwd and env setup', async (t) => {
     if (process.platform === 'win32') {
@@ -182,6 +214,27 @@ test('auto-reconnect timer ignores a replacement session with the same alias', a
 
     assert.equal(reconnectCalls, 0)
     assert.equal(replacementEnded, false)
+})
+
+test('auto-reconnect warnings keep aliases and errors literal', async (t) => {
+    const { manager } = createManager(t)
+    const warnings = []
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    t.mock.method(console, 'error', (...args) => warnings.push(format(...args)))
+    manager.maxReconnectAttempts = 1
+    manager.reconnectDelay = 1
+    manager.reconnect = async () => {
+        throw new Error('fixture-error %s')
+    }
+
+    for (const alias of ['test-%s', 'test-%j', 'test-%%']) {
+        manager.sessions.set(alias, createSession({ end() {} }))
+        manager.scheduleReconnect(alias)
+        t.mock.timers.tick(1)
+        await Promise.resolve()
+        assert.equal(warnings.at(-1), `Auto-reconnect failed for ${alias} (1/1): fixture-error %s`)
+    }
+    assert.equal(warnings.length, 3)
 })
 
 test('connect rejects conflicting configurations that reuse the same alias', async (t) => {

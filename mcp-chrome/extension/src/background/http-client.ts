@@ -482,7 +482,7 @@ export class HttpClient {
                     .join(', ')}`
             )
         } else {
-            console.log('[HTTP] No MCP Server found in port range')
+            console.debug('[HTTP] No MCP Server found in port range')
         }
 
         return healthyPorts.sort((a, b) => a - b)
@@ -631,7 +631,7 @@ export class HttpClient {
         this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, 1000)
         const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts - 1), MAX_RECONNECT_DELAY)
 
-        console.log(`[HTTP] Scheduling reconnect in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts})`)
+        console.debug(`[HTTP] Scheduling reconnect in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts})`)
 
         const generation = this.generation
         this.reconnectTimer = setTimeout(async () => {

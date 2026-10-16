@@ -21,7 +21,7 @@ import {
     setMcpTabGroupId,
     setMcpWindowId,
     unmarkManagedTab,
-    isCreatedTab,
+    isManagedTab,
 } from './tab-state'
 
 // ==================== 全局状态 ====================
@@ -106,17 +106,20 @@ async function handleInternalMessage(message: InternalMessage, sender: chrome.ru
 
         case 'GET_STATUS': {
             const servers = httpClient.getConnectedServers()
-            const readAccess = Number.isSafeInteger(message.tabId)
-                ? await Promise.all(
-                      servers.map(async (server) => ({
-                          port: server.port,
-                          allowed: await hasReadGrant(server.instanceId, message.tabId!),
-                      }))
-                  )
-                : []
+            const managed = Number.isSafeInteger(message.tabId) && isManagedTab({ id: message.tabId })
+            const readAccess =
+                Number.isSafeInteger(message.tabId) && !managed
+                    ? await Promise.all(
+                          servers.map(async (server) => ({
+                              port: server.port,
+                              allowed: await hasReadGrant(server.instanceId, message.tabId!),
+                          }))
+                      )
+                    : []
             return {
                 connected: httpClient.isConnected(),
                 ports: httpClient.getConnectedPorts(),
+                managed,
                 readAccess,
                 pairingTokenConfigured: await httpClient.hasPairingToken(),
                 allowInsecureNoToken: await httpClient.isAllowInsecureNoToken(),
@@ -143,8 +146,8 @@ async function handleInternalMessage(message: InternalMessage, sender: chrome.ru
             if (tab.windowId !== window.id || !tab.active) {
                 throw new Error('只能从 popup 授权当前窗口的活动页面')
             }
-            if (isCreatedTab(tab.id!)) {
-                throw new Error('由扩展创建的页面无需只读授权')
+            if (isManagedTab(tab)) {
+                throw new Error('受控页面无需普通只读授权')
             }
             await setReadGrant(instanceId, tab.id!, message.allow)
             return { success: true, allowed: message.allow }

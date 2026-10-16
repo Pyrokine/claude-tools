@@ -13,8 +13,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { generateBezierPath, getMouseMoveDelay, getTypingDelay, randomDelay } from '../anti-detection/index.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
-import { StructuredToolError } from '../core/errors.js'
-import type { InputEvent, Target } from '../core/types.js'
+import { StructuredToolError, TimeoutError } from '../core/errors.js'
+import { DEFAULT_TIMEOUT, type InputEvent, type Target } from '../core/types.js'
 import { ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { withPageContext } from './page-context.js'
@@ -33,6 +33,14 @@ const TEXT_SELECTION_INPUT_TYPES = new Set(['text', 'search', 'tel', 'url', 'pas
 
 function throwInputTimeoutError(timeout: number): never {
     throw new Error(`input timeout before event dispatch (${timeout}ms)`)
+}
+
+function remainingInputTimeout(deadline: number): number {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+        throw new TimeoutError('input timeout during event execution')
+    }
+    return remaining
 }
 
 export function supportsTextSelection(tag: string, inputType?: string): boolean {
@@ -172,7 +180,12 @@ const inputSchema = z.object({
         .describe('动作执行后要验证的页面状态；不传时 success 只表示事件已发出，不表示业务结果已达成'),
     targetId: pageTargetIdSchema.describe('目标页面 ID（Extension 或 CDP），优先于默认操作目标'),
     tabId: pageTargetIdSchema.describe('旧版目标 Tab ID，与 targetId 相同语义，保留兼容'),
-    timeout: z.number().optional().describe('超时毫秒，含 Cloudflare Challenge 等待和事件派发'),
+    timeout: z
+        .number()
+        .optional()
+        .describe(
+            '超时毫秒，含 Cloudflare Challenge 等待、目标准备、鼠标移动、字符输入和延迟；到期后停止后续动作，不自动重放'
+        ),
     frame: z
         .union([z.string(), z.number()])
         .optional()
@@ -186,19 +199,64 @@ type InputToolResponse = {
     isError?: boolean
 }
 
-function sanitizeInputFailureResponse(
+function sanitizeInputResponse(
     response: InputToolResponse,
-    events: ReadonlyArray<{ find?: string; text?: string }>
+    events: ReadonlyArray<{ find?: string; text?: string }>,
+    sensitiveInput: boolean
 ): InputToolResponse {
+    if (!response.isError && !sensitiveInput) {
+        return response
+    }
     const sensitiveValues = events
         .flatMap((event) => [event.find, event.text])
         .filter((value): value is string => !!value)
-    if (sensitiveValues.length === 0) {
-        return response
-    }
     for (const item of response.content) {
         try {
-            item.text = JSON.stringify(redactSensitiveInputData(JSON.parse(item.text), sensitiveValues), null, 2)
+            const payload = JSON.parse(item.text) as Record<string, unknown>
+            for (const key of ['warnings', 'eventResults', 'diagnostics', 'diagnosticsError']) {
+                if (key in payload) {
+                    payload[key] = redactSensitiveInputData(payload[key], sensitiveValues)
+                }
+            }
+            const pageContext = payload.pageContext as Record<string, unknown> | undefined
+            const postCondition = payload.postCondition as Record<string, unknown> | undefined
+            const details = [
+                payload.error,
+                pageContext,
+                pageContext?.before,
+                pageContext?.after,
+                postCondition,
+                ...(Array.isArray(postCondition?.checks) ? postCondition.checks : []),
+            ]
+            for (const detail of details) {
+                if (!detail || typeof detail !== 'object') {
+                    continue
+                }
+                const record = detail as Record<string, unknown>
+                for (const key of [
+                    'message',
+                    'suggestion',
+                    'context',
+                    'contextError',
+                    'url',
+                    'title',
+                    'actual',
+                    'error',
+                ]) {
+                    if (key in record) {
+                        record[key] = redactSensitiveInputData(record[key], sensitiveValues)
+                    }
+                }
+            }
+            if (sensitiveInput) {
+                if (payload.diagnostics) {
+                    payload.diagnostics = { redacted: true, reason: 'sensitive_input_or_unresolved_target' }
+                }
+                if (payload.diagnosticsError) {
+                    payload.diagnosticsError = '敏感输入的诊断详情已隐藏'
+                }
+            }
+            item.text = JSON.stringify(payload, null, 2)
         } catch {
             item.text = redactSensitiveInputData(item.text, sensitiveValues) as string
         }
@@ -212,6 +270,7 @@ function sanitizeInputFailureResponse(
 async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputToolResponse> {
     let eventsExecuted = 0
     let actionMayHaveExecuted = false
+    const privacy = { sensitive: false }
     const progress: { actionStatus: 'not_started' | 'failed' | 'unknown' | 'completed' } = {
         actionStatus: 'not_started',
     }
@@ -238,7 +297,7 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
         const unifiedSession = getUnifiedSession()
         const humanize = args.humanize ?? false
 
-        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
+        const response = await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
             return unifiedSession.withPageCondition(args, () =>
                 unifiedSession.withFrame(args.frame, async () => {
                     const mode = unifiedSession.getMode()
@@ -262,7 +321,15 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                             }
                             progress.actionStatus = 'failed'
                             const result = await executeInputEvent(
-                                { unifiedSession, session, mode, humanize, timeout: eventTimeout, frame: args.frame },
+                                {
+                                    unifiedSession,
+                                    session,
+                                    mode,
+                                    humanize,
+                                    timeout: eventTimeout,
+                                    frame: args.frame,
+                                    privacy,
+                                },
                                 event as InputEvent
                             )
                             ++eventsExecuted
@@ -288,7 +355,7 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                             } catch {
                                 // 保留原始 Challenge 错误响应
                             }
-                            return sanitizeInputFailureResponse(response, args.events)
+                            return response
                         }
                         if (text) {
                             try {
@@ -317,14 +384,17 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                                 payload.verificationRequested = Boolean(args.postCondition)
                                 payload.verificationStatus = 'unavailable'
                                 payload.failureStage = 'action'
-                                payload.retryable = /timeout|超时|disconnect|未连接|context|debugger/i.test(message)
+                                payload.retryable =
+                                    eventsExecuted === 0 &&
+                                    !actionMayHaveExecuted &&
+                                    /timeout|超时|disconnect|未连接|context|debugger/i.test(message)
                                 appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
                                 response.content[0].text = JSON.stringify(payload, null, 2)
                             } catch {
                                 // 保留原始错误响应
                             }
                         }
-                        return sanitizeInputFailureResponse(response, args.events)
+                        return response
                     }
 
                     progress.actionStatus = 'completed'
@@ -362,6 +432,7 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                 })
             ) // withPageCondition, withFrame
         }) // withTabId
+        return sanitizeInputResponse(response, args.events, privacy.sensitive)
     } catch (error) {
         const response = formatErrorResponse(error)
         const text = response.content[0]?.text
@@ -369,11 +440,21 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
             try {
                 const payload = JSON.parse(text) as Record<string, unknown>
                 const message = error instanceof Error ? error.message : String(error)
+                const unavailableCondition =
+                    eventsExecuted === 0 &&
+                    !actionMayHaveExecuted &&
+                    progress.actionStatus === 'not_started' &&
+                    error instanceof StructuredToolError &&
+                    error.code === 'DRIVER_CAPABILITY_ERROR' &&
+                    error.context.actionExecuted === false &&
+                    error.context.actionStatus === 'not_started' &&
+                    error.context.failureStage === 'precondition'
                 const preconditionFailed =
-                    error !== null &&
-                    typeof error === 'object' &&
-                    'code' in error &&
-                    error.code === 'ACTION_PRECONDITION_FAILED'
+                    unavailableCondition ||
+                    (error !== null &&
+                        typeof error === 'object' &&
+                        'code' in error &&
+                        error.code === 'ACTION_PRECONDITION_FAILED')
                 Object.assign(payload, {
                     eventsExecuted,
                     actionExecuted: eventsExecuted > 0 || actionMayHaveExecuted,
@@ -385,9 +466,11 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                               : progress.actionStatus,
                     verificationRequested: Boolean(args.postCondition),
                     verificationStatus: 'unavailable',
-                    failureStage,
+                    failureStage: unavailableCondition ? 'precondition' : failureStage,
                     retryable:
                         progress.actionStatus !== 'completed' &&
+                        eventsExecuted === 0 &&
+                        !actionMayHaveExecuted &&
                         !preconditionFailed &&
                         /timeout|超时|disconnect|未连接|context|debugger|attach/i.test(message),
                     diagnosticsStatus: args.diagnostics ? 'unavailable' : 'disabled',
@@ -403,7 +486,7 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
                 // 保留原始错误响应
             }
         }
-        return sanitizeInputFailureResponse(response, args.events)
+        return sanitizeInputResponse(response, args.events, privacy.sensitive)
     }
 }
 
@@ -430,6 +513,7 @@ type TextLocateResult =
 
 interface InputLocateResult {
     type: 'input'
+    inputType: string
     selectionStart: number
     selectionEnd: number
 }
@@ -450,6 +534,7 @@ interface InputExecutionContext {
     humanize: boolean
     timeout?: number
     frame?: string | number
+    privacy?: { sensitive: boolean }
 }
 
 const unifiedOnlyEventTypes = new Set<InputEvent['type']>([
@@ -472,6 +557,7 @@ async function executeInputEvent(context: InputExecutionContext, event: InputEve
                 humanize: context.humanize,
                 timeout: context.timeout,
                 frame: context.frame,
+                privacy: context.privacy,
             },
             event
         )
@@ -502,18 +588,26 @@ async function focusTargetForCommands(
     timeout?: number,
     frame?: string | number
 ): Promise<void> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     if ('x' in target || 'y' in target) {
-        const point = await getTargetPointExtension(unifiedSession, target, timeout, frame)
-        await unifiedSession.mouseMove(point.x, point.y)
-        await unifiedSession.mouseClick('left')
+        await handleUnifiedClick(
+            {
+                unifiedSession,
+                mode: unifiedSession.getMode(),
+                humanize: false,
+                timeout: remainingInputTimeout(deadline),
+                frame,
+            },
+            { type: 'click', target }
+        )
         return
     }
     if (unifiedSession.getMode() === 'cdp') {
-        await focusCdpTarget(getSession(), target, timeout)
+        await focusCdpTarget(getSession(), target, remainingInputTimeout(deadline))
         return
     }
     const params = targetToFindParams(target as Target & { nth?: number })
-    const els = await unifiedSession.find(params.selector, params.text, params.xpath, timeout)
+    const els = await unifiedSession.find(params.selector, params.text, params.xpath, remainingInputTimeout(deadline))
     const nth0 = params.nth ?? 0
     if (els.length <= nth0) {
         throw new StructuredToolError(
@@ -544,7 +638,7 @@ async function focusTargetForCommands(
             return document.activeElement === el
         })()`,
         undefined,
-        timeout
+        remainingInputTimeout(deadline)
     )
     if (focused !== true) {
         throw new StructuredToolError(
@@ -596,21 +690,29 @@ async function focusTargetIfNeeded(
     if (!target) {
         return
     }
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     if ('x' in target || 'y' in target) {
-        const point = await getTargetPointExtension(unifiedSession, target, timeout, frame)
-        await unifiedSession.mouseMove(point.x, point.y)
-        await unifiedSession.mouseClick('left')
+        await handleUnifiedClick(
+            {
+                unifiedSession,
+                mode: unifiedSession.getMode(),
+                humanize: false,
+                timeout: remainingInputTimeout(deadline),
+                frame,
+            },
+            { type: 'click', target }
+        )
         return
     }
     if (mode === 'cdp') {
         if (!session) {
             throw new Error('CDP locator 聚焦缺少 session')
         }
-        await focusCdpTarget(session, target, timeout)
+        await focusCdpTarget(session, target, remainingInputTimeout(deadline))
         return
     }
     const params = targetToFindParams(target as Target & { nth?: number })
-    const els = await unifiedSession.find(params.selector, params.text, params.xpath, timeout)
+    const els = await unifiedSession.find(params.selector, params.text, params.xpath, remainingInputTimeout(deadline))
     const nth0 = params.nth ?? 0
     if (els.length <= nth0) {
         throw new StructuredToolError(
@@ -630,6 +732,7 @@ async function focusTargetIfNeeded(
             )
         )
     }
+    remainingInputTimeout(deadline)
     const result = await unifiedSession.actionableClick(els[nth0].refId)
     if (!result.success) {
         throw new StructuredToolError(
@@ -790,8 +893,14 @@ async function selectText(
     findText: string,
     scopeTarget?: Target,
     nth = 0,
-    timeout?: number
+    timeout?: number,
+    privacy?: InputExecutionContext['privacy']
 ): Promise<string | undefined> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const sensitiveBefore = privacy?.sensitive ?? false
+    if (privacy) {
+        privacy.sensitive = true
+    }
     // 将 target 转为查询参数，传入注入脚本进行 DOM 查询
     let scopeSelector: string | null = null
     let scopeText: string | null = null
@@ -810,7 +919,7 @@ async function selectText(
     const result = await unifiedSession.evaluate<
         | TextLocateResult
         | InputLocateResult
-        | { type: 'notfound' }
+        | { type: 'notfound'; inputType?: string }
         | { type: 'unsupported'; tag: string; inputType: string; currentValue: string }
         | {
               type: 'noscope'
@@ -858,12 +967,12 @@ async function selectText(
             var pos = -1;
             for (var n = 0; n <= nth; n++) {
                 pos = val.indexOf(findText, pos + (n > 0 ? 1 : 0));
-                if (pos === -1) return {type: 'notfound'};
+                if (pos === -1) return {type: 'notfound', inputType: inputType};
             }
             // 原子化：定位到 input 同时完成 focus + setSelectionRange，避免外层 mouseClick 聚焦不可靠
             root.focus();
             root.setSelectionRange(pos, pos + findText.length);
-            return {type: 'input', selectionStart: pos, selectionEnd: pos + findText.length};
+            return {type: 'input', inputType: inputType, selectionStart: pos, selectionEnd: pos + findText.length};
         }
 
         // 在子树中查找 input/textarea
@@ -891,7 +1000,7 @@ async function selectText(
             if (ip !== -1) {
                 inp.focus();
                 inp.setSelectionRange(ip, ip + findText.length);
-                return {type: 'input', selectionStart: ip, selectionEnd: ip + findText.length};
+                return {type: 'input', inputType: childType, selectionStart: ip, selectionEnd: ip + findText.length};
             }
         }
 
@@ -970,9 +1079,17 @@ async function selectText(
         };
     }`,
         undefined,
-        timeout,
+        remainingInputTimeout(deadline),
         [findText, nth, scopeNth, scopeSelector, scopeText, scopeXpath]
     )
+    if (
+        privacy &&
+        result &&
+        result.type !== 'noscope' &&
+        (result.type !== 'notfound' || result.inputType !== undefined)
+    ) {
+        privacy.sensitive = sensitiveBefore || ('inputType' in result && result.inputType === 'password')
+    }
 
     if (!result || result.type === 'noscope') {
         const diagnostics = await collectTextSelectionDiagnostics(
@@ -1050,12 +1167,24 @@ async function selectText(
     }
 
     // Step 2: 模拟鼠标选择
-    await unifiedSession.mouseMove(coords.startX, coords.startY)
+    await unifiedSession.mouseMove(coords.startX, coords.startY, remainingInputTimeout(deadline))
+    remainingInputTimeout(deadline)
     await unifiedSession.mouseClick('left')
 
-    await unifiedSession.keyDown('Shift')
-    await unifiedSession.mouseMove(coords.endX, coords.endY)
-    await unifiedSession.mouseClick('left')
+    remainingInputTimeout(deadline)
+    try {
+        await unifiedSession.keyDown('Shift')
+        await unifiedSession.mouseMove(coords.endX, coords.endY, remainingInputTimeout(deadline))
+        remainingInputTimeout(deadline)
+        await unifiedSession.mouseClick('left')
+    } catch (error) {
+        try {
+            await unifiedSession.keyUp('Shift')
+        } catch (releaseError) {
+            console.error('[MCP] Shift release failed after selection error:', releaseError)
+        }
+        throw error
+    }
     await unifiedSession.keyUp('Shift')
 
     return coords.formatted
@@ -1150,6 +1279,7 @@ interface UnifiedInputContext {
     humanize: boolean
     timeout?: number
     frame?: string | number
+    privacy?: InputExecutionContext['privacy']
 }
 
 type UnifiedInputHandler = (context: UnifiedInputContext, event: InputEvent) => Promise<InputEventResult>
@@ -1188,6 +1318,7 @@ async function handleUnifiedKeyDown(
     { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     if (
         unifiedSession.isExtensionConnected() &&
         unifiedSession.getInputMode() === 'stealth' &&
@@ -1199,8 +1330,9 @@ async function handleUnifiedKeyDown(
         )
     }
     if (event.commands && event.commands.length > 0 && event.target) {
-        await focusTargetForCommands(unifiedSession, event.target, timeout, frame)
+        await focusTargetForCommands(unifiedSession, event.target, remainingInputTimeout(deadline), frame)
     }
+    remainingInputTimeout(deadline)
     await unifiedSession.keyDown(event.key!, event.commands)
     return undefined
 }
@@ -1217,6 +1349,7 @@ async function handleUnifiedClick(
     { unifiedSession, humanize, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     const button = event.button ?? 'left'
     const clickCount = event.clickCount ?? 1
     if (!event.target) {
@@ -1224,15 +1357,23 @@ async function handleUnifiedClick(
         return undefined
     }
 
-    const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame, !event.force)
+    const point = await getTargetPointExtension(
+        unifiedSession,
+        event.target,
+        remainingInputTimeout(deadline),
+        frame,
+        !event.force
+    )
     if (humanize) {
         for (const p of generateBezierPath(unifiedSession.getMousePosition(), point, event.steps)) {
-            await unifiedSession.mouseMove(p.x, p.y)
-            await randomDelay(getMouseMoveDelay(), getMouseMoveDelay() * 2)
+            await unifiedSession.mouseMove(p.x, p.y, remainingInputTimeout(deadline))
+            const remaining = remainingInputTimeout(deadline)
+            await randomDelay(Math.min(getMouseMoveDelay(), remaining), Math.min(getMouseMoveDelay() * 2, remaining))
         }
     } else {
-        await unifiedSession.mouseMove(point.x, point.y)
+        await unifiedSession.mouseMove(point.x, point.y, remainingInputTimeout(deadline))
     }
+    remainingInputTimeout(deadline)
     if (point.refId) {
         const result = await unifiedSession.actionableClick(point.refId, event.force === true, button, clickCount)
         if (!result.success) {
@@ -1254,10 +1395,17 @@ async function handleUnifiedMouseDown(
     { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     if (event.target) {
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
-        await unifiedSession.mouseMove(point.x, point.y)
+        const point = await getTargetPointExtension(
+            unifiedSession,
+            event.target,
+            remainingInputTimeout(deadline),
+            frame
+        )
+        await unifiedSession.mouseMove(point.x, point.y, remainingInputTimeout(deadline))
     }
+    remainingInputTimeout(deadline)
     await unifiedSession.mouseDown(event.button ?? 'left')
     return undefined
 }
@@ -1274,17 +1422,20 @@ async function handleUnifiedMouseMove(
     { unifiedSession, humanize, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    const point = await getTargetPointExtension(unifiedSession, event.target!, timeout, frame)
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const point = await getTargetPointExtension(unifiedSession, event.target!, remainingInputTimeout(deadline), frame)
 
     if (humanize && event.steps && event.steps > 1) {
         const path = generateBezierPath(unifiedSession.getMousePosition(), point, event.steps)
         for (const p of path) {
-            await unifiedSession.mouseMove(p.x, p.y)
-            await randomDelay(getMouseMoveDelay(), getMouseMoveDelay() * 2)
+            await unifiedSession.mouseMove(p.x, p.y, remainingInputTimeout(deadline))
+            const remaining = remainingInputTimeout(deadline)
+            await randomDelay(Math.min(getMouseMoveDelay(), remaining), Math.min(getMouseMoveDelay() * 2, remaining))
         }
     } else {
-        await unifiedSession.mouseMove(point.x, point.y)
+        await unifiedSession.mouseMove(point.x, point.y, remainingInputTimeout(deadline))
     }
+    remainingInputTimeout(deadline)
     return undefined
 }
 
@@ -1292,17 +1443,25 @@ async function handleUnifiedWheel(
     { unifiedSession, timeout, frame }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     if (event.target) {
         const { selector, text, xpath, nth: nthParam } = targetToFindParams(event.target as Target & { nth?: number })
-        const elements = await unifiedSession.find(selector, text, xpath, timeout)
+        const elements = await unifiedSession.find(selector, text, xpath, remainingInputTimeout(deadline))
         const nth = nthParam ?? 0
         if (elements.length > nth) {
+            remainingInputTimeout(deadline)
             await unifiedSession.scroll(event.deltaX ?? 0, event.deltaY ?? 0, elements[nth].refId)
             return undefined
         }
-        const point = await getTargetPointExtension(unifiedSession, event.target, timeout, frame)
-        await unifiedSession.mouseMove(point.x, point.y)
+        const point = await getTargetPointExtension(
+            unifiedSession,
+            event.target,
+            remainingInputTimeout(deadline),
+            frame
+        )
+        await unifiedSession.mouseMove(point.x, point.y, remainingInputTimeout(deadline))
     }
+    remainingInputTimeout(deadline)
     await unifiedSession.mouseWheel(event.deltaX ?? 0, event.deltaY ?? 0)
     return undefined
 }
@@ -1336,17 +1495,23 @@ async function handleUnifiedType(context: UnifiedInputContext, event: InputEvent
         await inputControlled(unifiedSession, event, timeout, frame)
         return undefined
     }
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
 
     if (event.target) {
-        await handleUnifiedClick(context, { type: 'click', target: event.target })
+        await handleUnifiedClick(
+            { ...context, timeout: remainingInputTimeout(deadline) },
+            { type: 'click', target: event.target }
+        )
         if (!('x' in event.target)) {
-            await focusTargetForCommands(unifiedSession, event.target, timeout, frame)
+            await focusTargetForCommands(unifiedSession, event.target, remainingInputTimeout(deadline), frame)
         }
     } else {
         const hasActiveFocus = await unifiedSession.evaluate<boolean>(
             '!!document.activeElement && ' +
                 'document.activeElement !== document.body && ' +
-                'document.activeElement !== document.documentElement'
+                'document.activeElement !== document.documentElement',
+            undefined,
+            remainingInputTimeout(deadline)
         )
         if (!hasActiveFocus) {
             throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')
@@ -1355,12 +1520,17 @@ async function handleUnifiedType(context: UnifiedInputContext, event: InputEvent
 
     const delay = event.delay ?? 0
     if (humanize) {
-        for (const char of event.text!) {
-            await unifiedSession.typeText(char)
-            await randomDelay(getTypingDelay(delay), getTypingDelay(delay) * 1.5)
+        for (const char of event.text!.replace(/\r\n?/g, '\n')) {
+            await unifiedSession.typeText(char, 0, remainingInputTimeout(deadline))
+            const remaining = remainingInputTimeout(deadline)
+            await randomDelay(
+                Math.min(getTypingDelay(delay), remaining),
+                Math.min(getTypingDelay(delay) * 1.5, remaining)
+            )
         }
+        remainingInputTimeout(deadline)
     } else {
-        await unifiedSession.typeText(event.text!, delay)
+        await unifiedSession.typeText(event.text!, delay, remainingInputTimeout(deadline))
     }
     return undefined
 }
@@ -1378,10 +1548,15 @@ async function handleUnifiedWait({ timeout }: UnifiedInputContext, event: InputE
 }
 
 async function handleUnifiedSelect(
-    { unifiedSession, session, mode, timeout, frame }: UnifiedInputContext,
+    { unifiedSession, session, mode, timeout, frame, privacy }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await focusTargetIfNeeded(unifiedSession, session, mode, event.target, timeout, frame)
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const sensitiveBefore = privacy?.sensitive ?? false
+    if (privacy) {
+        privacy.sensitive = true
+    }
+    await focusTargetIfNeeded(unifiedSession, session, mode, event.target, remainingInputTimeout(deadline), frame)
     const selectionTarget = await unifiedSession.evaluate<{ tag: string; inputType?: string; value?: string } | null>(
         `(() => {
             const el = document.activeElement;
@@ -1389,12 +1564,15 @@ async function handleUnifiedSelect(
             return {
                 tag: 'input',
                 inputType: (el.type || 'text').toLowerCase(),
-                value: String(el.value || '').slice(0, 160)
+                value: el.type === 'password' ? undefined : String(el.value || '').slice(0, 160)
             };
         })()`,
         undefined,
-        timeout
+        remainingInputTimeout(deadline)
     )
+    if (privacy) {
+        privacy.sensitive = sensitiveBefore || selectionTarget?.inputType === 'password'
+    }
     if (selectionTarget && !supportsTextSelection(selectionTarget.tag, selectionTarget.inputType)) {
         throw new StructuredToolError(
             'UNSUPPORTED_SELECTION',
@@ -1409,15 +1587,20 @@ async function handleUnifiedSelect(
             }
         )
     }
-    await selectText(unifiedSession, event.find!, event.target, event.nth, timeout)
+    await selectText(unifiedSession, event.find!, event.target, event.nth, remainingInputTimeout(deadline), privacy)
     return undefined
 }
 
 async function handleUnifiedReplace(
-    { unifiedSession, session, mode, timeout, frame }: UnifiedInputContext,
+    { unifiedSession, session, mode, timeout, frame, privacy }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await focusTargetIfNeeded(unifiedSession, session, mode, event.target, timeout, frame)
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const sensitiveBefore = privacy?.sensitive ?? false
+    if (privacy) {
+        privacy.sensitive = true
+    }
+    await focusTargetIfNeeded(unifiedSession, session, mode, event.target, remainingInputTimeout(deadline), frame)
     const directResult = await unifiedSession.evaluate<{
         handled: boolean
         success?: boolean
@@ -1432,7 +1615,7 @@ async function handleUnifiedReplace(
             var el = document.activeElement;
             if (!(el instanceof HTMLInputElement)) return {handled: false};
             var type = (el.type || 'text').toLowerCase();
-            if (['text', 'search', 'tel', 'url', 'password'].indexOf(type) !== -1) return {handled: false};
+            if (['text', 'search', 'tel', 'url', 'password'].indexOf(type) !== -1) return {handled: false, inputType: type};
             var current = String(el.value || '');
             var pos = -1;
             for (var i = 0; i <= nth; i++) {
@@ -1487,9 +1670,12 @@ async function handleUnifiedReplace(
             };
         }`,
         undefined,
-        timeout,
+        remainingInputTimeout(deadline),
         [event.find, event.text, event.nth ?? 0]
     )
+    if (privacy) {
+        privacy.sensitive = sensitiveBefore || directResult.inputType === 'password'
+    }
     if (directResult.handled) {
         if (!directResult.success) {
             const valueNotApplied = directResult.reason === 'value_not_applied'
@@ -1527,7 +1713,14 @@ async function handleUnifiedReplace(
             normalized: directResult.actualValue !== directResult.requestedValue,
         }
     }
-    const formatted = await selectText(unifiedSession, event.find!, event.target, event.nth, timeout)
+    const formatted = await selectText(
+        unifiedSession,
+        event.find!,
+        event.target,
+        event.nth,
+        remainingInputTimeout(deadline),
+        privacy
+    )
     let selectionConfirmed = false
     for (let i = 0; i < 25; i++) {
         const hasSelection = await unifiedSession.evaluate<boolean>(
@@ -1538,13 +1731,15 @@ async function handleUnifiedReplace(
                 }
                 var sel = window.getSelection();
                 return sel && !sel.isCollapsed;
-            })()`
+            })()`,
+            undefined,
+            remainingInputTimeout(deadline)
         )
         if (hasSelection) {
             selectionConfirmed = true
             break
         }
-        await new Promise((resolve) => setTimeout(resolve, 20))
+        await new Promise((resolve) => setTimeout(resolve, Math.min(20, remainingInputTimeout(deadline))))
     }
     if (!selectionConfirmed) {
         throw new Error(`选区同步失败：文本 "${event.find}" 已定位但未能建立选区，无法执行替换`)
@@ -1571,14 +1766,14 @@ async function handleUnifiedReplace(
         return 'fallback';
     }`,
         undefined,
-        timeout,
+        remainingInputTimeout(deadline),
         [event.text]
     )
     if (replaceResult === 'readonly') {
         throw new Error(`目标元素不可编辑，已选中文本 "${event.find}" 但无法替换`)
     }
     if (replaceResult === 'fallback') {
-        await unifiedSession.typeText(event.text!)
+        await unifiedSession.typeText(event.text!, 0, remainingInputTimeout(deadline))
     }
     if (formatted) {
         return `替换的文本原在 <${formatted}> 标签内，替换后格式可能丢失`
@@ -1853,6 +2048,15 @@ async function getTargetPointExtension(
     frame?: string | number,
     scroll = true
 ): Promise<{ x: number; y: number; refId?: string }> {
+    const budget = timeout ?? DEFAULT_TIMEOUT
+    const deadline = Date.now() + budget
+    const remaining = (): number => {
+        const value = deadline - Date.now()
+        if (value <= 0) {
+            throwInputTimeoutError(budget)
+        }
+        return value
+    }
     const frameOffset = unifiedSession.getFrameOffset()
     const isStealth = unifiedSession.getInputMode() === 'stealth'
 
@@ -1866,7 +2070,7 @@ async function getTargetPointExtension(
     }
 
     const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
-    const elements = await unifiedSession.find(selector, text, xpath, timeout)
+    const elements = await unifiedSession.find(selector, text, xpath, remaining())
     const nth = nthParam ?? 0
     if (elements.length === 0) {
         throw new StructuredToolError(
@@ -1921,8 +2125,11 @@ async function getTargetPointExtension(
             }
             const r2 = el.getBoundingClientRect();
             return { x: r2.x, y: r2.y, width: r2.width, height: r2.height };
-        })()`
+        })()`,
+        undefined,
+        remaining()
     )
+    remaining()
 
     if (!iframeRelRect) {
         throw new StructuredToolError(
@@ -1954,7 +2161,8 @@ async function getTargetPointExtension(
     // iframe + precise：消费者（chrome.debugger）需要父视口绝对，
     // scrollIntoView({block:'center'}) 会 cascade 到父框架，导致 frameOffset 与父绝对 rect 都过期，
     // refetch find() 让 content-handler 重新计算 frameOffset 并返回最新父绝对 rect
-    const refreshed = await unifiedSession.find(selector, text, xpath, timeout)
+    const refreshed = await unifiedSession.find(selector, text, xpath, remaining())
+    remaining()
     const rect = refreshed[nth]?.rect ?? elements[nth].rect
     return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, refId }
 }
@@ -2059,18 +2267,23 @@ async function handleCdpTouchStart({ session, timeout }: CdpInputContext, event:
 }
 
 async function handleCdpTouchMove({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
-    const point = await getTargetPoint(session, event.target!, timeout)
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const point = await getTargetPoint(session, event.target!, remainingInputTimeout(deadline))
 
     if (humanize && event.steps && event.steps > 1) {
         const current = session.getBehaviorSimulator().getCurrentPosition()
         const path = generateBezierPath(current, point, event.steps)
         for (const p of path) {
+            remainingInputTimeout(deadline)
             await session.touchMove(p.x, p.y)
-            await randomDelay(5, 15)
+            const remaining = remainingInputTimeout(deadline)
+            await randomDelay(Math.min(5, remaining), Math.min(15, remaining))
         }
     } else {
+        remainingInputTimeout(deadline)
         await session.touchMove(point.x, point.y)
     }
+    remainingInputTimeout(deadline)
 }
 
 async function handleCdpTouchEnd({ session }: CdpInputContext): Promise<void> {
@@ -2081,18 +2294,21 @@ async function handleCdpType({ session, humanize, timeout }: CdpInputContext, ev
     if (event.dispatch || event.mode === 'controlled') {
         throw new Error('controlled/dispatch 输入需要 Extension 连接，当前为 CDP 模式')
     }
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     if (event.target) {
-        await moveToTarget(session, event.target, humanize, timeout, undefined, 'input')
+        await moveToTarget(session, event.target, humanize, remainingInputTimeout(deadline), undefined, 'input')
         await session.mouseDown('left')
         await session.mouseUp('left')
         if (!('x' in event.target)) {
-            await focusCdpTarget(session, event.target, timeout)
+            await focusCdpTarget(session, event.target, remainingInputTimeout(deadline))
         }
     } else {
         const hasActiveFocus = await session.evaluate<boolean>(
             '!!document.activeElement && ' +
                 'document.activeElement !== document.body && ' +
-                'document.activeElement !== document.documentElement'
+                'document.activeElement !== document.documentElement',
+            undefined,
+            remainingInputTimeout(deadline)
         )
         if (!hasActiveFocus) {
             throw new Error('type 事件在无 target 时需要页面已有焦点元素，请提供 target 或先 click 目标元素')
@@ -2101,12 +2317,17 @@ async function handleCdpType({ session, humanize, timeout }: CdpInputContext, ev
 
     const delay = event.delay ?? 0
     if (humanize) {
-        for (const char of event.text!) {
-            await session.type(char)
-            await randomDelay(getTypingDelay(delay), getTypingDelay(delay) * 1.5)
+        for (const char of event.text!.replace(/\r\n?/g, '\n')) {
+            await session.type(char, 0, remainingInputTimeout(deadline))
+            const remaining = remainingInputTimeout(deadline)
+            await randomDelay(
+                Math.min(getTypingDelay(delay), remaining),
+                Math.min(getTypingDelay(delay) * 1.5, remaining)
+            )
         }
+        remainingInputTimeout(deadline)
     } else {
-        await session.type(event.text!, delay)
+        await session.type(event.text!, delay, remainingInputTimeout(deadline))
     }
 }
 
@@ -2130,15 +2351,17 @@ async function moveToTarget(
     steps?: number,
     waitType: 'click' | 'input' | 'none' = 'click'
 ): Promise<void> {
-    const point = await getTargetPoint(session, target, timeout, waitType)
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const point = await getTargetPoint(session, target, remainingInputTimeout(deadline), waitType)
     const simulator = session.getBehaviorSimulator()
 
     if (humanize) {
         // 人类化鼠标移动（贝塞尔曲线）
         const path = generateBezierPath(simulator.getCurrentPosition(), point, steps)
         for (const p of path) {
-            await session.mouseMove(p.x, p.y)
-            await randomDelay(getMouseMoveDelay(), getMouseMoveDelay() * 2)
+            await session.mouseMove(p.x, p.y, remainingInputTimeout(deadline))
+            const remaining = remainingInputTimeout(deadline)
+            await randomDelay(Math.min(getMouseMoveDelay(), remaining), Math.min(getMouseMoveDelay() * 2, remaining))
         }
     } else if (steps && steps > 1) {
         // 直线移动，分步
@@ -2147,12 +2370,13 @@ async function moveToTarget(
             const t = i / steps
             const x = current.x + (point.x - current.x) * t
             const y = current.y + (point.y - current.y) * t
-            await session.mouseMove(x, y)
+            await session.mouseMove(x, y, remainingInputTimeout(deadline))
         }
     } else {
         // 直接移动
-        await session.mouseMove(point.x, point.y)
+        await session.mouseMove(point.x, point.y, remainingInputTimeout(deadline))
     }
+    remainingInputTimeout(deadline)
 }
 
 /**
@@ -2169,13 +2393,23 @@ async function getTargetPoint(
         return { x: target.x, y: target.y }
     }
 
+    const budget = timeout ?? DEFAULT_TIMEOUT
+    const deadline = Date.now() + budget
+    const remaining = (): number => {
+        const value = deadline - Date.now()
+        if (value <= 0) {
+            throwInputTimeoutError(budget)
+        }
+        return value
+    }
+
     // 使用 Locator 定位元素
-    const locator = session.createLocator(target, { timeout })
+    const locator = session.createLocator(target, { timeout: remaining() })
     const nodeId = await locator.find()
 
     // 根据操作类型执行自动等待
     if (waitType !== 'none') {
-        const autoWait = session.createAutoWait({ timeout })
+        const autoWait = session.createAutoWait({ timeout: remaining() })
         if (waitType === 'click') {
             await autoWait.waitForClickable(nodeId)
         } else if (waitType === 'input') {
@@ -2183,7 +2417,10 @@ async function getTargetPoint(
         }
     }
 
-    return locator.getClickablePoint()
+    remaining()
+    const point = await locator.getClickablePoint()
+    remaining()
+    return point
 }
 
 /**

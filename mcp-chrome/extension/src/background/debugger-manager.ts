@@ -164,8 +164,28 @@ export class DebuggerManager {
         // 错误转换嵌入到 promise chain 中，确保所有 awaiter（包括并发场景下走 line 104
         // `await pending` 路径的第二个 caller）拿到的都是 DebuggerBlockedError 类型
         const myEpoch = this.cleanupEpoch.get(tabId) ?? 0
-        const attachPromise = chrome.debugger.attach({ tabId }, '1.3').then(
-            () => {
+        const attachPromise = chrome.debugger
+            .attach({ tabId }, '1.3')
+            .catch(async (err: unknown) => {
+                const msg = err instanceof Error ? err.message : String(err)
+                if (!msg.includes('Another debugger') && !msg.includes('already attached')) {
+                    throw err
+                }
+                // 外部会话拒绝此只读命令，继续返回占用错误，不 detach 或接管
+                const proof = (await chrome.debugger
+                    .sendCommand({ tabId }, 'Runtime.getIsolateId')
+                    .catch(() => null)) as { id?: unknown } | null | undefined
+                if ((this.cleanupEpoch.get(tabId) ?? 0) !== myEpoch) {
+                    return
+                }
+                if (typeof proof?.id === 'string' && proof.id.trim().length > 0) {
+                    return
+                }
+                this.debuggerBlocked.add(tabId)
+                this.debuggerBlockedRetryAfter.set(tabId, Date.now() + 2000)
+                throw new DebuggerBlockedError(tabId)
+            })
+            .then(() => {
                 // attach 成功但期间发生了 cleanup,丢弃成功结果（避免 onDetach 漏触发后 attachedTabs 漂移）
                 if ((this.cleanupEpoch.get(tabId) ?? 0) !== myEpoch) {
                     return
@@ -173,23 +193,15 @@ export class DebuggerManager {
                 this.attachedTabs.add(tabId)
                 this.debuggerBlocked.delete(tabId)
                 this.debuggerBlockedRetryAfter.delete(tabId)
-            },
-            (err: unknown) => {
-                const msg = err instanceof Error ? err.message : String(err)
-                if (msg.includes('Another debugger') || msg.includes('already attached')) {
-                    this.debuggerBlocked.add(tabId)
-                    this.debuggerBlockedRetryAfter.set(tabId, Date.now() + 2000)
-                    throw new DebuggerBlockedError(tabId)
-                }
-                throw err
-            }
-        )
+            })
 
         this.pendingAttach.set(tabId, attachPromise)
         try {
             await attachPromise
         } finally {
-            this.pendingAttach.delete(tabId)
+            if (this.pendingAttach.get(tabId) === attachPromise) {
+                this.pendingAttach.delete(tabId)
+            }
         }
     }
 

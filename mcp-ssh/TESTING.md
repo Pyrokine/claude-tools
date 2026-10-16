@@ -76,6 +76,14 @@ ssh2 中设置一个环境 socket，连接后重连，再用可用密钥执行�
 config；重连和配置 fingerprint 保留禁用语义；外部 ssh/rsync 不继承环境 socket，ssh 参数含
 `IdentityAgent=none`，密钥仍可使用 rsync；其他不存在的显式 socket 仍拒绝连接
 
+### connect-no-delay-01
+
+**步骤**：执行持久回归，在直连和跳板底层 socket 创建后记录客户端 `setNoDelay` 调用；连接失败后检查 pending 状态，再按
+`sync-parallel-01` 用自有原生 sshd 测量小文件同步，检查大文件校验和重连
+
+**预期**：每个新客户端在调用 `connect` 后启用
+`setNoDelay(true)`，连接失败不残留 pending 状态；跳板与重连使用同一设置，SFTP-only、内容校验和超时语义保持，不使用诊断 preload 代替当前代码验收
+
 ### connect-ready-timeout-01
 
 **步骤**：连接一个可建立 TCP 但不完成 SSH ready 的受控目标，设置 `readyTimeout=1000`
@@ -233,6 +241,27 @@ chunk，在普通 exec 和带密码的 sudo 分支分别执行；最后一个 ch
 **预期**：只读搜索、普通解释器和敏感词输出不误报；破坏性、提权、凭据参数、进程控制和资源使用分别返回对应的
 `commandRisk.categories` 与 `signals`
 
+### exec-command-risk-heredoc-01
+
+**步骤**：仅调用分类函数和 mock `ssh_exec`/`ssh_exec_batch` handler，不在真实主机执行覆盖
+`python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY`，以及引用、未引用、部分引用、反斜杠引用、空 delimiter、`<<-`
+和同一命令的多个 here-doc，正文包含普通 `rm`、Python 位运算、`it's`、引号与
+`&`，delimiter 后追加命令对照大小写不同、尾部多字、空格缩进和续行的 delimiter，以及 here-string 和引用或转义的 `<<` 文本
+
+**预期**：正文普通文本不产生 Shell 风险，delimiter 精确匹配后恢复检查，`<<-`
+只移除行首 tab 引用及部分引用 delimiter 关闭正文展开；未引用正文中的
+`$()`、反引号和嵌套命令替换仍报告对应风险双引号参数内有效命令替换会报告，单引号和转义后的替换文本不报告 mock
+handler 收到原始命令，分类不改变执行次数、`success`、退出码或输出，执行失败仍按原结果返回
+
+### exec-command-risk-background-01
+
+**步骤**：仅调用分类函数和 mock handler，以 `sleep 1 &` 分别在 EOF、空格、tab 和换行结尾测试覆盖 here-doc
+delimiter 后、引用或转义参数后、重定向后，以及命令替换内的后台操作对照 `&&`、`2>&1`、`3<&0`、`&>`、引用内的 `&`、转义
+`\\&` 和 Python `-c` 位运算
+
+**预期**：后台操作返回 `level="high"`、`categories=["process-control"]`、`signals=["background_task"]`
+逻辑连接、重定向、引用和转义文本不被当作后台操作，cmd 和 PowerShell 既有分类回归保持通过 Linux 上的 mock 与分类回归不代表 Windows 原生验证
+
 ### exec-script-01
 
 **步骤**：`ssh_exec_script(alias=..., script="set -e\nwhoami\npwd", cwd="/tmp")`
@@ -277,6 +306,28 @@ chunk，在普通 exec 和带密码的 sudo 分支分别执行；最后一个 ch
 
 **预期**：start 返回不可预测的 `operationId`，状态从 `starting/running` 进入
 `cancelled`；status 返回已校验的 PID 和 marker 状态；read 返回字节偏移及有上限的 stdout/stderr；cancel 只在 marker 校验后执行
+
+### operation-exit-code-01
+
+**前置条件**：自有 Linux/POSIX Shell 环境；普通进程和会话首进程场景需要支持等待退出的 `setsid`
+
+**步骤**：使用公开 `ssh_operation_start/status/read`，分别启动零退出、非零退出、带诊断 stderr 的零退出、 `sh` 不支持的
+`set -euo pipefail` 以及显式 `bash -lc` 对照；在自有 SSH
+fixture 中，让原 wrapper 分别从普通进程和会话首进程启动，再限制自有 PATH 使 `setsid` 不可见，重复零/非零退出
+
+**预期**：status/read 的终态和退出码与实际命令一致，非零退出为 `failed`，零退出为
+`completed`，stderr 非空不单独表示失败；marker、stdout/stderr 与 retention 元数据保留，不能将 `setsid`
+派生时外层的提前退出当作业务完成；无 `setsid` 时
+`processGroup=false`，仍保留真实退出码；持久回归必须执行实际 wrapper，不手工发射期望的退出码
+
+### operation-cancel-shell-01
+
+**前置条件**：自有 Linux 进程、可读取自身 `/proc/<pid>/environ`，本地 `sh` 和 Bash 可用
+
+**步骤**：在两种 Shell 中分别为本次创建的单 PID 和进程组执行取消；故障注入使用错误 marker，确认拒绝且原进程继续存在，随后使用合法身份取消；公开 MCP 在普通进程和会话首进程中验证 marker/running、cancel、status/read 的完整链路
+
+**预期**：错误身份不发送信号；合法身份成功发送 TERM，公开记录进入
+`cancelled`，后续命令未执行，输出和系统终止诊断原样保留；清理阶段终止自有进程不计产品取消成功，不终止其他进程，不放宽 marker/PID 校验
 
 ### operation-marker-preamble-01
 
@@ -356,8 +407,9 @@ offset 返回明确 UTF-8 boundary 错误
 4. `ssh_pty_read(ptyId=..., mode="screen")`
 5. `ssh_pty_close(ptyId=...)`
 
-**预期**：read 输出含 "pty_test"，返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`bufferSize`、
-`unreadRawBytes`、`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`，close 后 ptyId 失效
+**预期**：read 输出含 "pty_test"，返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、
+`unreadRawBytes`、`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`；list 项另含
+`bufferSize`，close 后 ptyId 失效
 
 ### pty-02: top 全屏刷新
 
@@ -748,9 +800,12 @@ API 同步抛错，以及 rename 请求发出后 callback 返回错误
 **步骤**：对含子目录和文件的目录调用
 `ssh_sync(..., verify={count:true, sha256:true, owner:true, mode:true, staleFiles:true})`
 
-**预期**：登录用户与本地 owner 一致时返回 `transferSuccess=true`、`verificationStatus="matched"`
-和目录 summary；owner 不一致时应明确返回 `mismatched`
-和限量样本，不能自动 chown；完整 manifest 不进入响应，mismatch 样本不超过 20 个
+**预期**：传输完成且所有已请求校验项一致时返回 `transferSuccess=true`、`verificationStatus="matched"`
+和目录 summary；owner 或 mode 不一致时返回 `success=false`、`transferSuccess=true`、`verificationStatus="mismatched"`
+及对应的 `checks.owner=false` 或
+`checks.mode=false`，不自动 chown/chmod，完整 manifest 不进入响应，mismatch 样本不超过 20 个
+
+SFTP 新目录使用目标端默认权限，新下载文件使用 0600，覆盖既有普通文件保留其 rwx 正例应准备 owner 和 mode 均匹配的目标；负例保留目录 mode 不同或新下载文件 mode 不同的场景，确认校验失败没有被传输成功掩盖显式修改自有目标权限后重复同步，确认所有请求项匹配时成功，工具不代替调用方修改权限
 
 ### sync-directory-special-mode-01
 

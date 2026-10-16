@@ -5,7 +5,10 @@
  * 处理，避免污染 Extension 错误面板
  */
 export class ExpectedOperationError extends Error {
-    constructor(message: string) {
+    constructor(
+        message: string,
+        readonly actionExecuted?: false
+    ) {
         super(message)
         this.name = 'ExpectedOperationError'
     }

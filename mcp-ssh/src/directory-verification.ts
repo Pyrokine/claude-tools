@@ -80,38 +80,38 @@ async function hashFile(filePath: string, size: number, maxBytes: number): Promi
     return hash.digest('hex')
 }
 
-function globPatternToRegExp(pattern: string): RegExp {
-    let expression = ''
-    for (let index = 0; index < pattern.length; ++index) {
-        const character = pattern[index]
-        if (character === '*' && pattern[index + 1] === '*') {
-            expression += '.*'
-            ++index
-        } else if (character === '*') {
-            expression += '[^/]*'
-        } else if (character === '?') {
-            expression += '[^/]'
-        } else {
-            expression += character.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-        }
-    }
-    return new RegExp(`^${expression}$`)
-}
-
-const excludePatternCache = new Map<string, RegExp>()
-
 export function matchesDirectoryExclude(relativePath: string, patterns: string[] | undefined): boolean {
     const normalizedPath = relativePath.replace(/^\.\//, '').replace(/^\//, '')
     const basename = path.posix.basename(normalizedPath)
     return Boolean(
         patterns?.some((pattern) => {
             const normalizedPattern = pattern.replace(/^\//, '')
-            let regex = excludePatternCache.get(normalizedPattern)
-            if (!regex) {
-                regex = globPatternToRegExp(normalizedPattern)
-                excludePatternCache.set(normalizedPattern, regex)
+            const candidate = normalizedPattern.includes('/') ? normalizedPath : basename
+            const matches = new Uint8Array(candidate.length + 1)
+            matches[0] = 1
+            for (let index = 0; index < normalizedPattern.length; ++index) {
+                const character = normalizedPattern[index]
+                const globstar = character === '*' && normalizedPattern[index + 1] === '*'
+                if (globstar) {
+                    ++index
+                }
+                let previous = matches[0]
+                if (character !== '*') {
+                    matches[0] = 0
+                }
+                for (let offset = 1; offset <= candidate.length; ++offset) {
+                    const before = matches[offset]
+                    const value = candidate[offset - 1]
+                    if (character === '*') {
+                        const canConsume = globstar ? /./.test(value) : value !== '/'
+                        matches[offset] = before || (matches[offset - 1] && canConsume) ? 1 : 0
+                    } else {
+                        matches[offset] = previous && (character === '?' ? value !== '/' : character === value) ? 1 : 0
+                    }
+                    previous = before
+                }
             }
-            return regex.test(normalizedPattern.includes('/') ? normalizedPath : basename)
+            return matches[candidate.length] === 1
         })
     )
 }

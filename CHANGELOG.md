@@ -15,8 +15,17 @@
 
 - breaking: Create a unique bundle for each export and use manifest v2; consumers must use the returned output paths
 - breaking: Apply `max_total` to the final compact JSON response in UTF-8 bytes and report `serialized_bytes`
-- fix: Match local and full MCP tool names together without excluding local tools or mixing server/tool pairs;
-  preserve full names in effective filters and continuation queries
+- feat: Add process-bound incremental scan and paged `history_scan_metadata`; retain physical sources beyond normal
+  collection limits, replay the latest page, and release cancelled or completed scan state
+- feat: Read known nested Workflow agent sources and expose exact `source` across search, get, context, trace, and CLI
+- feat: Index oversized records for scan, Unicode ranges, tool input/result views, and local context/trace windows;
+  structured previews carry exact get pointers and explicit full requests retain their contract
+- feat: Add a normalized, redacted `history_get(view=record)` view for original JSON objects and internal payloads;
+  retain bounded reading, original-view Unicode ranges, and private exports
+- fix: Avoid repeated whole-response serialization during normal budget reduction, report omitted metadata dimensions,
+  preserve exact counts across display truncation, and stop reads and serialization on cancellation
+- fix: Match local and full MCP tool names together without excluding local tools or mixing server/tool pairs; preserve
+  full names in effective filters and continuation queries
 - fix: Read local context and trace windows in sessions above 100,000 messages while retaining selected-span limits,
   redaction, tool association, and export semantics
 - fix: Redact Unicode-escaped sensitive JSON keys while preserving original character ranges and literal backslash keys
@@ -24,16 +33,47 @@
   search mode
 - fix: Report attempted files and unscanned files separately, and reduce coverage metadata before discarding search
   matches
-- fix: Preserve bounded code expressions during text redaction while masking sensitive literal arguments and incomplete expressions
+- fix: Preserve bounded code expressions during text redaction while masking sensitive literal arguments and incomplete
+  expressions
+- fix: Keep unquoted double-colon namespace and log separators for strict-only location names in ordinary and oversized
+  records, without relaxing credential, quoted-field, private IP, or URL protection
 - fix: Echo `subagents` in effective filters and document matching by each main or agent file's own session ID
-- fix: Recalculate the complete export quota after concurrent directory removal, with bounded retries and visible failure
+- fix: Recalculate the complete export quota after concurrent directory removal, with bounded retries and visible
+  failure
 
 ### mcp-chrome
 
 - breaking: Require an explicit `targetId` for `closePage`; selecting a target does not grant access to an existing user
   page
+- fix: Restore full managed access after explicit tab adoption; release preserves grouping and revokes access, with
+  visible warnings for browser-blocked capture/debugger cleanup
+- fix: Recover this Extension's existing debugger sessions after Service Worker restarts without taking over another
+  debugger; preserve concurrent attachment and cleanup state
+- fix: Keep unconditional page actions available when older Extensions lack page snapshots, reporting a fresh URL and
+  unavailable revision; reject unsupported atomic page conditions before dispatch and retain matching not-started
+  precondition status in evaluate and input responses
+- fix: Keep disconnected Server discovery and reconnect messages at debug level while retaining deduplicated warnings
+  for identified authentication and protocol failures
+- fix: Ignore unrelated Turnstile-sized elements and calculate Linux native clicks from client-window geometry and GTK
+  frame extents; reject missing tools or mismatched viewport data
+- feat: Expose native tab updates, group membership/title/color/collapse/movement, and window updates; support native
+  creation options and moving an existing tab while creating additional URL tabs, with distinct creation provenance
+- fix: Finish normal-state restoration before applying window bounds, return stable observed geometry, and report
+  incomplete window observation without replaying updates
+- fix: Return group members and native tab properties in both flat and window-grouped list views; group membership and
+  cached MCP window IDs no longer confer page authority
+- fix: Reject unsupported inactive-tab updates and popup multi-page creation before changes, preserve known preflight
+  rejection state and valid revisions, and keep new groups in their members' window unless explicitly moved
 - feat: Add `expectedUrl` and `expectedRevision` checks to page actions and return `pageContext` with the affected
   target and before/after state
+- fix: Preserve created-page IDs and actual managed state after partial creation failures; report unknown outcomes
+  without attributing the old default page or automatically repeating creation
+- feat: Grant and revoke ordinary reads through MCP, scoped to the server instance, document, URL, and revision;
+  permission-denied page management and navigation preserve valid read grants
+- feat: Return browser list summaries with optional full native properties and target/managed filters, omitting inline
+  favicon payloads and repeated tab objects
+- fix: Invoke zero-argument functions when `args=[]` is explicit across CDP, Extension precise/stealth, and iframe
+  evaluation; omitted args retain ordinary script semantics
 - fix: Preserve completed actions and original errors when restoring a temporary target fails; report restoration
   separately and clear stale CDP attachment state
 - fix: Keep target selection, action execution and page snapshots in one request scope; format asynchronous
@@ -42,14 +82,60 @@
   and unavailable navigation history
 - fix: Fix Extension content reads and iframe selection failing on unserializable injection arguments; preserve URL
   authorization checks and explicit zero-valued options
-- fix: Keep RPC transport time separate from default page-load waits when creating, navigating or refreshing a page
+- fix: Preserve the selected DOM iframe identity during precise evaluation when multiple frames share a URL, including
+  `about:srcdoc`; reject unresolved identities without executing a different frame
+- fix: Match iframe URLs containing fragments during precise evaluation without dropping query or fragment identity
+- fix: Restore existing iframe targets after Extension reloads without navigating the page; retain document-bound
+  initialization and verified frame identity
+- fix: Share one request budget across navigation preparation, queues, loading, challenges, diagnostics, and target
+  restoration; reject expired queued actions without late navigation or automatic replay
+- fix: Stop Challenge read fallbacks after inspection timeout and retain the unavailable inspection status
+- fix: Carry Challenge deadlines through Extension dispatch and OS mouse paths, release CDP presses on the original
+  session, and preserve known navigation status when verification times out
+- fix: Accept current main-frame BFCache restores when waiting for CDP history navigation, without accepting unrelated
+  frame commits or child-frame events
+- fix: Preserve the separate page-creation load wait and RPC transport margin
 - fix: Enforce screenshot/output budgets and private Windows output permissions; retain background automatic Extension
   connection
 - fix: Restore CDP role lookup, state text, offscreen input focus, editor targets, and repeated key events
-- fix: Apply force and coverage checks to click variants, reject force without an element target, and honor humanized click movement
-- fix: Apply mobile density and touch emulation in CDP, and keep injected User-Agent reads current after browser overrides
-- fix: Use page dispatch for same-page challenge buttons and immediate scrolling before reading challenge click coordinates
+- fix: Apply force and coverage checks to click variants, reject force without an element target, and honor humanized
+  click movement
+- fix: Apply mobile density and touch emulation in CDP, and keep injected User-Agent reads current after browser
+  overrides
+- fix: Use page dispatch for same-page challenge buttons and immediate scrolling before reading challenge click
+  coordinates
+- fix: Recognize visible English and Chinese verification `button` elements without changing native input for Cloudflare
+  iframes
+- fix: Hide password selection/replacement diagnostic bodies in successful and failed input responses; preserve ordinary
+  input diagnostics and action status
+- fix: Retain Challenge results in evaluate responses, including origin-wait status and action, verification, or output
+  failures
+- fix: Omit password values from Extension accessibility names without reading them; retain labels and ordinary input
+  values
+- fix: Report native script termination and Runtime internal errors as unknown results in evaluate and advanced CDP
+  commands; prevent direct retries after uncertain evaluation timeouts or stale contexts without replaying commands
+- fix: Keep CDP partial-creation errors consistent with the unmanaged state returned by page lists
 - fix: Wait for CSS-hidden CDP elements to become visible without failing on an unavailable box model
+- fix: Use the same browser text semantics for targeted HTML and whole pages, while retaining SVG/XML node text; accept
+  URL/revision conditions when reading or updating page notes
+- fix: Correct hidden-tab screenshot capabilities in screenshot and diagnostic bundle responses
+- fix: Suggest regenerating oversized baseline PNGs with `clip` or `scale` while preserving comparison budgets
+- fix: Retain declared CDP frame fields as `null` when their values are unavailable
+- fix: Return the selected document URL in CDP metadata extraction
+- fix: Check CDP background-page element stability without waiting for paused animation frames or activating the page
+- fix: Share the remaining CDP input budget across target lookup, actionability checks, and coordinate reads; stop
+  before dispatch when it expires
+- fix: Stop stepped and humanized mouse movement at the input deadline before subsequent clicks; carry the remaining
+  budget through driver preparation and Extension dispatch, retaining unknown partial-action results without replay
+- fix: Stop command focus, text selection, replacement, and stepped CDP touch movement at the remaining input deadline;
+  release Shift after selection failures without hiding the original action error
+- fix: Apply stealth typing delays between characters without delaying the first character; preserve deadline checks
+- fix: Refresh performance network records when the Extension debugger is unavailable; preserve stable sequences,
+  browser-provided status, and document-local clear boundaries without clearing the page timeline
+- fix: Include bounded focus metadata in controlled-input failure diagnostics without reading input values
+- docs: Specify caret-based keyboard insertion and explicit end-of-contenteditable append preparation
+- fix: Distinguish invalid path syntax from scope rejection, report the actual working directory and allowed roots, and
+  accept dot components without permitting parent traversal or symlink escapes
 
 ### mcp-ssh
 
@@ -62,12 +148,25 @@
   environment-agent fallback
 - fix: Preserve transfer targets and report cleanup/timeout uncertainty; retain the operation-start timeout test
   stability change
+- fix: Distinguish quoted here-doc content and command expansions from real background execution, retaining risk signals
+  for active command substitutions
+- fix: Preserve POSIX operation exit codes with or without `setsid`; verify process identity before cancellation in sh
+  and Bash
+- docs: Distinguish PTY read byte counters from the list-only `bufferSize` field
+- fix: Enable TCP_NODELAY on new SSH clients to reduce small-request latency in direct, jump-host and replacement
+  connections
+- fix: Preserve literal aliases and error messages in automatic reconnect warnings
+- fix: Bound directory exclude glob matching without regular-expression backtracking, preserving wildcard and literal
+  matching semantics
+- fix: Reject nonregular key and SSH config paths before synchronous reads to prevent FIFOs from blocking requests
 
 ### Dependencies and documentation
 
 - chore: Update the existing MCP SDK to 1.32.1 and compatible security revisions; `braces` 3.0.3 remains an affected
   development dependency without a patched release
 - docs: Add a separate root Chinese README and synchronize module migration notes and reusable regression guidance
+- fix: Pin the Rust toolchain Action to a commit, limit contents write access to the release job, and disable checkout
+  credential persistence
 
 ---
 
@@ -84,30 +183,82 @@
 
 - breaking: 每次导出创建独立 bundle 并使用 manifest v2，调用方使用响应返回的 output 路径
 - breaking: `max_total` 按最终紧凑 JSON 的 UTF-8 字节数限制，返回 `serialized_bytes`
+- feat: 新增绑定进程的逐批 scan 和分页
+  `history_scan_metadata`，保留超出 normal 收集限制的物理来源，重放最近页，释放已取消或消费结束的扫描状态
+- feat: 读取已识别的嵌套 Workflow agent，search、get、context、trace 和 CLI 使用精确 `source` 选择来源
+- feat: 为超大记录提供 scan、Unicode range、tool
+  input/result 视图及局部 context/trace，结构化 preview 附精确 get 指针，显式 full 保持完整返回合同
+- feat: 新增规范化且脱敏的 `history_get(view=record)`
+  视图，恢复原 JSON 对象与内部 payload，保留有界读取、原视图 Unicode 范围与私有导出
+- fix: normal 预算删减不再反复序列化完整响应，报告遗漏的 metadata 维度，展示截断保留精确计数，取消后停止读取与序列化
 - fix: 混合查询本地与完整 MCP 工具名时保留本地结果和 server/tool 配对，有效过滤条件与续查保留完整名称
 - fix: 支持在超过 100000 条消息的会话中读取局部 context 和 trace，保留选定跨度限制、脱敏、工具关联与导出语义
 - fix: 脱敏 Unicode 转义的敏感 JSON key，保留原文字符范围和字面反斜杠字段的语义
 - fix: 分别报告正文完整性与工具归因，容量和读取缺口使各搜索模式的命中计数标为非精确
 - fix: 分别列出已尝试扫描和未扫描文件，响应预算先缩减 coverage，保留命中消息
 - fix: 文本脱敏保留有限语法内的代码表达式，敏感字面量参数和不完整表达式仍整体遮蔽
+- fix: 普通与超大记录保留 strict 专有位置名称后的未加引号双冒号分隔符，凭证、引用字段、私有 IP 和 URL 保护保持
 - fix: 有效过滤条件回显 `subagents`，明确主文件与 agent 文件按各自 session ID 匹配
 - fix: 并发删除导出目录时重新计算完整配额，重试有上限，仍无法读取时返回错误
 
 ### mcp-chrome
 
 - breaking: `closePage` 必须显式传 `targetId`，选择目标不授予已有用户页面的访问权限
+- fix: 显式 adopt 后恢复完整受控能力，release 保留分组并撤销权限，浏览器阻止采集/debugger 清理时明确返回提示
+- fix: Service Worker 重启后恢复本 Extension 已有的 debugger 连接，不接管其他调试器，保留并发附加与清理状态
+- fix: 旧 Extension 缺少页面快照时保留无条件页面操作，返回实时 URL 和 revision 不可用提示，不支持的原子页面条件在派发前拒绝，evaluate 和 input 的顶层状态与错误上下文保持未开始状态
+- fix: 无 Server 扫描和重连消息使用 debug，已识别的认证、协议错误仍输出去重 warning
+- fix: 忽略只有尺寸相似的无关元素，Linux 原生点击使用 client 窗口几何与 GTK frame extents，工具缺失或视口不符时拒绝点击
+- feat: 公开原生页面更新、分组成员/名称/颜色/折叠/移动和窗口更新，支持原生创建参数、同时移入已有页并新建 URL 页面，分别记录创建来源
+- fix: normal 状态恢复完成后再应用窗口几何，返回稳定的浏览器观测值，观察未完成时明确报告，不重放更新动作
+- fix: 平铺目标与窗口列表回显分组成员和原生 tab 属性，分组归属及缓存的 MCP window ID 不赋予页面权限
+- fix: 不支持的活动页停用与 popup 多页面创建在变更前拒绝，保留明确未执行状态及有效 revision，新组默认保留成员原窗口，显式指定时才跨窗移动
 - feat: 页面动作支持 `expectedUrl` 和 `expectedRevision`，`pageContext` 返回实际目标及动作前后状态
+- fix: 创建部分失败后保留新页面 ID 和实际受控状态，未知结果不指向旧默认页，不自动重复创建
+- feat: 通过 MCP 授予和撤销普通读取权限，限定服务器实例、文档、URL 和 revision；页面管理或导航被权限拒绝时保留有效只读授权
+- feat: 页面列表默认返回摘要，按需提供完整原生属性和目标/受控过滤，不返回内联 favicon 正文或重复页面对象
+- fix: CDP、Extension precise/stealth 和 iframe 中显式 `args=[]` 调用零参函数，未传 args 保留普通脚本语义
 - fix: 临时目标恢复失败时保留已完成动作和原错误，单独报告恢复状态，清除失效的 CDP 附着状态
 - fix: 目标选择、动作和页面快照使用同一请求作用域，browse/manage 的异步失败使用统一错误格式
 - fix: 只有显式只读重试允许重新解析 stale iframe context，明确报告浏览器错误页及不可用的导航历史
 - fix: 修复 Extension 内容读取和 iframe 定位因注入参数不可序列化而失败，保留 URL 授权校验和显式零值参数
-- fix: 创建、导航和刷新页面时，为默认加载等待保留 RPC 传输时间，避免请求提前超时
+- fix: 多个 iframe URL 相同（包括 `about:srcdoc`）时，precise evaluate 保留所选 DOM
+  iframe 身份，无法确认时拒绝执行，不选择其他 frame
+- fix: precise evaluate 支持带 fragment 的 iframe URL，保留 query 和 fragment 身份
+- fix: Extension 重载后恢复原页面中的 iframe 操作，无需导航页面，保留绑定文档的初始化与 frame 身份验证
+- fix: 导航准备、排队、加载、Challenge、诊断和目标恢复共用请求预算，过期队列不迟到导航，不自动重放动作
+- fix: Challenge 检查超时后停止其他读取方式，保留检查未完成状态
+- fix: Challenge deadline 传到 Extension 派发与系统鼠标路径，CDP 按下后向原 session 释放，验证超时保留已知导航状态
+- fix: CDP 历史导航识别当前主 frame 的 BFCache 恢复，排除无关 frame commit 和子 frame 事件
+- fix: 页面创建保留独立的加载等待与 RPC 传输余量
 - fix: 限制截图与输出预算，校验 Windows 输出权限，保留 Extension 后台自动连接
 - fix: 恢复 CDP 角色定位、状态文本、视口外输入聚焦、编辑器目标和长按重复事件
 - fix: 点击各分支执行 force 与遮挡检查，无元素 target 时拒绝 force，humanize 点击执行鼠标移动
 - fix: CDP 设备模拟设置像素密度与触摸能力，注入的 User-Agent 读取随浏览器覆盖值更新
 - fix: 同页模拟挑战按钮使用页面点击，读取挑战点击坐标前立即完成滚动
+- fix: 识别精确匹配英文、中文验证文案的可见 button，保留 Cloudflare iframe 的系统鼠标路径
+- fix: 密码选择与替换的成功、失败响应均隐藏诊断正文，保留普通输入诊断及动作状态
+- fix: evaluate 响应保留 Challenge 结果，包含源站等待状态以及动作、验证或输出失败路径
+- fix: Extension 可访问名称不读取或返回密码值，保留标签与普通输入值
+- fix:
+  evaluate 与高级 CDP 命令将原生脚本终止及 Runtime 内部错误标为结果未知；执行中超时或过期 context 的结果未知时不可直接重试，不重放命令
+- fix: CDP 部分创建失败的受控状态与页面列表返回值保持一致
 - fix: CDP 等待 CSS 隐藏元素变为可见时，不再因缺少 box model 提前失败
+- fix: 目标 HTML 与整页遵循相同的浏览器文本语义，保留 SVG/XML 节点文本；页面备注读取与更新支持 URL/revision 条件
+- fix: 修正截图与诊断包中的隐藏页截图能力声明
+- fix: 超大 PNG 基准图拒绝时提示用 `clip` 或 `scale` 重新生成，保留截图对比预算
+- fix: CDP 帧字段无法取得值时保留字段并返回 `null`
+- fix: CDP 文档元信息返回实际文档 URL
+- fix: CDP 后台页面的位置检查不再等待已暂停的动画帧，保留稳定性检查，不激活页面
+- fix: CDP 输入的目标查找、可操作性检查与坐标读取共用剩余预算，到期后不派发动作
+- fix: 分步与 humanize 鼠标移动到期后不再点击，剩余预算传递至 driver 准备和 Extension 派发，部分执行保留 unknown 且不自动重放
+- fix: 命令聚焦、文本选择、替换和 CDP 分步触摸移动到期后停止后续动作，选区失败后仍释放 Shift，保留原动作错误
+- fix: Stealth 输入仅在字符之间延迟，首字符不额外等待，保留 deadline 检查
+- fix: Extension
+  debugger 不可用时刷新 performance 网络记录，保留序列号、浏览器响应状态与文档内清除边界，不清除网页共享数据
+- fix: 受控输入失败诊断包含有界焦点摘要，不读取输入值
+- docs: 明确键盘按光标位置插入，contenteditable 末尾追加需先建立末尾光标
+- fix: 区分路径语法与范围拒绝，返回实际工作目录和允许根，支持点组件，继续拒绝父目录访问和链接越界
 
 ### mcp-ssh
 
@@ -117,11 +268,19 @@
 - fix: 拒绝零进度文本分页和 EOF 无效编码，行范围 metadata 按实际返回字节计算
 - fix: `IdentityAgent none` 在配置继承、跳板机、重连和外部 rsync 中保持禁用，不使用环境 agent
 - fix: 保留传输目标，明确报告清理与超时的未知状态，保留 operation start timeout 测试稳定性改动
+- fix: 区分引用的 here-doc 正文、命令展开与实际后台执行，保留有效命令替换的风险信号
+- fix: POSIX operation 在有无 `setsid` 时保留真实退出码，sh 和 Bash 取消前校验进程身份
+- docs: 区分 PTY read 字节计数与仅由 list 返回的 `bufferSize` 字段
+- fix: 新 SSH client 启用 TCP_NODELAY，减少直连、跳板和替代连接的小请求等待
+- fix: 自动重连告警原样保留 alias 和错误文本中的格式占位符
+- fix: 目录 exclude glob 改为有界匹配，保留通配符和字面量语义，避免正则组合回溯
+- fix: 在同步读取前拒绝指向非普通文件的密钥与 SSH config 路径，避免 FIFO 阻塞请求
 
 ### 依赖和文档
 
 - chore: 更新现有 MCP SDK 至 1.32.1 及兼容的安全修订，`braces` 3.0.3 开发依赖仍受公告影响且没有修订版本
 - docs: 新增独立的根中文 README，同步模块迁移说明和可复用回归指导
+- fix: 固定 Rust toolchain Action 的 commit，仅 Release job 保留 contents 写权限，checkout 不持久化凭证
 
 **Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.16.2...v1.17.0
 
@@ -146,11 +305,12 @@
 ### mcp-chrome
 
 - feat: Add controlled page adoption, release, movement, ordering, pinning, and topology metadata
-- feat: Wait for browser challenges, handle visible Turnstile controls only on the active managed tab, and report denied or
-  timed-out states explicitly
+- feat: Wait for browser challenges, handle visible Turnstile controls only on the active managed tab, and report denied
+  or timed-out states explicitly
 - fix: Scope CDP events, logs, challenge state, and diagnostics to the current flat session and main document
 - fix: Return structured input errors, bound and redact diagnostic data, and preserve action and verification state
-- fix: Clean server build output before packaging; replace the stale 2.4.2 and metadata-incomplete 2.4.3 packages with 2.4.4
+- fix: Clean server build output before packaging; replace the stale 2.4.2 and metadata-incomplete 2.4.3 packages with
+  2.4.4
 - chore: Refresh npm development and Extension build dependencies to remove audit findings
 
 ### mcp-ssh
@@ -621,8 +781,8 @@
 
 - feat: 新增可选 pairing token 认证，同时默认保留零配置本地使用方式
 - feat: 加固 managed tab 和 window 边界，包括 close、activate、focus、resize 和 navigation 行为
-- feat: 新增 controlled input、更丰富的 select/replace 诊断、结构化页面状态、frame metadata、clip screenshot、PNG 对比和
-  action diagnostics
+- feat: 新增 controlled input、更丰富的 select/replace 诊断、结构化页面状态、frame metadata、clip
+  screenshot、PNG 对比和 action diagnostics
 - fix: 限制 CDP evaluate 结果展开、auth challenge 存储、Chrome 启动清理和 MCP frame 解析边界
 - docs: 更新 README、README_zh 和 TESTING，覆盖扩展后的浏览器自动化行为
 
@@ -1024,8 +1184,8 @@
 
 ### mcp-chrome 1.7.0
 
-- feat: 点击前可操作性检查 — 5 项检查（可见、可用、pointer-events、视口内、未被遮挡）+ 渐进退避重试 [0,20,100,100,500ms] + 自动
-  scroll-into-view
+- feat: 点击前可操作性检查 —
+  5 项检查（可见、可用、pointer-events、视口内、未被遮挡）+ 渐进退避重试 [0,20,100,100,500ms] + 自动 scroll-into-view
 - feat: `input dispatch` 模式 — 通过 nativeInputValueSetter 设置 value + 触发 input/change 事件，兼容 React/Vue 受控组件
 - feat: `input force` — 跳过可操作性检查
 - feat: `extract depth` — state 提取的 DOM 遍历深度限制

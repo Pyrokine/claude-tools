@@ -3,8 +3,11 @@ mod context;
 mod get;
 mod mcp_rmcp;
 mod projects;
+mod record_reader;
 mod search;
+mod session_files;
 mod sessions;
+mod stream_scan;
 mod trace;
 mod types;
 mod utils;
@@ -31,7 +34,13 @@ use utils::{
 ///   - 序列化失败（本地不可能,T/E 都 derive Serialize）→ Err(serde 错误描述)
 fn serialize_result<T: serde::Serialize, E: serde::Serialize>(result: Result<T, E>) -> Result<String, String> {
     match result {
-        Ok(v) => serde_json::to_string(&v).map_err(|e| e.to_string()),
+        Ok(v) => {
+            let mut bytes = Vec::new();
+            match record_reader::serialize_json(&mut bytes, &v, false) {
+                Ok(_) => Ok(String::from_utf8(bytes).expect("JSON is UTF-8")),
+                Err(error) => Err(serde_json::to_string(&error).unwrap_or_else(|failure| failure.to_string())),
+            }
+        }
         Err(e) => match serde_json::to_string(&e) {
             Ok(s) => Err(s),
             Err(serde_err) => Err(serde_err.to_string()),
@@ -56,6 +65,24 @@ struct Cli {
 enum Commands {
     /// Search conversations
     Search {
+        /// normal or scan; scan prints NDJSON result pages, then metadata pages, in this process
+        #[arg(long, default_value = "normal")]
+        mode: String,
+
+        /// Cursors cannot be reused across CLI processes
+        #[arg(long)]
+        cursor: Option<String>,
+
+        #[arg(long)]
+        scan_bytes: Option<u64>,
+
+        #[arg(long)]
+        scan_ms: Option<u64>,
+
+        /// preview or full; normal defaults to full, scan defaults to preview
+        #[arg(long)]
+        structured: Option<String>,
+
         /// Search pattern (empty for all)
         #[arg(default_value = "")]
         pattern: String,
@@ -71,6 +98,10 @@ enum Commands {
         /// Session IDs
         #[arg(long)]
         sessions: Option<Vec<String>>,
+
+        /// 精确 source，与显式项目和会话筛选取交集，子会话需要 --subagents
+        #[arg(long)]
+        source: Option<String>,
 
         /// Start time (ISO 8601)
         #[arg(long)]
@@ -177,9 +208,21 @@ enum Commands {
 
     /// Get full content by ref
     Get {
+        /// content (default), tool_input, tool_result, or record (normalized, redacted JSON object)
+        #[arg(long)]
+        view: Option<String>,
+
+        /// Original content array index for a tool view; not accepted with record
+        #[arg(long)]
+        block: Option<usize>,
+
         /// Reference (session_prefix:line)
         #[arg(long)]
         r#ref: String,
+
+        /// Exact source returned by search or scan metadata
+        #[arg(long)]
+        source: Option<String>,
 
         /// Char range for chunked reading (start-end)
         #[arg(long)]
@@ -206,6 +249,10 @@ enum Commands {
         /// Reference (session_prefix:line)
         #[arg(long)]
         r#ref: String,
+
+        /// Exact source returned by search or scan metadata
+        #[arg(long)]
+        source: Option<String>,
 
         /// Lines before anchor (counts only messages matching both --types and --pattern)
         #[arg(long)]
@@ -276,6 +323,10 @@ enum Commands {
         /// Reference (session_prefix:line)
         #[arg(long)]
         r#ref: String,
+
+        /// Exact source returned by search or scan metadata
+        #[arg(long)]
+        source: Option<String>,
 
         /// Messages before anchor (counts only matching --types and --pattern; default: 20)
         #[arg(long)]
@@ -367,6 +418,87 @@ enum Commands {
     },
 }
 
+fn run_scan_cli(
+    config: &Config,
+    params: SearchParams,
+    cursor: Option<String>,
+    scan_bytes: Option<u64>,
+    scan_ms: Option<u64>,
+) -> Result<(), ErrorResponse> {
+    use std::io::Write;
+    if cursor.is_some() {
+        return Err(utils::invalid_arguments(
+            "CLI cursor 不能跨进程使用；--mode scan 会在当前进程中驱动所有批次",
+        ));
+    }
+    let scans = stream_scan::ScanStore::default();
+    let max_total = params.max_total;
+    let limit = params.limit;
+    let mut request = stream_scan::ScanRequest {
+        params,
+        cursor: None,
+        scan_bytes,
+        scan_ms,
+        explicit_filters: serde_json::json!({}),
+    };
+    let mut output = std::io::stdout().lock();
+    let id = loop {
+        let page = record_reader::WorkControl::default()
+            .run(|| scans.search(config, request, std::sync::Arc::new(|| false)))?;
+        writeln!(output, "{page}")
+            .map_err(|error| record_reader::reader_error("io_error", format!("写入扫描页失败: {error}")))?;
+        output
+            .flush()
+            .map_err(|error| record_reader::reader_error("io_error", error.to_string()))?;
+        let page: serde_json::Value = serde_json::from_str(&page)
+            .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
+        if page["has_more"] == false {
+            break page["scan_id"].as_str().expect("scan_id string").to_string();
+        }
+        request = stream_scan::ScanRequest {
+            params: SearchParams {
+                max_total,
+                limit,
+                ..SearchParams::default()
+            },
+            cursor: Some(
+                page["next_query"]["cursor"]
+                    .as_str()
+                    .expect("cursor string")
+                    .to_string(),
+            ),
+            scan_bytes,
+            scan_ms,
+            explicit_filters: serde_json::json!({}),
+        };
+    };
+    let mut cursor = None;
+    loop {
+        let page = record_reader::WorkControl::default().run(|| {
+            scans.metadata(stream_scan::MetadataRequest {
+                scan_id: id.clone(),
+                cursor,
+                limit: limit.unwrap_or(100),
+                max_total,
+                release: false,
+            })
+        })?;
+        writeln!(output, "{page}").map_err(|error| record_reader::reader_error("io_error", error.to_string()))?;
+        let page: serde_json::Value = serde_json::from_str(&page)
+            .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
+        if page["has_more"] == false {
+            break;
+        }
+        cursor = Some(
+            page["next_query"]["cursor"]
+                .as_str()
+                .expect("metadata cursor string")
+                .to_string(),
+        );
+    }
+    scans.release(&id)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -388,10 +520,16 @@ async fn main() -> anyhow::Result<()> {
 
     let result: Result<String, String> = match command {
         Commands::Search {
+            mode,
+            cursor,
+            scan_bytes,
+            scan_ms,
+            structured,
             pattern,
             project,
             all,
             sessions,
+            source,
             since,
             until,
             types,
@@ -425,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
                     projects: project.unwrap_or_default(),
                     all_projects: all,
                     sessions: sessions.unwrap_or_default(),
+                    source,
                     since,
                     until,
                     types: split_csv_param(Some(types.as_str())),
@@ -452,17 +591,30 @@ async fn main() -> anyhow::Result<()> {
                     overwrite,
                     output_format,
                     subagents,
+                    structured,
                 })
             })();
 
             match parsed {
-                Ok(params) => serialize_result(search(&config, params)),
+                Ok(params) if mode == "scan" => match run_scan_cli(&config, params, cursor, scan_bytes, scan_ms) {
+                    Ok(()) => Ok(String::new()),
+                    Err(error) => serialize_result::<serde_json::Value, _>(Err(error)),
+                },
+                Ok(params) if mode == "normal" && cursor.is_none() && scan_bytes.is_none() && scan_ms.is_none() => {
+                    record_reader::WorkControl::default().run(|| serialize_result(search(&config, params)))
+                }
+                Ok(_) => serialize_result::<serde_json::Value, _>(Err(utils::invalid_arguments(
+                    "mode 仅支持 normal 或 scan；cursor 和 scan 预算需要 mode=scan",
+                ))),
                 Err(e) => serialize_result::<serde_json::Value, _>(Err(e)),
             }
         }
 
         Commands::Get {
             r#ref,
+            source,
+            view,
+            block,
             range,
             output,
             overwrite,
@@ -472,6 +624,9 @@ async fn main() -> anyhow::Result<()> {
             Ok(range) => {
                 let params = parse_optional_redaction_mode_param(redaction.as_deref()).map(|redaction| GetParams {
                     r#ref,
+                    source,
+                    view,
+                    block,
                     range,
                     output,
                     overwrite,
@@ -479,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
                     redaction,
                 });
                 match params {
-                    Ok(params) => serialize_result(get(&config, params)),
+                    Ok(params) => record_reader::WorkControl::default().run(|| serialize_result(get(&config, params))),
                     Err(e) => serialize_result::<serde_json::Value, _>(Err(e)),
                 }
             }
@@ -488,6 +643,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Context {
             r#ref,
+            source,
             before,
             after,
             until_type,
@@ -508,6 +664,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(redaction) => {
                 let params = ContextParams {
                     r#ref,
+                    source,
                     before,
                     after,
                     until_type,
@@ -526,13 +683,14 @@ async fn main() -> anyhow::Result<()> {
                     redaction,
                 };
 
-                serialize_result(context(&config, params))
+                record_reader::WorkControl::default().run(|| serialize_result(context(&config, params)))
             }
             Err(e) => serialize_result::<serde_json::Value, _>(Err(e)),
         },
 
         Commands::Trace {
             r#ref,
+            source,
             before,
             after,
             project,
@@ -555,6 +713,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(redaction) => {
                 let params = TraceParams {
                     r#ref,
+                    source,
                     before,
                     after,
                     project,
@@ -574,24 +733,27 @@ async fn main() -> anyhow::Result<()> {
                     overwrite,
                     redaction,
                 };
-                serialize_result(trace(&config, params))
+                record_reader::WorkControl::default().run(|| serialize_result(trace(&config, params)))
             }
             Err(e) => serialize_result::<serde_json::Value, _>(Err(e)),
         },
 
         Commands::BuildInfo => serialize_result::<_, ErrorResponse>(Ok(BuildIdentity::current())),
 
-        Commands::Projects => serialize_result(list_projects(&config)),
+        Commands::Projects => record_reader::WorkControl::default().run(|| serialize_result(list_projects(&config))),
 
         Commands::Sessions { project, redaction } => match parse_optional_redaction_mode_param(redaction.as_deref()) {
-            Ok(redaction) => serialize_result(list_sessions(&config, project.as_deref(), redaction)),
+            Ok(redaction) => record_reader::WorkControl::default()
+                .run(|| serialize_result(list_sessions(&config, project.as_deref(), redaction))),
             Err(e) => serialize_result::<serde_json::Value, _>(Err(e)),
         },
     };
 
     match result {
         Ok(output) => {
-            println!("{output}");
+            if !output.is_empty() {
+                println!("{output}");
+            }
             Ok(())
         }
         Err(output) => {
@@ -605,6 +767,30 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn cli_source_is_available_for_all_reference_readers() {
+        for command in ["search", "get", "context", "trace"] {
+            let mut args = vec![
+                "claude-history",
+                command,
+                "--source",
+                "/fixture/project/agent-same.jsonl",
+            ];
+            if command != "search" {
+                args.extend(["--ref", "agent-same:1"]);
+            }
+            let parsed = Cli::try_parse_from(args).unwrap();
+            let source = match parsed.command.unwrap() {
+                Commands::Search { source, .. }
+                | Commands::Get { source, .. }
+                | Commands::Context { source, .. }
+                | Commands::Trace { source, .. } => source,
+                _ => panic!("unexpected command"),
+            };
+            assert_eq!(source.as_deref(), Some("/fixture/project/agent-same.jsonl"));
+        }
+    }
 
     #[test]
     fn cli_version_and_build_info_are_available() {

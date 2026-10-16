@@ -1,6 +1,8 @@
+import { ExpectedOperationError } from '../types/expected-errors'
 import { InputKeySchema, InputMouseSchema, InputTouchSchema, InputTypeSchema } from '../types/schemas'
 import { type ActionContext, assertManagedTab, getTargetTabId } from './action-utils'
 import { DebuggerManager } from './debugger-manager'
+import { remainingNavigationTimeout } from './navigation-handler'
 
 export class InputEventHandler {
     /** 按 tabId 维护当前按下的鼠标按键 mask（W3C MouseEvent.buttons），
@@ -68,6 +70,9 @@ export class InputEventHandler {
         const p = InputMouseSchema.parse(params)
 
         const tabId = await this.getManagedTabId(p.tabId, context, 'input_mouse')
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
+        }
 
         // mouseWheel: chrome.debugger sendCommand for Input.dispatchMouseEvent(mouseWheel) never resolves
         // in Extension mode — dispatch WheelEvent via scripting.executeScript instead
@@ -115,6 +120,9 @@ export class InputEventHandler {
             type: p.type,
             x: p.x,
             y: p.y,
+        }
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
         }
 
         if (p.button && p.button !== 'none') {
@@ -281,6 +289,17 @@ export class InputEventHandler {
         const p = InputTypeSchema.parse(params)
 
         const tabId = await this.getManagedTabId(p.tabId, context, 'input_type')
+        const remainingTimeout = () => {
+            if (p.deadline === undefined) {
+                return Infinity
+            }
+            const remaining = p.deadline - Date.now()
+            if (remaining <= 0) {
+                throw new ExpectedOperationError('input timeout during typing')
+            }
+            return remaining
+        }
+        remainingTimeout()
         await this.debuggerManager.ensureAttached(tabId)
 
         const delay = p.delay ?? 0
@@ -288,6 +307,7 @@ export class InputEventHandler {
         const text = p.text.replace(/\r\n?/g, '\n')
 
         for (const char of text) {
+            remainingTimeout()
             if (char === '\n') {
                 // Enter: CDP 对 char='\n' 会丢弃，改为分发 Enter 键事件
                 const enterParams = {
@@ -296,19 +316,23 @@ export class InputEventHandler {
                     windowsVirtualKeyCode: 13,
                     nativeVirtualKeyCode: 13,
                 }
-                await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
-                    type: 'keyDown',
-                    ...enterParams,
-                })
-                await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
-                    type: 'char',
-                    text: '\r',
-                    ...enterParams,
-                })
-                await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
-                    type: 'keyUp',
-                    ...enterParams,
-                })
+                try {
+                    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+                        type: 'keyDown',
+                        ...enterParams,
+                    })
+                    remainingTimeout()
+                    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+                        type: 'char',
+                        text: '\r',
+                        ...enterParams,
+                    })
+                } finally {
+                    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+                        type: 'keyUp',
+                        ...enterParams,
+                    })
+                }
             } else {
                 await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
                     type: 'char',
@@ -317,9 +341,10 @@ export class InputEventHandler {
             }
 
             if (delay > 0) {
-                await new Promise((r) => setTimeout(r, delay))
+                await new Promise((r) => setTimeout(r, Math.min(delay, remainingTimeout())))
             }
         }
+        remainingTimeout()
 
         return { success: true }
     }

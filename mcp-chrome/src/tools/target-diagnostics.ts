@@ -68,33 +68,48 @@ export function summarizeTargetCandidates(candidates: TargetCandidate[]): Array<
 async function collectPageCandidates(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     timeout: number | undefined
-): Promise<{ candidates: unknown[]; diagnosticError?: string }> {
+): Promise<{ candidates: unknown[]; activeElement: Record<string, unknown> | null; diagnosticError?: string }> {
     try {
-        const candidates = await unifiedSession.evaluate<unknown[]>(
-            `(() => Array.from(document.querySelectorAll(
-                    'input, textarea, select, button, a, [role], [contenteditable="true"]'
-                ))
-                .slice(0, ${MAX_CANDIDATES})
-                .map((el) => {
-                    const rect = el.getBoundingClientRect();
-                    return {
-                        tag: el.tagName.toLowerCase(),
-                        id: el.id || undefined,
-                        role: el.getAttribute('role') || undefined,
-                        label: (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').slice(0, 80),
-                        text: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, ${MAX_CANDIDATE_TEXT}),
-                        visible: rect.width > 0 && rect.height > 0,
-                        disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
-                        bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
-                    };
-                }))()`,
+        return await unifiedSession.evaluate<{
+            candidates: unknown[]
+            activeElement: Record<string, unknown> | null
+        }>(
+            `(() => {
+                const active = document.activeElement;
+                return {
+                    activeElement: active ? {
+                        tag: active.tagName.toLowerCase().slice(0, 40),
+                        id: active.id ? active.id.slice(0, ${MAX_CANDIDATE_TEXT}) : undefined,
+                        role: active.getAttribute('role')?.slice(0, 80) || undefined,
+                        inputType: active instanceof HTMLInputElement ? active.type.slice(0, 40) : undefined,
+                        contentEditable: Boolean(active.isContentEditable)
+                    } : null,
+                    candidates: Array.from(document.querySelectorAll(
+                        'input, textarea, select, button, a, [role], [contenteditable="true"]'
+                    ))
+                        .slice(0, ${MAX_CANDIDATES})
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            return {
+                                tag: el.tagName.toLowerCase(),
+                                id: el.id || undefined,
+                                role: el.getAttribute('role') || undefined,
+                                label: (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').slice(0, 80),
+                                text: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, ${MAX_CANDIDATE_TEXT}),
+                                visible: rect.width > 0 && rect.height > 0,
+                                disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
+                                bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
+                            };
+                        })
+                };
+            })()`,
             undefined,
             Math.min(Math.max(timeout ?? MAX_DIAGNOSTIC_TIMEOUT_MS, 1), MAX_DIAGNOSTIC_TIMEOUT_MS)
         )
-        return { candidates }
     } catch (error) {
         return {
             candidates: [],
+            activeElement: null,
             diagnosticError: sanitizeErrorMessage(error).slice(0, 500),
         }
     }
@@ -122,7 +137,7 @@ export async function buildTargetDiagnostics(
     const knownCandidates = options.candidates ? summarizeTargetCandidates(options.candidates) : []
     const pageCandidates =
         knownCandidates.length > 0
-            ? { candidates: knownCandidates }
+            ? { candidates: knownCandidates, activeElement: null }
             : await collectPageCandidates(unifiedSession, options.timeout)
 
     return {
@@ -135,6 +150,7 @@ export async function buildTargetDiagnostics(
         frame: options.frame,
         matchCount: options.matchCount,
         candidates: pageCandidates.candidates,
+        activeElement: pageCandidates.activeElement,
         lastLocatorState: options.lastState,
         timeout: options.timeout,
         mode: unifiedSession.getMode(),

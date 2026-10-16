@@ -25,8 +25,8 @@ Chrome 浏览器自动化 MCP Server，双模式架构： **Extension 模式**�
 ## 迁移到 3.0
 
 - `manage(action="closePage")` 必须显式传入 `targetId`，不再关闭缺省页面
-- Extension 模式的 `adoptPage`
-  只标记受控页面，不授予内容读取、脚本或写权限；普通读取需在 popup 获取单页授权，测试操作可用 `newPage` 创建页面
+- Extension 模式显式 `adoptPage`
+  后，已有页面获得与新建受控页相同的读取、输入、脚本、截图、debugger 和日志能力，受控页面无需 popup 普通只读授权
 - 单页普通读取授权覆盖 text、HTML、attribute、computed
   style 与 state，不开放任意 JavaScript、CDP/debugger、input 或 screenshot
 - `tmp:` 文件只属于当前 MCP server 会话；重启后需重新生成，需保留的文件应在服务器退出前保存到 `cwd:`
@@ -201,11 +201,42 @@ Extension 模式的 `back/forward`
 `navigated=false`，其他原生错误保留；execution
 context 失效或浏览器拒绝向错误页注入时，仍返回操作失败，Extension 将其记录为预期操作警告；任意 debugger 命令不自动重放
 
+`open`、`back`、`forward`、`refresh` 的 `timeout`
+从请求入口开始计时，页面准备、排队、协议请求、加载、Challenge 检查与点击、诊断和目标恢复共用剩余预算，导航 RPC 不额外增加传输时间队列中的动作到期后不再派发，后续请求仍等待原在途动作结束；显式
+`timeout=0` 在导航派发前拒绝，页面创建保留独立的加载等待与传输余量合同
+
+超时不会撤回已经派发的 Chrome 操作，结果未知时返回 `TIMEOUT`、`actionExecuted="unknown"`、`actionStatus="unknown"` 和
+`retryable=false`，应读取实际页面状态，不重放导航 `pageContext.after` 使用实时快照，无法取得时为 null 并附
+`contextError`；恢复预算耗尽时单独报告恢复失败，保留主动作结果 CDP 历史等待接受当前 session 主 frame 的 BFCache 恢复或同文档事件，普通 frame
+commit、子 frame 和其他 session 的事件不作为完成信号
+
+Challenge 点击、detach 和检查 RPC 携带剩余 deadline，排队或页面校验耗尽预算后不再派发；系统鼠标移动与 fallback 进程使用同一 deadline
+CDP 已开始的按下始终尝试向原连接、原 session 释放，清理最多等待 1 秒，不向后来选择的目标发送只读 Challenge 检查到期返回
+`CHALLENGE_TIMEOUT`，保留已知主动作状态；点击结果未知时返回 `TIMEOUT`、已知主动作状态、
+`verificationStatus="unknown"`、`verificationActionExecuted` 和 `retryable=false`，不自动重放导航或点击
+
+evaluate 在成功、动作失败、后置验证不匹配和输出失败时保留 Challenge 结果字段 `originResponsePending=true`
+表示验证成功但源站尚未响应，不表示目标内容已加载
+
 页面类工具在两种 backend 中都接受 `targetId`，旧版 `tabId`
 仍可用；同时提供时两者必须一致。显式目标只作用于当前操作，结束后恢复原默认目标。`browse.close` 和 `manage.closePage`
 必须显式指定 ID。页面动作成功或失败时，响应中的 `pageContext`
 包含实际目标及来源（`explicit`、`default`、`created`、`reused`、`unconfirmed`）、前后 URL/revision、默认目标前后状态，以及 Extension 报告的浏览器活动目标；创建页面失败且未返回创建 ID 时标为
-`unconfirmed`。CDP 的活动状态标为不可用，不把操作目标当作前台页面。
+`unconfirmed`。CDP 的活动状态标为不可用，不把操作目标当作前台页面
+
+旧 Extension 缺少 `page_snapshot` 时，无条件页面动作仍可使用实时页面列表中的 URL，`pageContext.before` 和 `after`
+的快照返回 `revision=null`，并通过 `warning` 说明 revision 与原子条件不可用，传入 `expectedUrl` 或 `expectedRevision`
+时在派发前返回 `DRIVER_CAPABILITY_ERROR`、`actionExecuted=false` 和
+`actionStatus="not_started"`，更新 Extension 后才能使用这些条件 evaluate 和 input 保留
+`failureStage="precondition"`，顶层状态与错误上下文一致，不派发脚本或输入事件其他快照错误仍阻止动作，兼容读取共用原 timeout 预算
+
+Extension 页面快照确认目标 tab 已不存在时返回 `TARGET_NOT_FOUND`，保留 `context.targetId` 和原始
+`context.nativeMessage`；输入派发前被拒绝时保留
+`eventsExecuted=0`、`actionExecuted=false`，不改用其他页面或重放动作，用户脚本主动抛出同文案不归类为缺页
+
+Chrome 已返回创建标识后，失败响应保留 `error.context.createdTargetId`、窗口 ID、实际 `managed`、`actionExecuted`、
+`actionStatus="partial"` 和 `failureStage`；RPC 结果未知时，`actionStatus` 与 `actionExecuted` 均为 `"unknown"`
+未取得创建标识的失败响应中 `pageContext.targetId=null`，不指向原默认页，不自动重复创建或删除
 
 临时目标的恢复结果通过 `pageContext.targetRestoration` 单独报告，`restored` 表示恢复原默认目标，`cleared`
 表示原先无默认目标并清除临时选择，`previous_target_closed` 表示原默认页已关闭并清除选择，`failed`
@@ -223,20 +254,34 @@ epoch 与单页计数构成；Extension 跟踪主 frame 导航和 MCP 动作，C
 `browse` 仅 `open`、`back`、`forward`、`refresh`、`close` 接受这两个条件，`attach` 等其他动作在改变目标前返回
 `INVALID_ARGUMENT`
 
-Extension popup 可为一个非创建页面向当前连接的单个服务器实例授予普通读取权限，同一连接和文档未变化时，Service
-Worker 重启后仍可读取；导航、关闭页面或断开连接后授权失效。`targetId` 和 `adoptPage`
-均不能代替读取授权。授权覆盖定向文本、HTML、属性、计算样式及页面状态读取；任意脚本、debugger、截图、输入和 Cookie 访问不继承授权，现有 Cookie 工具仍按独立的 URL/name 过滤规则执行。`manage(action="pageMetadata", targetId=...)`
-可以读取或更新
-`taskHint`、`note`，列表还会显示创建与最近使用时间。这些元数据只在服务器进程中保存，关闭页面时删除，不参与内容读取授权。
+显式 `manage(action="adoptPage", targetId=...)` 将已有页面设为完整受控页，不聚焦或导航，`browse attach`
+只选择目标；创建来源、分组归属和颜色不决定页面权限，`releasePage`
+撤销完整权限，保留页面、窗口归属和分组，清理 MCP 日志状态、debugger 和 console 采集资源；Chrome 阻止资源清理时返回
+`warnings`，完整权限仍被撤销
+
+受控页在 Service Worker 重启后可继续使用本 Extension 已有的调试连接，其他调试器占用仍返回 `DEBUGGER_BLOCKED`
+
+通过 `manage(action="grantReadAccess", targetId=...)` 授予普通读取权限，用 `revokeReadAccess`
+撤销，无需点击 popup；两个动作必须显式指定目标，可传
+`expectedUrl`/`expectedRevision`；授权限定当前调用服务器实例、documentId、URL 和 revision，存储失败返回错误，不报告授权成功；popup 保留为可选入口，同一连接和文档未变化时，Service
+Worker 重启后仍可读取；导航、关闭页面或断开连接后授权失效，仅指定 `targetId`
+不授予读取权限；普通只读授权覆盖定向文本、HTML、属性、计算样式及页面状态读取，任意脚本、debugger、截图、输入和 Cookie 访问不继承授权，现有 Cookie 工具仍按独立的 URL/name 过滤规则执行
+
+页面管理或导航因缺少受控权限而被拒绝时，不更新 revision，已有有效的普通只读授权保持不变
+
+`manage(action="pageMetadata", targetId=...)` 可以读取或更新
+`taskHint`、`note`，列表还会显示创建与最近使用时间；读取和更新都支持 `expectedUrl`/`expectedRevision`，不匹配时返回
+`ACTION_PRECONDITION_FAILED`，不读取或更新备注；这些元数据只在服务器进程中保存，关闭页面时删除，不参与内容读取授权
 
 ### 访问验证
 
 `open`、`back`、`forward`、`refresh`、`input` 和 `evaluate` 之后，MCP Chrome 会等待 Cloudflare JS Challenge 或 Turnstile
 checkbox。Extension 模式下，导航先不启用 debugger 日志采集，连续八秒被动读取真实 tab 标题。interstitial 持续存在时，才检查可见 Turnstile 控件，找到后才点击。Extension
 inspect 走 isolated world，检查前先卸掉 debugger。同页测试按钮走页面点击；出现 Cloudflare Turnstile
-iframe 时，把 inspect 的 CSS 坐标换成屏幕坐标，系统鼠标沿路径移动、悬停后再按下抬起：Linux 用
-`xdotool`，并以当前 X11 活动窗口原点加窗口边距为准，且窗口标题必须对应该测试页，不用 Chrome `screenX`，也不用
-`outerHeight - innerHeight` 当顶栏；macOS 用 `cliclick` 或 System Events；Windows 用 PowerShell
+iframe 时，把 inspect 的 CSS 坐标换成屏幕坐标，系统鼠标沿路径移动、悬停后再按下抬起：Linux 用 `xdotool` 读取活动 Chrome
+client 窗口几何，用 `xprop` 读取 GTK frame
+extents，窗口标题必须对应该测试页缺少工具、窗口数据无效或与页面视口不符时停止点击，不用 Chrome `screenX` 或
+`outerHeight - innerHeight` 猜测内容原点；macOS 用 `cliclick` 或 System Events；Windows 用 PowerShell
 `mouse_event`。widget 点 compact
 Turnstile 卡片左侧 checkbox，宿主 wrapper 比卡片宽时也只点左侧卡片，不点文案。DOM 里已有 Cloudflare
 iframe 时，即使 iframe 尺寸为 0，也走系统鼠标，不改用页面点击，后续宿主页 `Verify you are human` / `请验证您是真人`
@@ -244,14 +289,15 @@ iframe 时，即使 iframe 尺寸为 0，也走系统鼠标，不改用页面点
 
 系统点击前会卸掉 debugger，再读一次视口。缺少系统鼠标工具或窗口未聚焦时返回可见错误，不会静默改用 CDP 点击。
 
-widget 要连续两次 inspect 到同一坐标才点；系统鼠标从远处过来时从控件附近起步。同一类 checkbox 或 compact
+widget 要连续两次 inspect 到同一坐标才点，不以普通元素的尺寸认定 widget；系统鼠标从远处过来时从控件附近起步。同一类 checkbox 或 compact
 widget 在同一次等待里最多点一次；Cloudflare 随后换成可见的 `Verify you are human` 或 `请验证您是真人`
 按钮时，inspect 判成 `verify` 后再点一次。访问受 Cloudflare 保护的页面默认保持
 `diagnostics=false`，因为 diagnostics 会启用 debugger 的 console 和 network 采集。
 
 检测覆盖 `Just a moment...`、`请稍候…` 等标题、Challenge DOM、正文标记和 `Verify you are human` / `请验证您是真人`
-控件。CDP 用 `Target.getTargetInfo` 读取实时标题。页面恢复后残留的 Cloudflare
-iframe 不算等待中，缓存标题不参与判定。不会调用 CAPTCHA solver、不会自动重试导航，也不会导出 `cf_clearance`
+控件，包括精确匹配这两种文案的可见 `button` 元素；没有 Cloudflare iframe 时，同页按钮使用页面点击 CDP 用
+`Target.getTargetInfo` 读取实时标题。页面恢复后残留的 Cloudflare iframe 不算等待中，缓存标题不参与判定。不会调用 CAPTCHA
+solver、不会自动重试导航，也不会导出 `cf_clearance`
 的值。CDP 超时不代表网站在用户真实 Chrome 中无法通过，排查网站前先检查返回的 `mode`。
 
 过盾成功时返回 `challengeResolved=true`、`challengeKind`、`waitedMs`、`clickedTurnstile` 和 `clearanceCookiePresent`
@@ -291,13 +337,32 @@ function 或 Promise 表达式；函数会被调用，最终 Promise 值会被�
 `tabId`）在两种 backend 中指定页面；`frame`
 在 Extension 模式中指定 iframe（CSS 选择器或索引），传入任一作用域时，动作、诊断和 post-condition 使用该目标作用域选定的同一个 backend，
 
+键盘 `type` 的 `timeout` 包含 Challenge 等待、焦点准备、字符输入和 `delay`/`humanize` 延迟，Extension
+precise/stealth 与 CDP 使用本次剩余预算，显式预算如 `timeout=45000`
+允许合法输入持续超过默认的 30000ms，到期后停止后续字符与事件；已派发的输入不能撤回，超时可能留下部分输入，响应为
+`actionExecuted=true`、`actionStatus="unknown"` 和 `retryable=false` 时，应独立读取页面确认实际值，不重放整个事件序列
+
+鼠标目标查找、分步移动和 `humanize`
+延迟也共用 input 剩余预算，每次移动和后续点击前检查截止时间，到期后停止后续移动和点击；已派发的原生事件不能撤回，结果为 unknown 时独立读取页面，不重放操作
+
+命令聚焦、文本选择和替换共用事件剩余预算，到期后停止后续动作；Shift 按下后仍尝试释放，释放失败不隐藏原动作错误，CDP 分步触摸移动到期后也停止后续触摸点与事件
+
+Stealth 的 `delay` 只作用于字符之间，首字符不额外等待；后台页面受定时器节流时，后续间隔会延长，本次预算仍限制后续输入
+
+Extension precise 与 CDP 的键盘输入使用当前光标和选区，提供 `target`
+会先点击目标并改变插入位置，向 contenteditable 末尾追加时，先聚焦并将光标放到末尾，再发送不带 `target` 的
+`type`，避免再次点击改变位置
+
+后台 CDP 点击和键盘输入无需激活页面，仍检查元素是否可见、可用且位置和尺寸稳定，必要时滚动到视口；点击还会检查遮挡目标查找、可操作性检查和最终坐标读取共用事件剩余预算，任一阶段耗尽预算后不派发鼠标或键盘事件
+
 **`click` 专属参数**：`force: true` 必须提供 `forceReason` 和非坐标型元素
 `target`，它会跳过可操作性检查（适用于测试隐藏元素等场景），但仍只分发标准 DOM 鼠标事件序列，不会直接调用框架私有 handler 中键、右键和多击采用同一检查规则，坐标型或省略 target 的点击不能使用 force，可操作性失败返回
 `ACTIONABILITY_FAILED`，包含 `rect`、`clickPoint`、遮挡元素、候选遮挡物和修复建议， **`type`
 专属参数**：`mode="controlled"` 或 `dispatch: true` 直接设置 `.value` 并触发 `input`/`change`
 事件，兼容 React/Vue 等框架的受控组件（键盘事件无法触发状态更新时使用），需要非坐标型
-`target`，仅限 Extension 模式，受控输入和目标查找失败时返回结构化 context，包含 `locator`、`matchCount`、`nth`
-和有数量上限的 `candidates`，选区相关错误另含编辑器与选区状态，password
+`target`，仅限 Extension 模式，受控输入和目标查找失败时返回结构化 context，包含
+`locator`、`matchCount`、`nth`、有数量上限的 `candidates` 和不含输入值的 `activeElement`
+摘要，焦点不可取得时返回 null，DOM 查询失败时还返回 `diagnosticError` 选区相关错误另含编辑器与选区状态，password
 input 的 value 不进入失败诊断，失败响应也会脱敏 input 事件传入的 `find` 和替换 `text`，`select` 和 `replace` 的事件级
 `nth` 表示文本第 N 次出现，嵌套的 `target.nth` 表示第 N 个目标元素，两者都从 0 开始并可同时使用，CDP 模式的 locator
 target 不依赖 Extension refId，
@@ -321,6 +386,10 @@ target 不依赖 Extension refId，
 | `state`      | 获取页面状态（URL、标题、可交互元素）  |
 | `metadata`   | 提取页面元信息（标题、OG、JSON-LD 等） |
 
+文本提取对整页和所选 HTML 元素使用浏览器的 `innerText`，已渲染区域不包含后代 `style`/`script`
+源码或隐藏后代文本；显式选择不可渲染的 HTML 元素时遵循浏览器 `innerText` 规则，SVG/XML 节点使用
+`textContent`，源码请使用 `html`
+
 参数：`output` 将结果保存到文件（`images=data` 时为输出目录），`images`（`info`/`data`）提取 HTML 中的图片元信息或数据，
 `frameHtml` 在 `frame` 路由后提取当前 iframe 文档，截图支持 `clip` 坐标区域、`compareWith` PNG 基准对比和 `diffOutput`
 差异图输出，`diffOutput` 必须同时传 `compareWith`。指定 `target` 的截图未匹配、`nth`
@@ -329,11 +398,18 @@ target 不依赖 Extension refId，
 `capabilities`。截图在执行前限制单边 16,384 像素、总计 12,000,000 像素、预计 RGBA 内存 48 MiB 和编码数据 25
 MiB；基准 PNG 在读取前检查文件大小，对比在解码前限制单个 PNG 25
 MiB 和 12,000,000 像素，解压时按已校验尺寸限制输出，并要求 scanline 长度精确匹配；损坏或异常膨胀的 PNG 会被拒绝，较大截图应使用
-`clip` 或 `scale` 缩小。Extension hidden tab 截图返回 `HIDDEN_TAB_SCREENSHOT`，不会自动切前台，`state` 返回
-`interactiveElements`，Extension 和 CDP 模式下 `metadata` 都返回
-`frames`，如果其他 debugger 占用 precise 截图路径，可视区域 fallback 会返回 `degraded`、`fallback` 和
-`limitations`；fallback 不支持的参数返回结构化 `SCREENSHOT_FALLBACK_UNSUPPORTED`，`targetId`（或旧版
-`tabId`）在两种 backend 中指定页面，`frame` 仅在 Extension 模式中指定 iframe，
+`clip` 或 `scale` 缩小，截图与 diagnosticBundle 在 Extension 和 CDP 模式中都返回
+`hiddenTabScreenshot=false`，Extension 隐藏页截图返回 `HIDDEN_TAB_SCREENSHOT`，不自动激活，`state` 返回
+`interactiveElements`，Extension 和 CDP 模式下 `metadata` 都返回 `frames` 和实际文档 `url`，Extension 指定 `frame`
+时返回该 iframe 文档地址；CDP 无法取得的已声明帧字段保留为 `null`，包括 DOM
+selector 和所属元素 rect，帧树顺序与 ID 保持不变；元信息还返回页面当前的 `managed` 状态与 `metadata` 对象，其
+`createdBy`、`createdAt`、`lastUsedAt`、`taskHint` 和 `note` 与 `browse list`、`manage pageMetadata`
+一致，inline 与文件输出包含相同字段；`frame` 指定 iframe 文档时，备注仍属于该页面，`managed`
+表示 Extension 页面托管状态，CDP 返回 false，不限制已连接 CDP 的正常操作，备注只保存在当前 Server 进程，未知创建来源返回
+`unknown`，其他 Server 不继承这些备注，不能据此判断跨会话归属或取得权限；如果其他 debugger 占用 precise 截图路径，可视区域 fallback 会返回
+`degraded`、`fallback` 和 `limitations`；fallback 不支持的参数返回结构化
+`SCREENSHOT_FALLBACK_UNSUPPORTED`，`targetId`（或旧版 `tabId`）在两种 backend 中指定页面，`frame`
+仅在 Extension 模式中指定 iframe，
 
 **`attribute` 特殊前缀**：`computed:<属性名>` 返回 computed CSS 样式值（如 `computed:color`、`computed:font-size`），
 `computed:*` 返回全部计算样式（300+ 属性，建议配合 `output` 写文件），
@@ -368,7 +444,7 @@ CDP 模式的 `visible` 要求 DOM 矩形宽高非零，且 CSS 不隐藏元素�
 | -------------------- | ------------------------------------------------------- |
 | `script`             | JavaScript 代码，裸 `return` 语句自动包裹 IIFE          |
 | `scriptFile`         | 从本地文件读取脚本，与 `script` 二选一                  |
-| `args`               | 传递给脚本的参数，script 须为函数表达式                 |
+| `args`               | 函数参数，`[]` 调用零参函数；省略时按原脚本语义执行     |
 | `mode`               | `precise`（默认，debugger API）或 `stealth`（JS 注入）  |
 | `staleContextRetry`  | iframe stale context 策略，`never`（默认）或 `readOnly` |
 | `output`             | 将结果保存到文件                                        |
@@ -393,38 +469,80 @@ precise 执行默认不在 execution context 失效后重放脚本，只有脚�
 发出后发生 stale context 时返回
 `actionExecuted=true`、`actionStatus="unknown"`，因为脚本可能已经产生部分副作用，但无法取得最终结果，
 
+Extension precise 主 frame 的对象结果，显式指定 `output` 时字符预算为 16
+Mi（16777216），未指定时保留 1000000，自动保存仍受该上限约束。两条路径均保留深度 8、节点 2000 和不可序列化结果拒绝，字符预算按 UTF-16
+code units 计，不等于输出文件的 UTF-8 字节数；`tmp:`
+文件还受临时输出配额约束。超限返回当前上限，并保留脚本已完成、输出失败的状态，不重放脚本。
+
 ### manage - 页面与环境管理
 
-| Action         | 描述                                             |
-| -------------- | ------------------------------------------------ |
-| `newPage`      | 新建受控页面/Tab                                 |
-| `pageMetadata` | 读取或设置页面的 `taskHint`、`note`              |
-| `closePage`    | 关闭受控页面并返回 `affected.before/after`       |
-| `adoptPage`    | 将已有 Tab 标记为受控页，不切前台                |
-| `releasePage`  | 将受控页移出管理，不关闭页面                     |
-| `movePage`     | 将受控 Tab 移到指定窗口或 index                  |
-| `reorderPage`  | 调整受控 Tab 在当前窗口内的顺序                  |
-| `pinPage`      | 固定受控 Tab                                     |
-| `unpinPage`    | 取消固定受控 Tab                                 |
-| `activatePage` | 激活受控 Tab 并聚焦所在窗口                      |
-| `focusWindow`  | 聚焦显式指定的窗口                               |
-| `resizeWindow` | 调整显式指定窗口的尺寸或状态                     |
-| `newWindow`    | 新建受控窗口                                     |
-| `closeWindow`  | 仅当窗口内全是 managed tab 时关闭窗口            |
-| `clearCache`   | 清除缓存/存储（清除 Cookie 请用 `cookies` 工具） |
-| `viewport`     | 设置视口大小                                     |
-| `userAgent`    | 设置 User-Agent                                  |
-| `emulate`      | 设备模拟（iPhone、iPad 等）                      |
-| `inputMode`    | 查询或设置输入模式（`precise` / `stealth`）      |
-| `stealth`      | 注入反检测脚本                                   |
-| `cdp`          | 发送原始 CDP 命令（高级，如 `Runtime.evaluate`） |
+| Action             | 描述                                             |
+| ------------------ | ------------------------------------------------ |
+| `newPage`          | 新建受控页面/Tab                                 |
+| `pageMetadata`     | 读取或设置页面的 `taskHint`、`note`              |
+| `closePage`        | 关闭受控页面并返回 `affected.before/after`       |
+| `adoptPage`        | 授予已有 Tab 完整受控能力，不改变前台            |
+| `releasePage`      | 将受控页移出管理，不关闭页面                     |
+| `grantReadAccess`  | 为当前调用实例授予显式页面的普通只读权限         |
+| `revokeReadAccess` | 撤销当前调用实例的普通只读授权                   |
+| `updatePage`       | 更新原生 tab 属性并返回实际状态                  |
+| `movePage`         | 将受控 Tab 移到指定窗口或 index                  |
+| `reorderPage`      | 调整受控 Tab 在当前窗口内的顺序                  |
+| `pinPage`          | 固定受控 Tab                                     |
+| `unpinPage`        | 取消固定受控 Tab                                 |
+| `activatePage`     | 激活受控 Tab 并聚焦所在窗口                      |
+| `focusWindow`      | 聚焦显式指定的窗口                               |
+| `resizeWindow`     | 调整显式指定窗口的尺寸或状态                     |
+| `newWindow`        | 新建受控窗口                                     |
+| `closeWindow`      | 仅当窗口内全是 managed tab 时关闭窗口            |
+| `updateWindow`     | 更新原生窗口位置、状态、焦点或提醒               |
+| `groupPages`       | 创建分组或将受控页加入已有分组                   |
+| `ungroupPages`     | 解除分组归属，保留受控权限                       |
+| `updateGroup`      | 更新分组名称、颜色和折叠状态                     |
+| `moveGroup`        | 将分组及其成员移动到指定窗口或位置               |
+| `clearCache`       | 清除缓存/存储（清除 Cookie 请用 `cookies` 工具） |
+| `viewport`         | 设置视口大小                                     |
+| `userAgent`        | 设置 User-Agent                                  |
+| `emulate`          | 设备模拟（iPhone、iPad 等）                      |
+| `inputMode`        | 查询或设置输入模式（`precise` / `stealth`）      |
+| `stealth`          | 注入反检测脚本                                   |
+| `cdp`              | 发送原始 CDP 命令（高级，如 `Runtime.evaluate`） |
 
-Tab/window 管理动作仅支持 Extension 模式，改变浏览器可见状态的动作必须显式传 `targetId` 或 `windowId`，并返回
-`affected.before/after`。Extension 模式不支持 `clearCache`，会返回 `UNSUPPORTED_MODE` 且不清除任何内容；清 Cookie 请用带
+原生 tab/window/group 配置仅支持 Extension 模式，操作已有对象时用 `targetId`、`targetIds`、`windowId` 或 `groupId`
+明确指定目标，返回 `affected.before/after`，分组结果还返回 `tabsBefore/tabsAfter`，`ungroupPages`
+由 Chrome 删除空组，不撤销成员的受控权限分组名称、颜色、折叠更新和整组移动要求所有成员受控，窗口更新、调整和聚焦要求窗口内所有 tab 受控，缓存的 MCP
+window ID 不改变此规则 Extension 模式不支持 `clearCache`，会返回 `UNSUPPORTED_MODE` 且不清除任何内容；清 Cookie 请用带
 `url` 或 `domain` 过滤的 `cookies(action="clear")`，清 storage 或 cache 请改用 CDP 模式。`focusWindow`
 只有在观测到目标窗口已聚焦后才返回成功，否则返回 `WINDOW_FOCUS_NOT_OBSERVED`，`closeWindow`
 遇到混有非托管 tab 的窗口会返回 `WINDOW_HAS_UNMANAGED_TABS`。持久的 `adoptPage`、`releasePage`
 目标变更与指定 tab 的操作串行执行，并发多事件 input 会始终留在指定 tab，持久目标变更会在该操作结束后生效
+
+| 动作                            | 原生参数                                                                                                                              | 行为                                                                                                   |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `newPage`                       | `url`、`windowId`、`index`、`active`、`pinned`、`openerTabId`、`groupId`、`timeout`                                                   | `active` 默认 false，`groupId=-1` 不分组，显式位置不受默认显示分组改变                                 |
+| `updatePage`                    | `url`、`active`、`pinned`、`highlighted`、`muted`、`autoDiscardable`、`openerTabId`                                                   | 必须传 `targetId`，只支持 `active=true` 且不聚焦窗口，`active=false` 在任何更新前拒绝                  |
+| `groupPages`                    | `targetIds`、`groupId`、`windowId`、`title`、`color`、`collapsed`                                                                     | 省略 `groupId` 时在成员原窗口创建分组，跨窗口成员须指定 `windowId`，加入已有组仅传 `targetIds/groupId` |
+| `ungroupPages`                  | `targetIds`                                                                                                                           | 解除分组，保留受控能力                                                                                 |
+| `updateGroup`                   | `groupId`、`title`、`color`、`collapsed`                                                                                              | 空名称及 false 折叠值按原值设置                                                                        |
+| `moveGroup`                     | `groupId`、`windowId`、`index`                                                                                                        | 移动全部成员，`index=-1` 表示窗口末尾                                                                  |
+| `newWindow`                     | `url` 或 `urls`、`targetId`、`windowType`、`focused`、`incognito`、`left`、`top`、`width`、`height`、`windowState`、`setSelfAsOpener` | normal 支持多 URL 及同时移入已有受控页，popup 只接受一个页面，所有新建页受控且分别记录创建来源         |
+| `updateWindow` / `resizeWindow` | `windowId`、`left`、`top`、`width`、`height`、`windowState`、`focused`、`drawAttention`                                               | 应用 Chrome 支持的窗口配置并返回观测状态                                                               |
+
+`updateWindow` 与 `resizeWindow` 修改状态或几何后等待浏览器观测稳定，非 normal 窗口同时请求 `windowState="normal"`
+和 bounds 时，状态转换完成后才应用一次几何参数，OS 调整后的几何按实际值返回有界等待内仍未观测到稳定状态时，`WINDOW_UPDATE_NOT_OBSERVED`
+返回部分执行状态及最后观测的窗口信息，再次更新前用 `browse list` 检查实际状态
+
+`browse list` 默认 `details="summary"`，返回页面标识、URL/标题、位置、managed/revision 和元数据传 `details="full"`
+获取选中、静音、自动丢弃、来源 tab ID 和可用原生只读属性，false 值保留 `targetIds` 与 `managedOnly=true`
+筛选页面及所属窗口、分组；`totalTargetCount`、`totalWindowCount` 和 `totalTabCount` 区分总量与选中数量窗口通过
+`targetIds` 引用页面，不重复完整对象；favicon data URL 不内联，完整结果用 `favIconInline=true`
+标明存在分组保留名称、颜色、折叠/共享、窗口、首个成员位置和成员 ID，颜色只属于分组，只读属性只回显，不作为写入参数列表操作不读取页面正文，不导航或改变焦点
+
+页面和分组移动接受
+`index=-1`，新建页的 index 非负，来源 tab 与显式分组、窗口必须位于同一窗口，固定页不能在分组中创建窗口状态与位置/尺寸的冲突、动作不支持的字段在修改前拒绝，CDP 明确拒绝不支持的 Chrome
+UI 配置，不静默忽略 `newWindow` 的 `url` 与 `urls` 是两种互斥输入方式，在 normal 窗口中可与 `targetId`
+同时使用 popup 只接受单个 URL 或一个已有页面，不能同时创建额外 URL 页面，明确的创建前拒绝保留
+`actionExecuted=false`、`actionStatus="not_started"`、`failureStage="preflight"`，更新在执行前拒绝时保留原 revision，原生更新已派发后的失败仍使 revision 失效
 
 `emulate` 在两个 backend 中设置设备视口、像素密度、触摸能力和 User-Agent，`viewport`
 恢复桌面视口与页面缩放并关闭触摸模拟，User-Agent 通过 `userAgent` 单独恢复
@@ -454,6 +572,11 @@ query 中常见的认证、签名、密码和 token 参数会在内联响应、d
 `redactedQueryParameters`，内联 network 结果会把脱敏后的单条 URL 限制为 2048 字符，截断时返回 `urlLength` 和
 `urlTruncated: true`，`urlPattern` 支持 `*` 匹配任意长度字符、`?` 匹配单个字符，`tabId`
 指定目标 Tab（Extension 模式），`frame` 不适用于日志，
+
+Extension debugger 不可用时，network 每次读取都会刷新 performance 记录并标记
+`source="performance"`；状态使用浏览器提供的 `responseStatus`，无法取得时为
+`0`，未知请求方法保留空值，重复读取保留记录序列号；`clear`
+清除 MCP 记录并推进当前文档的读取边界，不清除网页共享的 performance 数据，新文档重新建立边界，读取失败返回错误，不冒充空日志
 
 ### cookies - Cookie 管理
 
@@ -584,6 +707,16 @@ MiB；启动时只清理超过 24 小时且所属进程已退出的带归属标�
 清理条件，`cwd:` 响应不带此字段。重启后仍需通过 MCP 访问的文件使用
 `cwd:`。输出路径拒绝 Windows 保留设备名、ADS、非法字符以及末尾空格或点号；Windows 上写入敏感内容前须验证私有 DACL。
 
+路径语法错误返回 `INVALID_ARGUMENT`，允许 `.` 组件，继续拒绝 `..` 组件根目录外的路径及链接越界返回
+`PATH_NOT_ALLOWED`，两类错误均在 `error.context.cwd` 返回 server 的实际工作目录，范围拒绝另返回 `allowedRoots` 使用
+`cwd:` 指定相对于该目录的路径，或使用 `tmp:` 保存会话输出，`scriptFile` 与 `compareWith` 遵循相同校验
+
+配额拒绝返回 `TEMP_OUTPUT_QUOTA_EXCEEDED`，`error.context` 包含 `limits`、`usage`、`remaining`、`requested` 和
+`projected`。 `usage.complete=false` 时，占用只为已观察下界，`remaining`/`projected`
+为 null；已有输出保留。evaluate 的输出失败保留
+`actionExecuted=true`、`actionStatus=completed`、`failureStage=output`、`retryable=false`，不重放脚本。后续输出可使用
+`cwd:` 指定仓库内路径。
+
 ### 页面元信息
 
 ```
@@ -610,7 +743,16 @@ input(events=[
 
 CSS 选择器和数字索引按父文档的 DOM
 iframe 顺序定位，DOM 中不存在的子 frame（包括其他 Extension 加入的 frame）不会改变索引，也不会成为候选目标，所选元素无法对应到唯一 Chrome
-frame 时返回 `FRAME_IDENTITY_UNAVAILABLE`，不会选择其他frame
+frame 时返回 `FRAME_IDENTITY_UNAVAILABLE`，不会选择其他 frame；precise
+evaluate 按含 query 和 fragment 的完整 URL 定位，并按所选 DOM iframe 区分 URL 相同的 frame，包括
+`about:srcdoc`，无法确认身份时拒绝执行
+
+frame 定位失败分别返回 `INVALID_FRAME_SELECTOR`、`FRAME_NOT_IFRAME` 或 `FRAME_NOT_FOUND`，读取注入区分
+`INVALID_SELECTOR`、`FRAME_STALE_CONTEXT`、`FRAME_INJECTION_DENIED`、`FRAME_SCRIPT_FAILED`、 `FRAME_INJECTION_FAILED` 和
+`FRAME_SCRIPT_NO_RESULT`，并报告注入或脚本结果阶段，无结果不等于 selector 非法，空文本、空元素数组、null 属性值和 void 脚本调用保持原语义，错误不会重放脚本；成功定位后的读取失败在
+`pageContext.frameContext` 保留 DOM 索引、Chrome frame ID 和可取得的文档身份；frame
+URL 诊断去掉认证、query 和 fragment，长度限制为 500 字符，`data:` 与 `javascript:` 只返回协议；无法解析的 URL 返回
+`url=null` 和 `urlStatus="unavailable"`
 
 ### 等待元素
 
@@ -746,15 +888,24 @@ input 和 evaluate 返回值追加 `actionExecuted`、`actionStatus`、`verifica
 `actionExecuted=false`、`actionStatus="not_started"`。diagnostics 是附加能力，失败时返回
 `diagnosticsStatus`，不会覆盖主动作结果。browse 和 wait 的主动作失败时，也会保留失败前已收集的 diagnostics。目标诊断会读取当前 tab 的实时状态，不依赖 attach 时缓存的 URL 和标题。
 
+原生脚本终止，以及 CDP `Runtime` 脚本命令返回 `Internal error` 时，evaluate 和 `manage cdp` 保留原错误码，返回
+`actionExecuted=true`、`actionStatus="unknown"`、`retryable=false`，不重放命令；evaluate 的执行中 RPC 超时或过期 execution
+context 导致结果未知时也不可直接重试；执行开始前的超时仍可重试；页面主动抛出的同名异常仍按动作失败处理
+
+Extension 的 accessibility state 不读取 password
+value 生成元素名称，标签、placeholder、title 和普通输入值保留；显式脚本、HTML 和属性读取保持原有行为
+
 `replace` 仅对 `textarea` 以及 `text`、`search`、`tel`、`url`、`password`
 类型的 input 使用文本选区。其他 input 类型通过原生完整 value 更新，并返回请求值与浏览器规范化后的实际值。对不支持选区的类型单独执行
 `select` 会返回 `UNSUPPORTED_SELECTION`。CDP模式下，`select` 和 `replace` 的 locator target 通过 CDP
 locator 聚焦，不调用 Extension refId。password value 不进入 input 失败 context 和 text
-post-condition 观测值，失败响应还会脱敏传入的 `find` 和替换
-`text`。目标超时返回限量的locator、tab、frame、匹配数和候选上下文。显式 `tabId` 或 `frame`
+post-condition 观测值，失败响应还会脱敏传入的 `find` 和替换 `text`。password 的 `select`/`replace`
+成功和失败响应均隐藏 console 与 network 诊断正文，返回 `diagnostics.redacted=true` 和
+`reason="sensitive_input_or_unresolved_target"`；无法安全确认选择目标时也隐藏这些正文普通输入保留诊断，密码保护仅持续到当前 input 请求结束目标超时返回限量的locator、tab、frame、匹配数和候选上下文。显式
+`tabId` 或 `frame`
 作用域会在 input、wait、logs、extract 开始前确定活动 backend，动作和验证使用同一个目标 backend。precise iframe
 evaluate 默认使用 `staleContextRetry="never"`，context 失效时不重放脚本； `readOnly` 允许 Extension 校验 frame
 identity 并解析新 execution context 后重放一次。响应包含策略、`retryAttempted`、限量的 `retryReason`，以及最终 Extension
-frame、parent frame、URL、CDP frame 和 execution context ID 组成的
-`frameContext`，重复 URL 导致 frame 不唯一时拒绝选择任一 frame。端口扫描会把普通的 WebSocket
-open 前失败聚合为 debug；已识别 MCP server 的认证或协议拒绝只在摘要变化时输出一条限量 warning。
+frame、parent frame、URL、CDP frame 和 execution context ID 组成的 `frameContext`，URL 相同的 frame 仅在所选 DOM
+iframe 无法唯一确认目标时拒绝执行；Extension 重载后可继续访问原页面中的 iframe，无需刷新或重新导航端口扫描会把普通的 WebSocket
+open 前失败聚合为 debug；已识别 MCP server 的认证或协议拒绝只在摘要变化时输出一条限量 warning

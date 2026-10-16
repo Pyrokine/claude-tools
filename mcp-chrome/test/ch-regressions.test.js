@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import vm from 'node:vm';
+import { getSession, getUnifiedSession } from '../dist/core/index.js';
 
 import {
     focusCdpTarget,
@@ -46,6 +48,216 @@ import {
     resolveTurnstileOsClickPoint,
     windowNameMatchesPageTitle,
 } from '../dist/core/os-mouse.js';
+
+test('CH-08 ordinary verification buttons use page input while Cloudflare frames retain native input', () => {
+    for (const scenario of [
+        { text: 'Verify you are human', source: 'page' },
+        { text: '请验证您是真人', source: 'page' },
+        { text: 'Continue', source: 'iframe' },
+        { text: 'Verify you are human', hidden: true, source: 'iframe' },
+        { text: 'Verify you are human', frame: true, source: 'iframe' },
+    ]) {
+        const root = {};
+        const element = (tagName, textContent = '', hidden = false) => ({
+            tagName,
+            textContent,
+            hidden,
+            parentElement: root,
+            getBoundingClientRect: () => ({ left: 100, top: 100, width: 300, height: 65 }),
+            scrollIntoView() {},
+            closest: () => null,
+            getAttribute: () => null,
+        });
+        const wrapper = element('DIV');
+        const button = element('BUTTON', scenario.text, scenario.hidden);
+        const frame = {
+            ...element('IFRAME'),
+            getAttribute: () => 'https://challenges.cloudflare.com/test',
+            getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }),
+        };
+        const document = {
+            title: 'Just a moment...',
+            body: { innerText: '正在进行安全验证' },
+            documentElement: root,
+            querySelector: (selector) =>
+                selector === 'input[name="cf-turnstile-response"]' ? { parentElement: wrapper } : null,
+            querySelectorAll: (selector) => {
+                if (selector === 'button') return [element('BUTTON', 'Settings'), button];
+                if (selector === 'iframe' || selector.includes('iframe[src')) return scenario.frame ? [frame] : [];
+                if (selector === '#cf-please-wait') return [element('DIV')];
+                if (selector === '.cf-turnstile' || selector === 'div') return [wrapper];
+                return [];
+            },
+        };
+        const window = {
+            getComputedStyle: (node) => ({
+                display: node.hidden ? 'none' : 'block',
+                visibility: 'visible',
+                opacity: '1',
+            }),
+        };
+        const result = vm.runInNewContext(CHALLENGE_INSPECT_SCRIPT, {
+            document,
+            window,
+            location: { href: 'https://example.com/challenge' },
+        });
+        assert.equal(result.clickSource, scenario.source, JSON.stringify(scenario));
+        assert.equal(result.clickTargetKind, scenario.source === 'page' || scenario.frame ? 'verify' : 'widget');
+    }
+});
+
+test('C24 CDP inspection does not infer a widget from an unrelated div beside a zero-size iframe', () => {
+    let scrolls = 0;
+    const unrelated = {
+        tagName: 'DIV',
+        getBoundingClientRect: () => ({ left: 107, top: 267, width: 318, height: 58 }),
+        scrollIntoView() {
+            ++scrolls;
+        },
+        closest: () => null,
+    };
+    const frame = {
+        tagName: 'IFRAME',
+        getAttribute: () => 'https://challenges.cloudflare.com/turnstile/test',
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }),
+    };
+    const result = vm.runInNewContext(CHALLENGE_INSPECT_SCRIPT, {
+        document: {
+            title: 'Just a moment...',
+            body: { innerText: 'Editable content here for select/replace' },
+            querySelector: () => null,
+            querySelectorAll: (selector) =>
+                selector === 'div' ? [unrelated] : selector.includes('iframe') ? [frame] : [],
+        },
+        window: { getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }) },
+        location: { href: 'https://example.com/challenge' },
+    });
+    assert.equal(result.turnstilePresent, true);
+    assert.equal(result.clickPoint, null);
+    assert.equal(result.clickTargetKind, null);
+    assert.equal(scrolls, 0);
+});
+
+test('C24 Linux native coordinates use client-window geometry and asymmetric GTK shadows', async () => {
+    const viewport = {
+        screenX: -999,
+        screenY: -999,
+        innerWidth: 996,
+        innerHeight: 592,
+        outerWidth: 1040,
+        outerHeight: 780,
+        devicePixelRatio: 1,
+    };
+    const calls = [];
+    const point = await resolveTurnstileOsClickPoint(
+        { clickPoint: { x: 41, y: 109 }, viewport, clickSource: 'iframe', title: 'Just a moment...' },
+        {
+            platform: 'linux',
+            execFile: async (file, args) => {
+                calls.push({ file, args: [...args] });
+                if (args[0] === 'getactivewindow') return { stdout: '8388612\n', stderr: '' };
+                if (args[0] === 'getwindowname') return { stdout: 'Just a moment... - Google Chrome\n', stderr: '' };
+                if (args[0] === 'getwindowgeometry')
+                    return { stdout: 'X=90\nY=70\nWIDTH=1040\nHEIGHT=780\n', stderr: '' };
+                assert.equal(file, 'xprop');
+                assert.deepEqual([...args], ['-id', '8388612', '_GTK_FRAME_EXTENTS']);
+                return { stdout: '_GTK_FRAME_EXTENTS(CARDINAL) = 22, 22, 19, 25\n', stderr: '' };
+            },
+        }
+    );
+    assert.deepEqual(point, { x: 153, y: 342 });
+    assert.equal(calls.filter((call) => call.file === 'xprop').length, 1);
+});
+
+test('C24 X11 coordinates preserve scaling and reject unverified geometry or frame properties', async (t) => {
+    for (const specimen of [
+        {
+            name: 'scaled-gtk',
+            scale: 2,
+            width: 2080,
+            height: 1560,
+            extents: '_GTK_FRAME_EXTENTS(CARDINAL) = 44, 44, 38, 50\n',
+            point: { x: 216, y: 614 },
+        },
+        {
+            name: 'no-client-shadow',
+            width: 996,
+            height: 700,
+            extents: '_GTK_FRAME_EXTENTS:  not found.\n',
+            point: { x: 131, y: 287 },
+        },
+        {
+            name: 'no-client-shadow-new-atom',
+            width: 996,
+            height: 700,
+            extents: '_GTK_FRAME_EXTENTS:  no such atom on any window.\n',
+            point: { x: 131, y: 287 },
+        },
+        {
+            name: 'missing-shadow-mismatched-width',
+            width: 1040,
+            height: 780,
+            extents: '_GTK_FRAME_EXTENTS:  not found.\n',
+        },
+        { name: 'invalid-properties', width: 1040, height: 780, extents: '_GTK_FRAME_EXTENTS(CARDINAL) = unknown\n' },
+        {
+            name: 'negative-properties',
+            width: 1040,
+            height: 780,
+            extents: '_GTK_FRAME_EXTENTS(CARDINAL) = -22, 22, 19, 25\n',
+        },
+        { name: 'short-window', width: 1040, height: 500, extents: '_GTK_FRAME_EXTENTS(CARDINAL) = 22, 22, 19, 25\n' },
+        { name: 'missing-dimensions', width: undefined, height: undefined },
+        { name: 'missing-xprop', width: 1040, height: 780, missingTool: true },
+    ]) {
+        await t.test(specimen.name, async () => {
+            const viewport = {
+                screenX: -999,
+                screenY: -999,
+                innerWidth: 996,
+                innerHeight: 592,
+                outerWidth: 1040,
+                outerHeight: 780,
+                devicePixelRatio: specimen.scale ?? 1,
+            };
+            const operation = () =>
+                resolveTurnstileOsClickPoint(
+                    { clickPoint: { x: 41, y: 109 }, viewport, clickSource: 'iframe', title: 'Just a moment...' },
+                    {
+                        platform: 'linux',
+                        execFile: async (file, args) => {
+                            if (file === 'xprop') {
+                                if (specimen.missingTool) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+                                return { stdout: specimen.extents, stderr: '' };
+                            }
+                            assert.equal(file, 'xdotool');
+                            if (args[0] === 'getactivewindow') return { stdout: '8388612\n', stderr: '' };
+                            if (args[0] === 'getwindowname')
+                                return { stdout: 'Just a moment... - Google Chrome\n', stderr: '' };
+                            assert.deepEqual([...args], ['getwindowgeometry', '--shell', '8388612']);
+                            return {
+                                stdout: `X=90\nY=70\nWIDTH=${specimen.width}\nHEIGHT=${specimen.height}\n`,
+                                stderr: '',
+                            };
+                        },
+                    }
+                );
+            if (specimen.point) {
+                assert.deepEqual(await operation(), specimen.point);
+            } else {
+                await assert.rejects(operation, (error) => {
+                    assert.ok(error instanceof OsMouseError);
+                    assert.equal(
+                        error.code,
+                        specimen.missingTool ? 'OS_MOUSE_UNAVAILABLE' : 'TURNSTILE_OS_CLICK_UNAVAILABLE'
+                    );
+                    if (specimen.missingTool) assert.match(error.message, /xprop/);
+                    return true;
+                });
+            }
+        });
+    }
+});
 
 test('CDP event waits ignore events from other flat sessions', async () => {
     const client = new CDPClient();
@@ -103,6 +315,226 @@ test('CH-01 redacts input find and replacement sentinels from nested failure dat
     assert.equal(serialized.includes(findSentinel), false);
     assert.equal(serialized.includes(replacementSentinel), false);
     assert.match(serialized, /\[REDACTED\]/);
+});
+
+test('CH-01 registered input protects password diagnostics in both backends without hiding ordinary input', async (t) => {
+    for (const mode of ['extension', 'cdp']) {
+        for (const inputType of ['password', 'text']) {
+            for (const type of ['select', 'replace']) {
+                for (const fails of [false, true]) {
+                    await t.test(`${mode} ${inputType} ${type} ${fails ? 'failure' : 'success'}`, async () => {
+                        const find = fails ? 'missing-find-sentinel' : 'find-sentinel';
+                        const replacement = 'replacement-sentinel';
+                        const originalValue = 'password-value-sentinel find-sentinel find-sentinel';
+                        const logs = [];
+                        const requests = [];
+                        const diagnosticsText = `password-value-sentinel|${find}|${replacement}`;
+                        class Input {
+                            constructor(value, id) {
+                                Object.assign(this, {
+                                    value,
+                                    id,
+                                    type: inputType,
+                                    tagName: 'INPUT',
+                                    selectionStart: 0,
+                                    selectionEnd: 0,
+                                });
+                            }
+
+                            focus() {
+                                document.activeElement = this;
+                                logs.push({ level: 'error', text: diagnosticsText, timestamp: logs.length });
+                                requests.push({
+                                    url: 'https://example.com/input',
+                                    status: 500,
+                                    errorText: diagnosticsText,
+                                    sequence: requests.length,
+                                });
+                            }
+
+                            setSelectionRange(start, end) {
+                                this.selectionStart = start;
+                                this.selectionEnd = end;
+                            }
+
+                            setRangeText(text, start, end) {
+                                this.value = this.value.slice(0, start) + text + this.value.slice(end);
+                                this.selectionStart = this.selectionEnd = start + text.length;
+                            }
+
+                            dispatchEvent() {
+                                return true;
+                            }
+
+                            getBoundingClientRect() {
+                                return { x: 10, y: 20, width: 100, height: 25 };
+                            }
+
+                            querySelectorAll() {
+                                return [];
+                            }
+                        }
+                        const control = new Input('control-unchanged', 'control');
+                        const subject = new Input(originalValue, 'subject');
+                        const document = {
+                            activeElement: control,
+                            body: subject,
+                            querySelectorAll: () => [control, subject],
+                        };
+                        const globals = {
+                            document,
+                            HTMLInputElement: Input,
+                            Element: Input,
+                            Event: globalThis.Event,
+                            CSS: { escape: (value) => value },
+                            window: { getSelection: () => null },
+                        };
+                        const unified = getUnifiedSession();
+                        const session = getSession();
+                        const overrides = {
+                            getMode: () => mode,
+                            getCurrentTargetId: () => '101',
+                            getTargetRestoration: () => undefined,
+                            getPageSnapshot: async (targetId) => ({
+                                targetId,
+                                url: 'https://example.com/input',
+                                revision: 'r1',
+                            }),
+                            listTargets: async () => [{ targetId: '101' }],
+                            listTopology: async () => ({ activeTargetId: '101' }),
+                            withTabLock: async (action) => action(),
+                            withTabId: async (_id, action) => action(),
+                            withPageCondition: async (_args, action) => action(),
+                            withFrame: async (_frame, action) => action(),
+                            enableConsole: async () => {},
+                            enableNetwork: async () => {},
+                            getConsoleLogs: async () => [...logs],
+                            getNetworkRequests: async () => [...requests],
+                            find: async () => [{ refId: 'control' }, { refId: 'subject' }],
+                            actionableClick: async (refId) => {
+                                (refId === 'subject' ? subject : control).focus();
+                                return { success: true };
+                            },
+                            evaluate: async (script, _mode, _timeout, args) => {
+                                const result = vm.runInNewContext(`(${script})`, globals);
+                                const value =
+                                    typeof result === 'function' ? await result(...(args ?? [])) : await result;
+                                if (
+                                    inputType === 'password' &&
+                                    value &&
+                                    value.inputType === 'password' &&
+                                    value.tag === 'input'
+                                ) {
+                                    assert.equal(
+                                        value.value,
+                                        undefined,
+                                        'password capability probe must not return its value'
+                                    );
+                                }
+                                return value;
+                            },
+                        };
+                        const original = new Map(
+                            Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(unified, key)])
+                        );
+                        const originalLocator = Object.getOwnPropertyDescriptor(session, 'createLocator');
+                        Object.assign(unified, overrides);
+                        session.createLocator = () => ({
+                            evaluateOn: async () => {
+                                subject.focus();
+                                return true;
+                            },
+                        });
+                        try {
+                            let handler;
+                            registerInputTool({
+                                registerTool(_name, _options, callback) {
+                                    handler = callback;
+                                },
+                            });
+                            const response = await handler({
+                                targetId: '101',
+                                expectedUrl: 'https://example.com/input',
+                                diagnostics: true,
+                                events: [
+                                    {
+                                        type,
+                                        target: { css: '.fixture-input', nth: 1 },
+                                        find,
+                                        text: replacement,
+                                        nth: 1,
+                                    },
+                                ],
+                                postCondition: { script: 'true' },
+                                timeout: 2000,
+                            });
+                            const payload = JSON.parse(response.content[0].text);
+                            assert.equal(Boolean(response.isError), fails);
+                            assert.equal(payload.actionStatus, fails ? 'failed' : 'completed');
+                            assert.equal(payload.diagnosticsStatus, 'collected');
+                            assert.equal(payload.pageContext.targetId, '101');
+                            if (inputType === 'password') {
+                                assert.equal(payload.diagnostics.redacted, true);
+                                for (const secret of ['password-value-sentinel', find, replacement]) {
+                                    assert.equal(response.content[0].text.includes(secret), false);
+                                }
+                            } else {
+                                assert.equal(
+                                    payload.diagnostics.console[0].text.includes('password-value-sentinel'),
+                                    true
+                                );
+                                assert.equal(
+                                    payload.diagnostics.failedRequests[0].errorText.includes('password-value-sentinel'),
+                                    true
+                                );
+                            }
+                            if (fails) {
+                                assert.equal(payload.error.code, 'TEXT_NOT_FOUND');
+                                assert.equal(subject.value, originalValue);
+                            } else {
+                                assert.equal(payload.verificationStatus, 'matched');
+                                assert.equal(payload.postCondition.checks[0].actual, true);
+                                assert.equal(
+                                    subject.value,
+                                    type === 'replace'
+                                        ? 'password-value-sentinel find-sentinel replacement-sentinel'
+                                        : originalValue
+                                );
+                            }
+                            assert.equal(control.value, 'control-unchanged');
+                            if (inputType === 'password') {
+                                subject.type = 'text';
+                                const ordinary = await handler({
+                                    targetId: '101',
+                                    expectedUrl: 'https://example.com/input',
+                                    diagnostics: true,
+                                    events: [
+                                        {
+                                            type: 'select',
+                                            target: { css: '.fixture-input', nth: 1 },
+                                            find: 'find-sentinel',
+                                        },
+                                    ],
+                                    timeout: 2000,
+                                });
+                                const ordinaryPayload = JSON.parse(ordinary.content[0].text);
+                                assert.equal(ordinaryPayload.success, true);
+                                assert.equal(ordinaryPayload.diagnostics.redacted, undefined);
+                                assert.equal(ordinaryPayload.diagnostics.console[0].text, diagnosticsText);
+                            }
+                        } finally {
+                            for (const [key, descriptor] of original) {
+                                if (descriptor) Object.defineProperty(unified, key, descriptor);
+                                else delete unified[key];
+                            }
+                            if (originalLocator) Object.defineProperty(session, 'createLocator', originalLocator);
+                            else delete session.createLocator;
+                        }
+                    });
+                }
+            }
+        }
+    }
 });
 
 test('input empty event arrays reach structured handler validation', async () => {
@@ -259,11 +691,13 @@ test('CH-03 evaluate distinguishes pre-action and in-flight timeout', () => {
         actionStatus: 'failed',
         retryable: true,
     });
-    assert.deepEqual(classifyEvaluateActionError(new Error('Request timeout after 100ms')), {
-        actionExecuted: true,
-        actionStatus: 'unknown',
-        retryable: true,
-    });
+    for (const message of ['Request timeout after 100ms', 'Request timeout for action: debugger_send (998ms)']) {
+        assert.deepEqual(classifyEvaluateActionError(new Error(message)), {
+            actionExecuted: true,
+            actionStatus: 'unknown',
+            retryable: false,
+        });
+    }
     assert.deepEqual(classifyEvaluateActionError(new Error('ReferenceError: missing is not defined')), {
         actionExecuted: true,
         actionStatus: 'failed',
@@ -276,7 +710,7 @@ test('CH-03 evaluate distinguishes pre-action and in-flight timeout', () => {
         {
             actionExecuted: true,
             actionStatus: 'unknown',
-            retryable: true,
+            retryable: false,
         }
     );
     assert.deepEqual(classifyEvaluateActionError(new Error('Error: boom\n    at <anonymous>:1:7')), {
@@ -284,6 +718,60 @@ test('CH-03 evaluate distinguishes pre-action and in-flight timeout', () => {
         actionStatus: 'failed',
         retryable: false,
     });
+});
+
+test('C21 evaluate distinguishes native execution termination from page exceptions', () => {
+    for (const message of ['Execution was terminated', '{"code":-32000,"message":"Execution was terminated"}']) {
+        assert.deepEqual(classifyEvaluateActionError(new Error(message)), {
+            actionExecuted: true,
+            actionStatus: 'unknown',
+            retryable: false,
+        });
+    }
+    for (const message of [
+        'Error: Execution was terminated\n    at <anonymous>:1:1',
+        'Evaluation failed: Execution was terminated',
+    ]) {
+        assert.deepEqual(classifyEvaluateActionError(new Error(message)), {
+            actionExecuted: true,
+            actionStatus: 'failed',
+            retryable: false,
+        });
+    }
+    assert.deepEqual(classifyEvaluateActionError(new Error('{"code":-32602,"message":"Execution was terminated"}')), {
+        actionExecuted: false,
+        actionStatus: 'failed',
+        retryable: false,
+    });
+});
+
+test('C21 CDPClient script errors retain unknown execution state', () => {
+    for (const method of ['Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.runScript', 'Page.enable']) {
+        for (const message of ['Execution was terminated', 'Internal error', 'Invalid parameters']) {
+            const client = new CDPClient();
+            let error;
+            client.callbacks.set(1, {
+                method,
+                resolve: () => assert.fail('protocol error resolved'),
+                reject: (value) => {
+                    error = value;
+                },
+            });
+            const code = message === 'Internal error' ? -32603 : message === 'Invalid parameters' ? -32602 : -32000;
+            client.handleMessage(Buffer.from(JSON.stringify({ id: 1, error: { code, message } })));
+            const unknown = method !== 'Page.enable' && message !== 'Invalid parameters';
+            assert.deepEqual(
+                classifyEvaluateActionError(error),
+                {
+                    actionExecuted: unknown,
+                    actionStatus: unknown ? 'unknown' : 'failed',
+                    retryable: false,
+                },
+                `${method}: ${message}`
+            );
+            assert.equal(client.callbacks.size, 0);
+        }
+    }
 });
 
 test('CH-03 evaluate reports result materialization errors as output failures', () => {
@@ -455,10 +943,11 @@ test('CH-06 Extension only replays stale iframe contexts for read-only scripts',
 });
 
 test('CH-06 DOM iframe identity does not depend on webNavigation frame ordering', async () => {
-    const [resolverSource, actionUtilsSource, contentSource] = await Promise.all([
+    const [resolverSource, actionUtilsSource, contentSource, pageScriptsSource] = await Promise.all([
         readFile(new URL('../extension/src/background/frame-resolver.ts', import.meta.url), 'utf8'),
         readFile(new URL('../extension/src/background/action-utils.ts', import.meta.url), 'utf8'),
         readFile(new URL('../extension/src/content/content.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../extension/src/background/page-scripts.ts', import.meta.url), 'utf8'),
     ]);
 
     assert.match(resolverSource, /getDomFrameSnapshot\(tabId, 0, p\.frame, readable\.documentId, readable\.tab\.url\)/);
@@ -466,7 +955,11 @@ test('CH-06 DOM iframe identity does not depend on webNavigation frame ordering'
     assert.match(actionUtilsSource, /mcp-frame-probe/);
     assert.match(actionUtilsSource, /recordDomFrameProbe/);
     assert.match(actionUtilsSource, /candidateFrameIds\.length === 1/);
-    assert.match(contentSource, /MCP_FRAME_PROBE/);
+    assert.match(contentSource, /import \{ installFrameProbeListener \} from '\.\.\/background\/page-scripts'/);
+    assert.match(contentSource, /installFrameProbeListener\(\)/);
+    assert.match(actionUtilsSource, /documentIds: childDocumentIds/);
+    assert.match(actionUtilsSource, /func: installFrameProbeListener/);
+    assert.match(pageScriptsSource, /MCP_FRAME_PROBE/);
     assert.match(resolverSource, /不会按 webNavigation 列表顺序选择其他 frame/);
 });
 
@@ -1419,7 +1912,7 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     // noinspection LongLine — 正则需要验证四个相邻 enable 调用的完整顺序
     assert.match(
         sessionSource,
-        /this\.send\('Page.enable'\),\s*this\.send\('DOM.enable'\),\s*this\.send\('Network.enable'\),\s*this\.send\('Log.enable'\)/
+        /this\.send\('Page.enable', undefined, remaining\(\)\),\s*this\.send\('DOM.enable', undefined, remaining\(\)\),\s*this\.send\('Network.enable', undefined, remaining\(\)\),\s*this\.send\('Log.enable', undefined, remaining\(\)\)/
     );
     assert.doesNotMatch(
         sessionSource,
@@ -1515,7 +2008,16 @@ test('CH-08 OS mouse converts CSS points and clicks linux/darwin/win32 via execF
     };
     assert.deepEqual(cssClientToScreen({ x: 40, y: 80 }, viewport, 'linux'), { x: 140, y: 360 });
     assert.deepEqual(cssClientToScreen({ x: 40, y: 80 }, viewport, 'win32'), { x: 280, y: 720 });
-    assert.deepEqual(composeWindowClickPoint({ x: 40, y: 80 }, viewport, { x: 160, y: 120 }), { x: 240, y: 440 });
+    assert.deepEqual(
+        composeWindowClickPoint({ x: 40, y: 80 }, viewport, {
+            x: 160,
+            y: 120,
+            width: 2560,
+            height: 1600,
+            insets: null,
+        }),
+        { x: 240, y: 440 }
+    );
     const framed = {
         screenX: 80,
         screenY: 60,
@@ -1526,7 +2028,16 @@ test('CH-08 OS mouse converts CSS points and clicks linux/darwin/win32 via execF
         devicePixelRatio: 1,
     };
     assert.deepEqual(chromeInsets(framed), { left: 16, top: 187 });
-    assert.deepEqual(composeWindowClickPoint({ x: 200, y: 313 }, framed, { x: 80, y: 60 }), { x: 296, y: 560 });
+    assert.deepEqual(
+        composeWindowClickPoint({ x: 200, y: 313 }, framed, {
+            x: 80,
+            y: 60,
+            width: 1280,
+            height: 900,
+            insets: { left: 16, right: 16, bottom: 16 },
+        }),
+        { x: 296, y: 576 }
+    );
     assert.equal(windowNameMatchesPageTitle('请稍候… - Google Chrome', '请稍候…'), true);
     assert.equal(windowNameMatchesPageTitle('Gmail - Google Chrome', '请稍候…'), false);
     assert.equal(windowNameMatchesPageTitle('claude-tools – mcp-chrome/package.json', '请稍候…'), false);
@@ -1564,6 +2075,10 @@ test('CH-08 OS mouse converts CSS points and clicks linux/darwin/win32 via execF
         {
             platform: 'linux',
             execFile: async (file, args) => {
+                if (file === 'xprop') {
+                    assert.deepEqual([...args], ['-id', '123', '_GTK_FRAME_EXTENTS']);
+                    return { stdout: '_GTK_FRAME_EXTENTS:  not found.\n', stderr: '' };
+                }
                 assert.equal(file, 'xdotool');
                 if (args[0] === 'getactivewindow') {
                     return { stdout: '123\n', stderr: '' };
@@ -1573,7 +2088,7 @@ test('CH-08 OS mouse converts CSS points and clicks linux/darwin/win32 via execF
                     return { stdout: '请稍候… - Google Chrome\n', stderr: '' };
                 }
                 assert.deepEqual([...args], ['getwindowgeometry', '--shell', '123']);
-                return { stdout: 'X=160\nY=120\nWIDTH=1280\nHEIGHT=900\n', stderr: '' };
+                return { stdout: 'X=160\nY=120\nWIDTH=2560\nHEIGHT=1600\n', stderr: '' };
             },
         }
     );
@@ -1718,6 +2233,62 @@ test('CH-08 OS mouse converts CSS points and clicks linux/darwin/win32 via execF
             return true;
         }
     );
+});
+
+test('C-P6 OS mouse stops before a later process or fallback after deadline exhaustion', async () => {
+    const NativeDate = Date;
+    let now = 1000;
+    class ClockDate extends NativeDate {
+        static now() {
+            return now;
+        }
+    }
+    const originalDate = globalThis.Date;
+    globalThis.Date = ClockDate;
+    try {
+        const calls = [];
+        await assert.rejects(
+            () =>
+                osLeftClick(12, 34, {
+                    platform: 'linux',
+                    deadline: 1100,
+                    path: [
+                        { x: 10, y: 30 },
+                        { x: 12, y: 34 },
+                    ],
+                    execFile: async (_file, args, options) => {
+                        calls.push([...args]);
+                        assert.ok(options.timeout > 0);
+                        return { stdout: '', stderr: '' };
+                    },
+                    sleep: async () => {
+                        now = 1200;
+                    },
+                }),
+            (error) => error.code === 'TIMEOUT'
+        );
+        assert.deepEqual(calls, [['mousemove', '10', '30']]);
+        now = 1000;
+        const fallbackCalls = [];
+        await assert.rejects(
+            () =>
+                osLeftClick(12, 34, {
+                    platform: 'darwin',
+                    deadline: 1100,
+                    path: [{ x: 12, y: 34 }],
+                    warn() {},
+                    execFile: async (file) => {
+                        fallbackCalls.push(file);
+                        now = 1200;
+                        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+                    },
+                }),
+            (error) => error.code === 'TIMEOUT'
+        );
+        assert.deepEqual(fallbackCalls, ['cliclick']);
+    } finally {
+        globalThis.Date = originalDate;
+    }
 });
 
 test('CH-08 cookie clearing requires a URL or domain at every boundary', async () => {

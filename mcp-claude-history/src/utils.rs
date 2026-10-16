@@ -2,7 +2,9 @@ use crate::types::{ErrorResponse, ImageInfo, MessageRecord, Range, RedactionInfo
 use regex::{Regex, RegexBuilder};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+#[cfg(test)]
+use std::io::BufReader;
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -38,6 +40,10 @@ impl<R: BufRead> Iterator for BoundedJsonlLines<R> {
         let mut oversized = false;
         let mut read_any = false;
         loop {
+            if let Err(error) = crate::record_reader::check_work() {
+                self.finished = true;
+                return Some(Err(io::Error::other(error.message)));
+            }
             let available = match self.reader.fill_buf() {
                 Ok(available) => available,
                 Err(error) => {
@@ -66,6 +72,10 @@ impl<R: BufRead> Iterator for BoundedJsonlLines<R> {
             }
             let finished_line = available[consumed - 1] == b'\n';
             self.reader.consume(consumed);
+            if let Err(error) = crate::record_reader::account_work(consumed) {
+                self.finished = true;
+                return Some(Err(io::Error::other(error.message)));
+            }
             if finished_line {
                 break;
             }
@@ -524,6 +534,7 @@ pub fn tool_block_count(record: &MessageRecord) -> usize {
 }
 
 pub struct IndexedMessage {
+    pub span: crate::record_reader::SourceSpan,
     pub line_num: usize,
     pub effective_type: &'static str,
     pub subtype: &'static str,
@@ -537,6 +548,8 @@ pub enum SessionRange<'a> {
 }
 
 pub struct SessionIndex {
+    file: File,
+    snapshot: fs::Metadata,
     pub messages: Vec<IndexedMessage>,
     pub anchor_idx: usize,
     pub warnings: Vec<String>,
@@ -545,6 +558,7 @@ pub struct SessionIndex {
 
 pub struct WindowRecord {
     pub line_num: usize,
+    pub result_previews: std::collections::BTreeMap<usize, (String, usize)>,
     pub record: MessageRecord,
     pub effective_type: &'static str,
     pub subtype: &'static str,
@@ -561,7 +575,7 @@ pub fn index_session_messages(
     subtypes: &[String],
     range: SessionRange<'_>,
 ) -> Result<SessionIndex, ErrorResponse> {
-    let file = File::open(path).map_err(|e| ErrorResponse {
+    let file = crate::session_files::open_session_file(path).map_err(|e| ErrorResponse {
         error: "io_error".to_string(),
         message: format!("无法读取会话文件: {e}"),
         available: None,
@@ -589,11 +603,35 @@ pub fn index_session_messages(
     let mut start = 0;
     let mut end = 0;
     let mut after_matches = 0;
-    let mut read_errors = 0;
     let mut parse_errors = 0;
-    let mut oversized = 0;
-    for (line_idx, line) in bounded_jsonl_lines(BufReader::new(file)).enumerate() {
-        let line_num = line_idx + 1;
+    let snapshot = file
+        .metadata()
+        .map_err(|error| crate::record_reader::reader_error("io_error", error.to_string()))?;
+    let reader = crate::session_files::open_session_file(path)
+        .map_err(|error| crate::record_reader::reader_error("io_error", error.to_string()))?;
+    if !crate::session_files::matches_snapshot(
+        &snapshot,
+        &reader
+            .metadata()
+            .map_err(|error| crate::record_reader::reader_error("io_error", error.to_string()))?,
+    ) {
+        return Err(crate::record_reader::reader_error(
+            "source_changed",
+            "会话在建立窗口索引时发生变化",
+        ));
+    }
+    let mut lines = crate::record_reader::RecordLines::new(reader, snapshot.len());
+    loop {
+        let mut remaining = u64::MAX;
+        let located = match lines.step(
+            &mut remaining,
+            std::time::Instant::now() + std::time::Duration::from_secs(120),
+        )? {
+            crate::record_reader::LineStep::Record(record) => record,
+            crate::record_reader::LineStep::Yield => continue,
+            crate::record_reader::LineStep::End => break,
+        };
+        let line_num = located.line;
         if line_num > anchor_line && anchor_pos.is_none() {
             break;
         }
@@ -602,34 +640,65 @@ pub fn index_session_messages(
         {
             break;
         }
-        let line = match line {
-            Ok(BoundedLine::Record(line)) => line,
-            Ok(BoundedLine::TooLarge) => {
-                oversized += 1;
+        let (effective_type, subtype, matches_pattern) = if let Some(line) = located.small {
+            let record = match std::str::from_utf8(&line)
+                .ok()
+                .and_then(|line| parse_message_record(line).ok())
+            {
+                Some(Some(record)) => record,
+                Some(None) => continue,
+                None => {
+                    parse_errors += 1;
+                    continue;
+                }
+            };
+            let (effective_type, subtype) = classify_message(&record);
+            (
+                effective_type,
+                subtype,
+                !filter.has_filter()
+                    || filter
+                        .matches(&redact_text_with_mode(&replace_images_with_placeholders(&record), redaction).text),
+            )
+        } else {
+            let indexed = match crate::record_reader::index_record(
+                file.try_clone()
+                    .map_err(|error| crate::record_reader::reader_error("io_error", error.to_string()))?,
+                located.span,
+                true,
+            ) {
+                Ok(indexed) => indexed,
+                Err(error) if error.error == "parse_error" => {
+                    parse_errors += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if indexed.metadata.is_none() {
                 continue;
             }
-            Err(_) => {
-                read_errors += 1;
-                continue;
-            }
+            let (effective_type, subtype) = indexed.classify(
+                file.try_clone()
+                    .map_err(|error| crate::record_reader::reader_error("io_error", error.to_string()))?,
+                located.span,
+            )?;
+            let matches_pattern = if filter.has_filter() {
+                let (content, _) = render_window_content(&indexed, &file, located.span, redaction)?;
+                filter.matches(&content)
+            } else {
+                true
+            };
+            (effective_type, subtype, matches_pattern)
         };
-        let record = match parse_message_record(&line) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
+        crate::record_reader::check_work()?;
         let pos = message_pos;
         message_pos += 1;
-        let (effective_type, subtype) = classify_message(&record);
         let item = IndexedMessage {
+            span: located.span,
             line_num,
             effective_type,
             subtype,
-            matches_pattern: !filter.has_filter()
-                || filter.matches(&redact_text_with_mode(&replace_images_with_placeholders(&record), redaction).text),
+            matches_pattern,
         };
         let matched = matches(&item);
         if let SessionRange::UntilRef { line } = range
@@ -737,26 +806,21 @@ pub fn index_session_messages(
     }
     let anchor_pos = anchor_pos.ok_or_else(|| ErrorResponse {
         error: "ref_not_found".to_string(),
-        message: format!("ref 行不存在或超出 {MAX_JSONL_LINE_BYTES} 字节限制: {anchor_line}"),
+        message: format!("ref 行不存在或不是有效消息记录: {anchor_line}"),
         available: None,
     })?;
     if matches!(range, SessionRange::UntilRef { .. }) && boundary_pos.is_none() {
         return Err(missing_until());
     }
     messages.truncate(end - start);
-    let mut warnings = jsonl_read_warnings(read_errors, parse_errors);
+    let warnings = jsonl_read_warnings(0, parse_errors);
     let mut incomplete_reasons = Vec::new();
-    if read_errors > 0 {
-        incomplete_reasons.push(format!("read_errors={read_errors}"));
-    }
     if parse_errors > 0 {
         incomplete_reasons.push(format!("parse_errors={parse_errors}"));
     }
-    if oversized > 0 {
-        warnings.push(format!("oversized_jsonl_lines={oversized}"));
-        incomplete_reasons.push(format!("oversized_jsonl_lines={oversized}"));
-    }
     Ok(SessionIndex {
+        file,
+        snapshot,
         messages: messages.into(),
         anchor_idx: anchor_pos - start,
         warnings,
@@ -764,71 +828,136 @@ pub fn index_session_messages(
     })
 }
 
+fn render_window_content(
+    indexed: &crate::record_reader::IndexedRecord,
+    file: &File,
+    span: crate::record_reader::SourceSpan,
+    redaction: RedactionMode,
+) -> Result<(String, usize), ErrorResponse> {
+    use crate::record_reader::{TextBytes, reader_error, render_text_range};
+    let clone = || {
+        file.try_clone()
+            .map_err(|error| reader_error("io_error", error.to_string()))
+    };
+    let projection = indexed.projection(clone()?, span, "content", None)?;
+    let mut text = TextBytes::new(projection.cursor(clone()?, span));
+    let mut content = String::new();
+    let (_, _, count) = render_text_range(&mut text, redaction, None, |chunk| {
+        if content.len() + chunk.len() > MAX_SESSION_WINDOW_BYTES {
+            return Err(reader_error(
+                "session_window_memory_limit",
+                "逻辑正文超过 32 MiB，请用 history_get range/output 读取目标记录",
+            ));
+        }
+        content.push_str(std::str::from_utf8(chunk).map_err(|_| reader_error("parse_error", "逻辑正文 UTF-8 无效"))?);
+        Ok(())
+    })?;
+    Ok((content, count))
+}
+
 pub fn load_session_window(
     path: &Path,
-    selected: &[IndexedMessage],
+    index: &SessionIndex,
     redaction: RedactionMode,
 ) -> Result<Vec<WindowRecord>, ErrorResponse> {
+    use crate::record_reader::{check_work, index_record, reader_error};
+    let io_error = |error: io::Error| reader_error("io_error", error.to_string());
+    let selected = &index.messages;
     if selected.len() > MAX_SESSION_WINDOW {
-        return Err(ErrorResponse {
-            error: "session_window_limit".to_string(),
-            message: format!("上下文范围超过 {MAX_SESSION_WINDOW} 条，使用 before/after 或 until_ref 缩小范围"),
-            available: None,
-        });
+        return Err(reader_error(
+            "session_window_limit",
+            format!("上下文范围超过 {MAX_SESSION_WINDOW} 条，使用 before/after 或 until_ref 缩小范围"),
+        ));
     }
-    if selected.is_empty() {
-        return Ok(Vec::new());
+    let current = crate::session_files::open_session_file(path).map_err(io_error)?;
+    if !crate::session_files::matches_snapshot(&index.snapshot, &current.metadata().map_err(io_error)?) {
+        return Err(reader_error("source_changed", "会话在索引和读取之间发生变化"));
     }
-    let file = File::open(path).map_err(|e| ErrorResponse {
-        error: "io_error".to_string(),
-        message: format!("无法读取会话文件: {e}"),
-        available: None,
-    })?;
-    let mut records = Vec::new();
-    let mut bytes = 0usize;
-    let mut selected_idx = 0usize;
-    for (line_idx, line) in bounded_jsonl_lines(BufReader::new(file)).enumerate() {
-        let line_num = line_idx + 1;
-        if line_num < selected[selected_idx].line_num {
-            continue;
-        }
-        let Ok(BoundedLine::Record(line)) = line else {
-            return Err(invalid_arguments("会话在读取过程中变化，无法读取完整上下文"));
-        };
-        bytes = bytes.saturating_add(line.len());
-        if bytes > MAX_SESSION_WINDOW_BYTES {
+    let mut file = index.file.try_clone().map_err(io_error)?;
+    let mut records = Vec::with_capacity(selected.len());
+    let mut bytes = 0u64;
+    let mut rendered_bytes = 0usize;
+    for expected in selected {
+        check_work()?;
+        let length = expected.span.end - expected.span.start;
+        bytes = bytes.saturating_add(length);
+        if bytes > MAX_SESSION_WINDOW_BYTES as u64 {
             return Err(ErrorResponse {
                 error: "session_window_memory_limit".to_string(),
-                message: format!("选定范围超过 {MAX_SESSION_WINDOW_BYTES} 字节，使用较小的范围"),
-                available: None,
+                message: format!(
+                    "选定范围超过 {MAX_SESSION_WINDOW_BYTES} 字节，请缩小范围或用 history_get range/output 读取单条记录"
+                ),
+                available: Some(
+                    serde_json::json!({"source":path, "ref":format!("{}:{}",path.file_stem().and_then(|name| name.to_str()).unwrap_or_default(),expected.line_num), "get":{"source":path, "ref":format!("{}:{}",path.file_stem().and_then(|name| name.to_str()).unwrap_or_default(),expected.line_num), "range":"0-100000", "redaction":redaction.as_str()}}),
+                ),
             });
         }
-        let record = parse_message_record(&line)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid_arguments("会话在读取过程中变化"))?;
-        let (effective_type, subtype) = classify_message(&record);
-        let expected = &selected[selected_idx];
+        let mut result_previews = std::collections::BTreeMap::new();
+        let (record, effective_type, subtype, content, redacted_count) = if length <= MAX_JSONL_LINE_BYTES as u64 {
+            file.seek(SeekFrom::Start(expected.span.start)).map_err(io_error)?;
+            let mut line = vec![0; length as usize];
+            file.read_exact(&mut line).map_err(io_error)?;
+            let record = std::str::from_utf8(&line)
+                .ok()
+                .and_then(|line| parse_message_record(line).ok().flatten())
+                .ok_or_else(|| reader_error("source_changed", "会话目标记录在读取期间发生变化"))?;
+            let (effective_type, subtype) = classify_message(&record);
+            let rendered = redact_text_with_mode(&replace_images_with_placeholders(&record), redaction);
+            (record, effective_type, subtype, rendered.text, rendered.count)
+        } else {
+            let indexed = index_record(file.try_clone().map_err(io_error)?, expected.span, true)?;
+            let record = indexed.association_record(file.try_clone().map_err(io_error)?, expected.span, false)?;
+            let (effective_type, subtype) = indexed.classify(file.try_clone().map_err(io_error)?, expected.span)?;
+            let (content, count) = render_window_content(&indexed, &file, expected.span, redaction)?;
+            if let Some(blocks) = record
+                .message
+                .as_ref()
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for (block_index, _) in blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, block)| block["type"] == "tool_result")
+                {
+                    result_previews.insert(
+                        block_index,
+                        indexed.tool_result_preview(
+                            file.try_clone().map_err(io_error)?,
+                            expected.span,
+                            block_index,
+                            redaction,
+                            500,
+                        )?,
+                    );
+                }
+            }
+            (record, effective_type, subtype, content, count)
+        };
         if effective_type != expected.effective_type || subtype != expected.subtype {
-            return Err(invalid_arguments("会话在读取过程中变化"));
+            return Err(reader_error("source_changed", "会话消息类型在读取期间发生变化"));
         }
-        let rendered = redact_text_with_mode(&replace_images_with_placeholders(&record), redaction);
+        rendered_bytes = rendered_bytes.saturating_add(content.len());
+        if rendered_bytes > MAX_SESSION_WINDOW_BYTES {
+            return Err(reader_error(
+                "session_window_memory_limit",
+                "选定逻辑正文超过 32 MiB，请缩小范围或使用 history_get range/output",
+            ));
+        }
         records.push(WindowRecord {
-            line_num,
+            line_num: expected.line_num,
+            result_previews,
             record,
             effective_type,
             subtype,
-            content: rendered.text,
-            redacted_count: rendered.count,
+            content,
+            redacted_count,
         });
-        selected_idx += 1;
-        if selected_idx == selected.len() {
-            break;
-        }
     }
-    if selected_idx != selected.len() {
-        return Err(invalid_arguments("会话在读取过程中变化，范围不完整"));
+    if !crate::session_files::matches_snapshot(&index.snapshot, &current.metadata().map_err(io_error)?) {
+        return Err(reader_error("source_changed", "会话在读取窗口时发生变化"));
     }
+    check_work()?;
     Ok(records)
 }
 
@@ -1355,23 +1484,16 @@ pub fn truncate_content(content: &str, max_len: usize) -> (String, bool) {
 ///
 /// 匹配位置居中展示，前后各保留 max_len/2 的上下文
 /// 无匹配位置信息时退化为从头截断
-pub fn truncate_around_match(content: &str, match_pos: Option<usize>, max_len: usize) -> (String, bool) {
-    // 用 chars().count() 单次扫描算字符数，避免预分配 Vec<usize>
-    // （预分配在 100KB+ 内容上会消耗 ~800KB+ 临时内存）
-    let char_count = content.chars().count();
-
+pub fn preview_bounds(char_count: usize, match_pos: Option<usize>, max_len: usize) -> (usize, usize, bool, bool) {
     if char_count <= max_len {
-        return (content.to_string(), false);
+        return (0, char_count, false, false);
     }
     if max_len == 0 {
-        return (String::new(), true);
+        return (0, 0, false, false);
     }
-
     let Some(pos) = match_pos else {
-        // 从头截断：用 nth 直接定位第 max_len 个字符的 byte 偏移
-        return (content[..nth_byte_or_end(content, max_len)].to_string(), true);
+        return (0, max_len, false, false);
     };
-
     let pos = pos.min(char_count);
     let centered_window = |content_len: usize| {
         let mut start = pos.saturating_sub(content_len / 2);
@@ -1404,6 +1526,17 @@ pub fn truncate_around_match(content: &str, match_pos: Option<usize>, max_len: u
     let ellipsis_len = 3 * usize::from(prefix_ellipsis) + 3 * usize::from(suffix_ellipsis);
     let (start, end) = centered_window(max_len - ellipsis_len);
 
+    (start, end, prefix_ellipsis, suffix_ellipsis)
+}
+
+pub fn truncate_around_match(content: &str, match_pos: Option<usize>, max_len: usize) -> (String, bool) {
+    // 用 chars().count() 单次扫描算字符数，避免预分配 Vec<usize>
+    // （预分配在 100KB+ 内容上会消耗 ~800KB+ 临时内存）
+    let char_count = content.chars().count();
+    if char_count <= max_len {
+        return (content.to_string(), false);
+    }
+    let (start, end, prefix_ellipsis, suffix_ellipsis) = preview_bounds(char_count, match_pos, max_len);
     // 二次扫描定位 start/end 的 byte 偏移（O(N)、无内存分配）
     let start_byte = nth_byte_or_end(content, start);
     let end_byte = nth_byte_or_end(content, end);
@@ -1731,6 +1864,16 @@ pub fn redact_text_range_with_mode(text: &str, mode: RedactionMode, range: Optio
     TextRedaction { text: output, count }
 }
 
+pub(crate) fn token_uuid_statement_regex() -> &'static Regex {
+    static TOKEN_UUID: OnceLock<Regex> = OnceLock::new();
+    TOKEN_UUID.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:\btoken\b|令牌)[^\\\n\r"{}\[\]]{0,256}?(?:返回(?:了)?[ \t]{0,16}(?:新[ \t]{0,16})?|return(?:ed|s)?[ \t]{1,16}(?:a[ \t]{1,16})?(?:new[ \t]{1,16})?)UUID[ \t:：]{0,16}`?(?P<value>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\b"#,
+        )
+        .expect("valid regex")
+    })
+}
+
 fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit> {
     static AUTH_HEADER_RE: OnceLock<Regex> = OnceLock::new();
     static COOKIE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
@@ -1739,6 +1882,14 @@ fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit
     static INTERNAL_URL_RE: OnceLock<Regex> = OnceLock::new();
 
     let mut edits = collect_sensitive_field_edits(text, mode);
+    for captures in token_uuid_statement_regex().captures_iter(text) {
+        let value = captures.name("value").expect("UUID value");
+        edits.push(RedactionEdit {
+            start: value.start(),
+            end: value.end(),
+            replacement: "[redacted]",
+        });
+    }
     for captures in AUTH_HEADER_RE
         .get_or_init(|| Regex::new(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+").expect("valid regex"))
         .captures_iter(text)
@@ -1821,11 +1972,28 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
     let bytes = text.as_bytes();
     let mut edits = Vec::new();
     let mut cursor = 0;
+    let mut quoted_scopes: Vec<(usize, usize, u32)> = Vec::new();
     while cursor < bytes.len() {
+        while let Some(&(content_end, end, _)) = quoted_scopes.last() {
+            if cursor < content_end {
+                break;
+            }
+            quoted_scopes.pop();
+            cursor = cursor.max(end);
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
         let escaped_key = escaped_quoted_token(bytes, cursor);
-        let (key_start, key_end, key, quoted_content_start) =
+        let (key_start, key_end, key, quoted_content_start, quoted_content_end) =
             if let Some((end, content_start, content_end)) = escaped_key {
-                (cursor, end, &text[content_start..content_end], Some(content_start))
+                (
+                    cursor,
+                    end,
+                    &text[content_start..content_end],
+                    Some(content_start),
+                    content_end,
+                )
             } else {
                 match bytes[cursor] {
                     b'"' | b'\'' => {
@@ -1834,14 +2002,14 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
                             cursor += 1;
                             continue;
                         };
-                        (cursor, end, &text[cursor + 1..end - 1], Some(cursor + 1))
+                        (cursor, end, &text[cursor + 1..end - 1], Some(cursor + 1), end - 1)
                     }
                     value if is_key_byte(value) && (cursor == 0 || !is_key_byte(bytes[cursor.saturating_sub(1)])) => {
                         let mut end = cursor + 1;
                         while end < bytes.len() && is_key_byte(bytes[end]) {
                             end += 1;
                         }
-                        (cursor, end, &text[cursor..end], None)
+                        (cursor, end, &text[cursor..end], None, end)
                     }
                     _ => {
                         cursor += 1;
@@ -1850,11 +2018,43 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
                 }
             };
 
-        let mut separator = key_end;
-        while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
-            separator += 1;
-        }
-        if separator >= bytes.len() || !matches!(bytes[separator], b':' | b'=') {
+        let password_option = quoted_content_start.is_none()
+            && key.starts_with("--")
+            && is_command_password_option(&key.to_ascii_lowercase());
+        let encoded_whitespace = password_option && quoted_scopes.last().is_some_and(|scope| scope.2 > 0);
+        let separator = skip_whitespace(bytes, key_end, encoded_whitespace);
+        let double_colon_separator = quoted_content_start.is_none()
+            && bytes.get(separator) == Some(&b':')
+            && bytes.get(separator + 1) == Some(&b':')
+            && bytes.get(separator + 2) != Some(&b':')
+            && !is_sensitive_key(&key.to_ascii_lowercase(), RedactionMode::Auto);
+        let assignment =
+            bytes.get(separator).is_some_and(|byte| matches!(byte, b':' | b'=')) && !double_colon_separator;
+        if !(assignment || password_option && separator > key_end) {
+            if let Some(content_start) = quoted_content_start
+                && quoted_scopes.last().is_none_or(|scope| quoted_content_end < scope.0)
+            {
+                if quoted_scopes.len() == 32 {
+                    edits.push(RedactionEdit {
+                        start: content_start,
+                        end: quoted_content_end,
+                        replacement: "[redacted]",
+                    });
+                    cursor = key_end;
+                    continue;
+                }
+                let layers = if escaped_key.is_some() {
+                    let width = content_start - key_start - 1;
+                    if (width + 1).is_power_of_two() {
+                        (width + 1).trailing_zeros() + 1
+                    } else {
+                        0
+                    }
+                } else {
+                    u32::from(bytes[key_start] == b'"')
+                };
+                quoted_scopes.push((quoted_content_end, key_end, layers));
+            }
             cursor = quoted_content_start.unwrap_or(key_end);
             continue;
         }
@@ -1879,11 +2079,13 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
             continue;
         }
 
-        let mut value_start = separator + 1;
-        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-        let value_end = if quoted_content_start.is_none() && bytes[separator] == b'=' {
+        let value_start = skip_whitespace(bytes, separator + usize::from(assignment), encoded_whitespace);
+        let value_end = if password_option {
+            let scope = quoted_scopes
+                .last()
+                .map_or((bytes.len(), 0), |scope| (scope.0, scope.2));
+            json_like_value_end(bytes, value_start, Some(scope))
+        } else if quoted_content_start.is_none() && bytes[separator] == b'=' {
             let (end, preserve) = code_rhs_span(bytes, value_start);
             if preserve {
                 // Inspect nested assignments even when the enclosing expression is preserved.
@@ -1894,7 +2096,7 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
         } else {
             escaped_quoted_token(bytes, value_start)
                 .map(|(end, _, _)| end)
-                .unwrap_or_else(|| json_like_value_end(bytes, value_start))
+                .unwrap_or_else(|| json_like_value_end(bytes, value_start, None))
         };
         if value_end > value_start {
             edits.push(RedactionEdit {
@@ -2170,7 +2372,40 @@ fn quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> Option<usize> {
     None
 }
 
-fn json_like_value_end(bytes: &[u8], start: usize) -> usize {
+fn skip_whitespace(bytes: &[u8], mut cursor: usize, encoded: bool) -> usize {
+    loop {
+        if bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        } else if encoded && bytes.get(cursor) == Some(&b'\\') {
+            let mut end = cursor;
+            while bytes.get(end) == Some(&b'\\') {
+                end += 1;
+            }
+            if !(end - cursor).is_power_of_two()
+                || !bytes.get(end).is_some_and(|byte| matches!(byte, b't' | b'n' | b'r'))
+            {
+                break;
+            }
+            cursor = end + 1;
+        } else {
+            break;
+        }
+    }
+    cursor
+}
+
+fn json_like_value_end(bytes: &[u8], start: usize, command_scope: Option<(usize, u32)>) -> usize {
+    if let Some((end, layers)) = command_scope {
+        return crate::record_reader::value_end(
+            &mut crate::record_reader::SliceBytes(bytes),
+            start,
+            Some((end, layers)),
+        )
+        .unwrap_or_else(|_| {
+            eprintln!("命令行密码参数无法解析，已遮蔽至当前字符串末尾");
+            end
+        });
+    }
     if start >= bytes.len() {
         return start;
     }
@@ -2209,7 +2444,7 @@ fn json_like_value_end(bytes: &[u8], start: usize) -> usize {
     let mut cursor = start;
     while cursor < bytes.len()
         && !bytes[cursor].is_ascii_whitespace()
-        && !matches!(bytes[cursor], b',' | b';' | b'&' | b'}' | b']' | b'"' | b'\'')
+        && !matches!(bytes[cursor], b';' | b'&' | b'"' | b'\'' | b',' | b'}' | b']')
     {
         cursor += 1;
     }
@@ -2296,9 +2531,17 @@ fn redact_value_with_count(value: &serde_json::Value, mode: RedactionMode) -> (s
     }
 }
 
-fn is_sensitive_key(lower_key: &str, mode: RedactionMode) -> bool {
+pub(crate) fn is_command_password_option(lower_key: &str) -> bool {
+    matches!(
+        lower_key,
+        "--password" | "--http-password" | "--ftp-password" | "--proxy-password"
+    )
+}
+
+pub(crate) fn is_sensitive_key(lower_key: &str, mode: RedactionMode) -> bool {
     lower_key.contains("password")
         || lower_key.contains("passwd")
+        || lower_key == "sshpass"
         || lower_key == "pwd"
         || lower_key.contains("secret")
         || lower_key.contains("token")
@@ -2371,6 +2614,7 @@ pub enum ToolBlockKind {
 #[derive(Debug, Clone)]
 pub struct AssociatedToolBlock {
     pub kind: ToolBlockKind,
+    pub block_index: usize,
     pub call_key: Option<usize>,
     pub info: ToolInfo,
     pub input: Option<serde_json::Value>,
@@ -2455,12 +2699,14 @@ impl ToolAssociationTracker {
         };
 
         let mut blocks = Vec::new();
-        for item in content {
-            match item.get("type").and_then(serde_json::Value::as_str) {
-                Some("tool_use") => blocks.push(self.observe_use(record, item)),
-                Some("tool_result") => blocks.push(self.observe_result(record, item, detect_error_payload)),
-                _ => {}
-            }
+        for (index, item) in content.iter().enumerate() {
+            let mut block = match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_use") => self.observe_use(record, item),
+                Some("tool_result") => self.observe_result(record, item, detect_error_payload),
+                _ => continue,
+            };
+            block.block_index = index;
+            blocks.push(block);
         }
         blocks
     }
@@ -2488,6 +2734,7 @@ impl ToolAssociationTracker {
         self.pending.push(pending);
         AssociatedToolBlock {
             kind: ToolBlockKind::Use,
+            block_index: 0,
             call_key: Some(key),
             info,
             input,
@@ -2515,6 +2762,7 @@ impl ToolAssociationTracker {
         let association = self.associate_result(record, id.as_deref());
         AssociatedToolBlock {
             kind: ToolBlockKind::Result,
+            block_index: 0,
             call_key: association.call_key,
             info: association.info,
             input: None,
@@ -2848,11 +3096,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(index.messages.len(), 1);
-        assert_eq!(index.incomplete_reasons, ["parse_errors=1", "oversized_jsonl_lines=1"]);
+        assert_eq!(index.incomplete_reasons, ["parse_errors=2"]);
         assert_eq!(
-            load_session_window(&path, &index.messages, RedactionMode::Auto)
-                .unwrap()
-                .len(),
+            load_session_window(&path, &index, RedactionMode::Auto).unwrap().len(),
             1
         );
         let full = index_session_messages(
@@ -2865,7 +3111,7 @@ mod tests {
             SessionRange::Counts { before: 0, after: None },
         )
         .unwrap();
-        assert_eq!(full.incomplete_reasons, ["parse_errors=2", "oversized_jsonl_lines=2"]);
+        assert_eq!(full.incomplete_reasons, ["parse_errors=4"]);
         for line in [1, 2, anchor + 1, anchor + 2] {
             let error = index_session_messages(
                 &path,
@@ -2889,11 +3135,11 @@ mod tests {
             lines.push(replacement);
             fs::write(&path, lines.join("\n")).unwrap();
             assert_eq!(
-                load_session_window(&path, &index.messages, RedactionMode::Auto)
+                load_session_window(&path, &index, RedactionMode::Auto)
                     .err()
                     .unwrap()
                     .error,
-                "invalid_arguments"
+                "source_changed"
             );
         }
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -2922,17 +3168,22 @@ mod tests {
             SessionRange::UntilRef { line: 8 },
         )
         .unwrap();
-        assert_eq!(
-            load_session_window(&path, &index.messages, RedactionMode::Off)
-                .unwrap()
-                .len(),
-            8
-        );
+        assert_eq!(load_session_window(&path, &index, RedactionMode::Off).unwrap().len(), 8);
         let mut content = fs::read_to_string(&path).unwrap();
         content.insert(content.len() - 1, ' ');
         fs::write(&path, content).unwrap();
+        let index = index_session_messages(
+            &path,
+            1,
+            &filter,
+            RedactionMode::Off,
+            &[],
+            &[],
+            SessionRange::UntilRef { line: 8 },
+        )
+        .unwrap();
         assert_eq!(
-            load_session_window(&path, &index.messages, RedactionMode::Off)
+            load_session_window(&path, &index, RedactionMode::Off)
                 .err()
                 .unwrap()
                 .error,
@@ -3181,6 +3432,177 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
     }
 
     #[test]
+    fn sshpass_redaction_covers_text_structured_values_and_original_ranges() {
+        let secret = "fixture_sshpass_NOT_A_REAL_CREDENTIAL";
+        let input = serde_json::json!({
+            "env": {"SSHPASS": secret, "LANG": "C", "SSHPASS_FD": 3, "SSHPASS_FILE": "fixture-path"}
+        });
+        let encoded = format!(
+            r#"{{"env":{{"S{}u0053HPASS":"{secret}"}},"plain":"文字😀"}}"#,
+            char::from(92)
+        );
+        let texts = [
+            format!("前缀😀 SSHPASS={secret} 后缀"),
+            format!("export SSHPASS='{secret}'"),
+            input.to_string(),
+            encoded.clone(),
+            serde_json::to_string(&encoded).unwrap(),
+        ];
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            let (redacted, count) = redact_value_with_count(&input, mode);
+            assert_eq!(redacted["env"]["SSHPASS"], "[redacted]");
+            assert_eq!(redacted["env"]["LANG"], "C");
+            assert_eq!(redacted["env"]["SSHPASS_FD"], 3);
+            assert_eq!(redacted["env"]["SSHPASS_FILE"], "fixture-path");
+            assert_eq!(count, 1);
+            for text in &texts {
+                let result = redact_text_with_mode(text, mode);
+                assert!(!result.text.contains(secret), "mode={mode:?}");
+                assert_eq!(result.count, 1);
+                let start = text[..text.find(secret).unwrap()].chars().count();
+                assert_eq!(
+                    redact_text_range_with_mode(text, mode, Some((start + 3, start + 8))).text,
+                    "[redacted]"
+                );
+            }
+        }
+        assert_eq!(redact_value_with_count(&input, RedactionMode::Off), (input, 0));
+        for text in texts {
+            assert_eq!(redact_text_with_mode(&text, RedactionMode::Off).text, text);
+        }
+    }
+
+    #[test]
+    fn command_password_options_redact_values_without_hiding_other_arguments() {
+        let secret = "fixture.password,NOT_A_REAL_CREDENTIAL]tail}";
+        for option in ["--password", "--http-password", "--ftp-password", "--proxy-password"] {
+            for (separator, value) in [
+                (" ", secret.to_string()),
+                ("=", secret.to_string()),
+                (" ", format!("'{secret} with spaces'")),
+                ("\t", format!("\"{secret} with spaces\"")),
+                (" ", format!("'{secret}'suffix")),
+                (" ", format!("prefix'{secret}'")),
+                (" ", format!("{secret}\\ with\\ spaces")),
+                (" ", format!("\"{secret}\"suffix")),
+                (" ", format!("prefix\"{secret} with spaces\"suffix")),
+                (" ", format!("'{secret}\\ with spaces'suffix")),
+                (" ", format!("{secret}\\\"suffix")),
+                ("\n", secret.to_string()),
+                ("\r", secret.to_string()),
+            ] {
+                let argument = format!("{option}{separator}{value}");
+                let command = format!("前缀😀 wget --user fixture-user {argument} --preserve-permissions");
+                let value = serde_json::json!({"command": command, "env":{"LANG":"C"}, "note":"visible"});
+                let encoded = value.to_string();
+                let nested = serde_json::to_string(&encoded).unwrap();
+                for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+                    let expected_command =
+                        format!("前缀😀 wget --user fixture-user {option}{separator}[redacted] --preserve-permissions");
+                    let expected_value =
+                        serde_json::json!({"command":expected_command, "env":{"LANG":"C"}, "note":"visible"});
+                    let (redacted, count) = redact_value_with_count(&value, mode);
+                    assert_eq!(redacted, expected_value);
+                    assert_eq!(count, 1);
+                    for (text, expected) in [
+                        (&command, expected_command),
+                        (&encoded, expected_value.to_string()),
+                        (&nested, serde_json::to_string(&expected_value.to_string()).unwrap()),
+                    ] {
+                        let redacted = redact_text_with_mode(text, mode);
+                        assert_eq!(redacted.text, expected, "mode={mode:?} argument={argument:?}");
+                        assert_eq!(redacted.count, 1);
+                        let start = text[..text.find(secret).unwrap()].chars().count();
+                        assert_eq!(
+                            redact_text_range_with_mode(text, mode, Some((start + 3, start + 8))).text,
+                            "[redacted]"
+                        );
+                    }
+                }
+                assert_eq!(redact_value_with_count(&value, RedactionMode::Off), (value, 0));
+                for text in [&command, &encoded, &nested] {
+                    assert_eq!(redact_text_with_mode(text, RedactionMode::Off).text, *text);
+                }
+            }
+        }
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            for command in ["wget --password ", "wget --password=", "wget --password"] {
+                let empty = serde_json::json!({"command":command, "note":"visible"}).to_string();
+                for text in [empty.clone(), serde_json::to_string(&empty).unwrap()] {
+                    let redacted = redact_text_with_mode(&text, mode);
+                    assert_eq!(redacted.text, text);
+                    assert_eq!(redacted.count, 0);
+                }
+            }
+            for text in [
+                "wget --ask-password --quiet",
+                "wget --password-file fixture-path --quiet",
+                "wget --password\\tfixture-path --quiet",
+                "plain password explanation remains visible",
+            ] {
+                let redacted = redact_text_with_mode(text, mode);
+                assert_eq!(redacted.text, text);
+                assert_eq!(redacted.count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn token_uuid_statements_redact_values_without_hiding_identifiers() {
+        let secret = "11111111-1111-4111-8111-111111111111";
+        let identifier = "22222222-2222-4222-8222-222222222222";
+        for statement in [
+            format!("2. **用已有 token 创建新模块 token**: 成功,返回新 UUID `{secret}`"),
+            format!("token created successfully, returned a new UUID `{secret}`"),
+            format!("令牌创建成功，返回 UUID：{secret}"),
+            format!("创建令牌成功，返回新 UUID `{secret}`"),
+            format!("token {}返回新 UUID `{secret}`", "说明".repeat(120)),
+        ] {
+            let text = format!("前缀😀 {statement}\nsession UUID `{identifier}` remains visible");
+            let expected = text.replace(secret, "[redacted]");
+            let value = serde_json::json!({"text":text, "session":identifier, "ref":"fixture:12"});
+            let expected_value = serde_json::json!({"text":expected, "session":identifier, "ref":"fixture:12"});
+            for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+                assert_eq!(redact_value_with_count(&value, mode), (expected_value.clone(), 1));
+                for (original, expected) in [
+                    (text.clone(), expected.clone()),
+                    (value.to_string(), expected_value.to_string()),
+                    (
+                        serde_json::to_string(&value.to_string()).unwrap(),
+                        serde_json::to_string(&expected_value.to_string()).unwrap(),
+                    ),
+                ] {
+                    let redacted = redact_text_with_mode(&original, mode);
+                    assert_eq!(redacted.text, expected);
+                    assert_eq!(redacted.count, 1);
+                    let start = original[..original.find(secret).unwrap()].chars().count();
+                    assert_eq!(
+                        redact_text_range_with_mode(&original, mode, Some((start + 3, start + 8))).text,
+                        "[redacted]"
+                    );
+                }
+            }
+            assert_eq!(redact_value_with_count(&value, RedactionMode::Off), (value, 0));
+            assert_eq!(redact_text_with_mode(&text, RedactionMode::Off).text, text);
+        }
+        for text in [
+            format!("session UUID `{identifier}`"),
+            format!("token 统计 30，本会话 UUID `{identifier}`"),
+            format!("token 创建成功\n操作返回新 UUID `{identifier}`"),
+            format!("token 创建成功\\n操作返回新 UUID `{identifier}`"),
+            format!("token 创建成功，返回会话 UUID `{identifier}`"),
+            serde_json::json!({"aaa":"token","note":format!("返回新 UUID `{identifier}`")}).to_string(),
+            format!("operation_id={identifier} ref=fixture:12"),
+        ] {
+            for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+                let redacted = redact_text_with_mode(&text, mode);
+                assert_eq!(redacted.text, text);
+                assert_eq!(redacted.count, 0);
+            }
+        }
+    }
+
+    #[test]
     fn range_redaction_uses_full_text_context_and_raw_unicode_offsets() {
         let text = "前缀 password=fixture_secret 后缀";
         let secret_start = text.find("fixture_secret").unwrap();
@@ -3215,6 +3637,11 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
             "token = text(node, 1)",
             "sorted(values, key=lambda x: x['durationNs'])",
             "process_key = path.name.rsplit('.', 1)[0]",
+            "ghost_appearance :: description",
+            "host::method()",
+            "url::parse()",
+            "endpoint::status",
+            "domain::lookup",
         ] {
             for text in [
                 code.to_string(),
@@ -3297,6 +3724,35 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
                 "token=[redacted]"
             );
         }
+    }
+
+    #[test]
+    fn double_colon_locations_keep_sensitive_field_protection() {
+        for (text, expected) in [
+            ("host: fixture-machine", "host: [redacted]"),
+            ("password::fixture-secret", "password:[redacted]"),
+            ("host:::1", "host:[redacted]"),
+            (r#""host":"::fixture-machine""#, r#""host":[redacted]"#),
+            (r#""host"::fixture-machine"#, r#""host":[redacted]"#),
+            ("host::192.168.1.2", "host::[redacted-host]"),
+            ("url::https://example.com", "url::[redacted-url]"),
+            ("host::call(password=fixture-secret)", "host::call(password=[redacted])"),
+        ] {
+            assert_eq!(redact_text_with_mode(text, RedactionMode::Strict).text, expected);
+            assert_eq!(redact_text_with_mode(text, RedactionMode::Off).text, text);
+        }
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            assert_eq!(
+                redact_text_with_mode("password::fixture-secret", mode).text,
+                "password:[redacted]"
+            );
+        }
+        let text = "中文😀 host::method() 后缀";
+        let start = text[..text.find("::").unwrap()].chars().count();
+        assert_eq!(
+            redact_text_range_with_mode(text, RedactionMode::Strict, Some((start, start + 2))).text,
+            "::"
+        );
     }
 
     #[test]

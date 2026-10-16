@@ -32,6 +32,7 @@ import {
     type InteractiveElementInfo,
     type ListedTarget,
     type NewTabResult,
+    type NewPageOptions,
     type ReadPageOptions,
     type ReadPageResult,
     type ScreenshotResult,
@@ -39,11 +40,15 @@ import {
     type StaleContextRetryPolicy,
 } from './browser-driver.js'
 import {
+    CDPError,
+    creationError,
+    StructuredToolError,
     NavigationError,
     NavigationTimeoutError,
     PagePreconditionError,
     SessionNotFoundError,
     TargetNotFoundError,
+    TimeoutError,
 } from './errors.js'
 import { Locator } from './locator.js'
 import {
@@ -62,6 +67,8 @@ import {
     type TargetInfo,
     type WaitUntil,
 } from './types.js'
+
+import { remainingNavigationTimeout, waitForNavigationQueue, withNavigationBudget } from './utils.js'
 
 function wildcardSegmentMatches(value: string, segment: string, index: number): boolean {
     if (index + segment.length > value.length) {
@@ -331,11 +338,11 @@ class SessionManager implements IBrowserDriver {
     /**
      * 列出所有可用页面
      */
-    async listTargets(): Promise<ListedTarget[]> {
+    async listTargets(timeout?: number): Promise<ListedTarget[]> {
         this.ensureConnected()
 
         // 从 CDP 获取 targets
-        const { targetInfos } = (await this.cdp!.send('Target.getTargets')) as {
+        const { targetInfos } = (await this.sendBrowserCommand('Target.getTargets', undefined, timeout)) as {
             targetInfos: Array<{
                 targetId: string
                 type: string
@@ -367,17 +374,27 @@ class SessionManager implements IBrowserDriver {
      * 导航到 URL
      */
     async navigate(url: string, options: { wait?: WaitUntil; timeout?: number } = {}): Promise<void> {
+        const deadline = Date.now() + (options.timeout ?? DEFAULT_TIMEOUT)
         return this.withLock(async () => {
             this.ensureSession()
 
-            const { wait = 'load', timeout = DEFAULT_TIMEOUT } = options
+            const { wait = 'load' } = options
             const abortController = new AbortController()
-            const navigationWait = this.startNavigationWait(wait, timeout, abortController.signal, false)
+            const navigationWait = this.startNavigationWait(
+                wait,
+                remainingNavigationTimeout(deadline),
+                abortController.signal,
+                false
+            )
             navigationWait.promise.catch(() => {})
             navigationWait.markActionStarted()
 
             try {
-                const { frameId, loaderId, errorText } = (await this.send('Page.navigate', { url }, timeout)) as {
+                const { frameId, loaderId, errorText } = (await this.send(
+                    'Page.navigate',
+                    { url },
+                    remainingNavigationTimeout(deadline)
+                )) as {
                     frameId: string
                     loaderId?: string
                     errorText?: string
@@ -396,8 +413,8 @@ class SessionManager implements IBrowserDriver {
             }
 
             await navigationWait.promise
-            await this.updateState()
-        })
+            await this.updateState(remainingNavigationTimeout(deadline))
+        }, deadline)
     }
 
     /**
@@ -415,72 +432,92 @@ class SessionManager implements IBrowserDriver {
      */
     async waitForNavigation(timeout: number = DEFAULT_TIMEOUT): Promise<void> {
         this.ensureSession()
-        await this.waitForAnyEvent(['Page.loadEventFired', 'Page.navigatedWithinDocument'], timeout)
+        await this.waitForAnyEvent(
+            ['Page.loadEventFired', 'Page.navigatedWithinDocument', 'Page.frameNavigated'],
+            timeout
+        )
     }
 
     /**
      * 后退
      */
     async goBack(timeout = DEFAULT_TIMEOUT): Promise<{ navigated: boolean }> {
+        const deadline = Date.now() + timeout
         return this.withLock(async () => {
             this.ensureSession()
             const { currentIndex, entries } = await this.send<{
                 currentIndex: number
                 entries: Array<{ id: number; url: string; title: string }>
-            }>('Page.getNavigationHistory', undefined, timeout)
+            }>('Page.getNavigationHistory', undefined, remainingNavigationTimeout(deadline))
 
             if (currentIndex <= 0) {
                 return { navigated: false }
             }
 
-            // 跨文档导航触发 loadEventFired，同文档导航（hash/pushState）触发 navigatedWithinDocument
-            const waitPromise = this.waitForAnyEvent(['Page.loadEventFired', 'Page.navigatedWithinDocument'], timeout)
+            // 跨文档加载、主 frame BFCache 恢复和同文档导航分别提供完成事件
+            const waitPromise = this.waitForAnyEvent(
+                ['Page.loadEventFired', 'Page.navigatedWithinDocument', 'Page.frameNavigated'],
+                remainingNavigationTimeout(deadline)
+            )
             // 预注册 rejection handler：若 send() 抛错导致 waitPromise 永远不被 await，
             // 其 timer reject 不会成为 unhandled rejection（Node 20 默认会退出进程）
             waitPromise.catch(() => {})
-            await this.send('Page.navigateToHistoryEntry', { entryId: entries[currentIndex - 1].id }, timeout)
+            await this.send(
+                'Page.navigateToHistoryEntry',
+                { entryId: entries[currentIndex - 1].id },
+                remainingNavigationTimeout(deadline)
+            )
             await waitPromise
-            await this.updateState()
+            await this.updateState(remainingNavigationTimeout(deadline))
             return { navigated: true }
-        })
+        }, deadline)
     }
 
     /**
      * 前进
      */
     async goForward(timeout = DEFAULT_TIMEOUT): Promise<{ navigated: boolean }> {
+        const deadline = Date.now() + timeout
         return this.withLock(async () => {
             this.ensureSession()
             const { currentIndex, entries } = await this.send<{
                 currentIndex: number
                 entries: Array<{ id: number; url: string; title: string }>
-            }>('Page.getNavigationHistory', undefined, timeout)
+            }>('Page.getNavigationHistory', undefined, remainingNavigationTimeout(deadline))
 
             if (currentIndex >= entries.length - 1) {
                 return { navigated: false }
             }
 
-            // 跨文档导航触发 loadEventFired，同文档导航（hash/pushState）触发 navigatedWithinDocument
-            const waitPromise = this.waitForAnyEvent(['Page.loadEventFired', 'Page.navigatedWithinDocument'], timeout)
+            // 跨文档加载、主 frame BFCache 恢复和同文档导航分别提供完成事件
+            const waitPromise = this.waitForAnyEvent(
+                ['Page.loadEventFired', 'Page.navigatedWithinDocument', 'Page.frameNavigated'],
+                remainingNavigationTimeout(deadline)
+            )
             waitPromise.catch(() => {})
-            await this.send('Page.navigateToHistoryEntry', { entryId: entries[currentIndex + 1].id }, timeout)
+            await this.send(
+                'Page.navigateToHistoryEntry',
+                { entryId: entries[currentIndex + 1].id },
+                remainingNavigationTimeout(deadline)
+            )
             await waitPromise
-            await this.updateState()
+            await this.updateState(remainingNavigationTimeout(deadline))
             return { navigated: true }
-        })
+        }, deadline)
     }
 
     /**
      * 刷新
      */
     async reload(ignoreCache = false, waitUntil: string = 'load', timeout = DEFAULT_TIMEOUT): Promise<void> {
+        const deadline = Date.now() + timeout
         return this.withLock(async () => {
             this.ensureSession()
 
             const abortController = new AbortController()
             const navigationWait = this.startNavigationWait(
                 waitUntil as WaitUntil,
-                timeout,
+                remainingNavigationTimeout(deadline),
                 abortController.signal,
                 true
             )
@@ -488,15 +525,15 @@ class SessionManager implements IBrowserDriver {
             navigationWait.markActionStarted()
 
             try {
-                await this.send('Page.reload', { ignoreCache }, timeout)
+                await this.send('Page.reload', { ignoreCache }, remainingNavigationTimeout(deadline))
             } catch (error) {
                 abortController.abort(error)
                 throw error
             }
 
             await navigationWait.promise
-            await this.updateState()
-        })
+            await this.updateState(remainingNavigationTimeout(deadline))
+        }, deadline)
     }
 
     /**
@@ -529,17 +566,21 @@ class SessionManager implements IBrowserDriver {
     /**
      * 鼠标移动
      */
-    async mouseMove(x: number, y: number): Promise<void> {
+    async mouseMove(x: number, y: number, timeout?: number): Promise<void> {
         this.ensureSession()
         // 整数点位：避免 sub-pixel 渲染时坐标命中元素边界外的情况（与 Playwright 一致）
         const ix = Math.round(x)
         const iy = Math.round(y)
-        await this.send('Input.dispatchMouseEvent', {
-            type: 'mouseMoved',
-            x: ix,
-            y: iy,
-            modifiers: this.modifiers,
-        })
+        await this.send(
+            'Input.dispatchMouseEvent',
+            {
+                type: 'mouseMoved',
+                x: ix,
+                y: iy,
+                modifiers: this.modifiers,
+            },
+            timeout
+        )
         this.behaviorSimulator.setCurrentPosition({ x: ix, y: iy })
     }
 
@@ -637,8 +678,16 @@ class SessionManager implements IBrowserDriver {
     /**
      * 输入文本
      */
-    async type(text: string, delay = 0): Promise<void> {
+    async type(text: string, delay = 0, timeout = DEFAULT_TIMEOUT): Promise<void> {
         this.ensureSession()
+        const deadline = Date.now() + timeout
+        const remainingTimeout = () => {
+            const remaining = deadline - Date.now()
+            if (remaining <= 0) {
+                throw new TimeoutError('input timeout during typing')
+            }
+            return remaining
+        }
         // 归一化换行：\r\n 和 \r 都视作单个 \n
         const normalized = text.replace(/\r\n?/g, '\n')
         for (const char of normalized) {
@@ -651,35 +700,42 @@ class SessionManager implements IBrowserDriver {
                     nativeVirtualKeyCode: 13,
                     modifiers: this.modifiers,
                 }
-                await this.send('Input.dispatchKeyEvent', {
-                    type: 'keyDown',
-                    ...enterParams,
-                })
-                await this.send('Input.dispatchKeyEvent', {
-                    type: 'char',
-                    text: '\r',
-                    ...enterParams,
-                })
-                await this.send('Input.dispatchKeyEvent', {
-                    type: 'keyUp',
-                    ...enterParams,
-                })
+                const keyDownTimeout = remainingTimeout()
+                try {
+                    await this.send('Input.dispatchKeyEvent', { type: 'keyDown', ...enterParams }, keyDownTimeout)
+                    await this.send(
+                        'Input.dispatchKeyEvent',
+                        { type: 'char', text: '\r', ...enterParams },
+                        remainingTimeout()
+                    )
+                } finally {
+                    await this.send(
+                        'Input.dispatchKeyEvent',
+                        { type: 'keyUp', ...enterParams },
+                        Math.max(1, deadline - Date.now())
+                    )
+                }
             } else {
-                await this.send('Input.dispatchKeyEvent', {
-                    type: 'keyDown',
-                    modifiers: this.modifiers,
-                    text: char,
-                })
-                await this.send('Input.dispatchKeyEvent', {
-                    type: 'keyUp',
-                    modifiers: this.modifiers,
-                    text: char,
-                })
+                const keyDownTimeout = remainingTimeout()
+                try {
+                    await this.send(
+                        'Input.dispatchKeyEvent',
+                        { type: 'keyDown', modifiers: this.modifiers, text: char },
+                        keyDownTimeout
+                    )
+                } finally {
+                    await this.send(
+                        'Input.dispatchKeyEvent',
+                        { type: 'keyUp', modifiers: this.modifiers, text: char },
+                        Math.max(1, deadline - Date.now())
+                    )
+                }
             }
             if (delay > 0) {
-                await new Promise((r) => setTimeout(r, delay))
+                await new Promise((r) => setTimeout(r, Math.min(delay, remainingTimeout())))
             }
         }
+        remainingTimeout()
     }
 
     /**
@@ -872,7 +928,13 @@ class SessionManager implements IBrowserDriver {
     async getPageText(selector?: string): Promise<string> {
         this.ensureSession()
         if (selector) {
-            return this.evaluate<string>(`(s => document.querySelector(s)?.textContent || '')`, [selector])
+            return this.evaluate<string>(
+                `(s => {
+                    const element = document.querySelector(s);
+                    return element instanceof HTMLElement ? element.innerText : (element?.textContent ?? '');
+                })`,
+                [selector]
+            )
         }
         return this.evaluate<string>('document.body.innerText')
     }
@@ -1004,12 +1066,12 @@ class SessionManager implements IBrowserDriver {
             frames.push({
                 index,
                 frameId: node.frame.id,
-                parentFrameId: node.frame.parentId ?? parentFrameId,
+                parentFrameId: node.frame.parentId ?? parentFrameId ?? null,
                 url: node.frame.url,
-                title: index === 0 ? this.state?.title : undefined,
-                name: node.frame.name,
-                selector: undefined,
-                rect: undefined,
+                title: index === 0 ? (this.state?.title ?? null) : null,
+                name: node.frame.name ?? null,
+                selector: null,
+                rect: null,
                 mimeType: node.frame.mimeType,
             })
             for (const child of node.childFrames ?? []) {
@@ -1082,6 +1144,7 @@ class SessionManager implements IBrowserDriver {
                 feeds.push({href: l.href, type: l.getAttribute('type'), title: l.getAttribute('title') || undefined});
             });
             return {
+                url: location.href,
                 title: document.title,
                 description: meta('description'),
                 canonical: (document.querySelector('link[rel="canonical"]') || {}).href || undefined,
@@ -1241,8 +1304,18 @@ class SessionManager implements IBrowserDriver {
     }
 
     /** CDP 通用 inputMouse 接口实现：直接转发 Input.dispatchMouseEvent */
-    async inputMouse(type: InputMouseType, x: number, y: number, options: InputMouseOptions = {}): Promise<void> {
+    async inputMouse(
+        type: InputMouseType,
+        x: number,
+        y: number,
+        options: InputMouseOptions & { releaseAfterPress?: boolean } = {},
+        timeout?: number
+    ): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
         this.ensureSession()
+        if (deadline !== undefined) {
+            remainingNavigationTimeout(deadline)
+        }
         const params: Record<string, unknown> = {
             type,
             x: Math.round(x),
@@ -1263,7 +1336,42 @@ class SessionManager implements IBrowserDriver {
         if (options.modifiers !== undefined) {
             params.modifiers = options.modifiers
         }
-        await this.send('Input.dispatchMouseEvent', params)
+        if (type === 'mousePressed' && options.releaseAfterPress) {
+            const cdp = this.cdp!
+            const sessionId = this.sessionId ?? undefined
+            let failed = false
+            let failure: unknown
+            try {
+                await withNavigationBudget(
+                    () =>
+                        this.send(
+                            'Input.dispatchMouseEvent',
+                            params,
+                            deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                        ),
+                    deadline
+                )
+            } catch (error) {
+                failed = true
+                failure = error
+            } finally {
+                try {
+                    await cdp.send('Input.dispatchMouseEvent', { ...params, type: 'mouseReleased' }, sessionId, 1000)
+                } catch (error) {
+                    if (failed) {
+                        console.warn('[MCP] 鼠标释放清理失败，请检查原目标会话的鼠标状态')
+                    } else {
+                        failed = true
+                        failure = error
+                    }
+                }
+            }
+            if (failed) {
+                throw failure
+            }
+        } else {
+            await this.send('Input.dispatchMouseEvent', params, timeout)
+        }
         // mouseMoved 同步坐标到 BehaviorSimulator,与 mouseMove 方法保持一致
         if (type === 'mouseMoved') {
             this.behaviorSimulator.setCurrentPosition({ x: Math.round(x), y: Math.round(y) })
@@ -1277,8 +1385,8 @@ class SessionManager implements IBrowserDriver {
     }
 
     /** CDP inputType 接口实现：直接复用现有 type 方法 */
-    inputType(text: string, delay = 0): Promise<void> {
-        return this.type(text, delay)
+    inputType(text: string, delay = 0, timeout?: number): Promise<void> {
+        return this.type(text, delay, timeout)
     }
 
     // ==================== IBrowserDriver: Stealth（CDP 不支持） ====================
@@ -1328,8 +1436,9 @@ class SessionManager implements IBrowserDriver {
     }
 
     /** IBrowserDriver 接口：选择操作目标（attach 即可） */
-    async selectPage(targetId: string): Promise<void> {
-        await this.attachToTarget(targetId)
+    async selectPage(targetId: string, timeout?: number): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        await this.withLock(() => this.attachToTargetInternal(targetId, deadline), deadline)
     }
 
     /** IBrowserDriver 接口：获取当前操作目标 ID */
@@ -1337,21 +1446,30 @@ class SessionManager implements IBrowserDriver {
         return this.currentTargetId
     }
 
-    async deselectPage(): Promise<void> {
+    async deselectPage(timeout?: number): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
         try {
             if (this.sessionId && this.cdp?.isConnected) {
-                await this.cdp.send('Target.detachFromTarget', { sessionId: this.sessionId })
+                await this.cdp.send(
+                    'Target.detachFromTarget',
+                    { sessionId: this.sessionId },
+                    undefined,
+                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                )
             }
         } finally {
             this.clearAttachedTargetState()
         }
     }
 
-    async getPageSnapshot(targetId: string): Promise<{ targetId: string; url: string; revision: string }> {
+    async getPageSnapshot(
+        targetId: string,
+        timeout?: number
+    ): Promise<{ targetId: string; url: string; revision: string }> {
         this.ensureConnected()
         const { targetInfo } = await this.sendBrowserCommand<{
             targetInfo: { targetId: string; url?: string; type: string }
-        }>('Target.getTargetInfo', { targetId })
+        }>('Target.getTargetInfo', { targetId }, timeout)
         if (targetInfo.type !== 'page' || targetInfo.targetId !== targetId) {
             throw new TargetNotFoundError(targetId)
         }
@@ -1366,8 +1484,13 @@ class SessionManager implements IBrowserDriver {
         this.pendingPageCondition = condition
     }
 
-    async assertPageCondition(targetId: string, expectedUrl?: string, expectedRevision?: string): Promise<void> {
-        const snapshot = await this.getPageSnapshot(targetId)
+    async assertPageCondition(
+        targetId: string,
+        expectedUrl?: string,
+        expectedRevision?: string,
+        timeout?: number
+    ): Promise<void> {
+        const snapshot = await this.getPageSnapshot(targetId, timeout)
         if (
             (expectedUrl !== undefined && snapshot.url !== expectedUrl) ||
             (expectedRevision !== undefined && snapshot.revision !== expectedRevision)
@@ -1629,7 +1752,7 @@ class SessionManager implements IBrowserDriver {
         const sendTimeout = timeout !== undefined ? timeout + CDP_MARGIN : undefined
 
         // 有参数时使用 callFunctionOn：避免大 payload 字符串拼接，参数通过协议结构化传递
-        if (args && args.length > 0) {
+        if (args !== undefined) {
             const { result: globalResult } = (await this.send('Runtime.evaluate', {
                 expression: 'globalThis',
                 returnByValue: false,
@@ -1730,10 +1853,27 @@ class SessionManager implements IBrowserDriver {
      *
      * IBrowserDriver 接口：可选 url 参数，url 提供时新建后立即导航
      */
-    async newPage(url?: string, _timeout?: number): Promise<NewTabResult> {
+    async newPage(url?: string, timeout?: number, options: NewPageOptions = {}): Promise<NewTabResult> {
+        if (Object.values(options).some((value) => value !== undefined)) {
+            throw new DriverCapabilityError(
+                'CDP 模式不支持 Chrome UI 的 newPage 配置参数，未创建页面；请使用 Extension 模式'
+            )
+        }
         const target = await this.withLock(async () => this.newPageInternal())
         if (url) {
-            await this.navigate(url)
+            try {
+                await this.navigate(url, { timeout })
+            } catch (error) {
+                throw creationError(error, {
+                    action: 'newPage',
+                    createdTargetId: target.targetId,
+                    targetId: target.targetId,
+                    managed: false,
+                    actionExecuted: true,
+                    actionStatus: 'partial',
+                    failureStage: 'navigation',
+                })
+            }
             return {
                 targetId: target.targetId,
                 url: this.state?.url ?? url,
@@ -1817,14 +1957,14 @@ class SessionManager implements IBrowserDriver {
         return this.state
     }
 
-    async getLiveState(): Promise<SessionState | null> {
+    async getLiveState(timeout?: number): Promise<SessionState | null> {
         if (!this.currentTargetId) {
             return this.state
         }
         this.ensureConnected()
         const { targetInfo } = await this.sendBrowserCommand<{
             targetInfo: { url?: string; title?: string; targetId: string }
-        }>('Target.getTargetInfo', { targetId: this.currentTargetId })
+        }>('Target.getTargetInfo', { targetId: this.currentTargetId }, timeout)
         this.state = {
             url: targetInfo.url ?? '',
             title: targetInfo.title ?? '',
@@ -1848,6 +1988,7 @@ class SessionManager implements IBrowserDriver {
      * ensureSession() 确保在当前 tick 内 this.cdp 非空
      */
     async send<T>(method: string, params?: object, timeout?: number): Promise<T> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
         this.ensureSession()
         const mutation =
             method === 'Page.navigate' ||
@@ -1865,22 +2006,28 @@ class SessionManager implements IBrowserDriver {
                     actualTargetId: this.currentTargetId,
                 })
             }
-            await this.assertPageCondition(condition.targetId, condition.expectedUrl, condition.expectedRevision)
+            await this.assertPageCondition(
+                condition.targetId,
+                condition.expectedUrl,
+                condition.expectedRevision,
+                timeout
+            )
             this.pendingPageCondition = null
         }
+        const remaining = deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
         if (mutation && this.currentTargetId) {
             this.revisions.set(this.currentTargetId, (this.revisions.get(this.currentTargetId) ?? 0) + 1)
         }
-        return this.cdp!.send<T>(method, params, this.sessionId ?? undefined, timeout)
+        return this.cdp!.send<T>(method, params, this.sessionId ?? undefined, remaining)
     }
 
     /**
      * 发送 browser-level CDP 命令（不携带 sessionId）
      * 用于 Target.*、Browser.* 等浏览器级命令
      */
-    sendBrowserCommand<T>(method: string, params?: object): Promise<T> {
+    sendBrowserCommand<T>(method: string, params?: object, timeout?: number): Promise<T> {
         this.ensureConnected()
-        return this.cdp!.send(method, params)
+        return this.cdp!.send(method, params, undefined, timeout)
     }
 
     /**
@@ -2202,7 +2349,7 @@ class SessionManager implements IBrowserDriver {
     /**
      * 附加到指定页面（内部版本，不加锁，供 launch/connect 等已持锁方法调用）
      */
-    private async attachToTargetInternal(targetId: string): Promise<void> {
+    private async attachToTargetInternal(targetId: string, deadline?: number): Promise<void> {
         this.ensureConnected()
 
         // 如果已经附加到同一个 target，跳过
@@ -2213,9 +2360,13 @@ class SessionManager implements IBrowserDriver {
         // 如果有之前的 session，先分离
         if (this.sessionId) {
             try {
-                await this.cdp!.send('Target.detachFromTarget', {
-                    sessionId: this.sessionId,
-                })
+                await this.sendBrowserCommand(
+                    'Target.detachFromTarget',
+                    {
+                        sessionId: this.sessionId,
+                    },
+                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                )
             } catch {
                 // 忽略分离错误
             }
@@ -2224,16 +2375,20 @@ class SessionManager implements IBrowserDriver {
         this.clearAttachedTargetState()
 
         // 附加到目标
-        const { sessionId } = (await this.cdp!.send('Target.attachToTarget', {
-            targetId,
-            flatten: true,
-        })) as { sessionId: string }
+        const { sessionId } = (await this.sendBrowserCommand(
+            'Target.attachToTarget',
+            {
+                targetId,
+                flatten: true,
+            },
+            deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+        )) as { sessionId: string }
 
         this.sessionId = sessionId
         this.currentTargetId = targetId
 
         // 初始化会话
-        await this.initSession()
+        await this.initSession(deadline)
     }
 
     /**
@@ -2244,9 +2399,30 @@ class SessionManager implements IBrowserDriver {
 
         const { targetId } = (await this.cdp!.send('Target.createTarget', {
             url: 'about:blank',
+        }).catch((error: unknown) => {
+            throw creationError(error, {
+                action: 'newPage',
+                createdTargetId: null,
+                managed: null,
+                actionExecuted: 'unknown',
+                actionStatus: 'unknown',
+                failureStage: 'create',
+            })
         })) as { targetId: string }
 
-        await this.attachToTargetInternal(targetId)
+        try {
+            await this.attachToTargetInternal(targetId)
+        } catch (error) {
+            throw creationError(error, {
+                action: 'newPage',
+                createdTargetId: targetId,
+                targetId,
+                managed: false,
+                actionExecuted: true,
+                actionStatus: 'partial',
+                failureStage: 'attach',
+            })
+        }
 
         return {
             targetId,
@@ -2301,25 +2477,42 @@ class SessionManager implements IBrowserDriver {
     /**
      * 串行执行操作（防止并发竞态）
      */
-    private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    private async withLock<T>(fn: () => Promise<T>, deadline?: number): Promise<T> {
         const previousLock = this.operationLock
         let releaseLock: () => void
         this.operationLock = new Promise<void>((resolve) => {
             releaseLock = resolve
         })
+        let acquired = false
         try {
-            await previousLock
+            await waitForNavigationQueue(previousLock, deadline)
+            acquired = true
             return await fn()
+        } catch (error) {
+            if (deadline !== undefined) {
+                const context = { actionExecuted: 'unknown', actionStatus: 'unknown', retryable: false }
+                if (error instanceof CDPError && error.message.startsWith('CDP 命令超时: ')) {
+                    throw new StructuredToolError('TIMEOUT', error.message, '请回读实际页面，勿自动重放导航', context)
+                }
+                if (error instanceof TimeoutError || error instanceof NavigationTimeoutError) {
+                    Object.assign(error.context, context)
+                }
+            }
+            throw error
         } finally {
-            releaseLock!()
+            if (acquired) {
+                releaseLock!()
+            } else {
+                void previousLock.then(releaseLock!, releaseLock!)
+            }
         }
     }
 
     /**
      * 等待多个事件中的任一个触发
      *
-     * 用于同时监听跨文档导航 (loadEventFired) 和同文档导航 (navigatedWithinDocument)，
-     * 任意一个事件触发后清理所有监听器和超时定时器
+     * 监听当前 session 的加载完成、主 frame BFCache 恢复和同文档导航，
+     * 接受完成事件后清理所有监听器和超时定时器
      * close() 时通过 'disconnected' 信号立即 reject，不必等 timer 超时
      */
     private waitForAnyEvent(events: string[], timeout: number): Promise<void> {
@@ -2356,8 +2549,27 @@ class SessionManager implements IBrowserDriver {
             cdp.once('disconnected', onDisconnected)
 
             for (const event of events) {
-                const listener = (_params: unknown, eventSessionId?: string) => {
+                const listener = (params: unknown, eventSessionId?: string) => {
                     if (eventSessionId !== sessionId) {
+                        return
+                    }
+                    if (event === 'Page.frameNavigated') {
+                        const navigation = params as {
+                            type?: string
+                            frame?: { id?: string; parentId?: string }
+                        }
+                        if (
+                            navigation.type !== 'BackForwardCacheRestore' ||
+                            navigation.frame?.id !== this.mainFrameId ||
+                            navigation.frame.parentId
+                        ) {
+                            return
+                        }
+                    }
+                    if (
+                        event === 'Page.navigatedWithinDocument' &&
+                        (params as { frameId?: string }).frameId !== this.mainFrameId
+                    ) {
                         return
                     }
                     cleanup()
@@ -2372,17 +2584,20 @@ class SessionManager implements IBrowserDriver {
     /**
      * 初始化会话
      */
-    private async initSession(): Promise<void> {
+    private async initSession(deadline?: number): Promise<void> {
+        const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
         // 启用必要的域
         await Promise.all([
-            this.send('Page.enable'),
-            this.send('DOM.enable'),
-            this.send('Network.enable'),
-            this.send('Log.enable'),
+            this.send('Page.enable', undefined, remaining()),
+            this.send('DOM.enable', undefined, remaining()),
+            this.send('Network.enable', undefined, remaining()),
+            this.send('Log.enable', undefined, remaining()),
         ])
-        await this.send('Page.setLifecycleEventsEnabled', { enabled: true })
+        await this.send('Page.setLifecycleEventsEnabled', { enabled: true }, remaining())
         const { frameTree } = await this.send<{ frameTree: { frame: { id: string; loaderId?: string } } }>(
-            'Page.getFrameTree'
+            'Page.getFrameTree',
+            undefined,
+            remaining()
         )
         this.mainFrameId = frameTree.frame.id
         this.mainFrameLoaderId = frameTree.frame.loaderId ?? null
@@ -2390,16 +2605,20 @@ class SessionManager implements IBrowserDriver {
         // 根据 stealth 模式注入反检测脚本。不在当前文档 Runtime.evaluate，避免干扰 Cloudflare JS Challenge
         if (this.stealthMode !== 'off') {
             const script = getAntiDetectionScript(this.stealthMode)
-            await this.send('Page.addScriptToEvaluateOnNewDocument', {
-                source: script,
-            })
+            await this.send(
+                'Page.addScriptToEvaluateOnNewDocument',
+                {
+                    source: script,
+                },
+                remaining()
+            )
         }
 
         // 监听事件
         this.setupEventListeners()
 
         // 更新状态
-        await this.updateState()
+        await this.updateState(remaining())
     }
 
     /**
@@ -2538,8 +2757,8 @@ class SessionManager implements IBrowserDriver {
     /**
      * 更新页面状态
      */
-    private async updateState(): Promise<void> {
-        await this.getLiveState()
+    private async updateState(timeout?: number): Promise<void> {
+        await this.getLiveState(timeout)
     }
 
     private async ensureRuntimeEnabled(): Promise<void> {

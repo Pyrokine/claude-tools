@@ -17,6 +17,7 @@ pub struct ContextParams {
     pub until_ref: Option<String>,
     pub direction: String,
     pub project: Option<String>,
+    pub source: Option<String>,
     pub types: Vec<String>,
     pub subtypes: Vec<String>,
     pub max_content: usize,
@@ -41,6 +42,7 @@ impl Default for ContextParams {
             until_ref: None,
             direction: "forward".to_string(),
             project: None,
+            source: None,
             types: vec![],
             subtypes: vec![],
             max_content: 4000,
@@ -89,8 +91,12 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
     })?;
 
     // 查找 session 文件
-    let (_project_id, session_id, path) =
-        find_session_file(config, &parsed_ref.session_prefix, params.project.as_deref())?;
+    let (_project_id, session_id, path) = find_session_file(
+        config,
+        &parsed_ref.session_prefix,
+        params.project.as_deref(),
+        params.source.as_deref(),
+    )?;
 
     let prefix = ref_prefix(&session_id);
     let range = if let Some(until_type) = &params.until_type {
@@ -128,7 +134,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
         range,
     )?;
     let anchor_idx = index.anchor_idx;
-    let window = load_session_window(&path, &index.messages, params.redaction)?;
+    let window = load_session_window(&path, &index, params.redaction)?;
     // 构建结果
     let mut messages = Vec::new();
     let mut truncated_by_content = false;
@@ -337,6 +343,7 @@ mod tests {
                 before: Some(0),
                 after: Some(0),
                 project: Some("project".to_string()),
+                source: None,
                 ..ContextParams::default()
             },
         )
@@ -393,6 +400,7 @@ mod tests {
                 before: Some(0),
                 after: Some(0),
                 project: Some("project".to_string()),
+                source: None,
                 max_content: 1,
                 ..ContextParams::default()
             },
@@ -440,6 +448,7 @@ mod tests {
                     r#ref: anchor,
                     until_ref: Some(until),
                     project: Some("project".to_string()),
+                    source: None,
                     ..ContextParams::default()
                 },
             )
@@ -477,6 +486,7 @@ mod tests {
                 before: Some(5),
                 after: Some(2),
                 project: Some("project".to_string()),
+                source: None,
                 max_total: 700,
                 ..ContextParams::default()
             },
@@ -512,6 +522,7 @@ mod tests {
             ContextParams {
                 r#ref: "session-:1".to_string(),
                 project: Some("project".to_string()),
+                source: None,
                 ..ContextParams::default()
             },
         )

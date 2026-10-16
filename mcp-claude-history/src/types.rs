@@ -41,6 +41,10 @@ pub struct SearchResult {
     pub images: Vec<ImageInfo>,
     pub project: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -104,6 +108,13 @@ pub struct SummaryBucket {
     pub count: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchMetadataDimension {
+    pub total: usize,
+    pub returned: usize,
+    pub omitted: usize,
+}
+
 /// 图片信息
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageInfo {
@@ -149,6 +160,8 @@ pub struct SearchStats {
     pub ignored_keys: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata_dimensions: std::collections::BTreeMap<String, SearchMetadataDimension>,
     /// 是否触发了全局命中硬上限截断（GLOBAL_RESULT_CAP）；
     /// 客户端看到 has_more=false + truncated_global=true 应理解为"翻完但被截，需缩小搜索"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +194,8 @@ pub struct EffectiveFilters {
     pub projects: Vec<String>,
     pub all_projects: bool,
     pub sessions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub subagents: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,

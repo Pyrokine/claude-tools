@@ -55,6 +55,9 @@ export function validateKeyFile(p: string): void {
     }
 
     const stats = fs.statSync(real)
+    if (!stats.isFile()) {
+        throw new Error('Private key path must point to a regular file')
+    }
     if (stats.size > MAX_KEY_FILE_SIZE) {
         throw new Error(`Private key file too large: ${stats.size} bytes (max ${MAX_KEY_FILE_SIZE})`)
     }
@@ -80,6 +83,9 @@ export function validateConfigFile(p: string): void {
     }
 
     const stats = fs.statSync(real)
+    if (!stats.isFile()) {
+        throw new Error('SSH config path must point to a regular file')
+    }
     if (stats.size > MAX_CONFIG_FILE_SIZE) {
         throw new Error(`SSH config file too large: ${stats.size} bytes (max ${MAX_CONFIG_FILE_SIZE})`)
     }

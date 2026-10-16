@@ -17,8 +17,8 @@
 现在按 UTF-8 字节分别限制 exec 的 stdout/stderr 返回正文，原来按 JavaScript 字符串长度计量；非 ASCII 输出需要重新计算预算，并检查
 `stdoutTruncated` / `stderrTruncated`；`maxOutputSize=3` 可返回一个汉字，不能返回三个，文本只返回完整字符
 
-PTY 的 `bufferSize` 参数、read/list 结果中的 `bufferSize`、`unreadRawBytes` 和 `rawBufferLimit`
-现在按原始字节计量；raw 读取使用 `clear=true` 时，响应中的计数和 `rawBufferTruncated`
+PTY 的 `bufferSize` 参数与列表结果中的 `bufferSize`，以及 read/list 中的 `unreadRawBytes` 和 `rawBufferLimit`
+均按原始字节计量；raw 读取使用 `clear=true` 时，响应中的计数和 `rawBufferTruncated`
 描述清理前的状态，下次读取才反映清理后的缓冲区；精确读取 ANSI 或二进制输出用 `dataBase64`，`data` 是 UTF-8 文本预览
 
 文件读取支持 `encoding`（`auto`、`utf8`、`utf16le`、`utf16be`、`gbk`）和无损 `binary=true`；偏移按字节计量，分页使用
@@ -124,6 +124,8 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 
 `ssh_list_sessions()` 默认只返回 `alias`、规范化 `identity`、`runAs`、`connected` 和 `lastUsedAt`，使用 `detail=true`
 获取连接详情，或通过 `fields=[...]` 选择字段，任何模式都不返回 `keyPath`
+
+连接启用 TCP_NODELAY，减少交互命令和小文件 SFTP 请求之间的等待，直连、跳板和替代连接使用相同行为，无需新增选项
 
 `ssh_reconnect` 会在发布替代连接前，使绑定旧 client 的 operation、PTY、forward 和传输能力缓存失效。
 
@@ -373,7 +375,12 @@ timeout 错误也包含超时前已经产生的 head/tail 输出。stdout 和 st
 chunk，也会完整返回。
 
 `commandRisk`
-按所选 shell 报告破坏性、提权、凭据参数、进程控制及资源使用风险。只读搜索中的敏感词和普通 Python/Node 命令不会仅凭词语触发风险提示
+按所选 shell 报告破坏性、提权、凭据参数、进程控制及资源使用风险，只读搜索中的敏感词和普通 Python/Node 命令不会仅凭词语触发风险提示
+
+`commandRisk`
+仅提供诊断，不改变命令执行或执行结果 POSIX 分类将 here-doc 正文视为输入，支持引用及部分引用 delimiter、反斜杠引用、`<<-`
+和多个 here-doc 在大小写精确匹配的 delimiter 后恢复命令检查；未引用正文与双引号参数内的有效命令替换仍会检查 EOF 的后台
+`&` 会报告；`&&`、重定向、转义 `&` 和引用输入不会误报为后台操作
 
 ### 可跟踪的长时间命令
 
@@ -399,6 +406,11 @@ start callback 都会被拒绝并销毁 channel，sudo callback 在 timeout 后�
 listener 会在 SSH exec callback 返回前安装，极短命令即使立即输出 marker 并关闭，也会进入终态并设置 `finishedAt` 和
 `expiresAt`；SSH 会话在 tracked command 运行期间断开后状态变为 `unknown`，不会声称远端进程已经停止，`ssh_exec`
 保持原有同步 timeout 行为
+
+POSIX tracked 命令使用可用的 `setsid -w` 等待实际命令，包括 `setsid` 派生子进程的情况；非零退出为
+`failed`，零退出仍可含 stderr 输出命令在 `sh` 下执行，`pipefail` 等 Bash 选项须显式使用 `bash -lc`；没有 `setsid`
+时，`processGroup=false`，取消只针对 PID POSIX 取消先校验 marker，再使用 `sh`
+与 Bash 支持的信号参数发送 TERM，终止期间产生的系统诊断保留在 stderr
 
 ### 交互式命令（PTY 模式）
 
@@ -580,7 +592,9 @@ MiB、总哈希字节 1 GiB，可通过 `verify.maxEntries`、`verify.maxFileByt
 请求校验后，mismatch、skipped 或校验错误都会令顶层 `success=false`，`transferSuccess` 仍单独表示传输是否完成，
 `verificationStatus`、`verificationSuccess` 和 `failedChecks`
 描述校验结果，SFTP 单文件同步还会返回本地和远端的 size、mode 或 permissions、mtime、owner/group，以及通过 SFTP 流读取计算的 SHA-256 对比，upload 单文件使用
-`verifyOwner` 和 `verifyMode` ，目录逐项校验使用 `verify.owner` 和 `verify.mode`
+`verifyOwner` 和 `verifyMode`，目录逐项校验使用 `verify.owner` 和 `verify.mode`
+校验不会自动执行 chown/chmod，SFTP 新目录使用目标端默认权限，新下载文件使用
+`0600`，覆盖既有本地普通文件保留其 rwx 内容和 owner 匹配不代表 mode 匹配，请求 mode 校验时，已完成的传输仍会因权限不同而返回校验失败
 
 只有直连且存在已校验 key path 或可用 SSH agent 时才选择 rsync，password、inline key 和 jump
 host 会使用 SFTP，因为独立 OpenSSH 进程无法安全继承对应路由或认证材料，`preflightTimeout`、`connectTimeout` 和
@@ -625,9 +639,10 @@ ssh_pty_read(ptyId="pty_1_xxx")
 ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 ```
 
-`ssh_pty_read` 和 `ssh_pty_list` 返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、`bufferSize`、
-`unreadRawBytes`、`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`。三个 size 字段都按字节计数。screen 输出使用增量解码；raw 的
-`dataBase64` 无损保存原始字节，包括不完整的 UTF-8 序列，`data` 是文本预览。`rawBufferTruncated=true`
+`ssh_pty_read` 和 `ssh_pty_list` 返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、
+`unreadRawBytes`、`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`，列表项还返回
+`bufferSize`，这些 size 字段都按字节计数，screen 输出使用增量解码；raw 的 `dataBase64`
+无损保存原始字节，包括不完整的 UTF-8 序列，`data` 是文本预览。`rawBufferTruncated=true`
 表示从上次 clear 起已有更早的 raw 输出因字节上限被丢弃。raw 读取默认
 `clear=true`，响应返回清理前的字节数和截断标志，随后重置 raw 缓冲区和标志；screen 读取不清理 raw 状态。有限命令自然结束后仍可读取最终 screen，返回
 `active=false`，直到显式 close 或 closed session 保留期结束，默认 5 分钟，可通过 `SSH_MCP_PTY_CLOSED_RETENTION_MS`

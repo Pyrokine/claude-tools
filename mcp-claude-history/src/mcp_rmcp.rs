@@ -25,6 +25,29 @@ use crate::utils::{
     parse_optional_redaction_mode_param, parse_time_bounds, split_csv_param,
 };
 
+async fn run_history_work<T: Send + 'static>(
+    request: rmcp::service::RequestContext<rmcp::RoleServer>,
+    action: impl FnOnce() -> Result<T, ErrorResponse> + Send + 'static,
+    render: impl FnOnce(Result<T, ErrorResponse>) -> Result<CallToolResult, McpError> + Send + 'static,
+) -> Result<CallToolResult, McpError> {
+    let cancelled = request.ct.clone();
+    let control =
+        crate::record_reader::WorkControl::new(move || cancelled.is_cancelled(), std::time::Duration::from_secs(120));
+    tokio::task::spawn_blocking(move || {
+        control.run(|| {
+            let result = crate::record_reader::check_work()
+                .and_then(|_| action())
+                .and_then(|value| {
+                    crate::record_reader::check_work()?;
+                    Ok(value)
+                });
+            render(result)
+        })
+    })
+    .await
+    .map_err(|error| McpError::internal_error(format!("join error: {error}"), None))?
+}
+
 fn default_max_content_schema() -> Option<usize> {
     Some(DEFAULT_MAX_CONTENT)
 }
@@ -50,8 +73,26 @@ enum RedactionSchema {
     Off,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct SearchToolParams {
+    /// normal（默认）保留时间排序与 UUID 去重；scan 按冻结文件和物理行读取，不去重
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// 原样使用 scan 返回的 next_query；绑定当前进程，最近一页重试会重放
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// 单批处理字节预算，包含索引和投影读取，在固定缓冲边界检查
+    #[serde(default)]
+    #[schemars(range(min = 16384, max = 268435456))]
+    pub scan_bytes: Option<u64>,
+    /// 单批主动处理时间预算，10..10000 ms，不计批次之间的空闲
+    #[serde(default)]
+    #[schemars(range(min = 10, max = 10000))]
+    pub scan_ms: Option<u64>,
+    /// preview 限制结构化字段并附 history_get 定位；full 返回完整脱敏结构，normal 默认 full，scan 默认 preview
+    #[serde(default)]
+    pub structured: Option<String>,
+    /// 空串匹配全部；非 regex 时空格表示 AND、a|b 表示 OR、!term 排除；匹配完整正文，不受预览长度限制
     #[serde(default)]
     pub pattern: Option<String>,
     #[serde(default)]
@@ -60,6 +101,9 @@ pub struct SearchToolParams {
     pub all: Option<bool>,
     #[serde(default)]
     pub sessions: Option<String>,
+    /// 原样使用 search 或 scan metadata 返回的精确 source，选择一个物理文件；与显式 project、sessions 取交集，子会话仍需 subagents=true
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]
@@ -96,10 +140,12 @@ pub struct SearchToolParams {
     pub tool_payload_errors: Option<bool>,
     #[serde(default, alias = "dryRun", alias = "explain")]
     pub dry_run: Option<bool>,
+    /// normal 导出 JSONL bundle；相对路径默认 tmp:，cwd: 只接受当前工作目录下的相对路径；使用返回的实际 output 路径
     #[serde(default)]
     pub output: Option<String>,
     #[serde(default)]
     pub overwrite: Option<bool>,
+    /// search 导出只支持 jsonl，不能使用 json；scan 不支持 output
     #[serde(default)]
     pub output_format: Option<String>,
     #[serde(default)]
@@ -107,6 +153,7 @@ pub struct SearchToolParams {
     pub redaction: Option<String>,
     #[serde(default)]
     pub lines: Option<String>,
+    /// normal 将 pattern 作为 Rust regex，拒绝 look-around 和 backreference；scan 不支持 regex
     #[serde(default)]
     pub regex: Option<bool>,
     #[serde(default)]
@@ -140,7 +187,7 @@ pub struct SearchToolParams {
     pub max_total: Option<usize>,
     #[serde(default)]
     #[schemars(
-        description = "Default false searches only main JSONL files. True also includes <session>/subagents and <session>/remote-agents. sessions matches each file's own ID; a parent ID does not include its children.",
+        description = "Default false searches only main JSONL files. True also includes <session>/subagents, <session>/remote-agents, and <session>/subagents/workflows/<run>/agent-<id>.jsonl. Workflow journal files are excluded. sessions matches each file's own ID; a parent ID does not include its children.",
         default = "default_subagents_schema"
     )]
     pub subagents: Option<bool>,
@@ -149,8 +196,33 @@ pub struct SearchToolParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScanMetadataToolParams {
+    pub scan_id: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 10000))]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    #[schemars(range(min = 512, max = 10000000))]
+    pub max_total: Option<usize>,
+    /// 释放扫描状态，终止尚未完成的读取；不删除用户导出
+    #[serde(default)]
+    pub release: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetToolParams {
     pub r#ref: String,
+    /// 原样使用 search 或 scan metadata 返回的 source，精确选择同名会话来源；只允许当前历史目录内的已识别布局
+    #[serde(default)]
+    pub source: Option<String>,
+    /// content（默认）、tool_input、tool_result 或 record；record 返回整条原 JSON 对象的规范化脱敏文本，包括内部记录
+    #[serde(default)]
+    pub view: Option<String>,
+    /// 仅工具视图使用原始 message.content 数组下标；多个工具块时必须指定，record 不接受 block
+    #[serde(default)]
+    pub block: Option<usize>,
     #[serde(default)]
     pub range: Option<String>,
     #[serde(default)]
@@ -167,6 +239,9 @@ pub struct GetToolParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ContextToolParams {
     pub r#ref: String,
+    /// 原样使用 search 或 scan metadata 返回的 source，精确选择同名会话来源；只允许当前历史目录内的已识别布局
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub before: Option<usize>,
     #[serde(default)]
@@ -214,6 +289,9 @@ pub struct ContextToolParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TraceToolParams {
     pub r#ref: String,
+    /// 原样使用 search 或 scan metadata 返回的 source，精确选择同名会话来源；只允许当前历史目录内的已识别布局
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub before: Option<usize>,
     #[serde(default)]
@@ -275,6 +353,7 @@ pub struct SessionsToolParams {
 #[derive(Clone)]
 pub struct McpHistoryService {
     config: Config,
+    scans: crate::stream_scan::ScanStore,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -293,22 +372,31 @@ fn error_text(text: String) -> Result<CallToolResult, McpError> {
 }
 
 fn tool_text_result(result: Result<impl serde::Serialize, ErrorResponse>) -> Result<CallToolResult, McpError> {
-    match result {
-        Ok(value) => ok_text(
-            serde_json::to_string_pretty(&value)
-                .map_err(|e| McpError::internal_error(format!("history response serialization failed: {e}"), None))?,
-        ),
-        Err(error) => error_text(pretty_error(error)),
-    }
+    serialized_tool_text_result(result, true)
 }
 
 fn compact_tool_text_result(result: Result<impl serde::Serialize, ErrorResponse>) -> Result<CallToolResult, McpError> {
-    match result {
-        Ok(value) => ok_text(
-            serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("history response serialization failed: {e}"), None))?,
-        ),
-        Err(error) => error_text(pretty_error(error)),
+    serialized_tool_text_result(result, false)
+}
+
+fn serialized_tool_text_result(
+    result: Result<impl serde::Serialize, ErrorResponse>,
+    pretty: bool,
+) -> Result<CallToolResult, McpError> {
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => return error_text(pretty_error(error)),
+    };
+    let mut bytes = Vec::new();
+    match crate::record_reader::serialize_json(&mut bytes, &value, pretty) {
+        Ok(_) => ok_text(String::from_utf8(bytes).expect("JSON is UTF-8")),
+        Err(error) if matches!(error.error.as_str(), "cancelled" | "deadline_exceeded") => {
+            error_text(pretty_error(error))
+        }
+        Err(error) => Err(McpError::internal_error(
+            format!("history response serialization failed: {}", error.message),
+            None,
+        )),
     }
 }
 
@@ -316,6 +404,7 @@ impl McpHistoryService {
     pub fn new() -> Self {
         Self {
             config: Config::from_env(),
+            scans: crate::stream_scan::ScanStore::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -324,8 +413,33 @@ impl McpHistoryService {
 #[tool_router]
 impl McpHistoryService {
     #[tool(description = "Search Claude Code history. `human` means user-shaped; it does not verify human authorship.")]
-    async fn history_search(&self, Parameters(p): Parameters<SearchToolParams>) -> Result<CallToolResult, McpError> {
+    async fn history_search(
+        &self,
+        Parameters(p): Parameters<SearchToolParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
+        let mode = p.mode.as_deref().unwrap_or("normal");
+        if mode != "normal" && mode != "scan" {
+            return error_text(pretty_error(crate::utils::invalid_arguments(
+                "mode 仅支持 normal 或 scan",
+            )));
+        }
+        if mode == "normal" && (p.cursor.is_some() || p.scan_bytes.is_some() || p.scan_ms.is_some()) {
+            return error_text(pretty_error(crate::utils::invalid_arguments(
+                "cursor、scan_bytes、scan_ms 需要 mode=scan",
+            )));
+        }
+        let scanning = mode == "scan";
+        let mut explicit_filters =
+            serde_json::to_value(&p).map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        explicit_filters
+            .as_object_mut()
+            .expect("SearchToolParams object")
+            .retain(|key, value| {
+                !value.is_null()
+                    && !["mode", "cursor", "scan_bytes", "scan_ms", "limit", "max_total"].contains(&key.as_str())
+            });
 
         let projects: Vec<String> = split_csv_param(p.project.as_deref());
         let sessions: Vec<String> = split_csv_param(p.sessions.as_deref());
@@ -356,6 +470,7 @@ impl McpHistoryService {
             projects,
             all_projects: p.all.unwrap_or(false),
             sessions,
+            source: p.source,
             since,
             until,
             types,
@@ -383,15 +498,68 @@ impl McpHistoryService {
             overwrite: p.overwrite.unwrap_or(false),
             output_format: p.output_format,
             subagents: p.subagents.unwrap_or(false),
+            structured: p.structured,
         };
-        let result = tokio::task::spawn_blocking(move || search(&cfg, params))
-            .await
-            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
-        compact_tool_text_result(result)
+        let cancelled = context.ct.clone();
+        if scanning {
+            let scans = self.scans.clone();
+            let request = crate::stream_scan::ScanRequest {
+                params,
+                cursor: p.cursor,
+                scan_bytes: p.scan_bytes,
+                scan_ms: p.scan_ms,
+                explicit_filters,
+            };
+            let signal = std::sync::Arc::new(move || cancelled.is_cancelled());
+            let control_signal = signal.clone();
+            let control =
+                crate::record_reader::WorkControl::new(move || control_signal(), std::time::Duration::from_secs(120));
+            let result = tokio::task::spawn_blocking(move || control.run(|| scans.search(&cfg, request, signal)))
+                .await
+                .map_err(|error| McpError::internal_error(format!("join error: {error}"), None))?;
+            return match result {
+                Ok(text) => ok_text(text),
+                Err(error) => error_text(pretty_error(error)),
+            };
+        }
+        run_history_work(context, move || search(&cfg, params), compact_tool_text_result).await
     }
 
-    #[tool(description = "Get full content of a message by ref")]
-    async fn history_get(&self, Parameters(p): Parameters<GetToolParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Page through a completed scan's frozen file coverage, effective filters, exact summary buckets, warnings and attribution refs. Follow next_query until has_more=false, then release=true. Does not delete exports."
+    )]
+    async fn history_scan_metadata(
+        &self,
+        Parameters(p): Parameters<ScanMetadataToolParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let scans = self.scans.clone();
+        let request = crate::stream_scan::MetadataRequest {
+            scan_id: p.scan_id,
+            cursor: p.cursor,
+            limit: p.limit.unwrap_or(100),
+            max_total: p.max_total.unwrap_or(DEFAULT_MAX_TOTAL),
+            release: p.release.unwrap_or(false),
+        };
+        run_history_work(
+            context,
+            move || scans.metadata(request),
+            |result| match result {
+                Ok(text) => ok_text(text),
+                Err(error) => error_text(pretty_error(error)),
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Get message text or a selected tool input/result by ref. range uses original Unicode character offsets before redaction; oversized records are indexed without loading their whole JSON value. output exports a complete transactional bundle."
+    )]
+    async fn history_get(
+        &self,
+        Parameters(p): Parameters<GetToolParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let range = match parse_optional_range_param(p.range.as_deref()) {
             Ok(range) => range,
@@ -407,18 +575,22 @@ impl McpHistoryService {
             output: p.output,
             overwrite: p.overwrite.unwrap_or(false),
             project: p.project,
+            source: p.source,
             redaction,
+            view: p.view,
+            block: p.block,
         };
-        let result = tokio::task::spawn_blocking(move || get(&cfg, params))
-            .await
-            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
-        tool_text_result(result)
+        run_history_work(context, move || get(&cfg, params), tool_text_result).await
     }
 
     #[tool(
         description = "Get surrounding messages using before/after, until_type, or until_ref. Local queries support large sessions; the selected span is limited to 2,000 messages and 32 MiB, including hidden messages. Diagnostics cover the scanned prefix only."
     )]
-    async fn history_context(&self, Parameters(p): Parameters<ContextToolParams>) -> Result<CallToolResult, McpError> {
+    async fn history_context(
+        &self,
+        Parameters(p): Parameters<ContextToolParams>,
+        request: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let types: Vec<String> = split_csv_param(p.types.as_deref());
         let subtypes: Vec<String> = split_csv_param(p.subtypes.as_deref());
@@ -434,6 +606,7 @@ impl McpHistoryService {
             until_ref: p.until_ref,
             direction: p.direction.unwrap_or_else(|| "forward".to_string()),
             project: p.project,
+            source: p.source,
             types,
             subtypes,
             max_content: p.max_content.unwrap_or(4000),
@@ -445,16 +618,17 @@ impl McpHistoryService {
             overwrite: p.overwrite.unwrap_or(false),
             redaction,
         };
-        let result = tokio::task::spawn_blocking(move || context(&cfg, params))
-            .await
-            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
-        compact_tool_text_result(result)
+        run_history_work(request, move || context(&cfg, params), compact_tool_text_result).await
     }
 
     #[tool(
         description = "Trace nearby messages and tool call/result pairs. Choose one range mode. Local queries support large sessions; the selected span is limited to 2,000 messages and 32 MiB, including hidden messages. Diagnostics cover the scanned prefix only."
     )]
-    async fn history_trace(&self, Parameters(p): Parameters<TraceToolParams>) -> Result<CallToolResult, McpError> {
+    async fn history_trace(
+        &self,
+        Parameters(p): Parameters<TraceToolParams>,
+        request: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let redaction = match parse_optional_redaction_mode_param(p.redaction.as_deref()) {
             Ok(redaction) => redaction,
@@ -465,6 +639,7 @@ impl McpHistoryService {
             before: p.before,
             after: p.after,
             project: p.project,
+            source: p.source,
             max_content: p.max_content.unwrap_or(4000),
             max_total: p.max_total.unwrap_or(40000),
             types: split_csv_param(p.types.as_deref()),
@@ -481,10 +656,7 @@ impl McpHistoryService {
             overwrite: p.overwrite.unwrap_or(false),
             redaction,
         };
-        let result = tokio::task::spawn_blocking(move || trace(&cfg, params))
-            .await
-            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
-        compact_tool_text_result(result)
+        run_history_work(request, move || trace(&cfg, params), compact_tool_text_result).await
     }
 
     #[tool(description = "Get the running server build identity")]
@@ -493,18 +665,20 @@ impl McpHistoryService {
     }
 
     #[tool(description = "List all projects with conversation history")]
-    async fn history_projects(&self, _: Parameters<ProjectsToolParams>) -> Result<CallToolResult, McpError> {
+    async fn history_projects(
+        &self,
+        _: Parameters<ProjectsToolParams>,
+        request: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
-        let result = tokio::task::spawn_blocking(move || list_projects(&cfg))
-            .await
-            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
-        tool_text_result(result)
+        run_history_work(request, move || list_projects(&cfg), tool_text_result).await
     }
 
     #[tool(description = "List project sessions. Topics are redacted before preview; redaction defaults to auto.")]
     async fn history_sessions(
         &self,
         Parameters(p): Parameters<SessionsToolParams>,
+        request: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let project = p.project.clone();
@@ -512,10 +686,12 @@ impl McpHistoryService {
             Ok(redaction) => redaction,
             Err(e) => return error_text(pretty_error(e)),
         };
-        let result = tokio::task::spawn_blocking(move || list_sessions(&cfg, project.as_deref(), redaction))
-            .await
-            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
-        tool_text_result(result)
+        run_history_work(
+            request,
+            move || list_sessions(&cfg, project.as_deref(), redaction),
+            tool_text_result,
+        )
+        .await
     }
 }
 
@@ -540,6 +716,609 @@ pub async fn run_mcp_server_rmcp() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_context() -> rmcp::service::RequestContext<rmcp::RoleServer> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (client, server) = tokio::io::duplex(65536);
+        let serving = tokio::spawn(async move { McpHistoryService::new().serve(server).await });
+        let mut client = tokio::io::BufReader::new(client);
+        client.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let mut response = String::new();
+        client.read_line(&mut response).await.unwrap();
+        client
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let running = serving.await.unwrap().unwrap();
+        let context = rmcp::service::RequestContext::new(RequestId::Number(0), running.peer().clone());
+        running.cancel().await.unwrap();
+        context
+    }
+
+    #[tokio::test]
+    async fn all_history_readers_honor_request_cancellation_before_io() {
+        let service = McpHistoryService {
+            config: Config {
+                projects_dir: std::env::temp_dir().join("history-cancel-nonexistent-source"),
+            },
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        for tool in [
+            "search", "scan", "get", "context", "trace", "metadata", "sessions", "projects",
+        ] {
+            let request = test_context().await;
+            request.ct.cancel();
+            let mut params = serde_json::json!({"ref":"session0:1", "project":"project", "before":0, "after":0});
+            let result = match tool {
+                "search" | "scan" => {
+                    if tool == "scan" {
+                        params["mode"] = serde_json::json!("scan");
+                    }
+                    service
+                        .history_search(Parameters(serde_json::from_value(params).unwrap()), request)
+                        .await
+                }
+                "get" => {
+                    service
+                        .history_get(Parameters(serde_json::from_value(params).unwrap()), request)
+                        .await
+                }
+                "context" => {
+                    service
+                        .history_context(Parameters(serde_json::from_value(params).unwrap()), request)
+                        .await
+                }
+                "trace" => {
+                    service
+                        .history_trace(Parameters(serde_json::from_value(params).unwrap()), request)
+                        .await
+                }
+                "metadata" => {
+                    service
+                        .history_scan_metadata(
+                            Parameters(serde_json::from_value(serde_json::json!({"scan_id":"cancelled"})).unwrap()),
+                            request,
+                        )
+                        .await
+                }
+                "sessions" => {
+                    service
+                        .history_sessions(Parameters(serde_json::from_value(params).unwrap()), request)
+                        .await
+                }
+                "projects" => {
+                    service
+                        .history_projects(Parameters(ProjectsToolParams {}), request)
+                        .await
+                }
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["isError"], true, "{tool}: {result}");
+            let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["error"], "cancelled", "{tool}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_remains_active_during_response_serialization() {
+        struct CancelDuringSerialization {
+            cancel: Box<dyn Fn() + Send>,
+        }
+        impl serde::Serialize for CancelDuringSerialization {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                (self.cancel)();
+                serializer.serialize_str(&"x".repeat(65_536))
+            }
+        }
+        for pretty in [false, true] {
+            let request = test_context().await;
+            let cancellation = request.ct.clone();
+            let result = run_history_work(
+                request,
+                move || {
+                    Ok(CancelDuringSerialization {
+                        cancel: Box::new(move || cancellation.cancel()),
+                    })
+                },
+                move |result| serialized_tool_text_result(result, pretty),
+            )
+            .await
+            .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["isError"], true);
+            let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["error"], "cancelled");
+        }
+    }
+
+    #[tokio::test]
+    async fn large_anchor_preserves_window_positions_redaction_and_tool_pairing() {
+        use std::fs;
+        let owner = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("history-window-test-{owner}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(".owner"), &owner).unwrap();
+        let project = root.join("window");
+        fs::create_dir(&project).unwrap();
+        let source = project.join("window00.jsonl");
+        let result_text = format!(
+            "前缀😀 Authorization: Bearer {}\nvisible-after",
+            "x".repeat(crate::utils::MAX_JSONL_LINE_BYTES + 4096)
+        );
+        let records = [
+            serde_json::json!({"type":"user", "uuid":"before", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":"before-normal"}}),
+            serde_json::json!({"type":"assistant", "uuid":"call", "timestamp":"2026-10-01T00:00:01Z", "message":{"content":[{"type":"tool_use", "id":"large-call", "name":"mcp__fixture__probe", "input":{"note":"call-input"}}]}}),
+            serde_json::json!({"type":"user", "uuid":"large-result", "timestamp":"2026-10-01T00:00:02Z", "message":{"content":[{"type":"tool_result", "tool_use_id":"large-call", "content":result_text, "is_error":false}]}}),
+            serde_json::json!({"type":"user", "uuid":"after", "timestamp":"2026-10-01T00:00:03Z", "message":{"content":format!("after-normal-{}", "y".repeat(32768))}}),
+        ];
+        let mut file = std::io::BufWriter::new(fs::File::create(&source).unwrap());
+        use std::io::Write;
+        for record in records {
+            serde_json::to_writer(&mut file, &record).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let service = McpHistoryService {
+            config: Config {
+                projects_dir: root.clone(),
+            },
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        let params = serde_json::json!({"ref":"window00:3", "project":"window", "source":source, "before":1, "after":1, "max_content":200, "redaction":"strict"});
+        for result in [
+            service
+                .history_context(
+                    Parameters(serde_json::from_value(params.clone()).unwrap()),
+                    test_context().await,
+                )
+                .await
+                .unwrap(),
+            service
+                .history_trace(
+                    Parameters(serde_json::from_value(params.clone()).unwrap()),
+                    test_context().await,
+                )
+                .await
+                .unwrap(),
+        ] {
+            let result = serde_json::to_value(result).unwrap();
+            assert_ne!(result["isError"], true, "{result}");
+            let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message["ref"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["window00:2", "window00:3", "window00:4"]
+            );
+            assert!(body["messages"][1]["content"].as_str().unwrap().contains("[redacted]"));
+            assert!(!body["messages"][1]["content"].as_str().unwrap().contains("xxx"));
+            assert!(
+                body["messages"][2]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("after-normal-")
+            );
+            assert!(body["warnings"].as_array().is_none_or(Vec::is_empty));
+            if let Some(calls) = body["tool_calls"].as_array() {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0]["status"], "completed");
+                assert_eq!(calls[0]["result_ref"], "window00:3");
+                assert!(calls[0]["result_preview"].as_str().unwrap().contains("[redacted]"));
+                assert!(!calls[0]["result_preview"].as_str().unwrap().contains("xxx"));
+                assert!(body["association_issues"].as_array().is_none_or(Vec::is_empty));
+            }
+        }
+        let filter_source = project.join("filter00.jsonl");
+        let filter_records = [
+            serde_json::json!({"type":"assistant", "uuid":"filter-call", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":"filter-call", "name":"mcp__fixture__probe", "input":{}}]}}),
+            serde_json::json!({"type":"user", "uuid":"filter-result", "timestamp":"2026-10-01T00:00:01Z", "message":{"content":[{"type":"tool_result", "tool_use_id":"filter-call", "content":"fixture"}]}}),
+        ];
+        fs::write(
+            &filter_source,
+            filter_records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        for tools in ["probe", "mcp__fixture__probe", "mcp__other__probe"] {
+            let mut query = params.clone();
+            query["ref"] = serde_json::json!("filter00:2");
+            query["source"] = serde_json::json!(filter_source);
+            query["after"] = serde_json::json!(0);
+            query["tools"] = serde_json::json!(tools);
+            let result = service
+                .history_trace(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
+                .await
+                .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_ne!(result["isError"], true);
+            let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                body["tool_calls"].as_array().unwrap().len(),
+                usize::from(tools != "mcp__other__probe")
+            );
+        }
+        let get_params = serde_json::json!({"ref":"window00:3", "project":"window", "source":source, "range":"100-200", "redaction":"strict"});
+        let result = service
+            .history_get(
+                Parameters(serde_json::from_value(get_params).unwrap()),
+                test_context().await,
+            )
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_ne!(result["isError"], true);
+        let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["content"], "[redacted]");
+        assert_eq!(fs::read_to_string(root.join(".owner")).unwrap(), owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_selects_duplicate_agent_files_across_public_readers() {
+        use std::fs;
+        let owner = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("history-source-test-{owner}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(".owner"), &owner).unwrap();
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        let service = McpHistoryService {
+            config: config.clone(),
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        let sources = [
+            "project/parent00.jsonl",
+            "project/parent00/subagents/agent-same.jsonl",
+            "project/parent00/subagents/workflows/run/agent-same.jsonl",
+        ];
+        let mut paths = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let path = root.join(source);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{}\n", serde_json::json!({"type":"assistant", "uuid":format!("source-{index}"), "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":format!("call-{index}"), "name":"mcp__fixture__source", "input":{"note":format!("selected-source-{index}")}}]}}))).unwrap();
+            paths.push(path.canonicalize().unwrap());
+        }
+        let searched = service
+            .history_search(
+                Parameters(
+                    serde_json::from_value(
+                        serde_json::json!({"project":"project", "subagents":true, "structured":"preview"}),
+                    )
+                    .unwrap(),
+                ),
+                test_context().await,
+            )
+            .await
+            .unwrap();
+        let searched = serde_json::to_value(searched).unwrap();
+        assert_ne!(searched["isError"], true);
+        let response: serde_json::Value =
+            serde_json::from_str(searched["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(response["results"].as_array().unwrap().len(), 3);
+        for row in response["results"].as_array().unwrap() {
+            let source = row["source"].as_str().unwrap();
+            assert!(paths.iter().any(|path| path == std::path::Path::new(source)));
+            let pointer = row["tool_input_redacted"]["get"].clone();
+            assert_eq!(pointer["source"], source);
+            let selected = service
+                .history_get(
+                    Parameters(serde_json::from_value(pointer).unwrap()),
+                    test_context().await,
+                )
+                .await
+                .unwrap();
+            let selected = serde_json::to_value(selected).unwrap();
+            assert_ne!(selected["isError"], true);
+            assert!(
+                selected["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("selected-source-")
+            );
+        }
+        let error = crate::get::find_session_file(&config, "agent-same", Some("project"), None).unwrap_err();
+        assert_eq!(error.error, "session_ambiguous");
+        assert_eq!(error.available.unwrap()["sources"].as_array().unwrap().len(), 2);
+        let filter_error = crate::search::search(
+            &config,
+            crate::search::SearchParams {
+                projects: vec!["project".to_string()],
+                sessions: vec!["agent-same".to_string()],
+                subagents: true,
+                ..crate::search::SearchParams::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(filter_error.error, "session_ambiguous");
+        assert!(filter_error.message.contains("返回的 source 精确选择来源"));
+        assert_eq!(filter_error.available.unwrap()["sources"].as_array().unwrap().len(), 2);
+        for (index, source) in paths.iter().enumerate().skip(1) {
+            let params = serde_json::json!({"ref":"agent-same:1", "source":source, "before":0, "after":0});
+            for result in [
+                service
+                    .history_context(
+                        Parameters(serde_json::from_value(params.clone()).unwrap()),
+                        test_context().await,
+                    )
+                    .await
+                    .unwrap(),
+                service
+                    .history_trace(
+                        Parameters(serde_json::from_value(params).unwrap()),
+                        test_context().await,
+                    )
+                    .await
+                    .unwrap(),
+            ] {
+                let result = serde_json::to_value(result).unwrap();
+                assert_ne!(result["isError"], true);
+                let body: serde_json::Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+                assert!(
+                    body["messages"][0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("selected-source-{index}"))
+                );
+            }
+        }
+        for (index, source) in paths.iter().enumerate() {
+            let extra = serde_json::json!({"type":"user", "uuid":format!("extra-{index}"), "timestamp":"2026-10-01T00:00:00Z", "message":{"content":format!("selected-source-{index} {}", "x".repeat(32768))}});
+            use std::io::Write;
+            writeln!(fs::OpenOptions::new().append(true).open(source).unwrap(), "{extra}").unwrap();
+            for mode in ["normal", "scan"] {
+                let mut query = serde_json::json!({"source":source, "subagents":index > 0, "mode":mode, "limit":1, "max_content":100, "max_total":15000});
+                if mode == "scan" {
+                    query["scan_bytes"] = serde_json::json!(16384);
+                }
+                let mut refs = Vec::new();
+                let last = loop {
+                    let result = service
+                        .history_search(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
+                        .await
+                        .unwrap();
+                    let result = serde_json::to_value(result).unwrap();
+                    assert_ne!(result["isError"], true, "{result}");
+                    let body: serde_json::Value =
+                        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                    for row in body["results"].as_array().unwrap() {
+                        assert_eq!(row["source"], source.to_str().unwrap());
+                        assert!(
+                            row["matched_filters"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&serde_json::json!(format!("source={}", source.display())))
+                        );
+                        refs.push(row["ref"].clone());
+                    }
+                    let Some(next) = body.get("next_query").filter(|next| !next.is_null()) else {
+                        break body;
+                    };
+                    if mode == "normal" {
+                        assert_eq!(body["stats"]["effective_filters"]["source"], source.to_str().unwrap());
+                        assert_eq!(next["source"], source.to_str().unwrap());
+                    } else if refs.len() == 1 {
+                        let mut changed = next.clone();
+                        changed["source"] = serde_json::json!(paths[(index + 1) % paths.len()]);
+                        let result = service
+                            .history_search(
+                                Parameters(serde_json::from_value(changed).unwrap()),
+                                test_context().await,
+                            )
+                            .await
+                            .unwrap();
+                        let result = serde_json::to_value(result).unwrap();
+                        assert_eq!(result["isError"], true);
+                        let error: serde_json::Value =
+                            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                        assert_eq!(error["error"], "cursor_filter_mismatch");
+                    }
+                    query = next.clone();
+                };
+                assert_eq!(refs.len(), 2);
+                assert_ne!(refs[0], refs[1]);
+                if mode == "scan" {
+                    assert_eq!(last["scan_complete"], true);
+                    assert_eq!(last["stats"]["files_total"], 1);
+                    let metadata = service
+                        .scans
+                        .metadata(crate::stream_scan::MetadataRequest {
+                            scan_id: last["scan_id"].as_str().unwrap().to_string(),
+                            cursor: None,
+                            limit: 100,
+                            max_total: 15000,
+                            release: false,
+                        })
+                        .unwrap();
+                    let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+                    let filters = metadata["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|item| item["kind"] == "filters")
+                        .unwrap();
+                    assert_eq!(filters["value"]["source"], source.to_str().unwrap());
+                    service.scans.release(last["scan_id"].as_str().unwrap()).unwrap();
+                }
+            }
+        }
+        let unknown = root.join("project/unknown/agent-same.jsonl");
+        fs::create_dir_all(unknown.parent().unwrap()).unwrap();
+        fs::write(&unknown, b"{}\n").unwrap();
+        for (source, project, expected) in [
+            ("agent-same.jsonl".to_string(), None, "invalid_arguments"),
+            (
+                root.parent()
+                    .unwrap()
+                    .join("agent-same.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+                "invalid_arguments",
+            ),
+            (
+                root.join("project/../agent-same.jsonl").to_string_lossy().into_owned(),
+                None,
+                "invalid_arguments",
+            ),
+            (unknown.to_string_lossy().into_owned(), None, "source_not_found"),
+            (paths[0].to_string_lossy().into_owned(), None, "source_not_found"),
+        ] {
+            assert_eq!(
+                crate::get::find_session_file(&config, "agent-same", project, Some(&source))
+                    .unwrap_err()
+                    .error,
+                expected
+            );
+        }
+        fs::create_dir(root.join("other-project")).unwrap();
+        for (source, project, sessions, subagents, expected) in [
+            ("agent-same.jsonl".to_string(), None, None, true, "invalid_arguments"),
+            (
+                root.parent()
+                    .unwrap()
+                    .join("agent-same.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+                None,
+                true,
+                "invalid_arguments",
+            ),
+            (
+                root.join("project/../agent-same.jsonl").to_string_lossy().into_owned(),
+                None,
+                None,
+                true,
+                "invalid_arguments",
+            ),
+            (
+                unknown.to_string_lossy().into_owned(),
+                None,
+                None,
+                true,
+                "source_not_found",
+            ),
+            (
+                paths[1].to_string_lossy().into_owned(),
+                Some("other-project"),
+                None,
+                true,
+                "source_not_found",
+            ),
+            (
+                paths[1].to_string_lossy().into_owned(),
+                Some("project"),
+                Some("parent00"),
+                true,
+                "session_not_found",
+            ),
+            (
+                paths[1].to_string_lossy().into_owned(),
+                None,
+                None,
+                false,
+                "source_not_found",
+            ),
+        ] {
+            for mode in ["normal", "scan"] {
+                let query = serde_json::json!({"mode":mode, "source":source, "project":project, "sessions":sessions, "subagents":subagents});
+                let result = service
+                    .history_search(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
+                    .await
+                    .unwrap();
+                let result = serde_json::to_value(result).unwrap();
+                assert_eq!(result["isError"], true, "{result}");
+                let error: serde_json::Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(error["error"], expected);
+                if let Some(scan_id) = error["available"]["scan_id"].as_str() {
+                    service.scans.release(scan_id).unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            crate::get::find_session_file(&config, "agent-same", Some("other-project"), paths[1].to_str())
+                .unwrap_err()
+                .error,
+            "source_not_found"
+        );
+        #[cfg(unix)]
+        {
+            let link = paths[1].with_file_name("agent-linked.jsonl");
+            std::os::unix::fs::symlink(&paths[1], &link).unwrap();
+            assert_eq!(
+                crate::get::find_session_file(&config, "agent-linked", Some("project"), link.to_str())
+                    .unwrap_err()
+                    .error,
+                "source_unavailable"
+            );
+            for mode in ["normal", "scan"] {
+                let result = service
+                    .history_search(
+                        Parameters(
+                            serde_json::from_value(serde_json::json!({"mode":mode, "source":link, "subagents":true}))
+                                .unwrap(),
+                        ),
+                        test_context().await,
+                    )
+                    .await
+                    .unwrap();
+                let result = serde_json::to_value(result).unwrap();
+                assert_eq!(result["isError"], true);
+                let error: serde_json::Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(error["error"], "source_unavailable");
+                if let Some(scan_id) = error["available"]["scan_id"].as_str() {
+                    service.scans.release(scan_id).unwrap();
+                }
+            }
+        }
+        for schema in [
+            schemars::schema_for!(SearchToolParams),
+            schemars::schema_for!(GetToolParams),
+            schemars::schema_for!(ContextToolParams),
+            schemars::schema_for!(TraceToolParams),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            assert!(
+                schema["properties"]["source"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("source")
+            );
+        }
+        assert_eq!(fs::read_to_string(root.join(".owner")).unwrap(), owner);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn subagent_scope_is_explicit_across_public_search_modes() {
@@ -570,6 +1349,7 @@ mod tests {
             config: Config {
                 projects_dir: root.clone(),
             },
+            scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
         for subagents in [None, Some(false), Some(true)] {
@@ -591,7 +1371,10 @@ mod tests {
                         params[mode] = serde_json::json!(true);
                     }
                     let result = service
-                        .history_search(Parameters(serde_json::from_value(params).unwrap()))
+                        .history_search(
+                            Parameters(serde_json::from_value(params).unwrap()),
+                            test_context().await,
+                        )
                         .await
                         .unwrap();
                     let wrapper = serde_json::to_value(result).unwrap();
@@ -626,7 +1409,7 @@ mod tests {
         let mut pages = 0;
         loop {
             let result = service
-                .history_search(Parameters(serde_json::from_value(query).unwrap()))
+                .history_search(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
                 .await
                 .unwrap();
             let wrapper = serde_json::to_value(result).unwrap();
@@ -681,6 +1464,7 @@ mod tests {
             config: Config {
                 projects_dir: root.clone(),
             },
+            scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
         for mode in ["auto", "strict", "off"] {
@@ -701,17 +1485,26 @@ mod tests {
                     let result = match tool {
                         "search" => {
                             service
-                                .history_search(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_search(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                         "context" => {
                             service
-                                .history_context(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_context(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                         _ => {
                             service
-                                .history_trace(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_trace(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                     }
@@ -764,6 +1557,7 @@ mod tests {
             config: Config {
                 projects_dir: root.clone(),
             },
+            scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
         let base = serde_json::json!({"pattern": "fixture-needle", "project": "project", "tools": "Bash,mcp__mcp-ssh__ssh_exec"});
@@ -775,7 +1569,10 @@ mod tests {
                 params[mode] = serde_json::json!(true);
             }
             let result = service
-                .history_search(Parameters(serde_json::from_value(params).unwrap()))
+                .history_search(
+                    Parameters(serde_json::from_value(params).unwrap()),
+                    test_context().await,
+                )
                 .await
                 .unwrap();
             let wrapper = serde_json::to_value(result).unwrap();
@@ -820,7 +1617,7 @@ mod tests {
             let mut pages = 0;
             loop {
                 let result = service
-                    .history_search(Parameters(serde_json::from_value(query).unwrap()))
+                    .history_search(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
                     .await
                     .unwrap();
                 let wrapper = serde_json::to_value(result).unwrap();
@@ -883,6 +1680,7 @@ mod tests {
             config: Config {
                 projects_dir: root.clone(),
             },
+            scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
         for line in [31_714, 100_002] {
@@ -893,11 +1691,17 @@ mod tests {
                 });
                 let result = if tool == "context" {
                     service
-                        .history_context(Parameters(serde_json::from_value(params).unwrap()))
+                        .history_context(
+                            Parameters(serde_json::from_value(params).unwrap()),
+                            test_context().await,
+                        )
                         .await
                 } else {
                     service
-                        .history_trace(Parameters(serde_json::from_value(params).unwrap()))
+                        .history_trace(
+                            Parameters(serde_json::from_value(params).unwrap()),
+                            test_context().await,
+                        )
                         .await
                 }
                 .unwrap();
@@ -948,6 +1752,7 @@ mod tests {
             config: Config {
                 projects_dir: root.clone(),
             },
+            scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
         for tool in ["context", "trace"] {
@@ -993,11 +1798,17 @@ mod tests {
                 params["output"] = serde_json::json!(root.join(format!("export-{tool}-{case}")));
                 let result = if tool == "context" {
                     service
-                        .history_context(Parameters(serde_json::from_value(params.clone()).unwrap()))
+                        .history_context(
+                            Parameters(serde_json::from_value(params.clone()).unwrap()),
+                            test_context().await,
+                        )
                         .await
                 } else {
                     service
-                        .history_trace(Parameters(serde_json::from_value(params.clone()).unwrap()))
+                        .history_trace(
+                            Parameters(serde_json::from_value(params.clone()).unwrap()),
+                            test_context().await,
+                        )
                         .await
                 }
                 .unwrap();
@@ -1052,11 +1863,17 @@ mod tests {
                     serde_json::json!({"ref": "window-session:31", "project": "project", "until_ref": until_ref});
                 let result = if tool == "context" {
                     service
-                        .history_context(Parameters(serde_json::from_value(params).unwrap()))
+                        .history_context(
+                            Parameters(serde_json::from_value(params).unwrap()),
+                            test_context().await,
+                        )
                         .await
                 } else {
                     service
-                        .history_trace(Parameters(serde_json::from_value(params).unwrap()))
+                        .history_trace(
+                            Parameters(serde_json::from_value(params).unwrap()),
+                            test_context().await,
+                        )
                         .await
                 }
                 .unwrap();
@@ -1101,6 +1918,7 @@ mod tests {
             config: Config {
                 projects_dir: root.clone(),
             },
+            scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
         for mode in ["auto", "strict", "off"] {
@@ -1124,27 +1942,42 @@ mod tests {
                     let result = match tool {
                         "get" => {
                             service
-                                .history_get(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_get(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                         "search" => {
                             service
-                                .history_search(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_search(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                         "context" => {
                             service
-                                .history_context(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_context(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                         "trace" => {
                             service
-                                .history_trace(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_trace(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                         "sessions" => {
                             service
-                                .history_sessions(Parameters(serde_json::from_value(params).unwrap()))
+                                .history_sessions(
+                                    Parameters(serde_json::from_value(params).unwrap()),
+                                    test_context().await,
+                                )
                                 .await
                         }
                         _ => unreachable!(),
@@ -1187,13 +2020,16 @@ mod tests {
             }
             let secret_start = text[..text.find("fixture_secret").unwrap()].chars().count();
             let result = service
-                .history_get(Parameters(
-                    serde_json::from_value(serde_json::json!({
-                        "project": "project", "redaction": mode, "ref": "fixture-session:1",
-                        "range": format!("{}-{}", secret_start + 3, secret_start + 8)
-                    }))
-                    .unwrap(),
-                ))
+                .history_get(
+                    Parameters(
+                        serde_json::from_value(serde_json::json!({
+                            "project": "project", "redaction": mode, "ref": "fixture-session:1",
+                            "range": format!("{}-{}", secret_start + 3, secret_start + 8)
+                        }))
+                        .unwrap(),
+                    ),
+                    test_context().await,
+                )
                 .await
                 .unwrap();
             let wrapper = serde_json::to_value(result).unwrap();
@@ -1201,12 +2037,15 @@ mod tests {
                 serde_json::from_str(wrapper["content"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(payload["content"], if mode == "off" { "ture_" } else { "[redacted]" });
             let result = service
-                .history_get(Parameters(
-                    serde_json::from_value(serde_json::json!({
-                        "project": "project", "redaction": mode, "ref": "fixture-session:3"
-                    }))
-                    .unwrap(),
-                ))
+                .history_get(
+                    Parameters(
+                        serde_json::from_value(serde_json::json!({
+                            "project": "project", "redaction": mode, "ref": "fixture-session:3"
+                        }))
+                        .unwrap(),
+                    ),
+                    test_context().await,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -1215,6 +2054,21 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_schema_describes_patterns_outputs_and_workflow_sources() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchToolParams)).unwrap();
+        let properties = &schema["properties"];
+        for (name, term) in [
+            ("pattern", "AND"),
+            ("regex", "look-around"),
+            ("output", "cwd:"),
+            ("output_format", "jsonl"),
+            ("subagents", "subagents/workflows/<run>/agent-<id>.jsonl"),
+        ] {
+            assert!(properties[name]["description"].as_str().unwrap().contains(term));
+        }
     }
 
     #[test]

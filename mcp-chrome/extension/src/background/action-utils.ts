@@ -7,8 +7,9 @@
 import type { FrameProbeMessage } from '../types'
 import { ExpectedOperationError } from '../types/expected-errors'
 import { pageRevision } from './page-revision'
+import { installFrameProbeListener } from './page-scripts'
 import { readGrantDocumentId } from './read-grants'
-import { isCreatedTab, isManagedTab } from './tab-state'
+import { isManagedTab } from './tab-state'
 
 export interface ActionContext {
     mcpTabGroupId: number | null
@@ -54,7 +55,7 @@ export async function getTargetTabId(tabId?: number): Promise<number> {
     return activeTab.id
 }
 
-export function tabToInfo(tab: chrome.tabs.Tab, context: ActionContext) {
+export function tabToInfo(tab: chrome.tabs.Tab) {
     return {
         id: tab.id!,
         url: tab.url || '',
@@ -65,7 +66,21 @@ export function tabToInfo(tab: chrome.tabs.Tab, context: ActionContext) {
         groupId: tab.groupId,
         pinned: tab.pinned,
         incognito: tab.incognito,
-        managed: isManagedTab(tab, context),
+        highlighted: tab.highlighted,
+        autoDiscardable: tab.autoDiscardable,
+        muted: tab.mutedInfo?.muted,
+        mutedInfo: tab.mutedInfo,
+        audible: tab.audible,
+        discarded: tab.discarded,
+        frozen: tab.frozen,
+        openerTabId: tab.openerTabId,
+        pendingUrl: tab.pendingUrl,
+        favIconUrl: tab.favIconUrl,
+        lastAccessed: tab.lastAccessed,
+        width: tab.width,
+        height: tab.height,
+        splitViewId: tab.splitViewId,
+        managed: isManagedTab(tab),
         status: tab.status || 'unknown',
         revision: pageRevision(tab.id!),
     }
@@ -82,7 +97,7 @@ export async function assertManagedTab(
     } catch {
         throw new ExpectedOperationError(`Tab ${tabId} 不存在（可能已被关闭）`)
     }
-    if (!isManagedTab(tab, context)) {
+    if (!isManagedTab(tab)) {
         const detail = JSON.stringify({
             tabId,
             managed: false,
@@ -93,19 +108,12 @@ export async function assertManagedTab(
         })
         throw new ExpectedOperationError(
             `${operation} 拒绝操作非托管 tab, ${detail}, ` +
-                '请从 browse(action="list") 选择 managed=true 的 tab，或用 manage(action="newPage") 创建受控页面'
+                '请用 manage(action="adoptPage", targetId="' +
+                tabId +
+                '") 将目标页面设为受控，或创建新页面'
         )
     }
     return tab
-}
-
-export async function assertCreatedTab(tabId: number, operation: string): Promise<void> {
-    await getTargetTabId(tabId)
-    if (!isCreatedTab(tabId)) {
-        throw new ExpectedOperationError(
-            `${operation} 拒绝对非创建页面 ${tabId} 使用脚本、debugger 或截图；adoptPage 和只读授权不允许此操作`
-        )
-    }
 }
 
 export async function assertReadableTab(
@@ -114,7 +122,7 @@ export async function assertReadableTab(
     operation: string
 ): Promise<{ tab: chrome.tabs.Tab; documentId?: string }> {
     const tab = await chrome.tabs.get(tabId)
-    if (isCreatedTab(tabId)) {
+    if (isManagedTab(tab)) {
         return { tab }
     }
     const documentId = await readGrantDocumentId(context.serverInstanceId, tabId)
@@ -122,7 +130,7 @@ export async function assertReadableTab(
         return { tab, documentId }
     }
     throw new ExpectedOperationError(
-        `${operation} 拒绝读取非托管 tab ${tabId}，须从 Extension popup 为该页面和当前连接授予只读权限`
+        `${operation} 拒绝读取非托管 tab ${tabId}，请显式 adoptPage，或用 manage(action="grantReadAccess", targetId="${tabId}") 授予普通只读权限`
     )
 }
 
@@ -198,6 +206,37 @@ export async function getDomFrameSnapshot(
     documentId?: string,
     expectedUrl?: string
 ): Promise<DomFrameSnapshot> {
+    const chromeFrames = await chrome.webNavigation.getAllFrames({ tabId })
+    const parentFrame = chromeFrames?.find((frame) => frame.frameId === parentFrameId)
+    if (
+        documentId &&
+        (parentFrame?.documentId !== documentId || (expectedUrl !== undefined && parentFrame.url !== expectedUrl))
+    ) {
+        throw new ExpectedOperationError(`parent frame ${parentFrameId} 页面已变化，未读取`)
+    }
+    if (!chromeFrames || !parentFrame?.documentId) {
+        throw new ExpectedOperationError(`无法读取 parent frame ${parentFrameId} 的 documentId`)
+    }
+    const childDocumentIds = chromeFrames
+        .filter(
+            (frame) =>
+                frame.parentFrameId === parentFrameId &&
+                frame.parentDocumentId === parentFrame.documentId &&
+                !frame.errorOccurred &&
+                (!isRestrictedUrl(frame.url) || /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(frame.url))
+        )
+        .map((frame) => {
+            if (!frame.documentId) {
+                throw new ExpectedOperationError(`无法读取 iframe ${frame.frameId} 的 documentId`)
+            }
+            return frame.documentId
+        })
+    if (childDocumentIds.length > 0) {
+        await chrome.scripting.executeScript({
+            target: { tabId, documentIds: childDocumentIds },
+            func: installFrameProbeListener,
+        })
+    }
     const token = crypto.randomUUID()
     const pendingProbe: PendingDomFrameProbe = { tabId, frameIdsByIndex: new Map() }
     pendingDomFrameProbes.set(token, pendingProbe)

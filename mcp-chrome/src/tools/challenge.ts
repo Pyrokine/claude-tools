@@ -1,5 +1,7 @@
 import type { ViewportMetrics } from '../core/os-mouse.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
+import { StructuredToolError, TimeoutError } from '../core/errors.js'
+import { remainingNavigationTimeout, withNavigationBudget } from '../core/utils.js'
 
 export const CHALLENGE_POLL_MS = 500
 export const TURNSTILE_CLICK_COOLDOWN_MS = 2_000
@@ -100,7 +102,7 @@ export interface ChallengeHost {
     getCookies(filter?: { name?: string }): Promise<unknown>
     mouseMove(x: number, y: number): Promise<void>
     mouseClick(button?: 'left' | 'middle' | 'right' | 'back' | 'forward', clickCount?: number): Promise<void>
-    clickTurnstile?(snapshot: ChallengePageSnapshot): Promise<void>
+    clickTurnstile?(snapshot: ChallengePageSnapshot, timeout?: number): Promise<void>
 }
 
 export abstract class ChallengeError extends Error {
@@ -268,7 +270,11 @@ export const CHALLENGE_INSPECT_SCRIPT = `(() => {
     }) || candidates[0];
   };
   const turnstileBox = findVisibleTurnstileBox();
-  const hostVerify = Array.from(document.querySelectorAll(verifyButtonSelectors.join(','))).find(isVisible);
+  const hostVerify = Array.from(document.querySelectorAll(verifyButtonSelectors.join(','))).find(isVisible) ||
+    Array.from(document.querySelectorAll('button')).find((el) => {
+      const text = (el.textContent || '').trim();
+      return isVisible(el) && (text === 'Verify you are human' || text === '请验证您是真人');
+    });
   const useIframeClick = cloudflareFramePresent || (
     !hostVerify &&
     interstitialPending &&
@@ -319,17 +325,6 @@ export const CHALLENGE_INSPECT_SCRIPT = `(() => {
     const widget = Array.from(document.querySelectorAll(widgetSelectors.join(','))).find(isVisible);
     if (widget) {
       setClickTarget(widget, 'widget');
-    }
-  }
-  if (!clickPoint && turnstilePresent) {
-    const nodes = Array.from(document.querySelectorAll('div'));
-    for (const node of nodes) {
-      if (!isVisible(node)) continue;
-      const rect = node.getBoundingClientRect();
-      if (rect.width >= 280 && rect.width <= 320 && rect.height >= 50 && rect.height <= 80) {
-        setClickTarget(node, 'widget');
-        break;
-      }
     }
   }
   if (!clickPoint && turnstileBox) {
@@ -529,49 +524,58 @@ export async function readChallengeSnapshot(
     inspectTimeout = CHALLENGE_INSPECT_TIMEOUT_MS
 ): Promise<ChallengePageSnapshot> {
     const fallback = host.getState() ?? {}
-    const startedAt = Date.now()
+    const deadline = Date.now() + inspectTimeout
     if (host.inspectChallenge && host.getMode() === 'extension') {
         try {
             return normalizeChallengeSnapshot(
-                (await host.inspectChallenge(
-                    {
-                        challengeSelectors: CHALLENGE_SELECTORS,
-                        deniedSelectors: DENIED_SELECTORS,
-                        widgetSelectors: TURNSTILE_WIDGET_SELECTORS,
-                        verifyButtonSelectors: TURNSTILE_VERIFY_BUTTON_SELECTORS,
-                        frameSelectors: TURNSTILE_FRAME_SELECTORS,
-                        titleNeedles: CHALLENGE_TITLE_NEEDLES,
-                        textMarkers: CHALLENGE_TEXT_MARKERS,
-                        originResponsePendingTextMarkers: ORIGIN_RESPONSE_PENDING_TEXT_MARKERS,
-                    },
-                    Math.max(1, inspectTimeout)
+                (await withNavigationBudget(
+                    () =>
+                        host.inspectChallenge!(
+                            {
+                                challengeSelectors: CHALLENGE_SELECTORS,
+                                deniedSelectors: DENIED_SELECTORS,
+                                widgetSelectors: TURNSTILE_WIDGET_SELECTORS,
+                                verifyButtonSelectors: TURNSTILE_VERIFY_BUTTON_SELECTORS,
+                                frameSelectors: TURNSTILE_FRAME_SELECTORS,
+                                titleNeedles: CHALLENGE_TITLE_NEEDLES,
+                                textMarkers: CHALLENGE_TEXT_MARKERS,
+                                originResponsePendingTextMarkers: ORIGIN_RESPONSE_PENDING_TEXT_MARKERS,
+                            },
+                            remainingNavigationTimeout(deadline)
+                        ),
+                    deadline
                 )) as Partial<ChallengePageSnapshot>,
                 fallback
             )
-        } catch {
-            // isolated inspect 失败时改用 stealth/precise
+        } catch (error) {
+            if (error instanceof TimeoutError) {
+                return blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false)
+            }
+            // isolated inspect 失败时，在剩余预算内改用 stealth/precise
         }
     }
-    try {
-        return normalizeChallengeSnapshot(
-            await host.evaluate<ChallengePageSnapshot>(
-                CHALLENGE_INSPECT_SCRIPT,
-                'stealth',
-                Math.max(1, inspectTimeout)
-            ),
-            fallback
-        )
-    } catch {
-        const remaining = Math.max(1, inspectTimeout - (Date.now() - startedAt))
+    for (const mode of ['stealth', 'precise'] as const) {
         try {
             return normalizeChallengeSnapshot(
-                await host.evaluate<ChallengePageSnapshot>(CHALLENGE_INSPECT_SCRIPT, 'precise', remaining),
+                await withNavigationBudget(
+                    () =>
+                        host.evaluate<ChallengePageSnapshot>(
+                            CHALLENGE_INSPECT_SCRIPT,
+                            mode,
+                            remainingNavigationTimeout(deadline)
+                        ),
+                    deadline
+                ),
                 fallback
             )
-        } catch {
-            return blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false)
+        } catch (error) {
+            if (error instanceof TimeoutError) {
+                return blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false)
+            }
+            // 保留未完成检查的状态，由等待器继续判定
         }
     }
+    return blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false)
 }
 
 export async function waitForChallenge(
@@ -589,6 +593,7 @@ export async function waitForChallenge(
     const now = options.now ?? Date.now
     const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
     const startedAt = now()
+    const deadline = () => Date.now() + Math.max(1, timeout - (now() - startedAt))
     let lastInspectAt = startedAt
     let clickedTurnstile = false
     const clickedTargetKinds = new Set<ChallengeClickTargetKind>()
@@ -597,12 +602,39 @@ export async function waitForChallenge(
     let jsOnlyInterstitial = false
     let emptyInspectCount = 0
     let finalOriginResponseCheckStarted = false
+    const readWithinBudget = async <T>(operation: () => Promise<T>): Promise<T> => {
+        try {
+            return await withNavigationBudget(operation, deadline())
+        } catch (error) {
+            if (error instanceof TimeoutError || (error instanceof StructuredToolError && error.code === 'TIMEOUT')) {
+                throw new ChallengeTimeoutError(
+                    options.action,
+                    actionStatus,
+                    Math.max(0, now() - startedAt),
+                    clickedTurnstile ? 'turnstile' : observedKind,
+                    host.getMode(),
+                    clickedTurnstile
+                )
+            }
+            throw error
+        }
+    }
 
     while (true) {
         const remainingBeforeInspect = timeout - (now() - startedAt)
-        const header = await host.getChallengeState()
+        if (remainingBeforeInspect <= 0) {
+            throw new ChallengeTimeoutError(
+                options.action,
+                actionStatus,
+                Math.max(0, now() - startedAt),
+                clickedTurnstile ? 'turnstile' : observedKind,
+                host.getMode(),
+                clickedTurnstile
+            )
+        }
+        const header = await readWithinBudget(() => host.getChallengeState())
         const headerPending = header?.state === 'pending'
-        const pageTitle = await readPageTitle(host)
+        const pageTitle = await readWithinBudget(() => readPageTitle(host))
         const title = pageTitle.title
         if (DENIED_TITLE_PREFIXES.some((prefix) => title.trim().toLowerCase().startsWith(prefix))) {
             throw new ChallengeDeniedError(options.action, actionStatus, Math.max(0, now() - startedAt), host.getMode())
@@ -619,9 +651,11 @@ export async function waitForChallenge(
                     ? remainingBeforeInspect <= CHALLENGE_INSPECT_TIMEOUT_MS && !finalOriginResponseCheckStarted
                     : now() - lastInspectAt >= TURNSTILE_CLICK_COOLDOWN_MS)
             if (inspectChallengePage) {
-                snapshot = await readChallengeSnapshot(
-                    host,
-                    Math.min(CHALLENGE_INSPECT_TIMEOUT_MS, Math.max(1, remainingBeforeInspect))
+                snapshot = await readWithinBudget(() =>
+                    readChallengeSnapshot(
+                        host,
+                        Math.min(CHALLENGE_INSPECT_TIMEOUT_MS, Math.max(1, timeout - (now() - startedAt)))
+                    )
                 )
                 lastInspectAt = now()
                 if (jsOnlyInterstitial) {
@@ -643,9 +677,11 @@ export async function waitForChallenge(
             snapshot = blankChallengeSnapshot(title, host.getState()?.url ?? '', true)
         }
         if (!snapshot) {
-            snapshot = await readChallengeSnapshot(
-                host,
-                Math.min(CHALLENGE_INSPECT_TIMEOUT_MS, Math.max(1, remainingBeforeInspect))
+            snapshot = await readWithinBudget(() =>
+                readChallengeSnapshot(
+                    host,
+                    Math.min(CHALLENGE_INSPECT_TIMEOUT_MS, Math.max(1, timeout - (now() - startedAt)))
+                )
             )
             lastInspectAt = now()
         }
@@ -661,14 +697,20 @@ export async function waitForChallenge(
                 resolved: true,
                 waitedMs: Math.max(0, now() - startedAt),
                 clickedTurnstile,
-                clearanceCookiePresent: observedKind === 'none' ? false : await hasClearanceCookie(host),
+                clearanceCookiePresent:
+                    observedKind === 'none' ? false : await readWithinBudget(() => hasClearanceCookie(host)),
                 challengeKind: observedKind,
                 originResponsePending: snapshot.originResponsePending,
             }
         }
 
         const clickTargetKind = snapshot.clickTargetKind ?? (snapshot.clickPoint ? 'widget' : null)
-        if (snapshot.clickPoint && clickTargetKind && !clickedTargetKinds.has(clickTargetKind)) {
+        if (
+            now() - startedAt < timeout &&
+            snapshot.clickPoint &&
+            clickTargetKind &&
+            !clickedTargetKinds.has(clickTargetKind)
+        ) {
             const samePoint =
                 pendingClick &&
                 pendingClick.kind === clickTargetKind &&
@@ -677,11 +719,37 @@ export async function waitForChallenge(
             if (!samePoint) {
                 pendingClick = { kind: clickTargetKind, x: snapshot.clickPoint.x, y: snapshot.clickPoint.y }
             } else {
-                if (host.clickTurnstile) {
-                    await host.clickTurnstile(snapshot)
-                } else {
-                    await host.mouseMove(snapshot.clickPoint.x, snapshot.clickPoint.y)
-                    await host.mouseClick('left')
+                const clickDeadline = deadline()
+                const clickSnapshot = snapshot
+                const clickPoint = snapshot.clickPoint
+                try {
+                    if (host.clickTurnstile) {
+                        await withNavigationBudget(
+                            () => host.clickTurnstile!(clickSnapshot, Math.max(0, timeout - (now() - startedAt))),
+                            clickDeadline
+                        )
+                    } else {
+                        await withNavigationBudget(() => host.mouseMove(clickPoint.x, clickPoint.y), clickDeadline)
+                        await withNavigationBudget(() => host.mouseClick('left'), clickDeadline)
+                    }
+                } catch (error) {
+                    if (
+                        error instanceof TimeoutError ||
+                        (error instanceof StructuredToolError && error.code === 'TIMEOUT')
+                    ) {
+                        Object.assign(error.context, {
+                            action: options.action,
+                            actionExecuted: actionStatus === 'completed',
+                            actionStatus,
+                            verificationActionExecuted: error.context.actionExecuted ?? 'unknown',
+                            verificationStatus: 'unknown',
+                            challengeKind: 'turnstile',
+                            mode: host.getMode(),
+                            waitedMs: Math.max(0, now() - startedAt),
+                            retryable: false,
+                        })
+                    }
+                    throw error
                 }
                 clickedTargetKinds.add(clickTargetKind)
                 clickedTurnstile = true

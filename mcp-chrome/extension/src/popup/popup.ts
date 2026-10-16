@@ -37,10 +37,12 @@ async function updateStatus() {
             (item: { port: number; allowed: boolean }) => String(item.port) === readServer.value
         )
         readAccess.checked = granted?.allowed === true
-        readAccess.disabled = !activeTabId || !readServer.value
-        readHelp.textContent = activeTabId
-            ? `页面 ${activeTabId}：仅允许文字、HTML 和元信息读取；脚本、截图及写操作始终不可用`
-            : '当前窗口没有可授权的活动页面'
+        readAccess.disabled = !activeTabId || !readServer.value || response.managed === true
+        readHelp.textContent = response.managed
+            ? `页面 ${activeTabId} 已受控，可读取、输入、执行脚本和截图，无需普通只读授权`
+            : activeTabId
+              ? `页面 ${activeTabId} 未受控，此授权仅允许文字、HTML 和元信息读取；完整操作需显式 adoptPage`
+              : '当前窗口没有可授权的活动页面'
 
         if (response.connected) {
             const ports: number[] = response.ports ?? []

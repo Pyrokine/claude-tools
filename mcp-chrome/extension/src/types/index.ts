@@ -14,7 +14,22 @@ export interface TabInfo {
     groupId: number
     pinned: boolean
     incognito: boolean
-    managed: boolean // 是否属于 MCP Chrome 分组
+    managed: boolean // 是否已创建或显式 adopt 为受控页面
+    highlighted?: boolean
+    autoDiscardable?: boolean
+    muted?: boolean
+    mutedInfo?: chrome.tabs.MutedInfo
+    audible?: boolean
+    discarded?: boolean
+    frozen?: boolean
+    openerTabId?: number
+    pendingUrl?: string
+    favIconUrl?: string
+    lastAccessed?: number
+    width?: number
+    height?: number
+    splitViewId?: number
+    warnings?: string[]
     status: string
     revision?: string
 }
@@ -57,6 +72,19 @@ export interface TabGroupInfo {
     color: string
     windowId: number
     collapsed: boolean
+    shared?: boolean
+    index?: number
+    tabIds: number[]
+    targetIds: string[]
+}
+
+export interface ManagedGroupChangeResult {
+    success: boolean
+    groupId?: number
+    before: TabGroupInfo[]
+    after: TabGroupInfo[]
+    tabsBefore: TabInfo[]
+    tabsAfter: TabInfo[]
 }
 
 export interface BrowserTopology {
@@ -188,6 +216,7 @@ export interface ConsoleMessage {
 export interface NetworkRequest {
     /** 单个 tab 内单调递增，用于 diagnostics 增量读取 */
     sequence?: number
+    source?: 'performance'
     url: string
     method: string
     status?: number

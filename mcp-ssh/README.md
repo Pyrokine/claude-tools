@@ -17,9 +17,9 @@ SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.)
 Recalculate budgets for non-ASCII output and check `stdoutTruncated` / `stderrTruncated`; `maxOutputSize=3` can return
 one Chinese character, not three. Text responses end at a complete character boundary.
 
-PTY `bufferSize`, `bufferSize` in read/list results, `unreadRawBytes`, and `rawBufferLimit` now count raw bytes. A raw
-read with `clear=true` returns the counts and `rawBufferTruncated` state before clearing; the next read reflects the
-cleared buffer. Use `dataBase64` for exact ANSI or binary output and `data` for a UTF-8 preview.
+PTY `bufferSize` and list-result `bufferSize`, together with `unreadRawBytes` and `rawBufferLimit` in read/list results,
+now count raw bytes. A raw read with `clear=true` returns the counts and `rawBufferTruncated` state before clearing; the
+next read reflects the cleared buffer. Use `dataBase64` for exact ANSI or binary output and `data` for a UTF-8 preview.
 
 File reads accept `encoding` (`auto`, `utf8`, `utf16le`, `utf16be`, `gbk`) and lossless `binary=true`. Keep offsets in
 bytes and continue with `next_offset`; choose an explicit UTF-16 encoding for nonzero offsets. A budget too small for
@@ -127,6 +127,9 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 
 `ssh_list_sessions()` returns only `alias`, canonical `identity`, `runAs`, `connected`, and `lastUsedAt`. Use
 `detail=true` for connection details or `fields=[...]` to select fields. Neither mode returns `keyPath`.
+
+Connections enable TCP_NODELAY to reduce waiting between interactive commands and small-file SFTP requests. Direct,
+jump-host, and replacement connections share this behavior without an additional option.
 
 `ssh_reconnect` invalidates operations, PTYs, forwards, and cached transfer capability bound to the old client before
 the replacement connection is published. Automatic reconnect timers are bound to the session and client that scheduled
@@ -384,6 +387,12 @@ incrementally, so a UTF-8 character split across SSH data chunks is returned int
 shell-specific destructive, privilege, credential-argument, process-control, and resource-use signals; read-only
 searches containing a credential word and ordinary Python/Node commands are not flagged solely for those words.
 
+`commandRisk` is diagnostic metadata and does not change command execution or its result. POSIX classification treats
+here-doc bodies as input, supports quoted and partially quoted delimiters, backslash quoting, `<<-`, and multiple
+here-docs, and resumes after an exact, case-sensitive delimiter. Unquoted here-docs and double-quoted arguments still
+expose active command substitutions. A Shell background `&` at EOF is reported; `&&`, redirections, escaped ampersands,
+and quoted input are not background operators.
+
 ### Tracked long-running commands
 
 Use tracked operations when a command must continue beyond one synchronous tool call:
@@ -411,6 +420,12 @@ password is written. Operation listeners are installed inside the SSH exec callb
 command that emits its marker and closes immediately still enters a terminal state with `finishedAt` and `expiresAt`
 set. If the SSH session disconnects while a tracked command is active, its status becomes `unknown`; the server does not
 claim that the remote process stopped. `ssh_exec` keeps its existing synchronous timeout behavior.
+
+Tracked POSIX commands use `setsid -w` when available to wait for the command, including when `setsid` forks. Nonzero
+command exits produce `failed`; a zero exit can still have stderr output. Commands execute under `sh`, so Bash-only
+options such as `pipefail` require an explicit `bash -lc` command. Without `setsid`, `processGroup` is false and
+cancellation targets the PID. POSIX cancellation validates the marker before sending TERM with signal syntax supported
+by `sh` and Bash. System diagnostics produced during termination are retained as stderr output.
 
 ### Interactive Commands (PTY mode)
 
@@ -602,7 +617,10 @@ If verification is requested, a mismatch, skipped check, or verification error s
 `transferSuccess` still reports whether transfer completed. `verificationStatus`, `verificationSuccess`, and
 `failedChecks` describe the verification outcome. SFTP single-file transfers also include local and remote size, mode or
 permissions, mtime, owner/group, and a streamed SFTP SHA-256 comparison. `verifyOwner` and `verifyMode` apply to upload
-single-file sync; use `verify.owner` and `verify.mode` for directory manifests.
+single-file sync; use `verify.owner` and `verify.mode` for directory manifests. Verification does not run `chown` or
+`chmod`. New SFTP directories use destination-side default permissions, and new SFTP downloads use `0600`; replacing an
+existing local regular file preserves its `rwx` bits. These permissions can differ from the source even when content and
+owner match, so a requested mode check can fail after a completed transfer.
 
 Rsync is selected only for a direct connection with a validated key path or usable SSH agent. Password, inline-key, and
 jump-host sessions use SFTP because their route or credentials cannot be passed safely to a separate OpenSSH process.
@@ -648,17 +666,17 @@ ssh_pty_read(ptyId="pty_1_xxx")
 ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 ```
 
-`ssh_pty_read` and `ssh_pty_list` expose `lastInputAt`, `lastOutputAt`, `lastReadAt`, `bufferSize`, `unreadRawBytes`,
-`rawBufferLimit`, `rawBufferTruncated`, and `foregroundProcess`. The three size fields count bytes. PTY screen output is
-decoded incrementally. Raw output preserves the original bytes in `dataBase64`, including invalid or partial UTF-8;
-`data` is a text preview. `rawBufferTruncated=true` means older raw output since the last clear was discarded at the
-byte limit. A raw read uses `clear=true` by default: its response reports the pre-clear byte count and truncation flag,
-then resets the raw buffer and flag. Screen reads do not clear raw state. When a finite command exits naturally, its
-final screen remains readable with `active=false` until explicit close or the closed-session retention expires (5
-minutes by default, configurable with `SSH_MCP_PTY_CLOSED_RETENTION_MS`). `ssh_pty_write` returns `accepted=true` when
-the local stream accepts data. `backpressured=true` only reports a full buffer and does not mean the input was
-discarded. `ssh_pty_close` reports `closed`, `not_found`, `failed`, or `unknown`; retryable close failures keep the PTY
-state for a later retry.
+`ssh_pty_read` and `ssh_pty_list` expose `lastInputAt`, `lastOutputAt`, `lastReadAt`, `unreadRawBytes`,
+`rawBufferLimit`, `rawBufferTruncated`, and `foregroundProcess`. List entries also expose `bufferSize`. These size
+fields count bytes. PTY screen output is decoded incrementally. Raw output preserves the original bytes in `dataBase64`,
+including invalid or partial UTF-8; `data` is a text preview. `rawBufferTruncated=true` means older raw output since the
+last clear was discarded at the byte limit. A raw read uses `clear=true` by default: its response reports the pre-clear
+byte count and truncation flag, then resets the raw buffer and flag. Screen reads do not clear raw state. When a finite
+command exits naturally, its final screen remains readable with `active=false` until explicit close or the
+closed-session retention expires (5 minutes by default, configurable with `SSH_MCP_PTY_CLOSED_RETENTION_MS`).
+`ssh_pty_write` returns `accepted=true` when the local stream accepts data. `backpressured=true` only reports a full
+buffer and does not mean the input was discarded. `ssh_pty_close` reports `closed`, `not_found`, `failed`, or `unknown`;
+retryable close failures keep the PTY state for a later retry.
 
 Common control sequences:
 
