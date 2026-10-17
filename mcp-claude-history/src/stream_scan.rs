@@ -2057,8 +2057,9 @@ mod tests {
 
     #[test]
     fn indexed_structured_full_is_complete_json_independent_of_preview_limit() {
+        let secret = format!("npm_{}", "Aa0".repeat(12));
         let fixture = Fixture::new([
-            json!({"type":"assistant", "uuid":"full-record", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":"full-call", "name":"mcp__fixture__full", "input":{"password":"x".repeat(MAX_JSONL_LINE_BYTES + 1024), "command":"前缀😀 Authorization: Bearer\tfixture-value", "array":[1,null,true], "note":"entire-structured-value"}}]}}),
+            json!({"type":"assistant", "uuid":"full-record", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":"full-call", "name":"mcp__fixture__full", "input":{"password":"x".repeat(MAX_JSONL_LINE_BYTES + 1024), "command":"前缀😀 Authorization: Bearer\tfixture-value", "array":[1,null,true], "note":"entire-structured-value", "zztext":format!("前缀😀 [{secret}] visible")}}]}}),
         ]);
         let store = ScanStore::default();
         let mut request = fixture.request();
@@ -2071,12 +2072,76 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]["tool_input_redacted"],
-            json!({"password":"[redacted]", "command":"前缀😀 Authorization: [redacted]", "array":[1,null,true], "note":"entire-structured-value"})
+            json!({"password":"[redacted]", "command":"前缀😀 Authorization: [redacted]", "array":[1,null,true], "note":"entire-structured-value", "zztext":"前缀😀 [[redacted]] visible"})
         );
         assert!(rows[0]["tool_input_redacted"].get("preview").is_none());
         assert!(rows[0]["content"].as_str().unwrap().chars().count() <= 16);
         assert_eq!(last["stats"]["oversized_records"], 1);
         assert_eq!(last["counts_exact"], true);
+    }
+
+    #[test]
+    fn indexed_npm_token_previews_recover_redacted_input_and_result_ranges() {
+        let secret = format!("npm_{}", "Aa0".repeat(12));
+        for is_input in [true, false] {
+            let text = format!("{} 前缀😀 [{secret}] visible", "x".repeat(MAX_JSONL_LINE_BYTES + 1024));
+            let input = json!({"text":text,"note":"visible"});
+            let block = if is_input {
+                json!({"type":"tool_use","id":"npm-call","name":"Bash","input":input})
+            } else {
+                json!({"type":"tool_result","tool_use_id":"npm-call","content":[{"type":"text","text":text}],"is_error":false})
+            };
+            let original = if is_input { input.to_string() } else { block.to_string() };
+            let start = original[..original.find(&secret).unwrap()].chars().count();
+            let fixture = Fixture::new([
+                json!({"type":if is_input { "assistant" } else { "user" },"uuid":"npm-record","timestamp":"2026-10-01T00:00:00Z","message":{"content":[block]}}),
+            ]);
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let store = ScanStore::default();
+                let mut request = fixture.request();
+                request.params.redaction = mode;
+                request.params.structured = Some("preview".to_string());
+                request.params.max_content = 48;
+                request.params.max_content_tool_result = 48;
+                request.scan_bytes = Some(256 * 1024 * 1024);
+                request.scan_ms = Some(10_000);
+                let first = page(&store, &fixture, request);
+                let (last, rows, _) = finish(&store, &fixture, first);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(last["stats"]["oversized_records"], 1);
+                let value = &rows[0][if is_input {
+                    "tool_input_redacted"
+                } else {
+                    "tool_result_redacted"
+                }];
+                assert_eq!(value["truncated"], true);
+                let pointer = &value["get"];
+                assert_eq!(pointer["redaction"], mode.as_str());
+                let recovered = crate::get::get(
+                    &fixture.config,
+                    crate::get::GetParams {
+                        r#ref: pointer["ref"].as_str().unwrap().to_string(),
+                        range: Some((start + 4, start + 10)),
+                        output: None,
+                        project: pointer["project"].as_str().map(str::to_string),
+                        source: pointer["source"].as_str().map(str::to_string),
+                        redaction: mode,
+                        overwrite: false,
+                        view: pointer["view"].as_str().map(str::to_string),
+                        block: pointer["block"].as_u64().map(|value| value as usize),
+                    },
+                )
+                .unwrap();
+                let crate::types::GetResponse::Success { content, .. } = recovered else {
+                    panic!("expected recovered content")
+                };
+                assert_eq!(content, if mode.enabled() { "[redacted]" } else { &secret[4..10] });
+                if mode.enabled() {
+                    assert!(!value.to_string().contains(&secret));
+                }
+                store.release(last["scan_id"].as_str().unwrap()).unwrap();
+            }
+        }
     }
 
     #[test]

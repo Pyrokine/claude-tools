@@ -2316,6 +2316,13 @@ pub fn redaction_spans(
     let mut position = 0;
     while position < bytes.len() {
         let (character, width) = character_at(bytes, position)?;
+        if character == 'n'
+            && bytes.starts(position, b"npm_")?
+            && !preceding_word(bytes, position)?
+            && let Some(end) = prefix_regex(bytes, position, crate::utils::npm_token_regex(), 44)?
+        {
+            add_redaction(&mut edits, position, end, "[redacted]")?;
+        }
         if position >= token_uuid_cursor
             && matches!(character, 't' | 'T' | '令')
             && (character == '令' || !preceding_word(bytes, position)?)
@@ -2851,6 +2858,143 @@ mod tests {
             if !mode.enabled() {
                 assert_eq!(rendered, original);
             }
+        }
+    }
+
+    #[test]
+    fn npm_token_projection_crosses_reader_buffers_and_preserves_ranges() {
+        use crate::utils::RedactionMode;
+        let secret = format!("npm_{}", "Aa0".repeat(12));
+        let make_record = |padding: usize| {
+            let text = format!("{} 前缀😀 [{secret}] 后缀", "x".repeat(padding));
+            let input = serde_json::json!({"text":text,"note":"visible"});
+            let line = serde_json::json!({"uuid":"fixture","type":"assistant","timestamp":"2026-10-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"fixture-call","name":"fixture","input":input}]}}).to_string();
+            (line, input)
+        };
+        let overhead = make_record(0).0.find(&secret).unwrap();
+        for token_start in [BUFFER_BYTES - 12, BUFFER_BYTES * 4 - 12] {
+            let (line, input) = make_record(token_start - overhead);
+            assert_eq!(line.find(&secret).unwrap(), token_start);
+            let original = input.to_string();
+            let start = original[..original.find(&secret).unwrap()].chars().count();
+            let mut expected = input.clone();
+            expected["text"] =
+                serde_json::Value::String(input["text"].as_str().unwrap().replace(&secret, "[redacted]"));
+            let fixture = Fixture::new(&line);
+            let span = SourceSpan {
+                start: 0,
+                end: line.len() as u64,
+            };
+            let indexed = index_record(fixture.open(), span, true).unwrap();
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let projection = indexed
+                    .structured_projection(fixture.open(), span, "tool_input", Some(0), mode)
+                    .unwrap();
+                let mut bytes = TextBytes::new(projection.cursor(fixture.open(), span));
+                let mut rendered = String::new();
+                let (original_count, rendered_count, count) = render_text_range(&mut bytes, mode, None, |chunk| {
+                    rendered.push_str(std::str::from_utf8(chunk).unwrap());
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(original_count, original.chars().count());
+                assert_eq!(rendered_count, rendered.chars().count());
+                assert_eq!(count, usize::from(mode.enabled()));
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&rendered).unwrap(),
+                    if mode.enabled() {
+                        expected.clone()
+                    } else {
+                        input.clone()
+                    }
+                );
+                for (from, to, expected_redacted) in [
+                    (start + 4, start + 10, "[redacted]"),
+                    (start, start + secret.len(), "[redacted]"),
+                    (start - 1, start + secret.len() + 1, "[[redacted]]"),
+                ] {
+                    let mut ranged = String::new();
+                    let (_, _, ranged_count) = render_text_range(&mut bytes, mode, Some((from, to)), |chunk| {
+                        ranged.push_str(std::str::from_utf8(chunk).unwrap());
+                        Ok(())
+                    })
+                    .unwrap();
+                    let raw: String = original.chars().skip(from).take(to - from).collect();
+                    assert_eq!(
+                        ranged,
+                        if mode.enabled() {
+                            expected_redacted
+                        } else {
+                            raw.as_str()
+                        }
+                    );
+                    assert_eq!(ranged_count, usize::from(mode.enabled()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn npm_token_streaming_matches_explicit_text_and_count_expectations() {
+        use crate::utils::{RedactionMode, redact_text_with_mode};
+        let secret = format!("npm_{}", "Aa0".repeat(12));
+        let cases = [
+            (secret.clone(), "[redacted]".to_string(), 1),
+            (
+                format!("printf '%s\\n' '{secret}' --visible"),
+                "printf '%s\\n' '[redacted]' --visible".to_string(),
+                1,
+            ),
+            (format!("NPM_TOKEN='{secret}'"), "NPM_TOKEN=[redacted]".to_string(), 1),
+            (
+                format!("Authorization: Bearer {secret}"),
+                "Authorization: [redacted]".to_string(),
+                1,
+            ),
+            (format!("npm_{}", "A".repeat(35)), format!("npm_{}", "A".repeat(35)), 0),
+            (format!("npm_{}", "A".repeat(37)), format!("npm_{}", "A".repeat(37)), 0),
+            (format!("{secret}字"), format!("{secret}字"), 0),
+            (format!("字{secret}"), format!("字{secret}"), 0),
+            (format!("{secret}\u{0301}"), format!("{secret}\u{0301}"), 0),
+            (format!("[{secret}]😀"), "[[redacted]]😀".to_string(), 1),
+        ];
+        for (text, expected, expected_count) in cases {
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let spans = redaction_spans(&mut SliceBytes(text.as_bytes()), mode).unwrap();
+                let mut actual = String::new();
+                let mut position = 0;
+                for span in &spans {
+                    actual.push_str(&text[position..span.start]);
+                    actual.push_str(span.replacement);
+                    position = span.end;
+                }
+                actual.push_str(&text[position..]);
+                assert_eq!(
+                    actual,
+                    if mode.enabled() {
+                        expected.as_str()
+                    } else {
+                        text.as_str()
+                    }
+                );
+                assert_eq!(spans.len(), if mode.enabled() { expected_count } else { 0 });
+                let ordinary = redact_text_with_mode(&text, mode);
+                assert_eq!(actual, ordinary.text);
+                assert_eq!(spans.len(), ordinary.count);
+            }
+        }
+        let url = format!("https://example.com/{secret}");
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            let spans = redaction_spans(&mut SliceBytes(url.as_bytes()), mode).unwrap();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(
+                spans[0].replacement,
+                if mode == RedactionMode::Strict {
+                    "[redacted-url]"
+                } else {
+                    "[redacted]"
+                }
+            );
         }
     }
 

@@ -222,6 +222,9 @@ header，以及常见 password、token、cookie、API key、secret、private key
 `enabled=false`，被处理的结果会返回 `redacted=true` 和 `raw_available=true` ，JSONL
 manifest 会记录 redaction 元数据 JSON 字段名按解码后的字符串语义识别，覆盖 Unicode 转义和内嵌转义 JSON；字段名中的字面反斜杠不会被反复解码替换沿用原文值的位置，非敏感文本和格式保持原样
 
+auto 和 strict 也会遮蔽完整的 npm access token：小写 `npm_` 后接恰好 36 个 ASCII 字母或数字，前后使用完整 Unicode 单词边界
+正文、结构化 tool 字段、record 视图及导出中的独立值和独立引号参数使用同一规则，短值、长值及相连标识符保持原有行为，`off` 保留原值
+
 命令行中的 `--password`、`--http-password`、`--ftp-password`、`--proxy-password` 使用空白或 `=`
 分隔时，密码值会被遮蔽，带引号的值和转义 JSON 使用相同规则相邻的引号片段、普通片段和转义空格按完整参数遮蔽，外层 JSON 字符串边界和空值不会遮蔽后面的字段用户名和非敏感参数保持可见，`off`
 保留原始命令

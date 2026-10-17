@@ -1864,6 +1864,11 @@ pub fn redact_text_range_with_mode(text: &str, mode: RedactionMode, range: Optio
     TextRedaction { text: output, count }
 }
 
+pub(crate) fn npm_token_regex() -> &'static Regex {
+    static NPM_TOKEN: OnceLock<Regex> = OnceLock::new();
+    NPM_TOKEN.get_or_init(|| Regex::new(r"\bnpm_[A-Za-z0-9]{36}\b").expect("valid regex"))
+}
+
 pub(crate) fn token_uuid_statement_regex() -> &'static Regex {
     static TOKEN_UUID: OnceLock<Regex> = OnceLock::new();
     TOKEN_UUID.get_or_init(|| {
@@ -1882,6 +1887,7 @@ fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit
     static INTERNAL_URL_RE: OnceLock<Regex> = OnceLock::new();
 
     let mut edits = collect_sensitive_field_edits(text, mode);
+    push_matches(&mut edits, text, npm_token_regex(), "[redacted]");
     for captures in token_uuid_statement_regex().captures_iter(text) {
         let value = captures.name("value").expect("UUID value");
         edits.push(RedactionEdit {
@@ -3545,6 +3551,118 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
                 assert_eq!(redacted.count, 0);
             }
         }
+    }
+
+    #[test]
+    fn npm_tokens_redact_without_sensitive_field_names() {
+        let secret = format!("npm_{}", "Aa0".repeat(12));
+        let cases = [
+            (secret.clone(), "[redacted]".to_string(), 1),
+            (
+                format!("前缀😀 [{secret}] 后缀"),
+                "前缀😀 [[redacted]] 后缀".to_string(),
+                1,
+            ),
+            (
+                format!("printf '%s\\n' '{secret}' --visible"),
+                "printf '%s\\n' '[redacted]' --visible".to_string(),
+                1,
+            ),
+            (
+                format!("'{secret}' '{secret}'"),
+                "'[redacted]' '[redacted]'".to_string(),
+                2,
+            ),
+        ];
+        for (text, expected, expected_count) in cases {
+            let start = text[..text.find(&secret).unwrap()].chars().count();
+            for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+                let redacted = redact_text_with_mode(&text, mode);
+                assert_eq!(redacted.text, expected);
+                assert_eq!(redacted.count, expected_count);
+                let ranged = redact_text_range_with_mode(&text, mode, Some((start + 4, start + 10)));
+                assert_eq!(ranged.text, "[redacted]");
+                assert_eq!(ranged.count, 1);
+            }
+            let raw = redact_text_with_mode(&text, RedactionMode::Off);
+            assert_eq!(raw.text, text);
+            assert_eq!(raw.count, 0);
+            assert_eq!(
+                redact_text_range_with_mode(&text, RedactionMode::Off, Some((start + 4, start + 10))).text,
+                secret[4..10]
+            );
+        }
+        let input = serde_json::json!({"plain":secret,"array":[secret,{"text":secret}],"note":"visible"});
+        let expected =
+            serde_json::json!({"plain":"[redacted]","array":["[redacted]",{"text":"[redacted]"}],"note":"visible"});
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            assert_eq!(redact_value_with_count(&input, mode), (expected.clone(), 3));
+            for (text, expected_text) in [
+                (input.to_string(), expected.to_string()),
+                (
+                    serde_json::to_string(&input.to_string()).unwrap(),
+                    serde_json::to_string(&expected.to_string()).unwrap(),
+                ),
+            ] {
+                let redacted = redact_text_with_mode(&text, mode);
+                assert_eq!(redacted.text, expected_text);
+                assert_eq!(redacted.count, 3);
+            }
+            let command = format!("printf '//registry.npmjs.org/:_authToken=%s\\n' '{secret}'");
+            let (redacted, count) =
+                redact_value_with_count(&serde_json::json!({"command":command,"note":"visible"}), mode);
+            assert!(!redacted.to_string().contains(&secret));
+            assert_eq!(redacted["note"], "visible");
+            assert!(count >= 1);
+        }
+        assert_eq!(redact_value_with_count(&input, RedactionMode::Off), (input, 0));
+    }
+
+    #[test]
+    fn npm_token_boundaries_and_overlapping_rules_preserve_existing_behavior() {
+        let secret = format!("npm_{}", "Aa0".repeat(12));
+        let negatives = [
+            "npm_placeholder".to_string(),
+            format!("npm_{}", "A".repeat(35)),
+            format!("npm_{}", "A".repeat(37)),
+            format!("NPM_{}", "Aa0".repeat(12)),
+            format!("npm_{}-{}", "A".repeat(18), "A".repeat(18)),
+            format!("prefix{secret}"),
+            format!("{secret}suffix"),
+            format!("_{secret}"),
+            format!("{secret}_"),
+            format!("字{secret}"),
+            format!("{secret}字"),
+            format!("{secret}\u{0301}"),
+            "token = text(node, 1)".to_string(),
+        ];
+        for text in negatives {
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let redacted = redact_text_with_mode(&text, mode);
+                assert_eq!(redacted.text, text);
+                assert_eq!(redacted.count, 0);
+            }
+        }
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            for (text, expected) in [
+                (format!("NPM_TOKEN='{secret}'"), "NPM_TOKEN=[redacted]".to_string()),
+                (
+                    format!("Authorization: Bearer {secret}"),
+                    "Authorization: [redacted]".to_string(),
+                ),
+            ] {
+                let redacted = redact_text_with_mode(&text, mode);
+                assert_eq!(redacted.text, expected);
+                assert_eq!(redacted.count, 1);
+            }
+        }
+        let url = format!("https://example.com/{secret}");
+        let strict = redact_text_with_mode(&url, RedactionMode::Strict);
+        assert_eq!(strict.text, "[redacted-url]");
+        assert_eq!(strict.count, 1);
+        let auto = redact_text_with_mode(&url, RedactionMode::Auto);
+        assert_eq!(auto.text, "https://example.com/[redacted]");
+        assert_eq!(auto.count, 1);
     }
 
     #[test]

@@ -40,6 +40,8 @@
 - fix: Echo `subagents` in effective filters and document matching by each main or agent file's own session ID
 - fix: Recalculate the complete export quota after concurrent directory removal, with bounded retries and visible
   failure
+- fix: Redact recognizable npm tokens in standalone text and separately quoted tool arguments across structured views,
+  oversized records, Unicode ranges, and exports
 
 ### mcp-chrome
 
@@ -200,6 +202,7 @@
 - fix: 普通与超大记录保留 strict 专有位置名称后的未加引号双冒号分隔符，凭证、引用字段、私有 IP 和 URL 保护保持
 - fix: 有效过滤条件回显 `subagents`，明确主文件与 agent 文件按各自 session ID 匹配
 - fix: 并发删除导出目录时重新计算完整配额，重试有上限，仍无法读取时返回错误
+- fix: 遮蔽独立正文和独立引号参数中的可识别 npm token，覆盖结构化视图、超大记录、Unicode 范围及导出
 
 ### mcp-chrome
 

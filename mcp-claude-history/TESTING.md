@@ -376,6 +376,20 @@ search、context、trace 和导出，选择双冒号与敏感值内部的原始 
 
 **预期**：未加引号、恰好两个冒号且仅在 strict 中敏感的位置名称保持原文，普通与超大读取结果一致凭证字段、引用字段、三冒号值、内层敏感赋值和独立私有 IP/URL 保持原有保护，敏感范围不泄漏局部值，off 保留原文直接返回、预览与完整导出使用同一规则，不读取或复用真实认证材料
 
+### search-17h: 独立 npm token 脱敏
+
+**步骤**：在隔离 HOME/TMPDIR 的自有 JSONL 中，使用小写 `npm_` 加 36 个合成 ASCII 字母或数字构造测试值，不读取或使用真实凭证
+将测试值放入独立正文、普通字段和数组，以及 `printf` 格式串之后的独立引号参数；覆盖 tool input、tool result、嵌套 JSON 字符串和 record 视图
+加入 35/37 位正文、大写前缀、非法正文字符、相连的 ASCII/Unicode 标识符、普通 npm 名称、占位符、非敏感参数和合法代码表达式作为对照
+将测试值放在当前 reader 的实际缓冲边界两侧，并构造超过 8 MiB 的输入和结果，保留长的非敏感前缀
+分别以 auto、strict、off 调用 sessions、get 的 content/tool_input/tool_result/record、normal/scan search 的 full/preview、context、trace 及导出，完整消费 scan 的 next_query 和预览中的 get 恢复指针
+使用中文、emoji 和原始 Unicode 坐标选择测试值内部、完整值及相邻边界范围；检查与赋值、Authorization、strict URL 重叠时的替换计数，并读取完整导出正文与 manifest
+
+**预期**：auto/strict 在所有入口和视图中遮蔽完整测试值，范围与测试值任意部分相交时返回完整脱敏标记，重叠区间只计一次
+两种读取路径保持相同规则，普通字段、相邻非敏感参数和长文本保持原有内容，结构化 JSON 有效，负例不被独立 token 规则误判
+normal search 保留既有超大记录跳过与计数合同，超大消息通过 scan/get 读取；超预算时返回现有明确错误和恢复信息，不通过增加预算或完整加载超大记录替代有界读取
+off 返回完整原值及对应原始范围，计数为零；导出 manifest 的模式、字节数、完整性和私有权限与实际文件一致，凭证形状、单词边界和模式行为与双语 README 一致
+
 ### search-18: 过滤参数校验
 
 **步骤**：分别调用 `history_search(types="visitor")`、`history_search(subtypes="author")`、

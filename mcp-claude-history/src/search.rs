@@ -3534,6 +3534,116 @@ mod tests {
     }
 
     #[test]
+    fn search_npm_tokens_are_redacted_in_structured_results_and_exports() {
+        let secret = format!("npm_{}", "Aa0".repeat(12));
+        let command =
+            format!("NPM-FIX-NEEDLE 前缀😀 printf '//registry.npmjs.org/:_authToken=%s\\n' '{secret}' --visible");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("mcp-search-npm-{}-{nonce}", process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = File::create(project.join("npm-session-main.jsonl")).unwrap();
+        for record in [
+            serde_json::json!({"uuid":"npm-use","type":"assistant","timestamp":"2026-10-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"npm-call","name":"Bash","input":{"command":command,"note":"visible"}}]}}),
+            serde_json::json!({"uuid":"npm-result","type":"user","timestamp":"2026-10-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"npm-call","content":command,"is_error":false}]}}),
+        ] {
+            writeln!(file, "{record}").unwrap();
+        }
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        let params = |mode, structured: &str| SearchParams {
+            projects: vec!["project".to_string()],
+            pattern: "NPM-FIX-NEEDLE".to_string(),
+            redaction: mode,
+            structured: Some(structured.to_string()),
+            max_content: 64,
+            max_content_tool_result: 64,
+            ..SearchParams::default()
+        };
+        for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+            let expected = crate::utils::redact_text_with_mode(&command, mode).text;
+            assert!(expected.contains("--visible"));
+            for structured in ["full", "preview"] {
+                let response = search(&config, params(mode, structured)).unwrap();
+                assert_eq!(response.results.len(), 2);
+                for row in &response.results {
+                    let is_input = row.tool_input_redacted.is_some();
+                    let value = row
+                        .tool_input_redacted
+                        .as_ref()
+                        .or(row.tool_result_redacted.as_ref())
+                        .unwrap();
+                    let field = if is_input { "command" } else { "content" };
+                    if mode.enabled() {
+                        assert!(!row.content.contains(&secret));
+                        assert!(!value.to_string().contains(&secret));
+                    }
+                    if structured == "full" {
+                        assert_eq!(value[field].as_str().unwrap(), expected);
+                        if is_input {
+                            assert_eq!(value["note"], "visible");
+                        }
+                    } else {
+                        let pointer = &value["get"];
+                        assert_eq!(pointer["redaction"], mode.as_str());
+                        let recovered = crate::get::get(
+                            &config,
+                            crate::get::GetParams {
+                                r#ref: pointer["ref"].as_str().unwrap().to_string(),
+                                range: None,
+                                output: None,
+                                project: pointer["project"].as_str().map(str::to_string),
+                                source: pointer["source"].as_str().map(str::to_string),
+                                redaction: mode,
+                                overwrite: false,
+                                view: pointer["view"].as_str().map(str::to_string),
+                                block: pointer["block"].as_u64().map(|value| value as usize),
+                            },
+                        )
+                        .unwrap();
+                        let crate::types::GetResponse::Success { content, .. } = recovered else {
+                            panic!("expected recovered content")
+                        };
+                        let recovered: serde_json::Value = serde_json::from_str(&content).unwrap();
+                        assert_eq!(recovered[field].as_str().unwrap(), expected);
+                        assert_eq!(content.contains(&secret), mode == RedactionMode::Off);
+                    }
+                }
+            }
+            let response = search(
+                &config,
+                SearchParams {
+                    output: Some(format!(
+                        "tmp:npm-search-export-{}-{nonce}-{}",
+                        process::id(),
+                        mode.as_str()
+                    )),
+                    ..params(mode, "full")
+                },
+            )
+            .unwrap();
+            let output = response.output.unwrap();
+            let exported = fs::read_to_string(&output.results).unwrap();
+            let rows: Vec<serde_json::Value> = exported
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(exported.contains(&secret), mode == RedactionMode::Off);
+            let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&output.manifest).unwrap()).unwrap();
+            assert_eq!(manifest["bytes"], exported.len());
+            assert_eq!(manifest["count"], 2);
+            assert_eq!(manifest["redaction"]["mode"], mode.as_str());
+            fs::remove_dir_all(output.results.parent().unwrap()).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn continuation_query_preserves_line_ranges_and_result_order() {
         let tmp = env::temp_dir().join(format!("mcp-search-lines-continuation-test-{}", process::id()));
         fs::remove_dir_all(&tmp).ok();

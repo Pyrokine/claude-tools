@@ -234,6 +234,11 @@ using their decoded string value, including Unicode escapes and embedded escaped
 name are not repeatedly decoded. Replacements keep original value positions and leave nonsensitive text and formatting
 unchanged.
 
+Auto and strict also redact complete npm access tokens: lowercase `npm_` followed by exactly 36 ASCII alphanumeric
+characters, with Unicode word boundaries on both sides. This includes standalone values and separately quoted command
+arguments in text, structured tool fields, record views, and exports. Shorter or longer values and surrounding
+identifiers retain their existing behavior; `off` preserves the original value.
+
 Command lines redact the values of `--password`, `--http-password`, `--ftp-password`, and `--proxy-password` with
 whitespace or `=` separators, including quoted values and escaped JSON. The complete argument is redacted, including
 adjacent quoted and unquoted parts and escaped spaces. Enclosing JSON string boundaries and empty values leave later

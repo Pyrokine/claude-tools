@@ -1982,6 +1982,108 @@ mod tests {
     }
 
     #[test]
+    fn get_npm_tokens_are_redacted_in_all_views_ranges_and_exports() {
+        let secret = format!("npm_{}", "Aa0".repeat(12));
+        let command = format!("前缀😀 printf '%s\\n' '{secret}' --visible");
+        for (kind, block, structured_view) in [
+            (
+                "assistant",
+                serde_json::json!({"type":"tool_use","id":"npm-call","name":"Bash","input":{"command":command,"note":"visible"}}),
+                "tool_input",
+            ),
+            (
+                "user",
+                serde_json::json!({"type":"tool_result","tool_use_id":"npm-call","content":[{"type":"text","text":command}],"is_error":false}),
+                "tool_result",
+            ),
+        ] {
+            let record = serde_json::json!({"uuid":"npm-fixture","type":kind,"timestamp":"2026-10-01T00:00:00Z","message":{"content":[block]}});
+            let (root, config, reference) = fixture(record);
+            for view in ["content", structured_view, "record"] {
+                let params = || GetParams {
+                    r#ref: reference.clone(),
+                    range: None,
+                    output: None,
+                    project: Some("project".to_string()),
+                    source: None,
+                    redaction: RedactionMode::Off,
+                    overwrite: false,
+                    view: Some(view.to_string()),
+                    block: if view == structured_view { Some(0) } else { None },
+                };
+                let original = success_content(get(&config, params()).unwrap());
+                assert!(original.contains(&secret));
+                let start = original[..original.find(&secret).unwrap()].chars().count();
+                for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                    let expected = if mode.enabled() {
+                        original.replace(&secret, "[redacted]")
+                    } else {
+                        original.clone()
+                    };
+                    let content = success_content(
+                        get(
+                            &config,
+                            GetParams {
+                                redaction: mode,
+                                ..params()
+                            },
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(content, expected, "kind={kind} view={view} mode={mode:?}");
+                    if view != "content" {
+                        serde_json::from_str::<serde_json::Value>(&content).unwrap();
+                    }
+                    let ranged = success_content(
+                        get(
+                            &config,
+                            GetParams {
+                                range: Some((start + 4, start + 10)),
+                                redaction: mode,
+                                ..params()
+                            },
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(ranged, if mode.enabled() { "[redacted]" } else { &secret[4..10] });
+                    let response = get(
+                        &config,
+                        GetParams {
+                            range: Some((start + 4, start + 10)),
+                            output: Some(format!(
+                                "tmp:npm-get-{}-{}/message.txt",
+                                std::process::id(),
+                                export_nonce()
+                            )),
+                            redaction: mode,
+                            ..params()
+                        },
+                    )
+                    .unwrap();
+                    let GetResponse::Output { output, .. } = response else {
+                        panic!("expected output response")
+                    };
+                    assert_eq!(fs::read_to_string(&output.content).unwrap(), ranged);
+                    let manifest: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&output.manifest).unwrap()).unwrap();
+                    assert_eq!(manifest["redaction"]["mode"], mode.as_str());
+                    assert_eq!(manifest["redaction"]["redacted_count"], usize::from(mode.enabled()));
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(
+                            fs::metadata(&output.content).unwrap().permissions().mode() & 0o777,
+                            0o600
+                        );
+                    }
+                    fs::remove_dir_all(output.content.parent().unwrap()).unwrap();
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn get_record_view_preserves_internal_objects_and_redacts_nested_values() {
         for record in [
             serde_json::json!({
