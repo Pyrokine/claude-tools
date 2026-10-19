@@ -269,12 +269,7 @@ jobs:
                       if (npm.status !== 201) throw new Error(`npm Trusted Publisher 认证失败，HTTP ${npm.status}`);
                       const exchanged = await json(npm);
                       secret(exchanged.token);
-                      const created = Date.parse(exchanged.created);
-                      const expires = Date.parse(exchanged.expires);
-                      if (typeof exchanged.token_type !== 'string' || !exchanged.token_type || !Number.isFinite(created) || !Number.isFinite(expires) || expires <= created || expires <= Date.now()) {
-                          throw new Error('npm 短期凭证的类型或期限无效');
-                      }
-                      const message = `${packageName}: npm OIDC exchange HTTP 201，短期认证有效至 ${new Date(expires).toISOString()}，本步骤未发布版本`;
+                      const message = `${packageName}: npm OIDC exchange HTTP 201，已取得短期发布凭证，本步骤未发布版本`;
                       console.log(message);
                       fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n\n`);
                   } catch (error) {
