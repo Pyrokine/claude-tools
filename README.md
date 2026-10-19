@@ -65,3 +65,22 @@ Module versions are independent of the repository release tag.
   exact `source` and `history_get` tool views recover duplicate-source or oversized records.
 
 See the module READMEs for parameter contracts and migration examples.
+
+## npm publishing for maintainers
+
+The [npm Trusted Publishing workflow](./.github/workflows/npm-publish.yml) uses GitHub Actions OIDC instead of a
+long-lived npm publishing token. Configure a trusted publisher separately for `@pyrokine/mcp-chrome` and
+`@pyrokine/mcp-ssh`, using GitHub owner `Pyrokine`, repository `claude-tools`, workflow filename `npm-publish.yml`, and
+environment `npm-publish`. Allow direct publishing; separate dist-tag management permission is not required. The GitHub
+environment must restrict deployments to the `main` branch.
+
+Run the workflow from `main` and set `expected_commit` to its approved full commit SHA. Both `publish_chrome` and
+`publish_ssh` default to `false`: this builds and checks both packages and verifies their GitHub-to-npm OIDC token
+exchange without publishing a version. No `NPM_TOKEN` secret is required. Build jobs have no OIDC publishing permission;
+authentication jobs verify the packaged artifacts and do not run package lifecycle scripts.
+
+For a release, complete the module regression guides, package review, and the current release authorization first. Then
+enable only the publishing switches for the approved packages. The workflow publishes the checked tarballs, verifies
+registry `gitHead`, integrity, and `latest`, and does not create a repository tag or GitHub Release. Create the repository
+release tag only after npm publishing and its verification have completed. If publishing or registry verification fails,
+inspect the existing registry version before retrying; a failed workflow does not prove that nothing was published.

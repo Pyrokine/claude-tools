@@ -1,0 +1,328 @@
+name: npm Trusted Publishing
+
+on:
+    workflow_dispatch:
+        inputs:
+            expected_commit:
+                description: 已批准的 main 分支完整 commit SHA
+                required: true
+                type: string
+            publish_chrome:
+                description: 实际发布 Chrome，须已完成发版确认与规定回归
+                required: true
+                default: false
+                type: boolean
+            publish_ssh:
+                description: 实际发布 SSH，须已完成发版确认与规定回归
+                required: true
+                default: false
+                type: boolean
+
+permissions:
+    contents: read
+
+concurrency:
+    group: npm-publish
+    cancel-in-progress: false
+
+env:
+    EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+    NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+
+jobs:
+    build:
+        name: 构建 ${{ matrix.module }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        strategy:
+            fail-fast: false
+            matrix:
+                module: [mcp-chrome, mcp-ssh]
+        defaults:
+            run:
+                shell: bash
+        env:
+            MODULE: ${{ matrix.module }}
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: 核对批准的仓库、分支与提交
+              run: |
+                  set -euo pipefail
+                  [[ "$GITHUB_REPOSITORY" == "Pyrokine/claude-tools" ]]
+                  [[ "$GITHUB_REF" == "refs/heads/main" ]]
+                  [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+                  [[ "$EXPECTED_COMMIT" == "$GITHUB_SHA" ]]
+                  [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]]
+                  [[ -d .git ]]
+
+            - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+              with:
+                  node-version: 24
+
+            - name: 安装模块依赖
+              working-directory: ${{ matrix.module }}
+              run: npm ci --include=optional
+
+            - name: 安装 Chrome Extension 依赖
+              if: matrix.module == 'mcp-chrome'
+              working-directory: mcp-chrome/extension
+              run: npm ci --include=optional
+
+            - name: 测试模块
+              working-directory: ${{ matrix.module }}
+              run: npm test
+
+            - name: 构建并测试 Chrome Extension
+              if: matrix.module == 'mcp-chrome'
+              working-directory: mcp-chrome/extension
+              run: npm run build && npm test && npm run lint:css
+
+            - name: 检查模块代码
+              working-directory: ${{ matrix.module }}
+              run: npm run lint
+
+            - name: 打包并记录发布物身份
+              env:
+                  ARTIFACT_DIR: ${{ runner.temp }}/npm-pack-${{ matrix.module }}
+                  PACK_LOG: ${{ runner.temp }}/npm-pack-${{ matrix.module }}.log
+              working-directory: ${{ matrix.module }}
+              run: |
+                  set -euo pipefail
+                  git diff --exit-code
+                  mkdir -p "$ARTIFACT_DIR"
+                  npm pkg set gitHead="$GITHUB_SHA"
+                  npm pack --json --pack-destination "$ARTIFACT_DIR" | tee "$PACK_LOG"
+                  node --input-type=module <<'NODE'
+                  import fs from 'node:fs';
+                  import path from 'node:path';
+                  import crypto from 'node:crypto';
+                  import assert from 'node:assert/strict';
+                  import { execFileSync } from 'node:child_process';
+                  const log = fs.readFileSync(process.env.PACK_LOG, 'utf8');
+                  const marker = log.lastIndexOf('\n[');
+                  const records = JSON.parse(marker >= 0 ? log.slice(marker + 1) : log);
+                  assert.equal(records.length, 1);
+                  const [pack] = records;
+                  const expectedName = `@pyrokine/${process.env.MODULE}`;
+                  assert.equal(pack.name, expectedName);
+                  assert.equal(path.basename(pack.filename), pack.filename);
+                  const tarball = path.join(process.env.ARTIFACT_DIR, pack.filename);
+                  const pkg = JSON.parse(execFileSync('tar', ['-xOzf', tarball, 'package/package.json'], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+                  assert.equal(pkg.name, expectedName);
+                  assert.equal(pkg.version, pack.version);
+                  assert.equal(pkg.gitHead, process.env.GITHUB_SHA);
+                  assert.equal(pkg.repository?.url, 'git+https://github.com/Pyrokine/claude-tools.git');
+                  const files = new Set(pack.files.map(file => file.path));
+                  assert.ok(files.has('dist/index.js'));
+                  if (process.env.MODULE === 'mcp-chrome') {
+                      assert.ok(files.has('extension/dist/manifest.json'));
+                      assert.ok(files.has('scripts/start-chrome.ps1'));
+                  }
+                  const bytes = fs.readFileSync(tarball);
+                  const integrity = `sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`;
+                  assert.equal(integrity, pack.integrity);
+                  const metadata = { name: pkg.name, version: pkg.version, commit: pkg.gitHead, repository: pkg.repository.url, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), integrity };
+                  fs.renameSync(tarball, path.join(process.env.ARTIFACT_DIR, 'package.tgz'));
+                  fs.writeFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), `${JSON.stringify(metadata, null, 2)}\n`, { flag: 'wx' });
+                  console.log(`${metadata.name}@${metadata.version}: ${metadata.sha256}, commit ${metadata.commit}`);
+                  NODE
+
+            - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: npm-${{ matrix.module }}-${{ github.run_id }}
+                  path: |
+                      ${{ runner.temp }}/npm-pack-${{ matrix.module }}/package.tgz
+                      ${{ runner.temp }}/npm-pack-${{ matrix.module }}/metadata.json
+                  if-no-files-found: error
+                  overwrite: true
+                  retention-days: 7
+
+    authenticate:
+        name: 验证或发布 ${{ matrix.module }}
+        needs: build
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        environment: npm-publish
+        permissions:
+            contents: read
+            id-token: write
+        strategy:
+            fail-fast: false
+            max-parallel: 1
+            matrix:
+                module: [mcp-chrome, mcp-ssh]
+        defaults:
+            run:
+                shell: bash
+        env:
+            MODULE: ${{ matrix.module }}
+            NPM_CONFIG_USERCONFIG: /dev/null
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: 重新核对批准的提交
+              run: |
+                  set -euo pipefail
+                  [[ "$GITHUB_REPOSITORY" == "Pyrokine/claude-tools" ]]
+                  [[ "$GITHUB_REF" == "refs/heads/main" ]]
+                  [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+                  [[ "$EXPECTED_COMMIT" == "$GITHUB_SHA" ]]
+                  [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]]
+                  [[ -d .git ]]
+
+            - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+              with:
+                  node-version: 24
+
+            - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+              with:
+                  name: npm-${{ matrix.module }}-${{ github.run_id }}
+                  path: ${{ runner.temp }}/npm-release-${{ matrix.module }}
+
+            - name: 核对制品内容与摘要
+              env:
+                  ARTIFACT_DIR: ${{ runner.temp }}/npm-release-${{ matrix.module }}
+              run: |
+                  node --input-type=module <<'NODE'
+                  import fs from 'node:fs';
+                  import path from 'node:path';
+                  import crypto from 'node:crypto';
+                  import assert from 'node:assert/strict';
+                  import { execFileSync } from 'node:child_process';
+                  const version = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim();
+                  const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/);
+                  assert.ok(match, 'npm 版本格式无效');
+                  const [major, minor, patch] = match.slice(1).map(Number);
+                  assert.ok(major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))), 'npm 必须支持 Trusted Publishing');
+                  for (const key of ['NPM_TOKEN', 'NODE_AUTH_TOKEN', 'NPM_ID_TOKEN']) {
+                      assert.ok(!process.env[key], '认证 job 不使用预先提供的 npm token');
+                  }
+                  const metadata = JSON.parse(fs.readFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), 'utf8'));
+                  const tarball = path.join(process.env.ARTIFACT_DIR, 'package.tgz');
+                  const bytes = fs.readFileSync(tarball);
+                  assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), metadata.sha256);
+                  assert.equal(`sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`, metadata.integrity);
+                  const pkg = JSON.parse(execFileSync('tar', ['-xOzf', tarball, 'package/package.json'], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+                  assert.equal(metadata.name, `@pyrokine/${process.env.MODULE}`);
+                  assert.equal(pkg.name, metadata.name);
+                  assert.equal(pkg.version, metadata.version);
+                  assert.equal(pkg.gitHead, process.env.EXPECTED_COMMIT);
+                  assert.equal(metadata.commit, process.env.EXPECTED_COMMIT);
+                  assert.equal(pkg.repository?.url, 'git+https://github.com/Pyrokine/claude-tools.git');
+                  assert.equal(metadata.repository, pkg.repository.url);
+                  console.log(`${metadata.name}@${metadata.version}: 制品与批准提交一致，npm ${version}`);
+                  NODE
+
+            - name: 验证 GitHub OIDC 到 npm 的真实认证
+              run: |
+                  node --input-type=module <<'NODE'
+                  import fs from 'node:fs';
+                  const packageName = `@pyrokine/${process.env.MODULE}`;
+                  const mask = value => console.log(`::add-mask::${value.replaceAll('%', '%25')}`);
+                  async function request(url, options = {}) {
+                      try {
+                          return await fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(30000) });
+                      } catch {
+                          throw new Error('OIDC 请求失败或超时');
+                      }
+                  }
+                  async function json(response) {
+                      try {
+                          return await response.json();
+                      } catch {
+                          throw new Error('OIDC 响应不是有效 JSON');
+                      }
+                  }
+                  function secret(value) {
+                      if (typeof value !== 'string' || !value || /[\r\n]/.test(value)) {
+                          throw new Error('OIDC 响应缺少有效凭证');
+                      }
+                      mask(value);
+                      return value;
+                  }
+                  try {
+                      if (!process.env.ACTIONS_ID_TOKEN_REQUEST_URL || !process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
+                          throw new Error('GitHub 未提供所需的 OIDC 权限');
+                      }
+                      const url = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+                      url.searchParams.set('audience', 'npm:registry.npmjs.org');
+                      const github = await request(url, { headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}`, Accept: 'application/json' } });
+                      if (!github.ok) throw new Error(`GitHub OIDC 请求失败，HTTP ${github.status}`);
+                      const jwt = secret((await json(github)).value);
+                      let claims;
+                      try {
+                          claims = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'));
+                      } catch {
+                          throw new Error('GitHub OIDC 身份声明无效');
+                      }
+                      if (claims.repository !== 'Pyrokine/claude-tools' || claims.ref !== 'refs/heads/main' || claims.sha !== process.env.EXPECTED_COMMIT || claims.sub !== 'repo:Pyrokine/claude-tools:environment:npm-publish') {
+                          throw new Error('GitHub OIDC 身份与批准的仓库、分支、环境或提交不符');
+                      }
+                      const npm = await request(`https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(packageName)}`, { method: 'POST', headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/json' } });
+                      if (npm.status !== 201) throw new Error(`npm Trusted Publisher 认证失败，HTTP ${npm.status}`);
+                      const exchanged = await json(npm);
+                      secret(exchanged.token);
+                      const created = Date.parse(exchanged.created);
+                      const expires = Date.parse(exchanged.expires);
+                      if (typeof exchanged.token_type !== 'string' || !exchanged.token_type || !Number.isFinite(created) || !Number.isFinite(expires) || expires <= created || expires <= Date.now()) {
+                          throw new Error('npm 短期凭证的类型或期限无效');
+                      }
+                      const message = `${packageName}: npm OIDC exchange HTTP 201，短期认证有效至 ${new Date(expires).toISOString()}，本步骤未发布版本`;
+                      console.log(message);
+                      fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n\n`);
+                  } catch (error) {
+                      console.error(error.message);
+                      process.exitCode = 1;
+                  }
+                  NODE
+
+            - name: 发布已批准的模块并核对 registry
+              if: (matrix.module == 'mcp-chrome' && inputs.publish_chrome) || (matrix.module == 'mcp-ssh' && inputs.publish_ssh)
+              env:
+                  ARTIFACT_DIR: ${{ runner.temp }}/npm-release-${{ matrix.module }}
+              run: |
+                  node --input-type=module <<'NODE'
+                  import fs from 'node:fs';
+                  import path from 'node:path';
+                  import { spawnSync } from 'node:child_process';
+                  import { setTimeout as delay } from 'node:timers/promises';
+                  const metadata = JSON.parse(fs.readFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), 'utf8'));
+                  const tarball = path.join(process.env.ARTIFACT_DIR, 'package.tgz');
+                  const published = spawnSync('npm', ['publish', tarball, '--ignore-scripts', '--provenance', '--access', 'public', '--registry', 'https://registry.npmjs.org'], { encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024 });
+                  process.stdout.write(published.stdout ?? '');
+                  process.stderr.write(published.stderr ?? '');
+                  const marker = `+ ${metadata.name}@${metadata.version}`;
+                  const commandSucceeded = published.status === 0 && (published.stdout ?? '').split(/\r?\n/).some(line => line.trim() === marker);
+                  let verified = false;
+                  for (let attempt = 0; attempt < 20; ++attempt) {
+                      try {
+                          const url = new URL(`https://registry.npmjs.org/${metadata.name}`);
+                          url.searchParams.set('verification', `${process.env.GITHUB_RUN_ID}-${attempt}`);
+                          const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+                          if (response.ok) {
+                              const data = await response.json();
+                              const version = data.versions?.[metadata.version];
+                              verified = version?.gitHead === metadata.commit && version?.dist?.integrity === metadata.integrity && data['dist-tags']?.latest === metadata.version;
+                              if (verified) break;
+                          }
+                      } catch {
+                          console.log(`registry 校验第 ${attempt + 1} 次未完成`);
+                      }
+                      if (attempt < 19) await delay(15000);
+                  }
+                  if (!commandSucceeded || !verified) {
+                      console.error(`npm 命令成功回显=${commandSucceeded}，registry 身份校验=${verified}；未自动重发，请核对实际版本后处理`);
+                      process.exitCode = 1;
+                  } else {
+                      const message = `${metadata.name}@${metadata.version}: 已核对 registry gitHead、integrity 与 latest`;
+                      console.log(message);
+                      fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n\n`);
+                  }
+                  NODE

@@ -63,3 +63,18 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
   normal 保留排序、UUID 去重、regex 和 slice；精确 `source` 与 `history_get` 工具视图用于读取同名来源和超大记录
 
 参数合同和迁移示例见各模块 README
+
+## 维护者 npm 发布
+
+[npm Trusted Publishing 工作流](./.github/workflows/npm-publish.yml) 使用 GitHub Actions OIDC，不依赖需要定期续期的 npm
+发布 token，为 `@pyrokine/mcp-chrome` 和 `@pyrokine/mcp-ssh` 分别配置 Trusted Publisher：GitHub owner 为 `Pyrokine`，仓库为
+`claude-tools`，workflow 文件名为 `npm-publish.yml`，环境为 `npm-publish`，允许直接发布，无需另行授予 dist-tag 管理权限
+GitHub 环境的部署分支必须仅允许 `main`
+
+从 `main` 手动运行工作流，将 `expected_commit` 设置为已经批准的完整 commit SHA，`publish_chrome` 和 `publish_ssh` 默认均为
+`false`，此时只构建、检查两个包并验证 GitHub 到 npm 的真实 OIDC token 交换，不发布版本，也不需要配置 `NPM_TOKEN` secret
+构建 job 没有 OIDC 发布权限，认证 job 核对打包制品，不执行包的生命周期脚本
+
+正式发版前，完成各模块回归指导、包内容检查和当次发版授权，再仅开启已经批准发布的模块开关
+工作流发布已核对的 tarball，并验证 registry 的 `gitHead`、integrity 和 `latest`，不会创建仓库 tag 或 GitHub Release
+npm 发布及验证完成后再创建仓库 release tag，发布或 registry 验证失败时，先检查 registry 中的实际版本，再决定重试，工作流失败不代表版本尚未发布
