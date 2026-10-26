@@ -2252,6 +2252,7 @@ test(
     async (t) => {
         const directory = makeTempDir(t)
         const manager = new SessionManager(path.join(directory, 'cancellation.json'))
+        manager.persistSessions = () => {}
         t.after(() => manager.operationManager.close())
         manager.getRemotePlatform = () => 'posix'
 
@@ -2326,6 +2327,7 @@ test(
         for (const scenario of ['ordinary', 'session-leader', 'without-setsid']) {
             await t.test(scenario, async (t) => {
                 const manager = new SessionManager(path.join(directory, `${scenario}.json`))
+                manager.persistSessions = () => {}
                 const children = new Set()
                 t.after(async () => {
                     for (const child of children) {
@@ -2403,6 +2405,8 @@ test(
 test('session summaries stay brief while internal transfer capability retains route decisions', (t) => {
     const directory = makeTempDir(t)
     const manager = new SessionManager(path.join(directory, 'sessions.json'))
+    manager.persistSessions = () => {}
+    t.after(() => manager.operationManager.close())
     manager.sessions.set('password-session', {
         client: { end() {} },
         config: {

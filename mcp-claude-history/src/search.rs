@@ -2946,6 +2946,7 @@ mod tests {
         let source = root.join("project/full-output-session.jsonl");
         let body = format!("{} TAIL-4515", "中".repeat(4515));
         fs::write(&source,format!("{}\n{}\n",serde_json::json!({"uuid":"body","type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":body}}),serde_json::json!({"uuid":"tool","type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"thinking","thinking":"fixture thought"},{"type":"text","text":"Tool explanation"},{"type":"tool_use","id":"tool","name":"Bash","input":{"nested":{"password":"fixture-secret","note":body}}}]}}))).unwrap();
+        let source = source.canonicalize().unwrap();
         let config = Config {
             projects_dir: root.clone(),
         };
