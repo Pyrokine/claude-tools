@@ -52,7 +52,7 @@ Each subdirectory README includes source build instructions and client-specific 
 
 | Module             | Version | Changes                                                                                                                                                                                |
 | ------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| mcp-claude-history | 2.1.0   | Indexed large-record search, paged source catalogs, full-content exports, and precise source recovery                                                                                  |
+| mcp-claude-history | 2.1.1   | Indexed large-record search, paged source catalogs, full-content exports, precise source recovery, and Windows history-path/private-export fixes                                                                                  |
 | mcp-chrome         | 3.0.1   | Hidden-field value protection, middle-button events, focus-only editing commands, target/frame/deadline corrections, action-scoped window/group controls, and backend capability fixes |
 | mcp-ssh            | 3.1.0   | Existing OpenSSH master reuse, explicit file verification, filtered directory pages, and SFTP/output corrections                                                                       |
 

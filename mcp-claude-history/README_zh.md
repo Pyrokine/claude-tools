@@ -4,7 +4,9 @@
 
 Claude Code 对话历史搜索工具
 
-模块版本：2.1.0
+模块版本：2.1.1
+
+本版本修复 Windows 历史路径规范化后的文件读取，以及从 PowerShell 7 启动时的私有导出创建
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)
