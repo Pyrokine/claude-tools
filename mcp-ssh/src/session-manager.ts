@@ -18,12 +18,14 @@ import { isUtf8ContinuationByte, retainUtf8Suffix } from './utf8.js'
 import { clearRsyncCache } from './file-ops.js'
 import { ForwardManager } from './forward-manager.js'
 import { OperationManager } from './operation-manager.js'
+import { OpenSshConnection, OpenSshError } from './openssh.js'
 import { PtyManager } from './pty-manager.js'
 import { buildRemoteCommand, encodedPowershell, quotePowershell, remotePathStyle } from './remote-platform.js'
 import { sanitizeKeyError, validateKeyFile } from './security.js'
 import { escapeShellArg, expandTilde } from './tools/utils.js'
 import { checkWindowsAcl } from './windows-acl.js'
 import {
+    CommandChannel,
     ConnectionFailureDetails,
     DEFAULT_EXEC_MAX_OUTPUT_SIZE,
     ExecOptions,
@@ -36,6 +38,7 @@ import {
     OperationInfo,
     OperationReadResult,
     OperationStartOptions,
+    OpenSshMasterInfo,
     PersistedSession,
     PortForwardInfo,
     PtyCloseResult,
@@ -48,8 +51,7 @@ import {
     SSHSessionDetail,
 } from './types.js'
 
-interface SSHSession {
-    client: Client
+interface SessionState {
     config: SSHConnectionConfig
     connectedAt: number
     lastUsedAt: number
@@ -61,8 +63,16 @@ interface SSHSession {
     reconnectTimer?: NodeJS.Timeout
 }
 
+interface Ssh2Session extends SessionState {
+    backend?: 'ssh2'
+    client: Client
+}
+
+type SSHSession = Ssh2Session | (SessionState & { backend: 'openssh'; transport: OpenSshConnection })
+
 interface PendingConnection {
     client?: Client
+    signal: AbortSignal
     generation: number
     fingerprint: string
     cancel(error: Error): void
@@ -75,6 +85,11 @@ interface InFlightConnection {
 }
 
 interface SessionConnectionInfo {
+    backend: 'ssh2' | 'openssh'
+    masterReused?: boolean
+    identityStatus?: OpenSshMasterInfo['identityStatus']
+    masterPid?: number
+    observedLogin?: OpenSshMasterInfo['observedLogin']
     alias: string
     identity: string
     loginUser: string
@@ -201,14 +216,17 @@ export class SessionManager {
         const cancellation = new Promise<never>((_resolve, reject) => {
             rejectCancellation = reject
         })
+        const controller = new AbortController()
         const pendingConnection: PendingConnection = {
             generation,
             fingerprint,
+            signal: controller.signal,
             cancel: (error) => {
                 if (cancelled) {
                     return
                 }
                 cancelled = true
+                controller.abort(error)
                 try {
                     pendingConnection.client?.end()
                 } catch {
@@ -250,7 +268,8 @@ export class SessionManager {
         this.invalidateAliasResources(alias)
 
         try {
-            session.client.end()
+            if (session.backend === 'openssh') session.transport.close()
+            else session.client.end()
         } catch {
             /* 忽略已关闭的连接 */
         }
@@ -273,7 +292,8 @@ export class SessionManager {
             }
             this.invalidateAliasResources(alias)
             try {
-                session.client.end()
+                if (session.backend === 'openssh') session.transport.close()
+                else session.client.end()
             } catch {
                 /* 忽略已关闭的连接 */
             }
@@ -300,15 +320,32 @@ export class SessionManager {
         if (!session) {
             throw new Error(`Session '${alias}' not found. Use ssh_connect first.`)
         }
+        if (session.backend === 'openssh') session.transport.assertCurrent()
         if (!this.isAlive(session)) {
+            if (session.backend === 'openssh')
+                throw new OpenSshError('The bound OpenSSH master is no longer available', {
+                    code: 'master_unavailable',
+                    backend: 'openssh',
+                    alias,
+                    retryable: false,
+                })
             throw new Error(`Session '${alias}' is disconnected. Use ssh_connect to reconnect.`)
         }
         session.lastUsedAt = Date.now()
         return session
     }
 
+    getOpenSshConnection(alias: string): OpenSshConnection | undefined {
+        const session = this.sessions.get(alias)
+        if (session?.backend !== 'openssh') return undefined
+        this.getSession(alias)
+        return session.transport
+    }
+
     listSessions(): SSHSessionBrief[] {
         return Array.from(this.sessions, ([alias, session]) => ({
+            backend: session.backend ?? 'ssh2',
+            ...(session.backend === 'openssh' ? { masterReused: true, identityStatus: 'master_trusted' as const } : {}),
             alias,
             identity: this.sessionIdentity(session),
             runAs: session.config.runAs,
@@ -319,19 +356,24 @@ export class SessionManager {
 
     listSessionDetails(): SSHSessionDetail[] {
         return Array.from(this.sessions, ([alias, session]) => ({
+            backend: session.backend ?? 'ssh2',
+            ...(session.backend === 'openssh' ? session.transport.info : {}),
             alias,
             identity: this.sessionIdentity(session),
             host: session.config.host,
             port: session.config.port ?? 22,
             username: session.config.username,
             runAs: session.config.runAs,
-            authMethod: session.config.privateKeyPath
-                ? 'key'
-                : session.config.privateKey
-                  ? 'inline-key'
-                  : session.config.password
-                    ? 'password'
-                    : 'agent',
+            authMethod:
+                session.backend === 'openssh'
+                    ? 'master'
+                    : session.config.privateKeyPath
+                      ? 'key'
+                      : session.config.privateKey
+                        ? 'inline-key'
+                        : session.config.password
+                          ? 'password'
+                          : 'agent',
             connected: this.isAlive(session),
             connectedAt: session.connectedAt,
             lastUsedAt: session.lastUsedAt,
@@ -347,6 +389,8 @@ export class SessionManager {
         const session = this.getSession(alias)
         const config = session.config
         return {
+            backend: session.backend ?? 'ssh2',
+            ...(session.backend === 'openssh' ? session.transport.info : {}),
             alias,
             identity: this.sessionIdentity(session),
             loginUser: config.username,
@@ -392,6 +436,27 @@ export class SessionManager {
     getExternalTransferCapability(alias: string): ExternalTransferCapability {
         const session = this.getSession(alias)
         const config = session.config
+        if (session.backend === 'openssh') {
+            session.transport.assertCurrent()
+            return {
+                backend: 'openssh',
+                controlPath: config.controlPath,
+                alias,
+                identity: this.sessionIdentity(session),
+                host: config.host,
+                port: config.port,
+                username: config.username,
+                authMethod: 'master',
+                hasJumpHost: false,
+                routeSafeForOpenSsh: true,
+                rsyncEligible: true,
+                decisionReason: 'existing_openssh_master',
+                rsyncExecutable: config.rsyncExecutable,
+                rsyncProfile: 'posix',
+                commandShell: 'posix',
+                remotePathStyle: 'posix',
+            }
+        }
         const authMethod = config.privateKeyPath
             ? ('key-path' as const)
             : config.privateKey
@@ -538,7 +603,7 @@ export class SessionManager {
         if (!sudoPassword) {
             return this.exec(alias, `sudo ${command}`, options)
         }
-        const session = this.getSession(alias)
+        const session = this.requireSsh2Session(alias, 'password-based sudo')
         const startTime = Date.now()
         const timeout = options.timeout ?? this.defaultTimeout
         const maxOutputSize = this.normalizeMaxOutputSize(options.maxOutputSize)
@@ -711,7 +776,7 @@ export class SessionManager {
      * 获取 SFTP 客户端
      */
     getSftp(alias: string): Promise<SFTPWrapper> {
-        const session = this.getSession(alias)
+        const session = this.requireSsh2Session(alias, 'SFTP')
         return new Promise((resolve, reject) => {
             session.client.sftp((err, sftp) => {
                 if (!this.isCurrentSession(alias, session)) {
@@ -769,7 +834,7 @@ export class SessionManager {
         localHost: string = '127.0.0.1'
     ): Promise<{ forwardId: string; localPort: number }> {
         return this.forwardManager.forwardLocal(
-            { getClient: (a) => this.getSession(a).client },
+            { getClient: (a) => this.requireSsh2Session(a, 'port forwarding').client },
             alias,
             localPort,
             remoteHost,
@@ -788,7 +853,7 @@ export class SessionManager {
         remoteHost: string = '127.0.0.1'
     ): Promise<{ forwardId: string; remotePort: number }> {
         return this.forwardManager.forwardRemote(
-            { getClient: (a) => this.getSession(a).client },
+            { getClient: (a) => this.requireSsh2Session(a, 'port forwarding').client },
             alias,
             remotePort,
             localHost,
@@ -801,7 +866,7 @@ export class SessionManager {
         return this.forwardManager.close(
             forwardId,
             {
-                getClient: (a) => this.getSession(a).client,
+                getClient: (a) => this.requireSsh2Session(a, 'port forwarding').client,
             },
             options
         )
@@ -809,6 +874,19 @@ export class SessionManager {
 
     forwardList(): PortForwardInfo[] {
         return this.forwardManager.list()
+    }
+
+    private requireSsh2Session(alias: string, capability: string): Ssh2Session {
+        const session = this.getSession(alias)
+        if (session.backend === 'openssh') {
+            throw new OpenSshError(`The OpenSSH backend does not support ${capability}`, {
+                code: 'unsupported_backend',
+                backend: 'openssh',
+                capability,
+                retryable: false,
+            })
+        }
+        return session
     }
 
     private isSshAgentAvailable(socketPath?: string): boolean {
@@ -860,6 +938,8 @@ export class SessionManager {
                 ? undefined
                 : Object.entries(values).sort(([left], [right]) => left.localeCompare(right))
         const payload = (value: SSHConnectionConfig): Record<string, unknown> => ({
+            backend: value.backend ?? 'ssh2',
+            controlPath: value.controlPath,
             host: value.host,
             port: value.port ?? 22,
             username: value.username,
@@ -987,12 +1067,40 @@ export class SessionManager {
         return maxOutputSize
     }
 
+    private openCommandChannel(
+        session: SSHSession,
+        command: string,
+        options: Ssh2ExecOptions,
+        callback: (error: Error | undefined, stream?: CommandChannel) => void
+    ): void {
+        if (session.backend === 'openssh') {
+            if (options.pty) {
+                callback(
+                    new OpenSshError('The OpenSSH backend does not support PTY', {
+                        code: 'unsupported_backend',
+                        backend: 'openssh',
+                        capability: 'PTY',
+                        retryable: false,
+                    })
+                )
+                return
+            }
+            try {
+                callback(undefined, session.transport.open(command))
+            } catch (error) {
+                callback(error instanceof Error ? error : new Error(String(error)))
+            }
+        } else {
+            session.client.exec(command, options, callback)
+        }
+    }
+
     private async openOperationStream(
         alias: string,
         command: string,
         marker: string,
         options: OperationStartOptions,
-        adopt: (stream: ClientChannel) => void
+        adopt: (stream: CommandChannel) => void
     ): Promise<void> {
         const session = this.getSession(alias)
         const markerEnv = `MCP_SSH_OPERATION_MARKER=${this.escapeShellArg(marker)}`
@@ -1038,19 +1146,20 @@ export class SessionManager {
         }
 
         return new Promise((resolve, reject) => {
-            session.client.exec(fullCommand, {}, (error, stream) => {
+            this.openCommandChannel(session, fullCommand, {}, (error, stream) => {
                 if (!this.isCurrentSession(alias, session)) {
                     this.closeClientChannel(stream)
                     reject(new Error('Operation start was cancelled because the SSH session changed'))
                     return
                 }
-                if (error) {
-                    reject(new Error(`Operation start failed: ${error.message}`))
+                if (error || !stream) {
+                    reject(error ?? new Error('Operation start did not return a command channel'))
                     return
                 }
                 try {
                     adopt(stream)
-                    resolve()
+                    if (stream.ready) void stream.ready.then(resolve, reject)
+                    else resolve()
                 } catch (adoptionError) {
                     this.closeClientChannel(stream)
                     reject(adoptionError)
@@ -1153,7 +1262,7 @@ export class SessionManager {
             let stdoutTruncated = false
             let stderrTruncated = false
             let settled = false
-            let activeStream: ClientChannel | null = null
+            let activeStream: CommandChannel | null = null
             const stdoutDecoder = new StringDecoder('utf8')
             const stderrDecoder = new StringDecoder('utf8')
             let decodersEnded = false
@@ -1230,14 +1339,14 @@ export class SessionManager {
                 rejectOnce(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
             }, timeout)
 
-            session.client.exec(fullCommand, execOptions, (err, stream) => {
+            this.openCommandChannel(session, fullCommand, execOptions, (err, stream) => {
                 if (!this.isCurrentSession(alias, session)) {
                     this.closeClientChannel(stream)
                     rejectOnce(new Error('Exec was cancelled because the SSH session changed'))
                     return
                 }
-                if (err) {
-                    rejectOnce(new Error(`Exec failed: ${err.message}`))
+                if (err || !stream) {
+                    rejectOnce(err ?? new Error('Exec did not return a command channel'))
                     return
                 }
                 if (settled) {
@@ -1246,6 +1355,19 @@ export class SessionManager {
                 }
 
                 activeStream = stream
+                stream.on('error', (error: Error) => {
+                    rejectOnce(
+                        new CommandError(error.message, {
+                            failureKind: 'ssh_transport',
+                            operationStatus: 'unknown',
+                            retryable: false,
+                            stdout,
+                            stderr,
+                            ...this.outputMetadata(outputPreview()),
+                            ...this.resultMetadata(session, options, context),
+                        })
+                    )
+                })
 
                 stream.on('close', (code: number) => {
                     if (settled) {
@@ -1310,6 +1432,32 @@ export class SessionManager {
             return alias
         }
 
+        if (existing) {
+            existing.manualClose = true
+            if (existing.reconnectTimer) clearTimeout(existing.reconnectTimer)
+            this.invalidateAliasResources(alias)
+            if (existing.backend === 'openssh') existing.transport.close()
+            else existing.client.end()
+        }
+        if (config.backend === 'openssh') {
+            const transport = await OpenSshConnection.connect(config, pendingConnection.signal)
+            if (!this.isCurrentPendingConnection(alias, pendingConnection)) {
+                transport.close()
+                throw new Error(`Connection for alias '${alias}' was cancelled before ready`)
+            }
+            this.sessions.set(alias, {
+                backend: 'openssh',
+                transport,
+                config,
+                connectedAt: Date.now(),
+                lastUsedAt: Date.now(),
+                reconnectAttempts: 0,
+                connected: true,
+                manualClose: false,
+            })
+            this.persistSessions()
+            return alias
+        }
         const client = new Client()
         pendingConnection.client = client
         const readyTimeout = config.readyTimeout ?? this.defaultTimeout
@@ -1380,7 +1528,7 @@ export class SessionManager {
                 throw this.createConnectionError(error, jumpConfig, jumpConfig.readyTimeout!, 'jump_connect')
             }
             const jumpSession = this.sessions.get(jumpAlias)
-            if (!jumpSession || !this.isAlive(jumpSession)) {
+            if (!jumpSession || jumpSession.backend === 'openssh' || !this.isAlive(jumpSession)) {
                 throw new ConnectionError(`Jump host session '${jumpAlias}' is unavailable`, {
                     failureStage: 'transport_or_handshake',
                     connectionStep: 'jump_connect',
@@ -1454,7 +1602,7 @@ export class SessionManager {
 
             client.on('error', (error) => {
                 const session = this.sessions.get(alias)
-                if (session && session.client === client) {
+                if (session && session.backend !== 'openssh' && session.client === client) {
                     session.connected = false
                 }
                 rejectConnection(error)
@@ -1462,7 +1610,7 @@ export class SessionManager {
 
             client.on('close', () => {
                 const session = this.sessions.get(alias)
-                if (session && session.client === client) {
+                if (session && session.backend !== 'openssh' && session.client === client) {
                     session.connected = false
                     this.invalidateAliasResources(alias)
                     if (!session.manualClose) {
@@ -1486,7 +1634,7 @@ export class SessionManager {
      * 执行带 PTY 的命令，返回原始 stream（供 PtyManager 使用）
      */
     private execPtyStream(alias: string, command: string, options: PtyOptions): Promise<ClientChannel> {
-        const session = this.getSession(alias)
+        const session = this.requireSsh2Session(alias, 'PTY')
         const fullCommand = this.buildCommand(command, session, { env: options.env, cwd: options.cwd })
 
         return new Promise((resolve, reject) => {
@@ -1620,15 +1768,14 @@ export class SessionManager {
      * 检查连接是否存活
      */
     private isAlive(session: SSHSession): boolean {
-        return session.connected
+        return session.connected && (session.backend !== 'openssh' || session.transport.isAlive())
     }
 
     private isCurrentSession(alias: string, session: SSHSession): boolean {
-        const currentSession = this.sessions.get(alias)
-        return currentSession === session && currentSession.client === session.client && currentSession.connected
+        return this.sessions.get(alias) === session && this.isAlive(session)
     }
 
-    private closeClientChannel(stream: ClientChannel | undefined): void {
+    private closeClientChannel(stream: CommandChannel | undefined): void {
         try {
             stream?.destroy()
         } catch {
@@ -1654,7 +1801,7 @@ export class SessionManager {
      */
     private scheduleReconnect(alias: string): void {
         const session = this.sessions.get(alias)
-        if (!session || session.reconnectAttempts >= this.maxReconnectAttempts) {
+        if (!session || session.backend === 'openssh' || session.reconnectAttempts >= this.maxReconnectAttempts) {
             return
         }
 
@@ -1668,7 +1815,7 @@ export class SessionManager {
 
         session.reconnectTimer = setTimeout(async () => {
             const current = this.sessions.get(alias)
-            if (current !== session || current.client !== session.client) {
+            if (current !== session) {
                 return
             }
             session.reconnectTimer = undefined

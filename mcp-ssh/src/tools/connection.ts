@@ -10,6 +10,7 @@ import * as os from 'os'
 import * as path from 'path'
 import { z } from 'zod'
 import { sessionManager } from '../session-manager.js'
+import { OpenSshError, resolveOpenSshConfig } from '../openssh.js'
 import { parseProxyJump, parseSSHConfig } from '../ssh-config.js'
 import { sshPortSchema } from './schema.js'
 import { expandTilde, formatError, formatResult } from './utils.js'
@@ -33,6 +34,9 @@ const templateJumpHostSchema = z.object({
 })
 
 const connectionTemplateSchema = z.object({
+    backend: z.enum(['ssh2', 'openssh']).optional(),
+    controlPath: z.string().optional(),
+    configPath: z.string().optional(),
     configHost: z.string().optional(),
     host: z.string().optional(),
     user: z.string().optional(),
@@ -120,6 +124,11 @@ function mergeEnv(
 // ========== Schemas ==========
 
 const connectSchema = z.object({
+    backend: z
+        .enum(['ssh2', 'openssh'])
+        .optional()
+        .describe('连接后端，默认 ssh2；openssh 仅复用用户已有 master，失败不新建连接'),
+    controlPath: z.string().optional().describe('OpenSSH master 的 socket 路径，默认取 ssh -G 的 ControlPath'),
     template: z.string().optional().describe('连接模板名，从 SSH_MCP_TEMPLATES 或 ~/.mcp-ssh/templates.json 读取'),
     configHost: z.string().optional().describe('使用 ~/.ssh/config 中的 Host 配置（推荐）'),
     configPath: z.string().optional().describe('SSH 配置文件路径（默认 ~/.ssh/config）'),
@@ -174,6 +183,11 @@ const disconnectSchema = z.object({
 })
 
 const sessionFieldSchema = z.enum([
+    'backend',
+    'masterReused',
+    'identityStatus',
+    'masterPid',
+    'observedLogin',
     'alias',
     'identity',
     'runAs',
@@ -208,6 +222,9 @@ const configListSchema = z.object({
 async function handleConnect(args: z.infer<typeof connectSchema>) {
     try {
         const template = getTemplate(args.template)
+        const backend = args.backend ?? template.backend ?? 'ssh2'
+        const configPath = args.configPath ?? template.configPath
+        let controlPath = args.controlPath ?? template.controlPath
         const configHost = args.configHost ?? template.configHost
         let host = args.host ?? template.host
         let user = args.user ?? template.user ?? template.username
@@ -242,8 +259,58 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
               }
             | undefined
 
-        if (configHost) {
-            const allHosts = parseSSHConfig(args.configPath)
+        if (backend === 'openssh') {
+            if (
+                password !== undefined ||
+                keyPath !== undefined ||
+                agent !== undefined ||
+                args.jumpHost ||
+                template.jumpHost
+            ) {
+                throw new OpenSshError(
+                    'OpenSSH master reuse does not accept new authentication or jumpHost parameters',
+                    {
+                        code: 'unsupported_backend',
+                        backend,
+                        capability: 'new_authentication',
+                        retryable: false,
+                    }
+                )
+            }
+            if (
+                remotePlatform !== 'posix' ||
+                commandShell !== 'posix' ||
+                remotePathStyle !== 'posix' ||
+                (rsyncProfile && rsyncProfile !== 'posix')
+            ) {
+                throw new OpenSshError('OpenSSH master reuse requires a POSIX remote shell and path style', {
+                    code: 'unsupported_backend',
+                    backend,
+                    capability: 'platform',
+                    retryable: false,
+                })
+            }
+            const resolved = await resolveOpenSshConfig({
+                configHost,
+                configPath,
+                host,
+                username: user,
+                port,
+                controlPath,
+                readyTimeout,
+            })
+            host = resolved.host
+            user = resolved.username
+            port = resolved.port
+            controlPath = resolved.controlPath
+        } else if (controlPath !== undefined) {
+            throw new OpenSshError('controlPath requires backend=openssh', {
+                code: 'invalid_openssh_config',
+                backend,
+                retryable: false,
+            })
+        } else if (configHost) {
+            const allHosts = parseSSHConfig(configPath)
             const hostConfig = allHosts.find((h) => h.host === configHost)
             if (!hostConfig) {
                 return formatResult({
@@ -342,6 +409,8 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             .filter((session) => session.identity === identity && session.alias !== finalAlias && session.connected)
             .map((session) => ({ alias: session.alias, runAs: session.runAs, connectedAt: session.connectedAt }))
         const alias = await sessionManager.connect({
+            backend,
+            controlPath,
             host,
             port: finalPort,
             username: user,
@@ -365,6 +434,11 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
         const connected = sessionManager.getSessionConnectionInfo(alias)
         return formatResult({
             success: true,
+            backend: connected.backend,
+            masterReused: connected.masterReused,
+            identityStatus: connected.identityStatus,
+            masterPid: connected.masterPid,
+            observedLogin: connected.observedLogin,
             alias: connected.alias,
             reused,
             identity: connected.identity,
@@ -462,7 +536,8 @@ export function registerConnectionTools(server: McpServer): void {
         'ssh_connect',
         {
             description: [
-                '建立 SSH 连接并保持会话，支持密码、密钥认证，支持跳板机',
+                '建立 SSH 会话，默认 ssh2 支持密码、密钥和跳板机；backend=openssh 仅复用用户已有主连接，失败不新建连接或重新认证',
+                'OpenSSH 后端沿用用户 master 的信任，支持 POSIX 命令、后台操作和 rsync 同步；断开 alias 保留用户 master，未适配能力明确报错',
                 '',
                 '可通过 configHost 参数使用 ~/.ssh/config 中的配置，无需重复填写连接信息；模板会在连接前校验端口和嵌套 jumpHost 字段',
                 '支持 Host 多别名、Host * 全局默认继承、ProxyJump（user@host:port 格式）',

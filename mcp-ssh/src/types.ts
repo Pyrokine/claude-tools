@@ -2,6 +2,22 @@
  * SSH MCP Pro - 类型定义
  */
 
+import type { Readable } from 'stream'
+
+export interface CommandChannel extends Readable {
+    readonly stderr: Readable
+    readonly ready?: Promise<void>
+    close(): void
+}
+
+export interface OpenSshMasterInfo {
+    backend: 'openssh'
+    masterReused: true
+    identityStatus: 'master_trusted'
+    masterPid: number
+    observedLogin?: { uid: number; username: string; sshConnection?: string }
+}
+
 export const DEFAULT_EXEC_MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 export const HARD_EXEC_MAX_OUTPUT_SIZE = 50 * 1024 * 1024
 
@@ -11,6 +27,8 @@ export type RemotePathStyle = 'posix' | 'win32' | 'sftp-posix'
 export type RsyncProfile = 'posix' | 'native-win32' | 'msys2' | 'cygwin'
 
 export interface SSHConnectionConfig {
+    backend?: 'ssh2' | 'openssh'
+    controlPath?: string
     host: string
     port: number
     username: string
@@ -41,6 +59,9 @@ export interface SSHConnectionConfig {
 }
 
 export interface SSHSessionBrief {
+    backend?: 'ssh2' | 'openssh'
+    masterReused?: boolean
+    identityStatus?: 'master_trusted'
     alias: string
     identity: string
     runAs?: string
@@ -52,7 +73,7 @@ export interface SSHSessionDetail extends SSHSessionBrief {
     host: string
     port: number
     username: string
-    authMethod: 'key' | 'password' | 'agent' | 'inline-key'
+    authMethod: 'key' | 'password' | 'agent' | 'inline-key' | 'master'
     connectedAt: number
     hasJumpHost: boolean
     remotePlatform: RemotePlatform
@@ -61,12 +82,14 @@ export interface SSHSessionDetail extends SSHSessionBrief {
 }
 
 export interface ExternalTransferCapability {
+    backend?: 'ssh2' | 'openssh'
+    controlPath?: string
     alias: string
     identity: string
     host: string
     port: number
     username: string
-    authMethod: 'key-path' | 'password' | 'agent' | 'inline-key'
+    authMethod: 'key-path' | 'password' | 'agent' | 'inline-key' | 'master'
     keyPath?: string
     hasJumpHost: boolean
     routeSafeForOpenSsh: boolean

@@ -85,6 +85,224 @@ function fixtureSftp() {
     }
 }
 
+test('remote directory manifests continue after empty READDIR pages', async (t) => {
+    const directory = makeTempDir(t)
+    fs.writeFileSync(path.join(directory, 'after-empty.txt'), 'retained')
+    const sftp = fixtureSftp()
+    const readDirectory = sftp.readdir.bind(sftp)
+    let reads = 0
+    sftp.readdir = (handle, callback) => {
+        if (++reads <= 2) {
+            callback(null, [])
+        } else {
+            readDirectory(handle, callback)
+        }
+    }
+    const result = await createRemoteDirectoryManifest(sftp, directory, { count: true, sha256: true })
+    assert.equal(result.count, 2)
+    assert.equal(result.entries[1].path, 'after-empty.txt')
+    assert.equal(reads, 4)
+})
+
+test('SFTP reads preserve U+FEFF at nonzero offsets and later line starts', async (t) => {
+    const directory = makeTempDir(t)
+    const localPath = path.join(directory, 'bom.txt')
+    fs.writeFileSync(localPath, '﻿first\n﻿second\n')
+    const originalGetSftp = sessionManager.getSftp
+    sessionManager.getSftp = async () => ({
+        ...fixtureSftp(),
+        createReadStream(remotePath, options) {
+            return fs.createReadStream(remotePath, options)
+        },
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+    const full = await readFile('unused', localPath, { encoding: 'utf8' })
+    assert.equal(full.content, 'first\n﻿second\n')
+    const offset = Buffer.byteLength('﻿first\n')
+    const page = await readFile('unused', localPath, { offset, encoding: 'utf8' })
+    assert.equal(page.content, '﻿second\n')
+    const line = await readFile('unused', localPath, { lineRange: '2', encoding: 'utf8' })
+    assert.equal(line.content, '﻿second\n')
+    for (const bigEndian of [false, true]) {
+        const utf16 = Buffer.from('﻿A﻿B', 'utf16le')
+        if (bigEndian) utf16.swap16()
+        fs.writeFileSync(localPath, utf16)
+        const page = await readFile('unused', localPath, { offset: 4 })
+        assert.equal(page.encoding, bigEndian ? 'utf16be' : 'utf16le')
+        assert.equal(page.content, '﻿B')
+        for (const encoding of ['auto', bigEndian ? 'utf16be' : 'utf16le']) {
+            await assert.rejects(() => readFile('unused', localPath, { offset: 3, maxBytes: 4, encoding }), /boundary/)
+        }
+    }
+})
+
+test('failed recursive upload retains successful parent-directory statistics', async (t) => {
+    const directory = makeTempDir(t)
+    const source = path.join(directory, 'source')
+    const target = path.join(directory, 'target')
+    fs.mkdirSync(path.join(source, 'nested'), { recursive: true })
+    fs.writeFileSync(path.join(source, 'done.txt'), 'retained')
+    fs.writeFileSync(path.join(source, 'nested', 'fail.txt'), 'failure')
+    const originalGetSftp = sessionManager.getSftp
+    const originalCapability = sessionManager.getExternalTransferCapability
+    sessionManager.getExternalTransferCapability = () => ({ rsyncEligible: false, decisionReason: 'fixture_sftp' })
+    sessionManager.getSftp = async () => ({
+        stat(remotePath, callback) {
+            fs.stat(remotePath, callback)
+        },
+        mkdir(remotePath, attributes, callback = attributes) {
+            fs.mkdir(remotePath, { recursive: true }, callback)
+        },
+        createWriteStream(remotePath, options) {
+            if (remotePath.endsWith('/fail.txt')) {
+                return new Writable({
+                    write(_chunk, _encoding, callback) {
+                        callback(new Error('fixture upload failed'))
+                    },
+                })
+            }
+            return fs.createWriteStream(remotePath, options)
+        },
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+        sessionManager.getExternalTransferCapability = originalCapability
+    })
+    const result = await syncFiles('fixture', source, target, 'upload')
+    assert.equal(result.success, false)
+    assert.equal(result.filesTransferred, 1, JSON.stringify(result))
+    assert.equal(result.bytesTransferred, Buffer.byteLength('retained'))
+    assert.deepEqual(result.stats, { added: 1, updated: 0, deleted: 0, skipped: 0, failed: 1 })
+    assert.match(result.output, /fixture upload failed/)
+    assert.equal(fs.readFileSync(path.join(target, 'done.txt'), 'utf8'), 'retained')
+})
+
+test('upload timeout bounds metadata, digest, and failed verification cleanup', async (t) => {
+    const directory = makeTempDir(t)
+    const localPath = path.join(directory, 'source.txt')
+    fs.writeFileSync(localPath, 'payload')
+    const handlers = new Map()
+    registerFileTools({ registerTool: (name, _definition, handler) => handlers.set(name, handler) })
+    const originalGetSftp = sessionManager.getSftp
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+    for (const phase of ['metadata', 'digest', 'cleanup']) {
+        const streams = new Set()
+        sessionManager.getSftp = async () => ({
+            _extensions: { 'posix-rename@openssh.com': '1' },
+            stat(remotePath, callback) {
+                if (phase === 'metadata' && remotePath === '/remote/target.txt') {
+                    return
+                }
+                callback(null, {
+                    size: phase === 'cleanup' ? 0 : 7,
+                    mode: 0o100600,
+                    uid: 1,
+                    gid: 1,
+                    mtime: 0,
+                    atime: 0,
+                })
+            },
+            createWriteStream() {
+                return new Writable({
+                    write(_chunk, _encoding, callback) {
+                        callback()
+                    },
+                })
+            },
+            createReadStream() {
+                const stream = new Readable({ read() {} })
+                streams.add(stream)
+                return stream
+            },
+            unlink() {},
+            end() {
+                for (const stream of streams) stream.destroy()
+            },
+        })
+        const started = Date.now()
+        const response = await handlers.get('ssh_upload')({
+            alias: 'fixture',
+            localPath,
+            remotePath: '/remote/target.txt',
+            timeout: 20,
+            atomic: phase === 'cleanup',
+            verifyMd5: phase === 'digest',
+            verifySize: phase === 'cleanup',
+        })
+        const result = JSON.parse(response.content[0].text)
+        assert.equal(result.success, false, phase)
+        assert.ok(Date.now() - started < 2000, phase)
+        if (phase === 'cleanup') assert.match(result.cleanupWarning, /timed out/)
+        if (phase === 'digest') assert.equal(result.verificationStatus, 'error')
+    }
+})
+
+test('explicit single-file SHA-256 verification works on an exec-disabled SFTP server', async (t) => {
+    const directory = makeTempDir(t)
+    const source = path.join(directory, 'source.txt')
+    fs.writeFileSync(source, 'verified through SFTP', { mode: 0o640 })
+    const handlers = new Map()
+    registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
+    const originalGetSftp = sessionManager.getSftp
+    const originalCapability = sessionManager.getExternalTransferCapability
+    const originalExec = sessionManager.exec
+    sessionManager.exec = async () => {
+        throw new Error('exec is disabled')
+    }
+    sessionManager.getExternalTransferCapability = () => ({ rsyncEligible: false, decisionReason: 'fixture_sftp' })
+    sessionManager.getSftp = async () => ({
+        _extensions: { 'posix-rename@openssh.com': '1' },
+        stat(remotePath, callback) {
+            fs.stat(remotePath, (error, stats) =>
+                callback(
+                    error,
+                    stats && {
+                        mode: stats.mode,
+                        size: stats.size,
+                        uid: stats.uid,
+                        gid: stats.gid,
+                        mtime: Math.floor(stats.mtimeMs / 1000),
+                        atime: Math.floor(stats.atimeMs / 1000),
+                    }
+                )
+            )
+        },
+        createReadStream: (remotePath, options) => fs.createReadStream(remotePath, options),
+        createWriteStream: (remotePath, options) => fs.createWriteStream(remotePath, options),
+        ext_openssh_rename: (from, to, callback) => fs.rename(from, to, callback),
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+        sessionManager.getExternalTransferCapability = originalCapability
+        sessionManager.exec = originalExec
+    })
+    for (const direction of ['upload', 'download']) {
+        const target = path.join(directory, `target-${direction}`)
+        const request = {
+            alias: 'fixture',
+            localPath: direction === 'upload' ? source : target,
+            remotePath: direction === 'upload' ? target : source,
+            direction,
+            verify: { sha256: true, owner: true, mode: direction === 'upload' },
+        }
+        const entry = handlers.get('ssh_sync')
+        const result = JSON.parse((await entry.handler(entry.definition.inputSchema.parse(request))).content[0].text)
+        assert.equal(result.success, true, JSON.stringify(result))
+        assert.equal(result.method, 'sftp')
+        assert.equal(result.verification.kind, 'single_file')
+        assert.equal(result.verification.checks.sha256, true)
+        assert.equal(result.verificationStatus, 'matched')
+        assert.equal(fs.readFileSync(target, 'utf8'), 'verified through SFTP')
+    }
+})
+
 test('directory exclude glob matching preserves literals and avoids repeated-wildcard backtracking', () => {
     for (const [relativePath, pattern, expected] of [
         ['sub/cache/file.txt', '*.txt', true],
@@ -503,6 +721,198 @@ test('file mode metadata and permission text preserve special bits', async () =>
     })
     assert.equal(files[0].mode, 0o4755)
     assert.equal(files[0].permissions, '-rwsr-xr-x')
+})
+
+test('public directory listing filters intersections and bounds pages without truncating internal enumeration', async (t) => {
+    const handlers = new Map()
+    registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
+    const entry = handlers.get('ssh_list_dir')
+    const epoch = Date.parse('2026-01-01T00:00:00Z') / 1000
+    const attrs = { size: 7, mode: 0o100644, uid: 1, gid: 2, mtime: epoch, atime: epoch }
+    let entries = Array.from({ length: 120 }, (_, index) => ({
+        filename: `file-${String(index).padStart(3, '0')}.log`,
+        attrs: { ...attrs, mtime: epoch + index },
+    }))
+    entries.push(
+        { filename: 'z-directory', attrs: { ...attrs, mode: 0o40755 } },
+        { filename: '.hidden.log', attrs: { ...attrs, mtime: epoch + 5 } },
+        { filename: 'a+b[1].txt', attrs },
+        { filename: '中文😀.txt', attrs },
+        { filename: 'a\nb.txt', attrs }
+    )
+    const originalGetSftp = sessionManager.getSftp
+    let reads = 0
+    sessionManager.getSftp = async () => ({
+        readdir(_remotePath, callback) {
+            ++reads
+            callback(null, entries)
+        },
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+    const call = async (options = {}) => {
+        const response = await entry.handler(
+            entry.definition.inputSchema.parse({ alias: 'fixture', remotePath: '/remote/中文', ...options })
+        )
+        return { response, data: JSON.parse(response.content[0].text) }
+    }
+    const legacy = (await call()).data
+    assert.deepEqual(Object.keys(legacy), ['success', 'path', 'count', 'files'])
+    assert.equal(legacy.count, 124)
+    assert.equal(legacy.files[0].name, 'z-directory')
+    assert.equal((await call({ showHidden: true })).data.count, 125)
+    assert.equal((await call({ timeout: 1000 })).data.has_more, undefined)
+    const first = await call({ namePattern: '*' })
+    assert.equal(first.data.count, 100)
+    assert.equal(first.data.total_count, 124)
+    assert.equal(first.data.has_more, true)
+    assert.equal(first.data.next_offset, 100)
+    assert.ok(Buffer.byteLength(first.response.content[0].text, 'utf8') <= 65536)
+    assert.deepEqual(first.data.files, legacy.files.slice(0, 100))
+    const names = []
+    let offset = 0
+    for (;;) {
+        const page = await call({ offset, limit: 17, maxBytes: 7000 })
+        assert.ok(Buffer.byteLength(page.response.content[0].text, 'utf8') <= 7000)
+        assert.equal(page.data.count, page.data.files.length)
+        assert.equal(page.data.next_offset, offset + page.data.count)
+        names.push(...page.data.files.map((file) => file.name))
+        if (!page.data.has_more) break
+        assert.ok(page.data.next_offset > offset)
+        offset = page.data.next_offset
+    }
+    assert.deepEqual(
+        names,
+        legacy.files.map((file) => file.name)
+    )
+    const interval = {
+        namePattern: '*.log',
+        modifiedAfter: '2026-01-01T08:00:05+08:00',
+        modifiedBefore: '2026-01-01T00:00:08Z',
+    }
+    const filtered = (await call(interval)).data
+    assert.deepEqual(
+        filtered.files.map((file) => file.name),
+        ['file-005.log', 'file-006.log', 'file-007.log']
+    )
+    assert.equal(filtered.has_more, false)
+    assert.equal(filtered.next_offset, 3)
+    assert.equal((await call({ ...interval, showHidden: true })).data.count, 4)
+    assert.equal((await call({ modifiedAfter: '2026-01-01T00:01:59Z' })).data.count, 1)
+    assert.equal((await call({ modifiedBefore: '2026-01-01T00:00:01Z' })).data.count, 5)
+    assert.equal(
+        (await call({ namePattern: '*.log', modifiedAfter: '2026-01-01T00:00:00.0001Z' })).data.total_count,
+        119
+    )
+    assert.equal((await call({ namePattern: '*.log', modifiedBefore: '2026-01-01T00:00:00.0001Z' })).data.count, 1)
+    assert.equal((await call({ ...interval, modifiedBefore: '2026-01-01T00:00:05.000000Z' })).data.count, 0)
+    for (const [namePattern, expected] of [
+        ['a+b[1].txt', ['a+b[1].txt']],
+        ['中文??.txt', ['中文😀.txt']],
+        ['a*b.txt', ['a\nb.txt']],
+        ['FILE-*.log', []],
+        ['no-match', []],
+    ]) {
+        assert.deepEqual(
+            (await call({ namePattern })).data.files.map((file) => file.name),
+            expected
+        )
+    }
+    const empty = (await call({ ...interval, modifiedBefore: interval.modifiedAfter })).data
+    assert.equal(empty.total_count, 0)
+    assert.equal(empty.has_more, false)
+    assert.equal(empty.next_offset, 0)
+    const beyond = (await call({ offset: 1000 })).data
+    assert.deepEqual(beyond.files, [])
+    assert.equal(beyond.has_more, false)
+    assert.equal(beyond.next_offset, 1000)
+    const beforeInvalid = reads
+    for (const invalid of [
+        { offset: -1 },
+        { offset: 0.5 },
+        { offset: Number.MAX_SAFE_INTEGER + 1 },
+        { limit: 0 },
+        { limit: 1.5 },
+        { maxBytes: 0 },
+        { maxBytes: -1 },
+        { modifiedAfter: 'not-a-date' },
+        { modifiedBefore: '2026-02-30T00:00:00Z' },
+        { modifiedAfter: '2026-01-01T00:00:00' },
+        { ...interval, modifiedBefore: '2026-01-01T00:00:04Z' },
+        { modifiedAfter: '2026-01-01T00:00:00.0002Z', modifiedBefore: '2026-01-01T00:00:00.0001Z' },
+    ]) {
+        await assert.rejects(call(invalid))
+    }
+    assert.equal(reads, beforeInvalid)
+    assert.equal((await listDir('fixture', '/remote/中文', true)).length, 125)
+    entries.push({ filename: '../unsafe', attrs })
+    const unsafe = await call({ namePattern: 'no-match', offset: 1000, limit: 1 })
+    assert.equal(unsafe.response.isError, true)
+    assert.match(unsafe.data.error, /unsafe entry name/)
+})
+
+test('public directory byte budget measures emitted UTF-8 JSON and never advances past an oversized entry', async (t) => {
+    const handlers = new Map()
+    registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
+    const entry = handlers.get('ssh_list_dir')
+    const attrs = { size: 7, mode: 0o100644, uid: 1, gid: 2, mtime: 0, atime: 0 }
+    let entries = [{ filename: '中文😀"line\nfile.txt', attrs }]
+    const originalGetSftp = sessionManager.getSftp
+    sessionManager.getSftp = async () => ({
+        readdir(_remotePath, callback) {
+            callback(null, entries)
+        },
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+    const call = async (options = {}) => {
+        const response = await entry.handler(
+            entry.definition.inputSchema.parse({ alias: 'fixture', remotePath: '/remote/中文', limit: 1, ...options })
+        )
+        return { response, data: JSON.parse(response.content[0].text) }
+    }
+    const full = await call()
+    const bytes = Buffer.byteLength(full.response.content[0].text, 'utf8')
+    assert.ok(bytes > full.response.content[0].text.length)
+    const exact = await call({ maxBytes: bytes })
+    assert.equal(exact.response.content[0].text, full.response.content[0].text)
+    for (const maxBytes of [1, bytes - 1]) {
+        const failed = await call({ maxBytes })
+        assert.equal(failed.response.isError, true)
+        assert.equal(failed.data.success, false)
+        assert.equal(failed.data.code, 'LIST_DIR_MAX_BYTES_TOO_SMALL')
+        assert.equal(failed.data.offset, 0)
+        assert.equal(failed.data.next_offset, 0)
+        assert.ok(failed.data.requiredBytes > maxBytes)
+    }
+    entries = [
+        { filename: 'a.txt', attrs },
+        { filename: `z-${'中文'.repeat(100)}.txt`, attrs },
+    ]
+    const small = await call()
+    const maxBytes = Buffer.byteLength(small.response.content[0].text, 'utf8')
+    const page = await call({ limit: 100, maxBytes })
+    assert.equal(page.data.count, 1)
+    assert.equal(page.data.has_more, true)
+    assert.equal(page.data.next_offset, 1)
+    const failed = await call({ offset: page.data.next_offset, maxBytes })
+    assert.equal(failed.response.isError, true)
+    assert.equal(failed.data.next_offset, 1)
+    assert.equal(failed.data.offset, 1)
+    entries = Array.from({ length: 120 }, (_, index) => ({ filename: `${index}-${'中文'.repeat(100)}.txt`, attrs }))
+    const defaultBudget = await call({ limit: 100 })
+    assert.ok(defaultBudget.data.count > 0 && defaultBudget.data.count < 100)
+    assert.equal(defaultBudget.data.has_more, true)
+    assert.ok(Buffer.byteLength(defaultBudget.response.content[0].text, 'utf8') <= 65536)
+    entries = []
+    const empty = await call()
+    const emptyBytes = Buffer.byteLength(empty.response.content[0].text, 'utf8')
+    assert.equal((await call({ maxBytes: emptyBytes })).data.success, true)
+    assert.equal((await call({ maxBytes: emptyBytes - 1 })).response.isError, true)
 })
 
 test('atomic upload paths are unpredictable and exclusive SFTP writes refuse reuse', async (t) => {
@@ -2009,7 +2419,8 @@ test('session summaries stay brief while internal transfer capability retains ro
     })
 
     const brief = manager.listSessions()[0]
-    assert.deepEqual(Object.keys(brief).sort(), ['alias', 'connected', 'identity', 'lastUsedAt', 'runAs'])
+    assert.deepEqual(Object.keys(brief).sort(), ['alias', 'backend', 'connected', 'identity', 'lastUsedAt', 'runAs'])
+    assert.equal(brief.backend, 'ssh2')
     assert.equal('host' in brief, false)
     assert.equal('keyPath' in brief, false)
 

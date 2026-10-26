@@ -641,9 +641,59 @@ unit 原样返回；metadata 不发起额外远端读取
 
 ### list-dir-01
 
-**步骤**：`ssh_list_dir(alias=..., remotePath="/tmp", showHidden=false)`
+**步骤**：在自有测试目录准备超过 100 个条目，调用
+`ssh_list_dir(alias=..., remotePath=<test-dir>, showHidden=false)`，不传名称、时间或分页参数，再用 `showHidden=true`
+重复
 
-**预期**：数组，含至少 mcp-test-write 项
+**预期**：响应保持 `{success, path, count, files}`，`files`
+含全部可见条目，目录优先并按名称排序，不附加分页字段；`showHidden=true` 包含点开头名称，单独传 `timeout` 仍保持完整响应
+
+### list-dir-filter-01
+
+**步骤**：为自有文件设置连续秒级 mtime，以 `namePattern="*.log"`、带时区的 `modifiedAfter` 和 `modifiedBefore`
+联合查询；覆盖起点、终点、等价时区、亚毫秒边界、相等起止、隐藏文件、空匹配、区分大小写、字面
+`+`/`[]`、换行和多字节名称，再输入无时区时间、无效日期和起点晚于终点的区间
+
+**预期**：名称、时间和隐藏文件条件取交集，区间起点包含、终点不包含，相等起止返回空结果；名称通配复用同步 exclude 的
+`*`/`?` 语义；非法参数在 SFTP 读取前拒绝
+
+### list-dir-page-01
+
+**步骤**：在稳定的自有目录以 `namePattern="*"` 查询，未指定条数或字节预算；再以较小 `limit` 和 `maxBytes` 反复使用
+`next_offset` 续查，覆盖末页、空目录、超过末尾的偏移，以及负数、小数或超出安全整数范围的参数
+
+**预期**：有界模式默认最多 100 条、65536 UTF-8 字节；`count` 为本页条数，`total_count`
+为匹配总数，`next_offset=offset+count`，`has_more`
+准确；稳定目录所有分页的并集与完整列表一致，无重复或遗漏，末尾空页保留请求偏移；非法数值在远端读取前拒绝
+
+### list-dir-byte-01
+
+**步骤**：准备含中文、四字节字符、引号和换行的条目，按实际响应 `content[0].text`
+计算 UTF-8 字节数，分别使用恰好可容纳与少一个字节的
+`maxBytes`；覆盖分页元数据也无法容纳、首项超预算、已有前缀可返回但下一项超预算，以及偏移位数变化
+
+**预期**：成功 JSON 文本连同元数据和格式空白不超预算，不按字符串字符数或仅条目正文计费；条目无法完整返回时使用
+`LIST_DIR_MAX_BYTES_TOO_SMALL` 与 `requiredBytes` 报错，错误响应保留
+`offset`/`next_offset`，不返回无进度成功页，不跳过超预算条目；错误诊断不受成功响应预算约束
+
+### list-dir-internal-01
+
+**步骤**：公开目录调用返回有界页后，直接内部 `listDir`
+读取超过 100 项的同一目录；通过 SFTP 递归下载并请求 count、SHA-256 和 staleFiles 校验，覆盖隐藏文件、子目录及排序靠后的文件；另让被筛选或分页排除的条目含非法名称
+
+**预期**：内部列表完整，递归下载和目录校验不受公开分页默认值影响；传输和校验结果匹配完整自有目录，非法名称仍在构造子路径前拒绝；完整
+`readdir` 后的响应分页不代表远端增量或快照一致性
+
+### list-dir-stdio-01
+
+**前置条件**：Linux、ssh 和 sshd 可用，测试账号可创建 loopback SSH/SFTP 服务；只使用临时 HOME、临时密钥和自有 master
+
+**步骤**：执行 `test/openssh.test.mjs` 中的公开 stdio SFTP 目录用例，核对 initialize 的 server name/version，检查
+`tools/list` 六个新字段，再经 `tools/call` 完成名称／时间交集、续页、字节错误及完整下载校验；用显式 OpenSSH master
+alias 请求有界目录列表
+
+**预期**：独立 stdio 进程的注册与实际 SFTP 结果一致，默认后端仍为 ssh2，OpenSSH alias 返回现有
+`unsupported_backend`，不转用 ssh2/SFTP 或新增认证，关闭测试 MCP 后自有 master 仍存活；该结果只证明被测试的独立进程，当前用户 Host 加载身份单独核验
 
 ### mkdir-01
 
@@ -950,6 +1000,64 @@ fallback 原因；模拟 rsync 传输开始后失败，不应再启动 SFTP 重�
 用本地和远端均含空格的 Win32/UNC 路径运行 list/mkdir、单文件与目录同步，检查最终 basename、父目录与目标位置；下载中断和既有目标文件被锁住时应保留原文件且清理临时文件；检查 Windows 会话产物及临时下载的 DACL 仅授权当前身份、SYSTEM 与 Administrators；分别运行无害
 `grep -R secret`、普通 Python/Node、cmd 的 `taskkill /F`、PowerShell 的 `Remove-Item -Recurse`
 和包含凭据参数的命令，风险字段按 shell 区分
+
+## 10. 反馈修复与 OpenSSH 主连接复用
+
+本节自动化入口为 `npm test`，其中 `test/openssh.test.mjs` 使用临时 HOME、临时密钥、loopback
+sshd 和测试自有 master，真实 OpenSSH 用例要求 Linux、ssh、sshd、rsync 和 strace 在其他平台保留相应条件状态，不把模拟结果标为本机原生通过；所有清理只针对测试创建的进程和文件
+
+### feedback-readdir-empty-01
+
+让远端 READDIR 连续返回两个合法空页，再返回文件和协议 EOF，生成目录 manifest 预期空页之后的文件进入 count/hash，只有 EOF 结束枚举；持续空页受调用期限限制
+
+### feedback-upload-timeout-01
+
+分别让上传预检 stat、校验 stat、MD5 流和原子上传失败后的 unlink 不返回，使用较短 timeout 预期每个阶段在指定期限内返回，校验失败保留原目标，清理失败通过 cleanupWarning 明确报告
+
+### feedback-read-bom-01
+
+读取起始 BOM 与后续 U+FEFF 并存的 UTF-8、UTF-16LE/BE 文件，覆盖 offset、tail、lineRange、auto 和显式编码，预期只按文件起始位置处理 BOM，非零偏移和后续行开头的 U+FEFF 保留为正文，返回的字节偏移可继续分页
+
+UTF-16 的显式 offset 为奇数字节时，auto 和显式编码均返回字符边界错误；tail 按编码调整到下一个完整字符，binary 保留原始字节
+
+### feedback-partial-transfer-01
+
+先成功上传父目录文件，再让子目录文件失败；另让并发文件中的一项失败，其余已经发出的请求结束预期失败结果保留已知 filesTransferred、bytesTransferred、added/updated/failed，已启动的请求结算后再报告；超时状态可为 unknown，不报告全零成功项
+
+### feedback-terminal-utf8-01
+
+tracked
+operation 运行时输出部分多字节字符，先读取，再补齐字符；另一操作在残缺后缀处结束预期运行中可等待后续字节，终态残缺后缀返回明确编码错误并保留原缓冲，不无限返回空页；存储预算截断仍按已有 truncated 和偏移合同处理
+
+### sync-single-file-verify-01
+
+通过仅支持 SFTP 的账号和 OpenSSH
+master 分别执行文件与目录目标的双向单文件同步，覆盖空文件、普通内容、Unicode/空格名称及覆盖请求 verify.sha256、owner、mode，以及 Windows 文件 ACL，预期检查实际目标文件并返回 kind=single_file；内容摘要与本地独立 SHA-256 一致，传输和校验状态分开报告 count/deletions/staleFiles 的单文件请求、已知源文件超出哈希预算的请求在传输前拒绝；内容在校验期间变化时明确失败
+
+### sync-symlink-advice-01
+
+下载包含符号链接的目录并请求完整校验，预期 transferSuccess 保留实际结果，校验明确 skipped，说明排除链接后重试下载建议不要求设置仅用于 upload 的 followSymlinks；默认上传和下载均保持原有跳过链接策略
+
+### openssh-reuse-parallel-01
+
+终端预先建立测试 master，通过公开 MCP
+stdio 执行 initialize、tools/list 和 tools/call，使用 backend=openssh 与同一 configHost 预期连接返回有效目标、masterReused、masterPid 和 identityStatus=master_trusted；同 alias 两个命令与一次目录同步并发完成，探测、传输和校验均使用该 master，不先建立 ssh2
+session 覆盖 cwd、env、输出上限、远端退出 255 和独立 shell，连接结果不把配置与 PID 描述为独立远端身份认证
+
+### openssh-lifecycle-01
+
+同一 alias 启动两项操作，取消其中一项，再断开 alias；保留用户终端命令和另一个 alias；最后关闭测试 MCP 进程预期仅目标操作收到经过 PID/marker 验证的取消请求，同 alias 其余操作在单项取消后继续；alias 断开使其未确认终态的操作为 unknown，用户 master、终端及其他 alias 保持工作 MCP 退出只关闭自身通道和本机子进程组，不发送 -O
+exit/stop
+
+### openssh-reuse-only-01
+
+覆盖 master 预先不存在、失效、socket 被替换、alias 配置冲突及观察到的登录用户不符；在预检与实际命令之间让 socket 消失预期明确失败，strace 的 connect 记录只出现已有 AF_UNIX
+socket 尝试，不出现 AF_INET/AF_INET6
+SSH 连接，sshd 的新认证计数为零；实际复用失败路径执行失败代理，不把连接被防火墙拒绝当作验收成功
+
+### openssh-capability-01
+
+请求 password/key/agent/jumpHost、PTY、forward、独立 SFTP 工具、临时脚本上传或 Windows 组合；同步时移除本机/远端 rsync 或所需 GNU 工具预期在相关副作用之前返回具体能力错误，不转用 ssh2/SFTP，不新建 master；脚本不创建临时远端文件，显式 configPath 保留路径和文件大小校验
 
 ## 测试清理
 

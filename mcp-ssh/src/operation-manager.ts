@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import type { ClientChannel } from 'ssh2'
 import type {
+    CommandChannel,
     OperationCancelResult,
     OperationInfo,
     OperationReadResult,
@@ -37,7 +37,7 @@ export interface OperationDependencies {
         command: string,
         marker: string,
         options: OperationStartOptions,
-        adopt: (stream: ClientChannel) => void
+        adopt: (stream: CommandChannel) => void
     ): Promise<void>
     cancelRemote(
         alias: string,
@@ -79,7 +79,7 @@ interface OperationRecord {
     stderrTruncated: boolean
     maxOutputBytes: number
     markerBuffer: Buffer
-    stream?: ClientChannel
+    stream?: CommandChannel
     options: OperationStartOptions
     error?: string
 }
@@ -237,12 +237,28 @@ export class OperationManager {
         ensureUtf8Boundary(record.stderr, stderrOffset, 'stderrOffset')
         const stdoutRequestedEnd = Math.min(record.stdout.length, stdoutOffset + maxReadBytes)
         const stdoutEnd = utf8SafeEnd(record.stdout, stdoutOffset, stdoutRequestedEnd, 'stdout')
+        if (
+            record.finishedAt !== null &&
+            !record.stdoutTruncated &&
+            stdoutRequestedEnd === record.stdout.length &&
+            stdoutEnd < stdoutRequestedEnd
+        ) {
+            throw new Error('Operation output contains an incomplete UTF-8 sequence in stdout')
+        }
         const stdout = record.stdout.subarray(stdoutOffset, stdoutEnd)
         const nextStdoutOffset =
             record.stdoutTruncated && stdoutRequestedEnd === record.stdout.length ? stdoutRequestedEnd : stdoutEnd
         const remaining = maxReadBytes - stdout.length
         const stderrRequestedEnd = Math.min(record.stderr.length, stderrOffset + remaining)
         const stderrEnd = utf8SafeEnd(record.stderr, stderrOffset, stderrRequestedEnd, 'stderr')
+        if (
+            record.finishedAt !== null &&
+            !record.stderrTruncated &&
+            stderrRequestedEnd === record.stderr.length &&
+            stderrEnd < stderrRequestedEnd
+        ) {
+            throw new Error('Operation output contains an incomplete UTF-8 sequence in stderr')
+        }
         const stderr = record.stderr.subarray(stderrOffset, stderrEnd)
         const nextStderrOffset =
             record.stderrTruncated && stderrRequestedEnd === record.stderr.length ? stderrRequestedEnd : stderrEnd
@@ -356,7 +372,7 @@ export class OperationManager {
         clearInterval(this.sweeper)
     }
 
-    private attachStream(record: OperationRecord, stream: ClientChannel): void {
+    private attachStream(record: OperationRecord, stream: CommandChannel): void {
         stream.on('data', (data: Buffer) => {
             record.stdoutBytes += data.length
             this.appendOutput(record, 'stdout', data)
@@ -399,7 +415,14 @@ export class OperationManager {
             return
         }
         this.flushMarkerBuffer(record)
-        record.status = 'failed'
+        const details = 'details' in error ? error.details : undefined
+        record.status =
+            details &&
+            typeof details === 'object' &&
+            'operationStatus' in details &&
+            details.operationStatus === 'unknown'
+                ? 'unknown'
+                : 'failed'
         record.error = error.message
         this.finish(record)
     }

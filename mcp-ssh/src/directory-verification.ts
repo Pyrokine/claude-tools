@@ -5,6 +5,8 @@ import type { SFTPWrapper, Stats } from 'ssh2'
 import type { RemotePathStyle } from './types.js'
 import { remoteJoin } from './remote-platform.js'
 import { formatFileMode } from './file-mode.js'
+import type { OpenSshConnection } from './openssh.js'
+import { escapeShellArg } from './tools/utils.js'
 
 export const DIRECTORY_VERIFY_MAX_ENTRIES = 50_000
 export const DIRECTORY_VERIFY_MAX_MISMATCHES = 20
@@ -312,7 +314,7 @@ export async function createRemoteDirectoryManifest(
                         }
                     })
                 })
-                if (!batch || batch.length === 0) {
+                if (!batch) {
                     break
                 }
                 for (const item of batch) {
@@ -407,6 +409,153 @@ export async function createRemoteDirectoryManifest(
     }
 }
 
+export async function createOpenSshDirectoryManifest(
+    connection: OpenSshConnection,
+    rootPath: string,
+    request: DirectoryVerifyRequest,
+    timeout: number,
+    exclude?: string[],
+    followSymlinks: boolean = false
+): Promise<DirectoryManifest> {
+    const deadline = Date.now() + timeout
+    const remaining = (): number => {
+        const value = deadline - Date.now()
+        if (value <= 0) throw new Error('OpenSSH directory verification exhausted its timeout')
+        return value
+    }
+    const maxEntries = Math.min(request.maxEntries ?? 10_000, DIRECTORY_VERIFY_MAX_ENTRIES)
+    const maxFileBytes = Math.min(
+        request.maxFileBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_FILE_BYTES,
+        DIRECTORY_VERIFY_MAX_FILE_BYTES
+    )
+    const maxTotalBytes = Math.min(
+        request.maxTotalBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_TOTAL_BYTES,
+        DIRECTORY_VERIFY_MAX_TOTAL_BYTES
+    )
+    const rootBytes = await connection.capture(`realpath -ze -- ${escapeShellArg(rootPath)}`, remaining(), 64 * 1024)
+    if (rootBytes.at(-1) !== 0) throw new Error('OpenSSH realpath did not return a complete path')
+    const root = new TextDecoder('utf8', { fatal: true }).decode(rootBytes.subarray(0, -1))
+    if (((await connection.stat(root, remaining())).mode & 0o170000) !== 0o040000) {
+        throw new Error('remote directory verification root is not a directory')
+    }
+    const entries: ManifestEntry[] = []
+    const unsupportedSamples: string[] = []
+    let skippedSymlinks = 0
+    let skippedUnsupported = 0
+    let limitReason: DirectoryManifestLimitReason | undefined
+    let pending = Buffer.alloc(0)
+    const fields: string[] = []
+    let metadataBytes = 0
+    const metadataLimit = Math.min(128 * 1024 * 1024, Math.max(64 * 1024, maxEntries * 2048))
+    const limit = new Error('OpenSSH manifest resource limit reached')
+    const decoder = new TextDecoder('utf8', { fatal: true, ignoreBOM: true })
+    const consumeEntry = (): void => {
+        const [relative, kind, sizeText, modeText, owner, fullPath] = fields
+        fields.length = 0
+        const parts = relative.split('/')
+        if (relative && (relative.startsWith('/') || parts.some((part) => !part || part === '.' || part === '..'))) {
+            throw new Error('OpenSSH directory verification returned an unsafe relative path')
+        }
+        if (
+            relative &&
+            parts.some((_part, index) => matchesDirectoryExclude(parts.slice(0, index + 1).join('/'), exclude))
+        )
+            return
+        if (relative && parts.length > 64) {
+            limitReason = 'depth'
+            throw limit
+        }
+        if (entries.length >= maxEntries) {
+            limitReason = 'entries'
+            throw limit
+        }
+        if (kind === 'l') {
+            ++skippedSymlinks
+            return
+        }
+        if (kind !== 'f' && kind !== 'd') {
+            ++skippedUnsupported
+            if (unsupportedSamples.length < 10) unsupportedSamples.push(relative)
+            return
+        }
+        const size = Number(sizeText)
+        const mode = Number.parseInt(modeText, 8)
+        if (
+            !Number.isSafeInteger(size) ||
+            size < 0 ||
+            !/^[0-7]{1,4}$/.test(modeText) ||
+            !/^\d+$/.test(owner) ||
+            !fullPath
+        ) {
+            throw new Error('OpenSSH directory verification returned invalid file metadata')
+        }
+        entries.push({
+            path: relative || '.',
+            type: kind === 'd' ? 'directory' : 'file',
+            size: kind === 'f' ? size : 0,
+            mode: formatFileMode(mode),
+            owner,
+        })
+    }
+    const format = '%P\\0%y\\0%s\\0%m\\0%U\\0%p\\0'
+    try {
+        await connection.consume(
+            `LC_ALL=C find ${followSymlinks ? '-L' : '-P'} ${escapeShellArg(root)} -maxdepth 65 -printf ${escapeShellArg(format)}`,
+            (chunk) => {
+                metadataBytes += chunk.length
+                if (metadataBytes > metadataLimit) {
+                    limitReason = 'entries'
+                    throw limit
+                }
+                pending = Buffer.concat([pending, chunk])
+                let end: number
+                while ((end = pending.indexOf(0)) >= 0) {
+                    fields.push(decoder.decode(pending.subarray(0, end)))
+                    pending = pending.subarray(end + 1)
+                    if (fields.length === 6) consumeEntry()
+                }
+                if (pending.length > 64 * 1024) throw new Error('OpenSSH manifest field exceeded its byte budget')
+            },
+            remaining()
+        )
+        if (pending.length || fields.length) throw new Error('OpenSSH manifest ended with incomplete metadata')
+    } catch (error) {
+        if (error !== limit) throw error
+    }
+    if (!limitReason && request.sha256) {
+        let hashedBytes = 0
+        for (const entry of entries) {
+            if (entry.type !== 'file') continue
+            if (entry.size > maxFileBytes) {
+                limitReason = 'file_bytes'
+                break
+            }
+            if (hashedBytes + entry.size > maxTotalBytes) {
+                limitReason = 'total_bytes'
+                break
+            }
+            entry.sha256 = await connection.hashFile(
+                remoteJoin('posix', root, entry.path),
+                'sha256',
+                remaining(),
+                Math.min(maxFileBytes, maxTotalBytes - hashedBytes),
+                entry.size
+            )
+            hashedBytes += entry.size
+        }
+    }
+    return {
+        entries,
+        count: entries.length,
+        rootSha256: rootHash(entries),
+        limited: limitReason !== undefined,
+        limitReason,
+        skippedSymlinks,
+        skippedUnsupported,
+        unsupportedSamples,
+    }
+}
+
 export function createEmptyDirectoryManifest(): DirectoryManifest {
     const entries: ManifestEntry[] = []
     return {
@@ -446,7 +595,7 @@ export function compareDirectoryManifests(
         return {
             kind: 'directory',
             skipped: true,
-            reason: 'directory verification skipped symbolic links; set followSymlinks=true to verify link targets',
+            reason: 'directory verification skipped symbolic links and cannot verify the complete requested tree',
             expectedSkippedSymlinks: expected.skippedSymlinks,
             actualSkippedSymlinks: actual.skippedSymlinks,
             deletionBaselineSkippedSymlinks: deletionBaseline?.skippedSymlinks,

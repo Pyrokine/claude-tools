@@ -22,11 +22,49 @@ PTY 的 `bufferSize` 参数与列表结果中的 `bufferSize`，以及 read/list
 描述清理前的状态，下次读取才反映清理后的缓冲区；精确读取 ANSI 或二进制输出用 `dataBase64`，`data` 是 UTF-8 文本预览
 
 文件读取支持 `encoding`（`auto`、`utf8`、`utf16le`、`utf16be`、`gbk`）和无损 `binary=true`；偏移按字节计量，分页使用
-`next_offset`，非零偏移读取 UTF-16 时显式指定编码；预算不足以容纳下一个完整字符时返回错误，不再成功返回空页，EOF 处编码无效也会失败；binary 读取按实际字节前移；`lineRange`
+`next_offset`，`auto`
+在文件起始处判断编码，后续分页也使用该判断，非零偏移的 U+FEFF 保留为正文；预算不足以容纳下一个完整字符时返回错误，EOF 处编码无效也会失败；binary 读取按实际字节前移；`lineRange`
 的行号和末行换行状态只描述已返回的前缀
 
 连接 Windows 主机须设置 `remotePlatform="windows"`，本机为 Windows 不会改变远端默认值；按主机设置 `commandShell` 和
 `remotePathStyle`，使用 Windows rsync 时显式设置 `rsyncProfile`；下文 Windows 功能和示例继续适用
+
+## 复用已有 OpenSSH 主连接
+
+默认 `backend="ssh2"` 保留密码与密钥认证、跳板、SFTP、PTY 和转发，设置 `backend="openssh"` 复用终端已经建立的 master：
+
+```text
+ssh_connect(backend="openssh", configHost="myserver", alias="shared")
+ssh_exec(alias="shared", command="pwd", cwd="/tmp", env={TASK: "inspect"})
+ssh_sync(alias="shared", localPath="/local/data", remotePath="/remote/data", direction="upload", verify={sha256: true})
+```
+
+`ssh -G` 解析有效的 host、user、port 和 `ControlPath`，也可通过 `controlPath` 显式指定 socket，`configPath`
+保留原有路径与文件大小校验
+
+OpenSSH 按原生规则处理 `Host`、`Match`、`Include` 和 `ProxyJump`，其中包含用户配置的 `Match exec`
+命令；实际执行阶段使用已经解析的目标和 socket，不重新读取这份配置
+
+该后端只复用已有连接，master 不存在、被替换或失效时明确报错；实际命令和 rsync 通道在复用失败后通过失败代理终止，不新建 SSH 连接、重新认证或转用 ssh2/SFTP
+
+通过 configHost 或 controlPath 选择已有 master，password、key、agent 和 `jumpHost` 等新认证参数在连接前拒绝
+
+连接结果包含 `backend`、`masterReused`、`masterPid`、`identityStatus="master_trusted"`
+和实际观测的登录信息，沿用用户所选 master 的信任；工具检查 socket 所有权、alias 配置冲突和登录用户不符，不把 `ssh -G` 或
+`ssh -O check` 描述成独立的远端主机身份认证
+
+支持本机和远端均为 POSIX 的命令、tracked operation、文件元数据与 rsync 同步；同步要求本机和远端具备 rsync，远端具备 GNU
+`find`、`stat`、`head` 和 `realpath`，缺少能力时具体报错
+
+有界目录 manifest 和流式 SHA-256 校验均使用同一 master，不要求先建立 ssh2 会话或额外安装远端 Python；独立 SFTP 工具、临时脚本上传、PTY、转发和 Windows 组合返回
+`unsupported_backend`
+
+每条命令使用独立 shell，`runAs`、`cwd` 和 `env` 显式指定，原终端的 `su` 或环境变量变更不作为新通道状态
+
+取消单项只针对已经验证的目标进程；断开 alias 关闭该 alias 的自有通道；MCP 退出关闭自身通道和子进程，用户 master 与终端连接保持打开
+
+远端退出状态无法确认时，受影响 operation 保持 `unknown`；`ssh_reconnect`
+重新绑定配置所指的已有 master，不创建新的 master
 
 ## 功能特性
 
@@ -46,7 +84,7 @@ PTY 的 `bufferSize` 参数与列表结果中的 `bufferSize`，以及 read/list
     - 发送按键和命令
     - 窗口大小调整
 - **文件操作**：上传、下载、读取、写入、目录列表（通过 SFTP）
-- **智能同步**：目录同步，优先使用 rsync（无 rsync 时自动回退到 SFTP）
+- **智能同步**：文件与目录同步，默认 ssh2 在 rsync 不可用时使用 SFTP，OpenSSH 后端保持 rsync
 - **环境配置**：LANG、LC_ALL、自定义环境变量
 - **跳板机支持**：通过堡垒机连接
 
@@ -64,7 +102,7 @@ PTY 的 `bufferSize` 参数与列表结果中的 `bufferSize`，以及 read/list
 
 ## 安装
 
-需要 Node.js 20.19 或更新版本。
+需要 Node.js 20.19 或更新版本
 
 ### npm（推荐）
 
@@ -122,14 +160,15 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_reconnect`     | 重新连接断开的会话                  |
 | `ssh_config_list`   | 列出 ~/.ssh/config 中的 Host        |
 
-`ssh_list_sessions()` 默认只返回 `alias`、规范化 `identity`、`runAs`、`connected` 和 `lastUsedAt`，使用 `detail=true`
-获取连接详情，或通过 `fields=[...]` 选择字段，任何模式都不返回 `keyPath`
+`ssh_list_sessions()` 默认返回 `backend`、`alias`、规范化 `identity`、`runAs`、`connected` 和
+`lastUsedAt`，OpenSSH 条目另含 `masterReused` 与 `identityStatus`；使用 `detail=true` 获取连接详情，或通过
+`fields=[...]` 选择字段，任何模式都不返回 `keyPath`
 
-连接启用 TCP_NODELAY，减少交互命令和小文件 SFTP 请求之间的等待，直连、跳板和替代连接使用相同行为，无需新增选项
+ssh2 连接启用 TCP_NODELAY，减少交互命令和小文件 SFTP 请求之间的等待，直连、跳板和替代连接使用相同行为，无需新增选项
 
-`ssh_reconnect` 会在发布替代连接前，使绑定旧 client 的 operation、PTY、forward 和传输能力缓存失效。
+`ssh_reconnect` 会在发布替代连接前，使绑定旧 client 的 operation、PTY、forward 和传输能力缓存失效
 
-自动重连 timer 绑定发起调度的 session 和 client，不会断开同一 alias 下后来发布的新会话。
+自动重连 timer 绑定发起调度的 session 和 client，不会断开同一 alias 下后来发布的新会话
 
 旧 client 延迟到达的 `close` 不会让过期资源继续挂在同一 alias 下；通过 jump host 建立目标连接时，如果取消发生在
 `forwardOut` pending 阶段，延迟 callback 返回的 channel 会先销毁再结束连接请求
@@ -147,7 +186,7 @@ claude mcp add ssh -- node /path/to/mcp-ssh/dist/index.js
 | `ssh_exec_script`   | 上传并执行远端临时脚本          |
 
 远端为 Windows 时，`ssh_exec_script` 给 PowerShell 脚本写入 UTF-8 BOM，避免 Windows
-PowerShell 将 Unicode 脚本误读为系统编码；CMD 脚本先切换到代码页 65001 再执行 UTF-8 内容，切换失败则终止。POSIX 脚本内容保持不变
+PowerShell 将 Unicode 脚本误读为系统编码；CMD 脚本先切换到代码页 65001 再执行 UTF-8 内容，切换失败则终止；POSIX 脚本内容保持不变
 
 ### 可跟踪任务
 
@@ -288,7 +327,7 @@ ssh_connect(configHost="myserver", configPath="/custom/path/config")
 4. ssh_exec_parallel(aliases=["server1", "server2", "server3"], command="uptime")
 ```
 
-每台主机的结果包含与 `ssh_exec` 相同的元数据，包括 `failureKind`、`effectiveUser`、`cwd`、截断字段和诊断建议。
+每台主机的结果包含与 `ssh_exec` 相同的元数据，包括 `failureKind`、`effectiveUser`、`cwd`、截断字段和诊断建议
 `ssh_exec_parallel` 单次最多 32 个 alias，默认最多并发 4 台主机，可用 `maxConcurrency` 调整（最大 8），并支持
 `maxOutputSize` 限制每台主机的输出
 
@@ -303,7 +342,7 @@ ssh_disconnect(alias="myserver")
 ### 连接模板和 runAs
 
 模板可以通过 `SSH_MCP_TEMPLATES` 或 `~/.mcp-ssh/templates.json`
-提供，工具显式参数优先于模板值。选中的模板会在连接前校验，SSH 端口必须是 1 到 65535 的整数。模板无效时，错误只返回模板名和字段路径，不返回认证值
+提供，工具显式参数优先于模板值；选中的模板会在连接前校验，SSH 端口必须是 1 到 65535 的整数；模板无效时，错误只返回模板名和字段路径，不返回认证值
 
 ```json
 {
@@ -364,15 +403,15 @@ ssh_connect(
 ）及其他 shell（`.profile`），如不需要可设置 `loadProfile=false`
 
 `ssh_exec`、`ssh_exec_as_user` 和 `ssh_exec_sudo` 使用相同的身份优先级：`useLoginUser=true` 使用登录用户，否则本次
-`runAs` 覆盖连接级 `runAs`，再使用连接级 `runAs`。
+`runAs` 覆盖连接级 `runAs`，再使用连接级 `runAs`
 
 `ssh_exec` 和 `ssh_exec_as_user`
 返回执行元数据：`loginUser`、`effectiveUser`、`identity`、`cwd`、`resolvedCwd`、`shell`、
 `profileLoaded`、`envInjectedKeys`、`failureKind`、`stdoutBytes`、`stderrBytes` 和截断提示，大输出会返回 `stdoutHead`、
-`stdoutTail`、`stderrHead`、`stderrTail` 和 `recommendedReadCommand`。
+`stdoutTail`、`stderrHead`、`stderrTail` 和 `recommendedReadCommand`
 
-timeout 错误也包含超时前已经产生的 head/tail 输出。stdout 和 stderr 使用增量解码，UTF-8 字符即使跨越多个 SSH data
-chunk，也会完整返回。
+timeout 错误也包含超时前已经产生的 head/tail 输出；stdout 和 stderr 使用增量解码，UTF-8 字符即使跨越多个 SSH data
+chunk，也会完整返回
 
 `commandRisk`
 按所选 shell 报告破坏性、提权、凭据参数、进程控制及资源使用风险，只读搜索中的敏感词和普通 Python/Node 命令不会仅凭词语触发风险提示
@@ -442,7 +481,7 @@ ssh_exec_script(alias="server", script=<script-above>, timeout=30000)
 ssh_read_file(alias="server", remotePath="/tmp/mcp-log-errors.txt", maxBytes=65536)
 ```
 
-日志查询由通用命令和文件工具组合完成，不再提供独立的日志专用 MCP 工具。`ssh_exec_script.timeout`
+日志查询由通用命令和文件工具组合完成，不再提供独立的日志专用 MCP 工具；`ssh_exec_script.timeout`
 同时用于临时脚本上传、权限准备和执行阶段；SFTP 上传停滞时按请求的 timeout 结束，不再使用默认 SFTP 预算
 
 ### 设置环境变量
@@ -458,7 +497,7 @@ ssh_connect(
 
 ### 快速一次性执行
 
-无需管理连接，适用于单次命令。`ssh_quick_exec` 为每次调用创建唯一临时 alias，`readyTimeout` 只限制连接阶段，`timeout`
+无需管理连接，适用于单次命令；`ssh_quick_exec` 为每次调用创建唯一临时 alias，`readyTimeout` 只限制连接阶段，`timeout`
 只限制远端命令执行阶段：
 
 ```
@@ -512,28 +551,62 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180"
 `rm`，可用于禁用 exec 的 SFTP-only 服务和 BSD 系统，目录 manifest 校验也通过 SFTP 读取远端目录树
 
 `ssh_download` 先以 `0600` mode 写入目标同目录的临时文件，SFTP 流关闭且传输字节数与 SFTP `stat`
-报告的大小一致后再 rename 到本地目标。新文件保持 `0600`；替换普通文件时保留其 `rwx`
-位，但不复制 setuid、setgid 或 sticky 位。目标是 symlink、目录或其他非普通对象时，在远端读取开始前拒绝。下载失败、提前截断或取消时会删除临时文件，已有本地目标保持原内容。SFTP 目录列表在构造子路径前会拒绝空名称、`.`、`..`、NUL 和路径分隔符
+报告的大小一致后再 rename 到本地目标；新文件保持 `0600`；替换普通文件时保留其 `rwx`
+位，但不复制 setuid、setgid 或 sticky 位；目标是 symlink、目录或其他非普通对象时，在远端读取开始前拒绝；下载失败、提前截断或取消时会删除临时文件，已有本地目标保持原内容；SFTP 目录列表在构造子路径前会拒绝空名称、`.`、`..`、NUL 和路径分隔符
 
 命令执行结果在远端命令非零退出且没有 stdout/stderr 时返回 `emptyOutputFailure=true`，同时给出 effective
 user、cwd 和可用的后续读取建议，`ssh_read_file` 默认读取 1 MiB，`maxBytes` 超过 16 MiB 时会在远端传输前拒绝，返回
 `total_size`、
 `read_offset`、`requested_offset`、`read_bytes`、`read_end`、`next_offset`、`remaining_bytes`、`sample_kind` 和
-`truncated`，调用方可以区分完整读取、头部样本、尾部样本、字节范围和行范围。文本读取不会截断 UTF-8 字符，后续分段应使用
-`next_offset`。行范围读取不执行远端 shell 工具。
+`truncated`，调用方可以区分完整读取、头部样本、尾部样本、字节范围和行范围；文本读取不会截断 UTF-8 字符，后续分段应使用
+`next_offset`；行范围读取不执行远端 shell 工具
 
 `ssh_upload`、`ssh_download`、`ssh_read_file`、`ssh_write_file`、`ssh_list_dir`、`ssh_file_info` 和 `ssh_mkdir`
-支持单个 SFTP 操作的 `timeout`，默认 10 分钟，最大 1 小时。超时返回 `operationStatus="unknown"` 和
+支持单个 SFTP 操作的 `timeout`，默认 10 分钟，最大 1 小时；超时返回 `operationStatus="unknown"` 和
 `retryable=true`，重试前应检查受影响的远端或本地路径
 
 `ssh_list_dir` 和 `ssh_file_info` 返回按 `07777` 掩码提取的数值 `mode`，`permissions` 用作展示，其中 setuid/setgid 使用
-`s`/`S`，sticky 使用 `t`/`T`。`verifyMode` 支持 `4755` 等四位八进制值和 `-rwsr-xr-x`
+`s`/`S`，sticky 使用 `t`/`T`；`verifyMode` 支持 `4755` 等四位八进制值和 `-rwsr-xr-x`
 等权限文本；校验直接比较数值 mode，不从展示文本反向推导
+
+### 目录筛选与分页
+
+`ssh_list_dir` 未传下列六个参数时，继续返回完整的 `{success, path, count, files}`，条目按目录优先、名称排序，
+`showHidden=false` 排除名称以点开头的条目；传入任一筛选或分页参数后启用有界响应，默认每页最多 100 条、64 KiB
+
+| 参数             | 类型                     | 合同                                                                        |
+| ---------------- | ------------------------ | --------------------------------------------------------------------------- |
+| `namePattern`    | string                   | 名称区分大小写，复用同步 exclude 的 `*` 和 `?` 通配规则，其他字符按字面匹配 |
+| `modifiedAfter`  | 带时区的 ISO 8601 string | 修改时间下界，包含，例如 `2026-01-01T00:00:00Z`                             |
+| `modifiedBefore` | 带时区的 ISO 8601 string | 修改时间上界，不包含，须大于或等于 `modifiedAfter`                          |
+| `offset`         | 非负整数                 | 筛选并排序后的条目位置，默认 `0`                                            |
+| `limit`          | 正整数                   | 单页最多返回条数，有界模式默认 `100`                                        |
+| `maxBytes`       | 正整数                   | 返回 JSON 文本的 UTF-8 字节预算，包含元数据和格式空白，有界模式默认 `65536` |
+
+名称、时间和隐藏文件条件取交集，时间区间为 `[modifiedAfter, modifiedBefore)`，起止相同时返回空结果；有界响应中， `count`
+表示本页条数，`total_count` 表示全部匹配条数，并返回 `offset`、`has_more` 和 `next_offset`，保持筛选条件不变，使用
+`next_offset` 续查，直到 `has_more=false`；偏移达到或超过末尾时返回空页，保留该偏移
+
+```text
+ssh_list_dir(
+  alias="server", remotePath="/var/log/app", namePattern="*.log",
+  modifiedAfter="2026-01-01T00:00:00Z", modifiedBefore="2026-01-02T00:00:00Z",
+  offset=0, limit=100, maxBytes=65536
+)
+```
+
+字节预算约束成功响应的 JSON 文本，不包含 MCP 协议外层；分页元数据或下一完整条目无法放入预算时，工具返回
+`LIST_DIR_MAX_BYTES_TOO_SMALL`、`requiredBytes`，`offset` 和 `next_offset` 保持不变，提高 `maxBytes`
+后从该位置重试，错误诊断可超过请求预算；条目始终完整返回，不为满足预算而跳过条目
+
+每次调用都完成 SFTP `readdir`
+后再筛选和分页，分页只限制响应，不提供远端增量枚举或冻结快照，调用之间目录变化会改变偏移对应的条目；内部目录读取、递归下载、同步和目录校验保持现有枚举合同；默认 ssh2/SFTP 后端不变，OpenSSH
+master 模式仍拒绝独立 SFTP 目录读取
 
 ### 使用 rsync 或 SFTP 同步目录
 
-智能同步只在直连且存在已校验 key path 或可用 SSH agent 时选择 rsync，password、inline key、jump
-host 和其他无法安全交给 OpenSSH 的路由直接使用 SFTP：
+默认 ssh2 后端在直连且存在已校验 key path 或可用 SSH agent 时选择 rsync，password、inline key、jump
+host 和其他无法安全交给独立 OpenSSH 进程的路由直接使用 SFTP OpenSSH master 后端始终使用所选主连接，要求 rsync 可用：
 
 ```
 // 同步本地目录到远程（上传）
@@ -568,6 +641,9 @@ ssh_sync(..., dryRun=true)
 // 上传单文件后校验远端 owner/mode
 ssh_sync(..., direction="upload", verifyOwner="appuser", verifyMode="0644")
 
+// 上传或下载单文件后校验，目标也可为目录
+ssh_sync(..., verify={sha256: true, owner: true, mode: true, maxFileBytes: 268435456})
+
 // 使用有界 manifest 校验目录
 ssh_sync(
   ...,
@@ -581,8 +657,13 @@ ssh_sync(..., delete=true, verify={deletions: true})
 目录源路径在 rsync 和 SFTP 模式下都表示“把源目录内容同步到目标根目录”，目录源使用 `recursive=false`
 会被明确拒绝，相对排除模式按源目录下的相对路径匹配，不含 `/` 的模式匹配每一级 basename
 
+普通文件可在 upload 和 download 中使用 `verify.sha256`、`verify.owner`、`verify.mode` 与 Windows
+`verify.aclSddl`，校验目标为实际传输的文件，结果使用 `kind="single_file"`，返回文件摘要
+`verify.count`、`verify.deletions` 和 `verify.staleFiles`
+要求目录源，单文件传输前会明确拒绝；已知源文件超过请求的哈希字节上限时，也在传输前拒绝
+
 目录校验会生成有界的本地和远端 manifest，可比较条目数、SHA-256 root
-manifest、owner、包括 setuid、setgid、sticky 在内的四位八进制 mode、旧文件和删除结果。`verify.deletions=true`
+manifest、owner、包括 setuid、setgid、sticky 在内的四位八进制 mode、旧文件和删除结果；`verify.deletions=true`
 必须同时设置 `delete=true`，工具会在传输前记录目标目录，只检查这些删除候选是否消失，`staleFiles`
 则独立检查目标端全部额外条目，响应只返回摘要和最多 20 个 mismatch 样本，不返回完整 manifest，默认上限为 10000 个条目、单文件 256
 MiB、总哈希字节 1 GiB，可通过 `verify.maxEntries`、`verify.maxFileBytes` 和 `verify.maxTotalBytes`
@@ -592,16 +673,23 @@ MiB、总哈希字节 1 GiB，可通过 `verify.maxEntries`、`verify.maxFileByt
 请求校验后，mismatch、skipped 或校验错误都会令顶层 `success=false`，`transferSuccess` 仍单独表示传输是否完成，
 `verificationStatus`、`verificationSuccess` 和 `failedChecks`
 描述校验结果，SFTP 单文件同步还会返回本地和远端的 size、mode 或 permissions、mtime、owner/group，以及通过 SFTP 流读取计算的 SHA-256 对比，upload 单文件使用
-`verifyOwner` 和 `verifyMode`，目录逐项校验使用 `verify.owner` 和 `verify.mode`
+`verifyOwner` 和 `verifyMode`，文件和目录逐项校验均可使用 `verify.owner` 和 `verify.mode`
 校验不会自动执行 chown/chmod，SFTP 新目录使用目标端默认权限，新下载文件使用
 `0600`，覆盖既有本地普通文件保留其 rwx 内容和 owner 匹配不代表 mode 匹配，请求 mode 校验时，已完成的传输仍会因权限不同而返回校验失败
 
-只有直连且存在已校验 key path 或可用 SSH agent 时才选择 rsync，password、inline key 和 jump
-host 会使用 SFTP，因为独立 OpenSSH 进程无法安全继承对应路由或认证材料，`preflightTimeout`、`connectTimeout` 和
-`operationTimeout` 分别限制能力预检、rsync
-SSH 建连和完整传输，默认值为 10 秒、30 秒和 10 分钟，不具备 rsync 条件的 session 会返回 `rsyncProbe.status="skipped"`
-和路由判定原因，不再省略 probe，rsync 模式设置 `StrictHostKeyChecking=accept-new`，SFTP 不支持 `delete=true`
+ssh2 session 在直连且存在已校验 key path 或可用 SSH agent 时选择 rsync，password、inline key 和 jump
+host 会使用 SFTP，因为独立 OpenSSH 进程无法安全继承对应路由或认证材料 OpenSSH master
+session 不经过这项凭证选择，也不回退到 SFTP，`preflightTimeout`、`connectTimeout` 和 `operationTimeout`
+分别限制能力预检、rsync SSH 建连和完整传输，默认值为 10 秒、30 秒和 10 分钟，不具备 rsync 条件的 session 会返回
+`rsyncProbe.status="skipped"` 和路由判定原因，不再省略 probe，rsync 模式设置
+`StrictHostKeyChecking=accept-new`，SFTP 不支持 `delete=true`
 ，此类请求会明确失败，不会报告已经删除，如需严格的主机密钥验证与管理，请使用 SFTP 模式
+
+符号链接被跳过时，校验会说明目录不完整，download 可排除这些链接后重新同步和校验，`followSymlinks`
+只控制 upload 目录传输失败会保留已知成功文件数、字节数和失败计数；部分文件完成后发生超时，远端状态仍可为 `unknown`
+
+`ssh_upload(timeout=...)` 将该期限应用于每次元数据、摘要、传输、校验、rename 和清理操作，清理失败单独报告 tracked
+operation 终态输出以残缺 UTF-8 字符结束时明确返回编码错误；运行中的未完成字符仍可等待后续字节
 
 ### 持久化 PTY 会话（top、tmux 等）
 
@@ -642,12 +730,12 @@ ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 `ssh_pty_read` 和 `ssh_pty_list` 返回 `lastInputAt`、`lastOutputAt`、`lastReadAt`、
 `unreadRawBytes`、`rawBufferLimit`、`rawBufferTruncated`、`foregroundProcess`，列表项还返回
 `bufferSize`，这些 size 字段都按字节计数，screen 输出使用增量解码；raw 的 `dataBase64`
-无损保存原始字节，包括不完整的 UTF-8 序列，`data` 是文本预览。`rawBufferTruncated=true`
-表示从上次 clear 起已有更早的 raw 输出因字节上限被丢弃。raw 读取默认
-`clear=true`，响应返回清理前的字节数和截断标志，随后重置 raw 缓冲区和标志；screen 读取不清理 raw 状态。有限命令自然结束后仍可读取最终 screen，返回
+无损保存原始字节，包括不完整的 UTF-8 序列，`data` 是文本预览；`rawBufferTruncated=true`
+表示从上次 clear 起已有更早的 raw 输出因字节上限被丢弃；raw 读取默认
+`clear=true`，响应返回清理前的字节数和截断标志，随后重置 raw 缓冲区和标志；screen 读取不清理 raw 状态；有限命令自然结束后仍可读取最终 screen，返回
 `active=false`，直到显式 close 或 closed session 保留期结束，默认 5 分钟，可通过 `SSH_MCP_PTY_CLOSED_RETENTION_MS`
-调整。`ssh_pty_write` 返回 `accepted=true` 表示本地 stream 已接收输入， `backpressured=true`
-只表示缓冲区达到高水位，不代表输入丢失。`ssh_pty_close` 返回 `closed`、`not_found`、`failed` 或
+调整；`ssh_pty_write` 返回 `accepted=true` 表示本地 stream 已接收输入， `backpressured=true`
+只表示缓冲区达到高水位，不代表输入丢失；`ssh_pty_close` 返回 `closed`、`not_found`、`failed` 或
 `unknown`，可重试的失败会保留 PTY 状态
 
 常用控制序列：
@@ -684,18 +772,18 @@ ssh_forward_close(forwardId="fwd_1_xxx", mode="force", timeoutMs=5000)
 ```
 
 关闭成功表示本地 `server.close` 或远端 `unforwardIn` callback 已完成，结果包含 `listenerReleased`、`remoteUnforwarded`、
-`activeConnections`、`closeMode` 和 `retryable`。`ssh_forward_list` 返回 `lifecycle` 和
-`acceptingConnections`，`closing` 状态仍可重试，但不再接收流量。超时或 callback 失败时 forward 仍保留在
+`activeConnections`、`closeMode` 和 `retryable`；`ssh_forward_list` 返回 `lifecycle` 和
+`acceptingConnections`，`closing` 状态仍可重试，但不再接收流量；超时或 callback 失败时 forward 仍保留在
 `ssh_forward_list`，可以使用同一 `forwardId` 重试，本地转发关闭成功后端口可立即重新 bind，`remotePort=0`
 会返回实际分配端口，后续连接路由和 `unforwardIn` 都使用该端口
 
 forward 在 `listen` 或 `forwardIn` 完成前就进入生命周期管理，disconnect 会取消 pending
-creation。延迟返回的本地 listener 会被关闭，延迟分配的远端 listener 会被移除；close 开始后立即拒绝新的本地或远端连接。
+creation；延迟返回的本地 listener 会被关闭，延迟分配的远端 listener 会被移除；close 开始后立即拒绝新的本地或远端连接
 `forwardOut`、close 和 unforward 的延迟 callback 修改状态前会检查同一生命周期记录，已关闭的 forward 不会重新出现在
 `ssh_forward_list`；每条本地转发连接同时跟踪本地 socket 和 SSH `forwardOut`
-channel，任一端关闭或失败都会销毁另一端，force close 只在两端都销毁且 `activeConnections` 归零后返回。remote force
+channel，任一端关闭或失败都会销毁另一端，force close 只在两端都销毁且 `activeConnections` 归零后返回；remote force
 close 在 `unforwardIn`
-后遵循相同的连接排空规则，同一连接两端的 close/error 事件只递减一次计数。每个 alias 最多允许 32 个 pending `forwardOut`
+后遵循相同的连接排空规则，同一连接两端的 close/error 事件只递减一次计数；每个 alias 最多允许 32 个 pending `forwardOut`
 请求，close 会等待全部 callback；如果 SSH 服务端始终不回应 channel-open，请求会超时并保留可重试的 forward，同时拒绝同 alias 新建 local
 forward，避免 ssh2 pending channel 继续累积，此时断开 alias 才能释放始终不返回的底层请求
 
@@ -703,21 +791,23 @@ forward，避免 ssh2 pending channel 继续累积，此时断开 alias 才能�
 
 ### 连接选项
 
-| 选项                    | 类型   | 默认值     | 描述                                          |
-| ----------------------- | ------ | ---------- | --------------------------------------------- |
-| `host`                  | string | _必需_     | 服务器地址                                    |
-| `user`                  | string | _必需_     | 用户名                                        |
-| `password`              | string | -          | 密码认证                                      |
-| `keyPath`               | string | -          | SSH 私钥路径                                  |
-| `port`                  | number | 22         | SSH 端口                                      |
-| `alias`                 | string | 自动生成   | 连接别名，用于后续引用                        |
-| `template`              | string | -          | 连接模板名                                    |
-| `env`                   | object | -          | 环境变量                                      |
-| `defaultEnv`            | object | -          | 连接级默认环境变量                            |
-| `runAs`                 | string | -          | 默认执行用户                                  |
-| `keepaliveInterval`     | number | 30000      | 心跳间隔（毫秒）                              |
-| `readyTimeout`          | number | 30000      | 等待 SSH ready 的超时，最大 600000 毫秒       |
-| `jumpHost.readyTimeout` | number | 继承顶层值 | 跳板机等待 SSH ready 的超时，最大 600000 毫秒 |
+| 选项                    | 类型   | 默认值      | 描述                                          |
+| ----------------------- | ------ | ----------- | --------------------------------------------- |
+| `backend`               | string | `ssh2`      | `ssh2` 或仅复用已有 master 的 `openssh`       |
+| `controlPath`           | string | `ssh -G` 值 | 已有 OpenSSH control socket                   |
+| `host`                  | string | _必需_      | 服务器地址                                    |
+| `user`                  | string | _必需_      | 用户名                                        |
+| `password`              | string | -           | 密码认证                                      |
+| `keyPath`               | string | -           | SSH 私钥路径                                  |
+| `port`                  | number | 22          | SSH 端口                                      |
+| `alias`                 | string | 自动生成    | 连接别名，用于后续引用                        |
+| `template`              | string | -           | 连接模板名                                    |
+| `env`                   | object | -           | 环境变量                                      |
+| `defaultEnv`            | object | -           | 连接级默认环境变量                            |
+| `runAs`                 | string | -           | 默认执行用户                                  |
+| `keepaliveInterval`     | number | 30000       | 心跳间隔（毫秒）                              |
+| `readyTimeout`          | number | 30000       | 等待 SSH ready 的超时，最大 600000 毫秒       |
+| `jumpHost.readyTimeout` | number | 继承顶层值  | 跳板机等待 SSH ready 的超时，最大 600000 毫秒 |
 
 连接失败返回 `failureStage`、`retryable` 和限量建议，`failureStage` 为 `preflight`、`authentication`、`ready_timeout`、
 `transport_or_handshake` 或 `unknown`，多跳连接还可能返回 `connectionStep`，取值为 `key_read`、`jump_connect`、

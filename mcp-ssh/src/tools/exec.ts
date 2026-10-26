@@ -11,6 +11,7 @@ import { z } from 'zod'
 import { classifyCommandRisk, type CommandRisk } from '../command-risk.js'
 import * as fileOps from '../file-ops.js'
 import { sessionManager } from '../session-manager.js'
+import { OpenSshError } from '../openssh.js'
 import { encodedPowershell, quotePowershell, sftpPath } from '../remote-platform.js'
 import { type ExecResult, HARD_EXEC_MAX_OUTPUT_SIZE } from '../types.js'
 import { windowsTemporaryPathScript } from '../windows-acl.js'
@@ -376,6 +377,16 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
     let ownsRemotePath = false
     let executionStarted = false
     try {
+        if (sessionManager.getOpenSshConnection(args.alias))
+            throw new OpenSshError(
+                'The OpenSSH backend does not support temporary script uploads; use ssh_exec for inline commands',
+                {
+                    code: 'unsupported_backend',
+                    backend: 'openssh',
+                    capability: 'script_upload',
+                    retryable: false,
+                }
+            )
         const windows = sessionManager.getRemotePlatform(args.alias) === 'windows'
         const interpreter = args.interpreter ?? (windows ? sessionManager.getCommandShell(args.alias) : 'bash')
         const { effectiveUser, loginUser } = resolveScriptUsers(args)

@@ -250,6 +250,29 @@ test('tracked operation reads UTF-8 output without splitting characters', async 
     assert.throws(() => manager.read(started.operationId, { stdoutOffset: 2, maxBytes: 4 }), /UTF-8 character boundary/)
 })
 
+test('tracked operation reports incomplete terminal UTF-8 instead of endless empty pages', async (t) => {
+    const channel = createChannel()
+    const manager = new OperationManager({
+        async openStream(_alias, _command, marker, _options, adopt) {
+            channel.marker = marker
+            adopt(channel)
+        },
+        async cancelRemote() {
+            return { success: true }
+        },
+    })
+    t.after(() => manager.close())
+    const started = await manager.start('server', 'printf output')
+    channel.stderr.write(`__MCP_SSH_OPERATION__:${channel.marker}:4321:0\n`)
+    channel.write(Buffer.from([0xf0, 0x9f]))
+    await waitForEvents()
+    assert.equal(manager.read(started.operationId).stdout, '')
+    channel.emit('close', 0)
+    assert.throws(() => manager.read(started.operationId), /incomplete UTF-8.*stdout/)
+    assert.equal(manager.status(started.operationId).stdoutStoredBytes, 2)
+    assert.equal(manager.status(started.operationId).stdoutTruncated, false)
+})
+
 test('tracked operation advances past a partial UTF-8 character at the storage limit', async (t) => {
     const channel = createChannel()
     const manager = new OperationManager({
