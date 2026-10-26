@@ -6,7 +6,7 @@ A conversation history search tool for Claude Code
 
 Module version: 2.1.1
 
-This release fixes Windows history-file reads after path canonicalization and private export creation when started from PowerShell 7
+This release fixes Windows history-file reads after path canonicalization, private export creation when started from PowerShell 7, and atomic publication of export bundles
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)

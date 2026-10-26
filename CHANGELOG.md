@@ -17,6 +17,7 @@
 - fix: Search oversized records in normal and aggregate modes while preserving filters, redaction and match counts
 - fix: Export full content independently of response previews and preserve mixed text, thinking and tool blocks
 - fix: Correct Windows history-file paths and private export creation when started from PowerShell 7
+- fix: Restore atomic Windows export publication and keep existing bundles when replacement fails
 
 ### mcp-chrome
 
@@ -59,6 +60,7 @@
 - fix: normal 和 aggregate 模式可搜索超大记录，保留过滤条件、脱敏和命中计数
 - fix: 全文导出独立于响应预览，保留混合的 text、thinking 和 tool 块
 - fix: 修复 Windows 历史文件路径，以及从 PowerShell 7 启动时的私有导出创建
+- fix: 修复 Windows 导出目录的原子发布，替换失败时保留已有 bundle
 
 ### mcp-chrome
 
