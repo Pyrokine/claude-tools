@@ -987,6 +987,10 @@ fallback 原因；模拟 rsync 传输开始后失败，不应再启动 SFTP 重�
 
 ### win-upload-case-preflight-01
 
+**前置**：Windows 本地源目录使用支持大小写敏感标志的 NTFS，并具备执行
+`fsutil.exe file setCaseSensitiveInfo <空目录> enable` 的权限；创建名称后核对目录项确实同时存在
+无法启用时，仅将依赖同名不同大小写源文件的子用例标为条件 SKIP，保留 fsutil 的错误原因；不同名称的用例继续执行
+
 **步骤**：在区分大小写的本地文件系统建立 `a.txt` 和
 `A.txt`，分别上传到已存在的 Windows 大小写敏感和不敏感目录；使用密码 SFTP 和密钥 rsync 两条路径；覆盖 file-directory、嵌套目录、Unicode 名称、exclude、默认跳过链接、followSymlinks、循环目录链接和 dry-run；故障注入父目录不存在、exec 不可用、超时、截断响应和缺字段；无候选目录使用只支持 SFTP 的账号，POSIX 目标也执行大小写不同的文件上传
 

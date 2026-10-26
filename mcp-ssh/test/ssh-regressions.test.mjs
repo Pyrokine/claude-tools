@@ -30,6 +30,7 @@ import { registerExecTools } from '../dist/tools/exec.js'
 import { createAtomicUploadPath, registerFileTools } from '../dist/tools/file.js'
 import { dynamicSshPortSchema, sshPortSchema } from '../dist/tools/schema.js'
 import { buildTransferOutcome } from '../dist/transfer-outcome.js'
+import { checkWindowsAcl } from '../dist/windows-acl.js'
 
 const exec = promisify(execCallback)
 
@@ -2455,7 +2456,16 @@ test('session summaries stay brief while internal transfer capability retains ro
     assert.equal(unsafeKey.decisionReason, 'key_path_not_openssh_compatible')
     assert.equal(unsafeKey.keyPath, undefined)
 
-    fs.chmodSync(keyPath, 0o600)
+    if (process.platform === 'win32') {
+        assert.equal(checkWindowsAcl(keyPath, true), 'key_path_usable')
+        const withoutProfile = manager.getExternalTransferCapability('key-session')
+        assert.equal(withoutProfile.rsyncEligible, false)
+        assert.equal(withoutProfile.decisionReason, 'rsync_profile_required_for_windows')
+        assert.equal(withoutProfile.keyPath, keyPath)
+        manager.sessions.get('key-session').config.rsyncProfile = 'native-win32'
+    } else {
+        fs.chmodSync(keyPath, 0o600)
+    }
     const safeKey = manager.getExternalTransferCapability('key-session')
     assert.equal(safeKey.rsyncEligible, true)
     assert.equal(safeKey.decisionReason, 'direct_openssh_compatible_key_path')

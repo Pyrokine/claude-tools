@@ -40,13 +40,34 @@ import { registerPtyTools } from '../dist/tools/pty.js'
 import { expandTilde } from '../dist/tools/utils.js'
 import { checkWindowsAcl, windowsAclScript, windowsTemporaryPathScript } from '../dist/windows-acl.js'
 
-function fixture(t) {
+function fixture(t, getManager) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-windows-'))
     t.after(async () => {
+        const manager = getManager?.()
+        if (manager) {
+            await manager.disconnectAll()
+            await manager.persistQueue
+        }
         await new Promise((resolve) => setTimeout(resolve, 10))
         fs.rmSync(directory, { recursive: true, force: true })
     })
     return directory
+}
+
+function prepareCaseSensitiveDirectory(t, directory) {
+    if (process.platform === 'win32') {
+        const result = spawnSync('fsutil.exe', ['file', 'setCaseSensitiveInfo', directory, 'enable'], {
+            encoding: 'utf8',
+            timeout: 5000,
+        })
+        if (result.error || result.status !== 0) {
+            t.skip(
+                `NTFS case-sensitive source directory unavailable: ${result.error?.message ?? (result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`)}`
+            )
+            return false
+        }
+    }
+    return true
 }
 
 function tools(register) {
@@ -80,7 +101,7 @@ function remoteFile(bytes, events = []) {
 }
 
 test('S1: public connection passes explicit agent to ssh2, and unsupported Pageant on POSIX fails before connecting', async (t) => {
-    const dir = fixture(t)
+    const dir = fixture(t, () => manager)
     const sock = path.join(dir, 'agent.sock')
     fs.writeFileSync(sock, '')
     const original = Client.prototype.connect
@@ -128,7 +149,7 @@ test('S2/S3: POSIX, PowerShell, cmd grouping and privilege restrictions come fro
     assert.match(Buffer.from(exclamation.split(' ').at(-1), 'base64').toString('utf16le'), /\$env:VAR = 'a!b'/)
     const posix = buildRemoteCommand('false; touch /tmp/unsafe', 'posix', '/absent', { VAR: 'x' })
     assert.match(posix, /cd '\/absent' && export VAR='x' && eval 'false; touch \/tmp\/unsafe'/)
-    const dir = fixture(t)
+    const dir = fixture(t, () => manager)
     const manager = new SessionManager(path.join(dir, 'sessions.json'))
     let executed = 0
     manager.sessions.set('windows', {
@@ -176,7 +197,12 @@ test('S2: cmd applies injected env and cwd before expanding the user command on 
     })
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /new/)
-    assert.ok(result.stdout.toLowerCase().includes(cwd.toLowerCase()))
+    const reportedCwd = result.stdout.trim().split(/\r?\n/).at(-1)
+    assert.equal(
+        fs.realpathSync.native(reportedCwd).toLowerCase(),
+        fs.realpathSync.native(cwd).toLowerCase(),
+        result.stdout
+    )
     assert.doesNotMatch(result.stdout, /old/)
 })
 
@@ -597,7 +623,7 @@ test('S4: Windows script refuses to send content before ACL verification and cle
 })
 
 test('S6: Windows tracked operation captures PID and creation ticks and verifies identity before tree termination', async (t) => {
-    const dir = fixture(t)
+    const dir = fixture(t, () => manager)
     const manager = new SessionManager(path.join(dir, 'sessions.json'))
     let stream
     let commandSent
@@ -667,7 +693,7 @@ test('S6: Windows tracked operation captures PID and creation ticks and verifies
 })
 
 test('S10: SSH exec output budget is UTF-8 bytes, and PTY raw base64 preserves arbitrary bytes', async (t) => {
-    const dir = fixture(t)
+    const dir = fixture(t, () => manager)
     const manager = new SessionManager(path.join(dir, 'sessions.json'))
     manager.sessions.set('bytes', {
         client: {
@@ -986,8 +1012,8 @@ test('S4: Windows script bodies preserve Unicode for PowerShell and switch cmd t
         return
     }
     const root = fixture(t)
-    const psPath = path.join(root, 'unicode.ps1')
-    const cmdPath = path.join(root, 'unicode.cmd')
+    const psPath = path.join(root, 'unicode script.ps1')
+    const cmdPath = path.join(root, 'unicode script.cmd')
     fs.writeFileSync(psPath, psBody, 'utf8')
     fs.writeFileSync(cmdPath, cmdBody, 'utf8')
     const ps = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', psPath], {
@@ -996,7 +1022,11 @@ test('S4: Windows script bodies preserve Unicode for PowerShell and switch cmd t
     })
     assert.equal(ps.status, 0, ps.stderr)
     assert.match(ps.stdout, /ok/)
-    const cmd = spawnSync('cmd.exe', ['/D', '/C', `"${cmdPath}"`], { encoding: 'utf8', timeout: 5000 })
+    const cmd = spawnSync('cmd.exe', ['/D', '/S', '/C', `""${cmdPath}""`], {
+        encoding: 'utf8',
+        timeout: 5000,
+        windowsVerbatimArguments: true,
+    })
     assert.equal(cmd.status, 0, cmd.stderr)
     assert.match(cmd.stdout, /中文/)
 })
@@ -1171,7 +1201,7 @@ test('S8: Windows rsync requires explicit profile even with an otherwise usable 
         t.skip('POSIX key mode fixture; Windows key DACL requires native runner')
         return
     }
-    const dir = fixture(t)
+    const dir = fixture(t, () => manager)
     const manager = new SessionManager(path.join(dir, 'sessions.json'))
     const keyPath = path.join(dir, 'key')
     fs.writeFileSync(keyPath, 'test')
@@ -1490,8 +1520,10 @@ test('R1: public Windows upload refuses case collisions before any transfer or m
     const root = fixture(t)
     const source = path.join(root, 'source')
     fs.mkdirSync(source)
+    if (!prepareCaseSensitiveDirectory(t, source)) return
     fs.writeFileSync(path.join(source, 'a.txt'), 'lower')
     fs.writeFileSync(path.join(source, 'A.txt'), 'upper')
+    assert.deepEqual(fs.readdirSync(source).sort(), ['A.txt', 'a.txt'])
     const alias = 'upload-case-regression'
     const originalSftp = sessionManager.getSftp
     const originalExec = sessionManager.exec
@@ -1592,112 +1624,118 @@ test('R1: upload preflight shares traversal rules and rejects unverified candida
         for (const transport of ['sftp', 'rsync']) {
             if (transport === 'rsync' && spec.writes !== undefined) continue
             for (const dryRun of spec.writes === undefined ? [false, true] : [false]) {
-                const source = path.join(root, `source-${index}-${transport}-${dryRun}`)
-                fs.mkdirSync(source)
-                const entries = spec.nested ? path.join(source, 'nested') : source
-                if (spec.nested) {
-                    fs.mkdirSync(entries)
-                    fs.writeFileSync(path.join(source, 'earlier.txt'), 'must not transfer before nested checks')
-                }
-                fs.writeFileSync(path.join(entries, spec.names[0]), 'one')
-                const second = path.join(entries, spec.names[1])
-                if (spec.loop) fs.symlinkSync(entries, second, 'dir')
-                else if (spec.symlink) fs.symlinkSync(path.join(entries, spec.names[0]), second, 'file')
-                else if (spec.directory) fs.mkdirSync(second)
-                else fs.writeFileSync(second, 'two')
-                let queries = 0
-                let capabilityCalls = 0
-                const writes = []
-                const created = []
-                sessionManager.sessions.set(alias, {
-                    client: {},
-                    config: {
-                        host: 'example.com',
-                        username: 'test',
-                        password: 'test',
-                        remotePlatform: spec.platform ?? 'windows',
-                    },
-                    connected: true,
-                    connectedAt: 1,
-                    lastUsedAt: 1,
-                    reconnectAttempts: 0,
-                    manualClose: false,
-                })
-                sessionManager.getExternalTransferCapability = (...args) => {
-                    ++capabilityCalls
-                    if (transport === 'rsync')
-                        throw new Error('rsync selection must not start before rejected preflight')
-                    return originalCapability.apply(sessionManager, args)
-                }
-                sessionManager.exec = async (_alias, command, options) => {
-                    ++queries
-                    if (spec.queries === 0) assert.fail('no candidate must not require a shell')
-                    assert.ok(options.timeout > 0)
-                    const script = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
-                    assert.match(script, /CreateFileW\(parent, 128, 7, IntPtr.Zero, 3, 128 \| 33554432/)
-                    assert.match(script, /GetFileInformationByHandleEx\(handle, 23, out info, 4\)/)
-                    assert.match(script, /CompareStringOrdinal\(left, left.Length, right, right.Length, true\)/)
-                    if (spec.nested) assert.match(script, /C:\\Target\\nested/)
-                    if (spec.noShell) throw new Error('shell unavailable')
-                    return {
-                        success: true,
-                        exitCode: 0,
-                        stderr: '',
-                        stdout:
-                            spec.stdout ??
-                            JSON.stringify({
-                                caseSensitive: spec.caseSensitive ?? false,
-                                collision: spec.collision ?? null,
-                            }),
-                        ...spec.reply,
+                await t.test(`case=${index}, transport=${transport}, dryRun=${dryRun}`, async (t) => {
+                    const source = path.join(root, `source-${index}-${transport}-${dryRun}`)
+                    fs.mkdirSync(source)
+                    const entries = spec.nested ? path.join(source, 'nested') : source
+                    if (spec.nested) {
+                        fs.mkdirSync(entries)
+                        fs.writeFileSync(path.join(source, 'earlier.txt'), 'must not transfer before nested checks')
                     }
-                }
-                sessionManager.getSftp = async () => ({
-                    stat(_name, cb) {
-                        cb(null, { mode: 0o040755, size: 0 })
-                    },
-                    mkdir(name, cb) {
-                        created.push(name)
-                        cb(null)
-                    },
-                    createWriteStream(name) {
-                        writes.push(name)
-                        return new Writable({
-                            write(_bytes, _encoding, cb) {
-                                cb()
-                            },
-                        })
-                    },
-                    end() {},
-                })
-                const result = content(
-                    await tools(registerFileTools).get('ssh_sync').handler({
-                        alias,
-                        localPath: source,
-                        remotePath: 'C:\\Target',
-                        direction: 'upload',
-                        dryRun,
-                        exclude: spec.exclude,
-                        followSymlinks: spec.followSymlinks,
+                    if (new Set(spec.names.map((name) => name.toUpperCase())).size !== spec.names.length) {
+                        if (!prepareCaseSensitiveDirectory(t, entries)) return
+                    }
+                    fs.writeFileSync(path.join(entries, spec.names[0]), 'one')
+                    const second = path.join(entries, spec.names[1])
+                    if (spec.loop) fs.symlinkSync(entries, second, 'dir')
+                    else if (spec.symlink) fs.symlinkSync(path.join(entries, spec.names[0]), second, 'file')
+                    else if (spec.directory) fs.mkdirSync(second)
+                    else fs.writeFileSync(second, 'two')
+                    assert.deepEqual(fs.readdirSync(entries).sort(), [...spec.names].sort())
+                    let queries = 0
+                    let capabilityCalls = 0
+                    const writes = []
+                    const created = []
+                    sessionManager.sessions.set(alias, {
+                        client: {},
+                        config: {
+                            host: 'example.com',
+                            username: 'test',
+                            password: 'test',
+                            remotePlatform: spec.platform ?? 'windows',
+                        },
+                        connected: true,
+                        connectedAt: 1,
+                        lastUsedAt: 1,
+                        reconnectAttempts: 0,
+                        manualClose: false,
                     })
-                )
-                assert.equal(
-                    result.success,
-                    spec.writes !== undefined,
-                    JSON.stringify({ index, transport, dryRun, result })
-                )
-                assert.equal(queries, spec.queries ?? 1)
-                if (spec.writes === undefined) {
-                    assert.match(
-                        result.error ?? result.output,
-                        spec.unverified ? /case_semantics_unverified/ : /windows_filename_collision/
+                    sessionManager.getExternalTransferCapability = (...args) => {
+                        ++capabilityCalls
+                        if (transport === 'rsync')
+                            throw new Error('rsync selection must not start before rejected preflight')
+                        return originalCapability.apply(sessionManager, args)
+                    }
+                    sessionManager.exec = async (_alias, command, options) => {
+                        ++queries
+                        if (spec.queries === 0) assert.fail('no candidate must not require a shell')
+                        assert.ok(options.timeout > 0)
+                        const script = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
+                        assert.match(script, /CreateFileW\(parent, 128, 7, IntPtr.Zero, 3, 128 \| 33554432/)
+                        assert.match(script, /GetFileInformationByHandleEx\(handle, 23, out info, 4\)/)
+                        assert.match(script, /CompareStringOrdinal\(left, left.Length, right, right.Length, true\)/)
+                        if (spec.nested) assert.match(script, /C:\\Target\\nested/)
+                        if (spec.noShell) throw new Error('shell unavailable')
+                        return {
+                            success: true,
+                            exitCode: 0,
+                            stderr: '',
+                            stdout:
+                                spec.stdout ??
+                                JSON.stringify({
+                                    caseSensitive: spec.caseSensitive ?? false,
+                                    collision: spec.collision ?? null,
+                                }),
+                            ...spec.reply,
+                        }
+                    }
+                    sessionManager.getSftp = async () => ({
+                        stat(_name, cb) {
+                            cb(null, { mode: 0o040755, size: 0 })
+                        },
+                        mkdir(name, cb) {
+                            created.push(name)
+                            cb(null)
+                        },
+                        createWriteStream(name) {
+                            writes.push(name)
+                            return new Writable({
+                                write(_bytes, _encoding, cb) {
+                                    cb()
+                                },
+                            })
+                        },
+                        end() {},
+                    })
+                    const result = content(
+                        await tools(registerFileTools).get('ssh_sync').handler({
+                            alias,
+                            localPath: source,
+                            remotePath: 'C:\\Target',
+                            direction: 'upload',
+                            dryRun,
+                            exclude: spec.exclude,
+                            followSymlinks: spec.followSymlinks,
+                        })
                     )
-                    assert.equal(capabilityCalls, 0)
-                    assert.equal(writes.length, 0)
-                    assert.equal(created.length, 0)
-                } else {
-                    assert.equal(writes.length, spec.writes)
-                }
+                    assert.equal(
+                        result.success,
+                        spec.writes !== undefined,
+                        JSON.stringify({ index, transport, dryRun, result })
+                    )
+                    assert.equal(queries, spec.queries ?? 1)
+                    if (spec.writes === undefined) {
+                        assert.match(
+                            result.error ?? result.output,
+                            spec.unverified ? /case_semantics_unverified/ : /windows_filename_collision/
+                        )
+                        assert.equal(capabilityCalls, 0)
+                        assert.equal(writes.length, 0)
+                        assert.equal(created.length, 0)
+                    } else {
+                        assert.equal(writes.length, spec.writes)
+                    }
+                })
             }
         }
     }
@@ -1935,7 +1973,7 @@ test('R2: a tail budget that contains only a character fragment fails instead of
 })
 
 test('R4: IdentityAgent none allows password and disables environment agent across reconnect', async (t) => {
-    const root = fixture(t)
+    const root = fixture(t, () => manager)
     const originalConnect = Client.prototype.connect
     const oldSocket = process.env.SSH_AUTH_SOCK
     const connects = []
@@ -1988,8 +2026,8 @@ test('R4: IdentityAgent none allows password and disables environment agent acro
         }),
         /socket or pipe is unavailable/
     )
-    manager.disconnectAll()
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await manager.disconnectAll()
+    await manager.persistQueue
 })
 
 test('R4: public SSH config preserves none with keys, Host defaults, ProxyJump, and explicit overrides', async (t) => {
