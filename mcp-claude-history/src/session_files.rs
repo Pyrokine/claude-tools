@@ -247,6 +247,10 @@ pub fn open_session_file(path: &Path) -> io::Result<File> {
         let mut current = PathBuf::new();
         for component in path.components() {
             current.push(component.as_os_str());
+            // Windows 前缀与根分隔符组合后才是可查询的路径
+            if matches!(component, Component::Prefix(_)) {
+                continue;
+            }
             if fs::symlink_metadata(&current)?.file_type().is_symlink() {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "历史来源包含链接"));
             }
@@ -263,6 +267,31 @@ pub fn open_session_file(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn canonical_history_paths_are_readable_and_directories_are_rejected() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("history-canonical-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let expected = b"{\"type\":\"user\",\"message\":{\"content\":\"fixture\"}}\n";
+        fs::write(&path, expected).unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        #[cfg(windows)]
+        assert!(matches!(canonical.components().next(), Some(Component::Prefix(_))));
+        for source in [&path, &canonical] {
+            let mut file = open_session_file(source).unwrap();
+            let mut actual = Vec::new();
+            file.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(open_session_file(&fs::canonicalize(&root).unwrap()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn known_layouts_share_discovery_without_expanding_parent_filters() {

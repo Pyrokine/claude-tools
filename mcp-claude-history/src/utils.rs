@@ -183,6 +183,7 @@ if (-not $actual.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0
     let result = (|| -> io::Result<std::process::Output> {
         let mut child = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env_remove("PSModulePath")
             .env("MCP_HISTORY_PRIVATE_PATH", path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -3410,6 +3411,7 @@ if (@($actual.GetAccessRules($true, $false, [System.Security.Principal.SecurityI
 "#;
         let injected = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", inject])
+            .env_remove("PSModulePath")
             .env("MCP_HISTORY_PRIVATE_PATH", &path)
             .output()
             .unwrap();
@@ -3429,6 +3431,7 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
 "#;
         let verified = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", verify])
+            .env_remove("PSModulePath")
             .env("MCP_HISTORY_PRIVATE_PATH", &path)
             .output()
             .unwrap();
