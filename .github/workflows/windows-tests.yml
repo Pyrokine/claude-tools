@@ -36,6 +36,21 @@ jobs:
               run: |
                   node -e 'const fs = require("node:fs"); const cp = require("node:child_process"); const files = cp.execFileSync("git", ["ls-files", "-z"]).toString().split("\0").filter(Boolean).filter((file) => /\.(?:sh|bash|ps1|psm1|rs|ts|tsx|js|mjs|cjs|yml|yaml)$/.test(file)); const bad = files.filter((file) => fs.readFileSync(file).includes(13)); if (bad.length) { console.error("Non-LF source files:\n" + bad.join("\n")); process.exitCode = 1; }'
 
+            - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+              with:
+                  components: clippy, rustfmt
+
+            - name: Test and lint History
+              working-directory: mcp-claude-history
+              run: |
+                  cargo fmt --check
+                  cargo test --locked
+                  cargo clippy --locked -- -W clippy::all
+                  cargo build --release --locked
+                  cargo package --locked --allow-dirty --list
+                  cargo package --locked --allow-dirty --no-verify
+              shell: bash
+
             - name: Install Chrome packages
               run: npm ci
               working-directory: mcp-chrome
@@ -73,18 +88,3 @@ jobs:
               run: |
                   node -e 'const fs = require("node:fs"); const cp = require("node:child_process"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); const [pack] = JSON.parse(cp.execSync("npm pack --json --dry-run --ignore-scripts", { encoding: "utf8" })); const paths = new Set(pack.files.map((file) => file.path)); if (pack.name !== pkg.name || pack.version !== pkg.version || !paths.has("dist/index.js")) { console.error("SSH package lacks build output or has mismatched metadata"); process.exitCode = 1; }'
               working-directory: mcp-ssh
-
-            - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-              with:
-                  components: clippy, rustfmt
-
-            - name: Test and lint History
-              working-directory: mcp-claude-history
-              run: |
-                  cargo fmt --check
-                  cargo test --locked
-                  cargo clippy --locked -- -W clippy::all
-                  cargo build --release --locked
-                  cargo package --locked --allow-dirty --list
-                  cargo package --locked --allow-dirty --no-verify
-              shell: bash
