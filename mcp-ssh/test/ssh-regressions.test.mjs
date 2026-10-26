@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable, Writable } from 'node:stream'
@@ -189,15 +190,23 @@ test('upload timeout bounds metadata, digest, and failed verification cleanup', 
     const handlers = new Map()
     registerFileTools({ registerTool: (name, _definition, handler) => handlers.set(name, handler) })
     const originalGetSftp = sessionManager.getSftp
+    const originalCreateReadStream = fs.createReadStream
     t.after(() => {
         sessionManager.getSftp = originalGetSftp
+        fs.createReadStream = originalCreateReadStream
+        syncBuiltinESMExports()
     })
+    const payload = fs.readFileSync(localPath)
+    fs.createReadStream = () => Readable.from([payload])
+    syncBuiltinESMExports()
     for (const phase of ['metadata', 'digest', 'cleanup']) {
         const streams = new Set()
+        let reachedPhase = false
         sessionManager.getSftp = async () => ({
             _extensions: { 'posix-rename@openssh.com': '1' },
             stat(remotePath, callback) {
                 if (phase === 'metadata' && remotePath === '/remote/target.txt') {
+                    reachedPhase = true
                     return
                 }
                 callback(null, {
@@ -217,11 +226,14 @@ test('upload timeout bounds metadata, digest, and failed verification cleanup', 
                 })
             },
             createReadStream() {
+                if (phase === 'digest') reachedPhase = true
                 const stream = new Readable({ read() {} })
                 streams.add(stream)
                 return stream
             },
-            unlink() {},
+            unlink() {
+                if (phase === 'cleanup') reachedPhase = true
+            },
             end() {
                 for (const stream of streams) stream.destroy()
             },
@@ -238,6 +250,7 @@ test('upload timeout bounds metadata, digest, and failed verification cleanup', 
         })
         const result = JSON.parse(response.content[0].text)
         assert.equal(result.success, false, phase)
+        assert.equal(reachedPhase, true, `${phase}: ${JSON.stringify(result)}`)
         assert.ok(Date.now() - started < 2000, phase)
         if (phase === 'cleanup') assert.match(result.cleanupWarning, /timed out/)
         if (phase === 'digest') assert.equal(result.verificationStatus, 'error')
