@@ -359,6 +359,7 @@ mod tests {
         fs::remove_dir_all(&temp_root).ok();
         let project_path = temp_root.join("claude-tools").join("dev_foo").join(".local");
         fs::create_dir_all(&project_path).unwrap();
+        let project_path = PathBuf::from(normalize_input_path(&project_path.to_string_lossy()));
         let project_id = project_path_to_id(&project_path.to_string_lossy());
         let projects_dir = temp_root.join("projects");
         fs::create_dir_all(projects_dir.join(&project_id)).unwrap();

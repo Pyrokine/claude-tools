@@ -2104,6 +2104,7 @@ fn search_to_output_bounded(
         message: format!("同步搜索结果失败: {e}"),
         available: None,
     })?;
+    drop(file);
     push_time_filter_reason(&mut incomplete_reasons, collection.invalid_timestamps);
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
@@ -4822,6 +4823,7 @@ mod tests {
         for reason in ["tool_blocks_cap", "tool_pending_cap", "tool_pending_bytes_cap"] {
             let project = root.join(reason.replace('=', "-"));
             fs::create_dir_all(&project).unwrap();
+            let project = project.canonicalize().unwrap();
             let first = project.join("a-session.jsonl");
             let second = project.join("b-session.jsonl");
             let mut file = File::create(&first).unwrap();
@@ -4950,6 +4952,7 @@ mod tests {
         let root = env::temp_dir().join(format!("mcp-search-memory-coverage-{}", process::id()));
         let project = root.join("project");
         fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
         let first = project.join("a-session.jsonl");
         let second = project.join("b-session.jsonl");
         let mut file = File::create(&first).unwrap();
@@ -5069,6 +5072,7 @@ mod tests {
         for reason in ["uuid_dedupe_cap", "aggregate_matches_cap", "aggregate_bytes_cap"] {
             let project = root.join(reason);
             fs::create_dir_all(&project).unwrap();
+            let project = project.canonicalize().unwrap();
             let first = project.join("a-session.jsonl");
             let second = project.join("b-session.jsonl");
             let mut file = File::create(&first).unwrap();

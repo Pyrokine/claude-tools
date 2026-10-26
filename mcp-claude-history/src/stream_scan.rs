@@ -1845,6 +1845,7 @@ mod tests {
             let owner = opaque_id();
             let root = std::env::temp_dir().join(format!("history-scan-test-{owner}"));
             fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
             fs::write(root.join(".history-scan-test-owner"), &owner).unwrap();
             let projects_dir = root.join("projects");
             let project_dir = projects_dir.join("-scan-fixture");

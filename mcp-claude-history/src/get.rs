@@ -235,6 +235,7 @@ fn get_indexed(
         lines += usize::from(last.is_some_and(|byte| byte != b'\n'));
         output.sync_all().map_err(session_io_error)?;
         let bytes = output.metadata().map_err(session_io_error)?.len();
+        drop(output);
         let mut image_paths = Vec::new();
         for (index, projection, extension) in images {
             check_work()?;
@@ -272,6 +273,7 @@ fn get_indexed(
             )
             .map_err(session_io_error)?;
         manifest_file.sync_all().map_err(session_io_error)?;
+        drop(manifest_file);
         check_work()?;
         transaction.publish()?;
         return Ok(GetResponse::Output {
@@ -993,6 +995,8 @@ impl OutputTransaction {
             message: format!("同步导出归属标记失败: {error}"),
             available: None,
         })?;
+        // Windows 移动目录前需要关闭其中的文件句柄
+        drop(marker);
 
         let _guard = PUBLISH_LOCK
             .lock()
@@ -1316,6 +1320,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
             available: None,
         })?
         .len();
+    drop(file);
     let lines = request.content.lines().count();
     let redaction = redaction_info(
         request.redaction_mode,
@@ -1351,6 +1356,7 @@ fn write_output(request: OutputWriteRequest<'_>) -> Result<GetResponse, ErrorRes
         message: format!("manifest 同步失败: {e}"),
         available: None,
     })?;
+    drop(manifest_file);
     transaction.publish()?;
 
     Ok(GetResponse::Output {

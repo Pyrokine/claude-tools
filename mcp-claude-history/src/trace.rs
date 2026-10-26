@@ -274,6 +274,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
                 available: None,
             })?
             .len();
+        drop(file);
         let redacted_count = redacted_count.saturating_add(
             response
                 .tool_calls
@@ -315,6 +316,7 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
             message: format!("无法同步 trace manifest: {e}"),
             available: None,
         })?;
+        drop(manifest_file);
         response.output_path = Some(out_path.clone());
         response.output = Some(OutputInfo {
             content: out_path,

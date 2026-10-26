@@ -222,6 +222,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
                 available: None,
             })?
             .len();
+        drop(file);
         let redaction = redaction_info(
             params.redaction,
             redacted_count,
@@ -254,6 +255,7 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
             message: format!("无法同步 context manifest: {e}"),
             available: None,
         })?;
+        drop(manifest_file);
         response.output_path = Some(out_path.clone());
         response.output = Some(OutputInfo {
             content: out_path,
