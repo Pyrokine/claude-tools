@@ -1,6 +1,98 @@
 # Changelog
 
-## v1.18.1 - 2026-10-27
+## v1.18.2 - 2026-10-27
+
+## Versions
+
+- mcp-claude-history: 2.0.0 → 2.1.1
+- mcp-chrome: 3.0.0 → 3.0.1
+- mcp-chrome Extension: 3.0.0 → 3.0.1
+- mcp-ssh: 3.0.0 → 3.1.0
+
+## What's Changed
+
+### mcp-claude-history
+
+- feat: Add paged source catalogs, exact `sources` selection and grouped scans through MCP and CLI, with explicit catalog release
+- fix: Search oversized records in normal and aggregate modes while preserving filters, redaction and match counts
+- fix: Export full content independently of response previews and preserve mixed text, thinking and tool blocks
+- fix: Correct Windows history-file paths and private export creation when started from PowerShell 7
+- fix: Restore atomic Windows export publication and keep existing bundles when replacement fails
+- fix: Accept Windows SYSTEM and Administrators owners for export paths while preserving owner identity and current-user-only DACLs
+
+### mcp-chrome
+
+- fix: Restore managed pages across Extension reloads using document identity, and serialize initialization with later state changes
+- fix: Dispatch ordinary background Extension element clicks through the existing atomic click path, including iframe targets, without a preparatory mouse move or action replay
+- fix: Preserve iframe identity, valid script arguments and request deadlines across page operations
+- fix: Distinguish unavailable native contexts from verification-script errors and preserve the completed action state
+- fix: Return actual locator match counts and bounded candidates without unrelated window-focus suggestions
+- fix: Detect visible English and Chinese challenge content, preserve passive title waiting and native system-mouse handling, and retain existing debugger sessions on ordinary pages
+- fix: Read genuine older Extension group summaries without extra topology requests, keeping missing and malformed data distinct
+- fix: Preserve input-value redaction, native error details and document-scoped logs across successful and failed operations
+- chore: Update the Extension's Vite build dependency to 8.1.6
+
+### mcp-ssh
+
+- feat: Add an opt-in OpenSSH backend that reuses an existing ControlMaster without opening a new authenticated connection
+- feat: Add name/time filters, entry limits, offsets and UTF-8 response-byte budgets to SFTP directory listing
+- feat: Add explicit bounded verification for individual files and directory synchronization
+- fix: Preserve transport capabilities, remote-operation state and visible errors when a requested operation is unsupported or fails
+
+### Publishing
+
+- ci: Add GitHub Actions Trusted Publishing with exact-commit checks, isolated OIDC permissions and validation of the selected tarballs against npm registry metadata
+- ci: Run Windows export-transaction tests before building the Rust release artifacts
+- ci: Check Windows private ACLs and export transactions through native PowerShell as well as Bash
+
+---
+
+## 版本
+
+- mcp-claude-history: 2.0.0 → 2.1.1
+- mcp-chrome: 3.0.0 → 3.0.1
+- mcp-chrome Extension: 3.0.0 → 3.0.1
+- mcp-ssh: 3.0.0 → 3.1.0
+
+## 更新内容
+
+### mcp-claude-history
+
+- feat: 通过 MCP 和 CLI 提供来源目录分页、精确 `sources` 选取与分组扫描，支持显式释放来源目录
+- fix: normal 和 aggregate 模式可搜索超大记录，保留过滤条件、脱敏和命中计数
+- fix: 全文导出独立于响应预览，保留混合的 text、thinking 和 tool 块
+- fix: 修复 Windows 历史文件路径，以及从 PowerShell 7 启动时的私有导出创建
+- fix: 修复 Windows 导出目录的原子发布，替换失败时保留已有 bundle
+- fix: Windows 导出路径接受 SYSTEM 和 Administrators owner，保留 owner 身份与仅限当前用户的 DACL
+
+### mcp-chrome
+
+- fix: Extension 重载后按文档身份恢复受控页面，初始化与后续状态变更串行执行
+- fix: Extension 后台普通元素点击复用现有原子点击路径，覆盖 iframe 目标，省去前置鼠标移动且不重放动作
+- fix: 页面操作保留 iframe 身份、有效脚本参数和请求期限
+- fix: 区分原生 context 不可用与验证脚本错误，保留已完成的主动作状态
+- fix: 定位失败返回实际匹配数与有界候选，不再附加无关的窗口焦点建议
+- fix: 识别可见的英中文验证内容，保留标题被动等待与原生系统鼠标路径，普通页面继续复用已有 debugger 连接
+- fix: 读取真实旧 Extension 的分组摘要，无需额外拓扑请求，区分字段缺失与畸形数据
+- fix: 操作成功或失败时均保留输入值脱敏、原生错误详情与文档范围内的日志语义
+- chore: Extension 的 Vite 构建依赖更新至 8.1.6
+
+### mcp-ssh
+
+- feat: 新增显式选用的 OpenSSH 后端，复用已有 ControlMaster，不建立新的认证连接
+- feat: SFTP 目录列表支持名称与时间筛选、条数限制、偏移和 UTF-8 响应字节预算
+- feat: 普通文件与目录同步支持显式、有界的传输校验
+- fix: 请求不支持的能力或操作失败时，保留传输能力边界、远端操作状态和可见错误
+
+### 发布流程
+
+- ci: 新增 GitHub Actions Trusted Publishing，校验精确提交、隔离 OIDC 权限，并将所选 tarball 与 npm registry 元数据核对
+- ci: 构建 Rust 发布产物前执行 Windows 导出事务测试
+- ci: 通过原生 PowerShell 和 Bash 分别检查 Windows 私有 DACL 与导出事务
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.17.0...v1.18.2
+
+## v1.18.1 - Tag only / 仅创建 tag
 
 ## Versions
 

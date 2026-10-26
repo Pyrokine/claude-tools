@@ -51,6 +51,15 @@ jobs:
                   cargo package --locked --allow-dirty --no-verify
               shell: bash
 
+            - name: Test native PowerShell History exports
+              if: runner.os == 'Windows'
+              working-directory: mcp-claude-history
+              shell: pwsh
+              run: |
+                  cargo test --locked utils::tests::windows_private -- --nocapture
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                  cargo test --locked get::tests::
+
             - name: Install Chrome packages
               run: npm ci
               working-directory: mcp-chrome

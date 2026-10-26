@@ -164,7 +164,9 @@ $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $item = Get-Item -LiteralPath $p -Force
 if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'private path is a reparse point' }
 $acl = Get-Acl -LiteralPath $p
-if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'private path owner mismatch' }
+$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+$trustedOwners = @($sid.Value, 'S-1-5-18', 'S-1-5-32-544')
+if ($trustedOwners -notcontains $owner) { throw "private path owner mismatch: $owner" }
 $acl.SetAccessRuleProtection($true, $false)
 foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
 $inherit = if (Test-Path -LiteralPath $p -PathType Container) { 'ContainerInherit,ObjectInherit' } else { 'None' }
@@ -3382,6 +3384,105 @@ mod tests {
         let mut file = open_private_output_file(&file_path).unwrap();
         file.write_all(b"fixture").unwrap();
         set_private_permissions(&file_path, 0o600).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_acl_checks_trusted_owners_without_transferring_ownership() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mcp-history-owner-test-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let run = |script: &str, path: &Path, owner: &str| -> serde_json::Value {
+            let output = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .env_remove("PSModulePath")
+                .env("MCP_HISTORY_PRIVATE_PATH", path)
+                .env("MCP_HISTORY_TEST_OWNER", owner)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "owner={owner}, path={}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).unwrap()
+        };
+        let query = r#"
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
+$entries = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+$private = $acl.AreAccessRulesProtected -and $entries.Count -eq 1
+if ($private) {
+    $entry = $entries[0]
+    $private = -not $entry.IsInherited -and $entry.IdentityReference.Value -eq $sid.Value -and
+        $entry.AccessControlType -eq 'Allow' -and
+        ($entry.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl
+}
+[pscustomobject]@{
+    user = $sid.Value
+    owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    private = $private
+    sddl = $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+} | ConvertTo-Json -Compress
+"#;
+        let initial = run(query, &root, "");
+        eprintln!("Windows private-output fixture initial owner: {}", initial["owner"]);
+        let user = initial["user"].as_str().unwrap();
+        set_private_permissions(&root, 0o700).unwrap();
+        let assign = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$p = $env:MCP_HISTORY_PRIVATE_PATH
+$acl = Get-Acl -LiteralPath $p
+$everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($everyone, 'Read', 'Allow'))
+Set-Acl -LiteralPath $p -AclObject $acl
+& "$env:SystemRoot\System32\icacls.exe" $p /setowner "*$env:MCP_HISTORY_TEST_OWNER" /Q | Out-Null
+if ($LASTEXITCODE -ne 0) {{ throw "owner fixture failed: exit $LASTEXITCODE" }}
+{query}
+"#
+        );
+        for (name, owner, trusted) in [
+            ("user", user, true),
+            ("system", "S-1-5-18", true),
+            ("administrators", "S-1-5-32-544", true),
+            ("users", "S-1-5-32-545", false),
+        ] {
+            for (kind, directory) in [("directory", true), ("file", false)] {
+                let path = root.join(format!("{name}-{kind}"));
+                let content = if directory {
+                    fs::create_dir(&path).unwrap();
+                    path.join("sentinel.txt")
+                } else {
+                    path.clone()
+                };
+                fs::write(&content, b"owner fixture content").unwrap();
+                let before = run(&assign, &path, owner);
+                assert_eq!(before["owner"], owner, "{name}-{kind}");
+                assert_eq!(before["private"], false, "{name}-{kind}");
+                let result = set_private_permissions(&path, if directory { 0o700 } else { 0o600 });
+                if trusted {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.error, "privacy_not_enforced_on_windows");
+                    assert!(error.message.contains(owner));
+                }
+                let after = run(query, &path, owner);
+                assert_eq!(after["owner"], owner, "{name}-{kind}");
+                assert_eq!(after["private"], trusted, "{name}-{kind}");
+                if !trusted {
+                    assert_eq!(after["sddl"], before["sddl"], "{name}-{kind}");
+                }
+                assert_eq!(fs::read(&content).unwrap(), b"owner fixture content", "{name}-{kind}");
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

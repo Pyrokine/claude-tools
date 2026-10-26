@@ -847,6 +847,14 @@ UNC 路径查询同一项目，对大小写别名和多个项目匹配同一路�
 `project_ambiguous`非法输出路径被拒绝且不产生文件；私有 DACL 限定当前用户和系统必需主体，无法创建或验证时返回
 `privacy_not_enforced_on_windows`，不把 POSIX mode 当作验证证据
 
+通过 Bash 和原生 PowerShell 分别执行 `cargo test --locked utils::tests::windows_private -- --nocapture` 与 `cargo test --locked get::tests::`，每条命令均须成功
+
+使用独立临时 fixture，对目录和文件分别设置当前用户、SYSTEM、Administrators 和内置 Users 组 owner，读取实际 owner 后调用权限函数
+
+**预期**：当前用户、SYSTEM 和 Administrators owner 均可设置私有 DACL，owner 保持原值，DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，显式 Everyone ACE 被删除；Users 组 owner 返回 `privacy_not_enforced_on_windows`，错误包含该 SID，owner、DACL 和正文保持原样，可信 owner 集合不作为 DACL 授权集合
+
+测试仅修改自建临时对象，原生 owner 设置失败须报告 fixture 失败，不能记为通过或以模拟值替代
+
 ### history-output-03：CLI 与 MCP 参数
 
 **步骤**：运行 `mcp-claude-history --version` 和 `build-info`；检查四个输出工具的 MCP `overwrite` 和 redaction

@@ -297,6 +297,10 @@ Before publication, existing content and manifest files are synchronized without
 file synchronization uses a writable handle. A synchronization failure returns an error before replacing an existing
 bundle and removes the unpublished staging directory.
 
+On Windows, export paths may be owned by the current user, SYSTEM, or Administrators. The owner remains unchanged;
+the protected DACL grants only the current user FullControl Allow, with no inherited entries. Other owners are rejected
+before changing the DACL, and the error includes the owner SID.
+
 Exported search rows use the same filtering, timestamp ordering, and de-duplication as inline results, subject to a
 20,000-row / 16 MiB export ceiling. The v2 manifest records actual rows and bytes, `complete`, and `incomplete_reasons`,
 including any scan or export limits. Normal search, aggregate, scan, and reference readers index valid oversized records
