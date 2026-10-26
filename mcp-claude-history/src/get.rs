@@ -385,35 +385,22 @@ pub fn find_session_file(
     project_id: Option<&str>,
     source: Option<&str>,
 ) -> Result<(String, String, PathBuf), ErrorResponse> {
-    let source = source.map(Path::new);
-    let source_project = if let Some(source) = source {
-        if !source.is_absolute()
-            || source
-                .components()
-                .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    if let Some(source) = source {
+        let file = crate::session_files::resolve_exact_source(config, source)?;
+        if !session_matches_ref(&file.1, session_prefix)
+            || project_id
+                .map(|project| config.normalize_project_id(project))
+                .transpose()?
+                .is_some_and(|project| project != file.0)
         {
-            return Err(invalid_arguments(
-                "source 必须原样使用 search 或 scan metadata 返回的绝对来源路径",
+            return Err(crate::record_reader::reader_error(
+                "source_not_found",
+                "source 与 ref/project 不匹配",
             ));
         }
-        let root = config.projects_dir.canonicalize().map_err(session_io_error)?;
-        let relative = source
-            .strip_prefix(&config.projects_dir)
-            .or_else(|_| source.strip_prefix(&root))
-            .map_err(|_| invalid_arguments("source 不在当前历史目录内"))?;
-        let project = relative
-            .components()
-            .next()
-            .and_then(|part| match part {
-                Component::Normal(name) => name.to_str(),
-                _ => None,
-            })
-            .ok_or_else(|| invalid_arguments("source 没有合法项目标识"))?;
-        Some(project.to_string())
-    } else {
-        None
-    };
-    let selected_project = project_id.or(source_project.as_deref());
+        return Ok(file);
+    }
+    let selected_project = project_id;
     // 确定要搜索的项目
     let project_dirs: Vec<(String, PathBuf)> = if let Some(pid) = selected_project {
         let normalized = config.normalize_project_id(pid)?;
@@ -445,16 +432,6 @@ pub fn find_session_file(
         }
     }
 
-    if let Some(source) = source {
-        matches.retain(|(_, _, path)| path == source);
-        if matches.is_empty() {
-            return Err(ErrorResponse {
-                error: "source_not_found".to_string(),
-                message: "source 不属于已识别布局中与 ref/project 匹配的会话来源".to_string(),
-                available: None,
-            });
-        }
-    }
     if matches.len() == 1 {
         return Ok(matches.remove(0));
     }
@@ -462,7 +439,7 @@ pub fn find_session_file(
         return Err(ErrorResponse {
             error: "session_ambiguous".to_string(),
             message: format!(
-                "session prefix 不唯一: {session_prefix}，请用 project、完整 ref 或返回的 source 精确选择来源"
+                "session prefix 不唯一: {session_prefix}，请原样传入 available.sources 中的 source 精确选择物理来源"
             ),
             available: Some(serde_json::json!({
                 "candidates": matches
@@ -613,13 +590,13 @@ fn owner_pid(owner: &str) -> Option<u32> {
 }
 
 #[cfg(unix)]
-fn process_is_gone(pid: u32) -> bool {
+pub(crate) fn process_is_gone(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else { return false };
     (unsafe { libc::kill(pid, 0) }) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(windows)]
-fn process_is_gone(pid: u32) -> bool {
+pub(crate) fn process_is_gone(pid: u32) -> bool {
     use std::ffi::c_void;
 
     #[link(name = "kernel32")]
@@ -642,7 +619,7 @@ fn process_is_gone(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_is_gone(_pid: u32) -> bool {
+pub(crate) fn process_is_gone(_pid: u32) -> bool {
     false
 }
 
@@ -990,7 +967,10 @@ impl OutputTransaction {
 
     pub fn publish(mut self) -> Result<(), ErrorResponse> {
         let sync = |path: &Path| -> Result<(), ErrorResponse> {
-            File::open(path)
+            OpenOptions::new()
+                .read(true)
+                .write(cfg!(windows))
+                .open(path)
                 .and_then(|file| file.sync_all())
                 .map_err(|error| ErrorResponse {
                     error: "io_error".to_string(),
@@ -1494,7 +1474,7 @@ struct TempSessionMarker {
     owner: String,
 }
 
-fn checked_temp_directory(path: &Path) -> Result<fs::Metadata, String> {
+pub(crate) fn checked_temp_directory(path: &Path) -> Result<fs::Metadata, String> {
     let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(format!("临时目录不是普通目录: {}", path.display()));
@@ -2645,6 +2625,24 @@ mod tests {
         assert_eq!(fs::read_to_string(target.join("content.txt")).unwrap(), "old");
         assert_eq!(
             fs::read_to_string(target.join("manifest.json")).unwrap(),
+            "old manifest"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_sync_failure_preserves_existing_bundle_and_removes_staging() {
+        let root = env::temp_dir().join(format!("mcp-history-sync-failure-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let replacement = OutputTransaction::begin(bundle_paths(&root), true).unwrap();
+        let staging = replacement.staging_dir().to_path_buf();
+        fs::write(replacement.staging_content(), "new").unwrap();
+        assert_eq!(replacement.publish().unwrap_err().error, "io_error");
+        assert!(!staging.exists());
+        assert_eq!(fs::read_to_string(root.join("bundle/content.txt")).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(root.join("bundle/manifest.json")).unwrap(),
             "old manifest"
         );
         fs::remove_dir_all(root).unwrap();

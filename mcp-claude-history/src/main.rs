@@ -62,12 +62,27 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "CLI arguments are constructed once; named variants preserve the command schema"
+)]
 enum Commands {
     /// Search conversations
     Search {
         /// normal or scan; scan prints NDJSON result pages, then metadata pages, in this process
         #[arg(long, default_value = "normal")]
         mode: String,
+
+        /// Enumerate sources and consume scan groups plus metadata in this process
+        #[arg(long)]
+        grouped: bool,
+
+        #[arg(long)]
+        sources: Vec<String>,
+
+        /// File body preview (default) or full; independent from structured
+        #[arg(long, default_value = "preview")]
+        output_content: String,
 
         /// Cursors cannot be reused across CLI processes
         #[arg(long)]
@@ -418,22 +433,33 @@ enum Commands {
     },
 }
 
-fn run_scan_cli(
+fn print_scan_page(text: &str, group: Option<usize>, kind: &str) -> Result<(), ErrorResponse> {
+    use std::io::Write;
+    let mut output = std::io::stdout().lock();
+    if let Some(group) = group {
+        let mut page: serde_json::Value = serde_json::from_str(text)
+            .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
+        page["group"] = serde_json::json!(group);
+        page["kind"] = serde_json::json!(kind);
+        writeln!(output, "{page}")
+    } else {
+        writeln!(output, "{text}")
+    }
+    .and_then(|_| output.flush())
+    .map_err(|error| record_reader::reader_error("io_error", error.to_string()))
+}
+
+fn run_scan_group(
+    scans: &stream_scan::ScanStore,
     config: &Config,
     params: SearchParams,
-    cursor: Option<String>,
     scan_bytes: Option<u64>,
     scan_ms: Option<u64>,
+    group: Option<usize>,
 ) -> Result<(), ErrorResponse> {
-    use std::io::Write;
-    if cursor.is_some() {
-        return Err(utils::invalid_arguments(
-            "CLI cursor 不能跨进程使用；--mode scan 会在当前进程中驱动所有批次",
-        ));
-    }
-    let scans = stream_scan::ScanStore::default();
     let max_total = params.max_total;
     let limit = params.limit;
+    let sources = params.sources.clone();
     let mut request = stream_scan::ScanRequest {
         params,
         cursor: None,
@@ -441,62 +467,217 @@ fn run_scan_cli(
         scan_ms,
         explicit_filters: serde_json::json!({}),
     };
-    let mut output = std::io::stdout().lock();
-    let id = loop {
-        let page = record_reader::WorkControl::default()
-            .run(|| scans.search(config, request, std::sync::Arc::new(|| false)))?;
-        writeln!(output, "{page}")
-            .map_err(|error| record_reader::reader_error("io_error", format!("写入扫描页失败: {error}")))?;
-        output
-            .flush()
-            .map_err(|error| record_reader::reader_error("io_error", error.to_string()))?;
-        let page: serde_json::Value = serde_json::from_str(&page)
-            .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
-        if page["has_more"] == false {
-            break page["scan_id"].as_str().expect("scan_id string").to_string();
+    let mut id = None;
+    let mut body_rows = 0usize;
+    let mut pages = 0usize;
+    let result = (|| {
+        loop {
+            let page = match record_reader::WorkControl::default()
+                .run(|| scans.search(config, request, std::sync::Arc::new(|| false)))
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    if let Some(scan_id) = error.available.as_ref().and_then(|value| value["scan_id"].as_str()) {
+                        id = Some(scan_id.to_string());
+                    }
+                    return Err(error);
+                }
+            };
+            let value: serde_json::Value = serde_json::from_str(&page)
+                .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
+            id = value["scan_id"].as_str().map(str::to_string);
+            print_scan_page(&page, group, "body")?;
+            pages += 1;
+            body_rows += value["results"].as_array().map_or(0, Vec::len);
+            if value["has_more"] == false {
+                break;
+            }
+            request = stream_scan::ScanRequest {
+                params: SearchParams {
+                    max_total,
+                    limit,
+                    ..SearchParams::default()
+                },
+                cursor: value["next_query"]["cursor"].as_str().map(str::to_string),
+                scan_bytes,
+                scan_ms,
+                explicit_filters: serde_json::json!({}),
+            };
         }
-        request = stream_scan::ScanRequest {
-            params: SearchParams {
-                max_total,
-                limit,
-                ..SearchParams::default()
-            },
-            cursor: Some(
-                page["next_query"]["cursor"]
-                    .as_str()
-                    .expect("cursor string")
-                    .to_string(),
-            ),
-            scan_bytes,
-            scan_ms,
-            explicit_filters: serde_json::json!({}),
-        };
-    };
-    let mut cursor = None;
-    loop {
-        let page = record_reader::WorkControl::default().run(|| {
-            scans.metadata(stream_scan::MetadataRequest {
-                scan_id: id.clone(),
-                cursor,
-                limit: limit.unwrap_or(100),
-                max_total,
-                release: false,
-            })
-        })?;
-        writeln!(output, "{page}").map_err(|error| record_reader::reader_error("io_error", error.to_string()))?;
-        let page: serde_json::Value = serde_json::from_str(&page)
-            .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
-        if page["has_more"] == false {
-            break;
+        Ok(())
+    })();
+    if let Some(scan_id) = &id
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.available.as_ref().is_some_and(|value| value["released"] == true))
+    {
+        let mut cursor = None;
+        loop {
+            let page = record_reader::WorkControl::default().run(|| {
+                scans.metadata(stream_scan::MetadataRequest {
+                    scan_id: scan_id.clone(),
+                    cursor: cursor.clone(),
+                    limit: limit.unwrap_or(100),
+                    max_total,
+                    release: false,
+                })
+            });
+            let page = match page {
+                Ok(page) => page,
+                Err(error) => {
+                    scans.release(scan_id)?;
+                    return Err(error);
+                }
+            };
+            print_scan_page(&page, group, "metadata")?;
+            let value: serde_json::Value = serde_json::from_str(&page)
+                .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
+            if value["has_more"] == false {
+                break;
+            }
+            cursor = value["next_query"]["cursor"].as_str().map(str::to_string);
         }
-        cursor = Some(
-            page["next_query"]["cursor"]
-                .as_str()
-                .expect("metadata cursor string")
-                .to_string(),
-        );
+        scans.release(scan_id)?;
     }
-    scans.release(&id)
+    result.map_err(|mut error: ErrorResponse| {
+        let values = error.available.get_or_insert_with(|| serde_json::json!({}));
+        values["body_pages_returned"] = serde_json::json!(pages);
+        values["body_rows_returned"] = serde_json::json!(body_rows);
+        values["failed_group_sources"] = serde_json::json!(sources);
+        values["group"] = serde_json::json!(group);
+        error
+    })
+}
+
+fn run_scan_cli(
+    config: &Config,
+    params: SearchParams,
+    cursor: Option<String>,
+    scan_bytes: Option<u64>,
+    scan_ms: Option<u64>,
+) -> Result<(), ErrorResponse> {
+    if cursor.is_some() {
+        return Err(utils::invalid_arguments(
+            "CLI cursor 不能跨进程使用；scan 在同一进程消费所有批次",
+        ));
+    }
+    run_scan_group(
+        &stream_scan::ScanStore::default(),
+        config,
+        params,
+        scan_bytes,
+        scan_ms,
+        None,
+    )
+}
+
+fn run_sources_cli(
+    config: &Config,
+    params: SearchParams,
+    cursor: Option<String>,
+    scan_bytes: Option<u64>,
+    scan_ms: Option<u64>,
+    grouped: bool,
+) -> Result<(), ErrorResponse> {
+    if cursor.is_some() {
+        return Err(utils::invalid_arguments("CLI 来源目录 cursor 不能跨进程使用"));
+    }
+    if !grouped && (scan_bytes.is_some() || scan_ms.is_some()) {
+        return Err(utils::invalid_arguments(
+            "来源枚举不使用 scan 预算；正文分组使用 --mode scan --grouped",
+        ));
+    }
+    let scans = stream_scan::ScanStore::default();
+    let mut cursor = None;
+    let mut release_cursor = None;
+    let mut completed_groups = 0usize;
+    let result = (|| {
+        loop {
+            let mut catalog_params = params.clone();
+            catalog_params.limit = if grouped { Some(128) } else { params.limit };
+            let page = record_reader::WorkControl::default().run(|| {
+                scans.sources(
+                    config,
+                    stream_scan::SourcesRequest {
+                        params: catalog_params,
+                        cursor: cursor.clone(),
+                        release: false,
+                        explicit_filters: serde_json::json!({}),
+                    },
+                )
+            })?;
+            let value: serde_json::Value = serde_json::from_str(&page)
+                .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
+            release_cursor = value["release_query"]["cursor"].as_str().map(str::to_string);
+            print_scan_page(&page, Some(completed_groups), "sources")?;
+            if grouped {
+                let sources = value["scan_query"]["sources"]
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let mut groups = std::collections::VecDeque::from([sources]);
+                while let Some(sources) = groups.pop_front() {
+                    if sources.is_empty() {
+                        continue;
+                    }
+                    let mut group_params = params.clone();
+                    group_params.source = None;
+                    group_params.sources = sources.clone();
+                    match run_scan_group(
+                        &scans,
+                        config,
+                        group_params,
+                        scan_bytes,
+                        scan_ms,
+                        Some(completed_groups),
+                    ) {
+                        Ok(()) => completed_groups += 1,
+                        Err(error)
+                            if error.error == "scan_metadata_quota"
+                                && error.available.as_ref().is_some_and(|value| {
+                                    value["body_rows_returned"] == 0 && value["scan_phase"] == "enumeration"
+                                })
+                                && sources.len() > 1 =>
+                        {
+                            let middle = sources.len() / 2;
+                            groups.push_front(sources[middle..].to_vec());
+                            groups.push_front(sources[..middle].to_vec());
+                        }
+                        Err(mut error) => {
+                            let available = error.available.get_or_insert_with(|| serde_json::json!({}));
+                            available["completed_groups"] = serde_json::json!(completed_groups);
+                            available["unconsumed_groups"] = serde_json::json!(groups);
+                            available["unconsumed_sources_query"] = value["next_query"].clone();
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            if value["has_more"] == false {
+                break;
+            }
+            cursor = value["next_query"]["cursor"].as_str().map(str::to_string);
+        }
+        Ok(())
+    })();
+    if let Some(cursor) = release_cursor {
+        scans.sources(
+            config,
+            stream_scan::SourcesRequest {
+                params: SearchParams::default(),
+                cursor: Some(cursor),
+                release: true,
+                explicit_filters: serde_json::json!({}),
+            },
+        )?;
+    }
+    result
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -521,6 +702,9 @@ async fn main() -> anyhow::Result<()> {
     let result: Result<String, String> = match command {
         Commands::Search {
             mode,
+            grouped,
+            sources,
+            output_content,
             cursor,
             scan_bytes,
             scan_ms,
@@ -564,6 +748,8 @@ async fn main() -> anyhow::Result<()> {
                     all_projects: all,
                     sessions: sessions.unwrap_or_default(),
                     source,
+                    sources,
+                    output_content,
                     since,
                     until,
                     types: split_csv_param(Some(types.as_str())),
@@ -596,11 +782,23 @@ async fn main() -> anyhow::Result<()> {
             })();
 
             match parsed {
+                Ok(params) if (mode == "scan" && grouped) || mode == "sources" => {
+                    match run_sources_cli(&config, params, cursor, scan_bytes, scan_ms, grouped) {
+                        Ok(()) => Ok(String::new()),
+                        Err(error) => serialize_result::<serde_json::Value, _>(Err(error)),
+                    }
+                }
                 Ok(params) if mode == "scan" => match run_scan_cli(&config, params, cursor, scan_bytes, scan_ms) {
                     Ok(()) => Ok(String::new()),
                     Err(error) => serialize_result::<serde_json::Value, _>(Err(error)),
                 },
-                Ok(params) if mode == "normal" && cursor.is_none() && scan_bytes.is_none() && scan_ms.is_none() => {
+                Ok(params)
+                    if mode == "normal"
+                        && !grouped
+                        && cursor.is_none()
+                        && scan_bytes.is_none()
+                        && scan_ms.is_none() =>
+                {
                     record_reader::WorkControl::default().run(|| serialize_result(search(&config, params)))
                 }
                 Ok(_) => serialize_result::<serde_json::Value, _>(Err(utils::invalid_arguments(

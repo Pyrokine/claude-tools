@@ -67,6 +67,8 @@ pub struct SearchResult {
     /// 匹配位置（字符偏移），用于截断时居中显示上下文
     #[serde(skip)]
     pub match_pos: Option<usize>,
+    #[serde(skip)]
+    pub locator: Option<(crate::record_reader::SourceSpan, std::sync::Arc<std::fs::Metadata>)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +198,9 @@ pub struct EffectiveFilters {
     pub sessions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    pub output_content: String,
     pub subagents: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,

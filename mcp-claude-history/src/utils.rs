@@ -274,10 +274,18 @@ pub fn parse_message_record(line: &str) -> Result<Option<MessageRecord>, serde_j
     let Some(object) = value.as_object() else {
         return serde_json::from_value(value).map(Some);
     };
-    if !object.contains_key("uuid") && !object.contains_key("message") {
+    if is_internal_record(
+        object.get("type").and_then(serde_json::Value::as_str),
+        object.contains_key("uuid"),
+        object.contains_key("message"),
+    ) {
         return Ok(None);
     }
     serde_json::from_value(value).map(Some)
+}
+
+pub(crate) fn is_internal_record(record_type: Option<&str>, has_uuid: bool, has_message: bool) -> bool {
+    !has_uuid && (!has_message || record_type == Some("api-request-blob"))
 }
 
 pub fn jsonl_read_warnings(read_errors: usize, parse_errors: usize) -> Vec<String> {
@@ -716,7 +724,7 @@ pub fn index_session_messages(
                 boundary_pos = Some(pos);
             }
             if messages.len() == MAX_SESSION_WINDOW {
-                evicted_match |= messages.pop_front().as_ref().is_some_and(&matches);
+                evicted_match |= messages.pop_front().as_ref().is_some_and(matches);
             }
             messages.push_back(item);
             continue;
@@ -744,7 +752,7 @@ pub fn index_session_messages(
                     selected
                 }
                 SessionRange::UntilType { backward: true, .. } => boundary_pos.unwrap_or(pos),
-                SessionRange::UntilRef { line } if line < anchor_line => boundary_pos.ok_or_else(&missing_until)?,
+                SessionRange::UntilRef { line } if line < anchor_line => boundary_pos.ok_or_else(missing_until)?,
                 _ => pos,
             };
             end = pos + 1;
@@ -2092,7 +2100,8 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
                 .map_or((bytes.len(), 0), |scope| (scope.0, scope.2));
             json_like_value_end(bytes, value_start, Some(scope))
         } else if quoted_content_start.is_none() && bytes[separator] == b'=' {
-            let (end, preserve) = code_rhs_span(bytes, value_start);
+            let scope_end = quoted_scopes.last().map_or(bytes.len(), |scope| scope.0);
+            let (end, preserve) = code_rhs_span(&bytes[..scope_end], value_start);
             if preserve {
                 // Inspect nested assignments even when the enclosing expression is preserved.
                 cursor = value_start;

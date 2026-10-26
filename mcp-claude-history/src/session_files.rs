@@ -16,109 +16,162 @@ fn source_error(error: impl std::fmt::Display) -> ErrorResponse {
     }
 }
 
-fn read_entries(path: &Path, optional: bool, remaining: &mut usize) -> Result<Vec<fs::DirEntry>, ErrorResponse> {
+fn entries(path: &Path, optional: bool) -> Result<Option<fs::ReadDir>, ErrorResponse> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if optional && error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if optional && error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(source_error(error)),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(source_error(format!("目录不是普通目录: {}", path.display())));
     }
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(path).map_err(source_error)? {
+    fs::read_dir(path).map(Some).map_err(source_error)
+}
+
+/// 来源目录与正文扫描共用布局，枚举时不积累全部路径
+pub fn visit_session_files(
+    projects: &[(String, PathBuf)],
+    filters: &[String],
+    subagents: bool,
+    mut visit: impl FnMut(SessionFile) -> Result<(), ErrorResponse>,
+) -> Result<(), ErrorResponse> {
+    fn entry(entry: io::Result<fs::DirEntry>, remaining: &mut usize) -> Result<fs::DirEntry, ErrorResponse> {
         crate::record_reader::check_work()?;
         if *remaining == 0 {
             return Err(source_error("目录条目超过 200000，来源未全部枚举"));
         }
         *remaining -= 1;
-        entries.push(entry.map_err(source_error)?);
+        entry.map_err(source_error)
     }
-    entries.sort_by_key(fs::DirEntry::file_name);
-    Ok(entries)
-}
-
-fn append_file(
-    files: &mut Vec<SessionFile>,
-    project: &str,
-    entry: &fs::DirEntry,
-    agent: bool,
-) -> Result<(), ErrorResponse> {
-    if entry.path().extension().is_none_or(|extension| extension != "jsonl") {
-        return Ok(());
-    }
-    let name = entry.file_name().to_string_lossy().to_string();
-    let session = if agent {
-        name.strip_prefix("agent-")
-            .and_then(|name| name.strip_suffix(".jsonl"))
-            .filter(|id| !id.is_empty())
-            .map(|id| format!("agent-{id}"))
-    } else {
-        session_id_from_filename(&name)
-    };
-    let Some(session) = session else {
-        return Ok(());
-    };
-    if !entry.file_type().map_err(source_error)?.is_file() {
-        return Err(source_error(format!(
-            "会话来源不是普通文件: {}",
-            entry.path().display()
-        )));
-    }
-    if files.len() == MAX_DISCOVERED_FILES {
-        return Err(source_error("会话文件超过 100000，来源未全部枚举"));
-    }
-    files.push((project.to_string(), session, entry.path()));
-    Ok(())
-}
-
-/// 只枚举已经支持的会话布局，Workflow journal 不属于消息来源
-pub fn collect_session_files(
-    projects: &[(String, PathBuf)],
-    filters: &[String],
-    subagents: bool,
-) -> Result<Vec<SessionFile>, ErrorResponse> {
-    let mut files = Vec::new();
     let mut remaining = MAX_DIRECTORY_ENTRIES;
-    for (project, directory) in projects {
-        if fs::symlink_metadata(directory)
-            .map_err(source_error)?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(source_error(format!("项目目录为链接: {}", directory.display())));
+    let mut append = |project: &str, item: &fs::DirEntry, agent: bool| -> Result<(), ErrorResponse> {
+        if item.path().extension().is_none_or(|extension| extension != "jsonl") {
+            return Ok(());
         }
-        let directory = fs::canonicalize(directory).map_err(source_error)?;
-        for entry in read_entries(&directory, false, &mut remaining)? {
-            append_file(&mut files, project, &entry, false)?;
-            if !subagents || !entry.file_type().map_err(source_error)?.is_dir() {
+        let name = item.file_name().to_string_lossy().to_string();
+        let session = if agent {
+            name.strip_prefix("agent-")
+                .and_then(|name| name.strip_suffix(".jsonl"))
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("agent-{id}"))
+        } else {
+            session_id_from_filename(&name)
+        };
+        let Some(session) = session else {
+            return Ok(());
+        };
+        if !item.file_type().map_err(source_error)?.is_file() {
+            return Err(source_error(format!("会话来源不是普通文件: {}", item.path().display())));
+        }
+        if filters.is_empty() || filters.iter().any(|filter| session_matches_ref(&session, filter)) {
+            visit((project.to_string(), session, item.path()))?;
+        }
+        Ok(())
+    };
+    for (project, path) in projects {
+        let metadata = fs::symlink_metadata(path).map_err(source_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(source_error("项目目录为链接"));
+        }
+        let directory = fs::canonicalize(path).map_err(source_error)?;
+        for item in entries(&directory, false)?.into_iter().flatten() {
+            let item = entry(item, &mut remaining)?;
+            append(project, &item, false)?;
+            if !subagents || !item.file_type().map_err(source_error)?.is_dir() {
                 continue;
             }
             for sidechain in SIDECHAIN_SESSION_DIRS {
-                let sidechain_path = entry.path().join(sidechain);
-                for child in read_entries(&sidechain_path, true, &mut remaining)? {
-                    append_file(&mut files, project, &child, true)?;
+                for child in entries(&item.path().join(sidechain), true)?.into_iter().flatten() {
+                    let child = entry(child, &mut remaining)?;
+                    append(project, &child, true)?;
                     if *sidechain != "subagents" || child.file_name() != "workflows" {
                         continue;
                     }
-                    for run in read_entries(&child.path(), false, &mut remaining)? {
+                    for run in entries(&child.path(), false)?.into_iter().flatten() {
+                        let run = entry(run, &mut remaining)?;
                         if !run.file_type().map_err(source_error)?.is_dir() {
                             continue;
                         }
-                        for agent in read_entries(&run.path(), false, &mut remaining)? {
-                            append_file(&mut files, project, &agent, true)?;
+                        for agent in entries(&run.path(), false)?.into_iter().flatten() {
+                            append(project, &entry(agent, &mut remaining)?, true)?;
                         }
                     }
                 }
             }
         }
     }
-    files.retain(|(_, session, _)| {
-        filters.is_empty() || filters.iter().any(|filter| session_matches_ref(session, filter))
-    });
+    Ok(())
+}
+
+pub fn collect_session_files(
+    projects: &[(String, PathBuf)],
+    filters: &[String],
+    subagents: bool,
+) -> Result<Vec<SessionFile>, ErrorResponse> {
+    let mut files = Vec::new();
+    let mut bytes = 0usize;
+    visit_session_files(projects, filters, subagents, |file| {
+        bytes = bytes.saturating_add(file.0.len() + file.1.len() + file.2.as_os_str().len() + 128);
+        if files.len() == MAX_DISCOVERED_FILES || bytes > 32 * 1024 * 1024 {
+            return Err(source_error(
+                "来源清单超过 100000 条或 32 MiB，请使用 mode=sources 分组扫描",
+            ));
+        }
+        files.push(file);
+        Ok(())
+    })?;
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+/// 精确来源按相同布局验证，避免为每条 sources 再次枚举整个项目
+pub fn resolve_exact_source(config: &crate::config::Config, source: &str) -> Result<SessionFile, ErrorResponse> {
+    let path = Path::new(source);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return Err(crate::utils::invalid_arguments("source 必须使用返回的绝对来源路径"));
+    }
+    let root = config.projects_dir.canonicalize().map_err(source_error)?;
+    let relative = path
+        .strip_prefix(&config.projects_dir)
+        .or_else(|_| path.strip_prefix(&root))
+        .map_err(|_| crate::utils::invalid_arguments("source 不在历史目录内"))?;
+    let parts = relative
+        .components()
+        .map(|part| match part {
+            Component::Normal(value) => value.to_str().ok_or_else(|| source_error("source 路径不是 UTF-8")),
+            _ => Err(source_error("source 路径含非法组件")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let agent = match parts.as_slice() {
+        [_, _] => false,
+        [_, _, "subagents" | "remote-agents", _] => true,
+        [_, _, "subagents", "workflows", _, _] => true,
+        _ => {
+            return Err(crate::record_reader::reader_error(
+                "source_not_found",
+                "source 不属于受支持布局",
+            ));
+        }
+    };
+    let project = config.normalize_project_id(parts[0])?;
+    let name = *parts.last().expect("validated source layout");
+    let session = if agent {
+        name.strip_prefix("agent-")
+            .and_then(|name| name.strip_suffix(".jsonl"))
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("agent-{id}"))
+    } else {
+        session_id_from_filename(name)
+    }
+    .ok_or_else(|| crate::record_reader::reader_error("source_not_found", "source 不是受支持会话文件"))?;
+    let absolute = root.join(relative);
+    open_session_file(&absolute).map_err(source_error)?;
+    Ok((project, session, absolute))
 }
 
 pub fn matches_snapshot(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {

@@ -4,6 +4,8 @@ English | [中文](README_zh.md)
 
 A conversation history search tool for Claude Code
 
+Module version: 2.1.0
+
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
@@ -130,43 +132,46 @@ metadata and `topic_redacted_count` when a session topic had replacements.
 
 ### history_search
 
-| Parameter                 | Type    | Default                | Description                                                      |
-| ------------------------- | ------- | ---------------------- | ---------------------------------------------------------------- |
-| `mode`                    | string  | normal                 | `normal` or process-bound incremental `scan`                     |
-| `cursor`                  | string  | -                      | Use the returned scan `next_query`                               |
-| `scan_bytes`              | number  | 16777216               | Per-batch processing budget, 16384 to 268435456 bytes            |
-| `scan_ms`                 | number  | 1000                   | Per-batch active-time budget, 10 to 10000 ms                     |
-| `structured`              | string  | mode-dependent         | `full` in normal, `preview` in scan; explicit choice is retained |
-| `pattern`                 | string  | ""                     | Search pattern; empty returns all                                |
-| `project`                 | string  | current                | Project IDs, comma-separated                                     |
-| `all`                     | boolean | false                  | Search all projects                                              |
-| `sessions`                | string  | -                      | Session IDs, comma-separated                                     |
-| `source`                  | string  | -                      | Exact physical source returned by search or scan metadata        |
-| `since`                   | string  | -                      | RFC3339 instant, UTC date, or `today` (inclusive)                |
-| `until`                   | string  | -                      | RFC3339 instant (inclusive), UTC date, or `today`                |
-| `types`                   | string  | assistant,user,summary | Message types, comma-separated                                   |
-| `subtypes`                | string  | -                      | Message subtypes, comma-separated                                |
-| `servers`                 | string  | -                      | MCP server filter, comma-separated                               |
-| `tools`                   | string  | -                      | MCP tool filter, comma-separated                                 |
-| `lines`                   | string  | -                      | Line ranges, e.g. 100-200, !300-400                              |
-| `regex`                   | boolean | false                  | Use regex                                                        |
-| `case_sensitive`          | boolean | false                  | Use case-sensitive matching                                      |
-| `subagents`               | boolean | false                  | Include sidechain and remote-agent transcripts                   |
-| `summary`                 | boolean | false                  | Include grouped counts in `stats.summary`                        |
-| `aggregate`               | boolean | false                  | Return grouped counts without result rows                        |
-| `dry_run`                 | boolean | false                  | Preview selected files without reading content                   |
-| `failed_tool_results`     | boolean | false                  | Require harness-level `is_error=true`                            |
-| `tool_payload_errors`     | boolean | false                  | Require an error in the tool JSON payload                        |
-| `output`                  | string  | -                      | Export result bundle; relative paths use temp storage            |
-| `overwrite`               | boolean | false                  | Replace an existing owned export bundle                          |
-| `output_format`           | string  | jsonl                  | `jsonl`                                                          |
-| `redaction`               | string  | auto                   | `auto`, `strict`, or `off`                                       |
-| `offset`                  | number  | 0                      | Skip N results; incompatible with `slice`                        |
-| `limit`                   | number  | -                      | Max results; incompatible with `slice`                           |
-| `slice`                   | string  | -                      | Slice messages after filtering and sorting                       |
-| `max_content`             | number  | 4000                   | Regular preview limit (1 to 1,000,000)                           |
-| `max_content_tool_result` | number  | 500                    | Tool-result preview limit (1 to 1,000,000)                       |
-| `max_total`               | number  | 40000                  | Compact response limit (512 to 10,000,000 bytes)                 |
+| Parameter                 | Type     | Default                | Description                                                      |
+| ------------------------- | -------- | ---------------------- | ---------------------------------------------------------------- |
+| `mode`                    | string   | normal                 | `normal`, incremental `scan`, or paged `sources`                 |
+| `cursor`                  | string   | -                      | Use the returned scan `next_query`                               |
+| `scan_bytes`              | number   | 16777216               | Per-batch processing budget, 16384 to 268435456 bytes            |
+| `scan_ms`                 | number   | 1000                   | Per-batch active-time budget, 10 to 10000 ms                     |
+| `structured`              | string   | mode-dependent         | `full` in normal, `preview` in scan; explicit choice is retained |
+| `pattern`                 | string   | ""                     | Search pattern; empty returns all                                |
+| `project`                 | string   | current                | Project IDs, comma-separated                                     |
+| `all`                     | boolean  | false                  | Search all projects                                              |
+| `sessions`                | string   | -                      | Session IDs, comma-separated                                     |
+| `sources`                 | string[] | -                      | Up to 128 exact sources, mutually exclusive with `source`        |
+| `output_content`          | string   | preview                | Export body `preview` or `full`, independent from `structured`   |
+| `release`                 | boolean  | false                  | Release a sources catalog using its cursor                       |
+| `source`                  | string   | -                      | Exact physical source returned by search or scan metadata        |
+| `since`                   | string   | -                      | RFC3339 instant, UTC date, or `today` (inclusive)                |
+| `until`                   | string   | -                      | RFC3339 instant (inclusive), UTC date, or `today`                |
+| `types`                   | string   | assistant,user,summary | Message types, comma-separated                                   |
+| `subtypes`                | string   | -                      | Message subtypes, comma-separated                                |
+| `servers`                 | string   | -                      | MCP server filter, comma-separated                               |
+| `tools`                   | string   | -                      | MCP tool filter, comma-separated                                 |
+| `lines`                   | string   | -                      | Line ranges, e.g. 100-200, !300-400                              |
+| `regex`                   | boolean  | false                  | Use regex                                                        |
+| `case_sensitive`          | boolean  | false                  | Use case-sensitive matching                                      |
+| `subagents`               | boolean  | false                  | Include sidechain and remote-agent transcripts                   |
+| `summary`                 | boolean  | false                  | Include grouped counts in `stats.summary`                        |
+| `aggregate`               | boolean  | false                  | Return grouped counts without result rows                        |
+| `dry_run`                 | boolean  | false                  | Preview selected files without reading content                   |
+| `failed_tool_results`     | boolean  | false                  | Require harness-level `is_error=true`                            |
+| `tool_payload_errors`     | boolean  | false                  | Require an error in the tool JSON payload                        |
+| `output`                  | string   | -                      | Export result bundle; relative paths use temp storage            |
+| `overwrite`               | boolean  | false                  | Replace an existing owned export bundle                          |
+| `output_format`           | string   | jsonl                  | `jsonl`                                                          |
+| `redaction`               | string   | auto                   | `auto`, `strict`, or `off`                                       |
+| `offset`                  | number   | 0                      | Skip N results; incompatible with `slice`                        |
+| `limit`                   | number   | -                      | Max results; incompatible with `slice`                           |
+| `slice`                   | string   | -                      | Slice messages after filtering and sorting                       |
+| `max_content`             | number   | 4000                   | Regular preview limit (1 to 1,000,000)                           |
+| `max_content_tool_result` | number   | 500                    | Tool-result preview limit (1 to 1,000,000)                       |
+| `max_total`               | number   | 40000                  | Compact response limit (512 to 10,000,000 bytes)                 |
 
 `subagents=false` (the default) searches only main JSONL files. `true` includes direct agent files under
 `<session>/subagents/`, `<session>/remote-agents/`, and the known nested layout
@@ -214,10 +219,10 @@ line filters contribute to `stats.attribution_incomplete_reasons`; matched rows 
 `metadata_incomplete_reason`. Missing tool associations do not make a plain content search incomplete. If a `servers` or
 `tools` filter cannot be checked because of a missing association, `incomplete_reasons` includes
 `tool_filter_unverifiable`. Export manifests include the same attribution reasons. Normal, summary, aggregate, and
-output searches report `total_matches_exact=false` for scan gaps, including oversized JSONL lines in normal mode,
-read/parse gaps, and capacity stops. Pagination and response-budget reduction do not change an otherwise exact count.
-`complete=false` can therefore coexist with `total_matches_exact=true`. Pure attribution gaps stay separate unless a
-tool-name filter is unverifiable.
+output searches report `total_matches_exact=false` for scan gaps, including oversized regex bodies, read/parse gaps, and
+capacity stops. Pagination and response-budget reduction do not change an otherwise exact count. `complete=false` can
+therefore coexist with `total_matches_exact=true`. Pure attribution gaps stay separate unless a tool-name filter is
+unverifiable.
 
 `coverage.searched_files` lists the stable prefix of session files whose scanning was attempted, including a file that
 could not be opened or was stopped partway through; `incomplete_reasons` explains those gaps. `skipped_files` lists the
@@ -286,12 +291,18 @@ directories, unmarked directories, and `cwd:` output are preserved. Successful `
 condition in `output.retention`; `cwd:` exports omit that field. Each temporary session is limited to 256 entries and
 128 MiB.
 
+Before publication, existing content and manifest files are synchronized without creating or truncating them. Windows
+file synchronization uses a writable handle. A synchronization failure returns an error before replacing an existing
+bundle and removes the unpublished staging directory.
+
 Exported search rows use the same filtering, timestamp ordering, and de-duplication as inline results, subject to a
 20,000-row / 16 MiB export ceiling. The v2 manifest records actual rows and bytes, `complete`, and `incomplete_reasons`,
-including any scan or export limits. Normal search skips and reports individual JSONL lines over 8 MiB; scan and the
-reference readers index oversized records for bounded previews, range retrieval, and output. Context and trace reject
-selected windows over 2,000 messages (`session_window_limit`) or 32 MiB (`session_window_memory_limit`) rather than
-loading the whole session.
+including any scan or export limits. Normal search, aggregate, scan, and reference readers index valid oversized records
+for bounded previews, matching, range retrieval, and output. Literal patterns cover the complete logical body. Regex
+matches the complete logical body up to 8 MiB; larger bodies remain unchecked and report `regex_content_limit` plus
+source/line diagnostics and inexact counts. Physical JSONL size alone does not exclude a record. Context and trace
+reject selected windows over 2,000 messages (`session_window_limit`) or 32 MiB (`session_window_memory_limit`) rather
+than loading the whole session.
 
 `slice` uses Python half-open semantics after all filters and timestamp sorting. `[-10:]` returns the latest 10 matching
 messages. `[-10:-1]` excludes the latest message and returns up to 9 messages. If `max_total` removes part of a slice,
@@ -322,6 +333,37 @@ before preview truncation. The `get` pointer preserves the full ref, project, so
 redaction mode. Normal defaults to `full`; scan defaults to `preview`. Explicit `full` is never silently converted to
 preview. If it cannot fit, use the error's get pointer or budget guidance.
 
+#### Full search exports
+
+`output_content=preview` preserves the existing per-record preview limits. Set `output_content=full` with `output` to
+export complete redacted bodies; `max_content` and `max_content_tool_result` continue to control inline and structured
+previews. `structured` independently selects full tool JSON or a bounded preview with an exact get pointer. Sorting
+retains bounded source/record locations rather than full bodies. Export revalidates those locations and streams
+redaction and JSON escaping. The 20,000-row / 16 MiB ceiling applies to complete JSONL entries; the byte cap stops
+before the first entry that does not fit. Source changes, cancellation, and write failures abort publication of the
+bundle. The manifest separates `record_set_complete` from `content_complete`, records `output_content`, and provides
+`unexported_range` as an absolute half-open range in the ordered match set.
+
+#### Source catalogs and grouped scans
+
+Use `history_search(mode="sources", ...)` to freeze and page supported source paths without scanning message bodies.
+`limit` defaults to 128 and is limited to 1..128. Each page includes `enumeration_complete`, `source_progress`,
+`files_total`, `items`, and an executable `scan_query`. Follow `next_query` for the next source page and use the
+returned `release_query` when finished. Sources are stored in private disk manifests, capped at 128 MiB total per
+instance; retained catalog state is capped at 32 MiB, with at most four catalogs. Access renews a 20-minute idle TTL.
+Release, expiration, enumeration failure, and normal process exit remove manifests. After a forced exit, a later catalog
+request removes expired owned manifests only after confirming the owner process has exited.
+
+`sources` selects up to 128 exact paths in normal or scan mode and is mutually exclusive with `source`. Project,
+session, and subagent conditions intersect this list. Explicit source groups may contain same-ID physical files. A scan
+freezes file bytes when that group starts; separate groups are not one globally atomic snapshot.
+
+`search --mode sources` prints catalog pages. `search --mode scan --grouped` consumes each catalog group, all body
+pages, and all metadata pages in the same process. Its NDJSON adds `kind=sources|body|metadata` and `group`. An initial
+enumeration metadata-quota error may divide a group before any body rows have returned. Other failures report returned
+page/row counts, the failed group, queued unconsumed groups, and the remaining catalog query; they exit nonzero and do
+not replay a partly consumed group. CLI cursors remain process-local.
+
 #### Incremental scan
 
 Start with `history_search(mode="scan", ...)`, then pass each returned `next_query` unchanged. Scan emits deterministic
@@ -339,6 +381,10 @@ source-change, and other processing errors still fail explicitly. Long field nam
 exceeding 4 KiB. Quoted, unquoted, Unicode-escaped, and nested JSON-escaped fields retain the same redaction rules;
 invalid string escapes use the raw field text. JSON object keys in the oversized-record index remain limited to 4 KiB of
 decoded UTF-8 per key.
+
+Normal search and indexed scans skip internal metadata, including `api-request-blob` cache records without a message
+UUID. These records remain readable with `history_get(view="record")`. Malformed JSON, invalid UTF-8, and incomplete
+conversation messages still produce diagnostics.
 
 Cursors belong to the running MCP instance. Repeating the most recently successful request with the same budgets replays
 its response. Changed replay budgets, frozen filters, stale cursors, and another instance return explicit errors. A
@@ -386,6 +432,9 @@ Large direct responses return `content_too_large` with `content_size`, `valid_ra
 `range_suggestion`, and `output_suggestion`. Range offsets use the original message's Unicode character positions. Auto
 and strict redaction inspect the complete message before rendering a range, so a range that overlaps any part of a
 sensitive value returns a redaction marker. `redaction=off` returns the exact raw range, including complete tool input.
+
+Assignments inside quoted text stop at that string's boundary, preserving later fields and message blocks. A valid empty
+range returns no text and counts zero replacements. A range whose start is outside the original view is rejected.
 
 `view=tool_input` returns normalized input JSON; `view=tool_result` returns the normalized complete tool-result block.
 Use the original content-array `block` index when more than one block has the requested type. Range offsets refer to
@@ -510,7 +559,7 @@ mcp-claude-history search "" --slice '[-10:]'
 mcp-claude-history search "" --slice '[-10:-1]'
 
 # Search specific project
-mcp-claude-history search "bug" --project -home-user-myproject
+mcp-claude-history search "bug" --project=-home-user-myproject
 
 # Filter MCP tool calls and return a summary
 mcp-claude-history search "" --servers mcp-chrome --tools browse,evaluate --summary
@@ -586,7 +635,7 @@ mcp-claude-history trace --ref c86bc677:1234 --before 5 --after 5 --output tmp:h
 mcp-claude-history projects
 
 # List sessions in a project
-mcp-claude-history sessions --project -home-user-myproject
+mcp-claude-history sessions --project=-home-user-myproject
 ```
 
 ## Ref Format

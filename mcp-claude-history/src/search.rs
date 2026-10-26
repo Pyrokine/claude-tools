@@ -1,12 +1,17 @@
 use crate::config::Config;
 use crate::get::{OutputTransaction, ResolvedOutputFiles, resolve_output_files};
+use crate::record_reader::{
+    ByteSource, LineStep, RecordLines, SourceSpan, TextBytes, index_record, reader_error, render_text_range,
+    stream_matches_pattern,
+};
 use crate::types::*;
 use crate::utils::*;
 use regex::{Regex, RegexBuilder};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(test)]
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -30,6 +35,8 @@ pub struct SearchParams {
     pub all_projects: bool,
     pub sessions: Vec<String>,
     pub source: Option<String>,
+    pub sources: Vec<String>,
+    pub output_content: String,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<UntilBound>,
     pub types: Vec<String>,
@@ -70,6 +77,8 @@ impl Default for SearchParams {
             all_projects: false,
             sessions: Vec::new(),
             source: None,
+            sources: Vec::new(),
+            output_content: "preview".to_string(),
             since: None,
             until: None,
             types: vec!["assistant".to_string(), "user".to_string(), "summary".to_string()],
@@ -198,6 +207,8 @@ pub(crate) fn effective_filters(params: &SearchParams) -> EffectiveFilters {
         all_projects: params.all_projects,
         sessions: params.sessions.clone(),
         source: params.source.clone(),
+        sources: params.sources.clone(),
+        output_content: params.output_content.clone(),
         subagents: params.subagents,
         since: params.since.map(|v| v.to_rfc3339()),
         until: params.until.map(UntilBound::query_value),
@@ -307,6 +318,19 @@ pub(crate) fn prepare_search_params(params: SearchParams) -> Result<SearchParams
 }
 
 fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
+    if params.source.is_some() && !params.sources.is_empty() {
+        return Err(invalid_arguments("source 与 sources 互斥"));
+    }
+    if params.sources.len() > 128 || params.sources.iter().map(String::len).sum::<usize>() > 1024 * 1024 {
+        return Err(invalid_arguments("sources 每组最多 128 个路径且合计不超过 1 MiB"));
+    }
+    if !["preview", "full"].contains(&params.output_content.as_str())
+        || (params.output_content == "full" && params.output.is_none())
+    {
+        return Err(invalid_arguments(
+            "output_content 仅支持 preview 或 full；full 需要 output",
+        ));
+    }
     if params
         .structured
         .as_deref()
@@ -368,38 +392,62 @@ fn validate_search_params(params: &SearchParams) -> Result<(), ErrorResponse> {
 }
 
 pub(crate) fn prepare_search_inputs(config: &Config, params: &SearchParams) -> Result<SearchInputs, ErrorResponse> {
-    let (project_dirs, mut files) = if let Some(source) = &params.source {
-        let session = Path::new(source)
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| invalid_arguments("source 没有合法会话文件名"))?;
-        let file = crate::get::find_session_file(config, session, None, Some(source))?;
+    let (project_dirs, mut files) = if params.source.is_some() || !params.sources.is_empty() {
+        let sources = params.source.iter().chain(&params.sources);
+        let files = sources
+            .map(|source| crate::session_files::resolve_exact_source(config, source))
+            .collect::<Result<Vec<_>, _>>()?;
         let project_dirs = if params.projects.is_empty() && !params.all_projects {
-            vec![(file.0.clone(), config.project_dir(&file.0)?)]
+            files
+                .iter()
+                .map(|file| Ok((file.0.clone(), config.project_dir(&file.0)?)))
+                .collect::<Result<Vec<_>, ErrorResponse>>()?
         } else {
             get_project_dirs(config, params)?
         };
-        let project_dir = project_dirs
-            .iter()
-            .find(|(project, _)| project == &file.0)
-            .ok_or_else(|| crate::record_reader::reader_error("source_not_found", "source 不属于指定项目范围"))?
-            .1
-            .canonicalize()
-            .map_err(|error| crate::record_reader::reader_error("source_unavailable", error.to_string()))?;
-        if !params.subagents && file.2.parent() != Some(project_dir.as_path()) {
-            return Err(crate::record_reader::reader_error(
-                "source_not_found",
-                "子会话 source 需要 subagents=true",
-            ));
+        let mut selected_files = Vec::new();
+        for file in files {
+            let (project, _, path) = &file;
+            let selected_project = project_dirs.iter().any(|(selected, _)| selected == project);
+            let selected_layout = params.subagents
+                || path.parent()
+                    == Some(
+                        config
+                            .project_dir(project)?
+                            .canonicalize()
+                            .map_err(|error| reader_error("source_unavailable", error.to_string()))?
+                            .as_path(),
+                    );
+            if !selected_project || !selected_layout {
+                if params.source.is_some() {
+                    return Err(reader_error(
+                        "source_not_found",
+                        "source 不属于指定项目或 subagents 范围",
+                    ));
+                }
+                continue;
+            }
+            selected_files.push(file);
         }
-        (project_dirs, vec![file])
+        let files = selected_files;
+        (project_dirs, files)
     } else {
         let project_dirs = get_project_dirs(config, params)?;
         let files = collect_jsonl_files(&project_dirs, &params.sessions, params.subagents)?;
         (project_dirs, files)
     };
-    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
-    ensure_session_filters_unambiguous(&files, &params.sessions)?;
+    files.retain(|(_, session, _)| {
+        params.sessions.is_empty()
+            || params
+                .sessions
+                .iter()
+                .any(|filter| session_matches_ref(session, filter))
+    });
+    files.sort();
+    files.dedup();
+    if params.sources.is_empty() {
+        ensure_session_filters_unambiguous(&files, &params.sessions)?;
+    }
     let regex = build_search_regex(params)?;
     let search_pattern = if !params.use_regex && !params.pattern.is_empty() {
         Some(parse_search_pattern(&params.pattern, params.case_sensitive))
@@ -1180,7 +1228,7 @@ pub(crate) fn ensure_session_filters_unambiguous(
             return Err(ErrorResponse {
                 error: "session_ambiguous".to_string(),
                 message: format!(
-                    "session 过滤条件不唯一: {filter}；请使用完整 session id、project 或返回的 source 精确选择来源"
+                    "session 过滤条件不唯一: {filter}；请原样传入 available.sources 中的 source 精确选择物理来源"
                 ),
                 available: Some(serde_json::json!({
                     "candidates": matches.iter().map(|(project, session, _)| format!("{project}:{session}")).collect::<Vec<_>>(),
@@ -1197,6 +1245,19 @@ pub(crate) fn build_next_query(params: &SearchParams, next_offset: usize) -> ser
     let mut query = serde_json::Map::new();
     if let Some(source) = &params.source {
         query.insert("source".to_string(), serde_json::json!(source));
+    }
+    if !params.sources.is_empty() {
+        query.insert("sources".to_string(), serde_json::json!(params.sources));
+    }
+    query.insert("output_content".to_string(), serde_json::json!(params.output_content));
+    if let Some(output) = &params.output {
+        query.insert("output".to_string(), serde_json::json!(output));
+    }
+    if let Some(format) = &params.output_format {
+        query.insert("output_format".to_string(), serde_json::json!(format));
+    }
+    if params.overwrite {
+        query.insert("overwrite".to_string(), serde_json::json!(true));
     }
     if !params.pattern.is_empty() {
         query.insert("pattern".to_string(), serde_json::Value::String(params.pattern.clone()));
@@ -1507,6 +1568,9 @@ struct SearchManifestContext<'a> {
     max_content_tool_result: usize,
     max_records: usize,
     max_bytes: u64,
+    output_content: &'a str,
+    selected_start: usize,
+    selected_count: usize,
 }
 
 fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputInfo, ErrorResponse> {
@@ -1536,6 +1600,10 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         "sample_kind": sample_kind,
         "complete": ctx.complete,
         "content_truncated_count": ctx.content_truncated_count,
+        "record_set_complete": ctx.complete,
+        "content_complete": ctx.content_truncated_count == 0,
+        "output_content": ctx.output_content,
+        "unexported_range": {"start":ctx.selected_start + ctx.written_count,"end":ctx.selected_start + ctx.selected_count},
         "redacted_count": ctx.redacted_count,
         "bytes": ctx.bytes,
         "lines": ctx.written_count,
@@ -1660,97 +1728,62 @@ fn search_aggregate_streaming(
     let mut parse_errors = 0usize;
     let mut metadata_parse_errors = 0usize;
     let mut invalid_timestamps = 0usize;
-    let mut oversized_lines = 0usize;
-
-    'files: for (project_id, session_id, path) in files {
+    for (project_id, session_id, path) in files {
         crate::record_reader::check_work()?;
         files_scanned += 1;
-        let Ok(input) = crate::session_files::open_session_file(path) else {
-            read_errors += 1;
-            continue;
-        };
         let prefix = ref_prefix(session_id);
-        let mut tool_tracker = ToolAssociationTracker::default();
-        for (line_num, line) in bounded_jsonl_lines(BufReader::new(input)).enumerate() {
-            crate::record_reader::check_work()?;
-            let line_num = line_num + 1;
-            lines_scanned += 1;
-            let in_range = line_in_ranges(line_num, &params.lines);
-            let line = match line {
-                Ok(BoundedLine::Record(line)) => line,
-                Ok(BoundedLine::TooLarge) => {
-                    oversized_lines += 1;
-                    continue;
-                }
-                Err(_) => {
-                    read_errors += 1;
-                    continue;
-                }
-            };
-            let record = match parse_message_record(&line) {
-                Ok(Some(record)) => record,
-                Ok(None) => continue,
-                Err(_) => {
-                    if in_range {
-                        parse_errors += 1;
-                    } else {
-                        metadata_parse_errors += 1;
-                    }
-                    continue;
-                }
-            };
-            if tool_block_count(&record) > MAX_TOOL_BLOCKS {
-                incomplete_reasons.push("tool_blocks_cap".to_string());
-                break 'files;
-            }
-            let tool_blocks = tool_tracker.observe_record(&record, params.tool_payload_errors);
-            if tool_tracker.pending_len() > MAX_TOOL_BLOCKS {
-                incomplete_reasons.push("tool_pending_cap".to_string());
-                break 'files;
-            }
-            if tool_tracker.pending_bytes() > MAX_TOOL_PENDING_BYTES {
-                incomplete_reasons.push("tool_pending_bytes_cap".to_string());
-                break 'files;
-            }
-            if !in_range {
-                continue;
-            }
-            if time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
-                == TimeRangeMatch::UnparseableTimestamp
-            {
-                invalid_timestamps += 1;
-                continue;
-            }
-            let ctx = RecordBuildContext {
-                project_id,
-                session_id,
-                source: path,
-                prefix: &prefix,
-                params,
-                regex,
-                pattern,
-            };
-            let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues)?
-            else {
-                continue;
-            };
+        let ctx = RecordBuildContext {
+            project_id,
+            session_id,
+            source: path,
+            prefix: &prefix,
+            params,
+            regex,
+            pattern,
+        };
+        let mut stopped = false;
+        let stats = visit_search_file(&ctx, |result| {
             if !result.uuid.is_empty() {
                 if seen_uuids.contains(&result.uuid) {
-                    continue;
+                    return Ok(true);
                 }
                 if seen_uuids.len() >= STREAMING_UUID_DEDUPE_CAP {
-                    incomplete_reasons.push("uuid_dedupe_cap".to_string());
-                    break 'files;
+                    push_unique(&mut incomplete_reasons, "uuid_dedupe_cap");
+                    stopped = true;
+                    return Ok(false);
                 }
             }
             if let Err(reason) = aggregation.observe(&result) {
-                incomplete_reasons.push(reason.to_string());
-                break 'files;
+                push_unique(&mut incomplete_reasons, reason);
+                stopped = true;
+                return Ok(false);
             }
             if !result.uuid.is_empty() {
                 seen_uuids.insert(result.uuid.clone());
             }
             total_matches += 1;
+            Ok(true)
+        })?;
+        lines_scanned += stats.lines_scanned;
+        read_errors += stats.read_errors;
+        parse_errors += stats.parse_errors;
+        metadata_parse_errors += stats.metadata_parse_errors;
+        invalid_timestamps += stats.invalid_timestamps;
+        for issue in stats.metadata_issues {
+            push_unique(&mut incomplete_reasons, issue);
+        }
+        for issue in stats.attribution_issues {
+            push_unique(&mut attribution_issues, issue);
+        }
+        if stopped
+            || incomplete_reasons.iter().any(|reason| {
+                matches!(
+                    reason.as_str(),
+                    "tool_blocks_cap" | "tool_pending_cap" | "tool_pending_bytes_cap"
+                )
+            })
+        {
+            break;
         }
     }
 
@@ -1762,9 +1795,6 @@ fn search_aggregate_streaming(
     );
     push_time_filter_reason(&mut incomplete_reasons, invalid_timestamps);
     push_attribution_filter_reason(params, &mut incomplete_reasons, &attribution_issues);
-    if oversized_lines > 0 {
-        incomplete_reasons.push(format!("oversized_jsonl_lines={oversized_lines}"));
-    }
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     crate::record_reader::check_work()?;
@@ -1806,6 +1836,192 @@ fn search_aggregate_streaming(
     })
 }
 
+fn validate_export_source(result: &SearchResult) -> Result<std::fs::File, ErrorResponse> {
+    let (_, expected) = result
+        .locator
+        .as_ref()
+        .ok_or_else(|| reader_error("source_changed", "全文导出缺少来源定位"))?;
+    let path = result
+        .source
+        .as_deref()
+        .ok_or_else(|| reader_error("source_changed", "全文导出缺少来源"))?;
+    let file = crate::session_files::open_session_file(Path::new(path))
+        .map_err(|error| reader_error("source_changed", format!("{path}: {error}")))?;
+    let actual = file
+        .metadata()
+        .map_err(|error| reader_error("source_changed", error.to_string()))?;
+    if actual.len() != expected.len() || !crate::session_files::matches_snapshot(expected, &actual) {
+        return Err(reader_error(
+            "source_changed",
+            format!("{path} 在排序后发生变化，未发布全文导出"),
+        ));
+    }
+    Ok(file)
+}
+
+fn write_full_result(
+    output: &mut std::fs::File,
+    result: &SearchResult,
+    params: &SearchParams,
+    remaining: u64,
+) -> Result<(u64, usize), ErrorResponse> {
+    struct CappedWriter<'a> {
+        file: &'a mut std::fs::File,
+        remaining: u64,
+        bytes: u64,
+        exceeded: bool,
+    }
+    impl Write for CappedWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() as u64 > self.remaining {
+                self.exceeded = true;
+                return Err(std::io::Error::other("export_byte_cap"));
+            }
+            let written = self.file.write(bytes)?;
+            self.remaining -= written as u64;
+            self.bytes += written as u64;
+            Ok(written)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+    let start = output
+        .stream_position()
+        .map_err(|error| reader_error("io_error", error.to_string()))?;
+    let mut writer = CappedWriter {
+        file: output,
+        remaining,
+        bytes: 0,
+        exceeded: false,
+    };
+    let exported = (|| {
+        let file = validate_export_source(result)?;
+        let span = result.locator.as_ref().expect("validated locator").0;
+        let open = || {
+            file.try_clone()
+                .map_err(|error| reader_error("io_error", error.to_string()))
+        };
+        let indexed = index_record(open()?, span, true)?;
+        if indexed
+            .metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.uuid != result.uuid || metadata.timestamp != result.timestamp)
+        {
+            return Err(reader_error("source_changed", "来源记录与排序定位不一致"));
+        }
+        let mut metadata =
+            serde_json::to_value(result).map_err(|error| reader_error("serialize_error", error.to_string()))?;
+        let values = metadata.as_object_mut().expect("search result object");
+        values.remove("content");
+        values.remove("tool_input_redacted");
+        values.remove("tool_result_redacted");
+        writer
+            .write_all(b"{")
+            .map_err(|error| reader_error("io_error", error.to_string()))?;
+        for (key, value) in values {
+            crate::record_reader::serialize_json(&mut writer, key, false)?;
+            writer
+                .write_all(b":")
+                .map_err(|error| reader_error("io_error", error.to_string()))?;
+            crate::record_reader::serialize_json(&mut writer, value, false)?;
+            writer
+                .write_all(b",")
+                .map_err(|error| reader_error("io_error", error.to_string()))?;
+        }
+        writer
+            .write_all(b"\"content\":\"")
+            .map_err(|error| reader_error("io_error", error.to_string()))?;
+        let projection = indexed.projection(open()?, span, "content", None)?;
+        let mut text = TextBytes::new(projection.cursor(open()?, span));
+        let (_, _, mut redactions) = render_text_range(&mut text, params.redaction, None, |chunk| {
+            let text = std::str::from_utf8(chunk).map_err(|_| reader_error("invalid_utf8", "正文 UTF-8 无效"))?;
+            let escaped =
+                serde_json::to_vec(text).map_err(|error| reader_error("serialize_error", error.to_string()))?;
+            writer
+                .write_all(&escaped[1..escaped.len() - 1])
+                .map_err(|error| reader_error("io_error", error.to_string()))
+        })?;
+        writer
+            .write_all(b"\"")
+            .map_err(|error| reader_error("io_error", error.to_string()))?;
+        if let Some(block) = result.block {
+            let record = indexed.association_record(open()?, span, false)?;
+            let kind = record
+                .message
+                .as_ref()
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|content| content.get(block))
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str);
+            let (view, field) = match kind {
+                Some("tool_use") => ("tool_input", "tool_input_redacted"),
+                Some("tool_result") => ("tool_result", "tool_result_redacted"),
+                _ => return Err(reader_error("block_not_found", "选中的原始 content 下标不是工具块")),
+            };
+            writer
+                .write_all(format!(",\"{field}\":").as_bytes())
+                .map_err(|error| reader_error("io_error", error.to_string()))?;
+            if params.structured.as_deref() == Some("preview") {
+                let projection = indexed.structured_projection(open()?, span, view, Some(block), params.redaction)?;
+                let mut text = TextBytes::new(projection.cursor(open()?, span));
+                let maximum = if view == "tool_input" {
+                    params.max_content
+                } else {
+                    params.max_content_tool_result
+                };
+                let mut preview = String::new();
+                let mut characters = 0;
+                let mut original_bytes = 0;
+                let (_, rendered, count) = render_text_range(&mut text, params.redaction, None, |chunk| {
+                    original_bytes += chunk.len();
+                    for character in std::str::from_utf8(chunk)
+                        .map_err(|_| reader_error("invalid_utf8", "结构 UTF-8 无效"))?
+                        .chars()
+                    {
+                        if characters < maximum {
+                            preview.push(character);
+                        }
+                        characters += 1;
+                    }
+                    Ok(())
+                })?;
+                redactions += count;
+                let value = serde_json::json!({"preview":preview,"truncated":rendered > maximum,"original_bytes":original_bytes,
+                    "get":{"ref":format!("{}:{}", result.session,result.line),"project":result.project,"source":result.source,"view":view,"block":block,"redaction":params.redaction.as_str()}});
+                crate::record_reader::serialize_json(&mut writer, &value, false)?;
+            } else {
+                let projection = indexed.structured_projection(open()?, span, view, Some(block), params.redaction)?;
+                let mut text = TextBytes::new(projection.cursor(open()?, span));
+                let (_, _, count) = render_text_range(&mut text, params.redaction, None, |chunk| {
+                    writer
+                        .write_all(chunk)
+                        .map_err(|error| reader_error("io_error", error.to_string()))
+                })?;
+                redactions += count;
+            }
+        }
+        writer
+            .write_all(b"}\n")
+            .map_err(|error| reader_error("io_error", error.to_string()))?;
+        validate_export_source(result)?;
+        Ok((writer.bytes, redactions))
+    })();
+    if writer.exceeded {
+        writer
+            .file
+            .set_len(start)
+            .and_then(|_| writer.file.seek(SeekFrom::Start(start)))
+            .map_err(|error| reader_error("io_error", format!("恢复完整 JSONL 边界失败: {error}")))?;
+        return Err(reader_error(
+            "export_byte_cap",
+            "全文导出达到 16 MiB，保留此前完整 JSONL 条目",
+        ));
+    }
+    exported
+}
+
 fn search_to_output_bounded(
     params: &SearchParams,
     files: &[SearchFile],
@@ -1828,7 +2044,11 @@ fn search_to_output_bounded(
         .skip(window.range.start)
         .take(window.range.len())
         .collect();
-    let selected_results = truncate_selected_results(params, selected_results);
+    let selected_results = if params.output_content == "full" {
+        selected_results
+    } else {
+        truncate_selected_results(params, selected_results)
+    };
 
     let resolved = resolve_search_output_paths(params.output.as_deref().expect("output checked by caller"))?;
     let temp_output = resolved.temp_output;
@@ -1840,10 +2060,25 @@ fn search_to_output_bounded(
     let mut written_count = 0usize;
     let mut redacted_count = 0usize;
     let mut content_truncated_count = 0usize;
-    for result in selected_results {
+    for result in &selected_results {
         if written_count == MAX_EXPORT_RECORDS {
             push_unique(&mut incomplete_reasons, "export_record_cap");
             break;
+        }
+        if params.output_content == "full" {
+            match write_full_result(&mut file, result, params, MAX_EXPORT_BYTES.saturating_sub(bytes)) {
+                Ok((written, redactions)) => {
+                    bytes += written;
+                    written_count += 1;
+                    redacted_count += redactions;
+                    continue;
+                }
+                Err(error) if error.error == "export_byte_cap" => {
+                    push_unique(&mut incomplete_reasons, "export_byte_cap");
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
         let mut line = Vec::new();
         crate::record_reader::serialize_json(&mut line, &result, false)?;
@@ -1894,6 +2129,9 @@ fn search_to_output_bounded(
         max_content_tool_result: params.max_content_tool_result,
         max_records: MAX_EXPORT_RECORDS,
         max_bytes: MAX_EXPORT_BYTES,
+        output_content: &params.output_content,
+        selected_start: window.range.start,
+        selected_count: window.range.len(),
     })?;
     output_info.retention = temp_output.then(|| TEMP_OUTPUT_RETENTION.to_string());
     let warning = build_response_warning(&incomplete_reasons, &attribution_issues, params);
@@ -1931,6 +2169,11 @@ fn search_to_output_bounded(
     };
     let response = apply_response_budget(response, params.max_total, build_next_query(params, params.offset))?;
     crate::record_reader::check_work()?;
+    if params.output_content == "full" {
+        for result in &selected_results {
+            validate_export_source(result)?;
+        }
+    }
     transaction.publish()?;
     Ok(response)
 }
@@ -2000,6 +2243,9 @@ pub(crate) fn matched_filters(
     if let Some(source) = &params.source {
         filters.push(format!("source={source}"));
     }
+    if !params.sources.is_empty() {
+        filters.push("sources=true".to_string());
+    }
     if params.since.is_some() || params.until.is_some() {
         filters.push("time=true".to_string());
     }
@@ -2043,6 +2289,12 @@ pub(crate) fn build_search_result(
     let (matches, match_pos) = if ctx.params.pattern.is_empty() {
         (true, None)
     } else if let Some(regex) = ctx.regex {
+        if raw_content.len() > MAX_JSONL_LINE_BYTES {
+            return Err(reader_error(
+                "regex_content_limit",
+                "逻辑正文超过 8 MiB，regex 未完整检查该记录",
+            ));
+        }
         regex.find(&raw_content).map_or((false, None), |m| {
             (true, Some(raw_content[..m.start()].chars().count()))
         })
@@ -2074,10 +2326,10 @@ pub(crate) fn build_search_result(
         tool: None,
     });
     let metadata_incomplete_reason = selected_tool_block.and_then(|block| block.metadata_incomplete_reason.clone());
-    let rendered_tool_block = selected_tool_block.map(|block| {
+    let rendered_tool_block = selected_tool_block.filter(|_| !ctx.params.aggregate || ctx.params.output.is_some()).map(|block| {
         let mut rendered = render_tool_block(block, ctx.params.redaction);
         crate::record_reader::check_work()?;
-        if ctx.params.structured.as_deref() == Some("preview") {
+        if ctx.params.structured.as_deref() == Some("preview") || ctx.params.output_content == "full" {
             for (value, view, limit) in [
                 (&mut rendered.input, "tool_input", ctx.params.max_content),
                 (&mut rendered.result, "tool_result", ctx.params.max_content_tool_result),
@@ -2140,10 +2392,373 @@ pub(crate) fn build_search_result(
         redacted: (redacted || content_redacted).then_some(true),
         matched_filters,
         match_pos: (!content_redacted).then_some(match_pos).flatten(),
+        locator: None,
     }))
 }
 
-/// 搜索单个文件
+pub(crate) fn build_indexed_search_result(
+    ctx: &RecordBuildContext<'_>,
+    span: SourceSpan,
+    line: usize,
+    open: impl Fn() -> Result<std::fs::File, ErrorResponse>,
+    tracker: &mut ToolAssociationTracker,
+    attribution: &mut Vec<String>,
+    invalid_timestamps: &mut usize,
+) -> Result<Option<SearchResult>, ErrorResponse> {
+    let params = ctx.params;
+    let pattern = ctx.pattern;
+    let indexed = index_record(open()?, span, true)?;
+    let Some(metadata) = &indexed.metadata else {
+        return Ok(None);
+    };
+    let association_record = indexed.association_record(open()?, span, params.tool_payload_errors)?;
+    if tool_block_count(&association_record) > MAX_TOOL_BLOCKS {
+        return Err(reader_error("tool_blocks_cap", "单条消息工具块超出 2048"));
+    }
+    let blocks = tracker.observe_record(&association_record, params.tool_payload_errors);
+    let (effective_type, subtype) = indexed.classify(open()?, span)?;
+    if !line_in_ranges(line, &params.lines)
+        || !params.types.iter().any(|kind| kind == effective_type)
+        || !message_subtype_matches(subtype, &params.subtypes)
+    {
+        return Ok(None);
+    }
+    match time_in_range(&metadata.timestamp, params.since.as_ref(), params.until.as_ref()) {
+        TimeRangeMatch::Matches => {}
+        TimeRangeMatch::UnparseableTimestamp => {
+            *invalid_timestamps += 1;
+            return Ok(None);
+        }
+        _ => return Ok(None),
+    }
+    let projection = indexed.projection(open()?, span, "content", None)?;
+    let images = projection.images.clone();
+    let original_characters = projection.characters;
+    let mut text = TextBytes::new(projection.cursor(open()?, span));
+    let (matches, match_position) = if let Some(regex) = ctx.regex {
+        if text.len() > MAX_JSONL_LINE_BYTES {
+            return Err(reader_error(
+                "regex_content_limit",
+                "逻辑正文超过 8 MiB，regex 未完整检查该记录",
+            ));
+        }
+        let raw = text.range(0, text.len(), MAX_JSONL_LINE_BYTES)?;
+        let raw = std::str::from_utf8(&raw).map_err(|_| reader_error("invalid_utf8", "正文 UTF-8 无效"))?;
+        regex.find(raw).map_or((false, None), |found| {
+            (true, Some(raw[..found.start()].chars().count()))
+        })
+    } else if let Some(pattern) = pattern {
+        stream_matches_pattern(&mut text, pattern, params.case_sensitive)?
+    } else {
+        (true, None)
+    };
+    if !matches {
+        return Ok(None);
+    }
+    for block in &blocks {
+        if (!params.failed_tool_results || block.result_is_error == Some(true))
+            && (!params.tool_payload_errors || block.result_has_error_payload == Some(true))
+            && let Some(reason) = &block.metadata_incomplete_reason
+        {
+            push_unique(attribution, reason.clone());
+        }
+    }
+    let selected = select_tool_block(&blocks, params);
+    if has_tool_filter(params) && selected.is_none() {
+        return Ok(None);
+    }
+    let maximum = if subtype == "tool_result" {
+        params.max_content_tool_result
+    } else {
+        params.max_content
+    };
+    let (start, end, prefix, suffix) = preview_bounds(original_characters, match_position, maximum);
+    let mut head = String::new();
+    let mut window = String::new();
+    let mut collected = 0usize;
+    let (content_size, redacted_size, redacted_count) =
+        render_text_range(&mut text, params.redaction, None, |chunk| {
+            let chunk = std::str::from_utf8(chunk).map_err(|_| reader_error("parse_error", "正文 UTF-8 无效"))?;
+            for character in chunk.chars() {
+                if collected < maximum {
+                    head.push(character);
+                }
+                if (start..end).contains(&collected) {
+                    window.push(character);
+                }
+                collected += 1;
+            }
+            Ok(())
+        })?;
+    let content = if redacted_count > 0 {
+        head
+    } else {
+        format!(
+            "{}{window}{}",
+            if prefix { "..." } else { "" },
+            if suffix { "..." } else { "" }
+        )
+    };
+    let mut input = None;
+    let mut result = None;
+    if let Some(block) = selected.filter(|_| !params.aggregate || params.output.is_some()) {
+        let view = if block.kind == ToolBlockKind::Use {
+            "tool_input"
+        } else {
+            "tool_result"
+        };
+        let projection =
+            indexed.structured_projection(open()?, span, view, Some(block.block_index), params.redaction)?;
+        let full = params.structured.as_deref().unwrap_or("full") == "full" && params.output_content != "full";
+        let maximum = if block.kind == ToolBlockKind::Use {
+            params.max_content
+        } else {
+            params.max_content_tool_result
+        };
+        let mut cursor = TextBytes::new(projection.cursor(open()?, span));
+        let mut preview = String::new();
+        let mut characters = 0;
+        let mut original_bytes = 0usize;
+        let (_, rendered_size, _) = render_text_range(&mut cursor, params.redaction, None, |chunk| {
+            original_bytes = original_bytes
+                .checked_add(chunk.len())
+                .ok_or_else(|| reader_error("record_index_limit", "结构化文本长度溢出"))?;
+            if full {
+                if chunk.len() > params.max_total.saturating_sub(preview.len()) {
+                    return Err(ErrorResponse { error:"structured_response_too_large".to_string(), message:"完整结构超过响应预算；使用 history_get view/range/output 读取，或释放扫描后以 structured=preview 重新查询".to_string(),
+                        available:Some(json!({"get":{"ref":format!("{}:{line}", ctx.session_id), "project":ctx.project_id, "source":ctx.source.to_string_lossy(), "view":view, "block":block.block_index, "redaction":params.redaction.as_str()}})) });
+                }
+                preview.push_str(
+                    std::str::from_utf8(chunk).map_err(|_| reader_error("parse_error", "结构化视图 UTF-8 无效"))?,
+                );
+            } else {
+                for character in std::str::from_utf8(chunk)
+                    .map_err(|_| reader_error("parse_error", "结构化视图 UTF-8 无效"))?
+                    .chars()
+                {
+                    if characters < maximum {
+                        preview.push(character);
+                    }
+                    characters += 1;
+                }
+            }
+            Ok(())
+        })?;
+        let value = if full {
+            serde_json::from_str(&preview)
+                .map_err(|error| reader_error("parse_error", format!("脱敏结构化视图不是合法 JSON: {error}")))?
+        } else {
+            json!({"preview":preview, "truncated":rendered_size > maximum, "original_bytes":original_bytes,
+                "get":{"ref":format!("{}:{line}", ctx.session_id), "project":ctx.project_id, "source":ctx.source.to_string_lossy(), "view":view, "block":block.block_index, "redaction":params.redaction.as_str()}})
+        };
+        if block.kind == ToolBlockKind::Use {
+            input = Some(value);
+        } else {
+            result = Some(value);
+        }
+    }
+    Ok(Some(SearchResult {
+        r#ref: format!("{}:{line}", ctx.session_id),
+        session: ctx.session_id.to_string(),
+        line,
+        uuid: metadata.uuid.clone(),
+        r#type: effective_type.to_string(),
+        subtype: subtype.to_string(),
+        timestamp: metadata.timestamp.clone(),
+        content,
+        content_size,
+        truncated: redacted_size > maximum,
+        image_count: images.len(),
+        images,
+        project: ctx.project_id.to_string(),
+        source: Some(ctx.source.to_string_lossy().to_string()),
+        block: selected.map(|block| block.block_index),
+        server: selected.and_then(|block| block.info.server.clone()),
+        tool: selected.and_then(|block| block.info.tool.clone()),
+        metadata_incomplete_reason: selected.and_then(|block| block.metadata_incomplete_reason.clone()),
+        tool_input_redacted: input,
+        tool_result_redacted: result,
+        tool_result_is_error: selected.and_then(|block| block.result_is_error),
+        tool_result_has_error_payload: selected.and_then(|block| block.result_has_error_payload),
+        raw_available: (selected.is_some() || redacted_count > 0).then_some(true),
+        redacted: (params.redaction.enabled() && (selected.is_some() || redacted_count > 0)).then_some(true),
+        matched_filters: matched_filters(
+            params,
+            ctx.project_id,
+            ctx.session_id,
+            effective_type,
+            subtype,
+            &selected.map(|block| block.info.clone()).unwrap_or(ToolInfo {
+                server: None,
+                tool: None,
+            }),
+        ),
+        match_pos: None,
+        locator: None,
+    }))
+}
+
+fn visit_search_file(
+    ctx: &RecordBuildContext<'_>,
+    mut consume: impl FnMut(SearchResult) -> Result<bool, ErrorResponse>,
+) -> Result<FileSearchResult, ErrorResponse> {
+    crate::record_reader::check_work()?;
+    let mut stats = FileSearchResult {
+        lines_scanned: 0,
+        results: Vec::new(),
+        truncated: false,
+        read_errors: 0,
+        parse_errors: 0,
+        metadata_parse_errors: 0,
+        invalid_timestamps: 0,
+        metadata_issues: Vec::new(),
+        attribution_issues: Vec::new(),
+        result_bytes: 0,
+        memory_capped: false,
+        oversized_lines: 0,
+    };
+    let input = match crate::session_files::open_session_file(ctx.source) {
+        Ok(file) => file,
+        Err(_) => {
+            stats.read_errors = 1;
+            return Ok(stats);
+        }
+    };
+    let metadata = std::sync::Arc::new(
+        input
+            .metadata()
+            .map_err(|error| reader_error("io_error", error.to_string()))?,
+    );
+    let open = || {
+        let file = crate::session_files::open_session_file(ctx.source)
+            .map_err(|error| reader_error("source_changed", error.to_string()))?;
+        if !crate::session_files::matches_snapshot(
+            &metadata,
+            &file
+                .metadata()
+                .map_err(|error| reader_error("io_error", error.to_string()))?,
+        ) {
+            return Err(reader_error(
+                "source_changed",
+                format!("{} 来源发生变化", ctx.source.display()),
+            ));
+        }
+        Ok(file)
+    };
+    let mut lines = RecordLines::new(input, metadata.len());
+    let mut tracker = ToolAssociationTracker::default();
+    loop {
+        let mut remaining = u64::MAX;
+        let located = match lines.step(&mut remaining, Instant::now() + std::time::Duration::from_secs(120)) {
+            Ok(LineStep::Record(located)) => located,
+            Ok(LineStep::Yield) => continue,
+            Ok(LineStep::End) => break,
+            Err(error) if error.error == "io_error" => {
+                stats.read_errors += 1;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        stats.lines_scanned += 1;
+        let in_range = line_in_ranges(located.line, &ctx.params.lines);
+        let parsed = (|| {
+            if let Some(raw) = &located.small {
+                let raw = std::str::from_utf8(raw).map_err(|_| reader_error("invalid_utf8", "JSONL UTF-8 无效"))?;
+                let Some(record) =
+                    parse_message_record(raw).map_err(|_| reader_error("parse_error", "JSONL 格式或消息字段无效"))?
+                else {
+                    return Ok(None);
+                };
+                if tool_block_count(&record) > MAX_TOOL_BLOCKS {
+                    return Err(reader_error("tool_blocks_cap", "单条消息工具块超出 2048"));
+                }
+                let blocks = tracker.observe_record(&record, ctx.params.tool_payload_errors);
+                if !in_range {
+                    return Ok(None);
+                }
+                if time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref())
+                    == TimeRangeMatch::UnparseableTimestamp
+                {
+                    stats.invalid_timestamps += 1;
+                    return Ok(None);
+                }
+                build_search_result(ctx, located.line, record, &blocks, &mut stats.attribution_issues)
+            } else {
+                build_indexed_search_result(
+                    ctx,
+                    located.span,
+                    located.line,
+                    open,
+                    &mut tracker,
+                    &mut stats.attribution_issues,
+                    &mut stats.invalid_timestamps,
+                )
+            }
+        })();
+        if tracker.pending_len() > MAX_TOOL_BLOCKS {
+            push_unique(&mut stats.metadata_issues, "tool_pending_cap");
+            break;
+        }
+        if tracker.pending_bytes() > MAX_TOOL_PENDING_BYTES {
+            push_unique(&mut stats.metadata_issues, "tool_pending_bytes_cap");
+            break;
+        }
+        let result = match parsed {
+            Ok(result) => result,
+            Err(error) if matches!(error.error.as_str(), "parse_error" | "invalid_utf8") => {
+                if in_range {
+                    stats.parse_errors += 1;
+                } else {
+                    stats.metadata_parse_errors += 1;
+                }
+                push_unique(
+                    &mut stats.metadata_issues,
+                    format!("{}:{}:{}", error.error, ctx.source.display(), located.line),
+                );
+                continue;
+            }
+            Err(error) if error.error == "regex_content_limit" => {
+                push_unique(&mut stats.metadata_issues, "regex_content_limit");
+                push_unique(
+                    &mut stats.metadata_issues,
+                    format!("regex_content_limit:{}:{}", ctx.source.display(), located.line),
+                );
+                continue;
+            }
+            Err(error)
+                if matches!(
+                    error.error.as_str(),
+                    "tool_blocks_cap"
+                        | "tool_pending_cap"
+                        | "tool_pending_bytes_cap"
+                        | "record_index_limit"
+                        | "redaction_index_limit"
+                ) =>
+            {
+                push_unique(&mut stats.metadata_issues, error.error);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(mut result) = result {
+            result.r#ref = format!("{}:{}", ctx.prefix, located.line);
+            if ctx.params.output_content == "full" {
+                result.locator = Some((located.span, metadata.clone()));
+                result.content.clear();
+                result.tool_input_redacted = None;
+                result.tool_result_redacted = None;
+                result.truncated = false;
+            }
+            if !consume(result)? {
+                break;
+            }
+        }
+    }
+    open()?;
+    Ok(stats)
+}
+
+/// 单文件读取与 aggregate 共享记录匹配、诊断和关联路径
 fn search_file(
     project_id: &str,
     session_id: &str,
@@ -2153,137 +2768,39 @@ fn search_file(
     pattern: Option<&SearchPattern>,
     limits: FileSearchLimits,
 ) -> Result<FileSearchResult, ErrorResponse> {
-    crate::record_reader::check_work()?;
-    let mut results = Vec::new();
-    let mut lines_scanned = 0;
-    let mut truncated = false;
-    let mut read_errors = 0usize;
-    let mut parse_errors = 0usize;
-    let mut metadata_parse_errors = 0usize;
-    let mut invalid_timestamps = 0usize;
-    let mut metadata_issues = Vec::new();
-    let mut attribution_issues = Vec::new();
-    let mut result_bytes = 0usize;
-    let mut memory_capped = false;
-    let mut oversized_lines = 0usize;
-
-    let file = match crate::session_files::open_session_file(path) {
-        Ok(f) => f,
-        Err(_) => {
-            crate::record_reader::check_work()?;
-            return Ok(FileSearchResult {
-                lines_scanned: 0,
-                results,
-                truncated: false,
-                read_errors: 1,
-                parse_errors: 0,
-                metadata_parse_errors: 0,
-                invalid_timestamps: 0,
-                metadata_issues: Vec::new(),
-                attribution_issues: Vec::new(),
-                result_bytes: 0,
-                memory_capped: false,
-                oversized_lines: 0,
-            });
-        }
-    };
-
-    let reader = BufReader::new(file);
     let prefix = ref_prefix(session_id);
-    let mut tool_tracker = ToolAssociationTracker::default();
-
-    for (line_num, line) in bounded_jsonl_lines(reader).enumerate() {
-        crate::record_reader::check_work()?;
-        let line_num = line_num + 1; // 1-based
-        lines_scanned += 1;
-
-        let in_range = line_in_ranges(line_num, &params.lines);
-        let line = match line {
-            Ok(BoundedLine::Record(l)) => l,
-            Ok(BoundedLine::TooLarge) => {
-                oversized_lines += 1;
-                continue;
-            }
-            Err(_) => {
-                read_errors += 1;
-                continue;
-            }
-        };
-
-        // 解析 JSON
-        let record = match parse_message_record(&line) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(_) => {
-                if in_range {
-                    parse_errors += 1;
-                } else {
-                    metadata_parse_errors += 1;
-                }
-                continue;
-            }
-        };
-        if tool_block_count(&record) > MAX_TOOL_BLOCKS {
-            push_unique(&mut metadata_issues, "tool_blocks_cap");
-            break;
+    let ctx = RecordBuildContext {
+        project_id,
+        session_id,
+        source: path,
+        prefix: &prefix,
+        params,
+        regex,
+        pattern,
+    };
+    let mut results = Vec::new();
+    let mut result_bytes = 0;
+    let mut truncated = false;
+    let mut memory_capped = false;
+    let mut stats = visit_search_file(&ctx, |result| {
+        if results.len() == limits.max_matches {
+            truncated = true;
+            return Ok(false);
         }
-        let tool_blocks = tool_tracker.observe_record(&record, params.tool_payload_errors);
-        if tool_tracker.pending_len() > MAX_TOOL_BLOCKS {
-            push_unique(&mut metadata_issues, "tool_pending_cap");
-            break;
+        let bytes = crate::record_reader::serialize_json(std::io::sink(), &result, false)?.saturating_add(256);
+        if bytes > limits.max_bytes.saturating_sub(result_bytes) {
+            memory_capped = true;
+            return Ok(false);
         }
-        if tool_tracker.pending_bytes() > MAX_TOOL_PENDING_BYTES {
-            push_unique(&mut metadata_issues, "tool_pending_bytes_cap");
-            break;
-        }
-        if !in_range {
-            continue;
-        }
-        if time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
-            == TimeRangeMatch::UnparseableTimestamp
-        {
-            invalid_timestamps += 1;
-            continue;
-        }
-        let ctx = RecordBuildContext {
-            project_id,
-            session_id,
-            source: path,
-            prefix: &prefix,
-            params,
-            regex,
-            pattern,
-        };
-        if let Some(result) = build_search_result(&ctx, line_num, record, &tool_blocks, &mut attribution_issues)? {
-            if results.len() == limits.max_matches {
-                truncated = true;
-                break;
-            }
-            let bytes = crate::record_reader::serialize_json(std::io::sink(), &result, false)?;
-            if bytes > limits.max_bytes.saturating_sub(result_bytes) {
-                memory_capped = true;
-                break;
-            }
-            result_bytes += bytes;
-            results.push(result);
-        }
-    }
-
-    crate::record_reader::check_work()?;
-    Ok(FileSearchResult {
-        lines_scanned,
-        results,
-        truncated,
-        read_errors,
-        parse_errors,
-        metadata_parse_errors,
-        invalid_timestamps,
-        metadata_issues,
-        attribution_issues,
-        result_bytes,
-        memory_capped,
-        oversized_lines,
-    })
+        result_bytes += bytes;
+        results.push(result);
+        Ok(true)
+    })?;
+    stats.results = results;
+    stats.result_bytes = result_bytes;
+    stats.truncated = truncated;
+    stats.memory_capped = memory_capped;
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -2292,6 +2809,223 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::{env, fs, process};
+
+    #[test]
+    fn normal_large_record_matching_association_and_regex_limits() {
+        let root = env::temp_dir().join(format!("history-large-normal-{}", process::id()));
+        fs::create_dir_all(root.join("project")).unwrap();
+        let source = root.join("project/session-large.jsonl");
+        let mut file = File::create(&source).unwrap();
+        let padding = "x".repeat(MAX_JSONL_LINE_BYTES + 128);
+        writeln!(file,"{}",serde_json::json!({"uuid":"call","type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"call-1","name":"mcp__fixture__large","input":{"note":padding}}]}})).unwrap();
+        writeln!(file,"{}",serde_json::json!({"uuid":"result","type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":format!("{padding} 末尾 NEEDLE password=fixture-secret")} ]}})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"api-request-blob","message":{"cache":padding}})
+        )
+        .unwrap();
+        writeln!(file,"{}",serde_json::json!({"uuid":"small","type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":"NEEDLE small"}})).unwrap();
+        file.write_all(b"{\xff}\n{bad json}\n").unwrap();
+        drop(file);
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        for aggregate in [false, true] {
+            let response = search(
+                &config,
+                SearchParams {
+                    projects: vec!["project".into()],
+                    pattern: "末尾 NEEDLE|unused !absent".into(),
+                    tools: vec!["mcp__fixture__large".into()],
+                    lines: parse_optional_line_ranges_param(Some("2-4")).unwrap(),
+                    structured: (!aggregate).then(|| "preview".into()),
+                    redaction: RedactionMode::Off,
+                    aggregate,
+                    max_total: 10000,
+                    ..SearchParams::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(response.stats.total_matches, 1);
+            assert!(
+                !response
+                    .stats
+                    .incomplete_reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("oversized_jsonl"))
+            );
+            assert!(
+                response
+                    .stats
+                    .incomplete_reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("metadata_parse_error="))
+            );
+            if !aggregate {
+                assert_eq!(response.results[0].line, 2);
+                assert_eq!(response.results[0].tool.as_deref(), Some("large"));
+                assert!(response.results[0].content.contains("NEEDLE"));
+            }
+        }
+        let response = search(
+            &config,
+            SearchParams {
+                projects: vec!["project".into()],
+                pattern: "NEEDLE".into(),
+                use_regex: true,
+                structured: Some("preview".into()),
+                redaction: RedactionMode::Off,
+                max_total: 10000,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].line, 4);
+        assert!(
+            response
+                .stats
+                .incomplete_reasons
+                .contains(&"regex_content_limit".to_string())
+        );
+        assert!(!response.stats.total_matches_exact);
+        let spaced = root.join("project/session-spaced.jsonl");
+        fs::write(&spaced,format!("{{{}\"uuid\":\"spaced\",\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{{\"content\":\"small\"}}}}\n"," ".repeat(MAX_JSONL_LINE_BYTES))).unwrap();
+        let response = search(
+            &config,
+            SearchParams {
+                source: Some(spaced.to_string_lossy().to_string()),
+                pattern: "^small$".into(),
+                use_regex: true,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.stats.total_matches, 1);
+        assert!(response.stats.total_matches_exact);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn aggregate_large_tool_defaults_skip_payload_materialization() {
+        let root = env::temp_dir().join(format!("history-large-aggregate-default-{}", process::id()));
+        fs::create_dir_all(root.join("project")).unwrap();
+        let source = root.join("project/session-aggregate.jsonl");
+        let row = serde_json::json!({
+            "uuid": "duplicate", "type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": [{"type": "tool_use", "id": "call", "name": "mcp__fixture__large",
+                "input": {"note": "x".repeat(MAX_JSONL_LINE_BYTES + 128)}}]}
+        });
+        fs::write(&source, format!("{row}\n{row}\n")).unwrap();
+        let response = search(
+            &Config {
+                projects_dir: root.clone(),
+            },
+            SearchParams {
+                projects: vec!["project".into()],
+                aggregate: true,
+                tools: vec!["mcp__fixture__large".into()],
+                redaction: RedactionMode::Off,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.stats.total_matches, 1);
+        assert!(response.stats.total_matches_exact);
+        assert!(response.results.is_empty());
+        assert!(response.stats.summary.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_output_preserves_body_and_independent_structured_mode() {
+        let root = env::temp_dir().join(format!("history-full-output-{}", process::id()));
+        fs::create_dir_all(root.join("project")).unwrap();
+        let source = root.join("project/full-output-session.jsonl");
+        let body = format!("{} TAIL-4515", "中".repeat(4515));
+        fs::write(&source,format!("{}\n{}\n",serde_json::json!({"uuid":"body","type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":body}}),serde_json::json!({"uuid":"tool","type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"thinking","thinking":"fixture thought"},{"type":"text","text":"Tool explanation"},{"type":"tool_use","id":"tool","name":"Bash","input":{"nested":{"password":"fixture-secret","note":body}}}]}}))).unwrap();
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        for (content, structured, redaction) in [
+            ("preview", "full", RedactionMode::Auto),
+            ("full", "full", RedactionMode::Strict),
+            ("full", "preview", RedactionMode::Off),
+        ] {
+            let response = search(
+                &config,
+                SearchParams {
+                    projects: vec!["project".into()],
+                    output: Some(format!("tmp:full-body-{content}-{structured}")),
+                    output_content: content.into(),
+                    structured: Some(structured.into()),
+                    redaction,
+                    max_content: 100,
+                    max_total: 10000,
+                    ..SearchParams::default()
+                },
+            )
+            .unwrap();
+            let output = response.output.unwrap();
+            let raw = fs::read_to_string(&output.results).unwrap();
+            let rows: Vec<serde_json::Value> = raw.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let manifest: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&output.manifest).unwrap()).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(manifest["bytes"].as_u64(), Some(raw.len() as u64));
+            if content == "full" {
+                assert_eq!(rows[0]["content"], body);
+                assert_eq!(manifest["content_complete"], true);
+                assert_eq!(manifest["content_truncated_count"], 0);
+            } else {
+                assert!(!rows[0]["content"].as_str().unwrap().contains("TAIL-4515"));
+                assert_eq!(manifest["content_complete"], false);
+            }
+            if redaction == RedactionMode::Strict {
+                assert!(!raw.contains("fixture-secret"));
+                assert_eq!(rows[1]["tool_input_redacted"]["nested"]["note"], body);
+            }
+            if structured == "preview" {
+                assert_eq!(rows[1]["tool_input_redacted"]["truncated"], true);
+                assert_eq!(rows[1]["tool_input_redacted"]["get"]["block"], 2);
+                assert_eq!(
+                    rows[1]["tool_input_redacted"]["get"]["source"],
+                    source.to_string_lossy().as_ref()
+                );
+            }
+        }
+        let params = SearchParams {
+            projects: vec!["project".into()],
+            output: Some("tmp:full-failure".into()),
+            output_content: "full".into(),
+            ..SearchParams::default()
+        };
+        let inputs = prepare_search_inputs(&config, &params).unwrap();
+        let collection = collect_search_results(&params, &inputs.files, None, None).unwrap();
+        let mut output = File::create(root.join("bounded.jsonl")).unwrap();
+        assert_eq!(
+            write_full_result(&mut output, &collection.results[0], &params, 30)
+                .unwrap_err()
+                .error,
+            "export_byte_cap"
+        );
+        assert_eq!(output.metadata().unwrap().len(), 0);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert_eq!(
+            write_full_result(&mut output, &collection.results[0], &params, 100000)
+                .unwrap_err()
+                .error,
+            "source_changed"
+        );
+        drop(output);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn write_jsonl(dir: &Path, name: &str, lines: usize) -> PathBuf {
         let path = dir.join(name);
@@ -2396,7 +3130,7 @@ mod tests {
     #[test]
     #[ignore = "explicit synthetic phase measurement"]
     fn normal_summary_phase_measurement() {
-        for count in [200, 1000] {
+        for count in [200, 1000, 5000] {
             let owner = format!(
                 "{}-{}",
                 process::id(),
@@ -2413,8 +3147,10 @@ mod tests {
             let path = directory.join("summary0.jsonl");
             let mut output = std::io::BufWriter::new(File::create(&path).unwrap());
             for index in 0..count {
-                let record = serde_json::json!({"uuid":format!("summary-{index}"), "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":format!("call-{index}"), "name":format!("mcp__fixture__probe_{index}"), "input":{"note":"x".repeat(1500), "password":"synthetic-not-a-credential"}}]}});
+                let record = serde_json::json!({"uuid":format!("summary-{index}"), "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":format!("call-{index}"), "name":format!("mcp__mcp-ssh__probe_{index}"), "input":{"note":"x".repeat(1500), "password":"synthetic-not-a-credential"}}]}});
                 writeln!(output, "{record}").unwrap();
+                let result = serde_json::json!({"uuid":format!("result-{index}"), "type":"user", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_result", "tool_use_id":format!("call-{index}"), "content":"completed"}]}});
+                writeln!(output, "{result}").unwrap();
             }
             output.flush().unwrap();
             drop(output);
@@ -2431,7 +3167,7 @@ mod tests {
             for record in &records {
                 std::hint::black_box(redact_text_with_mode(
                     &replace_images_with_placeholders(record),
-                    RedactionMode::Auto,
+                    RedactionMode::Strict,
                 ));
             }
             let redaction_ms = redaction.elapsed().as_secs_f64() * 1000.0;
@@ -2443,6 +3179,11 @@ mod tests {
             let params = prepare_search_params(SearchParams {
                 all_projects: true,
                 summary: true,
+                redaction: RedactionMode::Strict,
+                servers: vec!["mcp-ssh".to_string()],
+                subagents: true,
+                subtypes: vec!["tool_use".to_string()],
+                types: vec!["assistant".to_string()],
                 since,
                 until,
                 limit: None,
@@ -2543,6 +3284,7 @@ mod tests {
                 redacted: None,
                 matched_filters: Vec::new(),
                 match_pos: None,
+                locator: None,
             }],
             has_more: false,
             next_offset: 1,
@@ -3344,6 +4086,7 @@ mod tests {
             redacted: None,
             matched_filters: Vec::new(),
             match_pos: None,
+            locator: None,
         };
         let results = truncate_selected_results(&params, vec![result]);
         assert!(results[0].content.chars().count() <= params.max_content_tool_result);
@@ -3379,6 +4122,7 @@ mod tests {
             redacted: None,
             matched_filters: Vec::new(),
             match_pos: None,
+            locator: None,
         };
         let mut aggregation = SearchAggregation {
             retained_bytes: MAX_SEARCH_RESULTS_BYTES - 1,
@@ -4075,12 +4819,7 @@ mod tests {
     #[test]
     fn scan_capacity_reasons_make_counts_inexact_in_all_modes() {
         let root = env::temp_dir().join(format!("mcp-search-capacity-matrix-{}", process::id()));
-        for reason in [
-            "oversized_jsonl_lines=1",
-            "tool_blocks_cap",
-            "tool_pending_cap",
-            "tool_pending_bytes_cap",
-        ] {
+        for reason in ["tool_blocks_cap", "tool_pending_cap", "tool_pending_bytes_cap"] {
             let project = root.join(reason.replace('=', "-"));
             fs::create_dir_all(&project).unwrap();
             let first = project.join("a-session.jsonl");
@@ -4431,7 +5170,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_jsonl_line_is_counted_and_following_record_is_searchable() {
+    fn malformed_large_record_reports_parse_error_and_preserves_following_line() {
         let root = env::temp_dir().join(format!("mcp-search-oversized-test-{}", process::id()));
         let project = root.join("project");
         fs::create_dir_all(&project).unwrap();
@@ -4460,12 +5199,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.results[0].line, 2);
-        assert!(
-            result
-                .stats
-                .incomplete_reasons
-                .contains(&"oversized_jsonl_lines=1".to_string())
-        );
+        assert!(result.stats.incomplete_reasons.contains(&"parse_errors=1".to_string()));
         assert!(result.stats.incomplete);
         fs::remove_dir_all(root).unwrap();
     }

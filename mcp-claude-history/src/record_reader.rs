@@ -709,10 +709,17 @@ impl JsonIndex {
                 metadata: None,
             });
         }
+        if !matches!(self.nodes[root].kind, NodeKind::Object(_)) {
+            return Err(reader_error("parse_error", "历史记录必须是 JSON 对象"));
+        }
         let uuid = string_field(&mut self.reader, &self.nodes, root, "uuid")?;
         let msg_type = string_field(&mut self.reader, &self.nodes, root, "type")?;
         let timestamp = string_field(&mut self.reader, &self.nodes, root, "timestamp")?;
-        if uuid.is_none() && child(&self.nodes, root, "message").is_none() {
+        if crate::utils::is_internal_record(
+            msg_type.as_deref(),
+            child(&self.nodes, root, "uuid").is_some(),
+            child(&self.nodes, root, "message").is_some(),
+        ) {
             return Ok(IndexedRecord {
                 nodes: self.nodes,
                 root,
@@ -1594,6 +1601,23 @@ impl ByteSource for SliceBytes<'_> {
     }
 }
 
+struct LimitedBytes<'a, T> {
+    source: &'a mut T,
+    end: usize,
+}
+
+impl<T: ByteSource> ByteSource for LimitedBytes<'_, T> {
+    fn len(&self) -> usize {
+        self.end
+    }
+    fn get(&mut self, position: usize) -> Result<Option<u8>, ErrorResponse> {
+        if position >= self.end {
+            return Ok(None);
+        }
+        self.source.get(position)
+    }
+}
+
 pub struct TextBytes {
     cursor: TextCursor,
     base: usize,
@@ -2200,7 +2224,14 @@ pub fn sensitive_field_spans(
                 .map_or((bytes.len(), 0), |scope| (scope.0, scope.2));
             value_end(bytes, value_start, Some(scope))?
         } else if !quoted && bytes.at(separator)? == b'=' {
-            let (end, preserve) = expression_span(bytes, value_start)?;
+            let scope_end = quoted_scopes.last().map_or(bytes.len(), |scope| scope.0);
+            let (end, preserve) = expression_span(
+                &mut LimitedBytes {
+                    source: bytes,
+                    end: scope_end,
+                },
+                value_start,
+            )?;
             if preserve {
                 cursor = value_start;
                 continue;
@@ -2498,10 +2529,6 @@ pub fn render_text_range(
     range: Option<(usize, usize)>,
     mut write: impl FnMut(&[u8]) -> Result<(), ErrorResponse>,
 ) -> Result<(usize, usize, usize), ErrorResponse> {
-    let edits = match &bytes.cursor.projection.redactions {
-        Some(edits) => edits.clone(),
-        None => redaction_spans(bytes, mode)?,
-    };
     let character_count = bytes.cursor.projection.characters;
     let (start_char, end_char) = range.unwrap_or((0, character_count));
     if start_char > end_char || (range.is_some() && start_char >= character_count) {
@@ -2510,6 +2537,13 @@ pub fn render_text_range(
             format!("range 无效，original_content_size={character_count}"),
         ));
     }
+    if start_char == end_char {
+        return Ok((character_count, 0, 0));
+    }
+    let edits = match &bytes.cursor.projection.redactions {
+        Some(edits) => edits.clone(),
+        None => redaction_spans(bytes, mode)?,
+    };
     let (start, end) = if range.is_none() {
         (0, bytes.len())
     } else {
@@ -2722,6 +2756,171 @@ mod tests {
                 == Some(self.owner.as_str())
             {
                 std::fs::remove_dir_all(&self.root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn internal_record_classification_matches_ordinary_parser() {
+        for (value, expected) in [
+            (
+                serde_json::json!({"type":"api-request-blob", "hash":"fixture", "message":{"role":"user", "content":[]}}),
+                None,
+            ),
+            (
+                serde_json::json!({"type":"queue-operation", "timestamp":"fixture"}),
+                None,
+            ),
+            (
+                serde_json::json!({"uuid":"fixture", "type":"user", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":"visible"}}),
+                Some(true),
+            ),
+            (
+                serde_json::json!({"type":"user", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":"missing uuid"}}),
+                Some(false),
+            ),
+            (
+                serde_json::json!({"uuid":"fixture", "type":"user", "message":{"content":"missing timestamp"}}),
+                Some(false),
+            ),
+            (serde_json::json!({"uuid":null, "type":"user"}), Some(false)),
+            (
+                serde_json::json!({"uuid":"fixture", "type":"api-request-blob", "message":{}}),
+                Some(false),
+            ),
+        ] {
+            for padding in [0, MAX_JSONL_LINE_BYTES + 1] {
+                let mut value = value.clone();
+                value["padding"] = "x".repeat(padding).into();
+                let line = value.to_string();
+                let ordinary = parse_message_record(&line);
+                let fixture = Fixture::new(&line);
+                let indexed = index_record(
+                    fixture.open(),
+                    SourceSpan {
+                        start: 0,
+                        end: line.len() as u64,
+                    },
+                    true,
+                );
+                match expected {
+                    None => {
+                        assert!(ordinary.unwrap().is_none());
+                        assert!(indexed.unwrap().metadata.is_none());
+                    }
+                    Some(true) => {
+                        assert!(ordinary.unwrap().is_some());
+                        assert!(indexed.unwrap().metadata.is_some());
+                    }
+                    Some(false) => {
+                        assert!(ordinary.is_err());
+                        assert_eq!(indexed.err().unwrap().error, "parse_error");
+                    }
+                }
+            }
+        }
+        let malformed = r#"{"type":"api-request-blob","message":{]"#;
+        assert!(parse_message_record(malformed).is_err());
+        let fixture = Fixture::new(malformed);
+        assert_eq!(
+            index_record(
+                fixture.open(),
+                SourceSpan {
+                    start: 0,
+                    end: malformed.len() as u64
+                },
+                true
+            )
+            .err()
+            .unwrap()
+            .error,
+            "parse_error"
+        );
+    }
+
+    #[test]
+    fn rhs_redaction_stays_inside_outer_strings() {
+        use crate::utils::{RedactionMode, redact_text_with_mode};
+        for rhs in [
+            "fixture-secret",
+            "build(\"fixture-secret\")",
+            "build(node] + \"fixture-secret\"",
+            "build(\"前缀😀 fixture-secret\")",
+            "build(node, \"fixture-secret\"",
+        ] {
+            let mut text = serde_json::json!({"command":format!("中文😀 token={rhs}"), "keep":"visible", "blocks":[{"type":"text", "text":"later message"}]}).to_string();
+            let mut expected = serde_json::json!({"command":"中文😀 token=[redacted]", "keep":"visible", "blocks":[{"type":"text", "text":"later message"}]}).to_string();
+            for _ in 0..3 {
+                for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                    let fixture = Fixture::new(&text);
+                    let mut projection = TextProjection::default();
+                    projection.literal(text.clone());
+                    let mut bytes = TextBytes::new(projection.cursor(
+                        fixture.open(),
+                        SourceSpan {
+                            start: 0,
+                            end: text.len() as u64,
+                        },
+                    ));
+                    let mut rendered = Vec::new();
+                    let (_, _, count) = render_text_range(&mut bytes, mode, None, |chunk| {
+                        rendered.extend_from_slice(chunk);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let rendered = String::from_utf8(rendered).unwrap();
+                    assert_eq!(
+                        rendered,
+                        if mode.enabled() { &expected } else { &text }.as_str(),
+                        "{text}"
+                    );
+                    assert_eq!(count, usize::from(mode.enabled()));
+                    let ordinary = redact_text_with_mode(&text, mode);
+                    assert_eq!(ordinary.text, rendered);
+                    assert_eq!(ordinary.count, count);
+                }
+                text = serde_json::to_string(&text).unwrap();
+                expected = serde_json::to_string(&expected).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn empty_ranges_write_no_text_or_redaction_markers() {
+        use crate::utils::RedactionMode;
+        let text = "前缀😀 token=fixture-secret 后缀";
+        let fixture = Fixture::new(text);
+        for structured in [false, true] {
+            let mut projection = TextProjection::default();
+            projection.literal(text.to_string());
+            if structured {
+                projection.redactions =
+                    Some(redaction_spans(&mut SliceBytes(text.as_bytes()), RedactionMode::Auto).unwrap());
+            }
+            let mut bytes = TextBytes::new(projection.cursor(
+                fixture.open(),
+                SourceSpan {
+                    start: 0,
+                    end: text.len() as u64,
+                },
+            ));
+            let length = text.chars().count();
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                for position in 0..length {
+                    let result = render_text_range(&mut bytes, mode, Some((position, position)), |_| {
+                        panic!("empty range emitted text")
+                    })
+                    .unwrap();
+                    assert_eq!(result, (length, 0, 0));
+                }
+                for range in [(length, length), (length + 1, length + 1), (5, 4)] {
+                    assert_eq!(
+                        render_text_range(&mut bytes, mode, Some(range), |_| panic!("invalid range emitted text"))
+                            .unwrap_err()
+                            .error,
+                        "invalid_range"
+                    );
+                }
             }
         }
     }

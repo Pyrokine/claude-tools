@@ -75,10 +75,10 @@ enum RedactionSchema {
 
 #[derive(Debug, Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct SearchToolParams {
-    /// normal（默认）保留时间排序与 UUID 去重；scan 按冻结文件和物理行读取，不去重
+    /// normal（默认）保留时间排序与 UUID 去重；scan 读取冻结来源的物理行；sources 分页来源目录
     #[serde(default)]
     pub mode: Option<String>,
-    /// 原样使用 scan 返回的 next_query；绑定当前进程，最近一页重试会重放
+    /// 原样使用 scan/sources 返回的 next_query；绑定当前进程，最近一页按原预算重试会重放
     #[serde(default)]
     pub cursor: Option<String>,
     /// 单批处理字节预算，包含索引和投影读取，在固定缓冲边界检查
@@ -104,6 +104,15 @@ pub struct SearchToolParams {
     /// 原样使用 search 或 scan metadata 返回的精确 source，选择一个物理文件；与显式 project、sessions 取交集，子会话仍需 subagents=true
     #[serde(default)]
     pub source: Option<String>,
+    /// 精确来源数组，每组最多 128 个；与 source 互斥，project/session/subagents 条件仍生效
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+    /// sources 模式释放来源目录，需要 cursor；不删除用户导出
+    #[serde(default)]
+    pub release: Option<bool>,
+    /// 文件正文 preview（默认）或 full；与 structured 独立，full 需要 output
+    #[serde(default)]
+    pub output_content: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]
@@ -420,9 +429,9 @@ impl McpHistoryService {
     ) -> Result<CallToolResult, McpError> {
         let cfg = self.config.clone();
         let mode = p.mode.as_deref().unwrap_or("normal");
-        if mode != "normal" && mode != "scan" {
+        if mode != "normal" && mode != "scan" && mode != "sources" {
             return error_text(pretty_error(crate::utils::invalid_arguments(
-                "mode 仅支持 normal 或 scan",
+                "mode 仅支持 normal、scan 或 sources",
             )));
         }
         if mode == "normal" && (p.cursor.is_some() || p.scan_bytes.is_some() || p.scan_ms.is_some()) {
@@ -431,6 +440,12 @@ impl McpHistoryService {
             )));
         }
         let scanning = mode == "scan";
+        let sourcing = mode == "sources";
+        if !sourcing && p.release.unwrap_or(false) {
+            return error_text(pretty_error(crate::utils::invalid_arguments(
+                "release 需要 mode=sources",
+            )));
+        }
         let mut explicit_filters =
             serde_json::to_value(&p).map_err(|error| McpError::internal_error(error.to_string(), None))?;
         explicit_filters
@@ -438,7 +453,16 @@ impl McpHistoryService {
             .expect("SearchToolParams object")
             .retain(|key, value| {
                 !value.is_null()
-                    && !["mode", "cursor", "scan_bytes", "scan_ms", "limit", "max_total"].contains(&key.as_str())
+                    && ![
+                        "mode",
+                        "cursor",
+                        "scan_bytes",
+                        "scan_ms",
+                        "limit",
+                        "max_total",
+                        "release",
+                    ]
+                    .contains(&key.as_str())
             });
 
         let projects: Vec<String> = split_csv_param(p.project.as_deref());
@@ -471,6 +495,8 @@ impl McpHistoryService {
             all_projects: p.all.unwrap_or(false),
             sessions,
             source: p.source,
+            sources: p.sources.unwrap_or_default(),
+            output_content: p.output_content.unwrap_or_else(|| "preview".to_string()),
             since,
             until,
             types,
@@ -501,6 +527,29 @@ impl McpHistoryService {
             structured: p.structured,
         };
         let cancelled = context.ct.clone();
+        if sourcing {
+            if p.scan_bytes.is_some() || p.scan_ms.is_some() {
+                return error_text(pretty_error(crate::utils::invalid_arguments(
+                    "sources 枚举不使用正文 scan 预算",
+                )));
+            }
+            let scans = self.scans.clone();
+            let request = crate::stream_scan::SourcesRequest {
+                params,
+                cursor: p.cursor,
+                release: p.release.unwrap_or(false),
+                explicit_filters,
+            };
+            return run_history_work(
+                context,
+                move || scans.sources(&cfg, request),
+                |result| match result {
+                    Ok(text) => ok_text(text),
+                    Err(error) => error_text(pretty_error(error)),
+                },
+            )
+            .await;
+        }
         if scanning {
             let scans = self.scans.clone();
             let request = crate::stream_scan::ScanRequest {
@@ -1057,7 +1106,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(filter_error.error, "session_ambiguous");
-        assert!(filter_error.message.contains("返回的 source 精确选择来源"));
+        assert!(filter_error.message.contains("available.sources 中的 source"));
         assert_eq!(filter_error.available.unwrap()["sources"].as_array().unwrap().len(), 2);
         for (index, source) in paths.iter().enumerate().skip(1) {
             let params = serde_json::json!({"ref":"agent-same:1", "source":source, "before":0, "after":0});
