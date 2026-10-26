@@ -129,8 +129,26 @@ npm run test:extension
 - 连接策略变化必须立即取消 health check、CONNECTING WebSocket 和重连 timer；旧 socket 的 close 不能删除同端口的新连接
 - fallback console 并发读取必须按 tab 串行并原子清空注入缓冲；Service
   Worker 重启后 debugger 恢复仍须卸载旧 hook，同一日志不重复，页面后装的 console wrapper 不被覆盖
-- 超过 60 秒但未收到 `loadingFinished` 或 `loadingFailed` 的请求仍保持 pending；容量丢失或 debugger
-  detach 后，`networkidle` 必须保持 timeout，直到新 root Document 开始或 tab cleanup
+- 超过 60 秒但未收到 `loadingFinished` 或 `loadingFailed` 的请求仍保持 pending；容量丢失时 `networkidle`
+  保持 timeout，直到新 root Document 开始或 tab cleanup；debugger detach 或 Network 观测未建立时返回明确观测错误
+- `CS-N03`：让 CDP 输入序列阻塞在首次按键 RPC，同时请求 Extension
+  connect；后者须等待输入和目标恢复，第二个按键仍发送到 CDP，结束后保留新模式
+- `CS-N05`：同时连接 Extension 与显式 CDP，向 CDP target 传入 `frame`；解析前返回能力错误，Extension 默认页的计数器不变
+- `CS-N01`：在 CDP 页面 A 留下日志，临时在 B 执行 evaluate，再读 A/B 日志；各页日志保留且互不混用，显式 clear、关闭目标和连接重置按各自范围清理
+- `CS-N02`：模拟收到 200 响应头后响应体失败；保留 status 与 errorText，只记录一次终态；正常 body 完成后清理关联，其他 session 事件不改变结果
+- `CS-N04`：precise、stealth 与 CDP 分别覆盖 keydown/keyup 的准备过期、队列过期和末次 RPC 迟到；后续事件不执行，unknown 不自动重放，剩余预算贯穿到 Extension
+  deadline 和 CDP send
+- `CE-R05`：首次 storage 读取延迟返回旧 true，其间显式设 false；下一次发现服务器仍拒绝无 token 连接；缺省设置继续自动连接本地 Server
+- `CE-N01`：两个同 URL iframe 在探测与 native
+  owner 查询之间重排、保持相同数量；仍按 document/frame 身份选择原目标，document 失效时明确失败，副作用计数器不变
+- `CE-N02`：分别让分组移动先执行、release 先执行、成员在等待锁期间变化；涉及成员按确定顺序串行，锁内重新检查权限与成员，拒绝分支无 native
+  move；向混合分组加入自有受控页仍保持原有权限合同
+- `CE-N04`：后台 fulfilled 响应含 storage
+  error 时，popup 显示保存失败、恢复按钮可用，并保留未保存 token 文本；不要求手动点击连接才能恢复正常调用
+- `CE-N05`：diagnostics 关闭时显式 networkidle 仍在导航前建立 Network 观测；进行中的请求、启用失败和中途 detach 均不返回假空闲；默认 load 不启用额外观测
+- `DOC-C01`：newPage/updatePage 等不适用 action 传入 activate 时，在任何操作前拒绝；newPage 的 active 与 movePage 的 activate 分别按既有合同工作
+- 连续截图或激活超时：先核对当前 Server 与 Extension
+  bundle 身份；受控测试页连续失败后检查公开错误与 pageContext，再用新 context 执行普通读取；只有当前构建实际复现时才能判定旧故障仍存在，不增加全局 timeout
 - PNG 解码必须拒绝重复 IHDR、IEND 后附加 chunk、超量解压和 scanline 缺失，并保留合法 RGB/RGBA 输入
 - `tmp:` 输出位于带归属标记的单次 server 会话目录，超过 256 项或 128 MiB 时拒绝写入；成功写入 `tmp:` 的响应包含
   `retention` 清理条件，`cwd:`
@@ -176,7 +194,7 @@ npm run test:extension
   `extension.helloReceived=true`、`extension.bundleStatus="match"`，活动 hash 与预期 hash 相同；带 `port` 时
   `mode="cdp"`
 - 载体：N/A
-- 备注：不带 `port` 的 `connect` 回到 Extension。只有显式传 `port` 才选择 CDP；`legacy`
+- 备注：不带 `port` 的 `connect` 回到 Extension，只有显式传 `port` 才选择 CDP；`legacy`
   表示旧 Extension 未上报 hash，`stale` 表示浏览器仍在运行旧 bundle，这两种状态都不阻断自动连接
 
 ### browse-list-01
@@ -583,6 +601,9 @@ npm run test:extension
 
 - 断言：`success=true`，`result === "Frame Button"`，`staleContextRetry === "readOnly"`，`retryAttempted === true`，
   `frameContext.executionContextId` 非空；脚本本身不写页面状态
+- 反例：同 URL iframe 的 owner 探测在重试解析时遇到原生
+  `No document with id`，在原 timeout 内重新取得当前 document，记录用户脚本执行次数为 2，解析次数独立计数；解析失败不再执行脚本，权限拒绝立即失败，默认
+  `never` 保持执行 1 次
 - 断言：主框架的 `__mcp_stale_fixture.startedAt` 与 `reloadedAt`
   均非空，`0 < reloadedAt - startedAt < 1000`；副作用计数保持为 0
 - 载体：独立 managed test-page
@@ -937,10 +958,14 @@ npm run test:extension
 - 断言：返回结构 `{ state: { pageContent, viewport, interactiveElements } }`，`pageContent` 非空字符串（含 accessibility
   tree 文本），`viewport.width/height` 为数字，`interactiveElements`
   含 role/name/selector/visible/disabled/bounds/covered
-- 密码保护：仅在自有页写入自造 password sentinel，分别读取整页、指定 password 子树和 `output` 文件， `pageContent` 与
-  `interactiveElements[].name`
-  均不含密码值；带标签、placeholder 或 title 的密码框保留名称，普通输入值保持可读，实际函数回归以抛错的 password value
-  getter 验证自动命名不读取该值
+- 隐藏值保护：仅在自有页给 `input[type=hidden]` 与 `input[type=password]`
+  设置自造 sentinel，分别读取默认整页、指定子树和 `output` 文件，`pageContent` 与 `interactiveElements[].name`
+  均不含这些值
+- getter 对照：在上述两类自有输入元素上安装会计数并抛错的 value getter，默认 `all`
+  和目标子树均成功返回，getter 读取次数为 0；隐藏元素仍保留类型、标签和
+  `visible=false`，带 aria-label、label、placeholder 或 title 的元素保留名称
+- 普通值对照：同页普通 text input 的非空短 value 仍出现在名称和正文中，submit
+  input 的长标签保留，显式脚本、HTML、属性和普通 `extract(type=text)` 保持各自原有合同
 - 载体：test-page
 
 ### extract-state-02-target
@@ -955,20 +980,21 @@ npm run test:extension
 - 断言：返回 `pageContent`（accessibility tree 输出为扁平文本，depth 参数影响生成逻辑但返回格式不直接体现层数）
 - 载体：test-page
 
-### extract-state-04-domsnapshot (CDP-only)
+### extract-state-04-domsnapshot
 
-- 前置：跑前需 CDP 模式（不在 Extension 模式下测试）
+- 前置：准备受控测试页，分别使用 CDP 和 Extension
 - 操作：`extract { type: "state", mode: "domsnapshot" }`
 - 断言：返回 `snapshot.documents` 数组（CDP `DOMSnapshot.captureSnapshot` 原始结果），含 `nodes` / `layout` /
   `textBoxes`
+- 文件对照：传入 `output`，文件包含同一目标的原始完整快照
 - 载体：test-page
-- KNOWN-LIMIT：Extension 模式下抛 INVALID_ARGUMENT（仅 CDP 支持）
 
-### extract-state-05-domsnapshot-ext-error
+### extract-state-05-domsnapshot-scopes-and-permissions
 
-- 操作（Extension 模式）：`extract { type: "state", mode: "domsnapshot" }`
-- 断言：返回 `error.code === 'INVALID_ARGUMENT'`，message 提示仅 CDP 支持
-- 载体：任意
+- 操作：分别在两种 backend 中给整页 DOMSnapshot 传入 `frame`、`target` 或 `depth`
+- 断言：返回 `INVALID_ARGUMENT`，不读取被忽略选择范围之外的快照
+- 权限对照：Extension 中普通只读授权页仍拒绝 debugger 快照，受控页可读取
+- 载体：自有测试页
 
 ### extract-metadata-01
 
@@ -982,9 +1008,10 @@ npm run test:extension
   相同，最近使用时间可随读取更新；CDP 的 `managed` 返回 false，不要求或调用 Extension-only 的 adoptPage
 - 文件与 iframe：传 `output` 后回读文件，字段与 inline 相同；Extension 指定本任务 iframe 时，文档标题属于 iframe，
   `managed` 与备注仍属于页面 T，读取不执行 adopt、导航或激活
-- 重载恢复：独立测试浏览器自动重载 Extension 并核对新构建连接身份后，复用原页面和同一 iframe
+- 重载恢复：记录受控页 T 的原生主文档 documentId，在独立测试浏览器原生重载 Extension 并核对新构建连接身份后，复用原页面和同一 iframe
   selector，连续两次 inline 和一次 `output`
-  读取均返回原文档 URL/title，回读文件与 inline 一致，frames 中保留该 iframe 的 selector/rect；不刷新、导航或替换目标
+  读取均返回原文档 URL/title 和 `managed=true`，备注保持，回读文件与 inline 一致，frames 中保留该 iframe 的 selector/rect；原生 documentId 保持，不刷新、导航、替换目标或重新 adopt
+- 恢复边界：正常导航后再次重载可恢复当前文档；release 后重启和重载均不恢复完整权限；用隔离故障注入验证跨浏览器代际的相同 tab ID、不同 documentId 不授予权限，缺少 documentId 时原本合法的 create/adopt 和同代际 Worker 恢复仍可用，跨 reload 恢复受限并有可见说明
 - 实例与失败：另一独立 Server 返回未知创建来源和空备注，不继承原 Server 的任务提示；关闭目标或目标状态读取失败返回错误，不能将缺失状态返回成
   `managed=false` 的成功结果；只读页面的 false 值保留，元信息不授权输入或脚本
 - 载体：test-page，不操作业务页面
@@ -1014,6 +1041,8 @@ npm run test:extension
 - 前置：attach test-page，先 `evaluate "document.getElementById('mouse-log').textContent=''"` 清空
 - 操作：`input { events: [{type:"click", target:{css:"#click-test"}}] }`
 - 断言：evaluate 读 `#mouse-log` textContent，包含 "单击测试"（onclick 记日志）
+- Extension 后台对照：测试页保持 inactive，独立读取 `document.visibilityState=hidden`，普通元素点击在本次预算内完成，业务计数只增加一次；原生鼠标移动无响应不能阻断已有原子元素点击，不激活页面或重放业务动作
+- 注册回归：precise/stealth、主页面/iframe 与 force 对照中，普通元素点击不调用原生或脚本鼠标移动，保留原子点击、可操作性检查和 force 语义，并更新逻辑鼠标位置；坐标、多键、多击和 humanize 的既有路径继续分别验收
 - 载体：test-page
 
 ### input-click-02-role
@@ -1330,6 +1359,20 @@ npm run test:extension
 - 操作：`[{keydown, key:"a", commands:["selectAll"]}, {keyup, key:"a"}]`
 - 断言：`#text-input.selectionStart=0, selectionEnd=11`，selectedText="hello world"
 
+### input-keydown-04a-commands-coordinate-focus
+
+- 前置：自有测试页包含未选中的 checkbox、带 href 的链接、text input、contenteditable、disabled
+  input 和无 tabindex 的 div，监听鼠标事件并记录 URL；Extension
+  precise 和独立 CDP 分别执行，Extension 另包含 iframe 变体
+- 操作：按各元素当前中心坐标发送
+  `{type:"keydown",key:"a",commands:["selectAll"],target:{x:X,y:Y}}`，成功时发送对应 keyup；iframe 坐标使用所选文档的局部坐标
+- 断言：成功目标成为 activeElement，checkbox 保持未选中，URL、点击及 mousedown/mouseup 计数不变；text
+  input 的选区覆盖原值，contenteditable 可被后续 editorContext 读取；默认目标和 frame 在成功或失败后恢复
+- 错误对照：视口外坐标返回 `TARGET_NOT_FOUND`，disabled 或不可聚焦目标返回
+  `TARGET_FOCUS_FAILED`，focus 抛错保留错误；所有失败均不派发 commands 或后续事件，不通过点击尝试恢复焦点
+- 期限对照：注册入口分别使坐标查找或 focus 消耗全部预算，后续命令和 editor 操作均不执行；成功分支逐层传递剩余预算，CDP 坐标聚焦不调用不支持坐标的 Locator.find
+- stealth 对照：commands 在任何查找、focus 或鼠标动作前返回既有不支持错误
+
 ### input-keydown-05-commands-copy-paste
 
 - 状态：KNOWN-LIMIT，见附录 A
@@ -1384,8 +1427,10 @@ npm run test:extension
 
 ### input-stealth-click-03-middle-buttons
 
-- 操作：`button:"middle"`
-- 断言：mousedown buttons=4（W3C middle 位掩码）
+- 前置：在自有测试页监听 mousedown、mouseup、click、auxclick、dblclick 与 contextmenu，测试函数分别使用坐标和 refId
+- 操作：`button:"middle"`，分别使用 `clickCount:1`、`2` 和 `3`，另执行独立的 middle mousedown/mouseup
+- 断言：每次按下 `button=1`、`buttons=4`，每次释放 `buttons=0`，随后派发
+  `auxclick`；多击 detail 依次递增，不派发 click、dblclick 或 contextmenu，独立 mouseup 同样使用 auxclick
 
 ### input-stealth-click-04-doubleclick-detail
 
@@ -1418,7 +1463,7 @@ npm run test:extension
 - 已移动后超时：`eventsExecuted=0`、`actionExecuted=true`、`actionStatus="unknown"`、`retryable=false`，不把已执行的鼠标移动报告为未执行，不自动重放
 - 注册入口回归：模拟时钟使首个移动耗尽预算后，只允许一次移动、不点击；覆盖 humanized
   click/mousemove、普通 click/mousedown、type 的目标聚焦及 CDP 直线分步；另验证定位和 driver 准备消耗后传递剩余时间、RPC/Extension 队列及实际页面脚本拒绝过期派发
-- 同类调用方回归：命令与 select/replace 的坐标聚焦到期后不执行后续动作，文本选择的第二次移动到期后不点击且释放 Shift，动作和释放均失败时保留原动作错误；replace 的选区轮询耗尽预算后不更新文本，预算充足时正常替换；CDP
+- 同类调用方回归：命令与 editor 的坐标聚焦只定位并 focus，查找或 focus 到期后不执行后续动作；select/replace 的坐标鼠标准备到期后停止，文本选择的第二次移动到期后不点击且释放 Shift，动作和释放均失败时保留原动作错误；replace 的选区轮询耗尽预算后不更新文本，预算充足时正常替换；CDP
   touchmove 直接与分步移动到期后不执行后续触摸点和事件
 - 计时保留端到端测量，服务内部未采集时明确记录，不用模拟时钟结果代替公开验收
 - 载体：test-page
@@ -1586,7 +1631,9 @@ npm run test:extension
 - 状态：条件，仅在独立测试浏览器环境中执行
 - 前置：agent 在该环境中创建 managed 测试 tab T，不存在用户窗口、tab 或登录态
 - 操作：`manage { action:"activatePage", targetId:<T> }`
-- 断言：`success=true`，`affected.after.active=true`
+- 断言：Extension 返回 `success=true`、`affected.after.active=true`
+- CDP 对照：为默认操作页 D 和待激活页 T 分别指定 ID，通过 `manage activatePage targetId=<T>`
+  激活，独立观察 T 已成为前台页；默认操作目标仍为 D，affected 只返回实际可读字段，不构造 `active` 或窗口焦点
 
 ### manage-focusWindow-01
 
@@ -1594,6 +1641,7 @@ npm run test:extension
 - 前置：agent 在该环境中创建测试窗口 W，不存在用户窗口、tab 或登录态
 - 操作：`manage { action:"focusWindow", windowId:<W> }`
 - 断言：`success=true`，`affected.after.focused=true`
+- 成员对照：分别在全部受控、混合成员和全部非托管的自有窗口执行，显式窗口聚焦均可用，非托管成员权限不变
 
 ### manage-resizeWindow-01
 
@@ -1604,7 +1652,8 @@ npm run test:extension
   接近设置值，等待后独立 `browse list details=full` 的窗口几何与响应一致
 - 恢复对照：记录 normal 基准，将 W 最大化，再用一次 `resizeWindow windowState=normal`
   同时传入基准位置和尺寸，首次恢复返回 normal，独立读取与基准及响应一致，不靠重复同一恢复请求满足断言
-- 清理：`manage closeWindow windowId=<W>`
+- 混合成员对照：解除其中一个自有 tab 的托管后重复尺寸与状态调整，结果可用，成员权限保持不变
+- 清理：将本用例解除托管的自有页重新 adopt，再执行 `manage closeWindow windowId=<W>`
 
 ### manage-newWindow-01
 
@@ -1641,6 +1690,8 @@ npm run test:extension
 - 负例：窗口、来源 tab 和分组不属于同一窗口，或 pinned=true 与已有分组同时指定时，创建前拒绝；跨窗口冲突返回
   `actionExecuted=false`、`actionStatus="not_started"`、`failureStage="preflight"`，独立 list 确认没有新增页
 - 默认创建对照：省略原生位置参数创建自有页，自动显示分组后的实际窗口与创建窗口一致，不移入其他窗口
+- 混合缓存窗口：在默认 MCP 窗口中解除一个自有页的托管，再不带位置参数创建页面，新页仍位于原窗口，窗口数量不增加，新页受控，非托管成员权限不变
+- 错误对照：窗口确实关闭时按现有路径创建新窗口并报告恢复日志；查询发生其他原生错误时直接返回错误，不因该错误创建窗口
 - 清理：关闭新建测试页
 
 ### manage-updatePage-01-native-state
@@ -1666,10 +1717,11 @@ npm run test:extension
 ### manage-updateGroup-01-properties
 
 - 状态：条件，仅在独立测试浏览器环境中执行
-- 前置：准备所有成员均受控的测试组 G
+- 前置：准备全部受控、混合成员和全部非托管的自有测试组 G
 - 操作：更新 title、九种合法 color 和 collapsed，设置 `title=""` 与 `collapsed=false`
 - 断言：实际组属性与 `affected.after`、`browse list.groups` 一致，空字符串与 false 不被替换，颜色只属于分组
-- 负例：非法颜色、无配置、负 groupId、readonly shared 写入或组内存在未受控成员时拒绝
+- 权限对照：名称、颜色和折叠变化不授予非托管成员读取、输入或 debugger 权限
+- 负例：非法颜色、无配置、负 groupId、目标组不存在或 readonly shared 写入时拒绝
 
 ### manage-moveGroup-01-window-and-index
 
@@ -1677,6 +1729,7 @@ npm run test:extension
 - 前置：准备所有成员均受控的组 G 与独立测试窗口 W
 - 操作：`moveGroup groupId=<G> windowId=<W> index=-1`，再按可用 index 调整位置
 - 断言：整组及成员均移入 W，实际顺序、首个成员位置和窗口归属回显正确，成员受控状态不变
+- 非托管成员对照：解除一个自有成员的托管后请求整组移动，在移动前拒绝，组及成员位置不变
 
 ### manage-ungroupPages-01-retain-control
 
@@ -1684,6 +1737,14 @@ npm run test:extension
 - 前置：测试组 G 只包含受控页 T1/T2
 - 操作：分别解除 T1 和剩余 T2 的分组
 - 断言：成员 groupId=-1 且 managed=true，最后一个成员离组后 Chrome 删除空组，读取和输入能力保留
+
+### manage-groupPages-02-unrelated-member-change
+
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：准备受控目标页 T 和同组的其他自有页 U，用隔离 Extension API 包装在前后快照之间改变 U 的分组归属
+- 操作：分别请求 T 创建分组、加入指定组、解除分组；另对有效 groupId 更新显示属性
+- 断言：无关 U 的变化不阻止有效目标操作，U 的权限不变
+- 目标对照：排队期间 T 解除托管、窗口或分组身份改变时，成员操作仍在副作用前拒绝；整组移动继续拒绝成员集合变化
 
 ### manage-newWindow-02-multiple-urls-and-existing-tab
 
@@ -1697,18 +1758,18 @@ npm run test:extension
 ### manage-updateWindow-01-native-state
 
 - 状态：条件，仅在独立测试浏览器环境中执行
-- 前置：窗口 W 内所有页受控
+- 前置：准备自有窗口 W，分别覆盖全部受控、混合成员和全部非托管状态
 - 操作：修改位置、尺寸、normal/minimized/maximized/fullscreen 状态、focused 与 drawAttention，分别读取实际窗口状态
 - 断言：参数到达 Chrome，状态转换和几何稳定后返回浏览器观测值，不把 OS 调整后的尺寸伪装成输入值，focused=true 只有观测到焦点才报成功
 - 首次恢复：分别从 maximized/minimized/fullscreen 用单次 `updateWindow windowState=normal`
   恢复原 normal 基准位置和尺寸，`affected.after.state=normal`，等待后独立 `browse list details=full`
   与响应及有效基准一致，不允许第二次恢复请求掩盖首次失败
-- 负例：状态与 bounds 冲突、focused/state 冲突及混合窗口更新拒绝，缓存的 MCP window ID 不赋予额外权限
+- 负例：状态与 bounds 冲突、focused/state 冲突或无效窗口 ID 时拒绝，窗口显示变化不赋予成员页面权限
 
 ### manage-configuration-01-backend-and-argument-errors
 
-- 操作：在 CDP 模式调用 Chrome
-  UI 配置动作及带原生 UI 参数的 newPage；在 Extension 模式给动作传不适用字段、未知字段或 readonly 字段
+- 操作：在 CDP 模式调用 `focusWindow/updateWindow/groupPages`
+  等 Extension 原生 UI 配置动作及带原生 UI 参数的 newPage；在 Extension 模式给动作传不适用字段、未知字段或 readonly 字段
 - 断言：CDP 返回能力错误且未创建/修改页面，参数错误在变更前拒绝，无静默忽略及假成功
 
 ### manage-viewport-01
@@ -1735,6 +1796,29 @@ npm run test:extension
 
 - 操作：`manage { action:"emulate" }`（不带 device）
 - 断言：返回 devices 列表，包含 "iPhone 13"、"iPad Pro" 等
+- 页面独立对照：无默认目标、默认页已关闭，以及显式 targetId 不存在时返回同一目录，不读取页面或改变默认目标
+- 条件对照：目录查询携带 `expectedUrl` 或 `expectedRevision` 时返回
+  `INVALID_ARGUMENT`；实际设置 device 继续校验目标和条件
+
+### manage-blank-page-01-debugger-capabilities
+
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：Extension 中创建受控 `about:blank` 页 T
+- 操作：对 T 设置 viewport、userAgent、emulate，并用 precise
+  evaluate 读取实际值；分别在 inputMode 为 precise 和 stealth 时执行管理动作
+- 断言：原生命令与 resize 事件链完成，视口、UA、触摸等按请求生效，precise
+  evaluate 返回实际值，管理动作不依赖脚本注入模式
+- 权限对照：非托管页、仅普通只读授权页，以及 `chrome://`、`chrome-extension://` 受限页仍按各自权限拒绝
+
+### extract-frame-06-unavailable-sibling
+
+- 状态：条件，仅在独立测试浏览器环境中执行
+- 前置：准备包含有效 iframe T 和自有 sibling
+  U 的受控页面，在独立 Extension 中分别注入 U 缺失 documentId 或 U 探测脚本拒绝的故障
+- 操作：选择 T 读取正文和状态，随后提取父页 metadata；再选择 U 执行相同读取
+- 断言：T 可用，metadata 的 `unavailableFrames` 和 U 对应的 `unavailableReason` 标明错误；选择 U 返回
+  `FRAME_IDENTITY_UNAVAILABLE`，不操作 T 或其他 iframe
+- 身份对照：父文档变化、选中 frame 映射不唯一时仍拒绝，探测与对象清理完整，有副作用脚本不自动重放
 
 ### manage-inputMode-01
 
@@ -1822,16 +1906,16 @@ npm run test:extension
 
 ### Cloudflare 实测约束
 
-真实站点只作补充观察，不加入发版门禁。进入 Cloudflare 站点前，先用 `browse { action: "list" }` 确认
+真实站点只作补充观察，不加入发版门禁，进入 Cloudflare 站点前，先用 `browse { action: "list" }` 确认
 `mode="extension"`，不传 `port`，也不传
-`diagnostics=true`。CDP 模式超时只能记录为 CDP 路径未完成，不能写成网站或用户真实 Chrome 无法通过。
+`diagnostics=true`，CDP 模式超时只能记录为 CDP 路径未完成，不能写成网站或用户真实 Chrome 无法通过
 
 ### browse-challenge-01-js-wait
 
 - 前置：attach 到 test-page，点击 `#challenge-js-btn`
 - 操作：`evaluate { script:"document.title" }`
 - 断言：约 1.2s 后 `success=true`，`mode="extension"`，`result === "MCP Chrome 测试页面"`，`#challenge-status` 为
-  `js-resolved`。恢复发生在八秒被动等待内时不得启用 debugger 或执行 page evaluate
+  `js-resolved`，恢复发生在八秒被动等待内时不得启用 debugger 或执行 page evaluate
 - 载体：test-page
 
 ### browse-challenge-02-turnstile-click
@@ -2105,7 +2189,7 @@ test-page.html 现有 region（供用例引用）：
   value、requested find、推荐模式
 - `ch-postcondition-01`: 已完成动作后的 false selector 返回 `actionStatus=completed`、`verificationStatus=not_matched`、
   `failureStage=verification`
-- `ch-postcondition-02`: frame/context/debugger 不可用返回 `verificationStatus=unavailable`，不伪装为 `not_matched`
+- `ch-postcondition-02`: 两种 backend 的原生 frame/context/debugger 不可用返回 `verificationStatus=unavailable`，覆盖真实 `Runtime.callFunctionOn: Cannot find context with specified id`；页面验证脚本抛出相同完整文案、无前缀文案或 debugger 文案时仍返回 `error`，同步 throw 与异步 reject 都验证；已完成动作保留 `actionStatus=completed` 和 `failureStage=verification`，独立读取业务计数为 1，不重放主动作
 - `ch-timeout-01`: 在自有页初始化 started/completed 计数，通过两种 backend 的 `manage cdp Runtime.evaluate`
   设置 1ms 协议 timeout，脚本先增加 started，再执行有界计算并增加 completed；独立读取实际计数，原生
   `Execution was terminated`（含实际 CDP 方法前缀）返回
@@ -2113,11 +2197,15 @@ test-page.html 现有 region（供用例引用）：
   脚本命令的 `Internal error` 或执行中 RPC timeout；这些结果未知的错误均不可直接重试，不把 RPC
   timeout 改称原生终止，调用前超时仍保留未执行及可重试状态；页面主动抛出的同名异常仍为动作失败；本地注册 callback 回归须用 CDPClient 实际消息转换覆盖
   `Runtime.evaluate`、`Runtime.callFunctionOn`、`Runtime.runScript`，同时保留普通参数错误和非脚本命令的负例
-- `ch-target-01`: input、extract、wait 的 target timeout 返回 locator、target
-  type、nth、URL、tabId、managed、frame、match count、最多 10 个候选和 last state
+- `ch-target-01`: 两种 backend 的 input、extract、wait 定位失败返回 locator、targetType、nth、currentUrl、tabId、managed、frame、matchCount、最多 10 个候选和 lastLocatorState；15 个匹配元素、`nth=30`、`timeout=500ms` 返回真实 `matchCount=15`，不把候选上限或 nth 越界当作总匹配数；CDP input/extract 保留 `ELEMENT_NOT_FOUND` 及原 URL/logs，wait 保留 `TIMEOUT`，不附与定位无关的焦点提示；诊断与动作共用原 deadline，失败目标/frame 作用域退出前读取，不重新派发动作；故障注入验证未知匹配数或 managed 为 null，诊断失败有 diagnosticError，不覆盖主错误或探测恢复后的默认页；沿用 `ch-password-01` 的完整响应脱敏断言
 - `ch-port-01`: 无 server 时 Extension 的聚合扫描摘要与重连消息均为 debug，不为每个候选端口输出 warning/error
 - `ch-port-02`: 已识别 MCP
-  server 的 token/proof 不匹配或认证协议不完整时，输出一条限量 warning；同一摘要重连时不重复刷屏
+  server 的 token/proof 不匹配或认证协议不完整时，输出一条限量 warning；同一摘要自动重连时不重复，拒绝消失后再出现须重新告警；显式 disconnect 后重新开始报告
+- `ch-port-03`: 发现集合依次为 A、A、同数量不同端口 B、空、空、A，恰好输出四条发现摘要，每次仍检查完整 78 个端口；显式断开后相同集合重新报告，过期 generation 的迟到结果不改变当前发现及拒绝摘要
+- `ch-cdp-01`: 在自有页禁用 Debugger 域，再调用 `Debugger.getScriptSource`，返回 `CDP_ERROR` 与 `domain_not_enabled`；显式启用后使用无效 scriptId，返回 `resource_not_found`，保留 method、targetId、原生 message 及可用的 code，两次调用均失败且不自动重试
+- `ch-cdp-02`: 在 Extension 模式请求浏览器级命令及不存在的方法，保留能力拒绝、`Not allowed` 权限拒绝和 `method_not_found`；资源查询中的 not found 不升级为整个域不支持；未知原生异常保持错误，不伪装为成功
+- `ch-cdp-03`: 通过 `manage cdp Runtime.evaluate` 设置 `returnByValue=true`，脚本增加自有计数后返回自引用对象，验证 Chrome 实际产生的原生序列化拒绝；注册 callback 和 Extension 边界反例分别覆盖 `Object couldn't be returned by value` 与 `Object reference chain is too long`，错误保留 `CDP_ERROR`、`actionExecuted=true`、`actionStatus=unknown`、`retryable=false`，独立读取计数只增加一次；iframe precise 使用相同断言，`readOnly` 策略也不重放序列化失败
+- `ch-cdp-04`: 页面脚本主动抛出与原生序列化、关闭 tab 或调试错误相同的文本，仍是脚本异常并保留 `retryable=false`；原生页面快照及权限检查遇到实际关闭目标时返回失败和 warning，其他查询错误保持原身份
 - `ch-frame-01`: iframe 导航销毁 context 后，默认 `staleContextRetry=never` 不重放有副作用脚本；显式 `readOnly`
   时最多重放一次，并返回策略、retry 和最终 frame/context 摘要
 - `ch-frame-02`: 两个相同 URL iframe 无法唯一确认所选 DOM owner 时返回 bounded
@@ -2125,6 +2213,8 @@ test-page.html 现有 region（供用例引用）：
 - `ch-frame-03`: 页面 DOM iframe 与 `webNavigation`
   额外 frame 同时存在时，selector 和 index 都按 DOM 元素身份命中目标，无法建立唯一映射时返回
   `FRAME_IDENTITY_UNAVAILABLE`
+- `ch-frame-04`: 使用已启用开发者模式的独立 Chrome profile 和独立测试 Server，阻止测试扩展访问其他 MCP 端口；加载修复前制品并访问自有 iframe，再在相同扩展路径更新及原生重载，保留页面不导航；新 worker 构建身份匹配后重复读取 iframe，结果正确且没有新增 ERROR，真实重载结果与 VM 故障注入分别记录
+- `ch-frame-05`: 故障注入覆盖 chrome/runtime 缺失、sendMessage 同步与异步 context invalidated、旧监听及安装标记共存；失效探测产生可见 warning 并移除自身监听，普通消息拒绝保留诊断且无 ACK，新请求不触发旧协议；两条父端探测均保留随机 token、document 与唯一候选验证，结束后拒绝迟到身份上报并释放 CDP 对象
 - `ch-password-01`: 仅用自造 password value、input `find` 和替换 `text` sentinel，分别执行 Extension/CDP 的
   `select`/`replace` 成功与失败、selector/nth 和 post-condition 对照；完整响应不得泄露 sentinel，诊断正文返回
   `redacted=true` 与
@@ -2142,10 +2232,10 @@ test-page.html 现有 region（供用例引用）：
 - `ch-challenge-03`: Access denied 返回 `CHALLENGE_DENIED`
 - `ch-challenge-04`: 超时返回 `CHALLENGE_TIMEOUT`，`retryable=true`，响应不包含 cookie 值；点过 checkbox 时
   `challengeKind="turnstile"` 且 `clickedTurnstile=true`，未 inspect 的标题快照不得覆盖该类型
-- `ch-challenge-05`: 目标页已恢复后，残留 Cloudflare iframe 不继续判 pending
-- `ch-challenge-06`: 中文标题 `请稍候…` 或正文“正在进行安全验证”仍判为 JS Challenge
+- `ch-challenge-05`: 目标页已恢复后，仅残留 Cloudflare iframe 或旧 pending header 不继续判 pending，不触发滚动或点击；可见的验证 widget、verify 控件或正文仍保持等待
+- `ch-challenge-06`: 两种 backend 分别覆盖中文标题 `请稍候…` 和普通标题下可见正文“正在进行安全验证”，均判为 JS Challenge，等待超时前业务计数为 0，正文恢复后业务动作最多执行一次；隐藏标记和无标记普通页面直接继续，没有固定八秒等待
 - `ch-challenge-07`: CDP 用 `Target.getTargetInfo` 读标题，启动时不启用 `Runtime.enable`
-- `ch-challenge-08`: Extension 在前八秒只读真实 tab 标题，不附加 debugger；标题恢复后直接返回
+- `ch-challenge-08`: Extension 在 Challenge 标题持续期间的前八秒只读真实 tab 标题，不 inspect、evaluate 或附加 debugger；标题恢复后完成有界可见内容检查，无验证证据时立即返回；普通页面的 evaluate/input 在检查后保留已有自有 debugger 连接，普通标题下发现可见验证控件或仍需验证的正文后才卸除，只有源站响应等待时保留连接，Challenge 标题下首次 inspect 前卸除
 - `ch-challenge-09`:
   Extension 八秒后仍出现可见 Turnstile 才检查并点击；同一类 checkbox/widget 在同一次等待里只点一次，换成可见的
   `Verify you are human` / `请验证您是真人` 按钮后 inspect 判成 `verify`
@@ -2168,7 +2258,7 @@ test-page.html 现有 region（供用例引用）：
   `eventsExecuted=0`；每次拒绝后独立读取脚本计数、输入状态和 URL，确认均未变化旧 Extension 实际返回
   `Unknown action: network_challenge_state` 时记录 server
   warning，回退到标题和 DOM 检测，不中断无条件导航或重放脚本其他接口的 Unknown
-  action 不代替该负例；恢复当前 Extension 后，公开 connect 再次确认版本与 bundle match
+  action 不代替该负例；真实旧 Extension 只返回组摘要、缺少 tabIds/targetIds 时，按同次 windows/tabs 中的 groupId 恢复实际成员和首个成员位置，summary/full、targetIds、managedOnly 及空交集分别验证，原生 false 属性和 totalTabCount 保留，无额外 RPC；完全缺少 groups 时，页面和窗口仍可列出，省略未知 groups 并有能力 warning；本地反例区分缺失、合法空数组、合法旧摘要、只提供一个成员数组及 null/非数组等畸形 groups，现代分组成员过滤不变，未知 RPC 错误继续失败；恢复当前 Extension 后，公开 connect 再次确认版本与 bundle match
 - `ch-challenge-11`: Cloudflare 可见文案明示验证成功但源站未响应时返回
   `originResponsePending=true`；两种 backend 的 evaluate 在成功、动作失败、后置验证不匹配及输出失败时均保留
   `challengeResolved`、`challengeKind`、`waitedMs`、`clickedTurnstile`、`clearanceCookiePresent`
@@ -2214,9 +2304,9 @@ test-page.html 现有 region（供用例引用）：
 
 ## Windows 兼容与页面授权专项
 
-以下用例只使用新建的独立测试页。不得导航、关闭或激活用户原有 Tab；C4 的授权负例只在独立测试 Chrome
-profile 中执行。无需浏览器的回归由 `npm test` 和 `npm run test:extension` 覆盖；Windows 原生行为只有在 Windows
-runner/主机实际执行后才算完成。
+以下用例只使用新建的独立测试页，用户原有 Tab 保持导航、打开和活动状态；C4 的授权负例只在独立测试 Chrome
+profile 中执行，无需浏览器的回归由 `npm test` 和 `npm run test:extension` 覆盖；Windows 原生行为只有在 Windows
+runner/主机实际执行后才算完成
 
 ### win-page-target-01（C1、C2）
 
@@ -2249,6 +2339,8 @@ runner/主机实际执行后才算完成。
   Worker 重启仍可读取，导航和关闭后权限失效；显式 adopt
   U 后无需 popup 只读授权即可进行完整受控操作，release 后完整权限停止；T 的自有 debugger 连接在 Worker 重启后继续可用，原生轨迹须证明 attach 冲突、有效
   `Runtime.getIsolateId`、后续成功动作且未 detach T 的既有连接
+- 恢复竞态：Worker 停止后，通过关闭非受控唤醒页使其重新启动，并在初始化尚未完成时触发关闭事件，原有多个存活受控页全部保留；原生记录分别证明 Worker-only restart 和 Extension reload，不用后者代替前者，初始化完成后的关闭作为对照
+- 存储反例：分别使代际标记准备、状态读取、local 状态提交及后续授权/撤销提交失败，恢复失败保持可见，连接和依赖授权的操作等待恢复成功，既有自动连接入口可重试；提交失败不发布内存权限，成功撤销后重启及重载不恢复，失败后的串行更新仍可执行，迟到导航事件不恢复已 release 的页面
 - 外部拒绝为条件项：沿用 `logs-network-01` 的真实原生拒绝前置；满足时返回
   `DEBUGGER_BLOCKED`，不能通过 detach 外部连接制造通过；Chrome 允许多客户端时不将合法 attach 成功判为接管，缺少前置则记录该条件项未验证
 - 断言：撤销、server instance、documentId、URL 或同 epoch

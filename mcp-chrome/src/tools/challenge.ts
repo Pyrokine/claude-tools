@@ -269,22 +269,23 @@ export const CHALLENGE_INSPECT_SCRIPT = `(() => {
       return rect.width >= 250 && rect.width <= 340 && rect.height >= 50 && rect.height <= 85;
     }) || candidates[0];
   };
-  const turnstileBox = findVisibleTurnstileBox();
   const hostVerify = Array.from(document.querySelectorAll(verifyButtonSelectors.join(','))).find(isVisible) ||
     Array.from(document.querySelectorAll('button')).find((el) => {
       const text = (el.textContent || '').trim();
       return isVisible(el) && (text === 'Verify you are human' || text === '请验证您是真人');
     });
-  const useIframeClick = cloudflareFramePresent || (
+  const turnstileBox = !originResponsePending && (interstitialPending || widgetHits.length > 0)
+    ? findVisibleTurnstileBox() : null;
+  const turnstilePresent =
+    widgetHits.length > 0 ||
+    Boolean(hostVerify) ||
+    (!originResponsePending && interstitialPending &&
+      (cloudflareFramePresent || frameHits.length > 0 || Boolean(turnstileBox)));
+  const useIframeClick = turnstilePresent && (cloudflareFramePresent || (
     !hostVerify &&
     interstitialPending &&
     Boolean(document.querySelector('input[name="cf-turnstile-response"]'))
-  );
-  const turnstilePresent =
-    widgetHits.length > 0 ||
-    useIframeClick ||
-    (interstitialPending && frameHits.length > 0) ||
-    Boolean(turnstileBox);
+  ));
   const pointFromRect = (rect, kind) => {
     if (!rect || rect.width < 8 || rect.height < 8) return null;
     const y = Math.round(rect.top + Math.min(rect.height, 65) / 2);
@@ -428,18 +429,18 @@ async function hasClearanceCookie(host: ChallengeHost): Promise<boolean> {
     }
 }
 
-async function readPageTitle(host: ChallengeHost): Promise<{ title: string; live: boolean }> {
+async function readPageTitle(host: ChallengeHost): Promise<string> {
     if (host.getLiveState) {
         try {
             const live = await host.getLiveState()
             if (typeof live?.title === 'string') {
-                return { title: live.title, live: true }
+                return live.title
             }
         } catch {
             // 回退到缓存状态
         }
     }
-    return { title: host.getState()?.title ?? '', live: false }
+    return host.getState()?.title ?? ''
 }
 
 function finitePoint(point: { x?: unknown; y?: unknown } | null | undefined): ChallengeClickPoint | null {
@@ -634,8 +635,7 @@ export async function waitForChallenge(
         }
         const header = await readWithinBudget(() => host.getChallengeState())
         const headerPending = header?.state === 'pending'
-        const pageTitle = await readWithinBudget(() => readPageTitle(host))
-        const title = pageTitle.title
+        const title = await readWithinBudget(() => readPageTitle(host))
         if (DENIED_TITLE_PREFIXES.some((prefix) => title.trim().toLowerCase().startsWith(prefix))) {
             throw new ChallengeDeniedError(options.action, actionStatus, Math.max(0, now() - startedAt), host.getMode())
         }
@@ -673,8 +673,6 @@ export async function waitForChallenge(
             } else {
                 snapshot = blankChallengeSnapshot(title, host.getState()?.url ?? '', false)
             }
-        } else if (pageTitle.live && title.trim() !== '' && (!headerPending || host.getMode() === 'extension')) {
-            snapshot = blankChallengeSnapshot(title, host.getState()?.url ?? '', true)
         }
         if (!snapshot) {
             snapshot = await readWithinBudget(() =>

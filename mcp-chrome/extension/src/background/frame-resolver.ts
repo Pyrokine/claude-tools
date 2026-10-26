@@ -1,12 +1,14 @@
-import { ExpectedOperationError } from '../types/expected-errors'
+import { ExpectedOperationError, wrapDebuggerError } from '../types/expected-errors'
 import { EvaluateInFrameSchema, GetAllFramesSchema, ResolveFrameSchema } from '../types/schemas'
 import {
     type ActionContext,
+    type DomFrameSnapshot,
     assertManagedTab,
     assertReadableTab,
     assertScriptable,
     getDomFrameSnapshot,
     getTargetTabId,
+    probeCdpFrameOwner,
 } from './action-utils.js'
 import type { DebuggerManager } from './debugger-manager.js'
 import { readGrantDocumentId } from './read-grants.js'
@@ -65,6 +67,7 @@ export class FrameResolver {
                             domIndex: snapshot.selectedIndex,
                             candidateFrameIds: selected?.candidateFrameIds ?? [],
                             domFrameCount: snapshot.frames.length,
+                            ...(snapshot.unavailableFrames ? { unavailableFrames: snapshot.unavailableFrames } : {}),
                         },
                     },
                 })
@@ -79,6 +82,7 @@ export class FrameResolver {
                 tabId,
                 ...this.frameIdentitySummary(identity),
                 domIndex: selected.index,
+                ...(snapshot.unavailableFrames ? { unavailableFrames: snapshot.unavailableFrames } : {}),
             },
         }
     }
@@ -96,7 +100,9 @@ export class FrameResolver {
             name: string | null
             selector: string | null
             rect: { x: number; y: number; width: number; height: number } | null
+            unavailableReason?: string
         }>
+        unavailableFrames?: DomFrameSnapshot['unavailableFrames']
     }> {
         const p = GetAllFramesSchema.parse(params) ?? {}
         const tabId = await getTargetTabId(p.tabId)
@@ -120,8 +126,10 @@ export class FrameResolver {
                 .filter((frame): frame is typeof frame & { frameId: number } => frame.frameId !== null)
                 .map((frame) => [frame.frameId, frame] as const)
         )
+        const unavailableFrames = new Map(snapshot.unavailableFrames?.map((frame) => [frame.frameId, frame.error]))
 
         return {
+            ...(snapshot.unavailableFrames ? { unavailableFrames: snapshot.unavailableFrames } : {}),
             frames: frames.map((frame, index) => {
                 const isMainFrame = frame.frameId === 0
                 const dom = isMainFrame ? undefined : domFramesByFrameId.get(frame.frameId)
@@ -134,6 +142,9 @@ export class FrameResolver {
                     name: isMainFrame ? null : (dom?.name ?? null),
                     selector: isMainFrame ? null : (dom?.selector ?? null),
                     rect: isMainFrame ? snapshot.parent.rect : (dom?.rect ?? null),
+                    ...(unavailableFrames.has(frame.frameId)
+                        ? { unavailableReason: unavailableFrames.get(frame.frameId) }
+                        : {}),
                 }
             }),
         }
@@ -171,21 +182,65 @@ export class FrameResolver {
                     }
                 )
             }
-            const identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
-            if (identity.parentFrameId !== originalFrame.parentFrameId || identity.frameId !== originalFrame.frameId) {
+            let identity = originalFrame
+            let resolved: { cdpFrameId: string }
+            try {
+                identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
+                const resolutionDeadline = startedAt + (p.timeout ?? 2000)
+                for (;;) {
+                    if (
+                        identity.parentFrameId !== originalFrame.parentFrameId ||
+                        identity.frameId !== originalFrame.frameId
+                    ) {
+                        throw this.frameEvaluationError(
+                            'FRAME_IDENTITY_CHANGED',
+                            'Frame identity changed before stale-context retry; refusing to guess target',
+                            {
+                                tabId,
+                                retryAttempted,
+                                retryReason,
+                                originalFrame: this.frameIdentitySummary(originalFrame),
+                                currentFrame: this.frameIdentitySummary(identity),
+                            }
+                        )
+                    }
+                    try {
+                        resolved = await this.resolveCdpFrame(tabId, identity)
+                        break
+                    } catch (error) {
+                        const message = error instanceof Error ? error.message : String(error)
+                        if (
+                            !retryAttempted ||
+                            message !== `No document with id ${identity.documentId} in tab with id ${tabId}`
+                        ) {
+                            throw error
+                        }
+                        const remainingResolution = resolutionDeadline - Date.now()
+                        if (remainingResolution <= 0) {
+                            throw new Error('Frame document resolution timed out after stale execution context', {
+                                cause: error,
+                            })
+                        }
+                        await new Promise((resolve) => setTimeout(resolve, Math.min(25, remainingResolution)))
+                        identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
+                    }
+                }
+            } catch (error) {
+                if (!retryAttempted) {
+                    throw error
+                }
                 throw this.frameEvaluationError(
-                    'FRAME_IDENTITY_CHANGED',
-                    'Frame identity changed before stale-context retry; refusing to guess target',
+                    'FRAME_EVALUATION_FAILED',
+                    (error instanceof Error ? error.message : String(error)).slice(0, 500),
                     {
                         tabId,
+                        ...this.frameIdentitySummary(identity),
+                        phase: 'retry_resolution',
                         retryAttempted,
                         retryReason,
-                        originalFrame: this.frameIdentitySummary(originalFrame),
-                        currentFrame: this.frameIdentitySummary(identity),
                     }
                 )
             }
-            const resolved = await this.resolveCdpFrame(tabId, identity)
             let contexts = this.debuggerManager.getExecutionContexts(tabId)
             if (contexts.length === 0 || attempt > 0) {
                 await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
@@ -250,9 +305,23 @@ export class FrameResolver {
                     },
                 }
             } catch (error) {
+                const nativeError = wrapDebuggerError(error, {
+                    tabId,
+                    method: 'Runtime.evaluate',
+                    phase: 'command',
+                    frameContext: {
+                        tabId,
+                        ...this.frameIdentitySummary(identity),
+                        cdpFrameId: resolved.cdpFrameId,
+                        executionContextId: targetCtx.id,
+                    },
+                })
                 const message = error instanceof Error ? error.message : String(error)
                 const staleContext =
                     /context.*(?:destroyed|not found|invalid)|Cannot find context|Execution context/i.test(message)
+                if (!staleContext && nativeError !== error) {
+                    throw nativeError
+                }
                 if (attempt > 0) {
                     throw this.frameEvaluationError('FRAME_EVALUATION_FAILED', message.slice(0, 500), {
                         tabId,
@@ -375,27 +444,23 @@ export class FrameResolver {
             })
         }
         if (candidates.length > 1) {
-            if (frame.parentFrameId === 0) {
-                const parent = await this.getExtensionFrameIdentity(tabId, 0)
-                const snapshot = await getDomFrameSnapshot(tabId, 0, undefined, parent.documentId, parent.url)
-                const selected = snapshot.frames.filter((item) => item.frameId === frame.frameId)
-                if (selected.length === 1) {
-                    const document = (await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument', {
-                        depth: 1,
-                    })) as { root: { nodeId: number } }
-                    const elements = (await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelectorAll', {
-                        nodeId: document.root.nodeId,
-                        selector: 'iframe, frame',
-                    })) as { nodeIds: number[] }
-                    const nodeId = elements.nodeIds[selected[0].index]
-                    if (nodeId && elements.nodeIds.length === snapshot.frames.length) {
-                        const owner = (await chrome.debugger.sendCommand({ tabId }, 'DOM.describeNode', {
-                            nodeId,
-                            depth: 1,
-                        })) as { node: { frameId?: string } }
-                        if (owner.node.frameId && candidates.includes(owner.node.frameId)) {
-                            return { cdpFrameId: owner.node.frameId }
+            if (frame.documentId) {
+                for (const candidate of candidates) {
+                    const matched = await probeCdpFrameOwner(tabId, frame.documentId, candidate)
+                    if (matched === frame.frameId) {
+                        const current = await this.getExtensionFrameIdentity(tabId, frame.frameId)
+                        if (current.documentId !== frame.documentId || current.parentFrameId !== frame.parentFrameId) {
+                            throw this.frameEvaluationError(
+                                'FRAME_IDENTITY_CHANGED',
+                                'Frame document changed during owner probe',
+                                {
+                                    tabId,
+                                    originalFrame: this.frameIdentitySummary(frame),
+                                    currentFrame: this.frameIdentitySummary(current),
+                                }
+                            )
                         }
+                        return { cdpFrameId: candidate }
                     }
                 }
             }

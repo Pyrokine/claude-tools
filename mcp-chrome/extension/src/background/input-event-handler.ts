@@ -23,6 +23,10 @@ export class InputEventHandler {
         const tabId = await this.getManagedTabId(p.tabId, context, 'input_key')
         await this.debuggerManager.ensureAttached(tabId)
 
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
+        }
+
         const cdpParams: Record<string, unknown> = {
             type: p.type,
         }
@@ -62,6 +66,9 @@ export class InputEventHandler {
         }
 
         await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', cdpParams)
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline, true)
+        }
 
         return { success: true }
     }

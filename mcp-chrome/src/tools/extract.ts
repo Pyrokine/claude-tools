@@ -22,10 +22,12 @@ import {
     getSession,
     getUnifiedSession,
     resolveScopedOutputPath,
+    StructuredToolError,
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
-import type { Target } from '../core/types.js'
+import { ElementNotFoundError } from '../core/errors.js'
+import { DEFAULT_TIMEOUT, type Target } from '../core/types.js'
 import { sanitizeUrlRecords } from './network-sanitizer.js'
 import { withPageContext } from './page-context.js'
 import {
@@ -38,7 +40,13 @@ import {
     readPngHeader,
 } from './png.js'
 import { pageTargetIdSchema, resolvePageTargetId, targetToFindParams, targetZodSchema } from './schema.js'
-import { buildTargetDiagnostics, TargetNotFoundError, TargetTimeoutError } from './target-diagnostics.js'
+import {
+    buildTargetDiagnostics,
+    enrichTargetError,
+    targetLookupTimeout,
+    TargetNotFoundError,
+    TargetTimeoutError,
+} from './target-diagnostics.js'
 
 /** 图片元信息 */
 interface ImageInfo {
@@ -125,7 +133,7 @@ const extractSchema = z
             .optional()
             .describe(
                 '页面状态提取模式（state 类型有效），accessibility=可访问性树（默认，与原 read_page 一致），' +
-                    'domsnapshot=CDP DOMSnapshot 全量快照（仅 CDP 模式）'
+                    'domsnapshot=DOMSnapshot 全量快照（CDP 或受控 Extension 页面，不支持 target/frame/depth 限定）'
             ),
         timeout: z.number().optional().describe('等待目标元素超时'),
         frame: z
@@ -162,7 +170,23 @@ interface ExtractContext {
 }
 
 async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
+    const timeout = args.timeout ?? DEFAULT_TIMEOUT
+    const deadline = Date.now() + timeout
     try {
+        if (
+            args.type === 'state' &&
+            args.mode === 'domsnapshot' &&
+            [args.target, args.frame, args.depth].some((value) => value !== undefined)
+        ) {
+            return formatErrorResponse(
+                new StructuredToolError(
+                    'INVALID_ARGUMENT',
+                    'domsnapshot 返回整页快照，不支持 target、frame 或 depth 限定',
+                    '局部页面状态请使用 mode="accessibility"',
+                    { actionExecuted: false }
+                )
+            )
+        }
         const unifiedSession = getUnifiedSession()
 
         // 多 tab 并行：临时切换到指定 tab
@@ -180,7 +204,22 @@ async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
                     await waitForTargetExtension(unifiedSession, args.target, args.timeout, args.frame)
                 }
 
-                return handleExtractInFrame({ unifiedSession, session, useExtension }, args)
+                try {
+                    const scopedArgs =
+                        !useExtension && args.target
+                            ? { ...args, timeout: targetLookupTimeout(Math.max(1, deadline - Date.now())) }
+                            : args
+                    return await handleExtractInFrame({ unifiedSession, session, useExtension }, scopedArgs)
+                } catch (error) {
+                    if (!useExtension && args.target && error instanceof ElementNotFoundError) {
+                        await enrichTargetError(error, unifiedSession, args.target, {
+                            timeout,
+                            deadline,
+                            frame: args.frame,
+                        })
+                    }
+                    throw error
+                }
             }) // withFrame
         }) // withTabId
     } catch (error) {
@@ -429,7 +468,7 @@ async function handleStateExtract(
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
     if (args.mode === 'domsnapshot') {
-        return handleDomSnapshotState(unifiedSession, useExtension, args)
+        return handleDomSnapshotState(unifiedSession, args)
     }
 
     let refId: string | undefined
@@ -477,25 +516,8 @@ async function handleStateExtract(
 
 async function handleDomSnapshotState(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
-    useExtension: boolean,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
-    if (useExtension) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: JSON.stringify({
-                        error: {
-                            code: 'INVALID_ARGUMENT',
-                            message: 'mode=domsnapshot 仅 CDP 模式支持，Extension 模式请用默认 accessibility',
-                        },
-                    }),
-                },
-            ],
-            isError: true,
-        }
-    }
     const snapshot = await unifiedSession.sendCdpCommand('DOMSnapshot.captureSnapshot', {
         computedStyles: ['display', 'visibility', 'opacity'],
         includePaintOrder: false,

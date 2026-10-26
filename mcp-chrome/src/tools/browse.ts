@@ -179,7 +179,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                 if (useExtension && !args.port) {
                     const connected = unifiedSession.isExtensionAvailable()
                     if (connected) {
-                        unifiedSession.setActiveMode('extension')
+                        await unifiedSession.setActiveMode('extension')
                     }
                     return formatResponse({
                         success: connected,
@@ -221,7 +221,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                             timeout: args.timeout ?? DEFAULT_TIMEOUT,
                             stealth: args.stealth as 'off' | 'safe' | 'aggressive' | undefined,
                         })
-                        unifiedSession.setActiveMode('cdp', true)
+                        await unifiedSession.setActiveMode('cdp', true)
                         return formatResponse({
                             success: true,
                             action: 'connect',
@@ -310,7 +310,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         }
                     })
                 const groups = topology?.groups
-                    .filter((group) => !filtered || group.targetIds.some((id) => selectedIds.has(id)))
+                    ?.filter((group) => !filtered || group.targetIds.some((id) => selectedIds.has(id)))
                     .map((group) => ({
                         ...group,
                         targetIds: group.targetIds.filter((id) => selectedIds.has(id)),
@@ -334,7 +334,13 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                               focusedWindowId: topology.focusedWindowId,
                               activeTargetId: topology.activeTargetId,
                               windows,
-                              groups,
+                              ...(groups === undefined
+                                  ? {
+                                        warnings: [
+                                            '当前 Extension 未提供 groups，分组信息未知；更新 Extension 后可返回分组',
+                                        ],
+                                    }
+                                  : { groups }),
                           }
                         : {}),
                 }

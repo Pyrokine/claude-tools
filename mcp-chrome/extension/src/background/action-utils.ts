@@ -6,7 +6,7 @@
 
 import type { FrameProbeMessage } from '../types'
 import { ExpectedOperationError } from '../types/expected-errors'
-import { pageRevision } from './page-revision'
+import { getExistingTab, pageRevision } from './page-revision'
 import { installFrameProbeListener } from './page-scripts'
 import { readGrantDocumentId } from './read-grants'
 import { isManagedTab } from './tab-state'
@@ -30,7 +30,7 @@ export function isRestrictedUrl(url: string | undefined): boolean {
 }
 
 export async function assertScriptable(tabId: number): Promise<void> {
-    const tab = await chrome.tabs.get(tabId)
+    const tab = await getExistingTab(tabId)
     if (isRestrictedUrl(tab.url)) {
         throw new ExpectedOperationError(
             `Cannot execute on restricted URL "${tab.url}". Navigate to an http/https page first.`
@@ -40,11 +40,7 @@ export async function assertScriptable(tabId: number): Promise<void> {
 
 export async function getTargetTabId(tabId?: number): Promise<number> {
     if (tabId !== undefined && tabId !== null) {
-        try {
-            await chrome.tabs.get(tabId)
-        } catch {
-            throw new ExpectedOperationError(`Tab ${tabId} 不存在（可能已被关闭）`)
-        }
+        await getExistingTab(tabId)
         return tabId
     }
 
@@ -91,12 +87,7 @@ export async function assertManagedTab(
     context: ActionContext,
     operation: string
 ): Promise<chrome.tabs.Tab> {
-    let tab: chrome.tabs.Tab
-    try {
-        tab = await chrome.tabs.get(tabId)
-    } catch {
-        throw new ExpectedOperationError(`Tab ${tabId} 不存在（可能已被关闭）`)
-    }
+    const tab = await getExistingTab(tabId)
     if (!isManagedTab(tab)) {
         const detail = JSON.stringify({
             tabId,
@@ -121,7 +112,7 @@ export async function assertReadableTab(
     context: ActionContext,
     operation: string
 ): Promise<{ tab: chrome.tabs.Tab; documentId?: string }> {
-    const tab = await chrome.tabs.get(tabId)
+    const tab = await getExistingTab(tabId)
     if (isManagedTab(tab)) {
         return { tab }
     }
@@ -155,6 +146,7 @@ export interface DomFrameSnapshot {
         rect: { x: number; y: number; width: number; height: number }
     }
     frames: DomFrameSnapshotFrame[]
+    unavailableFrames?: Array<{ frameId: number; documentId?: string; url: string; error: string }>
     selectedIndex: number | null
     selectionStatus: DomFrameSelectionStatus
     selectionError?: string
@@ -165,6 +157,7 @@ const FRAME_PROBE_TIMEOUT_MS = 500
 interface PendingDomFrameProbe {
     tabId: number
     frameIdsByIndex: Map<number, number[]>
+    documentId?: string
 }
 
 const pendingDomFrameProbes = new Map<string, PendingDomFrameProbe>()
@@ -179,6 +172,7 @@ export function recordDomFrameProbe(
         sender.tab?.id !== pending.tabId ||
         sender.frameId === undefined ||
         sender.frameId === 0 ||
+        (pending.documentId !== undefined && sender.documentId !== pending.documentId) ||
         !Number.isInteger(message.index) ||
         message.index < 0
     ) {
@@ -191,6 +185,57 @@ export function recordDomFrameProbe(
         pending.frameIdsByIndex.set(message.index, frameIds)
     }
     return { accepted: true }
+}
+
+/** 向 CDP 返回的实际 owner 节点探测，避免异步等待后按旧 DOM index 选择其他 iframe */
+export async function probeCdpFrameOwner(
+    tabId: number,
+    documentId: string,
+    cdpFrameId: string
+): Promise<number | null> {
+    await chrome.scripting.executeScript({
+        target: { tabId, documentIds: [documentId] },
+        func: installFrameProbeListener,
+    })
+    const owner = (await chrome.debugger.sendCommand({ tabId }, 'DOM.getFrameOwner', { frameId: cdpFrameId })) as {
+        backendNodeId: number
+    }
+    const resolved = (await chrome.debugger.sendCommand({ tabId }, 'DOM.resolveNode', {
+        backendNodeId: owner.backendNodeId,
+    })) as { object: { objectId?: string } }
+    const objectId = resolved.object.objectId
+    if (!objectId) {
+        return null
+    }
+    const token = crypto.randomUUID()
+    const pending: PendingDomFrameProbe = { tabId, documentId, frameIdsByIndex: new Map() }
+    pendingDomFrameProbes.set(token, pending)
+    try {
+        const result = (await chrome.debugger.sendCommand({ tabId }, 'Runtime.callFunctionOn', {
+            objectId,
+            functionDeclaration: `function(token, timeout) {
+                const child = this.contentWindow;
+                if (!this.isConnected || !child) return false;
+                return new Promise(resolve => {
+                    const finish = value => { clearTimeout(timer); window.removeEventListener('message', onMessage); resolve(value); };
+                    const onMessage = event => { if (event.source === child && event.data?.type === 'mcp-frame-probe-ack-v2' && event.data.token === token && event.data.index === 0) finish(true); };
+                    const timer = setTimeout(() => finish(false), timeout);
+                    window.addEventListener('message', onMessage);
+                    child.postMessage({type:'mcp-frame-probe-v2', token, index:0}, '*');
+                });
+            }`,
+            arguments: [{ value: token }, { value: FRAME_PROBE_TIMEOUT_MS }],
+            awaitPromise: true,
+            returnByValue: true,
+        })) as { result?: { value?: boolean }; exceptionDetails?: unknown }
+        const ids = pending.frameIdsByIndex.get(0) ?? []
+        return !result.exceptionDetails && result.result?.value === true && ids.length === 1 ? ids[0] : null
+    } finally {
+        pendingDomFrameProbes.delete(token)
+        await chrome.debugger.sendCommand({ tabId }, 'Runtime.releaseObject', { objectId }).catch((error) => {
+            console.debug('[MCP] Frame owner probe cleanup failed', error)
+        })
+    }
 }
 
 /**
@@ -217,26 +262,36 @@ export async function getDomFrameSnapshot(
     if (!chromeFrames || !parentFrame?.documentId) {
         throw new ExpectedOperationError(`无法读取 parent frame ${parentFrameId} 的 documentId`)
     }
-    const childDocumentIds = chromeFrames
-        .filter(
-            (frame) =>
-                frame.parentFrameId === parentFrameId &&
-                frame.parentDocumentId === parentFrame.documentId &&
-                !frame.errorOccurred &&
-                (!isRestrictedUrl(frame.url) || /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(frame.url))
-        )
-        .map((frame) => {
-            if (!frame.documentId) {
-                throw new ExpectedOperationError(`无法读取 iframe ${frame.frameId} 的 documentId`)
+    const unavailableFrames: NonNullable<DomFrameSnapshot['unavailableFrames']> = []
+    const verifiedFrameIds = new Set<number>()
+    const childFrames = chromeFrames.filter(
+        (frame) =>
+            frame.parentFrameId === parentFrameId &&
+            frame.parentDocumentId === parentFrame.documentId &&
+            !frame.errorOccurred &&
+            (!isRestrictedUrl(frame.url) || /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(frame.url))
+    )
+    await Promise.all(
+        childFrames.map(async (frame) => {
+            try {
+                if (!frame.documentId) {
+                    throw new ExpectedOperationError(`无法读取 iframe ${frame.frameId} 的 documentId`)
+                }
+                await chrome.scripting.executeScript({
+                    target: { tabId, documentIds: [frame.documentId] },
+                    func: installFrameProbeListener,
+                })
+                verifiedFrameIds.add(frame.frameId)
+            } catch (error) {
+                unavailableFrames.push({
+                    frameId: frame.frameId,
+                    documentId: frame.documentId,
+                    url: frame.url,
+                    error: error instanceof Error ? error.message : String(error),
+                })
             }
-            return frame.documentId
         })
-    if (childDocumentIds.length > 0) {
-        await chrome.scripting.executeScript({
-            target: { tabId, documentIds: childDocumentIds },
-            func: installFrameProbeListener,
-        })
-    }
+    )
     const token = crypto.randomUUID()
     const pendingProbe: PendingDomFrameProbe = { tabId, frameIdsByIndex: new Map() }
     pendingDomFrameProbes.set(token, pendingProbe)
@@ -306,7 +361,7 @@ export async function getDomFrameSnapshot(
                                     const data = event.data as { type?: string; token?: string; index?: number } | null
                                     if (
                                         event.source === child &&
-                                        data?.type === 'mcp-frame-probe-ack' &&
+                                        data?.type === 'mcp-frame-probe-ack-v2' &&
                                         data.token === probeToken &&
                                         data.index === index
                                     ) {
@@ -315,7 +370,7 @@ export async function getDomFrameSnapshot(
                                 }
                                 const timer = window.setTimeout(() => finish(false), timeoutMs)
                                 window.addEventListener('message', onMessage)
-                                child.postMessage({ type: 'mcp-frame-probe', token: probeToken, index }, '*')
+                                child.postMessage({ type: 'mcp-frame-probe-v2', token: probeToken, index }, '*')
                             })
                     )
                 )
@@ -378,10 +433,16 @@ export async function getDomFrameSnapshot(
                 const candidateFrameIds = acknowledged ? (pendingProbe.frameIdsByIndex.get(frame.index) ?? []) : []
                 return {
                     ...frame,
-                    frameId: candidateFrameIds.length === 1 ? candidateFrameIds[0] : null,
+                    frameId:
+                        candidateFrameIds.length === 1 && verifiedFrameIds.has(candidateFrameIds[0]!)
+                            ? candidateFrameIds[0]
+                            : null,
                     candidateFrameIds: candidateFrameIds.slice(0, 10),
                 }
             }),
+            ...(unavailableFrames.length
+                ? { unavailableFrames: unavailableFrames.sort((a, b) => a.frameId - b.frameId) }
+                : {}),
             selectedIndex: parentResult.selectedIndex,
             selectionStatus: parentResult.selectionStatus,
             ...(parentResult.selectionError ? { selectionError: parentResult.selectionError } : {}),
@@ -403,7 +464,7 @@ export async function getFrameOffset(tabId: number, frameId: number): Promise<{ 
         return null
     }
 
-    const tab = await chrome.tabs.get(tabId)
+    const tab = await getExistingTab(tabId)
     if (isRestrictedUrl(tab.url)) {
         return null
     }

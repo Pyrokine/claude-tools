@@ -8,6 +8,7 @@
 import {
     type ActionableClickResult,
     type BrowserTopology,
+    type BrowserTabGroupInfo,
     type CookieFilter,
     DriverCapabilityError,
     type GroupManagementResult,
@@ -172,17 +173,46 @@ export class ExtensionBridge implements IBrowserDriver {
     async listWindows(timeout?: number): Promise<BrowserTopology> {
         const result = await this.httpServer.sendCommand('tabs_topology', {}, timeout)
         const topology = result as BrowserTopology
-        return {
-            ...topology,
-            windows: topology.windows.map((window) => ({
-                ...window,
-                tabs: window.tabs.map((tab) => ({
-                    ...tab,
-                    targetId: String(tab.id),
-                    type: tab.type ?? 'page',
-                })),
+        const windows = topology.windows.map((window) => ({
+            ...window,
+            tabs: window.tabs.map((tab) => ({
+                ...tab,
+                targetId: String(tab.id),
+                type: tab.type ?? 'page',
             })),
+        }))
+        if (Object.hasOwn(topology, 'groups') && !Array.isArray(topology.groups)) {
+            throw new Error('Extension tabs_topology 返回的 groups 必须是数组')
         }
+        const groups = topology.groups?.map((group) => {
+            if (!group || typeof group !== 'object') {
+                throw new Error('Extension tabs_topology 返回了无效分组')
+            }
+            const summary = group as Partial<BrowserTabGroupInfo>
+            if (!Object.hasOwn(summary, 'tabIds') && !Object.hasOwn(summary, 'targetIds')) {
+                if (!Number.isSafeInteger(summary.id) || !Number.isSafeInteger(summary.windowId)) {
+                    throw new Error('Extension tabs_topology 的旧版分组缺少有效 id 或 windowId')
+                }
+                const members = windows
+                    .filter((window) => window.id === summary.windowId)
+                    .flatMap((window) => window.tabs)
+                    .filter((tab) => tab.groupId === summary.id)
+                if (members.some((tab) => !Number.isSafeInteger(tab.id))) {
+                    throw new Error('Extension tabs_topology 的分组成员包含无效 tab ID')
+                }
+                return {
+                    ...group,
+                    tabIds: members.map((tab) => tab.id as number),
+                    targetIds: members.map((tab) => tab.targetId),
+                    index: group.index ?? members[0]?.index,
+                }
+            }
+            if (!Array.isArray(group.tabIds) || !Array.isArray(group.targetIds)) {
+                throw new Error('Extension tabs_topology 的分组成员必须同时提供 tabIds 和 targetIds 数组')
+            }
+            return group
+        })
+        return { ...topology, windows, ...(groups === undefined ? {} : { groups }) }
     }
 
     /** IBrowserDriver 接口：列出所有 tab，统一为 ListedTarget 形式（id 字符串化以保持跨 driver 兼容） */
@@ -422,7 +452,6 @@ export class ExtensionBridge implements IBrowserDriver {
         return this.normalizePageChange(result)
     }
 
-    // noinspection JSUnusedGlobalSymbols — UnifiedSessionManager 通过 bridge 结构类型调用
     async activatePageWithAffected(targetId: string): Promise<PageManagementResult> {
         const tabId = this.parseTargetId(targetId)
         const result = (await this.httpServer.sendCommand('tabs_activate_managed', {
@@ -1003,13 +1032,18 @@ export class ExtensionBridge implements IBrowserDriver {
             windowsVirtualKeyCode?: number
             modifiers?: number
             commands?: string[]
-        } = {}
+        } = {},
+        timeout?: number
     ): Promise<void> {
-        await this.httpServer.sendCommand('input_key', {
-            tabId: this.requireCurrentTabId(),
-            type,
-            ...options,
-        })
+        await this.sendBudgetedCommand(
+            'input_key',
+            {
+                tabId: this.requireCurrentTabId(),
+                type,
+                ...options,
+            },
+            timeout
+        )
     }
 
     // ==================== 输入事件（通过 CDP）====================
@@ -1162,7 +1196,12 @@ export class ExtensionBridge implements IBrowserDriver {
 
     // ==================== Stealth 模式（JS 事件模拟，无 debugger）====================
 
-    async stealthKey(key: string, type: 'down' | 'up' | 'press' = 'press', modifiers: string[] = []): Promise<void> {
+    async stealthKey(
+        key: string,
+        type: 'down' | 'up' | 'press' = 'press',
+        modifiers: string[] = [],
+        timeout?: number
+    ): Promise<void> {
         if (this.currentTabId === null) {
             throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
         }
@@ -1173,7 +1212,7 @@ export class ExtensionBridge implements IBrowserDriver {
             type,
             modifiers,
         }
-        await this.httpServer.sendCommand('stealth_key', params)
+        await this.sendBudgetedCommand('stealth_key', params, timeout)
     }
 
     async stealthClick(
@@ -1294,15 +1333,22 @@ export class ExtensionBridge implements IBrowserDriver {
     /**
      * 解析 iframe 选择器/索引 → frameId
      */
-    async resolveFrame(frame: string | number): Promise<{
+    async resolveFrame(
+        frame: string | number,
+        timeout?: number
+    ): Promise<{
         frameId: number
         offset: { x: number; y: number } | null
         frameContext?: Record<string, unknown>
     }> {
-        return (await this.httpServer.sendCommand('resolve_frame', {
-            tabId: this.requireCurrentTabId(),
-            frame,
-        })) as { frameId: number; offset: { x: number; y: number } | null; frameContext?: Record<string, unknown> }
+        return (await this.sendBudgetedCommand(
+            'resolve_frame',
+            {
+                tabId: this.requireCurrentTabId(),
+                frame,
+            },
+            timeout
+        )) as { frameId: number; offset: { x: number; y: number } | null; frameContext?: Record<string, unknown> }
     }
 
     private async sendBudgetedCommand(
@@ -1313,6 +1359,9 @@ export class ExtensionBridge implements IBrowserDriver {
             | 'reload'
             | 'stealth_click'
             | 'input_mouse'
+            | 'input_key'
+            | 'stealth_key'
+            | 'resolve_frame'
             | 'stealth_mouse'
             | 'debugger_detach'
             | 'challenge_inspect',
@@ -1322,7 +1371,13 @@ export class ExtensionBridge implements IBrowserDriver {
         const deadline = Date.now() + timeout
         const remaining = remainingNavigationTimeout(deadline)
         try {
-            return await this.httpServer.sendCommand(action, { ...params, timeout: remaining, deadline }, remaining)
+            const result = await this.httpServer.sendCommand(
+                action,
+                { ...params, timeout: remaining, deadline },
+                remaining
+            )
+            remainingNavigationTimeout(deadline)
+            return result
         } catch (error) {
             if (error instanceof Error && error.message.startsWith(`Request timeout for action: ${action} (`)) {
                 throw new StructuredToolError('TIMEOUT', error.message, '请回读实际页面，勿自动重放操作', {

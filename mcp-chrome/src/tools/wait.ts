@@ -21,7 +21,13 @@ import { DEFAULT_TIMEOUT, type ElementState, type Target } from '../core/types.j
 import { withDiagnosticsResponse } from './diagnostics.js'
 import { withPageContext } from './page-context.js'
 import { pageTargetIdSchema, resolvePageTargetId, targetToFindParams, targetZodSchema } from './schema.js'
-import { buildTargetDiagnostics, type TargetCandidate, TargetTimeoutError } from './target-diagnostics.js'
+import {
+    buildTargetDiagnostics,
+    enrichTargetError,
+    targetLookupTimeout,
+    type TargetCandidate,
+    TargetTimeoutError,
+} from './target-diagnostics.js'
 
 /** 轮询间隔（毫秒） */
 const POLL_INTERVAL = 100
@@ -131,7 +137,7 @@ async function handleWait(args: z.infer<typeof waitSchema>): Promise<{
                                 await waitForElementExtension(unifiedSession, args.target!, state, timeout, args.frame)
                             } else {
                                 const session = getSession()
-                                await waitForElement(session, args.target!, state, timeout)
+                                await waitForElement(session, args.target!, state, timeout, unifiedSession, args.frame)
                             }
                             return {
                                 success: true,
@@ -547,13 +553,19 @@ async function waitForElement(
     session: ReturnType<typeof getSession>,
     target: Target,
     state: ElementState,
-    timeout: number
+    timeout: number,
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    frame?: string | number
 ): Promise<void> {
     const startTime = Date.now()
-    while (Date.now() - startTime < timeout) {
+    const lookupTimeout = targetLookupTimeout(timeout)
+    let lastLocator: ReturnType<typeof session.createLocator> | undefined
+    let lastError: ElementNotFoundError | undefined
+    while (Date.now() - startTime < lookupTimeout) {
         try {
-            const remaining = timeout - (Date.now() - startTime)
+            const remaining = lookupTimeout - (Date.now() - startTime)
             const locator = session.createLocator(target, { timeout: remaining })
+            lastLocator = locator
 
             switch (state) {
                 case 'attached':
@@ -589,13 +601,21 @@ async function waitForElement(
             if (state === 'detached' || state === 'hidden') {
                 return // 元素不存在，符合预期
             }
+            lastError = error
             // attached/visible 未找到时继续等待
         }
 
-        await sleepWithinBudget(startTime, timeout, POLL_INTERVAL)
+        await sleepWithinBudget(startTime, lookupTimeout, POLL_INTERVAL)
     }
 
-    throw new TimeoutError(`等待元素 ${JSON.stringify(target)} 状态 ${state} 超时 (${timeout}ms)`)
+    const error = new TimeoutError(`等待元素 ${JSON.stringify(target)} 状态 ${state} 超时 (${timeout}ms)`, {
+        ...lastError?.context,
+        ...lastLocator?.lastObservation,
+        target,
+        timeout,
+    })
+    await enrichTargetError(error, unifiedSession, target, { timeout, deadline: startTime + timeout, frame })
+    throw error
 }
 
 /**

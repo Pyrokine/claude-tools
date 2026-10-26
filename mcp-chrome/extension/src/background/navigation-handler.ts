@@ -3,6 +3,7 @@ import { ExpectedOperationError } from '../types/expected-errors'
 import { GoBackSchema, GoForwardSchema, NavigateSchema, ReloadSchema } from '../types/schemas'
 import { type ActionContext, assertManagedTab, getTargetTabId, isRestrictedUrl, tabToInfo } from './action-utils.js'
 import type { LogManager } from './log-manager.js'
+import { getExistingTab } from './page-revision.js'
 
 function normalizeNavigationUrl(url: string | undefined): string | undefined {
     if (url === undefined) {
@@ -36,7 +37,10 @@ export function remainingNavigationTimeout(deadline: number, actionExecuted = fa
 }
 
 export class NavigationHandler {
-    constructor(private logManager: LogManager) {}
+    constructor(
+        private logManager: LogManager,
+        private enableNetworkObservation?: (tabId: number) => Promise<void>
+    ) {}
 
     async navigate(params: unknown, context: ActionContext): Promise<TabInfo> {
         const p = NavigateSchema.parse(params)
@@ -58,7 +62,7 @@ export class NavigationHandler {
         }
 
         remainingNavigationTimeout(deadline, true)
-        const tab = await chrome.tabs.get(tabId)
+        const tab = await getExistingTab(tabId)
         return tabToInfo(tab)
     }
 
@@ -71,7 +75,8 @@ export class NavigationHandler {
         remainingNavigationTimeout(deadline)
         const tabId = await getTargetTabId(p.tabId)
         await assertManagedTab(tabId, context, 'go_back')
-        const beforeTab = await chrome.tabs.get(tabId)
+        await this.prepareNetworkIdle(tabId, p.waitUntil)
+        const beforeTab = await getExistingTab(tabId)
         const beforeUrl = beforeTab.url
 
         // 信号窗口受剩余预算控制，上限 5s，未传 timeout 时为 2s
@@ -83,7 +88,7 @@ export class NavigationHandler {
         }
 
         remainingNavigationTimeout(deadline, true)
-        const tab = await chrome.tabs.get(tabId)
+        const tab = await getExistingTab(tabId)
         return { url: tab.url || '', title: tab.title || '', navigated, managed: true }
     }
 
@@ -96,7 +101,8 @@ export class NavigationHandler {
         remainingNavigationTimeout(deadline)
         const tabId = await getTargetTabId(p.tabId)
         await assertManagedTab(tabId, context, 'go_forward')
-        const beforeTab = await chrome.tabs.get(tabId)
+        await this.prepareNetworkIdle(tabId, p.waitUntil)
+        const beforeTab = await getExistingTab(tabId)
         const beforeUrl = beforeTab.url
 
         // 信号窗口受剩余预算控制，上限 5s，未传 timeout 时为 2s
@@ -108,7 +114,7 @@ export class NavigationHandler {
         }
 
         remainingNavigationTimeout(deadline, true)
-        const tab = await chrome.tabs.get(tabId)
+        const tab = await getExistingTab(tabId)
         return { url: tab.url || '', title: tab.title || '', navigated, managed: true }
     }
 
@@ -129,12 +135,18 @@ export class NavigationHandler {
         }
 
         remainingNavigationTimeout(deadline, true)
-        const tab = await chrome.tabs.get(tabId)
+        const tab = await getExistingTab(tabId)
         return { url: tab.url || '', title: tab.title || '', managed: true }
     }
 
     async waitForNavigation(tabId: number, waitUntil: WaitUntil, timeout = 30000): Promise<void> {
         const startedAt = Date.now()
+        await this.prepareNetworkIdle(tabId, waitUntil)
+        timeout -= Date.now() - startedAt
+        if (timeout <= 0) {
+            throw navigationTimeout(true)
+        }
+        const observationStartedAt = Date.now()
         let currentDocumentId: string | null = null
 
         await new Promise<void>((resolve, reject) => {
@@ -170,12 +182,16 @@ export class NavigationHandler {
                 if (settled) {
                     return
                 }
-                const remaining = timeout - (Date.now() - startedAt)
+                const remaining = timeout - (Date.now() - observationStartedAt)
                 if (remaining <= 0) {
                     fail(navigationTimeout(true))
                     return
                 }
                 const pending = this.logManager.getPending(tabId)
+                if (!this.logManager.isNetworkObserved(tabId)) {
+                    fail(new ExpectedOperationError('Network 观测已中断，无法判断 networkidle'))
+                    return
+                }
                 const hasPending = pending !== undefined && pending.size > 0
                 const uncertain = this.logManager.isPendingUncertain(tabId)
                 if (hasPending || uncertain) {
@@ -228,7 +244,7 @@ export class NavigationHandler {
                             currentDocumentId = frame.documentId
                         }
                     }
-                    const tab = await chrome.tabs.get(tabId)
+                    const tab = await getExistingTab(tabId)
                     if (tab.status === 'complete') {
                         if (waitUntil === 'networkidle') {
                             checkIdle()
@@ -243,6 +259,15 @@ export class NavigationHandler {
         })
     }
 
+    private async prepareNetworkIdle(tabId: number, waitUntil: WaitUntil | undefined): Promise<void> {
+        if (waitUntil === 'networkidle') {
+            await this.enableNetworkObservation?.(tabId)
+            if (!this.logManager.isNetworkObserved(tabId)) {
+                throw new ExpectedOperationError('Network 观测未建立，无法判断 networkidle')
+            }
+        }
+    }
+
     private async runNavigationAction(
         tabId: number,
         waitUntil: WaitUntil,
@@ -251,6 +276,7 @@ export class NavigationHandler {
         expectedSameDocumentUrl?: string
     ): Promise<void> {
         remainingNavigationTimeout(deadline)
+        await this.prepareNetworkIdle(tabId, waitUntil)
         const normalizedSameDocumentUrl = normalizeNavigationUrl(expectedSameDocumentUrl)
         let baselineDocumentId: string | null = null
         if (expectedSameDocumentUrl && typeof chrome.webNavigation.getFrame === 'function') {
@@ -308,6 +334,10 @@ export class NavigationHandler {
                     return
                 }
                 const pending = this.logManager.getPending(tabId)
+                if (!this.logManager.isNetworkObserved(tabId)) {
+                    fail(new ExpectedOperationError('Network 观测已中断，无法判断 networkidle'))
+                    return
+                }
                 const hasPending = pending !== undefined && pending.size > 0
                 const uncertain = this.logManager.isPendingUncertain(tabId)
                 if (hasPending || uncertain) {
@@ -442,7 +472,7 @@ export class NavigationHandler {
                 if (!/Cannot find a (?:next|previous) page in history/i.test(msg)) {
                     throw error
                 }
-                const tab = await chrome.tabs.get(tabId)
+                const tab = await getExistingTab(tabId)
                 if (!isRestrictedUrl(tab.url)) {
                     const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
                     if (frame && !frame.errorOccurred) {

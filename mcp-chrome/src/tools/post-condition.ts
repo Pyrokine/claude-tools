@@ -62,9 +62,15 @@ function remainingMs(timeout: number, startedAt: number): number {
     return Math.max(0, timeout - (Date.now() - startedAt))
 }
 
-function isUnavailableError(message: string): boolean {
-    // noinspection LongLine — 保持不可用错误模式在一个正则中，避免分组语义变化
-    return /frame|execution context|debugger|extension.*(?:disconnect|未连接)|not connected|cannot resolve cdp|failed to attach|restricted|cannot access/i.test(
+class PostConditionScriptError extends Error {}
+
+function isUnavailableError(error: unknown): boolean {
+    if (error instanceof PostConditionScriptError) {
+        return false
+    }
+    const message = error instanceof Error ? error.message : String(error)
+    // 原生调用失败与页面内抛出的同文案异常分别分类
+    return /frame|execution context|cannot find context with specified id|debugger|extension.*(?:disconnect|未连接)|not connected|cannot resolve cdp|failed to attach|restricted|cannot access/i.test(
         message
     )
 }
@@ -126,16 +132,23 @@ async function checkPostCondition(
         checks.push({ name: 'urlIncludes', matched: url.includes(condition.urlIncludes), actual: url.slice(0, 500) })
     }
     if (condition.script !== undefined) {
-        const matched = await unifiedSession.evaluate<boolean>(
+        const result = await unifiedSession.evaluate<{ matched: boolean; error?: string }>(
             `async (source) => {
-                const value = (0, eval)(source)
-                return Boolean(await (typeof value === 'function' ? value() : value))
+                try {
+                    const value = (0, eval)(source)
+                    return { matched: Boolean(await (typeof value === 'function' ? value() : value)) }
+                } catch (error) {
+                    return { matched: false, error: String(error) }
+                }
             }`,
             mode,
             nextTimeout(),
             [condition.script]
         )
-        checks.push({ name: 'script', matched, actual: matched })
+        if (result.error !== undefined) {
+            throw new PostConditionScriptError(result.error)
+        }
+        checks.push({ name: 'script', matched: result.matched, actual: result.matched })
     }
     return checks
 }
@@ -170,14 +183,15 @@ export async function waitForPostCondition(
                 }
             }
         } catch (error) {
+            const unavailable = isUnavailableError(error)
             const message = boundedError(error)
             return {
                 matched: false,
-                verificationStatus: isUnavailableError(message) ? 'unavailable' : 'error',
+                verificationStatus: unavailable ? 'unavailable' : 'error',
                 operation,
                 elapsedMs: Date.now() - startedAt,
                 checks,
-                retryable: isUnavailableError(message),
+                retryable: unavailable,
                 error: message,
             }
         }

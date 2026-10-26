@@ -252,7 +252,7 @@ export interface BrowserTopology {
     focusedWindowId?: number
     activeTargetId?: string
     windows: BrowserWindowInfo[]
-    groups: BrowserTabGroupInfo[]
+    groups?: BrowserTabGroupInfo[]
 }
 
 export interface BrowserTabGroupInfo {
@@ -404,13 +404,13 @@ export interface IBrowserDriver {
     getAttribute(selector: string | undefined, refId: string | undefined, attribute: string): Promise<string | null>
 
     // ---- 输入（precise） ----
-    inputKey(type: InputKeyType, options?: InputKeyOptions): Promise<void>
+    inputKey(type: InputKeyType, options?: InputKeyOptions, timeout?: number): Promise<void>
     inputMouse(type: InputMouseType, x: number, y: number, options?: InputMouseOptions, timeout?: number): Promise<void>
     inputTouch(type: InputTouchType, touchPoints: InputTouchPoint[]): Promise<void>
     inputType(text: string, delay?: number, timeout?: number): Promise<void>
 
     // ---- Stealth (仅 Extension，CDP 实现 throw) ----
-    stealthKey(key: string, type: 'down' | 'up' | 'press', modifiers: string[]): Promise<void>
+    stealthKey(key: string, type: 'down' | 'up' | 'press', modifiers: string[], timeout?: number): Promise<void>
     stealthClick(
         x: number,
         y: number,
@@ -474,6 +474,7 @@ export interface IBrowserDriver {
     newPage(url?: string, timeout?: number, options?: NewPageOptions): Promise<NewTabResult>
     closePage(targetId: string): Promise<void | PageManagementResult>
     activatePage(targetId: string): Promise<void>
+    activatePageWithAffected?(targetId: string): Promise<PageManagementResult>
     selectPage(targetId: string, timeout?: number): Promise<void>
     getCurrentTargetId(): string | null
     setCurrentTargetId(targetId: string | null): void
@@ -486,7 +487,7 @@ export interface IBrowserDriver {
 
     // ---- iframe（仅 Extension） ----
     /** 仅 Extension 模式支持；CDP throw */
-    resolveFrame(frame: string | number): Promise<FrameResolveResult>
+    resolveFrame(frame: string | number, timeout?: number): Promise<FrameResolveResult>
     getCurrentFrameId(): number
     setCurrentFrameId(frameId: number): void
     /**

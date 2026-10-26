@@ -114,6 +114,7 @@ export class HttpClient {
     private pairingTokenLoaded = false
     private allowInsecureNoToken: boolean | null = null
     private lastServerFailureSummary = ''
+    private lastDiscoverySummary: string | null = null
 
     onMessage(handler: MessageHandler): void {
         this.messageHandler = handler
@@ -239,6 +240,8 @@ export class HttpClient {
         this.shouldReconnect = false
         this.generation += 1
         this.connectingGeneration = null
+        this.lastDiscoverySummary = null
+        this.lastServerFailureSummary = ''
         this.stopReconnect()
 
         for (const controller of this.pendingHealthChecks) {
@@ -296,6 +299,9 @@ export class HttpClient {
             return this.pairingToken ?? ''
         }
         const result = await chrome.storage.local.get(PAIRING_TOKEN_STORAGE_KEY)
+        if (this.pairingTokenLoaded) {
+            return this.pairingToken ?? ''
+        }
         this.pairingToken =
             typeof result[PAIRING_TOKEN_STORAGE_KEY] === 'string' ? result[PAIRING_TOKEN_STORAGE_KEY] : ''
         this.pairingTokenLoaded = true
@@ -307,6 +313,9 @@ export class HttpClient {
             return this.allowInsecureNoToken
         }
         const result = await chrome.storage.local.get(ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY)
+        if (this.allowInsecureNoToken !== null) {
+            return this.allowInsecureNoToken
+        }
         // 与 server 侧默认一致：未显式关闭时允许本地自动连接；v2 key 避免旧版 false 值污染默认行为
         this.allowInsecureNoToken = result[ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY] !== false
         return this.allowInsecureNoToken
@@ -475,17 +484,18 @@ export class HttpClient {
         }
         this.lastServerFailureSummary = failureSummary
 
-        if (healthyPorts.length > 0) {
-            console.log(
-                `[HTTP] Found ${healthyPorts.length} MCP Server(s) at ports: ${healthyPorts
-                    .sort((a, b) => a - b)
-                    .join(', ')}`
-            )
-        } else {
-            console.debug('[HTTP] No MCP Server found in port range')
+        healthyPorts.sort((a, b) => a - b)
+        const discoverySummary = healthyPorts.join(',')
+        if (discoverySummary !== this.lastDiscoverySummary) {
+            if (healthyPorts.length > 0) {
+                console.log(`[HTTP] Found ${healthyPorts.length} MCP Server(s) at ports: ${healthyPorts.join(', ')}`)
+            } else {
+                console.debug('[HTTP] No MCP Server found in port range')
+            }
+            this.lastDiscoverySummary = discoverySummary
         }
 
-        return healthyPorts.sort((a, b) => a - b)
+        return healthyPorts
     }
 
     private async checkPort(port: number, generation: number): Promise<PortCheckResult> {

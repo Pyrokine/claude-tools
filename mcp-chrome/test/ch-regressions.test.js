@@ -138,6 +138,54 @@ test('C24 CDP inspection does not infer a widget from an unrelated div beside a 
     assert.equal(scrolls, 0);
 });
 
+test('F4 inspection distinguishes visible verification evidence from leftover frames and hidden body text', () => {
+    for (const kind of ['visible-body', 'hidden-body', 'residual-frame', 'residual-input', 'origin-pending', 'widget', 'verify']) {
+        let scrolls = 0;
+        const root = {};
+        const element = (tagName) => ({
+            tagName,
+            parentElement: root,
+            textContent: kind === 'verify' ? '请验证您是真人' : '',
+            getBoundingClientRect: () => ({ left: 10, top: 20, width: 300, height: 65 }),
+            getAttribute: (name) => (name === 'src' ? 'https://challenges.cloudflare.com/turnstile/test' : null),
+            closest: () => null,
+            scrollIntoView: () => {
+                ++scrolls;
+            },
+        });
+        const frame = element('IFRAME');
+        const widget = element('DIV');
+        const button = element('BUTTON');
+        const snapshot = vm.runInNewContext(CHALLENGE_INSPECT_SCRIPT, {
+            document: {
+                title: kind === 'origin-pending' ? 'Just a moment...' : 'Ordinary',
+                documentElement: root,
+                body: {
+                    innerText: kind === 'visible-body'
+                        ? '正在进行安全验证'
+                        : kind === 'origin-pending'
+                          ? 'Verification successful. Waiting for origin response'
+                          : 'Ready',
+                    textContent: '正在进行安全验证',
+                },
+                querySelector: () => (['residual-input', 'origin-pending'].includes(kind) ? { parentElement: widget } : null),
+                querySelectorAll: (selector) => {
+                    if (['residual-frame', 'origin-pending'].includes(kind) && selector.includes('iframe')) return [frame];
+                    if (kind === 'widget' && selector.includes('.cf-turnstile')) return [widget];
+                    if (kind === 'verify' && selector === 'button') return [button];
+                    return [];
+                },
+            },
+            window: { getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }) },
+            location: { href: 'https://example.com/' },
+        });
+        const expected = kind === 'visible-body' ? 'js' : ['widget', 'verify'].includes(kind) ? 'turnstile' : 'none';
+        assert.equal(classifyChallengeSnapshot({ ...snapshot, inspected: true }, true), expected, kind);
+        assert.equal(scrolls > 0, ['widget', 'verify'].includes(kind), kind);
+        if (expected !== 'turnstile') assert.equal(snapshot.clickPoint, null, kind);
+    }
+});
+
 test('C24 Linux native coordinates use client-window geometry and asymmetric GTK shadows', async () => {
     const viewport = {
         screenX: -999,
@@ -599,7 +647,7 @@ test('CH-01 CDP locator focus does not depend on Extension refIds', async () => 
 
     await focusCdpTarget(session, target, 750);
     assert.deepEqual(receivedTarget, target);
-    assert.deepEqual(receivedOptions, { timeout: 750 });
+    assert.ok(receivedOptions.timeout > 0 && receivedOptions.timeout <= 600);
     assert.match(functionDeclaration, /this\.focus/);
 });
 
@@ -897,7 +945,7 @@ test('CH-04 target diagnostics read live tab state instead of cached attach meta
     ]);
     assert.match(sessionSource, /async getLiveState\(\)/);
     assert.match(sessionSource, /await this\.extensionBridge!\.listTargets\(\)/);
-    assert.match(diagnosticsSource, /await unifiedSession\.getLiveState\(\)/);
+    assert.match(diagnosticsSource, /withNavigationBudget\(\(\) => unifiedSession\.getLiveState\(\), deadline\)/);
     assert.match(extractSource, /await unifiedSession\.getLiveState\(\)/);
 });
 
@@ -910,8 +958,10 @@ test('CH-05 backend selection happens inside the active tab and frame scopes', a
 
     const assertScoped = (source, handler, backendMarker, hasFrame) => {
         const handlerIndex = source.indexOf(handler);
-        const tabIndex = source.indexOf('withPageContext(unifiedSession, resolvePageTargetId(args)', handlerIndex);
-        const frameIndex = hasFrame ? source.indexOf('withFrame(args.frame', tabIndex) : tabIndex;
+        const tabIndex =
+            handlerIndex +
+            source.slice(handlerIndex).search(/withPageContext\(\s*unifiedSession,\s*resolvePageTargetId\(args\)/);
+        const frameIndex = hasFrame ? tabIndex + source.slice(tabIndex).search(/withFrame\(\s*args\.frame/) : tabIndex;
         const backendIndex = source.indexOf(backendMarker, frameIndex);
         assert.ok(handlerIndex >= 0);
         assert.ok(tabIndex > handlerIndex);
@@ -957,7 +1007,8 @@ test('CH-06 DOM iframe identity does not depend on webNavigation frame ordering'
     assert.match(actionUtilsSource, /candidateFrameIds\.length === 1/);
     assert.match(contentSource, /import \{ installFrameProbeListener \} from '\.\.\/background\/page-scripts'/);
     assert.match(contentSource, /installFrameProbeListener\(\)/);
-    assert.match(actionUtilsSource, /documentIds: childDocumentIds/);
+    assert.match(actionUtilsSource, /documentIds: \[frame\.documentId\]/);
+    assert.match(actionUtilsSource, /verifiedFrameIds\.has/);
     assert.match(actionUtilsSource, /func: installFrameProbeListener/);
     assert.match(pageScriptsSource, /MCP_FRAME_PROBE/);
     assert.match(resolverSource, /不会按 webNavigation 列表顺序选择其他 frame/);
@@ -1187,6 +1238,10 @@ test('CH-08 Challenge waits for page recovery and clicks Turnstile checkbox', as
             title: extensionPending ? 'Just a moment...' : 'Example',
         }),
         getChallengeState: async () => null,
+        inspectChallenge: async () => {
+            assert.equal(extensionPending, false, '前八秒的 Challenge 标题只允许原生标题读取');
+            return { title: 'Example', selectorHits: [], deniedHits: [], turnstilePresent: false };
+        },
         evaluate: async () => {
             extensionEvaluated = true;
             throw new Error('自动 JS Challenge 不应附加 debugger');
@@ -1228,13 +1283,13 @@ test('CH-08 Challenge waits for page recovery and clicks Turnstile checkbox', as
         evaluate: async () => {
             extensionInspectionAt ??= extensionInteractiveClock;
             return {
-                title: 'Just a moment...',
+                title: extensionTurnstilePending ? 'Just a moment...' : 'Example',
                 url: 'https://example.com/',
                 selectorHits: [],
                 deniedHits: [],
                 textHits: [],
-                turnstilePresent: true,
-                clickPoint: { x: 20, y: 20 },
+                turnstilePresent: extensionTurnstilePending,
+                clickPoint: extensionTurnstilePending ? { x: 20, y: 20 } : null,
                 clickTargetKind: 'widget',
                 inspected: true,
             };
@@ -1433,7 +1488,7 @@ test('CH-08 Challenge waits for page recovery and clicks Turnstile checkbox', as
     });
     assert.equal(lateTurnstile.challengeKind, 'turnstile');
     assert.equal(lateTurnstile.clickedTurnstile, true);
-    assert.equal(lateTurnstileInspections, 3);
+    assert.equal(lateTurnstileInspections, 4);
     assert.equal(lateTurnstilePending, false);
 
     const inspectModes = [];
@@ -1531,10 +1586,10 @@ test('CH-08 Challenge waits for page recovery and clicks Turnstile checkbox', as
     };
     const skipped = await waitForChallenge(quietHost, { action: 'evaluate', timeout: 1_000 });
     assert.equal(skipped.challengeKind, 'none');
-    assert.equal(inspected, false);
+    assert.equal(inspected, true);
     const navigated = await waitForChallenge(quietHost, { action: 'open', timeout: 1_000 });
     assert.equal(navigated.challengeKind, 'none');
-    assert.equal(inspected, false);
+    assert.equal(inspected, true);
 
     let stalePending = true;
     let staleInspected = false;
@@ -1575,7 +1630,7 @@ test('CH-08 Challenge waits for page recovery and clicks Turnstile checkbox', as
     });
     assert.equal(recovered.resolved, true);
     assert.equal(recovered.challengeKind, 'js');
-    assert.equal(staleInspected, false);
+    assert.equal(staleInspected, true);
 
     // noinspection JSUnusedGlobalSymbols — structural test double
     const leftoverHost = {
@@ -1950,7 +2005,8 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     assert.doesNotMatch(inputSource, /unifiedSession\.enableNetwork\(\)/);
     assert.doesNotMatch(evaluateSource, /unifiedSession\.enableNetwork\(\)/);
     assert.match(challengeSource, /CHALLENGE_TIMEOUT/);
-    assert.match(challengeSource, /interstitialPending && frameHits.length > 0/);
+    assert.match(challengeSource, /!originResponsePending && interstitialPending &&/);
+    assert.match(challengeSource, /cloudflareFramePresent \|\| frameHits.length > 0 \|\| Boolean\(turnstileBox\)/);
     assert.match(challengeSource, /CHALLENGE_INSPECT_GRACE_MS/);
     assert.match(challengeSource, /CHALLENGE_EXTENSION_PASSIVE_GRACE_MS/);
     assert.match(challengeSource, /emptyInspectCount/);
@@ -1985,7 +2041,7 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     assert.match(unifiedSessionSource, /!windowInfo\.focused/);
     assert.doesNotMatch(unifiedSessionSource, /await this\.focusWindow\(/);
     assert.match(challengeSource, /host\.getMode\(\) === 'extension'/);
-    assert.match(challengeSource, /pageTitle\.live/);
+    assert.doesNotMatch(challengeSource, /pageTitle\.live/);
     for (const source of [challengeSource, pageScriptsSource]) {
         assert.match(source, /el\.scrollIntoView\(\{ block: 'center', inline: 'nearest', behavior: 'instant' \}\)/);
     }

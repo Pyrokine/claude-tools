@@ -1,4 +1,4 @@
-import { pageRevision } from './page-revision'
+import { getExistingTab, pageRevision } from './page-revision'
 
 const KEY_PREFIX = 'mcp_read_grants_v4_'
 const locks = new Map<string, Promise<void>>()
@@ -48,7 +48,7 @@ export async function readGrantDocumentId(
     if (!instanceId || revokedInstances.has(instanceId)) {
         return null
     }
-    const tab = await chrome.tabs.get(tabId)
+    const tab = await getExistingTab(tabId)
     const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
     if (!frame?.documentId) {
         return null
@@ -72,7 +72,7 @@ export async function readGrantDocumentId(
         if (revokedInstances.has(instanceId)) {
             return
         }
-        const currentTab = await chrome.tabs.get(tabId)
+        const currentTab = await getExistingTab(tabId)
         const currentFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
         const currentRevision = pageRevision(tabId)
         const grants = await getGrants(instanceId)
@@ -109,13 +109,13 @@ export async function setReadGrant(
             (grant) => grant.tabId !== tabId
         )
         if (allow) {
-            const tab = await chrome.tabs.get(tabId)
+            const tab = await getExistingTab(tabId)
             const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
             if (!frame?.documentId) {
                 throw new Error('无法确认当前页面身份，未授予只读权限')
             }
             const revision = pageRevision(tabId)
-            const currentTab = await chrome.tabs.get(tabId)
+            const currentTab = await getExistingTab(tabId)
             const currentFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
             if (
                 currentTab.url !== tab.url ||

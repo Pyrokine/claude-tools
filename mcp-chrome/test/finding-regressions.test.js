@@ -33,6 +33,7 @@ import {
     writePrivateFile,
 } from '../dist/core/utils.js';
 import { ExtensionBridge } from '../dist/extension/bridge.js';
+import { ExtensionHttpServer } from '../dist/extension/http-server.js';
 import { withPageContext, withPageResponse } from '../dist/tools/page-context.js';
 import { registerBrowseTool } from '../dist/tools/browse.js';
 import { readChallengeSnapshot, waitForChallenge } from '../dist/tools/challenge.js';
@@ -91,6 +92,7 @@ async function withPageFixture(mode, run) {
     };
     const driver = {
         isConnected: () => true,
+        getState: () => ({ url: `https://example.com/${state.current}`, title: 'Owned page', managed: mode === 'extension' }),
         getCurrentTargetId: () => state.current,
         setCurrentTargetId: (id) => {
             state.current = id;
@@ -149,6 +151,895 @@ async function withPageFixture(mode, run) {
         restoreCdp();
     }
 }
+
+test('F2 verification preserves native context failures and page-script error provenance without replay', async () => {
+    for (const mode of ['cdp', 'extension']) {
+        await withPageFixture(mode, async ({ unified, state }) => {
+            let nativeFailure = true;
+            let evaluations = 0;
+            const restore = patchProperties(unified, {
+                evaluate: async (source, _mode, _timeout, args = []) => {
+                    if (source === 'owned-effect') {
+                        state.dispatched.push('effect');
+                        return 7;
+                    }
+                    ++evaluations;
+                    if (nativeFailure)
+                        throw new CDPError('Runtime.callFunctionOn: Cannot find context with specified id');
+                    return (0, eval)(`(${source})`)(...args);
+                },
+                consumeLastEvaluationMetadata: () => undefined,
+            });
+            try {
+                const evaluate = registeredTool(registerEvaluateTool);
+                for (const script of [
+                    '() => true',
+                    '() => { throw new Error("Runtime.callFunctionOn: Cannot find context with specified id") }',
+                    'async () => { throw new Error("Debugger agent is not enabled") }',
+                ]) {
+                    nativeFailure = script === '() => true';
+                    const before = state.dispatched.length;
+                    const body = JSON.parse(
+                        (
+                            await evaluate({
+                                targetId: '202',
+                                expectedRevision: 'r202',
+                                script: 'owned-effect',
+                                postCondition: { script },
+                            })
+                        ).content[0].text
+                    );
+                    assert.equal(body.actionStatus, 'completed');
+                    assert.equal(body.result, 7);
+                    assert.equal(body.failureStage, 'verification');
+                    assert.equal(body.verificationStatus, nativeFailure ? 'unavailable' : 'error');
+                    assert.equal(state.dispatched.length - before, 1);
+                }
+                assert.equal(evaluations, 3);
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('F4 ordinary inspection preserves the debugger and Challenge titles detach before isolated reads', async () => {
+    const options = {
+        challengeSelectors: [], deniedSelectors: [], widgetSelectors: [], verifyButtonSelectors: [], frameSelectors: [],
+        titleNeedles: ['just a moment', '请稍候'], textMarkers: [], originResponsePendingTextMarkers: [],
+    };
+    for (const scenario of [
+        { title: 'Owned ordinary page', expected: ['inspect'] },
+        { title: 'Just a moment...', expected: ['detach', 'inspect'] },
+        { title: '请稍候…', expected: ['detach', 'inspect'] },
+        { title: 'Owned verification', textHits: ['正在进行安全验证'], expected: ['inspect', 'detach'] },
+        { title: 'Owned recovered', originResponsePending: true, textHits: ['正在进行安全验证'], expected: ['inspect'] },
+    ]) {
+        await withPageFixture('extension', async ({ unified, driver }) => {
+            const calls = [];
+            const { title } = scenario;
+            const snapshot = { title, inspected: true, textHits: scenario.textHits, originResponsePending: scenario.originResponsePending };
+            const restoreDriver = patchProperties(driver, {
+                debuggerDetach: async () => {
+                    calls.push('detach');
+                },
+                inspectChallenge: async () => {
+                    calls.push('inspect');
+                    return snapshot;
+                },
+            });
+            const restore = patchProperties(unified, {
+                getLiveState: async () => ({ url: 'https://example.com/owned', title, managed: true }),
+            });
+            try {
+                assert.equal(await unified.inspectChallenge(options, 1000), snapshot);
+                assert.deepEqual(calls, scenario.expected);
+            } finally {
+                restore();
+                restoreDriver();
+            }
+        });
+    }
+});
+
+test('F3 CDP tools retain full match counts and collect diagnostics before leaving the target frame', async () => {
+    await withPageFixture('cdp', async ({ unified, state }) => {
+        const session = getSession();
+        let frame;
+        let diagnosticReads = 0;
+        const cdp = {
+            async send(method) {
+                if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+                if (method === 'DOM.querySelectorAll') return { nodeIds: Array.from({ length: 15 }, (_, i) => i + 1) };
+                throw new CDPError(`unexpected ${method}`);
+            },
+        };
+        const restoreSession = patchProperties(session, {
+            createLocator: (target, options) => new Locator(cdp, target, 'owned', { ...options, nth: target.nth }),
+            evaluate: async (source) => {
+                ++diagnosticReads;
+                assert.doesNotMatch(source, /\.value\b/);
+                assert.equal(state.current, '202');
+                assert.equal(frame, 2);
+                return { candidates: [{ tag: 'button', text: 'candidate' }], activeElement: null };
+            },
+        });
+        const restore = patchProperties(unified, {
+            withFrame: async (requested, run) => {
+                frame = requested;
+                try {
+                    return await run();
+                } finally {
+                    frame = undefined;
+                }
+            },
+            getLiveState: async () => ({ url: `https://example.com/${state.current}` }),
+            getChallengeState: async () => null,
+            inspectChallenge: async () => ({ title: 'Ordinary', inspected: true }),
+            evaluate: async (source) => {
+                if (source.includes('activeElement')) {
+                    ++diagnosticReads;
+                    assert.equal(state.current, '202');
+                    assert.equal(frame, 2);
+                    return { candidates: [{ tag: 'button', text: 'candidate' }], activeElement: null };
+                }
+                return { title: 'Ordinary', selectorHits: [], deniedHits: [], turnstilePresent: false };
+            },
+        });
+        try {
+            for (const [register, args, code] of [
+                [
+                    registerInputTool,
+                    { events: [{ type: 'click', target: { css: 'button', nth: 30 } }], expectedRevision: 'r202' },
+                    'ELEMENT_NOT_FOUND',
+                ],
+                [registerExtractTool, { type: 'text', target: { css: 'button', nth: 30 } }, 'ELEMENT_NOT_FOUND'],
+                [registerWaitTool, { for: 'element', target: { css: 'button', nth: 30 } }, 'TIMEOUT'],
+            ]) {
+                const started = Date.now();
+                const response = await registeredTool(register)({ ...args, targetId: '202', frame: 2, timeout: 500 });
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(body.error.code, code, response.content[0].text);
+                assert.equal(body.hint, undefined, 'locator failures must not suggest changing window focus');
+                assert.equal(body.error.context.matchCount, 15);
+                assert.equal(body.error.context.nth, 30);
+                assert.equal(body.error.context.tabId, '202');
+                assert.equal(body.error.context.frame, 2);
+                assert.equal(body.error.context.managed, null);
+                assert.equal(body.error.context.connection, 'connected');
+                assert.equal(body.error.context.candidates.length, 1);
+                assert.equal(body.error.context.lastLocatorState, 'index_out_of_range');
+                assert.ok(Date.now() - started < 750, 'diagnostics must share the original deadline');
+                assert.equal(state.current, '101');
+            }
+            assert.equal(diagnosticReads, 3);
+        } finally {
+            restore();
+            restoreSession();
+        }
+    });
+});
+
+test('F3 diagnostic failures preserve primary errors, privacy, and the original deadline', async () => {
+    for (const outcome of ['ok', 'rejected', 'stalled', 'expired']) {
+        await withPageFixture('cdp', async ({ unified, state }) => {
+            let reads = 0;
+            const target = { css: 'button', nth: 30 };
+            const secret = 'sentinel-sensitive-input';
+            const restoreSession = patchProperties(getSession(), {
+                createLocator: (_target, options) => ({
+                    find: async () => {
+                        if (outcome === 'expired') await new Promise((resolve) => setTimeout(resolve, 85));
+                        throw new ElementNotFoundError(
+                            target,
+                            options.timeout,
+                            ['lookup-log'],
+                            'https://example.com/202',
+                            {
+                                matchCount: 15,
+                                lastLocatorState: 'index_out_of_range',
+                            }
+                        );
+                    },
+                }),
+                evaluate: async (source, _args, timeout) => {
+                    ++reads;
+                    assert.equal(state.current, '202');
+                    assert.ok(timeout > 0 && timeout <= 80);
+                    assert.doesNotMatch(source, /\.value\b/);
+                    if (outcome === 'stalled') return new Promise(() => {});
+                    if (outcome === 'rejected') throw new Error(`/home/private-user/test.js ${secret}`);
+                    return {
+                        candidates: Array.from({ length: 12 }, () => ({ tag: 'button', text: secret })),
+                        activeElement: null,
+                    };
+                },
+            });
+            const restore = patchProperties(unified, {
+                getLiveState: async () => ({ url: 'https://example.com/202' }),
+                evaluate: async () => assert.fail('diagnostics must not use reconnecting dispatch'),
+            });
+            try {
+                const started = Date.now();
+                const response = await registeredTool(registerInputTool)({
+                    targetId: '202',
+                    expectedRevision: 'r202',
+                    timeout: 80,
+                    events: [{ type: 'type', target, text: secret }],
+                });
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(body.error.code, 'ELEMENT_NOT_FOUND', outcome);
+                assert.equal(body.error.context.matchCount, 15, outcome);
+                assert.deepEqual(body.error.logs, ['lookup-log']);
+                assert.equal(response.content[0].text.includes(secret), false);
+                assert.equal(body.error.context.candidates.length, outcome === 'ok' ? 10 : 0);
+                if (['rejected', 'stalled'].includes(outcome))
+                    assert.equal(typeof body.error.context.diagnosticError, 'string');
+                assert.ok(Date.now() - started < 250, outcome);
+                assert.equal(reads, outcome === 'expired' ? 0 : 1, outcome);
+                assert.equal(state.current, ['stalled', 'expired'].includes(outcome) ? null : '101');
+                assert.deepEqual(state.dispatched, []);
+            } finally {
+                restore();
+                restoreSession();
+            }
+        });
+    }
+});
+
+test('F3 AX totals and unknown XPath counts remain distinct from unresolved DOM nodes', async () => {
+    for (const scenario of ['ax-range', 'ax-node', 'xpath']) {
+        const target = scenario === 'xpath' ? { xpath: '//button' } : { role: 'button' };
+        const locator = new Locator(
+            {
+                async send(method) {
+                    if (method === 'Accessibility.enable') return {};
+                    if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+                    if (method === 'Accessibility.queryAXTree')
+                        return {
+                            nodes: Array.from({ length: 15 }, () => ({ role: { value: 'button' } })),
+                        };
+                    if (method === 'Runtime.evaluate') return { result: { subtype: 'null' } };
+                    throw new CDPError('unexpected native command');
+                },
+            },
+            target,
+            'owned',
+            { nth: scenario === 'ax-range' ? 30 : 0, timeout: 5 }
+        );
+        await assert.rejects(
+            () => locator.find(),
+            (error) => {
+                assert.equal(error.context.matchCount, scenario === 'xpath' ? null : 15);
+                assert.equal(
+                    error.context.lastLocatorState,
+                    scenario === 'ax-range'
+                        ? 'index_out_of_range'
+                        : scenario === 'ax-node'
+                          ? 'node_resolution_failed'
+                          : 'not_found'
+                );
+                return true;
+            }
+        );
+        const observation = locator.lastObservation;
+        observation.matchCount = 999;
+        assert.notEqual(locator.lastObservation.matchCount, 999);
+    }
+});
+
+test('F4 ordinary live titles still inspect visible verification text without passive delay', async () => {
+    for (const mode of ['extension', 'cdp']) {
+        let clock = 0;
+        let inspections = 0;
+        const host = {
+            getMode: () => mode,
+            getState: () => ({ title: 'Ordinary', url: 'https://example.com/' }),
+            getLiveState: async () => ({ title: 'Ordinary', url: 'https://example.com/' }),
+            getChallengeState: async () => ({ state: 'pending', mode }),
+            evaluate: async () => {
+                ++inspections;
+                return {
+                    title: 'Ordinary',
+                    selectorHits: [],
+                    deniedHits: [],
+                    textHits: ['正在进行安全验证'],
+                    turnstilePresent: false,
+                };
+            },
+            getCookies: async () => [],
+            mouseMove: async () => assert.fail('verification text must not click'),
+            mouseClick: async () => assert.fail('verification text must not click'),
+        };
+        await assert.rejects(
+            () =>
+                waitForChallenge(host, {
+                    action: 'input',
+                    actionStatus: 'not_started',
+                    timeout: 500,
+                    now: () => clock,
+                    sleep: async (ms) => {
+                        clock += ms;
+                    },
+                }),
+            (error) => error.code === 'CHALLENGE_TIMEOUT'
+        );
+        assert.equal(inspections, 1);
+    }
+});
+
+test('F6 legacy topology omits unknown groups while empty and malformed groups remain distinct', async () => {
+    await withPageFixture('extension', async ({ unified }) => {
+        const bridge = new ExtensionBridge();
+        const topology = {
+            windowCount: 1,
+            windows: [
+                {
+                    id: 9,
+                    focused: false,
+                    alwaysOnTop: false,
+                    tabCount: 1,
+                    tabs: [{ id: 202, managed: true, active: false, muted: false, autoDiscardable: false }],
+                },
+            ],
+        };
+        let groups;
+        let provided = false;
+        let calls = 0;
+        bridge.httpServer.sendCommand = async (action) => {
+            assert.equal(action, 'tabs_topology');
+            ++calls;
+            return { ...topology, ...(provided ? { groups } : {}) };
+        };
+        const restore = patchProperties(unified, { listTopology: () => bridge.listWindows() });
+        try {
+            const browse = registeredTool(registerBrowseTool);
+            for (const details of ['summary', 'full']) {
+                const body = JSON.parse(
+                    (await browse({ action: 'list', details, targetIds: ['202'], managedOnly: true })).content[0].text
+                );
+                assert.equal(body.success, true);
+                assert.equal('groups' in body, false);
+                assert.match(body.warnings.join(' '), /groups|分组/);
+                assert.equal(body.targets[0].isActive, false);
+                if (details === 'full') assert.equal(body.targets[0].autoDiscardable, false);
+            }
+            provided = true;
+            groups = [];
+            assert.deepEqual(JSON.parse((await browse({ action: 'list' })).content[0].text).groups, []);
+            for (groups of [null, {}, [{ id: 7, targetIds: [] }], [{ id: 7, tabIds: [] }]]) {
+                const response = await browse({ action: 'list' });
+                assert.equal(response.isError, true);
+                assert.match(JSON.parse(response.content[0].text).error.message, /groups|分组/);
+            }
+            assert.equal(calls, 7);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test('F6 legacy group summaries retain real membership and filtering from the same topology response', async () => {
+    await withPageFixture('extension', async ({ unified }) => {
+        const bridge = new ExtensionBridge();
+        let calls = 0;
+        bridge.httpServer.sendCommand = async (action) => {
+            assert.equal(action, 'tabs_topology');
+            ++calls;
+            return {
+                windowCount: 2,
+                windows: [
+                    { id: 9, focused: false, tabCount: 3, tabs: [
+                        { id: 204, index: 0, groupId: -1, managed: true, active: false },
+                        { id: 202, index: 1, groupId: 7, managed: true, active: false, pinned: false },
+                        { id: 203, index: 2, groupId: 7, managed: false, active: false },
+                    ] },
+                    { id: 10, focused: false, tabCount: 1, tabs: [
+                        { id: 205, index: 0, groupId: 8, managed: false, active: false },
+                    ] },
+                ],
+                groups: [
+                    { id: 7, title: 'Legacy owned group', color: 'cyan', windowId: 9, collapsed: false },
+                    { id: 8, title: '', color: 'blue', windowId: 10, collapsed: false },
+                ],
+            };
+        };
+        const restore = patchProperties(unified, { listTopology: () => bridge.listWindows() });
+        try {
+            const browse = registeredTool(registerBrowseTool);
+            for (const details of ['summary', 'full']) {
+                const body = JSON.parse((await browse({ action: 'list', details })).content[0].text);
+                assert.equal(body.success, true);
+                const group = body.groups.find(item => item.id === 7);
+                assert.deepEqual(group.tabIds, [202, 203]);
+                assert.deepEqual(group.targetIds, ['202', '203']);
+                assert.equal(group.totalTabCount, 2);
+                assert.equal(group.index, 1);
+                assert.equal(group.collapsed, false);
+                assert.equal(body.targets.find(item => item.targetId === '202').pinned, false);
+                assert.equal(body.warnings, undefined);
+            }
+            for (const filter of [{ targetIds: ['202'] }, { managedOnly: true }]) {
+                const body = JSON.parse((await browse({ action: 'list', ...filter })).content[0].text);
+                assert.deepEqual(body.groups.map(item => item.id), [7]);
+                assert.deepEqual(body.groups[0].tabIds, [202]);
+                assert.deepEqual(body.groups[0].targetIds, ['202']);
+                assert.equal(body.groups[0].totalTabCount, 2);
+            }
+            const empty = JSON.parse((await browse({ action: 'list', targetIds: ['203'], managedOnly: true })).content[0].text);
+            assert.deepEqual(empty.targets, []);
+            assert.deepEqual(empty.groups, []);
+            assert.equal(calls, 5);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test('CR-07 device catalogue is independent of page state and never ignores page conditions', async (t) => {
+    for (const mode of ['extension', 'cdp']) {
+        await t.test(mode, async () =>
+            withPageFixture(mode, async ({ unified, state }) => {
+                let pageReads = 0;
+                const restore = patchProperties(unified, {
+                    getPageSnapshot: async () => {
+                        ++pageReads;
+                        throw new TargetNotFoundError('closed');
+                    },
+                    withTabId: async () => {
+                        throw new Error('catalogue must not select a page');
+                    },
+                });
+                try {
+                    const manage = registeredTool(registerManageTool);
+                    for (const targetId of [undefined, 'missing']) {
+                        const response = await manage({ action: 'emulate', targetId });
+                        assert.equal(response.isError, undefined);
+                        const data = JSON.parse(response.content[0].text);
+                        assert.ok(data.availableDevices.includes('iPhone 13'));
+                        assert.equal(data.pageContext, undefined);
+                    }
+                    for (const condition of [{ expectedUrl: 'https://example.com/' }, { expectedRevision: 'stale' }]) {
+                        const response = await manage({ action: 'emulate', ...condition });
+                        assert.equal(response.isError, true);
+                        assert.equal(JSON.parse(response.content[0].text).error.code, 'INVALID_ARGUMENT');
+                    }
+                    assert.equal(pageReads, 0);
+                    assert.equal(state.current, '101');
+                } finally {
+                    restore();
+                }
+            })
+        );
+    }
+});
+
+test('CR-08 DOMSnapshot uses the existing native path in each backend and rejects ignored scopes', async (t) => {
+    for (const mode of ['extension', 'cdp']) {
+        await t.test(mode, async () =>
+            withPageFixture(mode, async ({ unified, state }) => {
+                const calls = [];
+                const snapshot = { documents: [{ nodes: { nodeName: ['owned'] } }], strings: ['owned'] };
+                const restore = patchProperties(unified, {
+                    withFrame: async (_frame, run) => run(),
+                    sendCdpCommand: async (...args) => {
+                        calls.push({ args, targetId: state.current });
+                        return snapshot;
+                    },
+                });
+                try {
+                    const extract = registeredTool(registerExtractTool);
+                    const response = await extract({ type: 'state', mode: 'domsnapshot', targetId: '202' });
+                    assert.equal(response.isError, undefined);
+                    assert.deepEqual(JSON.parse(response.content[0].text).snapshot, snapshot);
+                    assert.equal(calls[0].args[0], 'DOMSnapshot.captureSnapshot');
+                    assert.equal(calls[0].targetId, '202');
+                    assert.equal(state.current, '101');
+                    for (const scope of [{ frame: 0 }, { target: { css: '#owned' } }, { depth: 1 }]) {
+                        const rejected = await extract({
+                            type: 'state',
+                            mode: 'domsnapshot',
+                            targetId: '202',
+                            ...scope,
+                        });
+                        assert.equal(rejected.isError, true);
+                        assert.equal(JSON.parse(rejected.content[0].text).error.code, 'INVALID_ARGUMENT');
+                    }
+                    assert.equal(calls.length, 1);
+                } finally {
+                    restore();
+                }
+            })
+        );
+    }
+});
+
+test('CR-09 CDP activation observes available fields without changing the default target', async () => {
+    await withPageFixture('cdp', async ({ state }) => {
+        const calls = [];
+        const cdp = getSession();
+        const restore = patchProperties(cdp, {
+            listTargets: async () =>
+                [...state.targets].map((targetId) => ({
+                    id: targetId,
+                    targetId,
+                    url: `https://example.com/${targetId}`,
+                    title: `Page ${targetId}`,
+                    revision: `r${targetId}`,
+                })),
+            activateTarget: async (targetId) => {
+                calls.push(targetId);
+            },
+        });
+        try {
+            const manage = registeredTool(registerManageTool);
+            const response = await manage({ action: 'activatePage', targetId: '202' });
+            assert.equal(response.isError, undefined);
+            const affected = JSON.parse(response.content[0].text).affected;
+            assert.equal(affected.before.targetId, '202');
+            assert.equal(affected.after.title, 'Page 202');
+            assert.equal(affected.after.active, undefined);
+            assert.deepEqual(calls, ['202']);
+            assert.equal(state.current, '101');
+            const missing = await manage({ action: 'activatePage', targetId: 'missing' });
+            assert.equal(missing.isError, true);
+            const stale = await manage({ action: 'activatePage', targetId: '202', expectedRevision: 'stale' });
+            assert.equal(stale.isError, true);
+            assert.equal(JSON.parse(stale.content[0].text).error.code, 'ACTION_PRECONDITION_FAILED');
+            assert.deepEqual(calls, ['202']);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test('CS-N03 public connect waits for the input scope and cannot replace its backend or restoration', async () => {
+    await withPageFixture('cdp', async ({ unified, driver }) => {
+        const gate = deferred();
+        const entered = deferred();
+        const calls = [];
+        driver.getConnectionInfo = () => ({ version: 'fixture' });
+        const proto = Object.getPrototypeOf(unified);
+        const restoreUnified = patchProperties(unified, {
+            extensionBridge: driver,
+            getMode: proto.getMode,
+            getDriver: proto.getDriver,
+        });
+        const restoreCdp = patchProperties(getSession(), {
+            async keyDown() {
+                calls.push('cdp-down');
+                entered.resolve();
+                await gate.promise;
+            },
+            async keyUp() {
+                calls.push('cdp-up');
+            },
+        });
+        try {
+            const input = registeredTool(registerInputTool)({
+                targetId: '202',
+                expectedRevision: 'r202',
+                events: [
+                    { type: 'keydown', key: 'a' },
+                    { type: 'keyup', key: 'a' },
+                ],
+            });
+            await entered.promise;
+            let connected = false;
+            const connect = registeredTool(registerBrowseTool)({ action: 'connect' }).then((result) => {
+                connected = true;
+                return result;
+            });
+            await new Promise((resolve) => setImmediate(resolve));
+            assert.equal(connected, false);
+            assert.equal(unified.activeMode, 'cdp');
+            gate.resolve();
+            assert.equal(JSON.parse((await input).content[0].text).success, true);
+            assert.equal(JSON.parse((await connect).content[0].text).mode, 'extension');
+            assert.deepEqual(calls, ['cdp-down', 'cdp-up']);
+            assert.equal(unified.getMode(), 'extension');
+            assert.equal(getSession().getCurrentTargetId(), '101');
+        } finally {
+            gate.resolve();
+            restoreCdp();
+            restoreUnified();
+        }
+    });
+});
+
+test('CS-N05 public CDP frame requests reject before probing an available Extension default page', async () => {
+    await withPageFixture('cdp', async ({ unified, driver }) => {
+        let probes = 0;
+        let scripts = 0;
+        driver.resolveFrame = async () => {
+            ++probes;
+            return { frameId: 4 };
+        };
+        const restore = patchProperties(unified, {
+            extensionBridge: driver,
+            evaluate: async () => {
+                ++scripts;
+            },
+        });
+        try {
+            const result = await registeredTool(registerEvaluateTool)({
+                targetId: '202',
+                frame: 0,
+                script: '++window.sideEffect',
+            });
+            const body = JSON.parse(result.content[0].text);
+            assert.equal(result.isError, true);
+            assert.equal(body.error.code, 'DRIVER_CAPABILITY_ERROR');
+            assert.equal(body.pageContext.targetId, '202');
+            assert.equal(probes, 0);
+            assert.equal(scripts, 0);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test('C7 public frame failures preserve the retry contract at the response top level', async () => {
+    await withPageFixture('extension', async ({ unified }) => {
+        const restore = patchProperties(unified, {
+            evaluate: async () => {
+                throw new StructuredToolError('FRAME_STALE_CONTEXT', 'Execution context became stale', undefined, {
+                    retryAttempted: false,
+                });
+            },
+        });
+        try {
+            const response = await registeredTool(registerEvaluateTool)({
+                targetId: '202',
+                expectedRevision: 'r202',
+                script: 'owned-action',
+            });
+            const payload = JSON.parse(response.content[0].text);
+            assert.equal(payload.retryAttempted, false);
+            assert.equal(payload.actionExecuted, true);
+            assert.equal(payload.actionStatus, 'unknown');
+        } finally {
+            restore();
+        }
+    });
+});
+
+test('CS-N01 public temporary CDP evaluate preserves each target log buffer and explicit clearing', async () => {
+    await withPageFixture('cdp', async ({ unified }) => {
+        const cdp = getSession();
+        const proto = Object.getPrototypeOf(cdp);
+        const original = { level: 'error', text: 'original-target', sequence: 1 };
+        const restoreCdp = patchProperties(cdp, {
+            cdp: { isConnected: true },
+            currentTargetId: '101',
+            sessionId: 'session-101',
+            targetLogs: new Map(),
+            consoleLogs: [original],
+            networkRequests: [{ url: 'original-request' }],
+            requestMap: new Map(),
+            selectPage: proto.selectPage,
+            getCurrentTargetId: proto.getCurrentTargetId,
+            async sendBrowserCommand(method, params) {
+                return method === 'Target.attachToTarget' ? { sessionId: `session-${params.targetId}` } : {};
+            },
+            async initSession() {},
+        });
+        const restoreUnified = patchProperties(unified, {
+            getState: () => null,
+            getLiveState: async () => null,
+            evaluate: async () => {
+                cdp.consoleLogs.push({ level: 'warning', text: 'temporary-target', sequence: 2 });
+                return true;
+            },
+        });
+        try {
+            const response = await registeredTool(registerEvaluateTool)({
+                targetId: '202',
+                expectedRevision: 'r202',
+                script: 'true',
+            });
+            assert.equal(response.isError, undefined);
+            assert.equal(cdp.currentTargetId, '101');
+            assert.deepEqual(
+                (await cdp.getConsoleLogs()).map((item) => item.text),
+                ['original-target']
+            );
+            assert.equal((await cdp.getNetworkRequests())[0].url, 'original-request');
+            await cdp.selectPage('202');
+            assert.deepEqual(
+                (await cdp.getConsoleLogs()).map((item) => item.text),
+                ['temporary-target']
+            );
+            await cdp.getConsoleLogs({ clear: true });
+            await cdp.selectPage('101');
+            await cdp.selectPage('202');
+            assert.deepEqual(await cdp.getConsoleLogs(), []);
+        } finally {
+            restoreUnified();
+            restoreCdp();
+        }
+    });
+});
+
+test('CS-N02 CDP retains response metadata until body completion and logs a body failure exactly once', async () => {
+    const cdp = getSession();
+    const listeners = new Map();
+    const restore = patchProperties(cdp, {
+        cdp: { onEvent: (name, listener) => listeners.set(name, listener) },
+        sessionId: 'owned',
+        currentTargetId: '101',
+        mainFrameId: 'main',
+        listenersInstalled: false,
+        requestMap: new Map(),
+        networkRequests: [],
+        consoleLogs: [],
+        targetLogs: new Map(),
+    });
+    const emit = (name, data, sessionId = 'owned') => listeners.get(name)(data, sessionId);
+    try {
+        cdp.setupEventListeners();
+        for (const failure of [false, true]) {
+            const requestId = String(failure);
+            emit('Network.requestWillBeSent', {
+                requestId,
+                request: { url: `https://example.com/${requestId}`, method: 'GET' },
+                type: 'Document',
+                frameId: 'main',
+                timestamp: 1,
+                wallTime: 10,
+            });
+            emit('Network.responseReceived', { requestId, response: { status: 200 }, timestamp: 2 });
+            assert.equal(cdp.requestMap.has(requestId), true);
+            const terminal = {
+                requestId,
+                timestamp: 3,
+                ...(failure ? { errorText: 'net::ERR_CONNECTION_RESET' } : {}),
+            };
+            emit(failure ? 'Network.loadingFailed' : 'Network.loadingFinished', terminal);
+            emit('Network.loadingFailed', terminal);
+            assert.equal(cdp.requestMap.has(requestId), false);
+        }
+        const entries = await cdp.getNetworkRequests();
+        assert.equal(entries.length, 2);
+        assert.deepEqual(
+            entries.map((item) => item.status),
+            [200, 200]
+        );
+        assert.equal(entries[1].errorText, 'net::ERR_CONNECTION_RESET');
+        assert.equal(entries[1].duration, 2000);
+    } finally {
+        restore();
+    }
+});
+
+test('CS-N04 public final key acknowledgements cannot return success after the input budget expires', async (t) => {
+    for (const key of ['keydown', 'keyup']) {
+        for (const route of ['precise', 'stealth', 'cdp']) {
+            await t.test(`${route}-${key}`, async () =>
+                withPageFixture(route === 'cdp' ? 'cdp' : 'extension', async ({ unified, driver }) => {
+                    let now = 1000;
+                    let dispatched = 0;
+                    let rpcBudget;
+                    const dispatch = async (...args) => {
+                        ++dispatched;
+                        rpcBudget = args.at(-1);
+                        now += 101;
+                    };
+                    const restoreClock = patchProperties(Date, { now: () => now });
+                    const restoreUnified = patchProperties(unified, { inputMode: route });
+                    driver.inputKey = dispatch;
+                    driver.stealthKey = dispatch;
+                    const restoreCdp =
+                        route === 'cdp'
+                            ? patchProperties(getSession(), { keyDown: dispatch, keyUp: dispatch })
+                            : () => {};
+                    try {
+                        const response = await registeredTool(registerInputTool)({
+                            targetId: '101',
+                            expectedRevision: 'r101',
+                            timeout: 100,
+                            events: [{ type: key, key: 'a' }],
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.isError, true);
+                        assert.equal(body.actionStatus, 'unknown');
+                        assert.equal(body.retryable, false);
+                        assert.equal(dispatched, 1);
+                        assert.ok(rpcBudget > 0 && rpcBudget <= 100);
+                    } finally {
+                        restoreCdp();
+                        restoreUnified();
+                        restoreClock();
+                    }
+                })
+            );
+        }
+    }
+});
+
+test('CS-N04 key RPCs carry remaining budgets and late acknowledgements retain unknown execution', async () => {
+    for (const method of ['inputKey', 'stealthKey']) {
+        const bridge = new ExtensionBridge();
+        let now = 1000;
+        const restoreClock = patchProperties(Date, { now: () => now });
+        const restore = patchProperties(bridge, {
+            currentTabId: 101,
+            httpServer: {
+                async sendCommand(action, params, timeout) {
+                    assert.equal(action, method === 'inputKey' ? 'input_key' : 'stealth_key');
+                    assert.equal(params.deadline, 1050);
+                    assert.equal(timeout, 50);
+                    now = 1051;
+                    return { success: true };
+                },
+            },
+        });
+        try {
+            await assert.rejects(
+                () =>
+                    method === 'inputKey'
+                        ? bridge.inputKey('keyDown', { key: 'a' }, 50)
+                        : bridge.stealthKey('a', 'up', [], 50),
+                (error) => error.code === 'TIMEOUT' && error.context.actionStatus === 'unknown'
+            );
+        } finally {
+            restore();
+            restoreClock();
+        }
+    }
+});
+
+test('DOC-C01 manage rejects activate outside movePage before page creation or mutation', async () => {
+    const manage = registeredTool(registerManageTool);
+    for (const action of ['newPage', 'updatePage', 'newWindow', 'groupPages']) {
+        assert.throws(() => manage({ action, activate: false }), /不支持 activate/);
+    }
+});
+
+test('Chrome public repeated screenshot timeouts preserve errors and allow a later current-context evaluation', async () => {
+    await withPageFixture('extension', async ({ unified }) => {
+        let screenshots = 0;
+        let evaluations = 0;
+        const restore = patchProperties(unified, {
+            getState: () => null,
+            getLiveState: async () => null,
+            screenshot: async () => {
+                ++screenshots;
+                throw new StructuredToolError('TIMEOUT', 'screenshot RPC timeout', 'read current state', {
+                    actionStatus: 'unknown',
+                    retryable: false,
+                });
+            },
+            evaluate: async (script) => {
+                if (script === 'owned') {
+                    ++evaluations;
+                    return 'current-context';
+                }
+                return false;
+            },
+        });
+        try {
+            const extract = registeredTool(registerExtractTool);
+            for (let attempt = 0; attempt < 3; ++attempt) {
+                const response = await extract({ targetId: '202', type: 'screenshot' });
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(response.isError, true);
+                assert.equal(body.error.code, 'TIMEOUT');
+                assert.equal(body.pageContext.targetId, '202');
+            }
+            const response = await registeredTool(registerEvaluateTool)({
+                targetId: '202',
+                expectedRevision: 'r202',
+                script: 'owned',
+            });
+            assert.equal(JSON.parse(response.content[0].text).result, 'current-context');
+            assert.equal(screenshots, 3);
+            assert.equal(evaluations, 1);
+        } finally {
+            restore();
+        }
+    });
+});
 
 test('C19 evaluate retains origin-wait fields across action, verification and output results', async (t) => {
     const evaluate = registeredTool(registerEvaluateTool);
@@ -226,6 +1117,170 @@ test('C19 evaluate retains origin-wait fields across action, verification and ou
                 });
             });
         }
+    }
+});
+
+test('ER-06 native result serialization survives Extension transport and action classification', async () => {
+    const server = Object.create(ExtensionHttpServer.prototype);
+    const nativeMessage = "Object couldn't be returned by value";
+    const detail = {
+        error: {
+            code: 'CDP_ERROR',
+            message: `Runtime.evaluate: ${nativeMessage}`,
+            suggestion: 'Return a serializable value',
+            context: {
+                nativeSource: 'chrome.debugger',
+                method: 'Runtime.evaluate',
+                phase: 'command',
+                targetId: '202',
+                nativeMessage,
+                nativeCode: -32000,
+                reason: 'result_not_serializable',
+            },
+        },
+    };
+    let nativeFailure;
+    server.messageHandlers = new Map([
+        [
+            'owned-error',
+            {
+                reject: (error) => {
+                    nativeFailure = error;
+                },
+                resolve: () => assert.fail('native failure was accepted'),
+            },
+        ],
+    ]);
+    server.handleMessage(JSON.stringify({ id: 'owned-error', success: false, error: JSON.stringify(detail) }));
+    assert.ok(nativeFailure instanceof CDPError);
+    assert.equal(server.messageHandlers.size, 0);
+    assert.deepEqual(JSON.parse(formatErrorResponse(nativeFailure).content[0].text), detail);
+    assert.deepEqual(classifyEvaluateFailure(nativeFailure), {
+        actionExecuted: true,
+        actionStatus: 'unknown',
+        retryable: false,
+        failureStage: 'action',
+    });
+    const evaluate = registeredTool(registerEvaluateTool);
+    const manage = registeredTool(registerManageTool);
+    await withPageFixture('extension', async ({ unified }) => {
+        let executions = 0;
+        const restore = patchProperties(unified, {
+            consumeLastEvaluationMetadata: () => undefined,
+            evaluate: async () => {
+                ++executions;
+                throw nativeFailure;
+            },
+            sendCdpCommand: async () => {
+                ++executions;
+                throw nativeFailure;
+            },
+        });
+        try {
+            for (const response of [
+                await evaluate({ targetId: '202', expectedRevision: 'r202', script: '++window.sideEffect' }),
+                await manage({ action: 'cdp', targetId: '202', cdpMethod: 'Runtime.evaluate' }),
+            ]) {
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(response.isError, true);
+                assert.equal(body.actionExecuted, true);
+                assert.equal(body.actionStatus, 'unknown');
+                assert.equal(body.retryable, false);
+                assert.deepEqual(body.error, detail.error);
+            }
+            assert.equal(executions, 2);
+        } finally {
+            restore();
+        }
+    });
+    for (const message of [nativeMessage, 'Object reference chain is too long']) {
+        for (const method of ['Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.runScript', 'Page.enable']) {
+            const client = new CDPClient();
+            let failure;
+            client.callbacks.set(1, {
+                method,
+                resolve: () => assert.fail('protocol error resolved'),
+                reject: (error) => {
+                    failure = error;
+                },
+            });
+            client.handleMessage(Buffer.from(JSON.stringify({ id: 1, error: { code: -32000, message } })));
+            assert.equal(classifyEvaluateFailure(failure).actionStatus === 'unknown', method.startsWith('Runtime.'));
+        }
+        for (const text of [message, `Error: ${message}\n    at <anonymous>:1:1`, `Runtime.evaluate: ${message}`]) {
+            assert.notEqual(classifyEvaluateFailure(new Error(text)).actionStatus, 'unknown');
+        }
+    }
+});
+
+test('ER-07 manage cdp preserves resource and method failures without claiming an unsupported domain', async () => {
+    const manage = registeredTool(registerManageTool);
+    await withPageFixture('extension', async ({ unified }) => {
+        let failure;
+        let executions = 0;
+        const restore = patchProperties(unified, {
+            sendCdpCommand: async () => {
+                ++executions;
+                throw failure;
+            },
+        });
+        try {
+            for (const message of ['Resource not found', 'request body is not supported', 'method not found']) {
+                failure = new Error(message);
+                const response = await manage({ action: 'cdp', targetId: '202', cdpMethod: 'Network.getResponseBody' });
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(response.isError, true);
+                assert.equal(body.error.code, 'UNKNOWN_ERROR');
+                assert.equal(body.error.message, message);
+                assert.equal(body.pageContext.targetId, '202');
+            }
+            assert.equal(executions, 3);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test('ER-10 page exceptions containing debugger or context text are not retryable', async () => {
+    const evaluate = registeredTool(registerEvaluateTool);
+    const messages = ['Error: Debugger agent is not enabled', 'Error: Cannot find context with specified id'];
+    for (const mode of ['extension', 'cdp']) {
+        await withPageFixture(mode, async ({ unified }) => {
+            let failure;
+            let executions = 0;
+            const restore = patchProperties(unified, {
+                consumeLastEvaluationMetadata: () => undefined,
+                evaluate: async () => {
+                    ++executions;
+                    throw failure;
+                },
+            });
+            try {
+                for (const message of messages) {
+                    failure = new Error(message);
+                    assert.deepEqual(classifyEvaluateFailure(failure), {
+                        actionExecuted: true,
+                        actionStatus: 'failed',
+                        failureStage: 'action',
+                        retryable: false,
+                    });
+                    const response = await evaluate({
+                        targetId: '202',
+                        expectedRevision: 'r202',
+                        script: 'owned-script',
+                    });
+                    const body = JSON.parse(response.content[0].text);
+                    assert.equal(response.isError, true);
+                    assert.equal(body.actionExecuted, true);
+                    assert.equal(body.actionStatus, 'failed');
+                    assert.equal(body.retryable, false);
+                    assert.equal(body.error.message, message);
+                }
+                assert.equal(executions, messages.length);
+            } finally {
+                restore();
+            }
+        });
     }
 });
 
@@ -1409,7 +2464,7 @@ test('C10 Extension target lookup and coordinate reads reduce the movement budge
                     const response = await registeredTool(registerInputTool)({
                         expectedRevision: 'r101',
                         timeout: 100,
-                        events: [{ type: 'click', target: { css: '#owned' } }],
+                        events: [{ type: 'mousemove', target: { css: '#owned' } }],
                     });
                     assert.equal(response.isError, undefined, response.content[0].text);
                     assert.deepEqual(budgets, [
@@ -1417,7 +2472,7 @@ test('C10 Extension target lookup and coordinate reads reduce the movement budge
                         ['point', 60],
                         ['move', 30],
                     ]);
-                    assert.equal(clicks, 1);
+                    assert.equal(clicks, 0);
                 } finally {
                     restore();
                     restoreClock();
@@ -1427,10 +2482,277 @@ test('C10 Extension target lookup and coordinate reads reduce the movement budge
     }
 });
 
-test('C10 coordinate focus stops commands and selection when movement expires', async (t) => {
+test('C-V16 commands focus coordinate targets without mouse effects in either backend or Extension frame', async (t) => {
+    for (const route of ['extension', 'frame', 'cdp']) {
+        for (const kind of [
+            'checkbox',
+            'link',
+            'input',
+            'contenteditable',
+            'disabled',
+            'nonfocusable',
+            'missing',
+            'throws',
+            'expired',
+        ]) {
+            await t.test(`${route}-${kind}`, async () => {
+                await withPageFixture(route === 'cdp' ? 'cdp' : 'extension', async ({ unified, driver, state }) => {
+                    const doc = { activeElement: null, querySelectorAll: () => [] };
+                    let focusCalls = 0;
+                    let frameId = 0;
+                    const calls = [];
+                    class HtmlElement {
+                        tagName = kind === 'link' ? 'A' : 'INPUT';
+                        id = 'owned-target';
+                        checked = false;
+                        isContentEditable = kind === 'contenteditable';
+                        getAttribute() {
+                            return null;
+                        }
+
+                        focus() {
+                            ++focusCalls;
+                            if (kind === 'throws') throw new Error('owned focus failure');
+                            if (kind !== 'disabled' && kind !== 'nonfocusable') doc.activeElement = this;
+                        }
+                    }
+                    const element = kind === 'missing' ? null : new HtmlElement();
+                    doc.elementFromPoint = (x, y) => {
+                        assert.deepEqual([x, y], [50, 60]);
+                        return element;
+                    };
+                    const win = { __mcpElementMap: element ? { ref_owned: new WeakRef(element) } : {} };
+                    const evaluate = (code, args) =>
+                        runInNewContext(args === undefined ? code : `(${code})(...args)`, {
+                            document: doc,
+                            window: win,
+                            HTMLElement: HtmlElement,
+                            HTMLInputElement: HtmlElement,
+                            Date: kind === 'expired' ? { now: () => Infinity } : Date,
+                            args,
+                        });
+                    const restoreDriver = patchProperties(driver, {
+                        resolveFrame: async (frame) => {
+                            assert.equal(frame, '#owned-frame');
+                            return { frameId: 7, offset: { x: 500, y: 800 } };
+                        },
+                        getCurrentFrameId: () => frameId,
+                        setCurrentFrameId: (value) => {
+                            frameId = value;
+                        },
+                        find: async (_selector, _text, _xpath, timeout, point) => {
+                            calls.push(['find', frameId, point, timeout]);
+                            assert.deepEqual(point, { x: 50, y: 60 });
+                            return element ? [{ refId: 'ref_owned' }] : [];
+                        },
+                    });
+                    const restoreCdp =
+                        route === 'cdp'
+                            ? patchProperties(getSession(), {
+                                  createLocator: () => assert.fail('coordinate command focus must not use Locator'),
+                                  evaluate: async (code, args, timeout) => {
+                                      calls.push(['evaluate', frameId, timeout]);
+                                      return evaluate(code, args);
+                                  },
+                              })
+                            : () => {};
+                    const restore = patchProperties(unified, {
+                        inputMode: 'precise',
+                        evaluate: async (code, _mode, timeout, args) => {
+                            calls.push(['evaluate', frameId, timeout]);
+                            return evaluate(code, args);
+                        },
+                        mouseMove: () => assert.fail('command focus must not move the mouse'),
+                        mouseClick: () => assert.fail('command focus must not click'),
+                        actionableClick: () => assert.fail('command focus must not click a reference'),
+                        keyDown: async (key, commands, timeout) => {
+                            assert.equal(doc.activeElement, element);
+                            assert.deepEqual(commands, ['selectAll']);
+                            calls.push(['key', frameId, timeout]);
+                            state.dispatched.push(key);
+                        },
+                    });
+                    try {
+                        const response = await registeredTool(registerInputTool)({
+                            expectedRevision: 'r101',
+                            timeout: 1000,
+                            ...(route === 'frame' ? { frame: '#owned-frame' } : {}),
+                            events: [{ type: 'keydown', key: 'a', commands: ['selectAll'], target: { x: 50, y: 60 } }],
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        const success = ['checkbox', 'link', 'input', 'contenteditable'].includes(kind);
+                        assert.equal(response.isError, success ? undefined : true, response.content[0].text);
+                        assert.equal(focusCalls, kind === 'missing' || kind === 'expired' ? 0 : 1);
+                        assert.deepEqual(state.dispatched, success ? ['a'] : []);
+                        assert.equal(element?.checked ?? false, false);
+                        assert.equal(frameId, 0, 'frame scope must be restored after success or failure');
+                        assert.equal(state.current, '101');
+                        if (success) {
+                            assert.ok(calls.every((call) => call[1] === (route === 'frame' ? 7 : 0)));
+                            assert.equal(body.eventsExecuted, 1);
+                        } else {
+                            assert.equal(body.eventsExecuted, 0);
+                            if (kind === 'missing') assert.equal(body.error.code, 'TARGET_NOT_FOUND');
+                            else if (kind === 'throws') assert.match(body.error.message, /owned focus failure/);
+                            else if (kind === 'expired')
+                                assert.match(body.error.message, /timeout before command focus/);
+                            else assert.equal(body.error.code, 'TARGET_FOCUS_FAILED');
+                        }
+                    } finally {
+                        restore();
+                        restoreCdp();
+                        restoreDriver();
+                    }
+                });
+            });
+        }
+    }
+});
+
+test('C-V16 commands keep the original focus deadline and reject stealth before preparing a target', async (t) => {
+    for (const route of ['extension', 'cdp', 'stealth']) {
+        for (const expiresAt of ['lookup', 'focus', 'none']) {
+            await t.test(`${route}-${expiresAt}`, async () => {
+                await withPageFixture(route === 'cdp' ? 'cdp' : 'extension', async ({ unified, driver }) => {
+                    let now = 1000;
+                    const budgets = [];
+                    const restoreClock = patchProperties(Date, { now: () => now });
+                    const focus = async (_code, _args, timeout) => {
+                        budgets.push(['focus', timeout]);
+                        now += expiresAt === 'focus' ? timeout : 20;
+                        return true;
+                    };
+                    const restoreDriver = patchProperties(driver, {
+                        find: async (_selector, _text, _xpath, timeout) => {
+                            budgets.push(['find', timeout]);
+                            now += expiresAt === 'lookup' ? timeout : 40;
+                            return [{ refId: 'ref_owned' }];
+                        },
+                    });
+                    const restoreCdp =
+                        route === 'cdp'
+                            ? patchProperties(getSession(), {
+                                  createLocator: () => assert.fail('coordinate command focus must not use Locator'),
+                                  evaluate: focus,
+                              })
+                            : () => {};
+                    const restore = patchProperties(unified, {
+                        inputMode: route === 'stealth' ? 'stealth' : 'precise',
+                        evaluate: focus,
+                        mouseMove: () => assert.fail('command focus must not move'),
+                        mouseClick: () => assert.fail('command focus must not click'),
+                        keyDown: async (_key, _commands, timeout) => {
+                            budgets.push(['key', timeout]);
+                        },
+                    });
+                    try {
+                        const response = await registeredTool(registerInputTool)({
+                            expectedRevision: 'r101',
+                            timeout: 100,
+                            events: [{ type: 'keydown', key: 'a', commands: ['selectAll'], target: { x: 50, y: 60 } }],
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        if (route === 'stealth') {
+                            assert.equal(response.isError, true);
+                            assert.match(body.error.message, /commands 参数不支持 stealth/);
+                            assert.deepEqual(budgets, []);
+                        } else if (expiresAt !== 'none' && (route !== 'cdp' || expiresAt === 'focus')) {
+                            assert.equal(response.isError, true, response.content[0].text);
+                            assert.match(body.error.message, /timeout/i);
+                            assert.equal(body.eventsExecuted, 0);
+                            assert.equal(
+                                budgets.some(([stage]) => stage === 'key'),
+                                false
+                            );
+                        } else {
+                            assert.equal(response.isError, undefined, response.content[0].text);
+                            assert.deepEqual(
+                                budgets,
+                                route === 'cdp'
+                                    ? [
+                                          ['focus', 100],
+                                          ['key', 80],
+                                      ]
+                                    : [
+                                          ['find', 100],
+                                          ['focus', 60],
+                                          ['key', 40],
+                                      ]
+                            );
+                        }
+                    } finally {
+                        restore();
+                        restoreCdp();
+                        restoreDriver();
+                        restoreClock();
+                    }
+                });
+            });
+        }
+    }
+});
+
+test('C-V16 editor actions consume only the budget left after coordinate focus', async (t) => {
+    for (const mode of ['extension', 'cdp']) {
+        for (const expires of [false, true]) {
+            await t.test(`${mode}-${expires}`, () =>
+                withPageFixture(mode, async ({ unified, driver }) => {
+                    let now = 1000;
+                    const budgets = [];
+                    const focus = async (_code, _args, timeout) => {
+                        budgets.push(['focus', timeout]);
+                        now += expires ? timeout : 20;
+                        return true;
+                    };
+                    const restoreClock = patchProperties(Date, { now: () => now });
+                    const restoreDriver = patchProperties(driver, {
+                        find: async () => {
+                            now += 40;
+                            return [{ refId: 'ref_owned' }];
+                        },
+                    });
+                    const restoreCdp = mode === 'cdp' ? patchProperties(getSession(), { evaluate: focus }) : () => {};
+                    const restore = patchProperties(unified, {
+                        inputMode: 'precise',
+                        evaluate: async (code, options, timeout, args) => {
+                            if (!args) return focus(code, options, timeout);
+                            budgets.push(['editor', timeout]);
+                            return { success: true };
+                        },
+                        mouseMove: () => assert.fail('editor focus must not move'),
+                        mouseClick: () => assert.fail('editor focus must not click'),
+                    });
+                    try {
+                        const response = await registeredTool(registerInputTool)({
+                            expectedRevision: 'r101',
+                            timeout: 100,
+                            events: [{ type: 'editorContext', target: { x: 50, y: 60 } }],
+                        });
+                        assert.equal(response.isError, expires ? true : undefined, response.content[0].text);
+                        assert.deepEqual(
+                            budgets,
+                            expires
+                                ? [['focus', mode === 'cdp' ? 100 : 60]]
+                                : [
+                                      ['focus', mode === 'cdp' ? 100 : 60],
+                                      ['editor', mode === 'cdp' ? 80 : 40],
+                                  ]
+                        );
+                    } finally {
+                        restore();
+                        restoreCdp();
+                        restoreDriver();
+                        restoreClock();
+                    }
+                })
+            );
+        }
+    }
+});
+
+test('C10 coordinate selection stops when movement expires', async (t) => {
     for (const route of ['precise', 'stealth', 'cdp']) {
         for (const event of [
-            { type: 'keydown', key: 'a', commands: ['selectAll'] },
             { type: 'select', find: 'owned' },
             { type: 'replace', find: 'owned', text: 'replacement' },
         ]) {
@@ -1464,12 +2786,6 @@ test('C10 coordinate focus stops commands and selection when movement expires', 
                         });
                         const body = JSON.parse(response.content[0].text);
                         assert.equal(response.isError, true);
-                        if (route === 'stealth' && event.commands) {
-                            assert.match(body.error.message, /commands 参数不支持 stealth/);
-                            assert.deepEqual(moves, []);
-                            assert.deepEqual(actions, []);
-                            return;
-                        }
                         assert.match(body.error.message, /timeout/i);
                         assert.deepEqual(moves, [100]);
                         assert.deepEqual(actions, []);
@@ -2850,7 +4166,7 @@ test('CDP locator and actionability keep one input event budget', async (t) => {
                 const restoreClock = patchProperties(Date, { now: () => now });
                 const restoreSession = patchProperties(getSession(), {
                     createLocator: (_target, options) => {
-                        assert.equal(options.timeout, 1000);
+                        assert.equal(options.timeout, 800);
                         return {
                             find: async () => {
                                 now += locatorTime;
@@ -3259,6 +4575,61 @@ test('C-R5 force rejects missing and coordinate targets before dispatch', async 
                 assert.deepEqual(state.dispatched, []);
             }
         });
+    }
+});
+
+test('F7 ordinary Extension element clicks use the existing atomic dispatcher without preparatory movement', async (t) => {
+    for (const inputMode of ['precise', 'stealth']) {
+        for (const frame of [undefined, 'iframe#owned']) {
+            for (const force of [false, true]) {
+                await t.test(`${inputMode}-${frame ?? 'main'}-force-${force}`, async () => {
+                    await withPageFixture('extension', async ({ unified, driver, state }) => {
+                        const rect = { x: 12, y: 20, width: 20, height: 10 };
+                        const offset = frame && inputMode === 'precise' ? { x: 100, y: 200 } : { x: 0, y: 0 };
+                        const restore = patchProperties(unified, {
+                            inputMode,
+                            currentMousePosition: { x: 1, y: 2 },
+                            getFrameOffset: () => frame ? { x: 100, y: 200 } : null,
+                            withFrame: async (_frame, run) => run(),
+                            find: async () => [{
+                                refId: 'owned-click',
+                                rect: { ...rect, x: rect.x + offset.x, y: rect.y + offset.y },
+                            }],
+                            evaluate: async () => rect,
+                        });
+                        driver.inputMouse = async () => assert.fail('atomic element clicks must not require native movement');
+                        driver.stealthMouse = async () => assert.fail('atomic element clicks must not require scripted movement');
+                        driver.actionableClick = async (refId, requestedForce) => {
+                            state.dispatched.push({ refId, force: requestedForce, targetId: state.current });
+                            state.actionCompleted = true;
+                            return { success: true };
+                        };
+                        try {
+                            const response = await registeredTool(registerInputTool)({
+                                targetId: '202',
+                                expectedRevision: 'r202',
+                                frame,
+                                timeout: 1000,
+                                events: [{
+                                    type: 'click',
+                                    target: { css: 'button.owned' },
+                                    force,
+                                    ...(force ? { forceReason: 'verify owned covered element' } : {}),
+                                }],
+                            });
+                            const body = JSON.parse(response.content[0].text);
+                            assert.notEqual(response.isError, true, response.content[0].text);
+                            assert.equal(body.eventsExecuted, 1);
+                            assert.deepEqual(state.dispatched, [{ refId: 'owned-click', force, targetId: '202' }]);
+                            assert.deepEqual(unified.getMousePosition(), { x: 22 + offset.x, y: 25 + offset.y });
+                            assert.equal(state.current, '101');
+                        } finally {
+                            restore();
+                        }
+                    });
+                });
+            }
+        }
     }
 });
 

@@ -33,6 +33,7 @@ import {
     type ListedTarget,
     type NewTabResult,
     type NewPageOptions,
+    type PageManagementResult,
     type ReadPageOptions,
     type ReadPageResult,
     type ScreenshotResult,
@@ -164,6 +165,7 @@ class SessionManager implements IBrowserDriver {
     private operationLock: Promise<void> = Promise.resolve()
     private consoleLogs: ConsoleLogEntry[] = []
     private networkRequests: NetworkRequestEntry[] = []
+    private targetLogs = new Map<string, { console: ConsoleLogEntry[]; network: NetworkRequestEntry[] }>()
     private nextConsoleLogSequence = 0
     private nextNetworkRequestSequence = 0
     private challengeRequired = false
@@ -178,6 +180,8 @@ class SessionManager implements IBrowserDriver {
             type: string
             timestamp: number
             frameId?: string
+            status?: number
+            challenge?: boolean
             _monotonic: number
         }
     >()
@@ -351,6 +355,12 @@ class SessionManager implements IBrowserDriver {
             }>
         }
 
+        const liveIds = new Set(targetInfos.map((target) => target.targetId))
+        for (const targetId of this.targetLogs.keys()) {
+            if (!liveIds.has(targetId)) {
+                this.targetLogs.delete(targetId)
+            }
+        }
         return targetInfos
             .filter((t) => t.type === 'page')
             .map((t) => ({
@@ -639,8 +649,10 @@ class SessionManager implements IBrowserDriver {
     async keyDown(
         key: string,
         commands?: string[],
-        options?: { rawKeyDown?: boolean; autoRepeat?: boolean }
+        options?: { rawKeyDown?: boolean; autoRepeat?: boolean },
+        timeout?: number
     ): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
         this.ensureSession()
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers | MODIFIER_KEYS[key] : this.modifiers
         const keyDefinition = getKeyDefinition(key)
@@ -656,23 +668,34 @@ class SessionManager implements IBrowserDriver {
         if (options?.autoRepeat) {
             params.autoRepeat = true
         }
-        await this.send('Input.dispatchKeyEvent', params)
+        await this.send('Input.dispatchKeyEvent', params, timeout)
         this.modifiers = nextModifiers
+        if (deadline !== undefined) {
+            remainingNavigationTimeout(deadline)
+        }
     }
 
     /**
      * 键盘释放
      */
-    async keyUp(key: string): Promise<void> {
+    async keyUp(key: string, timeout?: number): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
         this.ensureSession()
         const keyDefinition = getKeyDefinition(key)
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers & ~MODIFIER_KEYS[key] : this.modifiers
-        await this.send('Input.dispatchKeyEvent', {
-            type: 'keyUp',
-            modifiers: nextModifiers,
-            ...keyDefinition,
-        })
+        await this.send(
+            'Input.dispatchKeyEvent',
+            {
+                type: 'keyUp',
+                modifiers: nextModifiers,
+                ...keyDefinition,
+            },
+            timeout
+        )
         this.modifiers = nextModifiers
+        if (deadline !== undefined) {
+            remainingNavigationTimeout(deadline)
+        }
     }
 
     /**
@@ -1267,7 +1290,7 @@ class SessionManager implements IBrowserDriver {
     // ==================== IBrowserDriver: 输入（precise） ====================
 
     /** CDP 通用 inputKey 接口实现：直接转发 Input.dispatchKeyEvent，不维护 modifiers（由调用方提供） */
-    async inputKey(type: InputKeyType, options: InputKeyOptions = {}): Promise<void> {
+    async inputKey(type: InputKeyType, options: InputKeyOptions = {}, timeout?: number): Promise<void> {
         this.ensureSession()
         const params: Record<string, unknown> = { type }
         if (options.key !== undefined) {
@@ -1300,7 +1323,7 @@ class SessionManager implements IBrowserDriver {
         if (options.commands && options.commands.length > 0) {
             params.commands = options.commands
         }
-        await this.send('Input.dispatchKeyEvent', params)
+        await this.send('Input.dispatchKeyEvent', params, timeout)
     }
 
     /** CDP 通用 inputMouse 接口实现：直接转发 Input.dispatchMouseEvent */
@@ -1433,6 +1456,26 @@ class SessionManager implements IBrowserDriver {
     async activatePage(targetId: string): Promise<void> {
         await this.attachToTarget(targetId)
         await this.activateTarget(targetId)
+    }
+
+    async activatePageWithAffected(targetId: string): Promise<PageManagementResult> {
+        return this.withLock(async () => {
+            const before = (await this.listTargets()).find((target) => target.targetId === targetId)
+            if (!before) {
+                throw new TargetNotFoundError(targetId)
+            }
+            if (this.pendingPageCondition) {
+                const condition = this.pendingPageCondition
+                await this.assertPageCondition(targetId, condition.expectedUrl, condition.expectedRevision)
+                this.pendingPageCondition = null
+            }
+            await this.activateTarget(targetId)
+            const after = (await this.listTargets()).find((target) => target.targetId === targetId)
+            if (!after) {
+                throw new TargetNotFoundError(targetId)
+            }
+            return { targetId, before, after }
+        })
     }
 
     /** IBrowserDriver 接口：选择操作目标（attach 即可） */
@@ -1927,6 +1970,7 @@ class SessionManager implements IBrowserDriver {
             if (id === this.currentTargetId) {
                 this.clearAttachedTargetState()
             }
+            this.targetLogs.delete(id)
         })
     }
 
@@ -2386,6 +2430,9 @@ class SessionManager implements IBrowserDriver {
 
         this.sessionId = sessionId
         this.currentTargetId = targetId
+        const logs = this.targetLogs.get(targetId)
+        this.consoleLogs = logs?.console ?? []
+        this.networkRequests = logs?.network ?? []
 
         // 初始化会话
         await this.initSession(deadline)
@@ -2433,7 +2480,12 @@ class SessionManager implements IBrowserDriver {
     }
 
     private clearAttachedTargetState(): void {
-        this.clearLogs()
+        if (this.currentTargetId) {
+            this.targetLogs.set(this.currentTargetId, { console: this.consoleLogs, network: this.networkRequests })
+        }
+        this.consoleLogs = []
+        this.networkRequests = []
+        this.requestMap.clear()
         this.challengeRequired = false
         this.runtimeEnabled = false
         this.mainFrameId = null
@@ -2466,6 +2518,7 @@ class SessionManager implements IBrowserDriver {
         }
 
         this.clearAttachedTargetState()
+        this.targetLogs.clear()
         this.revisionEpoch = randomUUID()
         this.revisions.clear()
         this.pendingPageCondition = null
@@ -2708,29 +2761,18 @@ class SessionManager implements IBrowserDriver {
             }
             const request = this.requestMap.get(p.requestId)
             if (request) {
-                const { _monotonic, frameId, ...requestData } = request
                 const challenge = isCloudflareChallenge(p.response.headers)
-                if (requestData.type.toLowerCase() === 'document' && frameId === this.mainFrameId) {
+                if (request.type.toLowerCase() === 'document' && request.frameId === this.mainFrameId) {
                     // 仅新的主文档响应可以解除已知 Challenge，清空日志不能解除该状态
                     this.challengeRequired = challenge
                 }
-                this.networkRequests.push({
-                    sequence: ++this.nextNetworkRequestSequence,
-                    ...requestData,
-                    status: p.response.status,
-                    challenge,
-                    duration: Math.round((p.timestamp - _monotonic) * 1000),
-                })
-                // 环形缓冲区：批量裁剪到 800 条，均摊 O(n) 开销
-                if (this.networkRequests.length > SessionManager.MAX_LOG_ENTRIES) {
-                    this.networkRequests.splice(0, this.networkRequests.length - 800)
-                }
-                this.requestMap.delete(p.requestId)
+                request.status = p.response.status
+                request.challenge = challenge
             }
         })
 
         // 网络请求失败时写入日志再清理 requestMap，防止 diagnostics 丢失失败请求
-        this.cdp!.onEvent('Network.loadingFailed', (params: unknown, eventSessionId?: string) => {
+        const finalizeRequest = (params: unknown, eventSessionId?: string) => {
             if (!this.isCurrentSessionEvent(eventSessionId)) {
                 return
             }
@@ -2751,7 +2793,9 @@ class SessionManager implements IBrowserDriver {
                 }
             }
             this.requestMap.delete(p.requestId)
-        })
+        }
+        this.cdp!.onEvent('Network.loadingFinished', finalizeRequest)
+        this.cdp!.onEvent('Network.loadingFailed', finalizeRequest)
     }
 
     /**

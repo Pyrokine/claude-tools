@@ -60,13 +60,23 @@ export class StealthHandler {
     async stealthKey(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthKeySchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_key')
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline)
+        }
 
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
             func: simulateKeyEvent,
-            args: [p.key, p.type || 'press', p.modifiers || []],
+            args:
+                p.deadline === undefined
+                    ? [p.key, p.type || 'press', p.modifiers || []]
+                    : [p.key, p.type || 'press', p.modifiers || [], p.deadline],
         })
+
+        if (p.deadline !== undefined) {
+            remainingNavigationTimeout(p.deadline, true)
+        }
 
         return results[0].result as { success: boolean }
     }

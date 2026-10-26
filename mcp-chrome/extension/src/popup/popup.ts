@@ -126,12 +126,15 @@ connectBtn.addEventListener('click', async () => {
 saveTokenBtn.addEventListener('click', async () => {
     saveTokenBtn.disabled = true
     try {
-        await chrome.runtime.sendMessage({ type: 'SET_PAIRING_TOKEN', token: pairingTokenInput.value })
+        const response = await chrome.runtime.sendMessage({ type: 'SET_PAIRING_TOKEN', token: pairingTokenInput.value })
+        if (response?.error || response?.success !== true) {
+            throw new Error(response?.error ?? '保存 token 失败')
+        }
         pairingTokenInput.value = ''
         await updateStatus()
     } catch (error) {
         console.error('Save token failed:', error)
-        authHelp.textContent = '保存 token 失败'
+        authHelp.textContent = `保存 token 失败：${error instanceof Error ? error.message : String(error)}`
     } finally {
         saveTokenBtn.disabled = false
     }
@@ -140,14 +143,17 @@ saveTokenBtn.addEventListener('click', async () => {
 allowInsecureNoTokenInput.addEventListener('change', async () => {
     allowInsecureNoTokenInput.disabled = true
     try {
-        await chrome.runtime.sendMessage({
+        const response = await chrome.runtime.sendMessage({
             type: 'SET_ALLOW_INSECURE_NO_TOKEN',
             allow: allowInsecureNoTokenInput.checked,
         })
+        if (response?.error || response?.success !== true) {
+            throw new Error(response?.error ?? '保存无 token 连接设置失败')
+        }
         await updateStatus()
     } catch (error) {
         console.error('Save insecure mode failed:', error)
-        authHelp.textContent = '保存无 token 连接设置失败'
+        authHelp.textContent = `保存无 token 连接设置失败：${error instanceof Error ? error.message : String(error)}`
     } finally {
         allowInsecureNoTokenInput.disabled = false
     }

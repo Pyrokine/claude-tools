@@ -19,6 +19,7 @@ import {
     advancePageRevision,
     assertPageCondition,
     forgetPageRevision,
+    getExistingTab,
     pageRevision,
     pageSnapshot,
 } from './page-revision'
@@ -129,7 +130,10 @@ export class ActionHandler {
     private actionLocks = new Map<number, Promise<void>>()
     private logManager = new LogManager()
     private debuggerManager = new DebuggerManager(this.logManager)
-    private navigationHandler = new NavigationHandler(this.logManager)
+    private navigationHandler = new NavigationHandler(this.logManager, (tabId) =>
+        this.logEventHandler.enableNetworkObservation(tabId)
+    )
+
     private frameResolver = new FrameResolver(this.debuggerManager)
     private tabHandler = new TabHandler(this.navigationHandler)
     private contentHandler = new ContentHandler(this.debuggerManager)
@@ -156,6 +160,29 @@ export class ActionHandler {
                 })
             )
         }
+        if (action.startsWith('tabgroup_')) {
+            const snapshot = await this.tabHandler.getGroupLockSnapshot(action, params, context)
+            return this.withActionLocks(
+                snapshot.map((tab) => tab.id!),
+                async () => {
+                    const current = await this.tabHandler.getGroupLockSnapshot(action, params, context)
+                    const request = params as { tabId?: number; tabIds?: number[] }
+                    const targets = (tabs: chrome.tabs.Tab[]) =>
+                        action === 'tabgroup_update'
+                            ? []
+                            : action === 'tabgroup_move'
+                              ? tabs
+                              : tabs.filter((tab) => (request.tabIds ?? [request.tabId]).includes(tab.id))
+                    const identity = (tabs: chrome.tabs.Tab[]) =>
+                        targets(tabs).map((tab) => [tab.id, tab.groupId, tab.windowId])
+                    if (JSON.stringify(identity(snapshot)) !== JSON.stringify(identity(current))) {
+                        throw new ExpectedOperationError('分组成员或窗口已变化，未执行分组操作')
+                    }
+                    await Promise.all(targets(current).map((tab) => assertManagedTab(tab.id!, context, action)))
+                    return handler(params, context)
+                }
+            )
+        }
         const mutating = PAGE_MUTATIONS.has(action)
         if (mutating || MANAGED_PAGE_ONLY.has(action) || PAGE_READS.has(action)) {
             const request = params as {
@@ -165,94 +192,76 @@ export class ActionHandler {
                 deadline?: number
             } | null
             const tabId = await getTargetTabId(request?.tabId)
-            const previous = this.actionLocks.get(tabId) ?? Promise.resolve()
-            const operation = previous
-                .catch(() => {})
-                .then(async () => {
-                    if (request?.deadline !== undefined) {
-                        const deadline = (params as { deadline?: unknown } | null)?.deadline
-                        if (deadline !== undefined && (typeof deadline !== 'number' || !Number.isFinite(deadline))) {
-                            throw new ExpectedOperationError(
-                                JSON.stringify({
-                                    error: {
-                                        code: 'INVALID_ARGUMENT',
-                                        message: 'Action deadline must be a finite number',
-                                        context: { actionExecuted: false },
-                                    },
-                                })
-                            )
-                        }
-                        if (typeof deadline === 'number') {
-                            remainingNavigationTimeout(deadline)
-                        }
+            return this.withActionLocks([tabId], async () => {
+                if (request?.deadline !== undefined) {
+                    const deadline = (params as { deadline?: unknown } | null)?.deadline
+                    if (deadline !== undefined && (typeof deadline !== 'number' || !Number.isFinite(deadline))) {
+                        throw new ExpectedOperationError(
+                            JSON.stringify({
+                                error: {
+                                    code: 'INVALID_ARGUMENT',
+                                    message: 'Action deadline must be a finite number',
+                                    context: { actionExecuted: false },
+                                },
+                            })
+                        )
                     }
-                    await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
-                    if (MANAGED_PAGE_ONLY.has(action)) {
-                        await assertManagedTab(tabId, context, action)
+                    if (typeof deadline === 'number') {
+                        remainingNavigationTimeout(deadline)
                     }
-                    if (request?.deadline !== undefined) {
-                        remainingNavigationTimeout(request.deadline)
-                    }
-                    const warnings: string[] = []
-                    if (action === 'tabs_release' && this.debuggerManager.isAttached(tabId)) {
-                        try {
-                            await this.debuggerHandler.debuggerDetach({ tabId }, context)
-                        } catch (error) {
-                            warnings.push(
-                                `debugger 清理失败：${error instanceof Error ? error.message : String(error)}`
-                            )
-                        }
-                    }
-                    let result: unknown
-                    let actionExecuted = true
-                    try {
-                        result = await handler(params, context)
-                        if (action === 'tabs_close') {
-                            forgetPageRevision(tabId)
-                        }
-                        if (action === 'tabs_release') {
-                            if (
-                                (result as { managedBefore: boolean }).managedBefore &&
-                                !(await this.logEventHandler.flushAndUninstallConsoleHook(tabId))
-                            ) {
-                                warnings.push('console 监听清理失败，请检查 Extension 日志')
-                            }
-                            this.cleanupTab(tabId)
-                            if (warnings.length) {
-                                return { ...(result as object), warnings }
-                            }
-                        }
-                        return result
-                    } catch (error) {
-                        actionExecuted = !(error instanceof ExpectedOperationError && error.actionExecuted === false)
-                        throw error
-                    } finally {
-                        if (mutating && actionExecuted && action !== 'tabs_close') {
-                            advancePageRevision(tabId)
-                            if (action.startsWith('tabs_') || action === 'navigate') {
-                                const info = result as
-                                    | { id?: number; revision?: string; tab?: TabInfo; after?: TabInfo | null }
-                                    | undefined
-                                const after = info?.tab ?? info?.after ?? info
-                                if (after?.id === tabId) {
-                                    after.revision = pageRevision(tabId)
-                                }
-                            }
-                        }
-                    }
-                })
-            const settled = operation.then(
-                () => {},
-                () => {}
-            )
-            this.actionLocks.set(tabId, settled)
-            try {
-                return await operation
-            } finally {
-                if (this.actionLocks.get(tabId) === settled) {
-                    this.actionLocks.delete(tabId)
                 }
-            }
+                await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
+                if (MANAGED_PAGE_ONLY.has(action)) {
+                    await assertManagedTab(tabId, context, action)
+                }
+                if (request?.deadline !== undefined) {
+                    remainingNavigationTimeout(request.deadline)
+                }
+                const warnings: string[] = []
+                if (action === 'tabs_release' && this.debuggerManager.isAttached(tabId)) {
+                    try {
+                        await this.debuggerHandler.debuggerDetach({ tabId }, context)
+                    } catch (error) {
+                        warnings.push(`debugger 清理失败：${error instanceof Error ? error.message : String(error)}`)
+                    }
+                }
+                let result: unknown
+                let actionExecuted = true
+                try {
+                    result = await handler(params, context)
+                    if (action === 'tabs_close') {
+                        forgetPageRevision(tabId)
+                    }
+                    if (action === 'tabs_release') {
+                        if (
+                            (result as { managedBefore: boolean }).managedBefore &&
+                            !(await this.logEventHandler.flushAndUninstallConsoleHook(tabId))
+                        ) {
+                            warnings.push('console 监听清理失败，请检查 Extension 日志')
+                        }
+                        this.cleanupTab(tabId)
+                        if (warnings.length) {
+                            return { ...(result as object), warnings }
+                        }
+                    }
+                    return result
+                } catch (error) {
+                    actionExecuted = !(error instanceof ExpectedOperationError && error.actionExecuted === false)
+                    throw error
+                } finally {
+                    if (mutating && actionExecuted && action !== 'tabs_close') {
+                        advancePageRevision(tabId)
+                        if (action.startsWith('tabs_') || action === 'navigate') {
+                            const info = result as
+                                { id?: number; revision?: string; tab?: TabInfo; after?: TabInfo | null } | undefined
+                            const after = info?.tab ?? info?.after ?? info
+                            if (after?.id === tabId) {
+                                after.revision = pageRevision(tabId)
+                            }
+                        }
+                    }
+                }
+            })
         }
         return handler(params, context)
     }
@@ -264,6 +273,28 @@ export class ActionHandler {
         this.logManager.cleanupTab(tabId)
         this.debuggerManager.cleanupTab(tabId)
         this.inputEventHandler.cleanupTab(tabId)
+    }
+
+    private async withActionLocks<T>(tabIds: number[], action: () => Promise<T>): Promise<T> {
+        const ids = [...new Set(tabIds)].sort((a, b) => a - b)
+        const previous = Promise.all(ids.map((id) => this.actionLocks.get(id)))
+        const operation = previous.then(action)
+        const settled = operation.then(
+            () => {},
+            () => {}
+        )
+        for (const id of ids) {
+            this.actionLocks.set(id, settled)
+        }
+        try {
+            return await operation
+        } finally {
+            for (const id of ids) {
+                if (this.actionLocks.get(id) === settled) {
+                    this.actionLocks.delete(id)
+                }
+            }
+        }
     }
 
     private registerActions() {
@@ -298,7 +329,7 @@ export class ActionHandler {
                 success: true,
                 targetId: String(tabId),
                 allowed,
-                managed: isManagedTab(await chrome.tabs.get(tabId)),
+                managed: isManagedTab(await getExistingTab(tabId)),
                 scope: 'ordinary-read',
                 serverInstanceId: context.serverInstanceId,
                 url: before.url,

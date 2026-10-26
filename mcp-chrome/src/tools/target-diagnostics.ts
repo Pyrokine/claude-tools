@@ -1,5 +1,7 @@
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
-import { getUnifiedSession } from '../core/index.js'
+import { getSession, getUnifiedSession } from '../core/index.js'
+import { ElementNotFoundError, TimeoutError } from '../core/errors.js'
+import { withNavigationBudget } from '../core/utils.js'
 import type { Target } from '../core/types.js'
 
 const MAX_CANDIDATES = 10
@@ -70,11 +72,7 @@ async function collectPageCandidates(
     timeout: number | undefined
 ): Promise<{ candidates: unknown[]; activeElement: Record<string, unknown> | null; diagnosticError?: string }> {
     try {
-        return await unifiedSession.evaluate<{
-            candidates: unknown[]
-            activeElement: Record<string, unknown> | null
-        }>(
-            `(() => {
+        const script = `(() => {
                 const active = document.activeElement;
                 return {
                     activeElement: active ? {
@@ -102,10 +100,12 @@ async function collectPageCandidates(
                             };
                         })
                 };
-            })()`,
-            undefined,
-            Math.min(Math.max(timeout ?? MAX_DIAGNOSTIC_TIMEOUT_MS, 1), MAX_DIAGNOSTIC_TIMEOUT_MS)
-        )
+            })()`
+        const budget = Math.min(Math.max(timeout ?? MAX_DIAGNOSTIC_TIMEOUT_MS, 1), MAX_DIAGNOSTIC_TIMEOUT_MS)
+        // 原生 CDP 路径不经过会自动重连的 evaluate 分发，避免作用域恢复后的迟到探测
+        return unifiedSession.getMode() === 'cdp'
+            ? await getSession().evaluate(script, undefined, budget)
+            : await unifiedSession.evaluate(script, undefined, budget)
     } catch (error) {
         return {
             candidates: [],
@@ -115,47 +115,98 @@ async function collectPageCandidates(
     }
 }
 
+export function targetLookupTimeout(timeout: number): number {
+    return Math.max(1, timeout - Math.min(MAX_DIAGNOSTIC_TIMEOUT_MS, Math.floor(timeout / 5)))
+}
+
+export async function enrichTargetError(
+    error: ElementNotFoundError | TimeoutError,
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    target: Target,
+    options: { timeout: number; deadline: number; frame?: string | number }
+): Promise<void> {
+    try {
+        Object.assign(
+            error.context,
+            await buildTargetDiagnostics(unifiedSession, target, {
+                ...options,
+                nth: (target as Target & { nth?: number }).nth ?? 0,
+                matchCount: typeof error.context.matchCount === 'number' ? error.context.matchCount : null,
+                lastState:
+                    typeof error.context.lastLocatorState === 'string' ? error.context.lastLocatorState : 'unobserved',
+            })
+        )
+    } catch (diagnosticError) {
+        error.context.diagnosticError = sanitizeErrorMessage(diagnosticError).slice(0, 500)
+    }
+}
+
 export async function buildTargetDiagnostics(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
     options: {
         nth: number
         timeout?: number
+        deadline?: number
         frame?: string | number
-        matchCount: number
+        matchCount: number | null
         lastState: string
         lastError?: unknown
         candidates?: TargetCandidate[]
     }
 ): Promise<Record<string, unknown>> {
-    let state: Awaited<ReturnType<typeof unifiedSession.getLiveState>>
-    try {
-        state = await unifiedSession.getLiveState()
-    } catch {
-        state = null
+    const deadline = Math.min(
+        options.deadline ?? Infinity,
+        Date.now() + Math.min(options.timeout ?? MAX_DIAGNOSTIC_TIMEOUT_MS, MAX_DIAGNOSTIC_TIMEOUT_MS)
+    )
+    const remaining = () => Math.max(0, deadline - Date.now())
+    const tabId = unifiedSession.getCurrentTargetId()
+    const mode = unifiedSession.getMode()
+    let state = unifiedSession.getState()
+    let diagnosticError: string | undefined
+    if (remaining() > 0) {
+        try {
+            state = await withNavigationBudget(() => unifiedSession.getLiveState(), deadline)
+        } catch (error) {
+            diagnosticError = sanitizeErrorMessage(error).slice(0, 500)
+        }
     }
     const knownCandidates = options.candidates ? summarizeTargetCandidates(options.candidates) : []
-    const pageCandidates =
-        knownCandidates.length > 0
-            ? { candidates: knownCandidates, activeElement: null }
-            : await collectPageCandidates(unifiedSession, options.timeout)
+    let pageCandidates: Awaited<ReturnType<typeof collectPageCandidates>> = {
+        candidates: knownCandidates,
+        activeElement: null,
+    }
+    if (knownCandidates.length === 0 && remaining() > 0) {
+        try {
+            pageCandidates = await withNavigationBudget(
+                () => collectPageCandidates(unifiedSession, remaining()),
+                deadline
+            )
+        } catch (error) {
+            diagnosticError = sanitizeErrorMessage(error).slice(0, 500)
+        }
+    }
 
     return {
         locator: boundedTarget(target),
         targetType: targetType(target),
         nth: options.nth,
-        currentUrl: state?.url?.slice(0, 500),
-        tabId: unifiedSession.getCurrentTargetId(),
-        managed: state?.managed ?? false,
+        currentUrl: state?.url?.slice(0, 500) ?? null,
+        tabId,
+        managed: state?.managed ?? null,
         frame: options.frame,
         matchCount: options.matchCount,
-        candidates: pageCandidates.candidates,
+        candidates: pageCandidates.candidates.slice(0, MAX_CANDIDATES),
         activeElement: pageCandidates.activeElement,
         lastLocatorState: options.lastState,
         timeout: options.timeout,
-        mode: unifiedSession.getMode(),
-        connection: unifiedSession.isExtensionConnected() ? 'connected' : 'unavailable',
+        mode,
+        connection: (mode === 'cdp' ? getSession().isConnected() : unifiedSession.isExtensionConnected())
+            ? 'connected'
+            : 'unavailable',
         ...(options.lastError ? { lastError: sanitizeErrorMessage(options.lastError).slice(0, 500) } : {}),
-        ...(pageCandidates.diagnosticError ? { diagnosticError: pageCandidates.diagnosticError } : {}),
+        ...(diagnosticError || pageCandidates.diagnosticError
+            ? { diagnosticError: diagnosticError ?? pageCandidates.diagnosticError }
+            : {}),
     }
 }

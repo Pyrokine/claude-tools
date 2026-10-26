@@ -34,6 +34,7 @@ import {
 import { DebuggerBlockedError, DebuggerManager } from './debugger-manager'
 import { assertScreenshotBase64Budget, assertScreenshotBudget } from './screenshot-budget'
 import { readGrantDocumentId } from './read-grants'
+import { getExistingTab } from './page-revision'
 import { remainingNavigationTimeout } from './navigation-handler'
 import {
     type ActionabilityResult,
@@ -514,7 +515,7 @@ export class ContentHandler {
         const { tabId, documentId, expectedUrl } = await this.getReadableTabId(p.tabId, context, 'find', frameId)
 
         // 受限 URL 返回空数组（而非抛异常，避免 auto-wait 轮询时大量错误）
-        const tab = await chrome.tabs.get(tabId)
+        const tab = await getExistingTab(tabId)
         if (isRestrictedUrl(tab.url)) {
             return []
         }
@@ -803,7 +804,7 @@ export class ContentHandler {
 
     /** debugger 被占用时通过 captureVisibleTab 截图（仅可视区域） */
     private async screenshotFallback(tabId: number, p: ScreenshotInput): Promise<ScreenshotResult> {
-        const tab = await chrome.tabs.get(tabId)
+        const tab = await getExistingTab(tabId)
         if (!tab.active) {
             throw structuredOperationError(
                 'DEBUGGER_BLOCKED_SCREENSHOT_UNAVAILABLE',

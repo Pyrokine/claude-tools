@@ -190,6 +190,7 @@ const manageSchema = z
     .strict()
     .superRefine((args, context) => {
         const scopes: Record<string, string[]> = {
+            activate: ['movePage'],
             targetIds: ['groupPages', 'ungroupPages'],
             groupId: ['newPage', 'groupPages', 'updateGroup', 'moveGroup'],
             title: ['groupPages', 'updateGroup'],
@@ -336,6 +337,12 @@ async function handleManage(args: ManageArgs): Promise<ManageResponse> {
             'cdp',
         ]
         const conditional = args.expectedUrl !== undefined || args.expectedRevision !== undefined
+        if (args.action === 'emulate' && !args.device) {
+            if (conditional) {
+                return invalidArgument('设备目录查询不支持页面条件，未读取页面')
+            }
+            return await handler()
+        }
         if (args.action === 'newPage' && args.targetId) {
             return invalidArgument('newPage 创建新页面，不接受已有 targetId')
         }
@@ -683,7 +690,7 @@ async function handleViewport({ unifiedSession, mode }: ManageContext, args: Man
         })
         await unifiedSession.sendCdpCommand('Emulation.setPageScaleFactor', { pageScaleFactor: 1 })
         await unifiedSession.sendCdpCommand('Emulation.setTouchEmulationEnabled', { enabled: false })
-        await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))')
+        await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))', 'precise')
         return formatResponse({ success: true, action: 'viewport', width: args.width, height: args.height, mode })
     })
 }
@@ -721,14 +728,14 @@ function handleInputMode({ unifiedSession, mode }: ManageContext, args: ManageAr
 }
 
 async function handleEmulate({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
+    if (!args.device) {
+        return formatResponse({ success: true, action: 'emulate', availableDevices: Object.keys(devices) })
+    }
+    const device = devices[args.device]
+    if (!device) {
+        return invalidArgument(`未知设备: ${args.device}`, `可用设备: ${Object.keys(devices).join(', ')}`)
+    }
     return unifiedSession.withTabId(args.targetId, async () => {
-        if (!args.device) {
-            return formatResponse({ success: true, action: 'emulate', availableDevices: Object.keys(devices) })
-        }
-        const device = devices[args.device]
-        if (!device) {
-            return invalidArgument(`未知设备: ${args.device}`, `可用设备: ${Object.keys(devices).join(', ')}`)
-        }
         await unifiedSession.sendCdpCommand('Emulation.setDeviceMetricsOverride', {
             width: device.viewport.width,
             height: device.viewport.height,
@@ -741,7 +748,7 @@ async function handleEmulate({ unifiedSession, mode }: ManageContext, args: Mana
             maxTouchPoints: device.viewport.hasTouch ? 1 : 0,
         })
         await unifiedSession.sendCdpCommand('Emulation.setUserAgentOverride', { userAgent: device.userAgent })
-        await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))')
+        await unifiedSession.evaluate('window.dispatchEvent(new Event("resize"))', 'precise')
         return formatResponse({
             success: true,
             action: 'emulate',
@@ -771,30 +778,6 @@ async function handleCdp({ unifiedSession, mode }: ManageContext, args: ManageAr
             const result = await unifiedSession.sendCdpCommand(args.cdpMethod, args.cdpParams)
             return formatResponse({ success: true, action: 'cdp', method: args.cdpMethod, result, mode })
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error)
-            if (
-                mode === 'extension' &&
-                (errorMessage.includes('not supported') || errorMessage.includes('not found'))
-            ) {
-                const domain = args.cdpMethod.split('.')[0]
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text: JSON.stringify({
-                                error: {
-                                    code: 'CDP_DOMAIN_NOT_SUPPORTED',
-                                    message: `Extension 模式不支持 ${domain} 域`,
-                                    suggestion:
-                                        'Extension 模式可用域：Page、Runtime、Emulation、DOM、Input、Network，' +
-                                        '如需完整 CDP 支持，请使用 CDP 模式（browse action="launch"）',
-                                },
-                            }),
-                        },
-                    ],
-                    isError: true,
-                }
-            }
             const response = formatErrorResponse(error)
             if (isNativeExecutionResultUnknown(error)) {
                 const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>

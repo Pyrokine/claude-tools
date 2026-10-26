@@ -14,6 +14,7 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { readFileSync } from 'node:fs'
 import { WebSocket, WebSocketServer } from 'ws'
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
+import { CDPError } from '../core/errors.js'
 import { ExtensionDisconnectedError } from '../core/extension-errors.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
 
@@ -122,6 +123,20 @@ function parseExtensionError(error: string | undefined): Error {
             error?: { code?: unknown; message?: unknown; suggestion?: unknown; context?: unknown }
         }
         if (typeof parsed.error?.code === 'string' && typeof parsed.error.message === 'string') {
+            const context = parsed.error.context
+            if (
+                parsed.error.code === 'CDP_ERROR' &&
+                context !== null &&
+                typeof context === 'object' &&
+                'nativeSource' in context &&
+                context.nativeSource === 'chrome.debugger'
+            ) {
+                return new CDPError(
+                    sanitizeErrorMessage(parsed.error.message),
+                    { ...context },
+                    typeof parsed.error.suggestion === 'string' ? parsed.error.suggestion : undefined
+                )
+            }
             return new ExtensionStructuredError(parsed, sanitizeErrorMessage(parsed.error.message))
         }
     } catch {

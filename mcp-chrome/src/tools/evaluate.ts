@@ -172,6 +172,7 @@ export function classifyEvaluateActionError(error: unknown): {
         actionStatus: executionStatusUnknown ? 'unknown' : 'failed',
         retryable:
             !executionStatusUnknown &&
+            !pageEvaluationStarted &&
             /timeout|timed out|超时|disconnect|未连接|context|debugger|attach/i.test(message),
     }
 }
@@ -244,6 +245,15 @@ function appendEvaluateFailureMetadata(
             verificationRequested,
             ...overrides,
         })
+        const frameError = payload.error as { code?: string; context?: Record<string, unknown> } | undefined
+        if (/^FRAME_(?:STALE_CONTEXT|EVALUATION_FAILED|EVALUATION_TIMEOUT)$/.test(frameError?.code ?? '')) {
+            if (typeof frameError?.context?.retryAttempted === 'boolean') {
+                payload.retryAttempted = frameError.context.retryAttempted
+            }
+            if (typeof frameError?.context?.retryReason === 'string') {
+                payload.retryReason = frameError.context.retryReason
+            }
+        }
         return payload
     } catch {
         return undefined

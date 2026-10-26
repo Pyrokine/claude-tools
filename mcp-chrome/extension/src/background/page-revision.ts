@@ -15,8 +15,20 @@ export function forgetPageRevision(tabId: number): void {
     revisions.delete(tabId)
 }
 
+export async function getExistingTab(tabId: number): Promise<chrome.tabs.Tab> {
+    try {
+        return await chrome.tabs.get(tabId)
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (message === `No tab with id: ${tabId}.` || message === `No tab with id: ${tabId}`) {
+            throw new ExpectedOperationError(message)
+        }
+        throw error
+    }
+}
+
 export async function pageSnapshot(tabId: number): Promise<{ targetId: string; url: string; revision: string }> {
-    const tab = await chrome.tabs.get(tabId)
+    const tab = await getExistingTab(tabId)
     return { targetId: String(tabId), url: tab.url ?? '', revision: pageRevision(tabId) }
 }
 

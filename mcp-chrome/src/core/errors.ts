@@ -24,7 +24,7 @@ export function isNativeExecutionResultUnknown(error: unknown): boolean {
     if (
         message === 'Execution was terminated' ||
         (error instanceof CDPError &&
-            /^Runtime\.(?:evaluate|callFunctionOn|runScript): (?:Execution was terminated|Internal error)$/.test(
+            /^Runtime\.(?:evaluate|callFunctionOn|runScript): (?:Execution was terminated|Internal error|Object couldn't be returned by value\.?|Object reference chain is too long\.?)$/.test(
                 message
             ))
     ) {
@@ -212,11 +212,11 @@ export class ElementNotFoundError extends BrowserError {
     readonly logs: string[]
     override readonly context: ErrorContext
 
-    constructor(target: Target, timeout: number, logs: string[] = [], url?: string) {
+    constructor(target: Target, timeout: number, logs: string[] = [], url?: string, context: ErrorContext = {}) {
         super(`元素未找到: ${JSON.stringify(target)}`)
         this.suggestion = `请检查 target 是否正确，或增加 timeout（当前: ${timeout}ms）`
         this.logs = logs
-        this.context = { target, timeout }
+        this.context = { ...context, target, timeout }
         if (url) {
             this.context.url = url
         }
@@ -278,8 +278,11 @@ export class TimeoutError extends BrowserError {
     readonly code = 'TIMEOUT'
     readonly suggestion = '请增加超时时间，或检查操作条件是否能满足'
 
-    constructor(message: string) {
+    override readonly context: ErrorContext
+
+    constructor(message: string, context: ErrorContext = {}) {
         super(message)
+        this.context = { ...context }
     }
 }
 
@@ -288,10 +291,13 @@ export class TimeoutError extends BrowserError {
  */
 export class CDPError extends BrowserError {
     readonly code = 'CDP_ERROR'
-    readonly suggestion = '这是一个 CDP 协议错误，请检查操作是否正确'
+    readonly suggestion: string
+    override readonly context: ErrorContext
 
-    constructor(message: string) {
+    constructor(message: string, context: ErrorContext = {}, suggestion = '这是一个 CDP 协议错误，请检查操作是否正确') {
         super(message)
+        this.suggestion = suggestion
+        this.context = { ...context }
     }
 }
 
@@ -426,8 +432,9 @@ export function formatErrorResponse(error: unknown): {
             },
         }
 
-    // 检测 visibility 相关错误，添加 hint
-    const hint = detectVisibilityHint(errorMessage)
+    // 定位上下文中的 visible/hidden 描述元素状态，不代表窗口焦点要求
+    const context = (errorJson as { error?: { context?: ErrorContext } }).error?.context
+    const hint = context?.locator || context?.target ? null : detectVisibilityHint(errorMessage)
     if (hint) {
         ;(errorJson as Record<string, unknown>).hint = hint
     }

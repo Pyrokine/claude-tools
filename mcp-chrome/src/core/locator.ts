@@ -83,6 +83,11 @@ function escapeCSSAttributeValue(str: string): string {
  */
 export class Locator {
     private logs: string[] = []
+    private observation: { matchCount: number | null; lastLocatorState: string } = {
+        matchCount: null,
+        lastLocatorState: 'unobserved',
+    }
+
     private readonly timeout: number
     private readonly deadline: number
     private readonly nth: number
@@ -98,6 +103,10 @@ export class Locator {
         this.deadline = Date.now() + this.timeout
         this.nth = options.nth ?? 0
         this.getUrl = options.getUrl
+    }
+
+    get lastObservation(): Readonly<{ matchCount: number | null; lastLocatorState: string }> {
+        return { ...this.observation }
     }
 
     /**
@@ -159,7 +168,8 @@ export class Locator {
         })) as { object: { objectId: string } }
 
         if (!object?.objectId) {
-            throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+            this.observation.lastLocatorState = 'node_resolution_failed'
+            throw this.notFound()
         }
 
         // 在元素上执行函数
@@ -253,28 +263,22 @@ export class Locator {
                 (name === undefined || (exact ? node.name?.value === name : node.name?.value.includes(name)))
         )
 
-        // 对所有匹配节点计数（含无 backendDOMNodeId 的节点），确保 nth 语义正确
-        let matchCount = 0
-        for (const node of matchingNodes) {
-            if (matchCount < this.nth) {
-                ++matchCount
-                continue
-            }
-            if (node.backendDOMNodeId) {
-                this.log(
-                    `找到元素: backendDOMNodeId=${node.backendDOMNodeId}${this.nth > 0 ? `（第 ${this.nth} 个）` : ''}`
-                )
-                // 将 backendDOMNodeId 转换为 nodeId
-                const { nodeIds } = (await this.send('DOM.pushNodesByBackendIdsToFrontend', {
-                    backendNodeIds: [node.backendDOMNodeId],
-                })) as { nodeIds: number[] }
-                if (nodeIds.length > 0 && nodeIds[0] !== 0) {
-                    return nodeIds[0]
-                }
+        this.observeMatches(matchingNodes.length)
+        const node = matchingNodes[this.nth]
+        if (node?.backendDOMNodeId) {
+            this.log(`找到元素: backendDOMNodeId=${node.backendDOMNodeId}（第 ${this.nth} 个）`)
+            const { nodeIds } = (await this.send('DOM.pushNodesByBackendIdsToFrontend', {
+                backendNodeIds: [node.backendDOMNodeId],
+            })) as { nodeIds: number[] }
+            if (nodeIds[0]) {
+                return nodeIds[0]
             }
         }
+        if (node) {
+            this.observation.lastLocatorState = 'node_resolution_failed'
+        }
 
-        throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+        throw this.notFound()
     }
 
     /**
@@ -362,7 +366,7 @@ export class Locator {
         })) as { result: { objectId?: string } }
 
         if (!result.objectId) {
-            throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+            throw this.notFound()
         }
 
         return this.objectIdToNodeId(result.objectId)
@@ -475,7 +479,7 @@ export class Locator {
         })) as { result: { objectId?: string } }
 
         if (!result.objectId) {
-            throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+            throw this.notFound()
         }
 
         return this.objectIdToNodeId(result.objectId)
@@ -507,9 +511,10 @@ export class Locator {
                 selector: css,
             })) as { nodeIds: number[] }
 
+            this.observeMatches(nodeIds.length)
             if (this.nth >= nodeIds.length) {
                 this.log(`第 ${this.nth} 个匹配元素不存在（共 ${nodeIds.length} 个）: ${css}`)
-                throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+                throw this.notFound()
             }
 
             this.log(`找到元素: nodeId=${nodeIds[this.nth]}（第 ${this.nth} 个）`)
@@ -521,9 +526,13 @@ export class Locator {
             selector: css,
         })) as { nodeId: number }
 
+        this.observation = {
+            matchCount: nodeId === 0 ? 0 : null,
+            lastLocatorState: nodeId === 0 ? 'not_found' : 'found',
+        }
         if (nodeId === 0) {
             this.log(`元素未找到: ${css}`)
-            throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+            throw this.notFound()
         }
 
         this.log(`找到元素: nodeId=${nodeId}`)
@@ -549,7 +558,7 @@ export class Locator {
 
             if (!result.objectId || result.subtype === 'null') {
                 this.log(`第 ${this.nth} 个匹配元素不存在: ${xpath}`)
-                throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+                throw this.notFound()
             }
 
             return this.objectIdToNodeId(result.objectId)
@@ -566,7 +575,7 @@ export class Locator {
 
         if (!result.objectId) {
             this.log(`元素未找到: ${xpath}`)
-            throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+            throw this.notFound()
         }
 
         return this.objectIdToNodeId(result.objectId)
@@ -584,9 +593,11 @@ export class Locator {
         })) as { nodeId: number }
 
         if (nodeId === 0) {
-            throw new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.())
+            this.observation.lastLocatorState = 'node_resolution_failed'
+            throw this.notFound()
         }
 
+        this.observation.lastLocatorState = 'found'
         this.log(`找到元素: nodeId=${nodeId}`)
         return nodeId
     }
@@ -625,6 +636,20 @@ export class Locator {
      */
     private remaining(): number {
         return Math.max(1, this.deadline - Date.now())
+    }
+
+    private observeMatches(matchCount: number): void {
+        this.observation = {
+            matchCount,
+            lastLocatorState: matchCount === 0 ? 'not_found' : this.nth >= matchCount ? 'index_out_of_range' : 'found',
+        }
+    }
+
+    private notFound(): ElementNotFoundError {
+        if (this.observation.lastLocatorState === 'unobserved' || this.observation.lastLocatorState === 'found') {
+            this.observation.lastLocatorState = 'not_found'
+        }
+        return new ElementNotFoundError(this.target, this.timeout, this.logs, this.getUrl?.(), this.lastObservation)
     }
 
     /**

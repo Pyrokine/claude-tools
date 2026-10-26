@@ -12,7 +12,7 @@ import { isExpectedOperationError } from '../types/expected-errors'
 import { recordDomFrameProbe } from './action-utils'
 import { ActionHandler } from './actions'
 import { HttpClient } from './http-client'
-import { advancePageRevision, forgetPageRevision } from './page-revision'
+import { advancePageRevision, forgetPageRevision, getExistingTab } from './page-revision'
 import { hasReadGrant, revokeReadGrants, revokeTabReadGrants, setReadGrant } from './read-grants'
 import {
     getMcpTabGroupId,
@@ -21,6 +21,7 @@ import {
     setMcpTabGroupId,
     setMcpWindowId,
     unmarkManagedTab,
+    updateManagedTabDocument,
     isManagedTab,
 } from './tab-state'
 
@@ -28,6 +29,7 @@ import {
 
 const httpClient = new HttpClient()
 const actionHandler = new ActionHandler()
+let connectionGeneration = 0
 httpClient.onConnectionClosed((instanceId) => {
     void revokeReadGrants(instanceId).catch((error) => console.error('[MCP] Read grant cleanup failed:', error))
 })
@@ -54,6 +56,7 @@ httpClient.onMessage(async (message, port) => {
     const { id, action, params } = message
 
     try {
+        await restoreManagedTabs()
         const result = await actionHandler.execute(action, params, {
             mcpTabGroupId: getMcpTabGroupId(),
             mcpWindowId: getMcpWindowId(),
@@ -90,21 +93,25 @@ chrome.runtime.onMessage.addListener((message: InternalMessage, sender, sendResp
 async function handleInternalMessage(message: InternalMessage, sender: chrome.runtime.MessageSender): Promise<unknown> {
     switch (message.type) {
         case 'CONNECT':
-            return httpClient.connect()
+            return connectAfterRestore()
 
         case 'DISCONNECT':
+            ++connectionGeneration
             httpClient.disconnect()
             return { success: true }
 
         case 'SET_PAIRING_TOKEN':
+            await restoreManagedTabs()
             await httpClient.setPairingToken(message.token)
             return { success: true }
 
         case 'SET_ALLOW_INSECURE_NO_TOKEN':
+            await restoreManagedTabs()
             await httpClient.setAllowInsecureNoToken(message.allow)
             return { success: true }
 
         case 'GET_STATUS': {
+            await restoreManagedTabs()
             const servers = httpClient.getConnectedServers()
             const managed = Number.isSafeInteger(message.tabId) && isManagedTab({ id: message.tabId })
             const readAccess =
@@ -130,6 +137,7 @@ async function handleInternalMessage(message: InternalMessage, sender: chrome.ru
             if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('src/popup/popup.html')) {
                 throw new Error('只读权限只能从 Extension popup 修改')
             }
+            await restoreManagedTabs()
             if (
                 !Number.isSafeInteger(message.tabId) ||
                 !Number.isSafeInteger(message.port) ||
@@ -141,7 +149,7 @@ async function handleInternalMessage(message: InternalMessage, sender: chrome.ru
             if (!instanceId) {
                 throw new Error('目标 MCP Server 未连接或未提供连接身份')
             }
-            const tab = await chrome.tabs.get(message.tabId)
+            const tab = await getExistingTab(message.tabId)
             const window = await chrome.windows.getLastFocused()
             if (tab.windowId !== window.id || !tab.active) {
                 throw new Error('只能从 popup 授权当前窗口的活动页面')
@@ -249,6 +257,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.webNavigation.onCommitted.addListener((details) => {
     if (details.frameId === 0) {
         advancePageRevision(details.tabId)
+        void updateManagedTabDocument(details.tabId).catch((error) =>
+            console.warn('[MCP] Managed page document update failed:', error)
+        )
         void revokeTabReadGrants(details.tabId).catch((error) =>
             console.warn('[MCP] Read grant navigation cleanup failed:', error)
         )
@@ -284,15 +295,20 @@ void chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 })
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === KEEPALIVE_ALARM) {
         // 定期全量扫描：发现新 Server 或重连断开的
-        void httpClient.connect()
+        void connectAfterRestore().catch((error) => console.error('[MCP] Auto-connect failed:', error))
     }
 })
 
 // ==================== 自动连接 ====================
 
-// Service Worker 启动时恢复 managed tab 集合并尝试连接所有 MCP Server
-setTimeout(() => {
-    void restoreManagedTabs()
-        .catch((error) => console.error('[MCP] Failed to restore managed pages:', error))
-        .then(() => httpClient.connect())
-}, 500)
+async function connectAfterRestore(): Promise<{ connected: number; ports: number[] }> {
+    const requestedGeneration = connectionGeneration
+    await restoreManagedTabs()
+    if (requestedGeneration !== connectionGeneration) {
+        return { connected: 0, ports: [] }
+    }
+    return httpClient.connect()
+}
+
+// Service Worker 启动即恢复权限，成功后才连接 MCP Server
+void connectAfterRestore().catch((error) => console.error('[MCP] Auto-connect failed:', error))

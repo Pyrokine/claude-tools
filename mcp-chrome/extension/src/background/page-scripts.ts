@@ -1,15 +1,15 @@
 // ==================== 注入到页面的函数 ====================
 
 export function installFrameProbeListener(): void {
-    const probeWindow = window as Window & { __mcpFrameProbeListenerInstalled?: boolean }
-    if (probeWindow.__mcpFrameProbeListenerInstalled) {
+    const probeWindow = window as Window & { __mcpFrameProbeListenerV2?: (event: MessageEvent) => Promise<void> }
+    if (probeWindow.__mcpFrameProbeListenerV2) {
         return
     }
-    window.addEventListener('message', (event: MessageEvent) => {
+    const onMessage = async (event: MessageEvent): Promise<void> => {
         const data = event.data as { type?: string; token?: string; index?: number } | null
         if (
             event.source !== window.parent ||
-            data?.type !== 'mcp-frame-probe' ||
+            data?.type !== 'mcp-frame-probe-v2' ||
             typeof data.token !== 'string' ||
             data.token.length > 100 ||
             !Number.isInteger(data.index) ||
@@ -18,22 +18,33 @@ export function installFrameProbeListener(): void {
             return
         }
         const source = event.source as Window
-        void chrome.runtime
-            .sendMessage({ type: 'MCP_FRAME_PROBE', token: data.token, index: data.index })
-            .then((response: { accepted?: boolean } | undefined) => {
-                if (!response?.accepted) {
+        try {
+            const runtime = typeof chrome === 'undefined' ? undefined : chrome.runtime
+            if (typeof runtime?.sendMessage !== 'function') {
+                throw new Error('Extension context invalidated: runtime messaging is unavailable')
+            }
+            const response = (await runtime.sendMessage({
+                type: 'MCP_FRAME_PROBE',
+                token: data.token,
+                index: data.index,
+            })) as { accepted?: boolean } | undefined
+            if (response?.accepted) {
+                source.postMessage({ type: 'mcp-frame-probe-ack-v2', token: data.token, index: data.index }, '*')
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (/Extension context invalidated/i.test(message)) {
+                if (probeWindow.__mcpFrameProbeListenerV2 !== onMessage) {
                     return
                 }
-                source.postMessage({ type: 'mcp-frame-probe-ack', token: data.token, index: data.index }, '*')
-            })
-            .catch((error) => {
-                console.warn(
-                    '[MCP] iframe identity probe failed:',
-                    error instanceof Error ? error.message : String(error)
-                )
-            })
-    })
-    probeWindow.__mcpFrameProbeListenerInstalled = true
+                window.removeEventListener('message', onMessage)
+                delete probeWindow.__mcpFrameProbeListenerV2
+            }
+            console.warn('[MCP] iframe identity probe failed:', message)
+        }
+    }
+    window.addEventListener('message', onMessage)
+    probeWindow.__mcpFrameProbeListenerV2 = onMessage
 }
 
 // Accessibility Tree 生成
@@ -171,11 +182,11 @@ export function generateAccessibilityTree(
         if (tag === 'input') {
             const input = element as HTMLInputElement
             const inputType = input.type || ''
-            if (inputType === 'submit' && input.value?.trim()) {
-                return input.value.trim()
-            }
-            if (inputType !== 'password' && input.value && input.value.length < 50) {
-                return input.value.trim()
+            if (inputType !== 'hidden' && inputType !== 'password') {
+                const value = input.value
+                if (value && (inputType === 'submit' || value.length < 50)) {
+                    return value.trim()
+                }
             }
         }
 
@@ -1120,31 +1131,16 @@ export function simulateMouseClick(
     element.dispatchEvent(new MouseEvent('mouseover', released))
     element.dispatchEvent(new MouseEvent('mouseenter', { ...released, bubbles: false }))
     element.dispatchEvent(new MouseEvent('mousemove', released))
-    element.dispatchEvent(new MouseEvent('mousedown', { ...pressed, detail: 1 }))
-
-    // mousedown 时聚焦可聚焦元素
-    if ('focus' in element && typeof (element as HTMLElement).focus === 'function') {
-        ;(element as HTMLElement).focus()
-    }
-
-    element.dispatchEvent(new MouseEvent('mouseup', { ...released, detail: 1 }))
-
-    // 右键不触发 click，而是触发 contextmenu（浏览器原生行为）
-    if (button === 'right') {
-        element.dispatchEvent(new MouseEvent('contextmenu', released))
-    } else {
-        element.dispatchEvent(new MouseEvent('click', { ...released, detail: 1 }))
-    }
-
-    // 补发双击/三击事件（clickCount > 1 时）
-    for (let i = 2; i <= clickCount; i++) {
-        element.dispatchEvent(new MouseEvent('mousedown', { ...pressed, detail: i }))
-        element.dispatchEvent(new MouseEvent('mouseup', { ...released, detail: i }))
-        if (button !== 'right') {
-            element.dispatchEvent(new MouseEvent('click', { ...released, detail: i }))
-            if (i === 2) {
-                element.dispatchEvent(new MouseEvent('dblclick', { ...released, detail: i }))
-            }
+    const clickType = button === 'right' ? 'contextmenu' : button === 'middle' ? 'auxclick' : 'click'
+    for (let detail = 1; detail <= clickCount; ++detail) {
+        element.dispatchEvent(new MouseEvent('mousedown', { ...pressed, detail }))
+        if (detail === 1 && 'focus' in element && typeof (element as HTMLElement).focus === 'function') {
+            ;(element as HTMLElement).focus()
+        }
+        element.dispatchEvent(new MouseEvent('mouseup', { ...released, detail }))
+        element.dispatchEvent(new MouseEvent(clickType, { ...released, detail }))
+        if (button === 'left' && detail === 2) {
+            element.dispatchEvent(new MouseEvent('dblclick', { ...released, detail }))
         }
     }
 
@@ -1253,7 +1249,15 @@ export async function simulateKeyboardType(
 }
 
 // 模拟单个按键事件
-export function simulateKeyEvent(key: string, type: string, modifiers: string[]): { success: boolean } {
+export function simulateKeyEvent(
+    key: string,
+    type: string,
+    modifiers: string[],
+    deadline?: number
+): { success: boolean } {
+    if (deadline !== undefined && Date.now() >= deadline) {
+        throw new Error('input timeout before event dispatch')
+    }
     const activeElement = document.activeElement || document.body
 
     const keyEventOptions: KeyboardEventInit = {
@@ -1316,14 +1320,10 @@ export function simulateMouseEvent(
         ;(element as HTMLElement).focus()
     }
 
-    // mouseup 后自动触发 click 事件（模拟原生浏览器行为）
-    // 右键 mouseup 触发 contextmenu 而非 click（浏览器原生行为）
+    // mouseup 后按鼠标键派发 click、auxclick 或 contextmenu
     if (type === 'mouseup') {
-        if (button === 'right') {
-            element.dispatchEvent(new MouseEvent('contextmenu', eventOptions))
-        } else {
-            element.dispatchEvent(new MouseEvent('click', eventOptions))
-        }
+        const clickType = button === 'right' ? 'contextmenu' : button === 'middle' ? 'auxclick' : 'click'
+        element.dispatchEvent(new MouseEvent(clickType, eventOptions))
     }
 
     return { success: true }
@@ -1953,21 +1953,24 @@ export function inspectChallengePage(options: {
             }) || candidates[0]
         )
     }
-    const turnstileBox = findVisibleTurnstileBox()
     const hostVerify =
         Array.from(document.querySelectorAll(options.verifyButtonSelectors.join(','))).find(isVisible) ||
         Array.from(document.querySelectorAll('button')).find((el) => {
             const text = (el.textContent || '').trim()
             return isVisible(el) && (text === 'Verify you are human' || text === '请验证您是真人')
         })
-    const useIframeClick =
-        cloudflareFramePresent ||
-        (!hostVerify && interstitialPending && Boolean(document.querySelector('input[name="cf-turnstile-response"]')))
+    const turnstileBox =
+        !originResponsePending && (interstitialPending || widgetHits.length > 0) ? findVisibleTurnstileBox() : null
     const turnstilePresent =
         widgetHits.length > 0 ||
-        useIframeClick ||
-        (interstitialPending && frameHits.length > 0) ||
-        Boolean(turnstileBox)
+        Boolean(hostVerify) ||
+        (!originResponsePending &&
+            interstitialPending &&
+            (cloudflareFramePresent || frameHits.length > 0 || Boolean(turnstileBox)))
+    const useIframeClick =
+        turnstilePresent &&
+        (cloudflareFramePresent ||
+            (!hostVerify && interstitialPending && Boolean(document.querySelector('input[name="cf-turnstile-response"]'))))
     const pointFromRect = (rect: DOMRect, kind: 'verify' | 'widget') => {
         if (!rect || rect.width < 8 || rect.height < 8) {
             return null

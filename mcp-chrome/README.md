@@ -38,6 +38,27 @@ existing browser, **CDP mode** (fallback) launches a dedicated instance.
 Local zero-config auto-connect is unchanged. Reloading the Extension or restarting the MCP client does not require a
 manual Connect click.
 
+## Request scope and failure handling
+
+An input sequence keeps its selected backend and page until the sequence and target restoration finish. Concurrent
+`browse(action="connect")` waits for that scope. A CDP request with `frame` returns a capability error before resolving
+or operating on an Extension page. Extension frame resolution checks the selected document and probes the native iframe
+owner, so reordering same-URL frames cannot redirect execution by a stale DOM index.
+
+Explicit `wait="networkidle"` enables Network observation before navigation and waits for requests to finish followed by
+500 ms of quiet. Missing or interrupted observation returns an error; the default `load` path does not attach a debugger
+for network-idle tracking. CDP network logs retain the HTTP status when a response body fails and record one terminal
+entry per request. Temporary CDP page selection preserves separate log buffers for each target.
+
+Input `timeout` includes page selection, preparation and key RPCs. An acknowledgement that arrives after the deadline
+cannot produce success; uncertain execution is reported as `actionStatus="unknown"` with `retryable=false`. Read the
+current page state before deciding the next action.
+
+Group operations serialize with page release and recheck membership and managed authority while holding the affected
+page locks. For page creation, use `active`; `activate` is accepted only by `movePage`. Popup settings report failed
+storage writes, and delayed stored values cannot override a newer setting. Default local auto-connect remains enabled
+without a manual pairing or connection step.
+
 ## Compatible Clients
 
 | Client                    | Status |
@@ -288,6 +309,10 @@ page. `releasePage` revokes full managed access without closing the tab or chang
 log state and removes debugging and console capture resources. If Chrome prevents resource cleanup, the response
 includes `warnings` while managed access is still revoked.
 
+Managed access survives a Service Worker restart. Reloading the Extension also restores access to surviving managed
+tabs whose original document identity still matches, without refreshing or adopting them again. Tabs with unavailable
+document identity require explicit `adoptPage` after an Extension reload; ordinary navigation keeps managed access,
+and `releasePage` remains revoked after a restart or reload. A reused tab ID does not authorize a different document.
 A managed tab can keep using this Extension's existing debugger session after a Service Worker restart. Sessions owned
 by other debuggers still return `DEBUGGER_BLOCKED`.
 
@@ -308,9 +333,11 @@ page is closed; it never authorizes content access.
 ### Access challenges
 
 After `open`, `back`, `forward`, `refresh`, `input`, and `evaluate`, MCP Chrome waits for a Cloudflare JS Challenge or
-Turnstile checkbox. When Extension mode is active, navigation starts without debugger logging and reads the live tab
-title passively for eight seconds. If the interstitial persists, MCP Chrome checks for a visible Turnstile control and
-clicks it only when it finds one. Extension inspect uses an isolated world and detaches the debugger first. Same-page
+Turnstile checkbox. When Extension mode is active, navigation starts without debugger logging. While a Challenge title
+persists, MCP Chrome reads the live tab title passively for the first eight seconds. If the interstitial persists, it checks for a visible Turnstile control and
+clicks it only when it finds one. Extension inspect uses an isolated world. Challenge titles detach the debugger before
+inspection; ordinary-page checks retain an existing connection unless a visible verification control or unresolved
+challenge content is found. Same-page
 fixture buttons use the existing page click. If a Cloudflare Turnstile iframe is present, inspect CSS coordinates are
 converted to screen coordinates and the OS mouse moves along a path, hovers, then presses and releases: `xdotool` on
 Linux uses the focused Chrome client-window geometry and `xprop` GTK frame extents only when that window title matches
@@ -328,12 +355,15 @@ is clicked at most once; if Cloudflare then shows a visible `Verify you are huma
 button is inspected as `verify` and clicked at most once in the same wait. Use the default `diagnostics=false` for
 challenge-protected pages because diagnostics starts debugger console and network collection.
 
-Detection covers titles such as `Just a moment...` and `请稍候…`, challenge DOM or body-text markers, and
-`Verify you are human` / `请验证您是真人` controls, including visible `button` elements with that exact text. Same-page
-buttons use page input when no Cloudflare iframe is present. CDP reads live titles with `Target.getTargetInfo`. A
-leftover Cloudflare iframe on a recovered page is not pending. Cached titles do not decide the result. MCP Chrome does
-not call a CAPTCHA solver, retry navigation, or export `cf_clearance` values. A CDP timeout does not prove that the site
-fails in a user Chrome session; check the returned `mode` before diagnosing the site.
+Detection covers titles such as `Just a moment...` and `请稍候…`, visible challenge DOM or body-text markers, and
+`Verify you are human` / `请验证您是真人` controls, including visible `button` elements with that exact text. A normal
+title still requires a bounded check of visible content: visible `正在进行安全验证` blocks the action, while hidden
+markers do not. Pages without challenge evidence continue without a fixed eight-second wait. Same-page buttons use
+page input when no Cloudflare iframe is present. CDP reads live titles with `Target.getTargetInfo`. A leftover
+Cloudflare iframe or an old pending header alone does not keep a recovered page pending or trigger scrolling or a
+click. Cached titles do not decide the result. MCP Chrome does not call a CAPTCHA solver, retry navigation, or export
+`cf_clearance` values. A CDP timeout does not prove that the site fails in a user Chrome session; check the returned
+`mode` before diagnosing the site.
 
 A resolved challenge returns `challengeResolved=true`, `challengeKind`, `waitedMs`, `clickedTurnstile`, and
 `clearanceCookiePresent` (name presence only). If the visible page text says verification succeeded and Cloudflare is
@@ -371,7 +401,10 @@ Special-case parameters:
 - `keydown` accepts `commands` (e.g. `["selectAll"]`, `["copy"]`, `["paste"]`, `["cut"]`, `["undo"]`, `["redo"]`) to
   trigger native browser editing commands. A successful response means the browser accepted the command dispatch; use
   `postCondition` or `extract` to verify the page result. `commands` is precise-mode only; stealth mode throws because
-  the CDP commands API has no JS-event equivalent.
+  the CDP commands API has no JS-event equivalent. An element or coordinate `target` is focused without mouse events
+  before command dispatch. Coordinate focus does not toggle checkboxes, follow links, or invoke click listeners. A
+  missing or unfocusable target returns an error before commands are sent. Extension `frame` coordinates are local to
+  that frame.
 - `keydown` on a key already held emits `rawKeyDown` with `autoRepeat: true` (Puppeteer-compatible long-press).
 
 `events` must contain at least one event. Parameters: `humanize` enables Bézier curve movement and random delays.
@@ -383,6 +416,11 @@ functions are invoked and the final Promise value is awaited before matching, wh
 check. `targetId` (or legacy `tabId`) selects a page in either backend; `frame` selects an iframe (CSS selector or
 index) in Extension mode. When either scope is provided, the action, diagnostics, and post-condition use the backend
 selected for that target scope.
+
+If the frame, execution context, or debugger becomes unavailable during verification, the check returns
+`verificationStatus="unavailable"`. A script that throws or rejects, even with the same error text, returns `error`.
+An already completed action keeps `actionStatus="completed"` and `failureStage="verification"`; verification does not
+replay the action.
 
 For keyboard `type`, `timeout` includes Challenge waiting, focus preparation, character input, and `delay`/`humanize`
 delays. Extension precise/stealth and CDP use the remaining budget. An explicit budget such as `timeout=45000` allows
@@ -398,6 +436,10 @@ cannot be undone. Read the page independently after an unknown result instead of
 Command focus, text selection, and replacement share the remaining event budget. Expiry stops subsequent actions; Shift
 release is still attempted without hiding an earlier action error. Stepped CDP touch movement also stops at the
 deadline.
+
+Stealth left clicks emit `click`, middle clicks emit `auxclick`, and right clicks emit `contextmenu`. Each press/release
+pair carries its click `detail`; only left multiple clicks emit `dblclick` at `detail=2`. Separate stealth `mouseup`
+events follow the same button mapping.
 
 In stealth mode, `delay` separates characters; the first character has no initial wait. Background page timer throttling
 can lengthen subsequent intervals, but the same deadline still stops further input.
@@ -425,6 +467,13 @@ omitted from failure diagnostics, and input `find` or replacement `text` values 
 `select` and `replace`, event-level `nth` selects the Nth text occurrence while nested `target.nth` selects the Nth
 matching element; both are zero-based and may be used together. Locator targets for `select` and `replace` work in CDP
 mode without Extension ref IDs.
+
+In both backends, target lookup failures from `input`, `extract`, and `wait` report the failed locator, zero-based `nth`,
+URL, tab/frame scope, managed state, last locator state, and at most 10 candidate summaries within the request budget.
+`matchCount` is the observed total, not the candidate limit; an out-of-range `nth` does not turn 15 matches into zero.
+Unknown counts or managed state are `null`, and unavailable diagnostics include `diagnosticError`. CDP retains
+`ELEMENT_NOT_FOUND` for lookup failures and `TIMEOUT` for element waits, together with existing URL and log fields.
+Diagnostics read the failed target before its scope is restored and never replay input.
 
 ### extract - Content Extraction
 
@@ -470,9 +519,12 @@ describes Extension page management; CDP returns false without restricting norma
 `computed:font-size`). Use `computed:*` to return all computed style properties as JSON (returns 300+ properties — use
 `output` to save to file).
 
-**`state`-specific**: `depth` controls DOM traversal depth (default 15). Reduce to limit response size on large pages.
-`mode` selects the underlying source — `accessibility` (default, derived from the a11y tree) or `domsnapshot` (raw CDP
-`DOMSnapshot.captureSnapshot`, CDP-only; returns a flat node array with computed styles for advanced post-processing).
+**`state`-specific**: `depth` controls accessibility-tree traversal depth (default 15). Reduce it to limit response size
+on large pages. `mode` selects `accessibility` (default, derived from the a11y tree) or `domsnapshot` (raw
+`DOMSnapshot.captureSnapshot`, available through CDP or a managed Extension page). DOMSnapshot captures the whole page
+and rejects `target`, `frame`, and `depth` instead of ignoring those limits. Ordinary read grants do not grant debugger
+access. Unavailable sibling iframe probes are listed in metadata as `unavailableFrames` and per-frame
+`unavailableReason`; a uniquely verified selected iframe remains usable.
 
 ### wait - Wait for Conditions
 
@@ -525,9 +577,11 @@ action. `postCondition` is optional; when it is not provided, `success=true` onl
 returned. When it is provided and does not match before timeout, the tool returns `POST_CONDITION_FAILED` with the last
 observed checks. Precise iframe evaluation does not replay a script after a stale execution context by default. Set
 `staleContextRetry="readOnly"` only when the script has no side effects; the Extension may then resolve a new context
-and replay it once within the remaining timeout budget. A stale-context error after `Runtime.evaluate` reports
-`actionExecuted=true` and `actionStatus="unknown"`, because earlier side effects may already have happened even though
-the final result is unavailable.
+and replay it once within the remaining timeout budget. If Chrome still reports the removed document while resolving
+that retry, the Extension waits for the current document within the same budget; this does not add script executions.
+Permission failures stop immediately. A stale-context error after `Runtime.evaluate` reports `actionExecuted=true` and
+`actionStatus="unknown"`, because earlier side effects may already have happened even though the final result is
+unavailable.
 
 For object results in the main frame with Extension precise mode, an explicit `output` uses a 16 Mi (16777216) character
 budget. Without `output`, the 1000000-character budget still applies, including automatic saving. Both paths retain the
@@ -551,7 +605,7 @@ result limit reports the current limit and the completed script's output failure
 | `reorderPage`      | Reorder a controlled tab inside its window                        |
 | `pinPage`          | Pin a controlled tab                                              |
 | `unpinPage`        | Unpin a controlled tab                                            |
-| `activatePage`     | Activate a controlled tab and focus its window                    |
+| `activatePage`     | Activate an explicit page; Extension requires a controlled tab    |
 | `focusWindow`      | Focus an explicit window                                          |
 | `resizeWindow`     | Resize or change state for an explicit window                     |
 | `newWindow`        | Create a new controlled window                                    |
@@ -569,17 +623,27 @@ result limit reports the current limit and the completed script's output failure
 | `stealth`          | Inject anti-detection scripts                                     |
 | `cdp`              | Send raw CDP command (advanced, e.g. `Runtime.evaluate`)          |
 
-Native tab/window/group configuration is Extension-mode only. Mutations identify their existing targets with `targetId`,
-`targetIds`, `windowId`, or `groupId` and return `affected.before/after`. Group results also include
-`tabsBefore/tabsAfter`; `ungroupPages` removes an empty group through Chrome without revoking the tabs' managed state.
-Group title/color/collapse updates and group moves require all group members to be managed. Window updates, resizing,
-and focusing require all window tabs to be managed; a cached MCP window ID does not override that check. `clearCache` is
-unavailable in Extension mode and returns `UNSUPPORTED_MODE` without clearing anything. Use scoped
-`cookies(action="clear")` for cookies or CDP mode for storage and cache. `focusWindow` only returns success after the
-target window is observed as focused; otherwise it returns `WINDOW_FOCUS_NOT_OBSERVED`. `closeWindow` refuses mixed
-windows with unmanaged tabs and returns `WINDOW_HAS_UNMANAGED_TABS`. Persistent `adoptPage` and `releasePage` target
-changes are serialized with scoped tab operations, so a concurrent multi-event input remains on its requested tab and
-the persistent target is applied afterward.
+Native tab/window/group configuration uses Extension mode; `activatePage` also supports CDP. Mutations identify their
+existing targets with `targetId`, `targetIds`, `windowId`, or `groupId` and return `affected.before/after`. Group
+results also include `tabsBefore/tabsAfter`; `ungroupPages` removes an empty group through Chrome without revoking the
+tabs' managed state. Window display changes and group title/color/collapse updates use the explicit `windowId` or
+`groupId`, including containers with unmanaged members. They do not grant page permissions. Group moves and window
+closure still require every affected member to be managed. Grouping or ungrouping selected pages checks those pages;
+unrelated sibling changes do not invalidate a valid selection. Default page creation reuses a valid cached MCP window
+even when it contains unmanaged tabs. `clearCache` is unavailable in Extension mode and returns `UNSUPPORTED_MODE`
+without clearing anything. Use scoped `cookies(action="clear")` for cookies or CDP mode for storage and cache.
+`focusWindow` only returns success after the target window is observed as focused; otherwise it returns
+`WINDOW_FOCUS_NOT_OBSERVED`. `closeWindow` refuses mixed windows with unmanaged tabs and returns
+`WINDOW_HAS_UNMANAGED_TABS`. Persistent `adoptPage` and `releasePage` target changes are serialized with scoped tab
+operations, so a concurrent multi-event input remains on its requested tab and the persistent target is applied
+afterward.
+
+CDP `activatePage` retains the default operation target and reports the fields available from that backend, without
+inventing an `active` value or system-window focus. In Extension mode, `viewport`, `userAgent`, `emulate`, raw `cdp`,
+and precise `evaluate` support controlled `about:blank` pages. Chrome-internal and Extension pages retain their access
+restrictions. Querying `manage(action="emulate")` without `device` returns the local device catalogue without a live
+page; page conditions are rejected for this query. Setting a device continues to validate the selected page and
+conditions.
 
 | Action                          | Native parameters                                                                                                                     | Behavior                                                                                                                                                     |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -606,6 +670,11 @@ Window objects reference pages through `targetIds` rather than repeating full ta
 omitted; full details use `favIconInline=true` to indicate one exists. Groups retain title, color, collapsed/shared
 state, window, first-member index and member IDs. Color belongs to a group, not a tab. Readonly properties are returned
 when Chrome supplies them, not accepted as configuration writes. Listing does not read page content, navigate or focus.
+
+Older Extensions that return group summaries without member arrays use the same response's window/tab membership to
+populate group members and first-member index. Summary/full details and filters remain available without another RPC.
+If group information is absent entirely, `groups` is omitted with a warning that it is unavailable. A supplied
+`groups: []` means no groups. Malformed group data, including only one member array, returns an error.
 
 Moving tabs/groups accepts `index=-1`; page creation requires a nonnegative index. Opener and explicit group/window
 options must identify the same window. Pinned tabs cannot be created inside a group. Window state/bounds conflicts and
@@ -966,20 +1035,29 @@ MIT License - see [LICENSE](LICENSE) for details.
 Input and evaluate responses append `actionExecuted`, `actionStatus`, `verificationStatus`, `failureStage`, and
 `retryable`. Verification uses `matched`, `not_matched`, `unavailable`, or `error`; debugger timeouts report the action
 as `unknown` when completion cannot be proven. Page-thrown exceptions report `actionExecuted=true` with
-`actionStatus="failed"`; result materialization or serialization errors report `actionStatus="completed"` and
-`failureStage="output"`. Diagnostics are best-effort and return `diagnosticsStatus` without replacing the main action
+`actionStatus="failed"`. Once native execution returns a result, local materialization or serialization failures report
+`actionStatus="completed"` and `failureStage="output"`. Diagnostics are best-effort and return `diagnosticsStatus` without replacing the main action
 result. On a page precondition mismatch, input and evaluate report `actionExecuted=false` and
 `actionStatus="not_started"`. Browse and wait errors also retain any diagnostics collected before the action failed.
 Target diagnostics query the current tab state instead of relying on cached attach metadata.
 
-Native script termination and `Internal error` responses from CDP `Runtime` script commands preserve the original error
-code. evaluate and `manage cdp` return `actionExecuted=true`, `actionStatus="unknown"`, and `retryable=false` without
-replaying the command. evaluate also returns `retryable=false` when an in-flight RPC timeout or stale execution context
-leaves the result unknown; timeouts before execution starts remain retryable. Page-thrown exceptions with the same text
-remain action failures.
+Native script termination, `Internal error`, `Object couldn't be returned by value`, and `Object reference chain is too long`
+responses from CDP `Runtime` script commands preserve the original error code. evaluate and `manage cdp` return `actionExecuted=true`,
+`actionStatus="unknown"`, and `retryable=false` without replaying the command. evaluate also returns `retryable=false`
+when an in-flight RPC timeout or stale execution context leaves the result unknown; timeouts before execution starts
+remain retryable. Page-thrown exceptions with the same text remain non-retryable action failures.
 
-Extension accessibility state does not read password values to generate element names. Labels, placeholders, titles, and
-ordinary input values remain available. Explicit script, HTML, and attribute reads retain their existing behavior.
+Recognized Extension CDP rejections return `CDP_ERROR` with the method, target, native message and available protocol
+code. The context distinguishes a disabled Debugger domain, stale script ID, browser-level command restriction, missing
+method, command permission refusal (`Not allowed`), and native result serialization failure. A resource or method lookup failure does not imply that the entire
+domain is unsupported. These remain failed calls with warning diagnostics; unknown errors retain error-level reporting.
+A closed tab found during a native snapshot or permission check remains a target failure, separate from page-thrown
+exceptions with matching text.
+
+Extension accessibility state never reads `input[type=hidden]` or `input[type=password]` value getters for element names
+or state text. This applies to the default `all` filter, target subtrees, and file output. Hidden controls may still
+appear with `visible=false`; labels, placeholders, titles, and ordinary input values remain available. Explicit script,
+HTML, and attribute reads retain their existing behavior.
 
 `replace` uses text selection only for `textarea` and input types `text`, `search`, `tel`, `url`, and `password`. Other
 input types use a native full-value update and return the requested and actual browser-normalized values. A standalone
@@ -996,6 +1074,9 @@ replay stale scripts. `readOnly` permits one replay after the Extension verifies
 execution context. Responses include the policy, `retryAttempted`, bounded `retryReason`, and the final `frameContext`
 with the Extension frame, parent frame, URL, CDP frame, and execution context IDs. Same-URL frames are rejected only
 when the selected DOM iframe cannot identify one target. Existing iframe targets remain usable after an Extension reload
-without refreshing or navigating the page. Port scanning aggregates ordinary pre-open failures at debug level;
+without refreshing or navigating the page. Invalidated probe contexts produce a warning and stop listening instead of
+throwing an uncaught messaging error. Discovery reports the initial port set and subsequent changes, including transitions
+to no servers; unchanged scans and automatic reconnects do not repeat that summary. Each scan still checks the entire
+port range. Explicit disconnect starts a new reporting cycle. Ordinary pre-open failures remain debug-level;
 authentication and protocol rejections from identified MCP servers produce one bounded warning when the rejection
 summary changes.

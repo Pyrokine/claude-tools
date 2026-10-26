@@ -37,6 +37,7 @@ export class LogManager {
     private mainFrameIds = new Map<number, string>()
     private pendingRequests = new Map<number, Map<string, PendingRequest>>()
     private pendingUncertain = new Set<number>()
+    private networkObserved = new Set<number>()
     private sweepTimer: ReturnType<typeof setInterval> | null = null
 
     constructor() {
@@ -95,8 +96,17 @@ export class LogManager {
         return this.pendingUncertain.has(tabId)
     }
 
+    isNetworkObserved(tabId: number): boolean {
+        return this.networkObserved.has(tabId)
+    }
+
+    markNetworkObserved(tabId: number): void {
+        this.networkObserved.add(tabId)
+    }
+
     /** debugger 断开后请求结束事件不可恢复，保持不确定状态直到新主文档或 tab cleanup */
     handleDebuggerDetach(tabId: number): void {
+        this.networkObserved.delete(tabId)
         this.pendingRequests.delete(tabId)
         this.pendingUncertain.add(tabId)
         this.mainFrameIds.delete(tabId)
@@ -157,6 +167,7 @@ export class LogManager {
         }
 
         if (method === 'Network.requestWillBeSent') {
+            this.networkObserved.add(tabId)
             const p = params as {
                 requestId: string
                 request: { url: string; method: string }
@@ -258,6 +269,7 @@ export class LogManager {
         this.mainFrameIds.delete(tabId)
         this.pendingRequests.delete(tabId)
         this.pendingUncertain.delete(tabId)
+        this.networkObserved.delete(tabId)
     }
 
     private finalizeRequest(tabId: number, requestId: string, timestamp: number, errorText?: string): void {

@@ -131,6 +131,7 @@ class UnifiedSessionManager {
     private tabSwitchLock: Promise<void> = Promise.resolve() // 串行化 tab 切换，防止并发竞态
     private readonly tabLockContext = new AsyncLocalStorage<{
         session: UnifiedSessionManager
+        mode?: ActiveConnectionMode
         targetRestoration?: TargetRestoration
     }>()
 
@@ -171,6 +172,10 @@ class UnifiedSessionManager {
      * 获取当前连接模式
      */
     getMode(): ConnectionMode {
+        const scopedMode = this.tabLockContext.getStore()?.mode
+        if (scopedMode) {
+            return scopedMode
+        }
         if (this.activeMode === 'extension' && this.extensionBridge?.isConnected()) {
             return 'extension'
         }
@@ -190,9 +195,11 @@ class UnifiedSessionManager {
         return 'none'
     }
 
-    setActiveMode(mode: ActiveConnectionMode, cdpExplicitlySelected = false): void {
-        this.activeMode = mode
-        this.cdpExplicitlySelected = mode === 'cdp' && cdpExplicitlySelected
+    async setActiveMode(mode: ActiveConnectionMode, cdpExplicitlySelected = false): Promise<void> {
+        await this.withTabLock(async () => {
+            this.activeMode = mode
+            this.cdpExplicitlySelected = mode === 'cdp' && cdpExplicitlySelected
+        })
     }
 
     /**
@@ -496,13 +503,10 @@ class UnifiedSessionManager {
 
     async activatePageWithAffected(targetId: string): Promise<PageManagementResult> {
         const driver = await this.getDriver()
-        const bridge = driver as IBrowserDriver & {
-            activatePageWithAffected?: (targetId: string) => Promise<PageManagementResult>
+        if (!driver.activatePageWithAffected) {
+            throw new DriverCapabilityError('当前浏览器驱动不支持激活页面状态返回')
         }
-        if (!bridge.activatePageWithAffected) {
-            throw new DriverCapabilityError('activatePage 受控 affected 返回仅支持 Extension 模式')
-        }
-        return this.withTabLock(() => bridge.activatePageWithAffected!(targetId))
+        return this.withTabLock(() => driver.activatePageWithAffected!(targetId))
     }
 
     async focusWindow(windowId: number): Promise<PageManagementResult> {
@@ -641,9 +645,13 @@ class UnifiedSessionManager {
         refId: string,
         force = false,
         button: 'left' | 'middle' | 'right' | 'back' | 'forward' = 'left',
-        clickCount = 1
+        clickCount = 1,
+        point?: { x: number; y: number }
     ): Promise<ActionableClickResult> {
         const driver = await this.getDriver()
+        if (point) {
+            this.currentMousePosition = { x: point.x, y: point.y }
+        }
         if (button === 'left' && clickCount === 1) {
             return driver.actionableClick(refId, force)
         }
@@ -661,7 +669,7 @@ class UnifiedSessionManager {
     }
 
     /**
-     * dispatch 模式输入（ISOLATED 世界，兼容 React/Vue 受控组件）
+     * dispatch 模式输入（Extension MAIN 世界，兼容 React/Vue 受控组件）
      */
     async dispatchInput(refId: string, text: string): Promise<{ success: boolean; error?: string }> {
         const driver = await this.getDriver()
@@ -669,7 +677,7 @@ class UnifiedSessionManager {
     }
 
     /**
-     * HTML5 drag/drop（ISOLATED 世界，通过 refId 访问 __mcpElementMap 中的元素引用）
+     * HTML5 drag/drop（Extension MAIN 世界，与 refId 创建侧共享 __mcpElementMap）
      */
     async dragAndDrop(
         srcRefId: string,
@@ -680,7 +688,7 @@ class UnifiedSessionManager {
     }
 
     /**
-     * 获取元素 computed style（ISOLATED 世界）
+     * 获取元素 computed style（Extension 受控页为 MAIN，只读 documentId 授权为 ISOLATED）
      */
     async getComputedStyle(refId: string, prop: string): Promise<string | null> {
         const driver = await this.getDriver()
@@ -1133,6 +1141,10 @@ class UnifiedSessionManager {
         return this.withTabLock(async () => {
             const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
             const mode = this.getMode()
+            const scope = this.tabLockContext.getStore()!
+            if (mode !== 'none') {
+                scope.mode = mode
+            }
             if (!targetId) {
                 const current = this.getCurrentTargetId()
                 if (current) {
@@ -1324,17 +1336,20 @@ class UnifiedSessionManager {
      * 与 withTabId 配合使用时，应嵌套在 withTabId 内部：
      * withTabId(tabId, () => withFrame(frame, () => { ... }))
      */
-    async withFrame<T>(frame: string | number | undefined, fn: () => Promise<T>): Promise<T> {
+    async withFrame<T>(frame: string | number | undefined, fn: () => Promise<T>, deadline?: number): Promise<T> {
         if (frame === undefined) {
             return fn()
         }
 
-        if (!this.extensionBridge?.isConnected()) {
-            throw new Error('iframe 穿透需要 Extension 模式')
+        if (this.getMode() !== 'extension' || !this.extensionBridge?.isConnected()) {
+            throw new DriverCapabilityError('iframe 穿透需要 Extension 模式，当前连接未执行 frame 解析或操作')
         }
 
         const driver = this.extensionBridge!
-        const { frameId, offset, frameContext } = await driver.resolveFrame(frame)
+        const { frameId, offset, frameContext } = await driver.resolveFrame(
+            frame,
+            deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+        )
         const previousFrameId = driver.getCurrentFrameId()
         const previousFrameOffset = this.currentFrameOffset
         const previousRequireExtension = this.requireExtension
@@ -1404,8 +1419,10 @@ class UnifiedSessionManager {
     /**
      * 按下键盘按键
      */
-    async keyDown(key: string, commands?: string[]): Promise<void> {
-        const driver = await this.getDriver()
+    async keyDown(key: string, commands?: string[], timeout?: number): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        const driver = await this.getDriver(timeout)
+        const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
         const isExt = this.isExtensionConnected()
 
         // 预检查：stealth + commands 必然抛错，要在任何状态变更前抛出，避免 modifiers 污染
@@ -1420,29 +1437,33 @@ class UnifiedSessionManager {
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers | MODIFIER_KEYS[key] : this.modifiers
 
         if (!isExt) {
-            await getCdpSession().keyDown(key, commands, { rawKeyDown: isRepeat, autoRepeat: isRepeat })
+            await getCdpSession().keyDown(key, commands, { rawKeyDown: isRepeat, autoRepeat: isRepeat }, remaining())
             this.modifiers = nextModifiers
             this.pressedKeys.add(key)
             return
         }
 
         if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthKey(key, 'down', this.getModifierNames(nextModifiers))
+            await driver.stealthKey(key, 'down', this.getModifierNames(nextModifiers), remaining())
             this.modifiers = nextModifiers
             this.pressedKeys.add(key)
             return
         }
 
         const def = getKeyDefinition(key)
-        await driver.inputKey(isRepeat ? 'rawKeyDown' : 'keyDown', {
-            key: def.key,
-            code: def.code,
-            ...(commands && commands.length > 0 ? {} : { text: def.text }),
-            windowsVirtualKeyCode: def.keyCode,
-            modifiers: nextModifiers,
-            commands,
-            autoRepeat: isRepeat || undefined,
-        })
+        await driver.inputKey(
+            isRepeat ? 'rawKeyDown' : 'keyDown',
+            {
+                key: def.key,
+                code: def.code,
+                ...(commands && commands.length > 0 ? {} : { text: def.text }),
+                windowsVirtualKeyCode: def.keyCode,
+                modifiers: nextModifiers,
+                commands,
+                autoRepeat: isRepeat || undefined,
+            },
+            remaining()
+        )
         this.modifiers = nextModifiers
         this.pressedKeys.add(key)
     }
@@ -1450,23 +1471,29 @@ class UnifiedSessionManager {
     /**
      * 释放键盘按键
      */
-    async keyUp(key: string): Promise<void> {
-        const driver = await this.getDriver()
+    async keyUp(key: string, timeout?: number): Promise<void> {
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        const driver = await this.getDriver(timeout)
+        const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
         const isExt = this.isExtensionConnected()
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers & ~MODIFIER_KEYS[key] : this.modifiers
 
         if (!isExt) {
-            await getCdpSession().keyUp(key)
+            await getCdpSession().keyUp(key, remaining())
         } else if (this.inputMode === 'stealth') {
-            await driver.stealthKey(key, 'up', this.getModifierNames(nextModifiers))
+            await driver.stealthKey(key, 'up', this.getModifierNames(nextModifiers), remaining())
         } else {
             const def = getKeyDefinition(key)
-            await driver.inputKey('keyUp', {
-                key: def.key,
-                code: def.code,
-                windowsVirtualKeyCode: def.keyCode,
-                modifiers: nextModifiers,
-            })
+            await driver.inputKey(
+                'keyUp',
+                {
+                    key: def.key,
+                    code: def.code,
+                    windowsVirtualKeyCode: def.keyCode,
+                    modifiers: nextModifiers,
+                },
+                remaining()
+            )
         }
         this.modifiers = nextModifiers
         this.pressedKeys.delete(key)
@@ -1732,18 +1759,41 @@ class UnifiedSessionManager {
             throw new Error('challenge_inspect 仅在 Extension 模式可用')
         }
         const deadline = timeout === undefined ? undefined : Date.now() + timeout
-        await withNavigationBudget(
-            () =>
-                this.extensionBridge!.debuggerDetach(
-                    undefined,
-                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
-                ),
-            deadline
-        )
-        return this.extensionBridge.inspectChallenge(
+        const state = await withNavigationBudget(() => this.getLiveState(), deadline)
+        const title = (state?.title ?? '').trim().toLowerCase().replace(/…/g, '...')
+        const challengeTitle = options.titleNeedles.some((needle) => title.includes(needle.toLowerCase()))
+        const detach = () =>
+            withNavigationBudget(
+                () =>
+                    this.extensionBridge!.debuggerDetach(
+                        undefined,
+                        deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                    ),
+                deadline
+            )
+        if (challengeTitle) {
+            await detach()
+        }
+        const snapshot = await this.extensionBridge.inspectChallenge(
             options,
             deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
         )
+        if (!challengeTitle && snapshot && typeof snapshot === 'object') {
+            const evidence = snapshot as {
+                turnstilePresent?: boolean
+                originResponsePending?: boolean
+                selectorHits?: string[]
+                textHits?: string[]
+            }
+            if (
+                evidence.turnstilePresent ||
+                (!evidence.originResponsePending &&
+                    ((evidence.selectorHits?.length ?? 0) > 0 || (evidence.textHits?.length ?? 0) > 0))
+            ) {
+                await detach()
+            }
+        }
+        return snapshot
     }
 
     /**
@@ -2263,6 +2313,19 @@ class UnifiedSessionManager {
      *               避免工具 timeout 被连接等待吞掉，不传则使用默认 30s
      */
     private async getDriver(timeout?: number): Promise<IBrowserDriver> {
+        const scopedMode = this.tabLockContext.getStore()?.mode
+        if (scopedMode === 'extension') {
+            if (!this.extensionBridge?.isConnected()) {
+                throw new DriverCapabilityError('Extension 已断开，当前请求保留原后端，未改用 CDP')
+            }
+            return this.extensionBridge
+        }
+        if (scopedMode === 'cdp') {
+            if (!getCdpSession().isConnected()) {
+                throw new DriverCapabilityError('CDP 已断开，当前请求保留原后端，未改用 Extension')
+            }
+            return getCdpSession()
+        }
         if (this.activeMode === 'cdp' && this.cdpExplicitlySelected && getCdpSession().isConnected()) {
             this.assertCdpFallbackAllowed()
             return getCdpSession()

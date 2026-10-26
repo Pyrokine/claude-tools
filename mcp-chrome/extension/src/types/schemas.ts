@@ -445,6 +445,7 @@ export const DebuggerSendSchema = z.object({
 
 export const InputKeySchema = z.object({
     tabId: tabIdOpt,
+    deadline: z.number().finite().nonnegative().optional(),
     type: z.enum(['keyDown', 'keyUp', 'rawKeyDown', 'char']),
     key: z.string().optional(),
     code: z.string().optional(),
@@ -560,6 +561,7 @@ export const StealthTypeSchema = z.object({
 
 export const StealthKeySchema = z.object({
     tabId: tabIdOpt,
+    deadline: z.number().finite().nonnegative().optional(),
     frameId: frameIdOpt,
     key: z.string().min(1),
     type: z.enum(['down', 'up', 'press']).optional(),

@@ -13,7 +13,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { generateBezierPath, getMouseMoveDelay, getTypingDelay, randomDelay } from '../anti-detection/index.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
-import { StructuredToolError, TimeoutError } from '../core/errors.js'
+import { ElementNotFoundError, StructuredToolError, TimeoutError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT, type InputEvent, type Target } from '../core/types.js'
 import { ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
@@ -26,7 +26,7 @@ import {
     targetToFindParams,
     targetZodSchema,
 } from './schema.js'
-import { buildTargetDiagnostics } from './target-diagnostics.js'
+import { buildTargetDiagnostics, enrichTargetError, targetLookupTimeout } from './target-diagnostics.js'
 
 const INPUT_WAIT_MAX_MS = 60_000
 const TEXT_SELECTION_INPUT_TYPES = new Set(['text', 'search', 'tel', 'url', 'password'])
@@ -268,6 +268,8 @@ function sanitizeInputResponse(
  * input 工具处理器
  */
 async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputToolResponse> {
+    const inputStartedAt = Date.now()
+    const deadline = args.timeout === undefined ? undefined : inputStartedAt + args.timeout
     let eventsExecuted = 0
     let actionMayHaveExecuted = false
     const privacy = { sensitive: false }
@@ -297,141 +299,176 @@ async function handleInput(args: z.infer<typeof inputSchema>): Promise<InputTool
         const unifiedSession = getUnifiedSession()
         const humanize = args.humanize ?? false
 
-        const response = await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
-            return unifiedSession.withPageCondition(args, () =>
-                unifiedSession.withFrame(args.frame, async () => {
-                    const mode = unifiedSession.getMode()
-                    const inputStartedAt = Date.now()
-                    if (args.expectedUrl === undefined && args.expectedRevision === undefined) {
-                        await resolveChallenge(unifiedSession, 'input', 'not_started', args.timeout)
-                    }
-                    const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
-                    const warnings: string[] = []
-                    const eventResults: unknown[] = []
-                    const session = mode === 'cdp' ? getSession() : undefined
+        const response = await withPageContext(
+            unifiedSession,
+            resolvePageTargetId(args),
+            async () => {
+                return unifiedSession.withPageCondition(
+                    args,
+                    () =>
+                        unifiedSession.withFrame(
+                            args.frame,
+                            async () => {
+                                const mode = unifiedSession.getMode()
+                                if (args.expectedUrl === undefined && args.expectedRevision === undefined) {
+                                    await resolveChallenge(
+                                        unifiedSession,
+                                        'input',
+                                        'not_started',
+                                        deadline === undefined ? undefined : remainingInputTimeout(deadline)
+                                    )
+                                }
+                                const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics, deadline)
+                                const warnings: string[] = []
+                                const eventResults: unknown[] = []
+                                const session = mode === 'cdp' ? getSession() : undefined
 
-                    try {
-                        for (const event of args.events) {
-                            const eventTimeout =
-                                args.timeout === undefined
-                                    ? undefined
-                                    : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
-                            if (eventTimeout !== undefined && eventTimeout <= 0) {
-                                throwInputTimeoutError(args.timeout!)
-                            }
-                            progress.actionStatus = 'failed'
-                            const result = await executeInputEvent(
-                                {
-                                    unifiedSession,
-                                    session,
-                                    mode,
-                                    humanize,
-                                    timeout: eventTimeout,
-                                    frame: args.frame,
-                                    privacy,
-                                },
-                                event as InputEvent
-                            )
-                            ++eventsExecuted
-                            if (typeof result === 'string') {
-                                warnings.push(result)
-                            } else if (result) {
-                                eventResults.push(result)
-                            }
-                        }
-                    } catch (error) {
-                        const response = formatErrorResponse(error)
-                        const text = response.content[0]?.text
-                        if ((error instanceof ChallengeTimeoutError || error instanceof ChallengeDeniedError) && text) {
-                            try {
-                                const payload = JSON.parse(text) as Record<string, unknown>
-                                Object.assign(payload, {
+                                try {
+                                    for (const event of args.events) {
+                                        const eventTimeout =
+                                            args.timeout === undefined
+                                                ? undefined
+                                                : Math.max(0, args.timeout - (Date.now() - inputStartedAt))
+                                        if (eventTimeout !== undefined && eventTimeout <= 0) {
+                                            throwInputTimeoutError(args.timeout!)
+                                        }
+                                        progress.actionStatus = 'failed'
+                                        const result = await executeInputEvent(
+                                            {
+                                                unifiedSession,
+                                                session,
+                                                mode,
+                                                humanize,
+                                                timeout: eventTimeout,
+                                                frame: args.frame,
+                                                privacy,
+                                            },
+                                            event as InputEvent
+                                        )
+                                        ++eventsExecuted
+                                        if (typeof result === 'string') {
+                                            warnings.push(result)
+                                        } else if (result) {
+                                            eventResults.push(result)
+                                        }
+                                    }
+                                    if (args.timeout !== undefined && Date.now() - inputStartedAt >= args.timeout) {
+                                        throw new TimeoutError('input timeout after event dispatch')
+                                    }
+                                } catch (error) {
+                                    const response = formatErrorResponse(error)
+                                    const text = response.content[0]?.text
+                                    if (
+                                        (error instanceof ChallengeTimeoutError ||
+                                            error instanceof ChallengeDeniedError) &&
+                                        text
+                                    ) {
+                                        try {
+                                            const payload = JSON.parse(text) as Record<string, unknown>
+                                            Object.assign(payload, {
+                                                eventsExecuted,
+                                                remainingEventsNotExecuted: args.events.length - eventsExecuted,
+                                                verificationRequested: Boolean(args.postCondition),
+                                            })
+                                            appendDiagnostics(
+                                                payload,
+                                                await finishDiagnostics(unifiedSession, diagnostics, deadline)
+                                            )
+                                            response.content[0].text = JSON.stringify(payload, null, 2)
+                                        } catch {
+                                            // 保留原始 Challenge 错误响应
+                                        }
+                                        return response
+                                    }
+                                    if (text) {
+                                        try {
+                                            const payload = JSON.parse(text) as Record<string, unknown>
+                                            const message = error instanceof Error ? error.message : String(error)
+                                            const timedOut = /timeout|超时/i.test(message)
+                                            const preActionTimeout =
+                                                /timeout before event dispatch|超过 input 剩余 timeout/i.test(message)
+                                            actionMayHaveExecuted = timedOut && !preActionTimeout
+                                            const preconditionFailed =
+                                                error !== null &&
+                                                typeof error === 'object' &&
+                                                'code' in error &&
+                                                error.code === 'ACTION_PRECONDITION_FAILED'
+                                            actionMayHaveExecuted = actionMayHaveExecuted && !preconditionFailed
+                                            progress.actionStatus =
+                                                preconditionFailed && eventsExecuted === 0
+                                                    ? 'not_started'
+                                                    : actionMayHaveExecuted
+                                                      ? 'unknown'
+                                                      : 'failed'
+                                            payload.eventsExecuted = eventsExecuted
+                                            payload.actionExecuted = eventsExecuted > 0 || actionMayHaveExecuted
+                                            payload.actionStatus = progress.actionStatus
+                                            payload.verificationRequested = Boolean(args.postCondition)
+                                            payload.verificationStatus = 'unavailable'
+                                            payload.failureStage = 'action'
+                                            payload.retryable =
+                                                eventsExecuted === 0 &&
+                                                !actionMayHaveExecuted &&
+                                                /timeout|超时|disconnect|未连接|context|debugger/i.test(message)
+                                            appendDiagnostics(
+                                                payload,
+                                                await finishDiagnostics(unifiedSession, diagnostics, deadline)
+                                            )
+                                            response.content[0].text = JSON.stringify(payload, null, 2)
+                                        } catch {
+                                            // 保留原始错误响应
+                                        }
+                                    }
+                                    return response
+                                }
+
+                                progress.actionStatus = 'completed'
+                                failureStage = 'context'
+                                const result: Record<string, unknown> = {
+                                    success: true,
                                     eventsExecuted,
-                                    remainingEventsNotExecuted: args.events.length - eventsExecuted,
+                                    mode,
+                                    actionExecuted: true,
+                                    actionStatus: 'completed',
                                     verificationRequested: Boolean(args.postCondition),
-                                })
-                                appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
-                                response.content[0].text = JSON.stringify(payload, null, 2)
-                            } catch {
-                                // 保留原始 Challenge 错误响应
-                            }
-                            return response
-                        }
-                        if (text) {
-                            try {
-                                const payload = JSON.parse(text) as Record<string, unknown>
-                                const message = error instanceof Error ? error.message : String(error)
-                                const timedOut = /timeout|超时/i.test(message)
-                                const preActionTimeout = /timeout before event dispatch|超过 input 剩余 timeout/i.test(
-                                    message
+                                    verificationStatus: 'unavailable',
+                                    retryable: false,
+                                }
+                                if (warnings.length > 0) {
+                                    result.warnings = warnings
+                                }
+                                if (eventResults.length > 0) {
+                                    result.eventResults = eventResults
+                                }
+                                if (args.postCondition) {
+                                    failureStage = 'verification'
+                                    const postCondition = await waitForPostCondition(
+                                        unifiedSession,
+                                        args.postCondition,
+                                        'input'
+                                    )
+                                    failureStage = 'context'
+                                    result.postCondition = postCondition
+                                    result.verificationStatus = postCondition.verificationStatus
+                                    result.retryable = postCondition.retryable
+                                    if (postCondition.verificationStatus !== 'matched') {
+                                        result.success = false
+                                        result.failureStage = 'verification'
+                                    }
+                                }
+                                appendDiagnostics(
+                                    result,
+                                    await finishDiagnostics(unifiedSession, diagnostics, deadline)
                                 )
-                                actionMayHaveExecuted = timedOut && !preActionTimeout
-                                const preconditionFailed =
-                                    error !== null &&
-                                    typeof error === 'object' &&
-                                    'code' in error &&
-                                    error.code === 'ACTION_PRECONDITION_FAILED'
-                                actionMayHaveExecuted = actionMayHaveExecuted && !preconditionFailed
-                                progress.actionStatus =
-                                    preconditionFailed && eventsExecuted === 0
-                                        ? 'not_started'
-                                        : actionMayHaveExecuted
-                                          ? 'unknown'
-                                          : 'failed'
-                                payload.eventsExecuted = eventsExecuted
-                                payload.actionExecuted = eventsExecuted > 0 || actionMayHaveExecuted
-                                payload.actionStatus = progress.actionStatus
-                                payload.verificationRequested = Boolean(args.postCondition)
-                                payload.verificationStatus = 'unavailable'
-                                payload.failureStage = 'action'
-                                payload.retryable =
-                                    eventsExecuted === 0 &&
-                                    !actionMayHaveExecuted &&
-                                    /timeout|超时|disconnect|未连接|context|debugger/i.test(message)
-                                appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
-                                response.content[0].text = JSON.stringify(payload, null, 2)
-                            } catch {
-                                // 保留原始错误响应
-                            }
-                        }
-                        return response
-                    }
-
-                    progress.actionStatus = 'completed'
-                    failureStage = 'context'
-                    const result: Record<string, unknown> = {
-                        success: true,
-                        eventsExecuted,
-                        mode,
-                        actionExecuted: true,
-                        actionStatus: 'completed',
-                        verificationRequested: Boolean(args.postCondition),
-                        verificationStatus: 'unavailable',
-                        retryable: false,
-                    }
-                    if (warnings.length > 0) {
-                        result.warnings = warnings
-                    }
-                    if (eventResults.length > 0) {
-                        result.eventResults = eventResults
-                    }
-                    if (args.postCondition) {
-                        failureStage = 'verification'
-                        const postCondition = await waitForPostCondition(unifiedSession, args.postCondition, 'input')
-                        failureStage = 'context'
-                        result.postCondition = postCondition
-                        result.verificationStatus = postCondition.verificationStatus
-                        result.retryable = postCondition.retryable
-                        if (postCondition.verificationStatus !== 'matched') {
-                            result.success = false
-                            result.failureStage = 'verification'
-                        }
-                    }
-                    appendDiagnostics(result, await finishDiagnostics(unifiedSession, diagnostics))
-                    return formatResponse(result)
-                })
-            ) // withPageCondition, withFrame
-        }) // withTabId
+                                return formatResponse(result)
+                            },
+                            deadline
+                        ),
+                    deadline
+                ) // withPageCondition, withFrame
+            },
+            deadline
+        ) // withTabId
         return sanitizeInputResponse(response, args.events, privacy.sensitive)
     } catch (error) {
         const response = formatErrorResponse(error)
@@ -548,25 +585,35 @@ const unifiedOnlyEventTypes = new Set<InputEvent['type']>([
 ])
 
 async function executeInputEvent(context: InputExecutionContext, event: InputEvent): Promise<InputEventResult> {
-    if (context.mode === 'extension' || unifiedOnlyEventTypes.has(event.type)) {
-        return executeUnifiedEvent(
-            {
-                unifiedSession: context.unifiedSession,
-                session: context.session,
-                mode: context.mode,
-                humanize: context.humanize,
-                timeout: context.timeout,
-                frame: context.frame,
-                privacy: context.privacy,
-            },
-            event
-        )
+    const timeout = context.timeout ?? DEFAULT_TIMEOUT
+    const deadline = Date.now() + timeout
+    try {
+        if (context.mode === 'extension' || unifiedOnlyEventTypes.has(event.type)) {
+            return await executeUnifiedEvent(
+                {
+                    unifiedSession: context.unifiedSession,
+                    session: context.session,
+                    mode: context.mode,
+                    humanize: context.humanize,
+                    timeout: context.timeout,
+                    frame: context.frame,
+                    privacy: context.privacy,
+                },
+                event
+            )
+        }
+        if (!context.session) {
+            throw new Error('CDP 输入事件缺少 session')
+        }
+        await executeCdpEvent(context.session, event, context.humanize, context.timeout)
+        return undefined
+    } catch (error) {
+        if (context.mode === 'cdp' && error instanceof ElementNotFoundError) {
+            const target = error.context.target as Target
+            await enrichTargetError(error, context.unifiedSession, target, { timeout, deadline, frame: context.frame })
+        }
+        throw error
     }
-    if (!context.session) {
-        throw new Error('CDP 输入事件缺少 session')
-    }
-    await executeCdpEvent(context.session, event, context.humanize, context.timeout)
-    return undefined
 }
 
 /**
@@ -579,8 +626,7 @@ async function executeInputEvent(context: InputExecutionContext, event: InputEve
  * @returns 格式化标签名（如 "code"），若被替换文本在格式化节点内
  */
 /**
- * 如果 target 是选择器类型，先通过 actionableClick 聚焦
- * select/replace 事件用，保证选区建立前 activeElement 就是目标
+ * 命令与 editor 目标只定位并聚焦，不派发鼠标事件
  */
 async function focusTargetForCommands(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
@@ -589,25 +635,15 @@ async function focusTargetForCommands(
     frame?: string | number
 ): Promise<void> {
     const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
-    if ('x' in target || 'y' in target) {
-        await handleUnifiedClick(
-            {
-                unifiedSession,
-                mode: unifiedSession.getMode(),
-                humanize: false,
-                timeout: remainingInputTimeout(deadline),
-                frame,
-            },
-            { type: 'click', target }
-        )
-        return
-    }
     if (unifiedSession.getMode() === 'cdp') {
         await focusCdpTarget(getSession(), target, remainingInputTimeout(deadline))
         return
     }
     const params = targetToFindParams(target as Target & { nth?: number })
-    const els = await unifiedSession.find(params.selector, params.text, params.xpath, remainingInputTimeout(deadline))
+    const els =
+        'x' in target && 'y' in target
+            ? await unifiedSession.findAtPoint(target.x, target.y, undefined, remainingInputTimeout(deadline))
+            : await unifiedSession.find(params.selector, params.text, params.xpath, remainingInputTimeout(deadline))
     const nth0 = params.nth ?? 0
     if (els.length <= nth0) {
         throw new StructuredToolError(
@@ -621,7 +657,7 @@ async function focusTargetForCommands(
                 target,
                 els.length,
                 nth0,
-                timeout,
+                remainingInputTimeout(deadline),
                 '命令目标未找到',
                 frame
             )
@@ -629,12 +665,13 @@ async function focusTargetForCommands(
     }
     const focused = await unifiedSession.evaluate(
         `(() => {
+            if (Date.now() >= ${deadline}) throw new Error('input timeout before command focus')
             const ref = window.__mcpElementMap?.[${JSON.stringify(els[nth0].refId)}]
             const el = ref?.deref()
             if (!(el instanceof HTMLElement)) {
-                throw new Error('命令聚焦目标不存在')
+                return false
             }
-            el.focus()
+            el.focus({preventScroll: true})
             return document.activeElement === el
         })()`,
         undefined,
@@ -650,7 +687,7 @@ async function focusTargetForCommands(
                 target,
                 els.length,
                 nth0,
-                timeout,
+                remainingInputTimeout(deadline),
                 '命令目标聚焦失败',
                 frame
             )
@@ -663,17 +700,36 @@ export async function focusCdpTarget(
     target: Target,
     timeout?: number
 ): Promise<void> {
-    const locator = session.createLocator(target, timeout !== undefined ? { timeout } : undefined)
-    const focused = await locator.evaluateOn<boolean>(`function() {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const focus = `function() {
+        if (Date.now() >= ${deadline}) throw new Error('input timeout before command focus');
         if (!(this instanceof HTMLElement)) return false;
         this.focus({preventScroll: true});
         return document.activeElement === this;
-    }`)
+    }`
+    const focused =
+        'x' in target && 'y' in target
+            ? await session.evaluate<boolean | null>(
+                  `(() => {
+                      const el = document.elementFromPoint(${target.x}, ${target.y});
+                      return el ? (${focus}).call(el) : null;
+                  })()`,
+                  undefined,
+                  remainingInputTimeout(deadline)
+              )
+            : await session
+                  .createLocator(target, { timeout: targetLookupTimeout(remainingInputTimeout(deadline)) })
+                  .evaluateOn<boolean>(focus)
+    if (focused === null) {
+        throw new StructuredToolError('TARGET_NOT_FOUND', '目标坐标未命中元素', '请检查目标坐标是否在当前页面视口内', {
+            target,
+        })
+    }
     if (!focused) {
         throw new StructuredToolError(
             'TARGET_FOCUS_FAILED',
             '目标元素未成功聚焦',
-            '请检查目标是否可编辑、未 disabled，并确认 locator 指向 input、textarea 或 contenteditable 元素',
+            '请检查目标是否可聚焦、未 disabled，并确认 target 指向当前页面元素',
             { target }
         )
     }
@@ -1333,15 +1389,15 @@ async function handleUnifiedKeyDown(
         await focusTargetForCommands(unifiedSession, event.target, remainingInputTimeout(deadline), frame)
     }
     remainingInputTimeout(deadline)
-    await unifiedSession.keyDown(event.key!, event.commands)
+    await unifiedSession.keyDown(event.key!, event.commands, remainingInputTimeout(deadline))
     return undefined
 }
 
 async function handleUnifiedKeyUp(
-    { unifiedSession }: UnifiedInputContext,
+    { unifiedSession, timeout }: UnifiedInputContext,
     event: InputEvent
 ): Promise<InputEventResult> {
-    await unifiedSession.keyUp(event.key!)
+    await unifiedSession.keyUp(event.key!, timeout)
     return undefined
 }
 
@@ -1370,12 +1426,12 @@ async function handleUnifiedClick(
             const remaining = remainingInputTimeout(deadline)
             await randomDelay(Math.min(getMouseMoveDelay(), remaining), Math.min(getMouseMoveDelay() * 2, remaining))
         }
-    } else {
+    } else if (!point.refId || button !== 'left' || clickCount !== 1) {
         await unifiedSession.mouseMove(point.x, point.y, remainingInputTimeout(deadline))
     }
     remainingInputTimeout(deadline)
     if (point.refId) {
-        const result = await unifiedSession.actionableClick(point.refId, event.force === true, button, clickCount)
+        const result = await unifiedSession.actionableClick(point.refId, event.force === true, button, clickCount, point)
         if (!result.success) {
             throw new StructuredToolError(
                 'ACTIONABILITY_FAILED',
@@ -1968,8 +2024,9 @@ async function editorAction(
     timeout?: number,
     frame?: string | number
 ): Promise<unknown> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     if (event.target) {
-        await focusTargetForCommands(unifiedSession, event.target, timeout, frame)
+        await focusTargetForCommands(unifiedSession, event.target, remainingInputTimeout(deadline), frame)
     }
 
     return unifiedSession.evaluate(
@@ -2036,7 +2093,7 @@ async function editorAction(
             return {success: true, command: command};
         }`,
         undefined,
-        timeout,
+        remainingInputTimeout(deadline),
         [action, event.text ?? '', event.command ?? '']
     )
 }
@@ -2205,7 +2262,9 @@ const cdpInputHandlers: Partial<Record<InputEvent['type'], CdpInputHandler>> = {
 
 async function handleCdpClick({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
     if (event.force) {
-        const locator = session.createLocator(event.target!, { timeout })
+        const locator = session.createLocator(event.target!, {
+            timeout: targetLookupTimeout(timeout ?? DEFAULT_TIMEOUT),
+        })
         await locator.evaluateOn(`function() {
             if (!this.isConnected) throw new Error('目标元素已移除，未执行点击');
             const button = ${JSON.stringify(event.button ?? 'left')};
@@ -2404,7 +2463,7 @@ async function getTargetPoint(
     }
 
     // 使用 Locator 定位元素
-    const locator = session.createLocator(target, { timeout: remaining() })
+    const locator = session.createLocator(target, { timeout: targetLookupTimeout(remaining()) })
     const nodeId = await locator.find()
 
     // 根据操作类型执行自动等待

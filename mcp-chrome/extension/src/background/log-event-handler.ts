@@ -12,6 +12,7 @@ import {
 import { type ActionContext, assertManagedTab, assertScriptable, getTargetTabId, isRestrictedUrl } from './action-utils'
 import { DebuggerBlockedError, DebuggerManager } from './debugger-manager'
 import { LogManager } from './log-manager'
+import { getExistingTab } from './page-revision'
 
 function wildcardSegmentMatches(value: string, segment: string, index: number): boolean {
     if (index + segment.length > value.length) {
@@ -102,14 +103,7 @@ export class LogEventHandler {
         const tabId = await this.getManagedTabId(p.tabId, context, 'network_enable')
 
         try {
-            await this.debuggerManager.ensureAttached(tabId)
-            await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {})
-            const frameTree = (await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree', {})) as {
-                frameTree: { frame: { id: string } }
-            }
-            this.logManager.setMainFrameId(tabId, frameTree.frameTree.frame.id)
-            // 初始化主 frame 后再启用 Network，避免子 frame 响应覆盖 tab 级 Challenge 状态
-            await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
+            await this.enableNetworkObservation(tabId)
         } catch (err) {
             if (!(err instanceof DebuggerBlockedError)) {
                 throw err
@@ -122,6 +116,20 @@ export class LogEventHandler {
         }
 
         return { success: true }
+    }
+
+    async enableNetworkObservation(tabId: number): Promise<void> {
+        await this.debuggerManager.ensureAttached(tabId)
+        await chrome.debugger.sendCommand({ tabId }, 'Page.enable', {})
+        const frameTree = (await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree', {})) as {
+            frameTree: { frame: { id: string } }
+        }
+        this.logManager.setMainFrameId(tabId, frameTree.frameTree.frame.id)
+        await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
+        if (!this.debuggerManager.isAttached(tabId)) {
+            throw new ExpectedOperationError('Network 观测已中断，无法判断 networkidle')
+        }
+        this.logManager.markNetworkObserved(tabId)
     }
 
     async networkGet(params: unknown, context: ActionContext): Promise<{ requests: NetworkRequest[] }> {
@@ -150,7 +158,7 @@ export class LogEventHandler {
             }
             requests = [...requests.filter((item) => item.source !== 'performance'), ...latest].slice(-1000)
             this.logManager.setNetwork(tabId, requests)
-        } else if (p.clear && !isRestrictedUrl((await chrome.tabs.get(tabId)).url)) {
+        } else if (p.clear && !isRestrictedUrl((await getExistingTab(tabId)).url)) {
             await this.readPerformanceNetwork(tabId, true)
         }
 
@@ -169,7 +177,7 @@ export class LogEventHandler {
     async networkClear(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = NetworkClearSchema.parse(params) ?? {}
         const tabId = await this.getManagedTabId(p.tabId, context, 'network_clear')
-        if (!isRestrictedUrl((await chrome.tabs.get(tabId)).url)) {
+        if (!isRestrictedUrl((await getExistingTab(tabId)).url)) {
             await this.readPerformanceNetwork(tabId, true)
         }
         this.logManager.setNetwork(tabId, [])
@@ -185,7 +193,7 @@ export class LogEventHandler {
     /** 卸载 fallback console hook，把残留日志合并到 logManager，并报告清理结果 */
     async flushAndUninstallConsoleHook(tabId: number): Promise<boolean> {
         try {
-            const tab = await chrome.tabs.get(tabId)
+            const tab = await getExistingTab(tabId)
             if (isRestrictedUrl(tab.url)) {
                 return true
             }
@@ -345,7 +353,7 @@ export class LogEventHandler {
         let messages = this.logManager.getConsole(tabId)
 
         try {
-            const tab = await chrome.tabs.get(tabId)
+            const tab = await getExistingTab(tabId)
             if (!isRestrictedUrl(tab.url)) {
                 const results = await chrome.scripting.executeScript({
                     target: { tabId, frameIds: [0] },
@@ -448,7 +456,7 @@ export class LogEventHandler {
 
     private async clearFallbackConsole(tabId: number): Promise<void> {
         try {
-            const tab = await chrome.tabs.get(tabId)
+            const tab = await getExistingTab(tabId)
             if (isRestrictedUrl(tab.url)) {
                 return
             }
