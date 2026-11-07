@@ -935,7 +935,11 @@ fn replace_structured_value_with_preview(
         "preview": preview,
         "truncated": true,
         "budget_preview": true,
-        "original_bytes": if structured_preview { original.get("original_bytes").and_then(serde_json::Value::as_u64).unwrap_or(serialized.len() as u64) } else { serialized.len() as u64 },
+        "original_bytes": if structured_preview {
+            original.get("original_bytes").and_then(serde_json::Value::as_u64).unwrap_or(serialized.len() as u64)
+        } else {
+            serialized.len() as u64
+        },
         "get": get,
     }));
     Ok(true)
@@ -1231,8 +1235,16 @@ pub(crate) fn ensure_session_filters_unambiguous(
                     "session 过滤条件不唯一: {filter}；请原样传入 available.sources 中的 source 精确选择物理来源"
                 ),
                 available: Some(serde_json::json!({
-                    "candidates": matches.iter().map(|(project, session, _)| format!("{project}:{session}")).collect::<Vec<_>>(),
-                    "sources": matches.iter().map(|(project, session, source)| serde_json::json!({"project": project, "session": session, "source": source})).collect::<Vec<_>>()
+                    "candidates": matches.iter().map(|(project,
+                    session,
+                    _)| format!("{project}:{session}")).collect::<Vec<_>>(),
+                    "sources": matches.iter().map(|(project,
+                    session,
+                    source)| serde_json::json!({
+                        "project": project,
+                        "session": session,
+                        "source": source
+                    })).collect::<Vec<_>>()
                 })),
             });
         }
@@ -1603,7 +1615,10 @@ fn write_search_manifest(ctx: SearchManifestContext<'_>) -> Result<SearchOutputI
         "record_set_complete": ctx.complete,
         "content_complete": ctx.content_truncated_count == 0,
         "output_content": ctx.output_content,
-        "unexported_range": {"start":ctx.selected_start + ctx.written_count,"end":ctx.selected_start + ctx.selected_count},
+        "unexported_range": {
+            "start": ctx.selected_start + ctx.written_count,
+            "end": ctx.selected_start + ctx.selected_count
+        },
         "redacted_count": ctx.redacted_count,
         "bytes": ctx.bytes,
         "lines": ctx.written_count,
@@ -1988,8 +2003,21 @@ fn write_full_result(
                     Ok(())
                 })?;
                 redactions += count;
-                let value = serde_json::json!({"preview":preview,"truncated":rendered > maximum,"original_bytes":original_bytes,
-                    "get":{"ref":format!("{}:{}", result.session,result.line),"project":result.project,"source":result.source,"view":view,"block":block,"redaction":params.redaction.as_str()}});
+                let value = serde_json::json!({
+                    "preview": preview,
+                    "truncated": rendered > maximum,
+                    "original_bytes": original_bytes,
+                    "get": {
+                        "ref": format!("{}:{}",
+                        result.session,
+                        result.line),
+                        "project": result.project,
+                        "source": result.source,
+                        "view": view,
+                        "block": block,
+                        "redaction": params.redaction.as_str()
+                    }
+                });
                 crate::record_reader::serialize_json(&mut writer, &value, false)?;
             } else {
                 let projection = indexed.structured_projection(open()?, span, view, Some(block), params.redaction)?;
@@ -2189,7 +2217,7 @@ pub(crate) struct RecordBuildContext<'a> {
     pub pattern: Option<&'a SearchPattern>,
 }
 
-pub(crate) fn tool_block_matches(block: &AssociatedToolBlock, params: &SearchParams) -> bool {
+pub(crate) fn tool_block_matches(block: &AssociatedToolBlock<'_>, params: &SearchParams) -> bool {
     let server_matches = params.servers.is_empty()
         || block
             .info
@@ -2216,10 +2244,10 @@ fn push_attribution_filter_reason(params: &SearchParams, reasons: &mut Vec<Strin
     }
 }
 
-pub(crate) fn select_tool_block<'a>(
-    blocks: &'a [AssociatedToolBlock],
+pub(crate) fn select_tool_block<'a, 'record>(
+    blocks: &'a [AssociatedToolBlock<'record>],
     params: &SearchParams,
-) -> Option<&'a AssociatedToolBlock> {
+) -> Option<&'a AssociatedToolBlock<'record>> {
     if has_tool_filter(params) {
         blocks.iter().find(|block| tool_block_matches(block, params))
     } else {
@@ -2268,24 +2296,24 @@ pub(crate) fn matched_filters(
 pub(crate) fn build_search_result(
     ctx: &RecordBuildContext<'_>,
     line_num: usize,
-    record: MessageRecord,
-    tool_blocks: &[AssociatedToolBlock],
+    record: &MessageRecord,
+    tool_blocks: &[AssociatedToolBlock<'_>],
+    time_match: TimeRangeMatch,
     attribution_issues: &mut Vec<String>,
 ) -> Result<Option<SearchResult>, ErrorResponse> {
     crate::record_reader::check_work()?;
-    let (effective_type, subtype) = classify_message(&record);
+    let (effective_type, subtype) = classify_message(record);
     if !ctx.params.types.iter().any(|t| t == effective_type) {
         return Ok(None);
     }
     if !ctx.params.subtypes.is_empty() && !ctx.params.subtypes.iter().any(|s| s == subtype) {
         return Ok(None);
     }
-    if time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref()) != TimeRangeMatch::Matches
-    {
+    if time_match != TimeRangeMatch::Matches {
         return Ok(None);
     }
 
-    let (raw_content, images) = extract_and_replace_images(&record);
+    let (raw_content, images) = extract_and_replace_images(record);
     crate::record_reader::check_work()?;
     let (matches, match_pos) = if ctx.params.pattern.is_empty() {
         (true, None)
@@ -2327,27 +2355,42 @@ pub(crate) fn build_search_result(
         tool: None,
     });
     let metadata_incomplete_reason = selected_tool_block.and_then(|block| block.metadata_incomplete_reason.clone());
-    let rendered_tool_block = selected_tool_block.filter(|_| !ctx.params.aggregate || ctx.params.output.is_some()).map(|block| {
-        let mut rendered = render_tool_block(block, ctx.params.redaction);
-        crate::record_reader::check_work()?;
-        if ctx.params.structured.as_deref() == Some("preview") || ctx.params.output_content == "full" {
-            for (value, view, limit) in [
-                (&mut rendered.input, "tool_input", ctx.params.max_content),
-                (&mut rendered.result, "tool_result", ctx.params.max_content_tool_result),
-            ] {
-                if let Some(full) = value.take() {
-                    let mut serialized = Vec::new();
-                    crate::record_reader::serialize_json(&mut serialized, &full, false)?;
-                    let (preview, truncated) = truncate_content(std::str::from_utf8(&serialized).expect("JSON is UTF-8"), limit);
-                    *value = Some(serde_json::json!({
-                        "preview": preview, "truncated": truncated, "original_bytes": serialized.len(),
-                        "get": {"ref": format!("{}:{}", ctx.session_id, line_num), "project": ctx.project_id, "source": ctx.source, "view": view, "block": block.block_index, "redaction": ctx.params.redaction.as_str()}
-                    }));
+    let rendered_tool_block = selected_tool_block
+        .filter(|_| !ctx.params.aggregate || ctx.params.output.is_some())
+        .map(|block| {
+            let mut rendered = render_tool_block(block, ctx.params.redaction);
+            crate::record_reader::check_work()?;
+            if ctx.params.structured.as_deref() == Some("preview") || ctx.params.output_content == "full" {
+                for (value, view, limit) in [
+                    (&mut rendered.input, "tool_input", ctx.params.max_content),
+                    (&mut rendered.result, "tool_result", ctx.params.max_content_tool_result),
+                ] {
+                    if let Some(full) = value.take() {
+                        let mut serialized = Vec::new();
+                        crate::record_reader::serialize_json(&mut serialized, &full, false)?;
+                        let (preview, truncated) =
+                            truncate_content(std::str::from_utf8(&serialized).expect("JSON is UTF-8"), limit);
+                        *value = Some(serde_json::json!({
+                            "preview": preview,
+                            "truncated": truncated,
+                            "original_bytes": serialized.len(),
+                            "get": {
+                                "ref": format!("{}:{}",
+                                ctx.session_id,
+                                line_num),
+                                "project": ctx.project_id,
+                                "source": ctx.source,
+                                "view": view,
+                                "block": block.block_index,
+                                "redaction": ctx.params.redaction.as_str()
+                            }
+                        }));
+                    }
                 }
             }
-        }
-        Ok::<_, ErrorResponse>(rendered)
-    }).transpose()?;
+            Ok::<_, ErrorResponse>(rendered)
+        })
+        .transpose()?;
     let text_redaction = redact_text_with_mode(&raw_content, ctx.params.redaction);
     crate::record_reader::check_work()?;
     let content_redacted = text_redaction.count > 0;
@@ -2370,10 +2413,10 @@ pub(crate) fn build_search_result(
         r#ref: format!("{}:{}", ctx.prefix, line_num),
         session: ctx.session_id.to_string(),
         line: line_num,
-        uuid: record.uuid,
+        uuid: record.uuid.clone(),
         r#type: effective_type.to_string(),
         subtype: subtype.to_string(),
-        timestamp: record.timestamp,
+        timestamp: record.timestamp.clone(),
         content,
         content_size,
         truncated: false,
@@ -2526,8 +2569,25 @@ pub(crate) fn build_indexed_search_result(
                 .ok_or_else(|| reader_error("record_index_limit", "结构化文本长度溢出"))?;
             if full {
                 if chunk.len() > params.max_total.saturating_sub(preview.len()) {
-                    return Err(ErrorResponse { error:"structured_response_too_large".to_string(), message:"完整结构超过响应预算；使用 history_get view/range/output 读取，或释放扫描后以 structured=preview 重新查询".to_string(),
-                        available:Some(json!({"get":{"ref":format!("{}:{line}", ctx.session_id), "project":ctx.project_id, "source":ctx.source.to_string_lossy(), "view":view, "block":block.block_index, "redaction":params.redaction.as_str()}})) });
+                    return Err(ErrorResponse {
+                        error: "structured_response_too_large".to_string(),
+                        message: concat!(
+                            "完整结构超过响应预算；使用 history_get view/range/output 读取，",
+                            "或释放扫描后以 structured=preview 重新查询"
+                        )
+                        .to_string(),
+                        available: Some(json!({
+                            "get": {
+                                "ref": format!("{}:{line}",
+                                ctx.session_id),
+                                "project": ctx.project_id,
+                                "source": ctx.source.to_string_lossy(),
+                                "view": view,
+                                "block": block.block_index,
+                                "redaction": params.redaction.as_str()
+                            }
+                        })),
+                    });
                 }
                 preview.push_str(
                     std::str::from_utf8(chunk).map_err(|_| reader_error("parse_error", "结构化视图 UTF-8 无效"))?,
@@ -2549,8 +2609,20 @@ pub(crate) fn build_indexed_search_result(
             serde_json::from_str(&preview)
                 .map_err(|error| reader_error("parse_error", format!("脱敏结构化视图不是合法 JSON: {error}")))?
         } else {
-            json!({"preview":preview, "truncated":rendered_size > maximum, "original_bytes":original_bytes,
-                "get":{"ref":format!("{}:{line}", ctx.session_id), "project":ctx.project_id, "source":ctx.source.to_string_lossy(), "view":view, "block":block.block_index, "redaction":params.redaction.as_str()}})
+            json!({
+                "preview": preview,
+                "truncated": rendered_size > maximum,
+                "original_bytes": original_bytes,
+                "get": {
+                    "ref": format!("{}:{line}",
+                    ctx.session_id),
+                    "project": ctx.project_id,
+                    "source": ctx.source.to_string_lossy(),
+                    "view": view,
+                    "block": block.block_index,
+                    "redaction": params.redaction.as_str()
+                }
+            })
         };
         if block.kind == ToolBlockKind::Use {
             input = Some(value);
@@ -2650,7 +2722,7 @@ fn visit_search_file(
     let mut tracker = ToolAssociationTracker::default();
     loop {
         let mut remaining = u64::MAX;
-        let located = match lines.step(&mut remaining, Instant::now() + std::time::Duration::from_secs(120)) {
+        let mut located = match lines.step(&mut remaining, Instant::now() + std::time::Duration::from_secs(120)) {
             Ok(LineStep::Record(located)) => located,
             Ok(LineStep::Yield) => continue,
             Ok(LineStep::End) => break,
@@ -2677,13 +2749,19 @@ fn visit_search_file(
                 if !in_range {
                     return Ok(None);
                 }
-                if time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref())
-                    == TimeRangeMatch::UnparseableTimestamp
-                {
+                let time_match = time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref());
+                if time_match == TimeRangeMatch::UnparseableTimestamp {
                     stats.invalid_timestamps += 1;
                     return Ok(None);
                 }
-                build_search_result(ctx, located.line, record, &blocks, &mut stats.attribution_issues)
+                build_search_result(
+                    ctx,
+                    located.line,
+                    &record,
+                    &blocks,
+                    time_match,
+                    &mut stats.attribution_issues,
+                )
             } else {
                 build_indexed_search_result(
                     ctx,
@@ -2696,6 +2774,7 @@ fn visit_search_file(
                 )
             }
         })();
+        lines.recycle(&mut located);
         if tracker.pending_len() > MAX_TOOL_BLOCKS {
             push_unique(&mut stats.metadata_issues, "tool_pending_cap");
             break;
@@ -2818,15 +2897,66 @@ mod tests {
         let source = root.join("project/session-large.jsonl");
         let mut file = File::create(&source).unwrap();
         let padding = "x".repeat(MAX_JSONL_LINE_BYTES + 128);
-        writeln!(file,"{}",serde_json::json!({"uuid":"call","type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"call-1","name":"mcp__fixture__large","input":{"note":padding}}]}})).unwrap();
-        writeln!(file,"{}",serde_json::json!({"uuid":"result","type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":format!("{padding} 末尾 NEEDLE password=fixture-secret")} ]}})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "call",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "mcp__fixture__large",
+                            "input": {
+                                "note": padding
+                            }
+                        }
+                    ]
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "result",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": format!("{padding} 末尾 NEEDLE password=fixture-secret")
+                        }
+                    ]
+                }
+            })
+        )
+        .unwrap();
         writeln!(
             file,
             "{}",
             serde_json::json!({"type":"api-request-blob","message":{"cache":padding}})
         )
         .unwrap();
-        writeln!(file,"{}",serde_json::json!({"uuid":"small","type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":"NEEDLE small"}})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "small",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:02Z",
+                "message": {
+                    "content": "NEEDLE small"
+                }
+            })
+        )
+        .unwrap();
         file.write_all(b"{\xff}\n{bad json}\n").unwrap();
         drop(file);
         let config = Config {
@@ -2892,7 +3022,15 @@ mod tests {
         );
         assert!(!response.stats.total_matches_exact);
         let spaced = root.join("project/session-spaced.jsonl");
-        fs::write(&spaced,format!("{{{}\"uuid\":\"spaced\",\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{{\"content\":\"small\"}}}}\n"," ".repeat(MAX_JSONL_LINE_BYTES))).unwrap();
+        fs::write(
+            &spaced,
+            format!(
+                "{{{}\"uuid\":\"spaced\",\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\
+            \"message\":{{\"content\":\"small\"}}}}\n",
+                " ".repeat(MAX_JSONL_LINE_BYTES)
+            ),
+        )
+        .unwrap();
         let response = search(
             &config,
             SearchParams {
@@ -2945,7 +3083,49 @@ mod tests {
         fs::create_dir_all(root.join("project")).unwrap();
         let source = root.join("project/full-output-session.jsonl");
         let body = format!("{} TAIL-4515", "中".repeat(4515));
-        fs::write(&source,format!("{}\n{}\n",serde_json::json!({"uuid":"body","type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":body}}),serde_json::json!({"uuid":"tool","type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"thinking","thinking":"fixture thought"},{"type":"text","text":"Tool explanation"},{"type":"tool_use","id":"tool","name":"Bash","input":{"nested":{"password":"fixture-secret","note":body}}}]}}))).unwrap();
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "uuid": "body",
+                    "type": "user",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {
+                        "content": body
+                    }
+                }),
+                serde_json::json!({
+                    "uuid": "tool",
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "fixture thought"
+                            },
+                            {
+                                "type": "text",
+                                "text": "Tool explanation"
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "tool",
+                                "name": "Bash",
+                                "input": {
+                                    "nested": {
+                                        "password": "fixture-secret",
+                                        "note": body
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                })
+            ),
+        )
+        .unwrap();
         let source = source.canonicalize().unwrap();
         let config = Config {
             projects_dir: root.clone(),
@@ -3066,8 +3246,23 @@ mod tests {
         ];
         for (idx, name) in names.iter().enumerate() {
             for record in [
-                serde_json::json!({"uuid": format!("call-{idx}"), "type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
-                    "message": {"content": [{"type": "tool_use", "id": format!("tool-{idx}"), "name": name, "input": {"command": "fixture"}}]}}),
+                serde_json::json!({
+                    "uuid": format!("call-{idx}"),
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": format!("tool-{idx}"),
+                                "name": name,
+                                "input": {
+                                    "command": "fixture"
+                                }
+                            }
+                        ]
+                    }
+                }),
                 serde_json::json!({"uuid": format!("result-{idx}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
                     "message": {"content": [{"type": "tool_result", "tool_use_id": format!("tool-{idx}"),
                         "is_error": idx % 2 == 0, "content": "fixture"}]}}),
@@ -3130,6 +3325,136 @@ mod tests {
     }
 
     #[test]
+    fn normal_time_filter_preserves_association_and_excluded_type_diagnostics() {
+        let root = env::temp_dir().join(format!(
+            "history-time-reuse-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("project")).unwrap();
+        let records = [
+            json!({"uuid":"call","type":"assistant","timestamp":"2026-09-01T00:00:00Z",
+                "message":{"content":[{"type":"tool_use","id":"call-1","name":"mcp__fixture__echo","input":{}}]}}),
+            json!({"uuid":"result","type":"user","timestamp":"2026-10-01T00:00:01Z",
+                "message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"needle"}]}}),
+            json!({"uuid":"invalid-assistant","type":"assistant","timestamp":"invalid",
+                "message":{"content":"ignored"}}),
+            json!({"uuid":"invalid-user","type":"user","timestamp":"invalid",
+                "message":{"content":"needle"}}),
+            json!({"uuid":"outside","type":"user","timestamp":"2026-09-01T00:00:00Z",
+                "message":{"content":"needle"}}),
+            json!({"uuid":"timezone","type":"user","timestamp":"2026-10-01T08:00:01+08:00",
+                "message":{"content":"needle"}}),
+            json!({"uuid":"invalid-summary","type":"user","timestamp":"invalid","isCompactSummary":true,
+                "message":{"content":"ignored"}}),
+        ];
+        let data = records.iter().map(|record| format!("{record}\n")).collect::<String>();
+        fs::write(root.join("project/session-time-reuse.jsonl"), data).unwrap();
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        let (since, until) = parse_time_bounds(Some("2026-10-01T00:00:00Z"), Some("2026-10-01T00:00:02Z")).unwrap();
+        for aggregate in [false, true] {
+            let response = search(
+                &config,
+                SearchParams {
+                    projects: vec!["project".into()],
+                    types: vec!["user".into()],
+                    pattern: "needle".into(),
+                    tools: vec!["mcp__fixture__echo".into()],
+                    lines: parse_optional_line_ranges_param(Some("2-7")).unwrap(),
+                    since,
+                    until,
+                    aggregate,
+                    ..SearchParams::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(response.stats.total_matches, 1);
+            assert_eq!(response.stats.lines_scanned, 7);
+            assert_eq!(response.stats.skipped_invalid_timestamps, 3);
+            assert!(response.stats.attribution_incomplete_reasons.is_empty());
+            if !aggregate {
+                assert_eq!(response.results[0].line, 2);
+                assert_eq!(response.results[0].tool.as_deref(), Some("echo"));
+                assert_eq!(
+                    response.results[0].tool_result_redacted.as_ref().unwrap()["tool_use_id"],
+                    "call-1"
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit synthetic normal search phase measurement"]
+    fn normal_search_phase_measurement() {
+        let params = SearchParams {
+            pattern: "operation-not-present".to_string(),
+            ..SearchParams::default()
+        };
+        let pattern = parse_search_pattern(&params.pattern, params.case_sensitive);
+        let ctx = RecordBuildContext {
+            project_id: "fixture",
+            session_id: "fixture",
+            source: Path::new("fixture.jsonl"),
+            prefix: "fixture",
+            params: &params,
+            regex: None,
+            pattern: Some(&pattern),
+        };
+        for kind in ["text", "tool_use", "cache"] {
+            let padding = "synthetic nonmatching text ".repeat(4096);
+            let record = match kind {
+                "text" => json!({"uuid":"text","type":"assistant","timestamp":"2026-10-01T00:00:00Z",
+                    "message":{"content":[{"type":"text","text":padding}]}}),
+                "tool_use" => json!({"uuid":"call","type":"assistant","timestamp":"2026-10-01T00:00:00Z",
+                    "message":{"content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":padding}}]}}),
+                _ => json!({"type":"api-request-blob","message":{"content":padding}}),
+            };
+            let raw = record.to_string();
+            let count = 2000;
+            let mut parse = std::time::Duration::ZERO;
+            let mut association = std::time::Duration::ZERO;
+            let mut matching = std::time::Duration::ZERO;
+            for _ in 0..count {
+                let start = Instant::now();
+                let record = parse_message_record(&raw).unwrap();
+                parse += start.elapsed();
+                let Some(record) = record else { continue };
+                let mut tracker = ToolAssociationTracker::default();
+                let start = Instant::now();
+                let blocks = tracker.observe_record(&record, false);
+                association += start.elapsed();
+                let start = Instant::now();
+                assert!(
+                    build_search_result(
+                        &ctx,
+                        1,
+                        &record,
+                        &blocks,
+                        time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref()),
+                        &mut Vec::new(),
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                matching += start.elapsed();
+            }
+            println!(
+                "{}",
+                json!({"kind":kind,"records":count,"source_bytes":raw.len()*count,
+                "parse_ms":parse.as_secs_f64()*1000.0,"association_ms":association.as_secs_f64()*1000.0,
+                "matching_ms":matching.as_secs_f64()*1000.0})
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "explicit synthetic phase measurement"]
     fn normal_summary_phase_measurement() {
         for count in [200, 1000, 5000] {
@@ -3149,9 +3474,39 @@ mod tests {
             let path = directory.join("summary0.jsonl");
             let mut output = std::io::BufWriter::new(File::create(&path).unwrap());
             for index in 0..count {
-                let record = serde_json::json!({"uuid":format!("summary-{index}"), "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":format!("call-{index}"), "name":format!("mcp__mcp-ssh__probe_{index}"), "input":{"note":"x".repeat(1500), "password":"synthetic-not-a-credential"}}]}});
+                let record = serde_json::json!({
+                    "uuid": format!("summary-{index}"),
+                    "type": "assistant",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": format!("call-{index}"),
+                                "name": format!("mcp__mcp-ssh__probe_{index}"),
+                                "input": {
+                                    "note": "x".repeat(1500),
+                                    "password": "synthetic-not-a-credential"
+                                }
+                            }
+                        ]
+                    }
+                });
                 writeln!(output, "{record}").unwrap();
-                let result = serde_json::json!({"uuid":format!("result-{index}"), "type":"user", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_result", "tool_use_id":format!("call-{index}"), "content":"completed"}]}});
+                let result = serde_json::json!({
+                    "uuid": format!("result-{index}"),
+                    "type": "user",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": format!("call-{index}"),
+                                "content": "completed"
+                            }
+                        ]
+                    }
+                });
                 writeln!(output, "{result}").unwrap();
             }
             output.flush().unwrap();
@@ -3206,7 +3561,18 @@ mod tests {
             let serialize_full_ms = serialize.elapsed().as_secs_f64() * 1000.0;
             println!(
                 "{}",
-                serde_json::json!({"phase":"before_budget", "records":count, "source_bytes":raw.len(), "full_response_bytes":full_bytes, "read_ms":read_ms, "parse_ms":parse_ms, "redaction_ms":redaction_ms, "collect_ms":collect_ms, "summary_ms":summary_ms, "serialize_full_ms":serialize_full_ms})
+                serde_json::json!({
+                    "phase": "before_budget",
+                    "records": count,
+                    "source_bytes": raw.len(),
+                    "full_response_bytes": full_bytes,
+                    "read_ms": read_ms,
+                    "parse_ms": parse_ms,
+                    "redaction_ms": redaction_ms,
+                    "collect_ms": collect_ms,
+                    "summary_ms": summary_ms,
+                    "serialize_full_ms": serialize_full_ms
+                })
             );
             let budget = Instant::now();
             let budgeted = apply_response_budget(response, params.max_total, build_next_query(&params, 0)).unwrap();
@@ -3223,7 +3589,21 @@ mod tests {
             assert!(!response.results.is_empty());
             println!(
                 "{}",
-                serde_json::json!({"records":count, "source_bytes":raw.len(), "full_response_bytes":full_bytes, "response_bytes":response.serialized_bytes, "returned":response.results.len(), "read_ms":read_ms, "parse_ms":parse_ms, "redaction_ms":redaction_ms, "collect_ms":collect_ms, "summary_ms":summary_ms, "serialize_full_ms":serialize_full_ms, "budget_ms":budget_ms, "query_ms":query_ms})
+                serde_json::json!({
+                    "records": count,
+                    "source_bytes": raw.len(),
+                    "full_response_bytes": full_bytes,
+                    "response_bytes": response.serialized_bytes,
+                    "returned": response.results.len(),
+                    "read_ms": read_ms,
+                    "parse_ms": parse_ms,
+                    "redaction_ms": redaction_ms,
+                    "collect_ms": collect_ms,
+                    "summary_ms": summary_ms,
+                    "serialize_full_ms": serialize_full_ms,
+                    "budget_ms": budget_ms,
+                    "query_ms": query_ms
+                })
             );
             assert_eq!(fs::read_to_string(root.join(".owner")).unwrap(), owner);
             fs::remove_dir_all(root).unwrap();
@@ -3689,7 +4069,15 @@ mod tests {
                     "uuid": format!("assistant-{index}"),
                     "type": "assistant",
                     "timestamp": "2026-01-01T00:00:00Z",
-                    "message": {"content": [{"type": "tool_use", "id": letter.to_string().repeat(MAX_TOOL_PENDING_BYTES / 2 + 1024), "name": "Bash"}]}
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": letter.to_string().repeat(MAX_TOOL_PENDING_BYTES / 2 + 1024),
+                                "name": "Bash"
+                            }
+                        ]
+                    }
                 })
             )
             .unwrap();
@@ -4293,8 +4681,39 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         let mut file = File::create(project.join("npm-session-main.jsonl")).unwrap();
         for record in [
-            serde_json::json!({"uuid":"npm-use","type":"assistant","timestamp":"2026-10-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"npm-call","name":"Bash","input":{"command":command,"note":"visible"}}]}}),
-            serde_json::json!({"uuid":"npm-result","type":"user","timestamp":"2026-10-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"npm-call","content":command,"is_error":false}]}}),
+            serde_json::json!({
+                "uuid": "npm-use",
+                "type": "assistant",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "npm-call",
+                            "name": "Bash",
+                            "input": {
+                                "command": command,
+                                "note": "visible"
+                            }
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "uuid": "npm-result",
+                "type": "user",
+                "timestamp": "2026-10-01T00:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "npm-call",
+                            "content": command,
+                            "is_error": false
+                        }
+                    ]
+                }
+            }),
         ] {
             writeln!(file, "{record}").unwrap();
         }

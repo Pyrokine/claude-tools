@@ -14,6 +14,7 @@ const MAX_KEY_BYTES: usize = 4096;
 #[derive(Clone)]
 pub struct WorkControl {
     checkpoint: Arc<dyn Fn(usize) -> Result<(), ErrorResponse> + Send + Sync>,
+    output_published: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for WorkControl {
@@ -24,6 +25,8 @@ impl Default for WorkControl {
 
 thread_local! {
     static CURRENT_WORK: RefCell<Option<WorkControl>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    pub(crate) static SERIALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl WorkControl {
@@ -46,10 +49,14 @@ impl WorkControl {
     pub fn from_checkpoint(checkpoint: impl Fn(usize) -> Result<(), ErrorResponse> + Send + Sync + 'static) -> Self {
         Self {
             checkpoint: Arc::new(checkpoint),
+            output_published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub fn account(&self, bytes: usize) -> Result<(), ErrorResponse> {
+        if self.output_published.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         (self.checkpoint)(bytes)
     }
 
@@ -63,6 +70,14 @@ impl WorkControl {
         let _restore = Restore(CURRENT_WORK.with(|work| work.replace(Some(self.clone()))));
         action()
     }
+}
+
+pub fn mark_output_published() {
+    CURRENT_WORK.with(|work| {
+        if let Some(work) = work.borrow().as_ref() {
+            work.output_published.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
 }
 
 pub fn check_work() -> Result<(), ErrorResponse> {
@@ -107,6 +122,8 @@ pub fn serialize_json<T: serde::Serialize, W: io::Write>(
             }
             let written = self.inner.write(&buffer[..buffer.len().min(BUFFER_BYTES)])?;
             self.bytes += written;
+            #[cfg(test)]
+            SERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + written));
             self.unchecked_bytes = self.unchecked_bytes.saturating_add(written);
             Ok(written)
         }
@@ -202,10 +219,7 @@ impl RecordLines {
             let allowed = available
                 .len()
                 .min((self.snapshot_end - self.offset).min(*remaining) as usize);
-            let length = available[..allowed]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(allowed, |position| position + 1);
+            let length = (&available[..allowed]).skip_until(b'\n').map_err(io_error)?;
             let end = available[length - 1] == b'\n';
             account_work(length)?;
             if !self.oversized && self.small.len().saturating_add(length) > MAX_JSONL_LINE_BYTES {
@@ -237,6 +251,16 @@ impl RecordLines {
             line: self.line,
             span,
             small,
+        }
+    }
+
+    pub fn recycle(&mut self, record: &mut LocatedRecord) {
+        if let Some(mut buffer) = record.small.take()
+            && buffer.capacity() <= MAX_JSONL_LINE_BYTES
+        {
+            debug_assert!(self.small.is_empty());
+            buffer.clear();
+            self.small = buffer;
         }
     }
 }
@@ -505,13 +529,37 @@ impl JsonIndex {
                         *remaining = remaining.saturating_sub(self.position - begin);
                         return Ok(false);
                     }
-                    let character = decode_character(&mut self.reader, &mut self.position)?;
-                    token.bytes = token
-                        .bytes
-                        .checked_add(character.len_utf8())
-                        .ok_or_else(|| reader_error("record_index_limit", "文本长度溢出"))?;
-                    token.chars += 1;
-                    token.json_bytes += json_character_length(character);
+                    let offset = (self.position - self.reader.base) as usize;
+                    let available = &self.reader.buffer[offset..];
+                    let allowed = available.len().min((*remaining - (self.position - begin)) as usize);
+                    let length = available[..allowed]
+                        .iter()
+                        .position(|byte| *byte < 0x20 || matches!(byte, b'"' | b'\\'))
+                        .unwrap_or(allowed);
+                    let text = match std::str::from_utf8(&available[..length]) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            std::str::from_utf8(&available[..error.valid_up_to()]).expect("validated UTF-8 prefix")
+                        }
+                    };
+                    let length = text.len();
+                    if length > 0 {
+                        self.position += length as u64;
+                        token.bytes = token
+                            .bytes
+                            .checked_add(length)
+                            .ok_or_else(|| reader_error("record_index_limit", "文本长度溢出"))?;
+                        token.chars += text.chars().count();
+                        token.json_bytes += length;
+                    } else {
+                        let character = decode_character(&mut self.reader, &mut self.position)?;
+                        token.bytes = token
+                            .bytes
+                            .checked_add(character.len_utf8())
+                            .ok_or_else(|| reader_error("record_index_limit", "文本长度溢出"))?;
+                        token.chars += 1;
+                        token.json_bytes += json_character_length(character);
+                    }
                 }
                 self.position += 1;
                 let span = SourceSpan {
@@ -725,6 +773,9 @@ impl JsonIndex {
                 root,
                 metadata: None,
             });
+        }
+        if matches!(msg_type.as_deref(), Some("user" | "assistant")) && child(&self.nodes, root, "message").is_none() {
+            return Err(reader_error("parse_error", "消息缺少 message"));
         }
         let metadata = MessageRecord {
             uuid: uuid.ok_or_else(|| reader_error("parse_error", "消息缺少 uuid"))?,
@@ -996,7 +1047,12 @@ fn project_structured_node(
                         canonical += encoded.len();
                         position += width;
                     }
-                    add_redaction(edits, edit_start, canonical, edit.replacement)?;
+                    let replacement = if edit.replacement == "\"[redacted]\"" {
+                        "\\\"[redacted]\\\""
+                    } else {
+                        edit.replacement
+                    };
+                    add_redaction(edits, edit_start, canonical, replacement)?;
                 }
             }
         }
@@ -1128,8 +1184,12 @@ impl IndexedRecord {
                                     Some("tool_use") => has_use = true,
                                     Some("tool_result") => has_result = true,
                                     Some("thinking") => has_thinking = true,
-                                    Some("text") => has_text |= child(&self.nodes, *item, "text").is_some_and(|index| matches!(self.nodes[index].kind, NodeKind::String { chars, .. } if chars > 0)),
-                                    _ => {},
+                                    Some("text") => {
+                                        has_text |= child(&self.nodes, *item, "text").is_some_and(|index| {
+                                            matches!(self.nodes[index].kind, NodeKind::String { chars: 1.., .. })
+                                        });
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1450,14 +1510,30 @@ impl TextCursor {
                             self.raw = span.start + 1;
                         }
                         if self.pending_position == self.pending.len() {
-                            let character = decode_character(&mut self.reader, &mut self.raw)?;
                             self.pending.clear();
-                            if *canonical {
-                                encode_json_character(character, &mut self.pending);
+                            self.reader.required(self.raw)?;
+                            let offset = (self.raw - self.reader.base) as usize;
+                            let available = &self.reader.buffer[offset..];
+                            let allowed = available
+                                .len()
+                                .min(span.end.saturating_sub(self.raw).saturating_sub(1) as usize)
+                                .min(*length - self.within);
+                            let count = available[..allowed]
+                                .iter()
+                                .position(|byte| !byte.is_ascii() || *byte < 0x20 || matches!(byte, b'"' | b'\\'))
+                                .unwrap_or(allowed);
+                            if count > 0 {
+                                self.pending.extend_from_slice(&available[..count]);
+                                self.raw += count as u64;
                             } else {
-                                let mut encoded = [0; 4];
-                                self.pending
-                                    .extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                                let character = decode_character(&mut self.reader, &mut self.raw)?;
+                                if *canonical {
+                                    encode_json_character(character, &mut self.pending);
+                                } else {
+                                    let mut encoded = [0; 4];
+                                    self.pending
+                                        .extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                                }
                             }
                             self.pending_position = 0;
                         }
@@ -1681,6 +1757,99 @@ fn add_redaction(
         });
     }
     Ok(())
+}
+
+pub(crate) fn preserve_json_redactions(
+    bytes: &mut impl ByteSource,
+    edits: &mut [RedactionSpan],
+) -> Result<(), ErrorResponse> {
+    if edits.is_empty() {
+        return Ok(());
+    }
+    let mut start = 0;
+    while bytes.get(start)?.is_some_and(|byte| byte.is_ascii_whitespace()) {
+        start += 1;
+    }
+    if !bytes.get(start)?.is_some_and(|byte| matches!(byte, b'{' | b'[')) {
+        return Ok(());
+    }
+    struct Reader<'a, T> {
+        source: &'a mut T,
+        position: usize,
+        error: Option<ErrorResponse>,
+    }
+    impl<T: ByteSource> Read for Reader<'_, T> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let mut count = 0;
+            while count < buffer.len() {
+                match self.source.get(self.position) {
+                    Ok(Some(byte)) => {
+                        buffer[count] = byte;
+                        count += 1;
+                        self.position += 1;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        self.error = Some(error);
+                        return Err(io::Error::other("JSON input read failed"));
+                    }
+                }
+            }
+            Ok(count)
+        }
+    }
+    let mut reader = Reader {
+        source: bytes,
+        position: 0,
+        error: None,
+    };
+    let valid = serde_json::from_reader::<_, serde::de::IgnoredAny>(&mut reader).is_ok();
+    if let Some(error) = reader.error {
+        return Err(error);
+    }
+    if !valid {
+        return Ok(());
+    }
+    edits.sort_by(|left, right| left.start.cmp(&right.start).then_with(|| right.end.cmp(&left.end)));
+    let mut position = 0;
+    let mut string_start = usize::MAX;
+    let mut string_end = 0;
+    for edit in edits {
+        while position <= edit.start && position < reader.source.len() {
+            if reader.source.at(position)? == b'"' {
+                string_start = position;
+                string_end = quoted_end(reader.source, position, b'"')?.expect("validated JSON string");
+                position = string_end;
+                if edit.start < string_end {
+                    break;
+                }
+            } else {
+                position += 1;
+            }
+        }
+        if edit.start > string_start && edit.start < string_end {
+            edit.end = edit.end.min(string_end - 1);
+        } else {
+            edit.replacement = "\"[redacted]\"";
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn redaction_replacement(
+    replacement: &'static str,
+    edit_start: usize,
+    edit_end: usize,
+    range_start: usize,
+    range_end: usize,
+) -> &'static str {
+    if (edit_start < range_start || edit_end > range_end)
+        && matches!(replacement, "\"[redacted]\"" | "\\\"[redacted]\\\"")
+    {
+        "[redacted]"
+    } else {
+        replacement
+    }
 }
 
 fn quoted_end(bytes: &mut impl ByteSource, start: usize, quote: u8) -> Result<Option<usize>, ErrorResponse> {
@@ -2142,6 +2311,24 @@ pub fn sensitive_field_spans(
         if cursor >= bytes.len() {
             break;
         }
+        let next = skip_whitespace(bytes, cursor, quoted_scopes.last().is_some_and(|scope| scope.2 > 0))?;
+        let separated = next > cursor;
+        cursor = next;
+        if cursor >= bytes.len() || quoted_scopes.last().is_some_and(|scope| cursor >= scope.0) {
+            continue;
+        }
+        let scope = quoted_scopes
+            .last()
+            .map_or((bytes.len(), 0), |scope| (scope.0, scope.2));
+        if (separated || cursor == 0 || !key_byte(bytes.at(cursor - 1)?))
+            && let Some((start, end)) = authorization_header_span(bytes, cursor, scope)?
+        {
+            if end > start {
+                add_redaction(&mut edits, start, end, "[redacted]")?;
+            }
+            cursor = end;
+            continue;
+        }
         let escaped = escaped_quote(bytes, cursor)?;
         let (key_start, key_end, content_start, content_end, quoted) = if let Some((end, start, content_end)) = escaped
         {
@@ -2155,7 +2342,7 @@ pub fn sensitive_field_spans(
                     };
                     (cursor, end, cursor + 1, end - 1, true)
                 }
-                byte if key_byte(byte) && (cursor == 0 || !key_byte(bytes.at(cursor - 1)?)) => {
+                byte if key_byte(byte) && (separated || cursor == 0 || !key_byte(bytes.at(cursor - 1)?)) => {
                     let mut end = cursor + 1;
                     while bytes.get(end)?.is_some_and(key_byte) {
                         end += 1;
@@ -2318,6 +2505,229 @@ fn unicode_whitespace_end(bytes: &mut impl ByteSource, mut position: usize) -> R
     Ok(position)
 }
 
+fn authorization_character_at(
+    bytes: &mut impl ByteSource,
+    position: usize,
+    scope: (usize, u32),
+) -> Result<Option<(char, usize)>, ErrorResponse> {
+    let mut next = position;
+    Ok(field_character(bytes, &mut next, scope.0, scope.1)?.map(|character| (character, next - position)))
+}
+
+pub(crate) fn authorization_header_span(
+    bytes: &mut impl ByteSource,
+    start: usize,
+    scope: (usize, u32),
+) -> Result<Option<(usize, usize)>, ErrorResponse> {
+    let first = bytes.at(start)?;
+    if !matches!(first, b'a' | b'A' | b'p' | b'P' | b'\\')
+        || (first == b'\\' && start > 0 && bytes.at(start - 1)? == b'\\')
+    {
+        return Ok(None);
+    }
+    let result = (|| {
+        let Some((first, _)) = authorization_character_at(bytes, start, scope)? else {
+            return Ok(None);
+        };
+        let name = match first {
+            'a' | 'A' => "authorization",
+            'p' | 'P' => "proxy-authorization",
+            _ => return Ok(None),
+        };
+        let mut position = start;
+        for expected in name.chars() {
+            let Some((character, width)) = authorization_character_at(bytes, position, scope)? else {
+                return Ok(None);
+            };
+            if !character.eq_ignore_ascii_case(&expected) {
+                return Ok(None);
+            }
+            position += width;
+        }
+        while let Some((character, width)) = authorization_character_at(bytes, position, scope)? {
+            if character.is_whitespace() {
+                position += width;
+            } else if matches!(character, ':' | '=') {
+                return authorization_value_span(bytes, position + width, scope).map(Some);
+            } else {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    })();
+    match result {
+        Err(error) if error.error == "field_decode_error" => Ok(None),
+        result => result,
+    }
+}
+
+fn authorization_whitespace_end(
+    bytes: &mut impl ByteSource,
+    mut position: usize,
+    scope: (usize, u32),
+) -> Result<usize, ErrorResponse> {
+    while let Some((character, width)) = authorization_character_at(bytes, position, scope)? {
+        if !character.is_whitespace() || matches!(character, '\n' | '\r') {
+            break;
+        }
+        position += width;
+    }
+    Ok(position)
+}
+
+pub(crate) fn authorization_value_span(
+    bytes: &mut impl ByteSource,
+    from: usize,
+    scope: (usize, u32),
+) -> Result<(usize, usize), ErrorResponse> {
+    let result: Result<_, ErrorResponse> = (|| {
+        let start = authorization_whitespace_end(bytes, from, scope)?;
+        if let Some((end, _, _)) = escaped_quote(
+            &mut LimitedBytes {
+                source: bytes,
+                end: scope.0,
+            },
+            start,
+        )? {
+            return Ok((start, end));
+        }
+        if let Some(end) = authorization_quoted_end(bytes, start, scope)? {
+            return Ok((start, end));
+        }
+        let mut end = start;
+        let mut scheme = true;
+        let mut name = String::with_capacity(17);
+        while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+            if character.is_whitespace() || matches!(character, ',' | ';') {
+                break;
+            }
+            if end == start {
+                scheme &= character.is_ascii_alphabetic();
+            }
+            scheme &= character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character);
+            if name.len() < 17 {
+                name.push(character.to_ascii_lowercase());
+            }
+            end += width;
+        }
+        if !scheme || end == start {
+            return Ok((start, end));
+        }
+        let credential_start = authorization_whitespace_end(bytes, end, scope)?;
+        if credential_start == end {
+            return Ok((start, end));
+        }
+        let token_scheme = matches!(name.as_str(), "basic" | "bearer");
+        let aws_v4 = name == "aws4-hmac-sha256";
+        if !token_scheme
+            && let Some(mut parameter_end) = authorization_parameter_end(bytes, credential_start, aws_v4, scope)?
+        {
+            loop {
+                let separator = authorization_whitespace_end(bytes, parameter_end, scope)?;
+                let Some((',', width)) = authorization_character_at(bytes, separator, scope)? else {
+                    break;
+                };
+                let next = authorization_whitespace_end(bytes, separator + width, scope)?;
+                let Some(next_end) = authorization_parameter_end(bytes, next, aws_v4, scope)? else {
+                    break;
+                };
+                parameter_end = next_end;
+            }
+            return Ok((start, parameter_end));
+        }
+        let mut credential_end = credential_start;
+        while let Some((character, width)) = authorization_character_at(bytes, credential_end, scope)? {
+            if character.is_whitespace() || matches!(character, ',' | ';') {
+                break;
+            }
+            credential_end += width;
+        }
+        Ok((
+            start,
+            if credential_end > credential_start {
+                credential_end
+            } else {
+                end
+            },
+        ))
+    })();
+    match result {
+        // 无效的嵌套 JSON 转义按整个字符串范围脱敏
+        Err(error) if error.error == "field_decode_error" => Ok((from, scope.0)),
+        result => result,
+    }
+}
+
+fn authorization_parameter_end(
+    bytes: &mut impl ByteSource,
+    start: usize,
+    aws_v4: bool,
+    scope: (usize, u32),
+) -> Result<Option<usize>, ErrorResponse> {
+    let mut end = start;
+    let mut name = String::with_capacity(14);
+    while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+        if !(character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character)) {
+            break;
+        }
+        if name.len() < 14 {
+            name.push(character.to_ascii_lowercase());
+        }
+        end += width;
+    }
+    let separator = authorization_whitespace_end(bytes, end, scope)?;
+    let Some(('=', width)) = authorization_character_at(bytes, separator, scope)? else {
+        return Ok(None);
+    };
+    if end == start {
+        return Ok(None);
+    }
+    let signed_headers = aws_v4 && name == "signedheaders";
+    end = authorization_whitespace_end(bytes, separator + width, scope)?;
+    let Some((first, _)) = authorization_character_at(bytes, end, scope)? else {
+        return Ok(None);
+    };
+    if first.is_whitespace() || matches!(first, '=' | ',' | ';') {
+        return Ok(None);
+    }
+    if let Some(end) = authorization_quoted_end(bytes, end, scope)? {
+        return Ok(Some(end));
+    }
+    while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+        if character.is_whitespace() || character == ',' || (character == ';' && !signed_headers) {
+            break;
+        }
+        end += width;
+    }
+    Ok(Some(end))
+}
+
+fn authorization_quoted_end(
+    bytes: &mut impl ByteSource,
+    start: usize,
+    scope: (usize, u32),
+) -> Result<Option<usize>, ErrorResponse> {
+    let Some((quote @ ('"' | '\''), width)) = authorization_character_at(bytes, start, scope)? else {
+        return Ok(None);
+    };
+    let mut end = start + width;
+    let mut escaped = false;
+    while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+        if matches!(character, '\n' | '\r') {
+            return Ok(Some(end));
+        }
+        end += width;
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            return Ok(Some(end));
+        }
+    }
+    Ok(Some(scope.0))
+}
+
 pub fn redaction_spans(
     bytes: &mut impl ByteSource,
     mode: crate::utils::RedactionMode,
@@ -2327,10 +2737,8 @@ pub fn redaction_spans(
         return Ok(Vec::new());
     }
     let mut edits = sensitive_field_spans(bytes, mode)?;
-    static AUTH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static COOKIE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static HOST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let auth = AUTH.get_or_init(|| regex::Regex::new(r"(?i)^authorization").expect("valid regex"));
     let cookie = COOKIE.get_or_init(|| regex::Regex::new(r"(?i)^cookie").expect("valid regex"));
     let host = HOST.get_or_init(|| {
         regex::Regex::new(
@@ -2339,7 +2747,6 @@ pub fn redaction_spans(
         .expect("valid regex")
     });
     let mut token_uuid_cursor = 0;
-    let mut auth_cursor = 0;
     let mut cookie_cursor = 0;
     let mut key_cursor = 0;
     let mut url_cursor = 0;
@@ -2347,63 +2754,25 @@ pub fn redaction_spans(
     let mut position = 0;
     while position < bytes.len() {
         let (character, width) = character_at(bytes, position)?;
-        if character == 'n'
-            && bytes.starts(position, b"npm_")?
-            && !preceding_word(bytes, position)?
-            && let Some(end) = prefix_regex(bytes, position, crate::utils::npm_token_regex(), 44)?
+        let escaped_whitespace =
+            character == '\\' && bytes.get(position + 1)?.is_some_and(|byte| b"nrt".contains(&byte));
+        let token_start = position + if escaped_whitespace { 2 } else { 0 };
+        if ((character == 'n' && bytes.starts(position, b"npm_")? && !preceding_word(bytes, position)?)
+            || (escaped_whitespace && bytes.starts(token_start, b"npm_")?))
+            && let Some(end) = prefix_regex(bytes, position, crate::utils::npm_token_regex(), 46)?
         {
-            add_redaction(&mut edits, position, end, "[redacted]")?;
+            add_redaction(&mut edits, end - 40, end, "[redacted]")?;
         }
         if position >= token_uuid_cursor
-            && matches!(character, 't' | 'T' | '令')
-            && (character == '令' || !preceding_word(bytes, position)?)
-            && (bytes.range(position, (position + 5).min(bytes.len()), 5)?.eq_ignore_ascii_case(b"token")
-                || bytes.starts(position, "令牌".as_bytes())?)
+            && (matches!(character, 't' | 'T' | '令') || escaped_whitespace)
+            && (character == '令' || escaped_whitespace || !preceding_word(bytes, position)?)
+            && (bytes.range(token_start, (token_start + 5).min(bytes.len()), 5)?.eq_ignore_ascii_case(b"token")
+                || bytes.starts(token_start, "令牌".as_bytes())?)
             // 单行上下文最多 256 字符，1536 字节覆盖 Unicode 和固定返回语句
             && let Some(end) = prefix_regex(bytes, position, crate::utils::token_uuid_statement_regex(), 1536)?
         {
             add_redaction(&mut edits, end - 36, end, "[redacted]")?;
             token_uuid_cursor = end;
-        }
-        if position >= auth_cursor
-            && matches!(character, 'a' | 'A')
-            && !preceding_word(bytes, position)?
-            && let Some(name_end) = prefix_regex(bytes, position, auth, 64)?
-        {
-            let separator = unicode_whitespace_end(bytes, name_end)?;
-            if bytes.get(separator)?.is_some_and(|byte| matches!(byte, b':' | b'=')) {
-                let value_start = unicode_whitespace_end(bytes, separator + 1)?;
-                let mut end = value_start;
-                while end < bytes.len() {
-                    let (character, width) = character_at(bytes, end)?;
-                    if character.is_whitespace() || matches!(character, ',' | ';') {
-                        break;
-                    }
-                    end += width;
-                }
-                // Bearer 加空白时，前缀后的整个 token 都在同一敏感区间内
-                let bearer = bytes.range(value_start, (value_start + 6).min(bytes.len()), 6)?;
-                if bearer.eq_ignore_ascii_case(b"bearer") {
-                    let start = unicode_whitespace_end(bytes, value_start + 6)?;
-                    if start > value_start + 6 {
-                        let mut token_end = start;
-                        while token_end < bytes.len() {
-                            let (character, width) = character_at(bytes, token_end)?;
-                            if character.is_whitespace() || matches!(character, ',' | ';') {
-                                break;
-                            }
-                            token_end += width;
-                        }
-                        if token_end > start {
-                            end = token_end;
-                        }
-                    }
-                }
-                if end > value_start {
-                    add_redaction(&mut edits, value_start, end, "[redacted]")?;
-                    auth_cursor = end;
-                }
-            }
         }
         if mode == RedactionMode::Strict {
             if position >= cookie_cursor
@@ -2508,6 +2877,7 @@ pub fn redaction_spans(
         }
         position += width;
     }
+    preserve_json_redactions(bytes, &mut edits)?;
     edits.sort_by(|left, right| left.start.cmp(&right.start).then_with(|| right.end.cmp(&left.end)));
     let mut normalized: Vec<RedactionSpan> = Vec::new();
     for edit in edits {
@@ -2540,6 +2910,7 @@ pub fn render_text_range(
     if start_char == end_char {
         return Ok((character_count, 0, 0));
     }
+    let structured = bytes.cursor.projection.redactions.is_some();
     let edits = match &bytes.cursor.projection.redactions {
         Some(edits) => edits.clone(),
         None => redaction_spans(bytes, mode)?,
@@ -2579,7 +2950,12 @@ pub fn render_text_range(
         }
         let visible_start = edit.start.max(start);
         write_plain(bytes, position, visible_start, &mut emit)?;
-        emit(edit.replacement.as_bytes())?;
+        let replacement = if structured {
+            edit.replacement
+        } else {
+            redaction_replacement(edit.replacement, edit.start, edit.end, start, end)
+        };
+        emit(replacement.as_bytes())?;
         position = position.max(edit.end.min(end));
         count += 1;
     }
@@ -2636,8 +3012,13 @@ pub fn stream_matches_pattern(
     let mut original_character = 0;
     while position < bytes.len() {
         let (character, width) = character_at(bytes, position)?;
-        let mut folded = (!case_sensitive).then(|| character.to_lowercase());
-        let mut original = Some(character);
+        let ascii_fold = !case_sensitive && character.is_ascii();
+        let mut folded = (!case_sensitive && !ascii_fold).then(|| character.to_lowercase());
+        let mut original = Some(if ascii_fold {
+            character.to_ascii_lowercase()
+        } else {
+            character
+        });
         while let Some(character) = match &mut folded {
             Some(folded) => folded.next(),
             None => original.take(),
@@ -2718,6 +3099,103 @@ fn write_plain(
 }
 
 #[cfg(test)]
+pub(crate) fn ql_h01_authorization_corpus() -> Vec<(String, String)> {
+    let mut cases = Vec::new();
+    for header in ["Authorization", "Proxy-Authorization"] {
+        for value in [
+            "Basic Zml4dHVyZTpwYXNz",
+            "\"Basic Zml4dHVyZTpwYXNz\"",
+            "'Basic Zml4dHVyZTpwYXNz'",
+            "Bearer fixture.value",
+            "Fixture fixture.value:signature",
+            "Custom fixture.value:signature",
+            "Digest username=\"fixture user\", response=\"fixture-secret\"",
+            "AWS EXAMPLEACCESS:fixture-signature=",
+            "AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                SignedHeaders=host;x-amz-date, Signature=fixture.signature",
+        ] {
+            let mut text = format!("前缀😀\n{header}: {value}\nX-Diagnostic: visible");
+            let mut expected = format!("前缀😀\n{header}: [redacted]\nX-Diagnostic: visible");
+            for _ in 0..4 {
+                cases.push((text.clone(), expected.clone()));
+                text = serde_json::to_string(&text).unwrap();
+                expected = serde_json::to_string(&expected).unwrap();
+            }
+        }
+        for (value, encoded) in [
+            ("Basic Zml4dHVyZTpwYXNz", "B"),
+            ("Basic Zml4dHVyZTpwYXNz", "a"),
+            ("Bearer fixture.value", "B "),
+            ("Fixture fixture.value:signature", "Fi:"),
+            ("\"Basic Zml4dHVyZTpwYXNz\"", "\""),
+            ("AWS EXAMPLEACCESS:fixture-signature=", "W:"),
+            (
+                "Digest username=\"fixture user\", response=\"fixture-secret\"",
+                "Drespon=,",
+            ),
+            (
+                "AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                    SignedHeaders=host;x-amz-date, Signature=fixture.signature",
+                "WS4Hi=,;",
+            ),
+        ] {
+            let mut value = serde_json::to_string(value).unwrap();
+            for character in encoded.chars() {
+                let encoded = format!("\\u{:04x}", character as u32);
+                value = if character == '"' {
+                    value.replace("\\\"", &encoded)
+                } else {
+                    value.replace(character, &encoded)
+                };
+            }
+            let value = &value[1..value.len() - 1];
+            let mut text = format!("\"前缀😀\\n{header}: {value}\\nX-Diagnostic: visible\"");
+            let mut expected = format!("\"前缀😀\\n{header}: [redacted]\\nX-Diagnostic: visible\"");
+            for _ in 1..4 {
+                cases.push((text.clone(), expected.clone()));
+                text = serde_json::to_string(&text).unwrap();
+                expected = serde_json::to_string(&expected).unwrap();
+            }
+        }
+        for encoded_header in [
+            header.replacen('A', "\\u0041", 1),
+            header.replace('o', "\\u006f"),
+            header
+                .chars()
+                .map(|character| format!("\\u{:04x}", character as u32))
+                .collect(),
+        ] {
+            for separator in [":", "\\u003a"] {
+                let mut text =
+                    format!("\"前缀😀\\n{encoded_header}{separator} Basic Zml4dHVyZTpwYXNz\\nX-Diagnostic: visible\"");
+                let mut expected =
+                    format!("\"前缀😀\\n{encoded_header}{separator} [redacted]\\nX-Diagnostic: visible\"");
+                for _ in 1..4 {
+                    cases.push((text.clone(), expected.clone()));
+                    text = serde_json::to_string(&text).unwrap();
+                    expected = serde_json::to_string(&expected).unwrap();
+                }
+            }
+        }
+        let text = format!("\"{header}\\u003a Basic Zml4dHVyZTpwYXNz\\nX-Diagnostic: visible\"");
+        let expected = format!("\"{header}\\u003a [redacted]\\nX-Diagnostic: visible\"");
+        cases.push((text, expected));
+        for literal in [
+            format!(
+                "{}: Basic Zml4dHVyZTpwYXNz\\nX-Diagnostic: visible",
+                header.replacen('A', "\\u0041", 1)
+            ),
+            format!("{header}\\u003a Basic Zml4dHVyZTpwYXNz\\nX-Diagnostic: visible"),
+        ] {
+            cases.push((literal.clone(), literal.clone()));
+            let quoted = serde_json::to_string(&literal).unwrap();
+            cases.push((quoted.clone(), quoted));
+        }
+    }
+    cases
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::utils::{parse_message_record, replace_images_with_placeholders};
@@ -2761,10 +3239,349 @@ mod tests {
     }
 
     #[test]
+    fn record_lines_preserve_byte_boundaries_snapshots_and_batch_accounting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut data = b"\n\r\n".to_vec();
+        data.extend(0..=255);
+        data.resize(data.len() + BUFFER_BYTES + 3, b'x');
+        data.extend_from_slice(b"\nlast");
+        let fixture = Fixture::new("");
+        std::fs::write(&fixture.path, &data).unwrap();
+        for snapshot_end in [0, data.len() - 2, data.len()] {
+            let expected: Vec<_> = data[..snapshot_end].split_inclusive(|byte| *byte == b'\n').collect();
+            for budget in [1, 2, 17, BUFFER_BYTES as u64 - 1, BUFFER_BYTES as u64, u64::MAX] {
+                for recycle in [false, true] {
+                    let accounted = Arc::new(AtomicUsize::new(0));
+                    let control = WorkControl::from_checkpoint({
+                        let accounted = Arc::clone(&accounted);
+                        move |bytes| {
+                            accounted.fetch_add(bytes, Ordering::Relaxed);
+                            Ok(())
+                        }
+                    });
+                    control.run(|| {
+                        let mut lines = RecordLines::new(fixture.open(), snapshot_end as u64);
+                        let mut remaining = budget;
+                        let mut count = 0;
+                        let mut offset = 0;
+                        loop {
+                            match lines
+                                .step(&mut remaining, Instant::now() + Duration::from_secs(10))
+                                .unwrap()
+                            {
+                                LineStep::Record(mut record) => {
+                                    assert_eq!(record.line, count + 1);
+                                    assert_eq!(record.span.start, offset);
+                                    assert_eq!(record.small.as_deref(), Some(expected[count]));
+                                    offset += expected[count].len() as u64;
+                                    assert_eq!(record.span.end, offset);
+                                    count += 1;
+                                    if recycle {
+                                        lines.recycle(&mut record);
+                                    }
+                                }
+                                LineStep::Yield => {
+                                    assert_eq!(remaining, 0);
+                                    remaining = budget;
+                                }
+                                LineStep::End => break,
+                            }
+                        }
+                        assert_eq!(count, expected.len());
+                        assert_eq!(lines.offset, snapshot_end as u64);
+                        assert_eq!(accounted.load(Ordering::Relaxed), snapshot_end);
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn record_lines_reuse_consumed_buffers_with_bounded_capacity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let row = format!("{}\n", "x".repeat(1023));
+        let count = 2000;
+        let data = row.repeat(count);
+        let fixture = Fixture::new(&data);
+        let accounted = Arc::new(AtomicUsize::new(0));
+        let control = WorkControl::from_checkpoint({
+            let accounted = Arc::clone(&accounted);
+            move |bytes| {
+                accounted.fetch_add(bytes, Ordering::Relaxed);
+                Ok(())
+            }
+        });
+        control.run(|| {
+            let mut lines = RecordLines::new(fixture.open(), data.len() as u64);
+            let mut remaining = u64::MAX;
+            let mut capacity = 0;
+            for index in 0..count {
+                if index > 0 {
+                    assert_eq!(lines.small.capacity(), capacity);
+                }
+                let LineStep::Record(mut record) = lines
+                    .step(&mut remaining, Instant::now() + Duration::from_secs(10))
+                    .unwrap()
+                else {
+                    panic!("expected complete row");
+                };
+                assert_eq!(record.small.as_deref(), Some(row.as_bytes()));
+                assert_eq!(record.line, index + 1);
+                assert_eq!(record.span.start, (index * row.len()) as u64);
+                assert_eq!(record.span.end, ((index + 1) * row.len()) as u64);
+                lines.recycle(&mut record);
+                assert!(record.small.is_none());
+                assert!(lines.small.is_empty());
+                assert!(lines.small.capacity() >= row.len());
+                if index == 0 {
+                    capacity = lines.small.capacity();
+                } else {
+                    assert_eq!(lines.small.capacity(), capacity);
+                }
+            }
+            assert!(matches!(
+                lines.step(&mut remaining, Instant::now()).unwrap(),
+                LineStep::End
+            ));
+            assert_eq!(accounted.load(Ordering::Relaxed), data.len());
+            let mut record = LocatedRecord {
+                line: count + 1,
+                span: SourceSpan { start: 0, end: 0 },
+                small: Some(Vec::with_capacity(MAX_JSONL_LINE_BYTES + 1)),
+            };
+            lines.recycle(&mut record);
+            assert!(record.small.is_none());
+            assert_eq!(lines.small.capacity(), capacity);
+        });
+    }
+
+    #[test]
+    fn indexed_string_runs_preserve_boundaries_escapes_and_scan_budgets() {
+        for padding in [
+            BUFFER_BYTES - 25,
+            BUFFER_BYTES - 24,
+            BUFFER_BYTES - 23,
+            BUFFER_BYTES,
+            BUFFER_BYTES * 2 + 1,
+        ] {
+            let text = format!("{}界\\\"\n😀\u{7f} end", "x".repeat(padding));
+            let raw = serde_json::json!({"uuid":"fixture","type":"user","timestamp":"2026-10-01T00:00:00Z",
+                "message":{"content":text}})
+            .to_string();
+            for raw in [
+                raw.clone(),
+                raw.replace('界', "\\u754c").replace('😀', "\\uD83D\\uDE00"),
+            ] {
+                let fixture = Fixture::new(&raw);
+                let span = SourceSpan {
+                    start: 0,
+                    end: raw.len() as u64,
+                };
+                for budget in [17, BUFFER_BYTES as u64] {
+                    let mut index = JsonIndex::new(fixture.open(), span);
+                    loop {
+                        let mut remaining = budget;
+                        if index
+                            .advance(&mut remaining, Instant::now() + Duration::from_secs(10))
+                            .unwrap()
+                        {
+                            break;
+                        }
+                    }
+                    let indexed = index.finish(true).unwrap();
+                    let projection = indexed.projection(fixture.open(), span, "content", None).unwrap();
+                    assert_eq!(projection.characters, text.chars().count());
+                    assert_eq!(
+                        projection.cursor(fixture.open(), span).read_text(raw.len()).unwrap(),
+                        text
+                    );
+                }
+                for invalid in [
+                    raw.replace(" end", "\u{1} end"),
+                    raw.replace('😀', "\\uD83Dinvalid")
+                        .replace("\\uD83D\\uDE00", "\\uD83Dinvalid"),
+                ] {
+                    let fixture = Fixture::new(&invalid);
+                    assert_eq!(
+                        index_record(
+                            fixture.open(),
+                            SourceSpan {
+                                start: 0,
+                                end: invalid.len() as u64
+                            },
+                            true
+                        )
+                        .err()
+                        .unwrap()
+                        .error,
+                        "parse_error"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_cursor_ascii_runs_preserve_projection_and_seek() {
+        for padding in [BUFFER_BYTES - 1, BUFFER_BYTES, BUFFER_BYTES + 1, BUFFER_BYTES * 3 + 7] {
+            let text = format!(
+                "{}界\\\"\n😀\u{7f}\u{1}{}",
+                "x".repeat(padding),
+                "tail".repeat(BUFFER_BYTES / 4 + 1)
+            );
+            let raw = serde_json::to_string(&text).unwrap();
+            for raw in [
+                raw.clone(),
+                raw.replace('界', "\\u754c").replace('😀', "\\uD83D\\uDE00"),
+            ] {
+                let fixture = Fixture::new(&raw);
+                let span = SourceSpan {
+                    start: 0,
+                    end: raw.len() as u64,
+                };
+                let indexed = index_record(fixture.open(), span, false).unwrap();
+                for canonical in [false, true] {
+                    let mut projection = TextProjection::default();
+                    projection.string(&indexed.nodes[indexed.root], canonical);
+                    let mut cursor = projection.cursor(fixture.open(), span);
+                    let expected = if canonical {
+                        serde_json::to_string(&text).unwrap()
+                    } else {
+                        text.clone()
+                    };
+                    for _ in 0..if canonical { 2 } else { 1 } {
+                        cursor.next_byte().unwrap().unwrap();
+                    }
+                    assert!(cursor.pending.len() > 1, "ASCII run was not buffered");
+                    assert!(cursor.pending.len() <= BUFFER_BYTES);
+                    cursor.seek(0).unwrap();
+                    assert_eq!(cursor.read_text(raw.len() * 2).unwrap(), expected);
+                    assert!(cursor.checkpoints.len() <= 1024);
+                    for position in [
+                        0,
+                        padding - 1,
+                        padding + 1,
+                        expected.len() / 2,
+                        expected.len() - 1,
+                        expected.len(),
+                        1,
+                        BUFFER_BYTES + 2,
+                    ] {
+                        cursor.seek(position).unwrap();
+                        let mut actual = [0; 17];
+                        let count = cursor.read(&mut actual).unwrap();
+                        let end = expected.len().min(position + actual.len());
+                        assert_eq!(&actual[..count], &expected.as_bytes()[position..end]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_ascii_case_folding_matches_ordinary_unicode_word_rules() {
+        use crate::utils::{matches_pattern, parse_search_pattern};
+        let text = format!("{} 前缀😀İD ΟΣ end\\\"\nTail", "ABC".repeat(BUFFER_BYTES));
+        let raw = serde_json::to_string(&text).unwrap();
+        let fixture = Fixture::new(&raw);
+        let span = SourceSpan {
+            start: 0,
+            end: raw.len() as u64,
+        };
+        let indexed = index_record(fixture.open(), span, false).unwrap();
+        for case_sensitive in [false, true] {
+            for query in [
+                "abc",
+                "ABC",
+                "i",
+                "\u{307}",
+                "d tail",
+                "οσ",
+                "ος",
+                "missing|tail",
+                "tail !absent",
+                "tail !tail",
+                "!absent",
+                "missing",
+            ] {
+                let pattern = parse_search_pattern(query, case_sensitive);
+                let mut projection = TextProjection::default();
+                projection.string(&indexed.nodes[indexed.root], false);
+                let mut bytes = TextBytes::new(projection.cursor(fixture.open(), span));
+                assert_eq!(
+                    stream_matches_pattern(&mut bytes, &pattern, case_sensitive).unwrap(),
+                    matches_pattern(&text, &pattern, case_sensitive),
+                    "{query} case_sensitive={case_sensitive}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_cursor_ascii_runs_preserve_cancellation_and_byte_accounting() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let text = "x".repeat(BUFFER_BYTES * 3);
+        let raw = serde_json::to_string(&text).unwrap();
+        let fixture = Fixture::new(&raw);
+        let span = SourceSpan {
+            start: 0,
+            end: raw.len() as u64,
+        };
+        let indexed = index_record(fixture.open(), span, false).unwrap();
+        let mut projection = TextProjection::default();
+        projection.string(&indexed.nodes[indexed.root], false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control = WorkControl::new(
+            {
+                let cancelled = Arc::clone(&cancelled);
+                move || cancelled.load(Ordering::Relaxed)
+            },
+            Duration::from_secs(10),
+        );
+        control.run(|| {
+            let mut cursor = projection.clone().cursor(fixture.open(), span);
+            assert_eq!(cursor.next_byte().unwrap(), Some(b'x'));
+            cancelled.store(true, Ordering::Relaxed);
+            let mut consumed = 1;
+            loop {
+                match cursor.next_byte() {
+                    Ok(Some(_)) => consumed += 1,
+                    Err(error) => {
+                        assert_eq!(error.error, "cancelled");
+                        assert!(consumed <= BUFFER_BYTES);
+                        break;
+                    }
+                    Ok(None) => panic!("cancelled text cursor reached EOF"),
+                }
+            }
+        });
+        let accounted = Arc::new(AtomicUsize::new(0));
+        let control = WorkControl::from_checkpoint({
+            let accounted = Arc::clone(&accounted);
+            move |bytes| {
+                if accounted.fetch_add(bytes, Ordering::Relaxed) + bytes > BUFFER_BYTES {
+                    return Err(reader_error("deadline_exceeded", "fixture byte budget"));
+                }
+                Ok(())
+            }
+        });
+        let error = control.run(|| projection.cursor(fixture.open(), span).read_text(raw.len()));
+        assert_eq!(error.unwrap_err().error, "deadline_exceeded");
+        assert_eq!(accounted.load(Ordering::Relaxed), BUFFER_BYTES * 2);
+    }
+
+    #[test]
     fn internal_record_classification_matches_ordinary_parser() {
         for (value, expected) in [
             (
-                serde_json::json!({"type":"api-request-blob", "hash":"fixture", "message":{"role":"user", "content":[]}}),
+                serde_json::json!({
+                    "type": "api-request-blob",
+                    "hash": "fixture",
+                    "message": {
+                        "role": "user",
+                        "content": []
+                    }
+                }),
                 None,
             ),
             (
@@ -2772,16 +3589,43 @@ mod tests {
                 None,
             ),
             (
-                serde_json::json!({"uuid":"fixture", "type":"user", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":"visible"}}),
+                serde_json::json!({
+                    "uuid": "fixture",
+                    "type": "user",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": "visible"
+                    }
+                }),
                 Some(true),
             ),
             (
-                serde_json::json!({"type":"user", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":"missing uuid"}}),
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": "missing uuid"
+                    }
+                }),
                 Some(false),
             ),
             (
                 serde_json::json!({"uuid":"fixture", "type":"user", "message":{"content":"missing timestamp"}}),
                 Some(false),
+            ),
+            (
+                serde_json::json!({"uuid":"fixture", "type":"user", "timestamp":"2026-10-01T00:00:00Z"}),
+                Some(false),
+            ),
+            (
+                serde_json::json!({"uuid":"fixture", "type":"assistant", "timestamp":"2026-10-01T00:00:00Z"}),
+                Some(false),
+            ),
+            (
+                serde_json::json!({
+                    "uuid":"fixture", "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":null
+                }),
+                Some(true),
             ),
             (serde_json::json!({"uuid":null, "type":"user"}), Some(false)),
             (
@@ -2839,6 +3683,136 @@ mod tests {
     }
 
     #[test]
+    fn json_redaction_checks_each_string_once() {
+        struct Counted<'a> {
+            bytes: &'a [u8],
+            reads: usize,
+        }
+        impl ByteSource for Counted<'_> {
+            fn len(&self) -> usize {
+                self.bytes.len()
+            }
+            fn get(&mut self, position: usize) -> Result<Option<u8>, ErrorResponse> {
+                self.reads += 1;
+                Ok(self.bytes.get(position).copied())
+            }
+        }
+        let text = format!("{{\"note\":\"{}\"}}", "password=fixture-value ".repeat(128));
+        let mut spans: Vec<_> = text
+            .match_indices("fixture-value")
+            .map(|(start, value)| RedactionSpan {
+                start,
+                end: start + value.len(),
+                replacement: "[redacted]",
+            })
+            .collect();
+        let mut bytes = Counted {
+            bytes: text.as_bytes(),
+            reads: 0,
+        };
+        preserve_json_redactions(&mut bytes, &mut spans).unwrap();
+        assert!(bytes.reads < text.len() * 4, "reads={}", bytes.reads);
+        assert!(spans.iter().all(|span| span.replacement == "[redacted]"));
+    }
+
+    #[test]
+    fn json_text_redaction_reaches_search_and_get_in_small_and_streaming_records() {
+        use crate::config::Config;
+        use crate::get::{GetParams, get};
+        use crate::search::{SearchParams, search};
+        use crate::types::GetResponse;
+        use crate::utils::RedactionMode;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("history-json-redaction-{}-{nonce}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let body = r#"{"needle":"fixture-json-needle","sensitiveReads":{"password":0,"hidden":0},"nested":{"password":false,"secret":null},"token":"fixture-secret"}"#;
+        for (session, padding) in [("normal01", 0), ("stream01", MAX_JSONL_LINE_BYTES + 1)] {
+            let record = serde_json::json!({"uuid":session,"type":"user","timestamp":"2026-10-01T00:00:00Z",
+                "padding":"x".repeat(padding),"message":{"content":[{"type":"tool_result","tool_use_id":"fixture-call","content":[{"type":"text","text":body}]}]}});
+            std::fs::write(project.join(format!("{session}.jsonl")), format!("{record}\n")).unwrap();
+        }
+        let config = Config {
+            projects_dir: root.clone(),
+        };
+        for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+            let result = search(
+                &config,
+                SearchParams {
+                    projects: vec!["project".into()],
+                    pattern: "fixture-json-needle".into(),
+                    redaction: mode,
+                    structured: Some("full".into()),
+                    ..SearchParams::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.results.len(), 2);
+            for row in result.results {
+                let structured = row.tool_result_redacted.unwrap();
+                let actual = structured["content"][0]["text"].as_str().unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(actual).unwrap();
+                let expected = if mode.enabled() {
+                    serde_json::json!("[redacted]")
+                } else {
+                    serde_json::json!(0)
+                };
+                assert_eq!(parsed["sensitiveReads"]["password"], expected);
+                assert_eq!(parsed["sensitiveReads"]["hidden"], 0);
+                assert_eq!(
+                    parsed["nested"]["password"],
+                    if mode.enabled() {
+                        serde_json::json!("[redacted]")
+                    } else {
+                        serde_json::json!(false)
+                    }
+                );
+                assert_eq!(
+                    parsed["nested"]["secret"],
+                    if mode.enabled() {
+                        serde_json::json!("[redacted]")
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
+                assert_eq!(
+                    parsed["token"],
+                    if mode.enabled() { "[redacted]" } else { "fixture-secret" }
+                );
+                if !mode.enabled() {
+                    assert_eq!(actual, body);
+                }
+                let response = get(
+                    &config,
+                    GetParams {
+                        r#ref: row.r#ref,
+                        range: None,
+                        output: None,
+                        project: Some("project".into()),
+                        source: None,
+                        redaction: mode,
+                        overwrite: false,
+                        view: Some("tool_result".into()),
+                        block: Some(0),
+                    },
+                )
+                .unwrap();
+                let GetResponse::Success { content, .. } = response else {
+                    panic!("expected get result")
+                };
+                let output: serde_json::Value = serde_json::from_str(&content).unwrap();
+                let inner: serde_json::Value =
+                    serde_json::from_str(output["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(inner, parsed);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rhs_redaction_stays_inside_outer_strings() {
         use crate::utils::{RedactionMode, redact_text_with_mode};
         for rhs in [
@@ -2848,8 +3822,28 @@ mod tests {
             "build(\"前缀😀 fixture-secret\")",
             "build(node, \"fixture-secret\"",
         ] {
-            let mut text = serde_json::json!({"command":format!("中文😀 token={rhs}"), "keep":"visible", "blocks":[{"type":"text", "text":"later message"}]}).to_string();
-            let mut expected = serde_json::json!({"command":"中文😀 token=[redacted]", "keep":"visible", "blocks":[{"type":"text", "text":"later message"}]}).to_string();
+            let mut text = serde_json::json!({
+                "command": format!("中文😀 token={rhs}"),
+                "keep": "visible",
+                "blocks": [
+                    {
+                        "type": "text",
+                        "text": "later message"
+                    }
+                ]
+            })
+            .to_string();
+            let mut expected = serde_json::json!({
+                "command": "中文😀 token=[redacted]",
+                "keep": "visible",
+                "blocks": [
+                    {
+                        "type": "text",
+                        "text": "later message"
+                    }
+                ]
+            })
+            .to_string();
             for _ in 0..3 {
                 for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
                     let fixture = Fixture::new(&text);
@@ -2929,11 +3923,63 @@ mod tests {
     fn structured_projection_matches_tree_redaction_and_preserves_original_ranges() {
         use crate::utils::{RedactionMode, ToolAssociationTracker, ToolBlockKind, render_tool_block};
         let values = [
-            serde_json::json!({"type":"tool_use", "id":"fixture-call", "name":"fixture", "input":{"password":{"nested":[1,"test-only-sensitive-value"]}, "url":"https://example.com/中文", "command":"前缀😀\nAuthorization: Bearer\tfixture-value\nword token='quoted-value'", "values":[1.0,null,true,"key = config.get('ENV')"]}}),
-            serde_json::json!({"type":"tool_result", "tool_use_id":"fixture-call", "content":[{"type":"text","text":"前缀😀\nAuthorization: Bearer \t fixture-value\nCookie: fixture=value"}, {"text":"{\"password\":\"test-only-sensitive-value\"}"}], "is_error":false}),
+            serde_json::json!({
+                "type": "tool_use",
+                "id": "fixture-call",
+                "name": "fixture",
+                "input": {
+                    "password": {
+                        "nested": [
+                            1,
+                            "test-only-sensitive-value"
+                        ]
+                    },
+                    "url": "https://example.com/中文",
+                    "command": "前缀😀\nAuthorization: Bearer\tfixture-value\nword token='quoted-value'",
+                    "values": [
+                        1.0,
+                        null,
+                        true,
+                        "key = config.get('ENV')"
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "fixture-call",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "前缀😀\nAuthorization: Bearer \t fixture-value\nCookie: fixture=value"
+                    },
+                    {
+                        "text": "{\"password\":\"test-only-sensitive-value\"}"
+                    },
+                    {
+                        "text": "{\"password\":0,\"nested\":{\"password\":true},\"plain\":\"visible\"}"
+                    }
+                ],
+                "is_error": false
+            }),
         ];
         for value in values {
-            let line = serde_json::json!({"uuid":"fixture", "type":if value["type"] == "tool_use" { "assistant" } else { "user" }, "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[value]}}).to_string();
+            let line = serde_json::json!({
+                "uuid": "fixture",
+                "type": if value[
+                    "type"
+                ] == "tool_use" {
+                    "assistant"
+                } else {
+                    "user"
+                },
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        value
+                    ]
+                }
+            })
+            .to_string();
             let fixture = Fixture::new(&line);
             let span = SourceSpan {
                 start: 0,
@@ -2987,10 +4033,29 @@ mod tests {
                 assert_eq!(redacted_count, expected.redacted_count);
                 assert_eq!(original_count, original.chars().count());
                 assert_eq!(rendered_count, rendered.chars().count());
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&rendered).unwrap(),
-                    *expected_value
-                );
+                let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+                assert_eq!(parsed, *expected_value);
+                if view == "tool_result" {
+                    let inner: serde_json::Value =
+                        serde_json::from_str(parsed["content"][2]["text"].as_str().unwrap()).unwrap();
+                    assert_eq!(
+                        inner["password"],
+                        if mode.enabled() {
+                            serde_json::json!("[redacted]")
+                        } else {
+                            serde_json::json!(0)
+                        }
+                    );
+                    assert_eq!(
+                        inner["nested"]["password"],
+                        if mode.enabled() {
+                            serde_json::json!("[redacted]")
+                        } else {
+                            serde_json::json!(true)
+                        }
+                    );
+                    assert_eq!(inner["plain"], "visible");
+                }
                 if mode.enabled() && view == "tool_input" {
                     let start = original[..original.find("test-only-sensitive-value").unwrap()]
                         .chars()
@@ -3014,7 +4079,22 @@ mod tests {
         let secret = "fixture_sshpass_NOT_A_REAL_CREDENTIAL";
         let input = serde_json::json!({"aaa":"前缀😀", "env":{"SSHPASS":secret,"LANG":"C","SSHPASS_FD":3}});
         let original = input.to_string();
-        let line = serde_json::json!({"uuid":"fixture", "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use","id":"fixture-call","name":"fixture","input":input}]}}).to_string();
+        let line = serde_json::json!({
+            "uuid": "fixture",
+            "type": "assistant",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "fixture-call",
+                        "name": "fixture",
+                        "input": input
+                    }
+                ]
+            }
+        })
+        .to_string();
         let fixture = Fixture::new(&line);
         let span = SourceSpan {
             start: 0,
@@ -3067,7 +4147,22 @@ mod tests {
         let make_record = |padding: usize| {
             let text = format!("{} 前缀😀 [{secret}] 后缀", "x".repeat(padding));
             let input = serde_json::json!({"text":text,"note":"visible"});
-            let line = serde_json::json!({"uuid":"fixture","type":"assistant","timestamp":"2026-10-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"fixture-call","name":"fixture","input":input}]}}).to_string();
+            let line = serde_json::json!({
+                "uuid": "fixture",
+                "type": "assistant",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "fixture-call",
+                            "name": "fixture",
+                            "input": input
+                        }
+                    ]
+                }
+            })
+            .to_string();
             (line, input)
         };
         let overhead = make_record(0).0.find(&secret).unwrap();
@@ -3140,6 +4235,21 @@ mod tests {
         let cases = [
             (secret.clone(), "[redacted]".to_string(), 1),
             (
+                format!("prefix\\n{secret}\\nsuffix"),
+                "prefix\\n[redacted]\\nsuffix".to_string(),
+                1,
+            ),
+            (
+                format!("prefix\\r{secret}\\rsuffix"),
+                "prefix\\r[redacted]\\rsuffix".to_string(),
+                1,
+            ),
+            (
+                format!("prefix\\t{secret}\\tsuffix"),
+                "prefix\\t[redacted]\\tsuffix".to_string(),
+                1,
+            ),
+            (
                 format!("printf '%s\\n' '{secret}' --visible"),
                 "printf '%s\\n' '[redacted]' --visible".to_string(),
                 1,
@@ -3153,6 +4263,12 @@ mod tests {
             (format!("npm_{}", "A".repeat(35)), format!("npm_{}", "A".repeat(35)), 0),
             (format!("npm_{}", "A".repeat(37)), format!("npm_{}", "A".repeat(37)), 0),
             (format!("{secret}字"), format!("{secret}字"), 0),
+            (format!("prefix\\n{secret}字"), format!("prefix\\n{secret}字"), 0),
+            (
+                format!("prefix\\n{secret}\u{0301}"),
+                format!("prefix\\n{secret}\u{0301}"),
+                0,
+            ),
             (format!("字{secret}"), format!("字{secret}"), 0),
             (format!("{secret}\u{0301}"), format!("{secret}\u{0301}"), 0),
             (format!("[{secret}]😀"), "[[redacted]]😀".to_string(), 1),
@@ -3202,12 +4318,51 @@ mod tests {
         use crate::utils::RedactionMode;
         let secret = "11111111-1111-4111-8111-111111111111";
         let identifier = "22222222-2222-4222-8222-222222222222";
-        let statement = format!("前缀😀 2. **用已有 token 创建新模块 token**: 成功,返回新 UUID `{secret}`");
+        let statement = format!("前缀😀\ntoken created, returned a new UUID {secret}\nordinary suffix");
+        let mut serialized = statement.clone();
+        for _ in 0..=3 {
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let spans = redaction_spans(&mut SliceBytes(serialized.as_bytes()), mode).unwrap();
+                let mut rendered = String::new();
+                let mut position = 0;
+                for span in &spans {
+                    rendered.push_str(&serialized[position..span.start]);
+                    rendered.push_str(span.replacement);
+                    position = span.end;
+                }
+                rendered.push_str(&serialized[position..]);
+                assert_eq!(spans.len(), usize::from(mode.enabled()));
+                assert_eq!(
+                    rendered,
+                    if mode.enabled() {
+                        serialized.replace(secret, "[redacted]")
+                    } else {
+                        serialized.clone()
+                    }
+                );
+            }
+            serialized = serde_json::to_string(&serialized).unwrap();
+        }
         let input = serde_json::json!({"text":statement,"session":identifier,"ref":"fixture:12"});
         let original = input.to_string();
         let expected =
             serde_json::json!({"text":statement.replace(secret,"[redacted]"),"session":identifier,"ref":"fixture:12"});
-        let line = serde_json::json!({"uuid":"fixture", "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use","id":"fixture-call","name":"fixture","input":input}]}}).to_string();
+        let line = serde_json::json!({
+            "uuid": "fixture",
+            "type": "assistant",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "fixture-call",
+                        "name": "fixture",
+                        "input": input
+                    }
+                ]
+            }
+        })
+        .to_string();
         let fixture = Fixture::new(&line);
         let span = SourceSpan {
             start: 0,
@@ -3268,7 +4423,22 @@ mod tests {
                 let input =
                     serde_json::json!({"aaa":"前缀😀", "command":command, "env":{"LANG":"C"}, "note":"visible"});
                 let original = input.to_string();
-                let line = serde_json::json!({"uuid":"fixture", "type":"assistant", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use","id":"fixture-call","name":"fixture","input":input}]}}).to_string();
+                let line = serde_json::json!({
+                    "uuid": "fixture",
+                    "type": "assistant",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "fixture-call",
+                                "name": "fixture",
+                                "input": input
+                            }
+                        ]
+                    }
+                })
+                .to_string();
                 let fixture = Fixture::new(&line);
                 let span = SourceSpan {
                     start: 0,
@@ -3310,6 +4480,253 @@ mod tests {
                     if !mode.enabled() {
                         assert_eq!(rendered, original);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mh_h01_authorization_keeps_json_scope_and_decoded_header_boundaries() {
+        use crate::utils::{RedactionMode, redact_text_with_mode};
+        for header in [
+            "Authorization: Basic Zml4dHVyZTpwYXNz",
+            "Authorization:\tBearer fixture.value",
+            "Authorization: Digest username=\"fixture user\", response=\"fixture-secret\"",
+            "Authorization: AWS EXAMPLEACCESS:fixture-signature=",
+            "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                SignedHeaders=host;x-amz-date, \
+                Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            let mut text = format!("note: visible\n{header}\nX-Diagnostic: visible");
+            let mut expected = format!(
+                "note: visible\nAuthorization:{}[redacted]\nX-Diagnostic: visible",
+                if header.starts_with("Authorization:\t") {
+                    "\t"
+                } else {
+                    " "
+                }
+            );
+            for _ in 0..4 {
+                for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                    let expected = if mode.enabled() { &expected } else { &text };
+                    let plain = redact_text_with_mode(&text, mode);
+                    assert_eq!(&plain.text, expected, "{mode:?} {text}");
+                    let fixture = Fixture::new(&text);
+                    let mut projection = TextProjection::default();
+                    projection.literal(text.clone());
+                    let mut bytes = TextBytes::new(projection.cursor(
+                        fixture.open(),
+                        SourceSpan {
+                            start: 0,
+                            end: text.len() as u64,
+                        },
+                    ));
+                    let mut rendered = String::new();
+                    let (_, _, count) = render_text_range(&mut bytes, mode, None, |chunk| {
+                        rendered.push_str(std::str::from_utf8(chunk).unwrap());
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(&rendered, expected, "indexed {mode:?} {text}");
+                    assert_eq!(count, plain.count);
+                }
+                text = serde_json::to_string(&text).unwrap();
+                expected = serde_json::to_string(&expected).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ql_h01_authorization_complete_values_and_decoded_syntax() {
+        use crate::utils::{RedactionMode, redact_text_range_with_mode};
+        let mut failures = Vec::new();
+        for (text, redacted) in ql_h01_authorization_corpus() {
+            let redacts = text != redacted;
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let expected = if mode.enabled() { &redacted } else { &text };
+                let mut ranges = vec![None];
+                for secret in [
+                    "Zml4dHVyZTpwYXNz",
+                    "fixture.value",
+                    "EXAMPLEACCESS",
+                    "fixture.signature",
+                    "signature",
+                ] {
+                    if let Some(start) = text.find(secret) {
+                        let start = text[..start].chars().count();
+                        ranges.push(Some((start + 2, start + 5)));
+                    }
+                }
+                for range in ranges {
+                    let expected = if let Some((start, end)) = range {
+                        if mode.enabled() && redacts {
+                            "[redacted]".to_string()
+                        } else {
+                            text.chars().skip(start).take(end - start).collect()
+                        }
+                    } else {
+                        expected.clone()
+                    };
+                    let plain = redact_text_range_with_mode(&text, mode, range);
+                    if plain.text != expected || plain.count != usize::from(mode.enabled() && redacts) {
+                        failures.push(format!("plain {mode:?} {range:?} {text:?}: {:?}", plain.text));
+                    }
+                    let fixture = Fixture::new(&text);
+                    let mut projection = TextProjection::default();
+                    projection.literal(text.clone());
+                    let mut bytes = TextBytes::new(projection.cursor(
+                        fixture.open(),
+                        SourceSpan {
+                            start: 0,
+                            end: text.len() as u64,
+                        },
+                    ));
+                    let mut actual = String::new();
+                    let (_, _, count) = render_text_range(&mut bytes, mode, range, |chunk| {
+                        actual.push_str(std::str::from_utf8(chunk).unwrap());
+                        Ok(())
+                    })
+                    .unwrap();
+                    if actual != expected || count != usize::from(mode.enabled() && redacts) {
+                        failures.push(format!("indexed {mode:?} {range:?} {text:?}: {actual:?}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn repair_h02_authorization_expected_corpus() {
+        use crate::utils::{RedactionMode, redact_text_with_mode};
+        for (text, expected) in [
+            ("Authorization: Basic Zml4dHVyZTpwYXNz", "Authorization: [redacted]"),
+            (
+                "Authorization: Basic c3ludGhldGljOnBhc3M=, status=ok",
+                "Authorization: [redacted], status=ok",
+            ),
+            (
+                "Authorization: Digest username = \"fixture user\", response = \"fixture-secret\", X-Trace: visible",
+                "Authorization: [redacted], X-Trace: visible",
+            ),
+            (
+                "Authorization: Digest username=\"fixture user\", response=\"fixture-secret\", X-Trace: visible",
+                "Authorization: [redacted], X-Trace: visible",
+            ),
+            (
+                "Authorization: Custom fixture.value diagnostic tail",
+                "Authorization: [redacted] diagnostic tail",
+            ),
+            (
+                "Authorization: Bearer fixture.value visible-after",
+                "Authorization: [redacted] visible-after",
+            ),
+            (
+                "Authorization: Custom fixture.value; status=ok",
+                "Authorization: [redacted]; status=ok",
+            ),
+            (
+                "Authorization: Custom fixture.value:signature diagnostic tail",
+                "Authorization: [redacted] diagnostic tail",
+            ),
+            (
+                "Proxy-Authorization: Fixture fixture.value:signature; status=ok",
+                "Proxy-Authorization: [redacted]; status=ok",
+            ),
+            (
+                "Authorization: Basic Zml4dHVyZTpwYXNz, X-Trace: visible",
+                "Authorization: [redacted], X-Trace: visible",
+            ),
+            (
+                "Authorization: Bearer\nX-Trace: visible",
+                "Authorization: [redacted]\nX-Trace: visible",
+            ),
+            (
+                "Authorization: Basic Zml4dHVyZTpwYXNz\nX-Trace: visible",
+                "Authorization: [redacted]\nX-Trace: visible",
+            ),
+            (
+                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                    SignedHeaders=host;x-amz-date, \
+                    Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nX-Diagnostic: visible",
+                "Authorization: [redacted]\nX-Diagnostic: visible",
+            ),
+            (
+                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                    SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=fixture.signature, X-Trace: visible",
+                "Authorization: [redacted], X-Trace: visible",
+            ),
+            (
+                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                    SignedHeaders=host;x-amz-date, Signature=fixture.signature; status=ok",
+                "Authorization: [redacted]; status=ok",
+            ),
+            (
+                "Authorization: AWS EXAMPLEACCESS:fixture-signature=\nX-Diagnostic: visible",
+                "Authorization: [redacted]\nX-Diagnostic: visible",
+            ),
+            (
+                "Authorization: AWS EXAMPLEACCESS:fixture-signature= diagnostic tail",
+                "Authorization: [redacted] diagnostic tail",
+            ),
+            (
+                "Authorization: AWS\nX-Trace: visible",
+                "Authorization: [redacted]\nX-Trace: visible",
+            ),
+            (
+                "Authorization: AWS4-HMAC-SHA256\r\nX-Trace: visible",
+                "Authorization: [redacted]\r\nX-Trace: visible",
+            ),
+        ] {
+            for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                let expected = if mode.enabled() { expected } else { text };
+                let plain = redact_text_with_mode(text, mode);
+                assert_eq!(plain.text, expected, "plain {mode:?} {text:?}");
+                assert_eq!(plain.count, usize::from(mode.enabled()));
+                let fixture = Fixture::new(text);
+                let mut projection = TextProjection::default();
+                projection.literal(text.to_string());
+                let mut bytes = TextBytes::new(projection.cursor(
+                    fixture.open(),
+                    SourceSpan {
+                        start: 0,
+                        end: text.len() as u64,
+                    },
+                ));
+                let mut actual = String::new();
+                let (_, _, count) = render_text_range(&mut bytes, mode, None, |chunk| {
+                    actual.push_str(std::str::from_utf8(chunk).unwrap());
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(actual, expected, "indexed {mode:?} {text:?}");
+                assert_eq!(count, plain.count);
+                for start in [
+                    "fixture.value",
+                    "Zml4dHVyZTpwYXNz",
+                    "EXAMPLEACCESS",
+                    "fixture.signature",
+                    "fixture-signature",
+                    "0123456789abcdef",
+                ]
+                .into_iter()
+                .filter_map(|needle| text.find(needle))
+                {
+                    let range = Some((start + 2, start + 5));
+                    let plain = crate::utils::redact_text_range_with_mode(text, mode, range);
+                    let expected = if mode.enabled() {
+                        "[redacted]"
+                    } else {
+                        &text[start + 2..start + 5]
+                    };
+                    assert_eq!(plain.text, expected);
+                    let mut actual = String::new();
+                    render_text_range(&mut bytes, mode, range, |chunk| {
+                        actual.push_str(std::str::from_utf8(chunk).unwrap());
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(actual, expected);
                 }
             }
         }
@@ -3475,7 +4892,12 @@ mod tests {
 
     #[test]
     fn resumable_index_projects_exactly_like_small_records() {
-        let line = r#"{"uuid":"fixture","type":"assistant","timestamp":"2026-10-12T00:00:00Z","message":{"content":[{"type":"text","text":"中文 😀\n\""},{"type":"tool_use","name":"fixture","input":{"z":1.0,"a":"😀"}},{"type":"tool_result","content":[{"text":""},{"text":"结果"}]},{"type":"image","source":{"data":"YWJj","media_type":"image/png"}}]}}"#;
+        let line = concat!(
+            r#"{"uuid":"fixture","type":"assistant","timestamp":"2026-10-12T00:00:00Z","#,
+            r#""message":{"content":[{"type":"text","text":"中文 😀\n\""},{"type":"tool_use","name":"fixture","#,
+            r#""input":{"z":1.0,"a":"😀"}},{"type":"tool_result","content":[{"text":""},{"text":"结果"}]},"#,
+            r#"{"type":"image","source":{"data":"YWJj","media_type":"image/png"}}]}}"#
+        );
         let fixture = Fixture::new(line);
         let span = SourceSpan {
             start: 0,

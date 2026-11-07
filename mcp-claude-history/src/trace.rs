@@ -340,32 +340,72 @@ pub fn trace(config: &Config, params: TraceParams) -> Result<TraceResponse, Erro
 }
 
 fn budget_trace_response(response: &mut TraceResponse, max_total: usize) -> Result<(), ErrorResponse> {
-    loop {
-        let bytes = serde_json::to_vec(response)
-            .map_err(|e| invalid_arguments(format!("序列化 trace 失败: {e}")))?
-            .len();
-        if bytes <= max_total {
-            return Ok(());
+    use crate::record_reader::{check_work, serialize_json};
+    let mut message_sizes = response
+        .messages
+        .iter()
+        .map(|message| serialize_json(std::io::sink(), message, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tool_sizes = response
+        .tool_calls
+        .iter()
+        .map(|call| serialize_json(std::io::sink(), call, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut issue_sizes = response
+        .association_issues
+        .iter()
+        .map(|issue| serialize_json(std::io::sink(), issue, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let messages = std::mem::take(&mut response.messages);
+    let tools = std::mem::take(&mut response.tool_calls);
+    let issues = std::mem::take(&mut response.association_issues);
+    let fixed = serialize_json(std::io::sink(), response, false);
+    response.messages = messages;
+    response.tool_calls = tools;
+    response.association_issues = issues;
+    let issue_field = r#","association_issues":[]"#.len();
+    let mut bytes = fixed?;
+    for sizes in [&message_sizes, &tool_sizes, &issue_sizes] {
+        bytes += sizes.iter().sum::<usize>() + sizes.len().saturating_sub(1);
+    }
+    if !issue_sizes.is_empty() {
+        bytes += issue_field;
+    }
+    while bytes > max_total {
+        check_work()?;
+        match response.truncated.replace(true) {
+            None => bytes += r#","truncated":true"#.len(),
+            Some(false) => bytes -= 1,
+            Some(true) => {}
         }
-        response.truncated = Some(true);
         // Keep the anchor and retain only complete tool-call summaries.
-        if response.tool_calls.pop().is_some() || response.association_issues.pop().is_some() {
-            continue;
-        }
-        if let Some(position) = response
+        if let Some(size) = tool_sizes.pop() {
+            response.tool_calls.pop();
+            bytes -= size + usize::from(!tool_sizes.is_empty());
+        } else if let Some(size) = issue_sizes.pop() {
+            response.association_issues.pop();
+            bytes -= size + if issue_sizes.is_empty() { issue_field } else { 1 };
+        } else if let Some(position) = response
             .messages
             .iter()
             .rposition(|message| message.is_anchor != Some(true))
         {
             response.messages.remove(position);
-            continue;
+            bytes -= message_sizes.remove(position) + usize::from(!message_sizes.is_empty());
+        } else {
+            return Err(ErrorResponse {
+                error: "response_too_large".to_string(),
+                message: format!("trace 响应超过 max_total={max_total} 字节；请增大预算或缩小范围"),
+                available: Some(serde_json::json!({"serialized_bytes": bytes, "max_total_bytes": max_total})),
+            });
         }
-        return Err(ErrorResponse {
-            error: "response_too_large".to_string(),
-            message: format!("trace 响应超过 max_total={max_total} 字节；请增大预算或缩小范围"),
-            available: Some(serde_json::json!({"serialized_bytes": bytes, "max_total_bytes": max_total})),
-        });
     }
+    let actual = serialize_json(std::io::sink(), response, false)?;
+    debug_assert_eq!(actual, bytes);
+    if actual > max_total {
+        return Err(invalid_arguments("trace 响应字节预算计算不一致"));
+    }
+    Ok(())
 }
 
 const ASSOCIATION_ISSUE_CAP: usize = 20;
@@ -441,6 +481,62 @@ fn tool_result_preview(result: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_h03_trace_encoding_work_is_linear_and_cancellable() {
+        let mut response = TraceResponse {
+            anchor_ref: "fixture:1000".into(),
+            project: "fixture".into(),
+            session: "fixture".into(),
+            messages: (0..2000)
+                .map(|index| TraceMessage {
+                    r#ref: format!("fixture:{index}"),
+                    r#type: "user".into(),
+                    subtype: "human".into(),
+                    timestamp: "2026-10-01T00:00:00Z".into(),
+                    content: "中\\\"\n".repeat(100),
+                    is_anchor: (index == 1000).then_some(true),
+                })
+                .collect(),
+            tool_calls: (0..100)
+                .map(|index| TraceToolCall {
+                    r#ref: format!("fixture:{index}"),
+                    server: Some("fixture".into()),
+                    tool: Some("probe".into()),
+                    status: "completed".into(),
+                    match_method: "tool_use_id".into(),
+                    result_ref: Some(format!("fixture:{}", index + 1)),
+                    result_preview: Some("中\\\"".repeat(100)),
+                    redacted_count: 0,
+                })
+                .collect(),
+            association_issues: vec![TraceAssociationIssue {
+                result_ref: "fixture:2".into(),
+                kind: "unmatched".into(),
+                tool_use_id: None,
+                pending_count: 0,
+            }],
+            truncated: None,
+            warnings: vec!["fixture".into()],
+            output_path: None,
+            output: None,
+        };
+        let error = crate::record_reader::WorkControl::new(|| true, std::time::Duration::from_secs(1))
+            .run(|| budget_trace_response(&mut response, 3000))
+            .unwrap_err();
+        assert_eq!(error.error, "cancelled");
+        let original = serde_json::to_vec(&response).unwrap().len();
+        crate::record_reader::SERIALIZED_BYTES.set(0);
+        budget_trace_response(&mut response, 3000).unwrap();
+        let encoded = crate::record_reader::SERIALIZED_BYTES.get();
+        eprintln!("trace encoded={encoded} original={original}");
+        assert!(encoded >= original);
+        assert!(encoded < original + 6000, "encoded={encoded}, original={original}");
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 3000);
+        assert!(response.messages.iter().any(|message| message.is_anchor == Some(true)));
+        assert!(response.tool_calls.is_empty());
+        assert!(response.association_issues.is_empty());
+    }
 
     type TraceRecord = WindowRecord;
 
@@ -670,7 +766,16 @@ mod tests {
         )
         .unwrap();
         writeln!(file, "{{").unwrap();
-        writeln!(file, "{}", serde_json::json!({"uuid": "incomplete"})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "incomplete",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z"
+            })
+        )
+        .unwrap();
         writeln!(
             file,
             "{}",

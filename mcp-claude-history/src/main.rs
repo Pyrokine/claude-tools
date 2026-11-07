@@ -460,6 +460,14 @@ fn run_scan_group(
     let max_total = params.max_total;
     let limit = params.limit;
     let sources = params.sources.clone();
+    let mut restart_query = search::build_next_query(&params, 0);
+    restart_query["mode"] = serde_json::json!("scan");
+    if let Some(bytes) = scan_bytes {
+        restart_query["scan_bytes"] = serde_json::json!(bytes);
+    }
+    if let Some(ms) = scan_ms {
+        restart_query["scan_ms"] = serde_json::json!(ms);
+    }
     let mut request = stream_scan::ScanRequest {
         params,
         cursor: None,
@@ -506,46 +514,75 @@ fn run_scan_group(
         }
         Ok(())
     })();
+    let mut result = result;
+    let mut released = true;
     if let Some(scan_id) = &id
         && !result
             .as_ref()
             .err()
             .is_some_and(|error| error.available.as_ref().is_some_and(|value| value["released"] == true))
     {
-        let mut cursor = None;
-        loop {
-            let page = record_reader::WorkControl::default().run(|| {
-                scans.metadata(stream_scan::MetadataRequest {
-                    scan_id: scan_id.clone(),
-                    cursor: cursor.clone(),
-                    limit: limit.unwrap_or(100),
-                    max_total,
-                    release: false,
-                })
-            });
-            let page = match page {
-                Ok(page) => page,
-                Err(error) => {
-                    scans.release(scan_id)?;
-                    return Err(error);
+        let metadata = (|| {
+            let mut cursor = None;
+            loop {
+                let page = record_reader::WorkControl::default().run(|| {
+                    scans.metadata(stream_scan::MetadataRequest {
+                        scan_id: scan_id.clone(),
+                        cursor: cursor.clone(),
+                        limit: limit.unwrap_or(100),
+                        max_total,
+                        release: false,
+                    })
+                })?;
+                print_scan_page(&page, group, "metadata")?;
+                let value: serde_json::Value = serde_json::from_str(&page)
+                    .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
+                if value["has_more"] == false {
+                    return Ok::<_, ErrorResponse>(());
                 }
-            };
-            print_scan_page(&page, group, "metadata")?;
-            let value: serde_json::Value = serde_json::from_str(&page)
-                .map_err(|error| record_reader::reader_error("serialize_error", error.to_string()))?;
-            if value["has_more"] == false {
-                break;
+                cursor = value["next_query"]["cursor"].as_str().map(str::to_string);
             }
-            cursor = value["next_query"]["cursor"].as_str().map(str::to_string);
+        })();
+        if let Err(mut error) = metadata {
+            if let Some(serde_json::Value::Object(details)) = &mut error.available {
+                for field in ["next_query", "metadata_query", "release_query"] {
+                    details.remove(field);
+                }
+            }
+            if let Err(primary) = &mut result {
+                primary
+                    .details_mut()
+                    .insert("metadata_error".into(), serde_json::json!(error));
+            } else {
+                result = Err(error);
+            }
         }
-        scans.release(scan_id)?;
+        if let Err(error) = scans.release(scan_id) {
+            released = false;
+            if let Err(primary) = &mut result {
+                primary
+                    .details_mut()
+                    .insert("release_error".into(), serde_json::json!(error));
+            } else {
+                result = Err(error);
+            }
+        }
     }
     result.map_err(|mut error: ErrorResponse| {
-        let values = error.available.get_or_insert_with(|| serde_json::json!({}));
-        values["body_pages_returned"] = serde_json::json!(pages);
-        values["body_rows_returned"] = serde_json::json!(body_rows);
-        values["failed_group_sources"] = serde_json::json!(sources);
-        values["group"] = serde_json::json!(group);
+        let values = error.details_mut();
+        if let Some(maximum) = values.get("next_query").and_then(|query| query["max_total"].as_u64()) {
+            restart_query["max_total"] = serde_json::json!(maximum.min(search::MAX_TOTAL_LIMIT as u64));
+        }
+        for field in ["next_query", "metadata_query", "release_query"] {
+            values.remove(field);
+        }
+        values.insert("released".into(), serde_json::json!(released));
+        values.insert("resume_possible".into(), serde_json::json!(false));
+        values.insert("restart_query".into(), restart_query);
+        values.insert("body_pages_returned".into(), serde_json::json!(pages));
+        values.insert("body_rows_returned".into(), serde_json::json!(body_rows));
+        values.insert("failed_group_sources".into(), serde_json::json!(sources));
+        values.insert("group".into(), serde_json::json!(group));
         error
     })
 }
@@ -650,10 +687,10 @@ fn run_sources_cli(
                             groups.push_front(sources[..middle].to_vec());
                         }
                         Err(mut error) => {
-                            let available = error.available.get_or_insert_with(|| serde_json::json!({}));
-                            available["completed_groups"] = serde_json::json!(completed_groups);
-                            available["unconsumed_groups"] = serde_json::json!(groups);
-                            available["unconsumed_sources_query"] = value["next_query"].clone();
+                            let available = error.details_mut();
+                            available.insert("completed_groups".into(), serde_json::json!(completed_groups));
+                            available.insert("unconsumed_groups".into(), serde_json::json!(groups));
+                            available.insert("unconsumed_sources_query".into(), serde_json::Value::Null);
                             return Err(error);
                         }
                     }
@@ -666,8 +703,10 @@ fn run_sources_cli(
         }
         Ok(())
     })();
-    if let Some(cursor) = release_cursor {
-        scans.sources(
+    let mut result = result;
+    let mut released = true;
+    if let Some(cursor) = release_cursor
+        && let Err(error) = scans.sources(
             config,
             stream_scan::SourcesRequest {
                 params: SearchParams::default(),
@@ -675,9 +714,32 @@ fn run_sources_cli(
                 release: true,
                 explicit_filters: serde_json::json!({}),
             },
-        )?;
+        )
+    {
+        released = false;
+        if let Err(primary) = &mut result {
+            primary
+                .details_mut()
+                .insert("catalog_release_error".into(), serde_json::json!(error));
+        } else {
+            result = Err(error);
+        }
     }
-    result
+    result.map_err(|mut error| {
+        let available = error.details_mut();
+        for field in ["next_query", "release_query", "unconsumed_sources_query"] {
+            available.remove(field);
+        }
+        available.insert("catalog_released".into(), serde_json::json!(released));
+        let mut restart = search::build_next_query(&params, 0);
+        restart["mode"] = serde_json::json!("sources");
+        if grouped {
+            restart["limit"] = serde_json::json!(128);
+            available.insert("completed_groups".into(), serde_json::json!(completed_groups));
+        }
+        available.insert("restart_sources_query".into(), restart);
+        error
+    })
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -965,6 +1027,60 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn repair_h05_scan_preserves_body_budget_error_and_progress() {
+        let root = std::env::temp_dir().join(format!("history-cli-repair-{}", std::process::id()));
+        let project = root.join("fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = project.join("fixture-session.jsonl");
+        std::fs::write(
+            &source,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "fixture",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": "x".repeat(10000)
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let error = run_scan_group(
+            &stream_scan::ScanStore::default(),
+            &Config {
+                projects_dir: root.clone(),
+            },
+            SearchParams {
+                projects: vec!["fixture".into()],
+                sources: vec![source.to_string_lossy().to_string()],
+                max_content: 10000,
+                max_total: 2000,
+                ..SearchParams::default()
+            },
+            None,
+            None,
+            Some(3),
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "response_too_large");
+        let available = error.available.unwrap();
+        assert!(available["required_bytes"].as_u64().unwrap() > 2000);
+        assert_eq!(available["body_rows_returned"], 0);
+        assert_eq!(available["group"], 3);
+        assert_eq!(available["released"], true);
+        assert_eq!(available["resume_possible"], false);
+        assert!(available["next_query"].is_null());
+        assert!(available["restart_query"]["cursor"].is_null());
+        assert_eq!(
+            available["restart_query"]["sources"][0],
+            source.to_string_lossy().as_ref()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn cli_source_is_available_for_all_reference_readers() {

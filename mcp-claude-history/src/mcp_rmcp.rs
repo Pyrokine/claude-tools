@@ -95,10 +95,13 @@ pub struct SearchToolParams {
     /// 空串匹配全部；非 regex 时空格表示 AND、a|b 表示 OR、!term 排除；匹配完整正文，不受预览长度限制
     #[serde(default)]
     pub pattern: Option<String>,
+    /// 项目 ID 或路径，逗号分隔；未指定 project/all 时搜索当前项目
     #[serde(default)]
     pub project: Option<String>,
+    /// true 搜索所有项目；与 project 互斥，默认 false
     #[serde(default)]
     pub all: Option<bool>,
+    /// 所选项目内的会话 ID 或前缀，逗号分隔；跨项目检索使用 all=true，子会话另设 subagents=true
     #[serde(default)]
     pub sessions: Option<String>,
     /// 原样使用 search 或 scan metadata 返回的精确 source，选择一个物理文件；与显式 project、sessions 取交集，子会话仍需 subagents=true
@@ -113,23 +116,28 @@ pub struct SearchToolParams {
     /// 文件正文 preview（默认）或 full；与 structured 独立，full 需要 output
     #[serde(default)]
     pub output_content: Option<String>,
+    /// 起点（含）：带时区的 RFC3339，如 2026-01-01T12:00:00Z；UTC 日期 YYYY-MM-DD 或 today
     #[serde(default)]
     pub since: Option<String>,
+    /// 终点：带时区的 RFC3339（含）；UTC 日期 YYYY-MM-DD 或 today 覆盖该 UTC 整日
     #[serde(default)]
     pub until: Option<String>,
+    /// 逗号分隔的消息类型：assistant、user、summary、system、other；会话标题通过 history_sessions.title 读取
     #[serde(default)]
     pub types: Option<String>,
-    /// Comma-separated classifications. `human` denotes a user-shaped record, not verified human authorship.
+    /// 逗号分隔的消息子类型：human、tool_result、meta、text、tool_use、thinking、empty、summary、system、other；human 仅表示 user 形态记录，作者身份未验证
     #[serde(default)]
     pub subtypes: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Comma-separated MCP servers; combined with tools using AND. Full tool names do not add server filters."
+        description = "Comma-separated MCP servers; combined with tools using AND. Full tool names do not add \
+            server filters."
     )]
     pub servers: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Comma-separated tool names matched using OR. Full mcp__server__tool names bind server and tool; short names match the tool across servers and can include local tools such as Bash."
+        description = "Comma-separated tool names matched using OR. Full mcp__server__tool names bind server \
+            and tool; short names match the tool across servers and can include local tools such as Bash."
     )]
     pub tools: Option<String>,
     #[serde(default)]
@@ -196,7 +204,9 @@ pub struct SearchToolParams {
     pub max_total: Option<usize>,
     #[serde(default)]
     #[schemars(
-        description = "Default false searches only main JSONL files. True also includes <session>/subagents, <session>/remote-agents, and <session>/subagents/workflows/<run>/agent-<id>.jsonl. Workflow journal files are excluded. sessions matches each file's own ID; a parent ID does not include its children.",
+        description = "Default false searches only main JSONL files. True also includes <session>/subagents, \
+            <session>/remote-agents, and <session>/subagents/workflows/<run>/agent-<id>.jsonl. Workflow journal \
+            files are excluded. sessions matches each file's own ID; a parent ID does not include its children.",
         default = "default_subagents_schema"
     )]
     pub subagents: Option<bool>,
@@ -232,8 +242,10 @@ pub struct GetToolParams {
     /// 仅工具视图使用原始 message.content 数组下标；多个工具块时必须指定，record 不接受 block
     #[serde(default)]
     pub block: Option<usize>,
+    /// 原始视图的 Unicode 字符半开范围，使用 start-end，例如 0-100000，end 为排他端点
     #[serde(default)]
     pub range: Option<String>,
+    /// 导出事务 bundle，支持 tmp:（受控临时会话根）和 cwd:（当前工作目录）；相对路径默认 tmp:；绝对路径仅允许当前工作目录或受控临时会话根内，使用返回的实际 output 路径
     #[serde(default)]
     pub output: Option<String>,
     #[serde(default)]
@@ -251,8 +263,10 @@ pub struct ContextToolParams {
     /// 原样使用 search 或 scan metadata 返回的 source，精确选择同名会话来源；只允许当前历史目录内的已识别布局
     #[serde(default)]
     pub source: Option<String>,
+    /// 锚点前匹配 types、subtypes、pattern 的消息数；选定跨度内全部消息（含被过滤的消息）计入 2,000 条上限
     #[serde(default)]
     pub before: Option<usize>,
+    /// 锚点后匹配 types、subtypes、pattern 的消息数；选定跨度内全部消息（含被过滤的消息）计入 2,000 条上限
     #[serde(default)]
     pub after: Option<usize>,
     #[serde(default)]
@@ -263,9 +277,10 @@ pub struct ContextToolParams {
     /// `forward` or `backward`; applies only to until_type.
     #[serde(default)]
     pub direction: Option<String>,
+    /// 逗号分隔的消息类型：assistant、user、summary、system、other；会话标题通过 history_sessions.title 读取
     #[serde(default)]
     pub types: Option<String>,
-    /// Comma-separated classifications. `human` denotes a user-shaped record, not verified human authorship.
+    /// 逗号分隔的消息子类型：human、tool_result、meta、text、tool_use、thinking、empty、summary、system、other；human 仅表示 user 形态记录，作者身份未验证
     #[serde(default)]
     pub subtypes: Option<String>,
     #[serde(default)]
@@ -301,8 +316,10 @@ pub struct TraceToolParams {
     /// 原样使用 search 或 scan metadata 返回的 source，精确选择同名会话来源；只允许当前历史目录内的已识别布局
     #[serde(default)]
     pub source: Option<String>,
+    /// 锚点前匹配 types、subtypes、pattern 的消息数；选定跨度内全部消息（含被过滤的消息）计入 2,000 条上限
     #[serde(default)]
     pub before: Option<usize>,
+    /// 锚点后匹配 types、subtypes、pattern 的消息数；选定跨度内全部消息（含被过滤的消息）计入 2,000 条上限
     #[serde(default)]
     pub after: Option<usize>,
     #[serde(default)]
@@ -316,9 +333,10 @@ pub struct TraceToolParams {
         range(min = 512, max = 10000000)
     )]
     pub max_total: Option<usize>,
+    /// 逗号分隔的消息类型：assistant、user、summary、system、other；会话标题通过 history_sessions.title 读取
     #[serde(default)]
     pub types: Option<String>,
-    /// Comma-separated classifications. `human` denotes a user-shaped record, not verified human authorship.
+    /// 逗号分隔的消息子类型：human、tool_result、meta、text、tool_use、thinking、empty、summary、system、other；human 仅表示 user 形态记录，作者身份未验证
     #[serde(default)]
     pub subtypes: Option<String>,
     #[serde(default)]
@@ -575,7 +593,9 @@ impl McpHistoryService {
     }
 
     #[tool(
-        description = "Page through a completed scan's frozen file coverage, effective filters, exact summary buckets, warnings and attribution refs. Follow next_query until has_more=false, then release=true. Does not delete exports."
+        description = "Page through a completed scan's frozen file coverage, effective filters, exact summary \
+            buckets, warnings and attribution refs. Follow next_query until has_more=false, then release=true. \
+            Does not delete exports."
     )]
     async fn history_scan_metadata(
         &self,
@@ -602,7 +622,9 @@ impl McpHistoryService {
     }
 
     #[tool(
-        description = "Get message text or a selected tool input/result by ref. range uses original Unicode character offsets before redaction; oversized records are indexed without loading their whole JSON value. output exports a complete transactional bundle."
+        description = "Get message text or a selected tool input/result by ref. range uses original Unicode \
+            character offsets before redaction; oversized records are indexed without loading their whole JSON \
+            value. output exports a complete transactional bundle."
     )]
     async fn history_get(
         &self,
@@ -633,7 +655,9 @@ impl McpHistoryService {
     }
 
     #[tool(
-        description = "Get surrounding messages using before/after, until_type, or until_ref. Local queries support large sessions; the selected span is limited to 2,000 messages and 32 MiB, including hidden messages. Diagnostics cover the scanned prefix only."
+        description = "Get surrounding messages using before/after, until_type, or until_ref. Local queries \
+            support large sessions; the selected span is limited to 2,000 messages and 32 MiB, including hidden \
+            messages. Diagnostics cover the scanned prefix only."
     )]
     async fn history_context(
         &self,
@@ -671,7 +695,9 @@ impl McpHistoryService {
     }
 
     #[tool(
-        description = "Trace nearby messages and tool call/result pairs. Choose one range mode. Local queries support large sessions; the selected span is limited to 2,000 messages and 32 MiB, including hidden messages. Diagnostics cover the scanned prefix only."
+        description = "Trace nearby messages and tool call/result pairs. Choose one range mode. Local queries \
+            support large sessions; the selected span is limited to 2,000 messages and 32 MiB, including hidden \
+            messages. Diagnostics cover the scanned prefix only."
     )]
     async fn history_trace(
         &self,
@@ -771,7 +797,15 @@ mod tests {
         let (client, server) = tokio::io::duplex(65536);
         let serving = tokio::spawn(async move { McpHistoryService::new().serve(server).await });
         let mut client = tokio::io::BufReader::new(client);
-        client.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.unwrap();
+        client
+            .get_mut()
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\
+            \"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\
+            \"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
+            )
+            .await
+            .unwrap();
         let mut response = String::new();
         client.read_line(&mut response).await.unwrap();
         client
@@ -795,15 +829,15 @@ mod tests {
             tool_router: McpHistoryService::tool_router(),
         };
         for tool in [
-            "search", "scan", "get", "context", "trace", "metadata", "sessions", "projects",
+            "search", "scan", "sources", "get", "context", "trace", "metadata", "sessions", "projects",
         ] {
             let request = test_context().await;
             request.ct.cancel();
             let mut params = serde_json::json!({"ref":"session0:1", "project":"project", "before":0, "after":0});
             let result = match tool {
-                "search" | "scan" => {
-                    if tool == "scan" {
-                        params["mode"] = serde_json::json!("scan");
+                "search" | "scan" | "sources" => {
+                    if tool != "search" {
+                        params["mode"] = serde_json::json!(tool);
                     }
                     service
                         .history_search(Parameters(serde_json::from_value(params).unwrap()), request)
@@ -850,6 +884,341 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(body["error"], "cancelled", "{tool}: {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn repair_sources_public_invalid_limits_leave_capacity_available() {
+        let root = std::env::temp_dir().join(format!("history-source-limit-{}", std::process::id()));
+        let project = root.join("fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("fixture1.jsonl"), "").unwrap();
+        let service = McpHistoryService {
+            config: Config {
+                projects_dir: root.clone(),
+            },
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        for (params, expected) in [
+            (
+                serde_json::json!({"mode":"sources", "project":"missing"}),
+                "project_not_found",
+            ),
+            (
+                serde_json::json!({"mode":"sources", "project":"fixture", "all":true}),
+                "invalid_arguments",
+            ),
+            (serde_json::json!({"mode":"sources"}), "no_current_project"),
+        ] {
+            let result = service
+                .history_search(
+                    Parameters(serde_json::from_value(params).unwrap()),
+                    test_context().await,
+                )
+                .await
+                .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["isError"], true);
+            let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["error"], expected);
+            assert_eq!(body["available"]["details"][0]["id"], "fixture");
+        }
+        for limit in [129, 129, 129, 129, 129, 1] {
+            let params = serde_json::json!({"mode":"sources", "project":"fixture", "limit":limit});
+            let result = service
+                .history_search(
+                    Parameters(serde_json::from_value(params).unwrap()),
+                    test_context().await,
+                )
+                .await
+                .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            if limit == 1 {
+                assert_ne!(result["isError"], true, "{result}");
+                assert_eq!(body["items"].as_array().unwrap().len(), 1);
+                let params = body["release_query"].clone();
+                let released = service
+                    .history_search(
+                        Parameters(serde_json::from_value(params).unwrap()),
+                        test_context().await,
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(serde_json::to_value(released).unwrap()["isError"], true);
+            } else {
+                assert_eq!(body["error"], "invalid_arguments");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mh_h03_public_sources_retains_completed_page_on_late_cancellation() {
+        let root = std::env::temp_dir().join(format!(
+            "history-sources-late-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("fixture1.jsonl"), "").unwrap();
+        let service = McpHistoryService {
+            config: Config {
+                projects_dir: root.clone(),
+            },
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        for _ in 0..5 {
+            let request = test_context().await;
+            let cancelled = request.ct.clone();
+            let config = service.config.clone();
+            let scans = service.scans.clone();
+            let result = run_history_work(
+                request,
+                move || {
+                    let result = scans.sources(
+                        &config,
+                        crate::stream_scan::SourcesRequest {
+                            params: SearchParams {
+                                projects: vec!["fixture".into()],
+                                ..SearchParams::default()
+                            },
+                            cursor: None,
+                            release: false,
+                            explicit_filters: serde_json::json!({}),
+                        },
+                    );
+                    cancelled.cancel();
+                    result
+                },
+                |result| match result {
+                    Ok(text) => ok_text(text),
+                    Err(error) => error_text(pretty_error(error)),
+                },
+            )
+            .await
+            .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_ne!(result["isError"], true, "{result}");
+            let page: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(page["items"].as_array().unwrap().len(), 1);
+            let release = service
+                .history_search(
+                    Parameters(serde_json::from_value(page["release_query"].clone()).unwrap()),
+                    test_context().await,
+                )
+                .await
+                .unwrap();
+            assert_ne!(serde_json::to_value(release).unwrap()["isError"], true);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_h01_h02_public_get_validates_paths_and_redacts_exports() {
+        let owner = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("history-get-repair-{owner}"));
+        let project = root.join("fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        let text = "Authorization: Basic Zml4dHVyZTpwYXNz\nAuthorization: Custom fixture.opaque\nAuthorization: \
+            AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-date, \
+            Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nAuthorization: AWS \
+            EXAMPLEACCESS:fixture-signature=\nX-Diagnostic: visible";
+        std::fs::write(
+            project.join("fixture1.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "fixture",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": text
+                    }
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "fixture-tool",
+                    "timestamp": "2026-10-01T00:00:01Z",
+                    "message": {
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "fixture-tool-use",
+                            "name": "Bash",
+                            "input": {"command": text, "note": "visible"}
+                        }]
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let service = McpHistoryService {
+            config: Config {
+                projects_dir: root.clone(),
+            },
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        let temp_root = crate::get::resolve_output_dir("tmp:.").unwrap();
+        for suffix in ["escape", "escape/body.txt"] {
+            let params = serde_json::json!({
+                "ref": "fixture1:1",
+                "project": "fixture",
+                "output": temp_root.join(format!("missing-{owner}/../../{suffix}"))
+            });
+            let result = service
+                .history_get(
+                    Parameters(serde_json::from_value(params).unwrap()),
+                    test_context().await,
+                )
+                .await
+                .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["isError"], true, "{result}");
+            let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["error"], "invalid_output_dir");
+        }
+        for mode in ["auto", "strict", "off"] {
+            for (reference, view) in [
+                ("fixture1:1", "content"),
+                ("fixture1:1", "record"),
+                ("fixture1:2", "content"),
+                ("fixture1:2", "record"),
+                ("fixture1:2", "tool_input"),
+            ] {
+                for export in [false, true] {
+                    let mut params =
+                        serde_json::json!({"ref":reference, "project":"fixture", "view":view, "redaction":mode});
+                    if export {
+                        params["output"] =
+                            serde_json::json!(temp_root.join(format!("missing-{owner}/../get-{owner}/body.txt")));
+                    }
+                    let result = service
+                        .history_get(
+                            Parameters(serde_json::from_value(params).unwrap()),
+                            test_context().await,
+                        )
+                        .await
+                        .unwrap();
+                    let result = serde_json::to_value(result).unwrap();
+                    assert_ne!(result["isError"], true, "{result}");
+                    let body: serde_json::Value =
+                        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                    let content = if export {
+                        std::fs::read_to_string(body["output"]["content"].as_str().unwrap()).unwrap()
+                    } else {
+                        body["content"].as_str().unwrap().to_string()
+                    };
+                    assert_eq!(
+                        content.contains("Zml4dHVyZTpwYXNz"),
+                        mode == "off",
+                        "{view} {mode} {content}"
+                    );
+                    assert_eq!(
+                        content.contains("fixture.opaque"),
+                        mode == "off",
+                        "{view} {mode} {content}"
+                    );
+                    for secret in ["EXAMPLEACCESS", "0123456789abcdef", "fixture-signature="] {
+                        assert_eq!(
+                            content.contains(secret),
+                            mode == "off",
+                            "{reference} {view} {mode} {content}"
+                        );
+                    }
+                    assert!(content.contains("X-Diagnostic: visible"));
+                }
+            }
+        }
+        assert!(!temp_root.join(format!("missing-{owner}")).exists());
+        std::fs::remove_dir_all(temp_root.join(format!("get-{owner}"))).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_h03_published_get_survives_late_cancellation() {
+        let root = std::env::temp_dir().join(format!(
+            "history-publish-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("fixture1.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "fixture",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": "published-fixture"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let request = test_context().await;
+        let cancellation = request.ct.clone();
+        let result = run_history_work(
+            request,
+            move || {
+                let response = get(
+                    &Config {
+                        projects_dir: root.clone(),
+                    },
+                    GetParams {
+                        r#ref: "fixture1:1".into(),
+                        project: Some("fixture".into()),
+                        source: None,
+                        range: None,
+                        output: Some(format!(
+                            "tmp:publish-cancel-{}/body.txt",
+                            root.file_name().unwrap().to_string_lossy()
+                        )),
+                        overwrite: false,
+                        redaction: crate::utils::RedactionMode::Auto,
+                        view: None,
+                        block: None,
+                    },
+                );
+                cancellation.cancel();
+                std::fs::remove_dir_all(root).unwrap();
+                response
+            },
+            tool_text_result,
+        )
+        .await
+        .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        let body: serde_json::Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let content = std::path::Path::new(body["output"]["content"].as_str().unwrap());
+        assert_eq!(std::fs::read_to_string(content).unwrap(), "published-fixture");
+        assert_eq!(body["output"]["complete"], true);
+        std::fs::remove_dir_all(content.parent().unwrap()).unwrap();
+        let control = crate::record_reader::WorkControl::new(|| true, std::time::Duration::from_secs(1));
+        assert_eq!(
+            control.run(crate::record_reader::check_work).unwrap_err().error,
+            "cancelled"
+        );
     }
 
     #[tokio::test]
@@ -906,10 +1275,55 @@ mod tests {
             "x".repeat(crate::utils::MAX_JSONL_LINE_BYTES + 4096)
         );
         let records = [
-            serde_json::json!({"type":"user", "uuid":"before", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":"before-normal"}}),
-            serde_json::json!({"type":"assistant", "uuid":"call", "timestamp":"2026-10-01T00:00:01Z", "message":{"content":[{"type":"tool_use", "id":"large-call", "name":"mcp__fixture__probe", "input":{"note":"call-input"}}]}}),
-            serde_json::json!({"type":"user", "uuid":"large-result", "timestamp":"2026-10-01T00:00:02Z", "message":{"content":[{"type":"tool_result", "tool_use_id":"large-call", "content":result_text, "is_error":false}]}}),
-            serde_json::json!({"type":"user", "uuid":"after", "timestamp":"2026-10-01T00:00:03Z", "message":{"content":format!("after-normal-{}", "y".repeat(32768))}}),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "before",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": "before-normal"
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "call",
+                "timestamp": "2026-10-01T00:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "large-call",
+                            "name": "mcp__fixture__probe",
+                            "input": {
+                                "note": "call-input"
+                            }
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "large-result",
+                "timestamp": "2026-10-01T00:00:02Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "large-call",
+                            "content": result_text,
+                            "is_error": false
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "after",
+                "timestamp": "2026-10-01T00:00:03Z",
+                "message": {
+                    "content": format!("after-normal-{}",
+                    "y".repeat(32768))
+                }
+            }),
         ];
         let mut file = std::io::BufWriter::new(fs::File::create(&source).unwrap());
         use std::io::Write;
@@ -926,7 +1340,15 @@ mod tests {
             scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
-        let params = serde_json::json!({"ref":"window00:3", "project":"window", "source":source, "before":1, "after":1, "max_content":200, "redaction":"strict"});
+        let params = serde_json::json!({
+            "ref": "window00:3",
+            "project": "window",
+            "source": source,
+            "before": 1,
+            "after": 1,
+            "max_content": 200,
+            "redaction": "strict"
+        });
         for result in [
             service
                 .history_context(
@@ -975,8 +1397,35 @@ mod tests {
         }
         let filter_source = project.join("filter00.jsonl");
         let filter_records = [
-            serde_json::json!({"type":"assistant", "uuid":"filter-call", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":"filter-call", "name":"mcp__fixture__probe", "input":{}}]}}),
-            serde_json::json!({"type":"user", "uuid":"filter-result", "timestamp":"2026-10-01T00:00:01Z", "message":{"content":[{"type":"tool_result", "tool_use_id":"filter-call", "content":"fixture"}]}}),
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "filter-call",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "filter-call",
+                            "name": "mcp__fixture__probe",
+                            "input": {}
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "filter-result",
+                "timestamp": "2026-10-01T00:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "filter-call",
+                            "content": "fixture"
+                        }
+                    ]
+                }
+            }),
         ];
         fs::write(
             &filter_source,
@@ -1004,7 +1453,13 @@ mod tests {
                 usize::from(tools != "mcp__other__probe")
             );
         }
-        let get_params = serde_json::json!({"ref":"window00:3", "project":"window", "source":source, "range":"100-200", "redaction":"strict"});
+        let get_params = serde_json::json!({
+            "ref": "window00:3",
+            "project": "window",
+            "source": source,
+            "range": "100-200",
+            "redaction": "strict"
+        });
         let result = service
             .history_get(
                 Parameters(serde_json::from_value(get_params).unwrap()),
@@ -1051,7 +1506,30 @@ mod tests {
         for (index, source) in sources.iter().enumerate() {
             let path = root.join(source);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("{}\n", serde_json::json!({"type":"assistant", "uuid":format!("source-{index}"), "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":format!("call-{index}"), "name":"mcp__fixture__source", "input":{"note":format!("selected-source-{index}")}}]}}))).unwrap();
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "assistant",
+                        "uuid": format!("source-{index}"),
+                        "timestamp": "2026-10-01T00:00:00Z",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": format!("call-{index}"),
+                                    "name": "mcp__fixture__source",
+                                    "input": {
+                                        "note": format!("selected-source-{index}")
+                                    }
+                                }
+                            ]
+                        }
+                    })
+                ),
+            )
+            .unwrap();
             paths.push(path.canonicalize().unwrap());
         }
         let searched = service
@@ -1140,11 +1618,26 @@ mod tests {
             }
         }
         for (index, source) in paths.iter().enumerate() {
-            let extra = serde_json::json!({"type":"user", "uuid":format!("extra-{index}"), "timestamp":"2026-10-01T00:00:00Z", "message":{"content":format!("selected-source-{index} {}", "x".repeat(32768))}});
+            let extra = serde_json::json!({
+                "type": "user",
+                "uuid": format!("extra-{index}"),
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": format!("selected-source-{index} {}",
+                    "x".repeat(32768))
+                }
+            });
             use std::io::Write;
             writeln!(fs::OpenOptions::new().append(true).open(source).unwrap(), "{extra}").unwrap();
             for mode in ["normal", "scan"] {
-                let mut query = serde_json::json!({"source":source, "subagents":index > 0, "mode":mode, "limit":1, "max_content":100, "max_total":15000});
+                let mut query = serde_json::json!({
+                    "source": source,
+                    "subagents": index > 0,
+                    "mode": mode,
+                    "limit": 1,
+                    "max_content": 100,
+                    "max_total": 15000
+                });
                 if mode == "scan" {
                     query["scan_bytes"] = serde_json::json!(16384);
                 }
@@ -1299,7 +1792,13 @@ mod tests {
             ),
         ] {
             for mode in ["normal", "scan"] {
-                let query = serde_json::json!({"mode":mode, "source":source, "project":project, "sessions":sessions, "subagents":subagents});
+                let query = serde_json::json!({
+                    "mode": mode,
+                    "source": source,
+                    "project": project,
+                    "sessions": sessions,
+                    "subagents": subagents
+                });
                 let result = service
                     .history_search(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
                     .await
@@ -1388,8 +1887,15 @@ mod tests {
                 path,
                 format!(
                     "{}\n",
-                    serde_json::json!({"uuid": id, "type": "user",
-                "timestamp": "2026-01-01T00:00:00Z", "message": {"content": format!("scope-needle-{id} {}", "x".repeat(1000))}})
+                    serde_json::json!({
+                        "uuid": id,
+                        "type": "user",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "message": {
+                            "content": format!("scope-needle-{id} {}",
+                            "x".repeat(1000))
+                        }
+                    })
                 ),
             )
             .unwrap();
@@ -1504,10 +2010,32 @@ mod tests {
         let code = "token = text(node, 1)";
         let secret = "fixture_secret_NOT_A_REAL_CREDENTIAL";
         let records = [code.to_string(), format!("token=build(\"{secret}\")")];
-        let body = records.iter().enumerate().map(|(i, text)| format!("{}\n", serde_json::json!({
-            "uuid": format!("code-{i}"), "type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
-            "message": {"content": [{"type": "tool_use", "id": format!("tool-{i}"), "name": "Bash", "input": {"command": text}}]}
-        }))).collect::<String>();
+        let body = records
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "uuid": format!("code-{i}"),
+                        "type": "assistant",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": format!("tool-{i}"),
+                                    "name": "Bash",
+                                    "input": {
+                                        "command": text
+                                    }
+                                }
+                            ]
+                        }
+                    })
+                )
+            })
+            .collect::<String>();
         fs::write(project.join("code0000.jsonl"), body).unwrap();
         let service = McpHistoryService {
             config: Config {
@@ -1597,9 +2125,28 @@ mod tests {
         .iter()
         .enumerate()
         {
-            writeln!(file, "{}", serde_json::json!({"uuid": format!("call-{idx}"), "type": "assistant",
-                "timestamp": "2026-01-01T00:00:00Z", "message": {"content": [{"type": "tool_use", "id": format!("tool-{idx}"),
-                    "name": name, "input": {"command": "fixture-needle"}}]}})).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("call-{idx}"),
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": format!("tool-{idx}"),
+                                "name": name,
+                                "input": {
+                                    "command": "fixture-needle"
+                                }
+                            }
+                        ]
+                    }
+                })
+            )
+            .unwrap();
         }
         drop(file);
         let service = McpHistoryService {
@@ -1609,7 +2156,11 @@ mod tests {
             scans: crate::stream_scan::ScanStore::default(),
             tool_router: McpHistoryService::tool_router(),
         };
-        let base = serde_json::json!({"pattern": "fixture-needle", "project": "project", "tools": "Bash,mcp__mcp-ssh__ssh_exec"});
+        let base = serde_json::json!({
+            "pattern": "fixture-needle",
+            "project": "project",
+            "tools": "Bash,mcp__mcp-ssh__ssh_exec"
+        });
         for mode in ["normal", "dry_run", "summary", "aggregate", "output"] {
             let mut params = base.clone();
             if mode == "output" {
@@ -1712,14 +2263,41 @@ mod tests {
         let mut file = std::io::BufWriter::new(fs::File::create(project.join("large-session.jsonl")).unwrap());
         for line in 1..=100_005 {
             let record = if line % 2 == 1 {
-                serde_json::json!({"uuid": format!("call-{line}"), "type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
-                    "message": {"content": [{"type": "tool_use", "id": format!("tool-{line}"),
-                        "name": "Bash", "input": {"command": "fixture"}}]}})
+                serde_json::json!({
+                    "uuid": format!("call-{line}"),
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": format!("tool-{line}"),
+                                "name": "Bash",
+                                "input": {
+                                    "command": "fixture"
+                                }
+                            }
+                        ]
+                    }
+                })
             } else {
-                serde_json::json!({"uuid": format!("result-{line}"), "type": "user", "timestamp": "2026-01-01T00:00:00Z",
-                    "parentUuid": format!("call-{}", line - 1),
-                    "message": {"content": [{"type": "tool_result", "tool_use_id": format!("tool-{}", line - 1),
-                        "content": format!("message-{line} password=fixture_secret")}]}})
+                serde_json::json!({
+                    "uuid": format!("result-{line}"),
+                    "type": "user",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "parentUuid": format!("call-{}",
+                    line - 1),
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": format!("tool-{}",
+                                line - 1),
+                                "content": format!("message-{line} password=fixture_secret")
+                            }
+                        ]
+                    }
+                })
             };
             writeln!(file, "{record}").unwrap();
         }
@@ -1793,8 +2371,19 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         let mut file = fs::File::create(project.join("window-session.jsonl")).unwrap();
         for line in 1..=60 {
-            writeln!(file, "{}", serde_json::json!({"uuid": format!("message-{line}"), "type": "user",
-                "timestamp": "2026-01-01T00:00:00Z", "message": {"content": format!("message-{line} password=fixture_secret")}})).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "uuid": format!("message-{line}"),
+                    "type": "user",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {
+                        "content": format!("message-{line} password=fixture_secret")
+                    }
+                })
+            )
+            .unwrap();
         }
         drop(file);
         let service = McpHistoryService {
@@ -1954,11 +2543,43 @@ mod tests {
         for record in [
             serde_json::json!({"uuid": "human", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
                 "message": {"content": text}}),
-            serde_json::json!({"uuid": "call", "type": "assistant", "timestamp": "2026-01-01T00:00:01Z",
-                "message": {"content": [{"type": "tool_use", "id": "call-1", "name": "Bash", "input": {"command": embedded}}]}}),
-            serde_json::json!({"uuid": "result", "parentUuid": "call", "type": "user", "timestamp": "2026-01-01T00:00:02Z",
-                "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1",
-                    "content": [{"type": "text", "text": body}]}]}}),
+            serde_json::json!({
+                "uuid": "call",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "Bash",
+                            "input": {
+                                "command": embedded
+                            }
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "uuid": "result",
+                "parentUuid": "call",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:02Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": body
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
         ] {
             writeln!(file, "{record}").unwrap();
         }
@@ -2115,8 +2736,195 @@ mod tests {
             ("output", "cwd:"),
             ("output_format", "jsonl"),
             ("subagents", "subagents/workflows/<run>/agent-<id>.jsonl"),
+            ("project", "当前项目"),
+            ("all", "所有项目"),
+            ("sessions", "all=true"),
+            ("since", "RFC3339"),
+            ("until", "UTC"),
         ] {
             assert!(properties[name]["description"].as_str().unwrap().contains(term));
+        }
+    }
+
+    #[tokio::test]
+    async fn broad_normal_and_scan_preserve_filename_pattern_and_recent_date_filters() {
+        use std::fs;
+        let owner = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("history-broad-pattern-{owner}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(".owner"), &owner).unwrap();
+        let pattern = ".claude/skills/mrdr-optimize-analysis/SKILL.md";
+        let cache = serde_json::json!({"type":"api-request-blob", "message":{"content":
+            (0..2000).map(|index| serde_json::json!({"index":index,"text":"synthetic ignored cache"})).collect::<Vec<_>>()
+        }}).to_string();
+        for project in 0..4 {
+            let directory = root.join(format!("project-{project}"));
+            fs::create_dir_all(directory.join("session-main/subagents/workflows/run")).unwrap();
+            for (index, relative) in [
+                "session-main.jsonl",
+                "session-main/subagents/agent-one.jsonl",
+                "session-main/subagents/workflows/run/agent-two.jsonl",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let record = |uuid: &str, timestamp: &str, content: &str| {
+                    serde_json::json!({
+                        "type":"user","uuid":format!("{project}-{index}-{uuid}"),"timestamp":timestamp,
+                        "message":{"role":"user","content":content}
+                    })
+                };
+                fs::write(
+                    directory.join(relative),
+                    format!(
+                        "{cache}\n{}\n{}\n{}\n",
+                        record("old", "2026-10-01T00:00:00Z", pattern),
+                        record("match", "2026-10-29T12:00:00Z", pattern),
+                        record("other", "2026-10-29T12:00:00Z", "other text")
+                    ),
+                )
+                .unwrap();
+            }
+        }
+        let service = McpHistoryService {
+            config: Config {
+                projects_dir: root.clone(),
+            },
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        let mut collections = Vec::new();
+        for mode in ["normal", "scan"] {
+            let started = std::time::Instant::now();
+            let mut query = serde_json::json!({"mode":mode,"all":true,"subagents":true,"pattern":pattern,
+                "since":"2026-10-28","until":"2026-10-30","types":"user","subtypes":"human",
+                "limit":100,"max_content":100,"max_total":100000});
+            if mode == "scan" {
+                query["scan_bytes"] = serde_json::json!(16384);
+            }
+            let mut rows = std::collections::BTreeSet::new();
+            let last = loop {
+                let result = service
+                    .history_search(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
+                    .await
+                    .unwrap();
+                let result = serde_json::to_value(result).unwrap();
+                assert_ne!(result["isError"], true, "{result}");
+                let body: serde_json::Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                for row in body["results"].as_array().unwrap() {
+                    assert_eq!(row["line"], 3);
+                    assert_eq!(row["content"], pattern);
+                    assert_eq!(row["timestamp"], "2026-10-29T12:00:00Z");
+                    rows.insert(
+                        serde_json::json!({"source":row["source"],"uuid":row["uuid"],"line":row["line"],
+                        "type":row["type"],"subtype":row["subtype"],"content":row["content"]})
+                        .to_string(),
+                    );
+                }
+                if body["has_more"] == false {
+                    break body;
+                }
+                query = body["next_query"].clone();
+            };
+            assert_eq!(rows.len(), 12);
+            assert_eq!(last["stats"]["files_scanned"], 12);
+            if mode == "scan" {
+                assert_eq!(last["scan_complete"], true);
+                assert_eq!(last["counts_exact"], true);
+                let result = service
+                    .history_scan_metadata(
+                        Parameters(
+                            serde_json::from_value(serde_json::json!({
+                                "scan_id":last["scan_id"],"limit":100,"max_total":100000
+                            }))
+                            .unwrap(),
+                        ),
+                        test_context().await,
+                    )
+                    .await
+                    .unwrap();
+                let result = serde_json::to_value(result).unwrap();
+                assert_ne!(result["isError"], true, "{result}");
+                let metadata: serde_json::Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(metadata["dimensions"]["files"]["returned"], 12);
+            } else {
+                assert_eq!(last["stats"]["total_matches_exact"], true);
+            }
+            println!(
+                "{}",
+                serde_json::json!({"mode":mode,"query_ms":started.elapsed().as_millis(),
+                "files":12,"matches":rows.len(),"pattern":pattern})
+            );
+            collections.push(rows);
+        }
+        assert_eq!(collections[0], collections[1]);
+        assert_eq!(fs::read_to_string(root.join(".owner")).unwrap(), owner);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn get_schema_describes_output_roots() {
+        let schema = serde_json::to_value(schemars::schema_for!(GetToolParams)).unwrap();
+        let description = schema["properties"]["output"]["description"].as_str().unwrap();
+        for term in ["tmp:", "cwd:", "相对路径默认 tmp:", "绝对路径仅允许", "实际 output"] {
+            assert!(description.contains(term), "missing {term}: {description}");
+        }
+    }
+
+    #[test]
+    fn message_filter_schemas_describe_canonical_values() {
+        for schema in [
+            schemars::schema_for!(SearchToolParams),
+            schemars::schema_for!(ContextToolParams),
+            schemars::schema_for!(TraceToolParams),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            for (field, values) in [
+                ("types", crate::utils::MESSAGE_TYPES),
+                ("subtypes", crate::utils::MESSAGE_SUBTYPES),
+            ] {
+                let description = schema["properties"][field]["description"].as_str().unwrap();
+                for &value in values {
+                    assert!(description.contains(value), "{field} missing {value}: {description}");
+                }
+            }
+            assert!(
+                schema["properties"]["types"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("history_sessions.title")
+            );
+        }
+    }
+
+    #[test]
+    fn message_range_schemas_describe_offsets_and_filtered_counts() {
+        let get = serde_json::to_value(schemars::schema_for!(GetToolParams)).unwrap();
+        let range = get["properties"]["range"]["description"].as_str().unwrap();
+        for term in ["start-end", "0-100000", "Unicode", "半开"] {
+            assert!(range.contains(term), "missing {term}: {range}");
+        }
+        for schema in [
+            schemars::schema_for!(ContextToolParams),
+            schemars::schema_for!(TraceToolParams),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            for field in ["before", "after"] {
+                let description = schema["properties"][field]["description"].as_str().unwrap();
+                for term in ["types", "subtypes", "pattern", "匹配", "2,000", "被过滤"] {
+                    assert!(description.contains(term), "{field} missing {term}: {description}");
+                }
+            }
         }
     }
 

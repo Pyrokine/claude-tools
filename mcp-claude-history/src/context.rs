@@ -279,28 +279,43 @@ pub fn context(config: &Config, params: ContextParams) -> Result<ContextResponse
 }
 
 fn budget_context_response(response: &mut ContextResponse, max_total: usize) -> Result<(), ErrorResponse> {
-    loop {
-        let bytes = serde_json::to_vec(response)
-            .map_err(|e| invalid_arguments(format!("序列化 context 失败: {e}")))?
-            .len();
-        if bytes <= max_total {
-            return Ok(());
-        }
-        if let Some(position) = response
+    use crate::record_reader::{check_work, serialize_json};
+    let mut sizes = response
+        .messages
+        .iter()
+        .map(|message| serialize_json(std::io::sink(), message, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let messages = std::mem::take(&mut response.messages);
+    let fixed = serialize_json(std::io::sink(), response, false);
+    response.messages = messages;
+    let mut bytes = fixed? + sizes.iter().sum::<usize>() + sizes.len().saturating_sub(1);
+    while bytes > max_total {
+        check_work()?;
+        let Some(position) = response
             .messages
             .iter()
             .rposition(|message| message.is_anchor != Some(true))
-        {
-            response.messages.remove(position);
-            response.truncated = Some(true);
-        } else {
+        else {
             return Err(ErrorResponse {
                 error: "response_too_large".to_string(),
                 message: format!("context 响应超过 max_total={max_total} 字节；请增大预算或缩小范围"),
                 available: Some(serde_json::json!({"serialized_bytes": bytes, "max_total_bytes": max_total})),
             });
+        };
+        response.messages.remove(position);
+        bytes -= sizes.remove(position) + usize::from(!sizes.is_empty());
+        match response.truncated.replace(true) {
+            None => bytes += r#","truncated":true"#.len(),
+            Some(false) => bytes -= 1,
+            Some(true) => {}
         }
     }
+    let actual = serialize_json(std::io::sink(), response, false)?;
+    debug_assert_eq!(actual, bytes);
+    if actual > max_total {
+        return Err(invalid_arguments("context 响应字节预算计算不一致"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,6 +323,51 @@ mod tests {
     use super::*;
     use std::env;
     use std::process;
+
+    #[test]
+    fn repair_h03_context_encoding_work_is_linear() {
+        let mut response = ContextResponse {
+            anchor_ref: "fixture:1000".into(),
+            messages: (0..2000)
+                .map(|index| ContextMessage {
+                    r#ref: format!("fixture:{index}"),
+                    r#type: "user".into(),
+                    subtype: "human".into(),
+                    content: "中\\\"\n".repeat(100),
+                    is_anchor: (index == 1000).then_some(true),
+                })
+                .collect(),
+            truncated: None,
+            warnings: vec!["fixture".into()],
+            output_path: None,
+            output: None,
+        };
+        let original = serde_json::to_vec(&response).unwrap().len();
+        crate::record_reader::SERIALIZED_BYTES.set(0);
+        budget_context_response(&mut response, 3000).unwrap();
+        let encoded = crate::record_reader::SERIALIZED_BYTES.get();
+        eprintln!("context encoded={encoded} original={original}");
+        assert!(encoded >= original);
+        assert!(encoded < original + 6000, "encoded={encoded}, original={original}");
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 3000);
+        assert!(response.messages.iter().any(|message| message.is_anchor == Some(true)));
+    }
+
+    #[test]
+    fn repair_h03_context_budget_checks_cancellation() {
+        let mut response = ContextResponse {
+            anchor_ref: "fixture:1".into(),
+            messages: vec![],
+            truncated: None,
+            warnings: vec![],
+            output_path: None,
+            output: None,
+        };
+        let error = crate::record_reader::WorkControl::new(|| true, std::time::Duration::from_secs(1))
+            .run(|| budget_context_response(&mut response, 512))
+            .unwrap_err();
+        assert_eq!(error.error, "cancelled");
+    }
 
     #[test]
     fn legal_non_message_records_do_not_count_as_parse_errors() {
@@ -323,7 +383,16 @@ mod tests {
         )
         .unwrap();
         writeln!(file, "{{").unwrap();
-        writeln!(file, "{}", serde_json::json!({"uuid": "incomplete"})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "uuid": "incomplete",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z"
+            })
+        )
+        .unwrap();
         writeln!(
             file,
             "{}",

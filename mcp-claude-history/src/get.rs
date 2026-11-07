@@ -70,7 +70,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     let located = loop {
         match lines.step(&mut remaining, deadline)? {
             crate::record_reader::LineStep::Record(record) if record.line == parsed_ref.line => break record,
-            crate::record_reader::LineStep::Record(_) => {}
+            crate::record_reader::LineStep::Record(mut record) => lines.recycle(&mut record),
             crate::record_reader::LineStep::Yield => {
                 return Err(crate::record_reader::reader_error(
                     "deadline_exceeded",
@@ -93,11 +93,18 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
     let line = located.small.expect("bounded message line");
 
     // 解析消息
-    let record: MessageRecord = serde_json::from_slice(&line).map_err(|e| ErrorResponse {
+    let line = std::str::from_utf8(&line).map_err(|e| ErrorResponse {
         error: "parse_error".to_string(),
         message: format!("解析消息失败: {e}"),
         available: None,
     })?;
+    let record = parse_message_record(line)
+        .map_err(|e| ErrorResponse {
+            error: "parse_error".to_string(),
+            message: format!("解析消息失败: {e}"),
+            available: None,
+        })?
+        .ok_or_else(|| crate::record_reader::reader_error("parse_error", "目标行不是消息记录"))?;
 
     // 提取内容和图片
     let (effective_type, _) = classify_message(&record);
@@ -261,9 +268,19 @@ fn get_indexed(
         let manifest_path = transaction.manifest();
         let sample_kind = if params.range.is_some() { "range" } else { "all" }.to_string();
         let manifest = serde_json::json!({
-            "schema": "mcp-claude-history.get-output.v2", "ref": params.r#ref, "view": view, "block": params.block,
-            "content_size": content_size, "original_content_size": original_content_size, "content": content_path,
-            "images": image_paths, "bytes": bytes, "lines": lines, "complete": true, "sample_kind": sample_kind, "redaction": redaction,
+            "schema": "mcp-claude-history.get-output.v2",
+            "ref": params.r#ref,
+            "view": view,
+            "block": params.block,
+            "content_size": content_size,
+            "original_content_size": original_content_size,
+            "content": content_path,
+            "images": image_paths,
+            "bytes": bytes,
+            "lines": lines,
+            "complete": true,
+            "sample_kind": sample_kind,
+            "redaction": redaction,
         });
         let mut manifest_file = open_private_output_file(&transaction.staging_manifest())?;
         manifest_file
@@ -446,9 +463,17 @@ pub fn find_session_file(
             available: Some(serde_json::json!({
                 "candidates": matches
                     .iter()
-                    .map(|(project, session, _)| format!("{project}:{session}"))
+                    .map(|(project,
+                session,
+                _)| format!("{project}:{session}"))
                     .collect::<Vec<_>>(),
-                "sources": matches.iter().map(|(project, session, path)| serde_json::json!({"project":project,"session":session,"source":path})).collect::<Vec<_>>()
+                "sources": matches.iter().map(|(project,
+                session,
+                path)| serde_json::json!({
+                    "project": project,
+                    "session": session,
+                    "source": path
+                })).collect::<Vec<_>>()
             })),
         });
     }
@@ -507,8 +532,19 @@ pub fn resolve_output_files(
         .or_else(|| trimmed.strip_prefix(CWD_PATH_PREFIX))
         .unwrap_or(trimmed);
     let requested_path = Path::new(path_part);
-    if requested_path.extension().is_none() {
-        let directory = resolve_output_dir(trimmed)?;
+    let directory = resolve_output_dir(trimmed)?;
+    let is_directory = match fs::metadata(&directory) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(ErrorResponse {
+                error: "invalid_output_dir".to_string(),
+                message: format!("无法检查输出路径: {error}"),
+                available: None,
+            });
+        }
+    };
+    if requested_path.extension().is_none() || is_directory {
         return Ok(ResolvedOutputFiles {
             content: directory.join(default_file_name),
             manifest: directory.join(default_manifest_name),
@@ -1045,6 +1081,7 @@ impl OutputTransaction {
 
         let parent = self.final_dir.parent().expect("output parent exists");
         let backup = parent.join(format!(".mcp-history-backup-{}", export_nonce()));
+        crate::record_reader::check_work()?;
         let journal = if had_existing {
             match fs::symlink_metadata(&backup) {
                 Ok(_) => {
@@ -1084,6 +1121,12 @@ impl OutputTransaction {
         } else {
             None
         };
+        if let Err(error) = crate::record_reader::check_work() {
+            if let Some(journal) = &journal {
+                self.restore_previous(&backup, journal)?;
+            }
+            return Err(error);
+        }
         if let Err(error) = fs::rename(&self.staging, &self.final_dir) {
             if let Some(journal) = &journal {
                 self.restore_previous(&backup, journal)?;
@@ -1095,6 +1138,7 @@ impl OutputTransaction {
             });
         }
         self.committed = true;
+        crate::record_reader::mark_output_published();
         sync_publish_directory(parent)?;
         if let Some(journal) = journal {
             fs::remove_dir_all(&backup).map_err(|error| ErrorResponse {
@@ -1664,7 +1708,7 @@ fn resolve_relative_output_dir(relative: &str, root: &Path, prefix: &str) -> Res
     })?;
 
     assert_within_allowed_root(&canonical_target, root)?;
-    Ok(candidate)
+    Ok(canonical_target)
 }
 
 fn resolve_absolute_output_dir(absolute: &Path, cwd_root: &Path, temp_root: &Path) -> Result<PathBuf, ErrorResponse> {
@@ -1675,7 +1719,7 @@ fn resolve_absolute_output_dir(absolute: &Path, cwd_root: &Path, temp_root: &Pat
     })?;
 
     if is_within_root(&canonical_target, cwd_root) || is_within_root(&canonical_target, temp_root) {
-        return Ok(absolute.to_path_buf());
+        return Ok(canonical_target);
     }
 
     Err(ErrorResponse {
@@ -1711,33 +1755,44 @@ fn is_within_root(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
-/// 对路径做 canonicalize；若路径不存在则向上找到第一个存在的祖先 canonicalize 后再拼接剩余部分
+/// 逐组件解析已有链接后处理 `..`，未创建的尾部也使用同一物理路径语义
 fn canonicalize_or_ancestor(path: &Path) -> std::io::Result<PathBuf> {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return Ok(canonical);
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::Normal(_) | Component::ParentDir) && !resolved.as_os_str().is_empty() {
+            match fs::metadata(&resolved) {
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "输出路径祖先不是目录",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) => resolved.push(component.as_os_str()),
+            Component::RootDir => {
+                resolved.push(component.as_os_str());
+                resolved = fs::canonicalize(&resolved)?;
+            }
+            Component::Normal(_) => {
+                resolved.push(component.as_os_str());
+                match fs::symlink_metadata(&resolved) {
+                    Ok(_) => resolved = fs::canonicalize(&resolved)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
     }
-    // 路径不存在，向上找到第一个存在的祖先
-    let mut current = path.to_path_buf();
-    let mut tail = PathBuf::new();
-    while let Some(parent) = current.parent() {
-        if let Some(name) = current.file_name() {
-            let mut new_tail = PathBuf::from(name);
-            new_tail.push(&tail);
-            tail = new_tail;
-        }
-        current = parent.to_path_buf();
-        if current.exists() {
-            let canonical = fs::canonicalize(&current)?;
-            return Ok(canonical.join(tail));
-        }
-        if current.as_os_str().is_empty() {
-            break;
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("无法 canonicalize 路径: {}", path.display()),
-    ))
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -1758,6 +1813,35 @@ mod tests {
             Config { projects_dir: root },
             format!("{}:1", ref_prefix(session_id)),
         )
+    }
+
+    #[test]
+    fn repair_h01_absolute_paths_preserve_parent_and_symlink_semantics() {
+        let root = env::temp_dir().join(format!("mcp-history-path-repair-{}", export_nonce()));
+        let cwd = root.join("cwd");
+        let temp = root.join("temp");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&temp).unwrap();
+        let cwd = fs::canonicalize(cwd).unwrap();
+        let temp = fs::canonicalize(temp).unwrap();
+        let escape = cwd.join("missing/../../escape");
+        let result = resolve_absolute_output_dir(&escape, &cwd, &temp);
+        assert!(result.is_err(), "escaped path accepted: {result:?}");
+        let legal = cwd.join("missing/../inside");
+        let resolved = resolve_absolute_output_dir(&legal, &cwd, &temp).unwrap();
+        assert_eq!(resolved, cwd.join("inside"));
+        assert!(!cwd.join("missing").exists());
+        #[cfg(unix)]
+        {
+            let nested = cwd.join("real/nested");
+            fs::create_dir_all(&nested).unwrap();
+            std::os::unix::fs::symlink(&nested, cwd.join("link")).unwrap();
+            let resolved = resolve_absolute_output_dir(&cwd.join("link/../inside"), &cwd, &temp).unwrap();
+            assert_eq!(resolved, cwd.join("real/inside"));
+            std::os::unix::fs::symlink(&root, cwd.join("outside")).unwrap();
+            assert!(resolve_absolute_output_dir(&cwd.join("outside/new"), &cwd, &temp).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn finished_pid() -> u32 {
@@ -1945,8 +2029,26 @@ mod tests {
     #[test]
     fn get_structured_view_selects_original_block_and_normalizes_json() {
         let (root, config, reference) = fixture(serde_json::json!({
-            "uuid": "views", "type": "assistant", "timestamp": "2026-10-12T00:00:00Z",
-            "message": {"content": [{"type":"text", "text":"before"}, {"type":"tool_use", "name":"Bash", "id":"call", "input":{"z":1,"a":"中文😀"}}]}
+            "uuid": "views",
+            "type": "assistant",
+            "timestamp": "2026-10-12T00:00:00Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "before"
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "id": "call",
+                        "input": {
+                            "z": 1,
+                            "a": "中文😀"
+                        }
+                    }
+                ]
+            }
         }));
         let response = get(
             &config,
@@ -1974,16 +2076,43 @@ mod tests {
         for (kind, block, structured_view) in [
             (
                 "assistant",
-                serde_json::json!({"type":"tool_use","id":"npm-call","name":"Bash","input":{"command":command,"note":"visible"}}),
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": "npm-call",
+                    "name": "Bash",
+                    "input": {
+                        "command": command,
+                        "note": "visible"
+                    }
+                }),
                 "tool_input",
             ),
             (
                 "user",
-                serde_json::json!({"type":"tool_result","tool_use_id":"npm-call","content":[{"type":"text","text":command}],"is_error":false}),
+                serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": "npm-call",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": command
+                        }
+                    ],
+                    "is_error": false
+                }),
                 "tool_result",
             ),
         ] {
-            let record = serde_json::json!({"uuid":"npm-fixture","type":kind,"timestamp":"2026-10-01T00:00:00Z","message":{"content":[block]}});
+            let record = serde_json::json!({
+                "uuid": "npm-fixture",
+                "type": kind,
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        block
+                    ]
+                }
+            });
             let (root, config, reference) = fixture(record);
             for view in ["content", structured_view, "record"] {
                 let params = || GetParams {
@@ -2066,6 +2195,211 @@ mod tests {
                 }
             }
             fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ql_h01_get_authorization_views_ranges_and_exports() {
+        let output_root = format!("tmp:ql-h01-get-{}", export_nonce());
+        for (text, redacted) in crate::record_reader::ql_h01_authorization_corpus() {
+            for kind in ["text", "tool_use", "tool_result"] {
+                let make_record = |text: &str| {
+                    let content = match kind {
+                        "text" => serde_json::json!(text),
+                        "tool_use" => {
+                            serde_json::json!([{
+                                "type":"tool_use", "id":"fixture-call", "name":"Bash",
+                                "input":{"command":text, "note":"visible"}
+                            }])
+                        }
+                        "tool_result" => {
+                            serde_json::json!([{"type":"tool_result", "tool_use_id":"fixture-call", "content":text}])
+                        }
+                        _ => unreachable!(),
+                    };
+                    serde_json::json!({
+                        "type":if kind == "tool_use" { "assistant" } else { "user" }, "uuid":"fixture",
+                        "timestamp":"2026-10-01T00:00:00Z", "message":{"content":content}
+                    })
+                };
+                let record = make_record(&text);
+                let expected_record = make_record(&redacted);
+                let mut views = vec![("record", record.to_string(), expected_record.to_string())];
+                if kind == "tool_use" {
+                    let input = &record["message"]["content"][0]["input"];
+                    let expected = &expected_record["message"]["content"][0]["input"];
+                    views.push(("tool_input", input.to_string(), expected.to_string()));
+                    views.push((
+                        "content",
+                        format!("[TOOL_USE:Bash({input})]"),
+                        format!("[TOOL_USE:Bash({expected})]"),
+                    ));
+                } else {
+                    views.push(("content", text.clone(), redacted.clone()));
+                    if kind == "tool_result" {
+                        views.push((
+                            "tool_result",
+                            record["message"]["content"][0].to_string(),
+                            expected_record["message"]["content"][0].to_string(),
+                        ));
+                    }
+                }
+                let (root, config, reference) = fixture(record);
+                for (view, original, redacted) in views {
+                    let redacts = original != redacted;
+                    for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                        let expected = if mode.enabled() { &redacted } else { &original };
+                        let params = || GetParams {
+                            r#ref: reference.clone(),
+                            range: None,
+                            output: None,
+                            project: Some("project".into()),
+                            source: None,
+                            redaction: mode,
+                            overwrite: false,
+                            view: Some(view.into()),
+                            block: None,
+                        };
+                        assert_eq!(
+                            success_content(get(&config, params()).unwrap()),
+                            *expected,
+                            "{kind} {view} {mode:?} {text}"
+                        );
+                        let mut ranges = vec![None];
+                        for secret in [
+                            "Zml4dHVyZTpwYXNz",
+                            "fixture.value",
+                            "EXAMPLEACCESS",
+                            "fixture.signature",
+                        ] {
+                            if let Some(start) = original.find(secret) {
+                                let start = original[..start].chars().count();
+                                ranges.push(Some((start + 2, start + 5)));
+                            }
+                        }
+                        for range in ranges {
+                            let expected = if let Some((start, end)) = range {
+                                if mode.enabled() && redacts {
+                                    "[redacted]".to_string()
+                                } else {
+                                    original.chars().skip(start).take(end - start).collect()
+                                }
+                            } else {
+                                expected.clone()
+                            };
+                            if range.is_some() {
+                                assert_eq!(
+                                    success_content(get(&config, GetParams { range, ..params() }).unwrap()),
+                                    expected
+                                );
+                            }
+                            let response = get(
+                                &config,
+                                GetParams {
+                                    range,
+                                    output: Some(format!("{output_root}/body.txt")),
+                                    ..params()
+                                },
+                            )
+                            .unwrap();
+                            let GetResponse::Output {
+                                output,
+                                content_size,
+                                original_content_size,
+                                ..
+                            } = response
+                            else {
+                                panic!("expected output response")
+                            };
+                            assert_eq!(
+                                fs::read_to_string(&output.content).unwrap(),
+                                expected,
+                                "export {kind} {view} {mode:?} {range:?} {text}"
+                            );
+                            let manifest: serde_json::Value =
+                                serde_json::from_slice(&fs::read(&output.manifest).unwrap()).unwrap();
+                            assert_eq!(manifest["redaction"]["mode"], mode.as_str());
+                            assert_eq!(
+                                manifest["redaction"]["redacted_count"],
+                                usize::from(mode.enabled() && redacts)
+                            );
+                            assert_eq!(manifest["original_content_size"], original.chars().count());
+                            assert_eq!(original_content_size, original.chars().count());
+                            assert_eq!(manifest["content_size"], expected.chars().count());
+                            assert_eq!(content_size, expected.chars().count());
+                            assert_eq!(manifest["bytes"], expected.len());
+                            assert_eq!(manifest["complete"], true);
+                            fs::remove_dir_all(output.content.parent().unwrap()).unwrap();
+                        }
+                    }
+                }
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+        fs::remove_dir_all(resolve_output_dir(&output_root).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn r29_h02_get_message_integrity_matches_record_sizes() {
+        for (message, valid) in [
+            (None, false),
+            (Some(serde_json::Value::Null), true),
+            (Some(serde_json::json!({})), true),
+            (Some(serde_json::json!({"content":""})), true),
+        ] {
+            for record_type in ["user", "assistant"] {
+                let mut record = serde_json::json!({
+                    "uuid":"fixture", "type":record_type, "timestamp":"2026-10-01T00:00:00Z"
+                });
+                if let Some(message) = &message {
+                    record["message"] = message.clone();
+                }
+                let original = record.to_string();
+                let base_size = original.len();
+                for size in [
+                    base_size,
+                    MAX_JSONL_LINE_BYTES - 1,
+                    MAX_JSONL_LINE_BYTES,
+                    MAX_JSONL_LINE_BYTES + 1,
+                ] {
+                    let line = format!("{}{original}", " ".repeat(size - base_size));
+                    assert_eq!(line.len(), size);
+                    let (root, config, reference) = fixture(record.clone());
+                    fs::write(root.join("project/session-history-test.jsonl"), line).unwrap();
+                    let params = || GetParams {
+                        r#ref: reference.clone(),
+                        range: None,
+                        output: None,
+                        project: Some("project".into()),
+                        source: None,
+                        redaction: RedactionMode::Auto,
+                        overwrite: false,
+                        view: None,
+                        block: None,
+                    };
+                    let result = get(&config, params());
+                    if valid {
+                        assert_eq!(success_content(result.unwrap()), "", "{record_type} {size}");
+                    } else {
+                        assert_eq!(result.unwrap_err().error, "parse_error", "{record_type} {size}");
+                    }
+                    assert_eq!(
+                        success_content(
+                            get(
+                                &config,
+                                GetParams {
+                                    view: Some("record".into()),
+                                    range: Some((0, 1)),
+                                    ..params()
+                                }
+                            )
+                            .unwrap()
+                        ),
+                        "{"
+                    );
+                    fs::remove_dir_all(root).unwrap();
+                }
+            }
         }
     }
 
@@ -2194,8 +2528,21 @@ mod tests {
     #[test]
     fn invalid_image_fails_without_publishing_an_export() {
         let (root, config, reference) = fixture(serde_json::json!({
-            "uuid": "image-fixture", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
-            "message": {"content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not-base64!"}}]}
+            "uuid": "image-fixture",
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "not-base64!"
+                        }
+                    }
+                ]
+            }
         }));
         let error = get(
             &config,
@@ -2463,6 +2810,59 @@ mod tests {
     }
 
     #[test]
+    fn returned_dotted_export_directories_keep_the_overwrite_destination() {
+        let (root, config, reference) = fixture(serde_json::json!({
+            "uuid": "returned-directory",
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": "original content"}
+        }));
+        let params = |output, overwrite, range| GetParams {
+            r#ref: reference.clone(),
+            range,
+            output: Some(output),
+            project: Some("project".to_string()),
+            source: None,
+            redaction: RedactionMode::Auto,
+            overwrite,
+            view: None,
+            block: None,
+        };
+        for prefix in [TMP_PATH_PREFIX, CWD_PATH_PREFIX] {
+            let name = format!("{prefix}returned-directory-{}.txt", export_nonce());
+            let GetResponse::Output { output, .. } = get(&config, params(name, false, None)).unwrap() else {
+                panic!("expected output response")
+            };
+            let directory = output.content.parent().unwrap().to_path_buf();
+            assert!(directory.extension().is_some());
+            let output_root = if prefix == TMP_PATH_PREFIX {
+                controlled_temp_root().unwrap()
+            } else {
+                fs::canonicalize(env::current_dir().unwrap()).unwrap()
+            };
+            for requested in [
+                directory.display().to_string(),
+                format!("{prefix}{}", directory.strip_prefix(&output_root).unwrap().display()),
+                format!("{}/", directory.display()),
+            ] {
+                let resolved = resolve_output_files(&requested, "message.txt", "manifest.json").unwrap();
+                assert!(!resolved.explicit_file);
+                assert_eq!(resolved.directory, directory);
+                let GetResponse::Output { output, .. } = get(&config, params(requested, true, Some((0, 8)))).unwrap()
+                else {
+                    panic!("expected output response")
+                };
+                assert_eq!(output.content.parent(), Some(directory.as_path()));
+                assert_eq!(output.manifest.parent(), Some(directory.as_path()));
+                assert_eq!(fs::read_to_string(&output.content).unwrap(), "original");
+                assert!(output.manifest.is_file());
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_windows_special_paths_before_resolving_output() {
         for name in [
             "tmp:report.txt:payload",
@@ -2489,6 +2889,24 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn repair_h03_cancel_before_publication_keeps_previous_bundle() {
+        let root = env::temp_dir().join(format!("mcp-history-publish-cancel-{}", export_nonce()));
+        fs::create_dir(&root).unwrap();
+        published_bundle(&root);
+        let replacement = OutputTransaction::begin(bundle_paths(&root), true).unwrap();
+        let staging = replacement.staging_dir().to_path_buf();
+        fs::write(replacement.staging_content(), "new").unwrap();
+        fs::write(replacement.staging_manifest(), "new manifest").unwrap();
+        let error = crate::record_reader::WorkControl::new(|| true, Duration::from_secs(1))
+            .run(|| replacement.publish())
+            .unwrap_err();
+        assert_eq!(error.error, "cancelled");
+        assert_eq!(fs::read_to_string(root.join("bundle/content.txt")).unwrap(), "old");
+        assert!(!staging.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

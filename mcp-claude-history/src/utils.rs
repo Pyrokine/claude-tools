@@ -59,10 +59,13 @@ impl<R: BufRead> Iterator for BoundedJsonlLines<R> {
                 break;
             }
             read_any = true;
-            let consumed = available
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(available.len(), |i| i + 1);
+            let consumed = match (&available[..]).skip_until(b'\n') {
+                Ok(consumed) => consumed,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+            };
             if !oversized && bytes.len().saturating_add(consumed) > MAX_JSONL_LINE_BYTES {
                 oversized = true;
                 bytes.clear();
@@ -157,7 +160,8 @@ pub fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorRespon
 #[cfg(windows)]
 pub fn set_private_permissions(path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
     // Pass the path as an environment variable; it must never be interpreted as PowerShell code.
-    let script = r#"
+    let script = concat!(
+        r#"
 $ErrorActionPreference = 'Stop'
 $p = $env:MCP_HISTORY_PRIVATE_PATH
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -178,10 +182,13 @@ $entries = @($actual.Access)
 if (-not $actual.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].IsInherited -or
     $entries[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or
     $entries[0].AccessControlType -ne 'Allow' -or
-    ($entries[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
+    ($entries[0].FileSystemRights -band "#,
+        r#"[System.Security.AccessControl.FileSystemRights]::FullControl) -ne "#,
+        r#"[System.Security.AccessControl.FileSystemRights]::FullControl) {
     throw 'private DACL verification failed'
 }
-"#;
+"#
+    );
     let result = (|| -> io::Result<std::process::Output> {
         let mut child = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -273,18 +280,90 @@ pub fn open_private_output_file(path: &Path) -> Result<File, ErrorResponse> {
 }
 
 pub fn parse_message_record(line: &str) -> Result<Option<MessageRecord>, serde_json::Error> {
-    let value: serde_json::Value = serde_json::from_str(line)?;
-    let Some(object) = value.as_object() else {
-        return serde_json::from_value(value).map(Some);
+    // 序列沿用 MessageRecord 的必填字段校验
+    if !line.trim_start().starts_with('{') {
+        return serde_json::from_str::<MessageRecord>(line).map(Some);
+    }
+    fn present_raw_value<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<&'de serde_json::value::RawValue>, D::Error> {
+        <&serde_json::value::RawValue as serde::Deserialize>::deserialize(deserializer).map(Some)
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    struct Fields<'a> {
+        #[serde(borrow, deserialize_with = "present_raw_value")]
+        uuid: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, rename = "type", deserialize_with = "present_raw_value")]
+        kind: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, deserialize_with = "present_raw_value")]
+        timestamp: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, deserialize_with = "present_raw_value")]
+        message: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, deserialize_with = "present_raw_value")]
+        is_compact_summary: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, deserialize_with = "present_raw_value")]
+        is_meta: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, deserialize_with = "present_raw_value")]
+        parent_uuid: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, rename = "sourceToolAssistantUUID", deserialize_with = "present_raw_value")]
+        source_tool_assistant_upper: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, rename = "sourceToolAssistantUuid", deserialize_with = "present_raw_value")]
+        source_tool_assistant_lower: Option<&'a serde_json::value::RawValue>,
+    }
+
+    let fallback;
+    let fields = match serde_json::from_str::<Fields<'_>>(line) {
+        Ok(fields) => [
+            ("uuid", fields.uuid),
+            ("type", fields.kind),
+            ("timestamp", fields.timestamp),
+            ("message", fields.message),
+            ("isCompactSummary", fields.is_compact_summary),
+            ("isMeta", fields.is_meta),
+            ("parentUuid", fields.parent_uuid),
+            ("sourceToolAssistantUUID", fields.source_tool_assistant_upper),
+            ("sourceToolAssistantUuid", fields.source_tool_assistant_lower),
+        ],
+        Err(_) => {
+            // 重复字段沿用原映射的最后值优先语义
+            fallback =
+                match serde_json::from_str::<std::collections::BTreeMap<String, &serde_json::value::RawValue>>(line) {
+                    Ok(fields) => fields,
+                    Err(_) => return serde_json::from_str::<MessageRecord>(line).map(Some),
+                };
+            [
+                "uuid",
+                "type",
+                "timestamp",
+                "message",
+                "isCompactSummary",
+                "isMeta",
+                "parentUuid",
+                "sourceToolAssistantUUID",
+                "sourceToolAssistantUuid",
+            ]
+            .map(|name| (name, fallback.get(name).copied()))
+        }
     };
-    if is_internal_record(
-        object.get("type").and_then(serde_json::Value::as_str),
-        object.contains_key("uuid"),
-        object.contains_key("message"),
-    ) {
+    let get = |name| {
+        fields
+            .iter()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| *value)
+    };
+    let record_type = get("type").and_then(|value| serde_json::from_str::<String>(value.get()).ok());
+    if is_internal_record(record_type.as_deref(), get("uuid").is_some(), get("message").is_some()) {
         return Ok(None);
     }
-    serde_json::from_value(value).map(Some)
+    if matches!(record_type.as_deref(), Some("user" | "assistant")) && get("message").is_none() {
+        return Err(<serde_json::Error as serde::de::Error>::missing_field("message"));
+    }
+    let fields = fields
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| (name, value)));
+    <MessageRecord as serde::Deserialize>::deserialize(serde::de::value::MapDeserializer::new(fields)).map(Some)
 }
 
 pub(crate) fn is_internal_record(record_type: Option<&str>, has_uuid: bool, has_message: bool) -> bool {
@@ -634,7 +713,7 @@ pub fn index_session_messages(
     let mut lines = crate::record_reader::RecordLines::new(reader, snapshot.len());
     loop {
         let mut remaining = u64::MAX;
-        let located = match lines.step(
+        let mut located = match lines.step(
             &mut remaining,
             std::time::Instant::now() + std::time::Duration::from_secs(120),
         )? {
@@ -651,15 +730,19 @@ pub fn index_session_messages(
         {
             break;
         }
-        let (effective_type, subtype, matches_pattern) = if let Some(line) = located.small {
-            let record = match std::str::from_utf8(&line)
+        let (effective_type, subtype, matches_pattern) = if let Some(line) = &located.small {
+            let record = match std::str::from_utf8(line)
                 .ok()
                 .and_then(|line| parse_message_record(line).ok())
             {
                 Some(Some(record)) => record,
-                Some(None) => continue,
+                Some(None) => {
+                    lines.recycle(&mut located);
+                    continue;
+                }
                 None => {
                     parse_errors += 1;
+                    lines.recycle(&mut located);
                     continue;
                 }
             };
@@ -701,6 +784,7 @@ pub fn index_session_messages(
             };
             (effective_type, subtype, matches_pattern)
         };
+        lines.recycle(&mut located);
         crate::record_reader::check_work()?;
         let pos = message_pos;
         message_pos += 1;
@@ -898,9 +982,20 @@ pub fn load_session_window(
                 message: format!(
                     "选定范围超过 {MAX_SESSION_WINDOW_BYTES} 字节，请缩小范围或用 history_get range/output 读取单条记录"
                 ),
-                available: Some(
-                    serde_json::json!({"source":path, "ref":format!("{}:{}",path.file_stem().and_then(|name| name.to_str()).unwrap_or_default(),expected.line_num), "get":{"source":path, "ref":format!("{}:{}",path.file_stem().and_then(|name| name.to_str()).unwrap_or_default(),expected.line_num), "range":"0-100000", "redaction":redaction.as_str()}}),
-                ),
+                available: Some(serde_json::json!({
+                    "source": path,
+                    "ref": format!("{}:{}",
+                    path.file_stem().and_then(|name| name.to_str()).unwrap_or_default(),
+                    expected.line_num),
+                    "get": {
+                        "source": path,
+                        "ref": format!("{}:{}",
+                        path.file_stem().and_then(|name| name.to_str()).unwrap_or_default(),
+                        expected.line_num),
+                        "range": "0-100000",
+                        "redaction": redaction.as_str()
+                    }
+                })),
             });
         }
         let mut result_previews = std::collections::BTreeMap::new();
@@ -1654,21 +1749,34 @@ pub fn matches_pattern(content: &str, pattern: &SearchPattern, case_sensitive: b
         return (true, match_pos);
     }
 
-    // case-insensitive：构造小写内容 + 小写字符索引到原文字符索引的映射
-    // 预分配 capacity（按字节上界），避免热路径多次 Vec/String grow 抖动
-    let mut lower = String::with_capacity(content.len());
-    let mut map: Vec<usize> = Vec::with_capacity(content.len());
-    for (orig_idx, ch) in content.chars().enumerate() {
-        for lc in ch.to_lowercase() {
-            lower.push(lc);
-            map.push(orig_idx);
+    let ascii = content.is_ascii();
+    let lower = if ascii {
+        content.to_ascii_lowercase()
+    } else {
+        let mut lower = String::with_capacity(content.len());
+        for character in content.chars() {
+            if character.is_ascii() {
+                lower.push(character.to_ascii_lowercase());
+            } else {
+                lower.extend(character.to_lowercase());
+            }
         }
-    }
-
+        lower
+    };
     let find_pos = |word: &str| -> Option<usize> {
         let byte_pos = lower.find(word)?;
+        if ascii {
+            return Some(byte_pos);
+        }
         let lower_char_pos = lower[..byte_pos].chars().count();
-        map.get(lower_char_pos).copied()
+        let mut lower_chars = 0;
+        for (original_index, character) in content.chars().enumerate() {
+            lower_chars += character.to_lowercase().count();
+            if lower_char_pos < lower_chars {
+                return Some(original_index);
+            }
+        }
+        None
     };
 
     // must_have（AND）：单次 find，既判断存在又获取位置
@@ -1824,12 +1932,7 @@ pub struct TextRedaction {
     pub count: usize,
 }
 
-#[derive(Debug)]
-struct RedactionEdit {
-    start: usize,
-    end: usize,
-    replacement: &'static str,
-}
+type RedactionEdit = crate::record_reader::RedactionSpan;
 
 pub fn redact_text_with_mode(text: &str, mode: RedactionMode) -> TextRedaction {
     redact_text_range_with_mode(text, mode, None)
@@ -1865,7 +1968,13 @@ pub fn redact_text_range_with_mode(text: &str, mode: RedactionMode, range: Optio
         if cursor < visible_start {
             output.push_str(&text[cursor..visible_start]);
         }
-        output.push_str(edit.replacement);
+        output.push_str(crate::record_reader::redaction_replacement(
+            edit.replacement,
+            edit.start,
+            edit.end,
+            start,
+            end,
+        ));
         cursor = cursor.max(edit.end.min(end));
         count += 1;
     }
@@ -1877,21 +1986,22 @@ pub fn redact_text_range_with_mode(text: &str, mode: RedactionMode, range: Optio
 
 pub(crate) fn npm_token_regex() -> &'static Regex {
     static NPM_TOKEN: OnceLock<Regex> = OnceLock::new();
-    NPM_TOKEN.get_or_init(|| Regex::new(r"\bnpm_[A-Za-z0-9]{36}\b").expect("valid regex"))
+    NPM_TOKEN.get_or_init(|| Regex::new(r"(?:\b|\\[nrt])(?P<value>npm_[A-Za-z0-9]{36})\b").expect("valid regex"))
 }
 
 pub(crate) fn token_uuid_statement_regex() -> &'static Regex {
     static TOKEN_UUID: OnceLock<Regex> = OnceLock::new();
     TOKEN_UUID.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:\btoken\b|令牌)[^\\\n\r"{}\[\]]{0,256}?(?:返回(?:了)?[ \t]{0,16}(?:新[ \t]{0,16})?|return(?:ed|s)?[ \t]{1,16}(?:a[ \t]{1,16})?(?:new[ \t]{1,16})?)UUID[ \t:：]{0,16}`?(?P<value>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\b"#,
-        )
+        Regex::new(concat!(
+            r#"(?i)(?:(?:\b|\\[nrt])token\b|令牌)[^\\\n\r"{}\[\]]{0,256}?(?:返回(?:了)?[ \t]{0,16}(?:新[ \t]{0,"#,
+            r#"16})?|return(?:ed|s)?[ \t]{1,16}(?:a[ \t]{1,16})?(?:new[ \t]{1,16})?)UUID[ \t:：]{0,"#,
+            r#"16}`?(?P<value>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\b"#
+        ))
         .expect("valid regex")
     })
 }
 
 fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit> {
-    static AUTH_HEADER_RE: OnceLock<Regex> = OnceLock::new();
     static COOKIE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
     static PRIVATE_KEY_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     static PRIVATE_HOST_RE: OnceLock<Regex> = OnceLock::new();
@@ -1899,27 +2009,7 @@ fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit
 
     let mut edits = collect_sensitive_field_edits(text, mode);
     push_matches(&mut edits, text, npm_token_regex(), "[redacted]");
-    for captures in token_uuid_statement_regex().captures_iter(text) {
-        let value = captures.name("value").expect("UUID value");
-        edits.push(RedactionEdit {
-            start: value.start(),
-            end: value.end(),
-            replacement: "[redacted]",
-        });
-    }
-    for captures in AUTH_HEADER_RE
-        .get_or_init(|| Regex::new(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+").expect("valid regex"))
-        .captures_iter(text)
-    {
-        let whole = captures.get(0).expect("whole match");
-        let prefix = captures.get(1).expect("authorization prefix");
-        edits.push(RedactionEdit {
-            start: prefix.end(),
-            end: whole.end(),
-            replacement: "[redacted]",
-        });
-    }
-
+    push_matches(&mut edits, text, token_uuid_statement_regex(), "[redacted]");
     if mode == RedactionMode::Strict {
         for captures in COOKIE_HEADER_RE
             .get_or_init(|| Regex::new(r"(?i)\b(cookie\s*[:=]\s*)[^\n\r]+").expect("valid regex"))
@@ -1961,6 +2051,8 @@ fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit
         );
     }
 
+    crate::record_reader::preserve_json_redactions(&mut crate::record_reader::SliceBytes(text.as_bytes()), &mut edits)
+        .expect("in-memory UTF-8 text");
     edits.sort_by(|left, right| left.start.cmp(&right.start).then_with(|| right.end.cmp(&left.end)));
     let mut normalized: Vec<RedactionEdit> = Vec::new();
     for edit in edits {
@@ -1978,10 +2070,15 @@ fn collect_redaction_edits(text: &str, mode: RedactionMode) -> Vec<RedactionEdit
 }
 
 fn push_matches(edits: &mut Vec<RedactionEdit>, text: &str, regex: &Regex, replacement: &'static str) {
-    edits.extend(regex.find_iter(text).map(|matched| RedactionEdit {
-        start: matched.start(),
-        end: matched.end(),
-        replacement,
+    edits.extend(regex.captures_iter(text).map(|captures| {
+        let matched = captures
+            .name("value")
+            .unwrap_or_else(|| captures.get(0).expect("whole match"));
+        RedactionEdit {
+            start: matched.start(),
+            end: matched.end(),
+            replacement,
+        }
     }));
 }
 
@@ -2000,6 +2097,33 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
         }
         if cursor >= bytes.len() {
             break;
+        }
+        let next = skip_whitespace(bytes, cursor, quoted_scopes.last().is_some_and(|scope| scope.2 > 0));
+        let separated = next > cursor;
+        cursor = next;
+        if cursor >= bytes.len() || quoted_scopes.last().is_some_and(|scope| cursor >= scope.0) {
+            continue;
+        }
+        let scope = quoted_scopes
+            .last()
+            .map_or((bytes.len(), 0), |scope| (scope.0, scope.2));
+        if (separated || cursor == 0 || !is_key_byte(bytes[cursor - 1]))
+            && let Some((start, end)) = crate::record_reader::authorization_header_span(
+                &mut crate::record_reader::SliceBytes(bytes),
+                cursor,
+                scope,
+            )
+            .expect("in-memory UTF-8 text")
+        {
+            if end > start {
+                edits.push(RedactionEdit {
+                    start,
+                    end,
+                    replacement: "[redacted]",
+                });
+            }
+            cursor = end;
+            continue;
         }
         let escaped_key = escaped_quoted_token(bytes, cursor);
         let (key_start, key_end, key, quoted_content_start, quoted_content_end) =
@@ -2021,7 +2145,10 @@ fn collect_sensitive_field_edits(text: &str, mode: RedactionMode) -> Vec<Redacti
                         };
                         (cursor, end, &text[cursor + 1..end - 1], Some(cursor + 1), end - 1)
                     }
-                    value if is_key_byte(value) && (cursor == 0 || !is_key_byte(bytes[cursor.saturating_sub(1)])) => {
+                    value
+                        if is_key_byte(value)
+                            && (separated || cursor == 0 || !is_key_byte(bytes[cursor.saturating_sub(1)])) =>
+                    {
                         let mut end = cursor + 1;
                         while end < bytes.len() && is_key_byte(bytes[end]) {
                             end += 1;
@@ -2630,13 +2757,13 @@ pub enum ToolBlockKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct AssociatedToolBlock {
+pub struct AssociatedToolBlock<'a> {
     pub kind: ToolBlockKind,
     pub block_index: usize,
     pub call_key: Option<usize>,
     pub info: ToolInfo,
-    pub input: Option<serde_json::Value>,
-    pub result: Option<serde_json::Value>,
+    pub input: Option<&'a serde_json::Value>,
+    pub result: Option<&'a serde_json::Value>,
     pub result_is_error: Option<bool>,
     pub result_has_error_payload: Option<bool>,
     pub metadata_incomplete_reason: Option<String>,
@@ -2654,12 +2781,12 @@ pub struct RenderedToolBlock {
     pub redacted_count: usize,
 }
 
-pub fn render_tool_block(block: &AssociatedToolBlock, mode: RedactionMode) -> RenderedToolBlock {
-    let (input, input_count) = block.input.as_ref().map_or((None, 0), |input| {
+pub fn render_tool_block(block: &AssociatedToolBlock<'_>, mode: RedactionMode) -> RenderedToolBlock {
+    let (input, input_count) = block.input.map_or((None, 0), |input| {
         let (value, count) = redact_value_with_count(input, mode);
         (Some(value), count)
     });
-    let (result, result_count) = block.result.as_ref().map_or((None, 0), |result| {
+    let (result, result_count) = block.result.map_or((None, 0), |result| {
         let (value, count) = redact_value_with_count(result, mode);
         (Some(value), count)
     });
@@ -2706,7 +2833,11 @@ impl ToolAssociationTracker {
         self.pending_bytes
     }
 
-    pub fn observe_record(&mut self, record: &MessageRecord, detect_error_payload: bool) -> Vec<AssociatedToolBlock> {
+    pub fn observe_record<'a>(
+        &mut self,
+        record: &'a MessageRecord,
+        detect_error_payload: bool,
+    ) -> Vec<AssociatedToolBlock<'a>> {
         let Some(content) = record
             .message
             .as_ref()
@@ -2729,7 +2860,7 @@ impl ToolAssociationTracker {
         blocks
     }
 
-    fn observe_use(&mut self, record: &MessageRecord, item: &serde_json::Value) -> AssociatedToolBlock {
+    fn observe_use<'a>(&mut self, record: &MessageRecord, item: &'a serde_json::Value) -> AssociatedToolBlock<'a> {
         let info = item
             .get("name")
             .and_then(serde_json::Value::as_str)
@@ -2739,7 +2870,7 @@ impl ToolAssociationTracker {
             .get("id")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
-        let input = item.get("input").cloned();
+        let input = item.get("input");
         let key = self.next_key;
         self.next_key = self.next_key.saturating_add(1);
         let pending = PendingToolUse {
@@ -2767,12 +2898,12 @@ impl ToolAssociationTracker {
         }
     }
 
-    fn observe_result(
+    fn observe_result<'a>(
         &mut self,
         record: &MessageRecord,
-        item: &serde_json::Value,
+        item: &'a serde_json::Value,
         detect_error_payload: bool,
-    ) -> AssociatedToolBlock {
+    ) -> AssociatedToolBlock<'a> {
         let id = item
             .get("tool_use_id")
             .and_then(serde_json::Value::as_str)
@@ -2784,7 +2915,7 @@ impl ToolAssociationTracker {
             call_key: association.call_key,
             info: association.info,
             input: None,
-            result: Some(item.clone()),
+            result: Some(item),
             result_is_error: item.get("is_error").and_then(serde_json::Value::as_bool),
             result_has_error_payload: detect_error_payload.then(|| tool_result_has_error_payload(item)),
             metadata_incomplete_reason: association.metadata_incomplete_reason,
@@ -2910,6 +3041,69 @@ pub fn project_id_to_display_path(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_association_borrows_payload_and_preserves_rendering() {
+        let call: MessageRecord = serde_json::from_value(serde_json::json!({
+            "uuid": "call", "type": "assistant", "timestamp": "2026-10-01T00:00:00Z",
+            "message": {"content": [
+                {"type": "text", "text": "prefix"},
+                {"type": "tool_use", "id": "call-1", "name": "mcp__fixture__echo",
+                 "input": {"payload": "x".repeat(65536), "password": "synthetic-secret"}}
+            ]}
+        }))
+        .unwrap();
+        let input = &call.message.as_ref().unwrap()["content"][1]["input"];
+        let mut tracker = ToolAssociationTracker::default();
+        let calls = tracker.observe_record(&call, true);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].block_index, 1);
+        assert_eq!(calls[0].info.tool.as_deref(), Some("echo"));
+        assert_eq!(tracker.pending_len(), 1);
+        assert!(
+            std::ptr::eq(
+                calls[0].input.as_ref().unwrap().get("payload").unwrap(),
+                input.get("payload").unwrap()
+            ),
+            "tool input was deep-copied before matching"
+        );
+        let result: MessageRecord = serde_json::from_value(serde_json::json!({
+            "uuid": "result", "type": "user", "timestamp": "2026-10-01T00:00:01Z",
+            "message": {"content": [
+                {"type": "text", "text": "prefix"},
+                {"type": "tool_result", "tool_use_id": "call-1", "is_error": true,
+                 "content": serde_json::json!({"error": "fixture", "padding": "y".repeat(65536)}).to_string()}
+            ]}
+        }))
+        .unwrap();
+        let original = &result.message.as_ref().unwrap()["content"][1];
+        let results = tracker.observe_record(&result, true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].block_index, 1);
+        assert_eq!(results[0].call_key, calls[0].call_key);
+        assert_eq!(results[0].result_is_error, Some(true));
+        assert_eq!(results[0].result_has_error_payload, Some(true));
+        assert_eq!(tracker.pending_len(), 0);
+        assert_eq!(tracker.pending_bytes(), 0);
+        assert!(
+            std::ptr::eq(
+                results[0].result.as_ref().unwrap().get("content").unwrap(),
+                original.get("content").unwrap()
+            ),
+            "tool result was deep-copied before matching"
+        );
+        for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+            let rendered = render_tool_block(&calls[0], mode);
+            let (expected, count) = redact_value_with_count(input, mode);
+            assert_eq!(rendered.input, Some(expected));
+            assert_eq!(rendered.redacted_count, count);
+            let rendered = render_tool_block(&results[0], mode);
+            let (expected, count) = redact_value_with_count(original, mode);
+            assert_eq!(rendered.result, Some(expected));
+            assert_eq!(rendered.redacted_count, count);
+        }
+        assert_eq!(input["password"], "synthetic-secret");
+    }
 
     fn window_fixture(name: &str, lines: impl IntoIterator<Item = String>) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("mcp-history-window-{name}-{}", std::process::id()));
@@ -3272,6 +3466,135 @@ mod tests {
     }
 
     #[test]
+    fn case_insensitive_match_positions_preserve_unicode_expansion_and_word_rules() {
+        for (content, query, expected) in [
+            ("prefix OP_ID suffix", "op_id", (true, Some(7))),
+            ("前缀😀İD suffix", "i", (true, Some(3))),
+            ("前缀😀İD suffix", "\u{307}", (true, Some(3))),
+            ("前缀😀İD suffix", "d suffix", (true, Some(4))),
+            ("ΟΣ end", "οσ", (true, Some(0))),
+            ("ΟΣ end", "ος", (false, None)),
+            ("前缀😀İD suffix", "missing|d !absent", (true, Some(4))),
+            ("前缀😀İD suffix", "d !suffix", (false, None)),
+            ("long nonmatching text", "missing", (false, None)),
+            ("前缀😀İD suffix", "!absent", (true, None)),
+        ] {
+            assert_eq!(
+                matches_pattern(content, &parse_search_pattern(query, false), false),
+                expected,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_ascii_lowercase_preserves_every_unicode_scalar_and_original_position() {
+        let mut checked = 0;
+        for scalar in 0..=0x10ffff {
+            let Some(character) = char::from_u32(scalar) else {
+                continue;
+            };
+            let content = format!("A{character}Z");
+            let word: String = character.to_lowercase().collect();
+            let reference: String = content.chars().flat_map(char::to_lowercase).collect();
+            let byte_position = reference.find(&word).unwrap();
+            let folded_position = reference[..byte_position].chars().count();
+            let mut folded_characters = 0;
+            let expected_position = content
+                .chars()
+                .position(|original| {
+                    folded_characters += original.to_lowercase().count();
+                    folded_characters > folded_position
+                })
+                .unwrap();
+            let pattern = SearchPattern {
+                must_have: vec![word],
+                any_of: vec![],
+                must_not: vec![],
+            };
+            assert_eq!(
+                matches_pattern(&content, &pattern, false),
+                (true, Some(expected_position)),
+                "U+{scalar:04X}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 1_112_064);
+    }
+
+    #[test]
+    fn raw_record_parser_preserves_null_missing_unknown_and_duplicate_fields() {
+        let base = r#"{"uuid":"fixture","type":"user","timestamp":"2026-10-01","message":{"content":"file/SKILL.md"}}"#;
+        let mut cases = vec![
+            base.to_string(),
+            base.replace("\"message\":{\"content\":\"file/SKILL.md\"}", "\"message\":null"),
+            base.replace(",\"message\":{\"content\":\"file/SKILL.md\"}", ""),
+            base.replace("\"uuid\":\"fixture\"", "\"uuid\":null"),
+            base.replace("\"type\":\"user\"", "\"type\":\"user\",\"type\":\"assistant\""),
+            base.replace("\"timestamp\":\"2026-10-01\"", "\"timestamp\":false"),
+            base.replace("\"message\":", "\"isCompactSummary\":null,\"message\":"),
+            base.replace("\"message\":", "\"isMeta\":false,\"isMeta\":true,\"message\":"),
+            base.replace("\"uuid\":", "\"\\u0075uid\":"),
+            base.replace(
+                "\"message\":",
+                "\"sourceToolAssistantUUID\":\"a\",\"sourceToolAssistantUuid\":\"b\",\"message\":",
+            ),
+            base.replace("\"file/SKILL.md\"", "1e400"),
+            r#"{"type":"api-request-blob","message":{"content":"cache"},"timestamp":false}"#.to_string(),
+            r#"{"type":"custom-title","unknown":{"a":[1,null,{"b":"value"}]}}"#.to_string(),
+            r#"{"type":"api-request-blob","message":{"broken":}}"#.to_string(),
+            "null".to_string(),
+            "[]".to_string(),
+        ];
+        cases.push(base.replace("\"message\":", "\"unknown\":{\"payload\":[1,2,3]},\"message\":"));
+        for line in cases {
+            let reference = (|| {
+                let value: serde_json::Value = serde_json::from_str(&line)?;
+                if let Some(object) = value.as_object() {
+                    let kind = object.get("type").and_then(serde_json::Value::as_str);
+                    if is_internal_record(kind, object.contains_key("uuid"), object.contains_key("message")) {
+                        return Ok(None);
+                    }
+                    if matches!(kind, Some("user" | "assistant")) && !object.contains_key("message") {
+                        return Err(<serde_json::Error as serde::de::Error>::missing_field("message"));
+                    }
+                }
+                serde_json::from_value::<MessageRecord>(value).map(Some)
+            })();
+            let actual = parse_message_record(&line);
+            assert_eq!(actual.is_ok(), reference.is_ok(), "{line}");
+            if let (Ok(actual), Ok(reference)) = (actual, reference) {
+                assert_eq!(format!("{actual:?}"), format!("{reference:?}"), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit synthetic parser performance measurement"]
+    fn raw_record_parser_phase_measurement() {
+        let line = serde_json::json!({
+            "type": "api-request-blob", "message": {
+                "content": (0..1000).map(|index| serde_json::json!({"index": index, "text": "synthetic cache payload"})).collect::<Vec<_>>()
+            }
+        }).to_string();
+        let start = std::time::Instant::now();
+        for _ in 0..2000 {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            std::hint::black_box(value);
+        }
+        let materialized_ms = start.elapsed().as_millis();
+        let start = std::time::Instant::now();
+        for _ in 0..2000 {
+            assert!(parse_message_record(&line).unwrap().is_none());
+        }
+        println!(
+            "{}",
+            serde_json::json!({"records":2000,"source_bytes":line.len()*2000,
+            "materialized_ms":materialized_ms,"raw_ms":start.elapsed().as_millis()})
+        );
+    }
+
+    #[test]
     fn context_selector_validation_rejects_ambiguous_combinations() {
         assert!(validate_context_range_selectors(None, None, Some("user"), None).is_ok());
         assert!(validate_context_range_selectors(Some(0), None, Some("user"), None).is_err());
@@ -3349,6 +3672,40 @@ mod tests {
     }
 
     #[test]
+    fn bounded_jsonl_lines_preserve_chunks_utf8_errors_and_byte_accounting() {
+        use crate::record_reader::WorkControl;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut data = b"\n\r\n\xff\n".to_vec();
+        data.resize(data.len() + 16 * 1024 + 3, b'x');
+        data.extend_from_slice("界\nlast".as_bytes());
+        for capacity in [1, 2, 17, 16 * 1024] {
+            let accounted = Arc::new(AtomicUsize::new(0));
+            let control = WorkControl::from_checkpoint({
+                let accounted = Arc::clone(&accounted);
+                move |bytes| {
+                    accounted.fetch_add(bytes, Ordering::Relaxed);
+                    Ok(())
+                }
+            });
+            control.run(|| {
+                let mut lines = bounded_jsonl_lines(BufReader::with_capacity(capacity, data.as_slice()));
+                for expected in data.split_inclusive(|byte| *byte == b'\n') {
+                    let actual = lines.next().unwrap();
+                    match std::str::from_utf8(expected) {
+                        Ok(expected) => {
+                            assert!(matches!(actual.unwrap(), BoundedLine::Record(line) if line == expected))
+                        }
+                        Err(_) => assert_eq!(actual.err().unwrap().kind(), io::ErrorKind::InvalidData),
+                    }
+                }
+                assert!(lines.next().is_none());
+                assert_eq!(accounted.load(Ordering::Relaxed), data.len());
+            });
+        }
+    }
+
+    #[test]
     fn bounded_jsonl_lines_discard_large_line_and_resume_on_next_line() {
         let text = format!("{}\n{{\"ok\":true}}\n", "x".repeat(MAX_JSONL_LINE_BYTES + 2));
         let mut lines = bounded_jsonl_lines(BufReader::new(text.as_bytes()));
@@ -3412,7 +3769,8 @@ mod tests {
             );
             serde_json::from_slice(&output.stdout).unwrap()
         };
-        let query = r#"
+        let query = concat!(
+            r#"
 $ErrorActionPreference = 'Stop'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $acl = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
@@ -3422,7 +3780,9 @@ if ($private) {
     $entry = $entries[0]
     $private = -not $entry.IsInherited -and $entry.IdentityReference.Value -eq $sid.Value -and
         $entry.AccessControlType -eq 'Allow' -and
-        ($entry.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl
+        ($entry.FileSystemRights -band "#,
+            r#"[System.Security.AccessControl.FileSystemRights]::FullControl) -eq "#,
+            r#"[System.Security.AccessControl.FileSystemRights]::FullControl
 }
 [pscustomobject]@{
     user = $sid.Value
@@ -3430,7 +3790,8 @@ if ($private) {
     private = $private
     sddl = $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)
 } | ConvertTo-Json -Compress
-"#;
+"#
+        );
         let initial = run(query, &root, "");
         eprintln!("Windows private-output fixture initial owner: {}", initial["owner"]);
         let user = initial["user"].as_str().unwrap();
@@ -3500,7 +3861,8 @@ if ($LASTEXITCODE -ne 0) {{ throw "owner fixture failed: exit $LASTEXITCODE" }}
         fs::write(&path, b"").unwrap();
         set_private_permissions(&path, 0o600).unwrap();
 
-        let inject = r#"
+        let inject = concat!(
+            r#"
 $ErrorActionPreference = 'Stop'
 $acl = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
 $everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
@@ -3508,8 +3870,11 @@ $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($everyone, 'Re
 $acl.AddAccessRule($rule)
 Set-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH -AclObject $acl
 $actual = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
-if (@($actual.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $everyone.Value }).Count -ne 1) { throw 'Everyone rule was not applied' }
-"#;
+if (@($actual.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | "#,
+            r#"Where-Object { $_.IdentityReference.Value -eq $everyone.Value }).Count -ne 1) { "#,
+            r#"throw 'Everyone rule was not applied' }
+"#
+        );
         let injected = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", inject])
             .env_remove("PSModulePath")
@@ -3523,13 +3888,16 @@ if (@($actual.GetAccessRules($true, $false, [System.Security.Principal.SecurityI
         );
 
         set_private_permissions(&path, 0o600).unwrap();
-        let verify = r#"
+        let verify = concat!(
+            r#"
 $ErrorActionPreference = 'Stop'
 $acl = Get-Acl -LiteralPath $env:MCP_HISTORY_PRIVATE_PATH
 $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $entries = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].IdentityReference.Value -ne $owner) { throw 'ACL still grants another identity access' }
-"#;
+if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or "#,
+            r#"$entries[0].IdentityReference.Value -ne $owner) { throw 'ACL still grants another identity access' }
+"#
+        );
         let verified = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", verify])
             .env_remove("PSModulePath")
@@ -3746,6 +4114,8 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
             format!("{secret}_"),
             format!("字{secret}"),
             format!("{secret}字"),
+            format!("prefix\\n{secret}字"),
+            format!("prefix\\n{secret}\u{0301}"),
             format!("{secret}\u{0301}"),
             "token = text(node, 1)".to_string(),
         ];
@@ -3769,6 +4139,18 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
                 assert_eq!(redacted.count, 1);
             }
         }
+        for separator in ['\n', '\r', '\t'] {
+            let mut text = format!("ordinary prefix{separator}{secret}{separator}ordinary suffix");
+            for _ in 0..=3 {
+                for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+                    let redacted = redact_text_with_mode(&text, mode);
+                    assert_eq!(redacted.text, text.replace(&secret, "[redacted]"));
+                    assert_eq!(redacted.count, 1);
+                }
+                assert_eq!(redact_text_with_mode(&text, RedactionMode::Off).text, text);
+                text = serde_json::to_string(&text).unwrap();
+            }
+        }
         let url = format!("https://example.com/{secret}");
         let strict = redact_text_with_mode(&url, RedactionMode::Strict);
         assert_eq!(strict.text, "[redacted-url]");
@@ -3785,6 +4167,9 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
         for statement in [
             format!("2. **用已有 token 创建新模块 token**: 成功,返回新 UUID `{secret}`"),
             format!("token created successfully, returned a new UUID `{secret}`"),
+            format!("ordinary prefix\ntoken created, returned a new UUID {secret}\nordinary suffix"),
+            format!("ordinary prefix\rtoken created, returned a new UUID {secret}"),
+            format!("ordinary prefix\ttoken created, returned a new UUID {secret}"),
             format!("令牌创建成功，返回 UUID：{secret}"),
             format!("创建令牌成功，返回新 UUID `{secret}`"),
             format!("token {}返回新 UUID `{secret}`", "说明".repeat(120)),
@@ -3987,6 +4372,33 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
     }
 
     #[test]
+    fn complete_json_text_redacts_sensitive_values_as_json() {
+        let text = r#" {"sensitiveReads":{"password":0,"hidden":0,"file":0},"bool":{"password":true},"null":{"password":null},"string":{"password":"fixture-secret"},"plain":"visible"} "#;
+        let expected = serde_json::json!({"sensitiveReads":{"password":"[redacted]","hidden":0,"file":0},"bool":{"password":"[redacted]"},"null":{"password":"[redacted]"},"string":{"password":"[redacted]"},"plain":"visible"});
+        for mode in [RedactionMode::Auto, RedactionMode::Strict] {
+            let result = redact_text_with_mode(text, mode);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.text).unwrap(),
+                expected
+            );
+            assert_eq!(result.count, 4);
+            let start = text.find("fixture-secret").unwrap();
+            assert!(
+                redact_text_range_with_mode(text, mode, Some((start, start + 4)))
+                    .text
+                    .contains("[redacted]")
+            );
+        }
+        assert_eq!(redact_text_with_mode(text, RedactionMode::Off).text, text);
+        let log = r#"{"note":"Cookie: fixture-secret","password":0,"keep":"visible"}"#;
+        let output = redact_text_with_mode(log, RedactionMode::Strict);
+        let decoded: serde_json::Value = serde_json::from_str(&output.text).unwrap();
+        assert_eq!(decoded["password"], "[redacted]");
+        assert_eq!(decoded["keep"], "visible");
+        assert!(!output.text.contains("fixture-secret"));
+    }
+
+    #[test]
     fn prefixed_and_fenced_json_fields_are_redacted() {
         for mode in [RedactionMode::Auto, RedactionMode::Strict] {
             for text in [
@@ -4047,7 +4459,7 @@ if (-not $acl.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].I
         let nested = format!("{{\"outer\": {body}, \"untouched\": [1, 2]}}");
         assert_eq!(
             redact_text_with_mode(&nested, RedactionMode::Auto).text,
-            nested.replace("\"fixture_secret\"", "[redacted]")
+            nested.replace("\"fixture_secret\"", "\"[redacted]\"")
         );
     }
 

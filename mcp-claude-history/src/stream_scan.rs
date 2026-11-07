@@ -105,6 +105,7 @@ struct ScanMetadata {
     counts_exact: bool,
     filters: Value,
     files: Vec<FileCoverage>,
+    sources: Option<SourceCatalog>,
     summary: BTreeMap<String, BTreeMap<String, usize>>,
     issues: Vec<Value>,
     warnings: Vec<String>,
@@ -122,6 +123,7 @@ impl ScanMetadata {
             counts_exact: true,
             filters,
             files: Vec::new(),
+            sources: None,
             summary: BTreeMap::new(),
             issues: Vec::new(),
             warnings: Vec::new(),
@@ -156,7 +158,20 @@ impl ScanMetadata {
         reason: &str,
         attribution: bool,
     ) -> Result<(), ErrorResponse> {
-        let item = json!({"project": project, "session": session, "source": source, "ref": format!("{}:{line}", ref_prefix(session)), "line": line, "reason": reason, "kind": if attribution { "attribution" } else { "record" }});
+        let item = json!({
+            "project": project,
+            "session": session,
+            "source": source,
+            "ref": format!("{}:{line}",
+            ref_prefix(session)),
+            "line": line,
+            "reason": reason,
+            "kind": if attribution {
+                "attribution"
+            } else {
+                "record"
+            }
+        });
         self.reserve(item.to_string().len() + 128)?;
         self.issues.push(item);
         if attribution {
@@ -715,11 +730,7 @@ impl ScanStore {
                 .err()
                 .is_some_and(|error| matches!(error.error.as_str(), "cancelled" | "deadline_exceeded"));
         if let Err(error) = &mut result {
-            let mut available = match error.available.take() {
-                Some(Value::Object(available)) => available,
-                Some(value) => serde_json::Map::from_iter([("details".to_string(), value)]),
-                None => serde_json::Map::new(),
-            };
+            let available = error.details_mut();
             available.insert("scan_id".to_string(), json!(id));
             available.insert("released".to_string(), json!(stopped));
             available.insert(
@@ -729,7 +740,6 @@ impl ScanStore {
             if !stopped {
                 available.insert("metadata_query".to_string(), json!({"scan_id":id}));
             }
-            error.available = Some(Value::Object(available));
         }
         drop(guard);
         if stopped {
@@ -786,7 +796,7 @@ impl ScanStore {
             .try_lock()
             .map_err(|_| reader_error("scan_busy", "扫描正在执行，请在返回批次后读取 metadata"))?;
         guard.last_access = Instant::now();
-        let metadata = guard
+        let mut metadata = guard
             .metadata
             .lock()
             .map_err(|_| reader_error("scan_state_error", "扫描 metadata 不可用"))?;
@@ -818,15 +828,65 @@ impl ScanStore {
         if offset > total {
             return Err(invalid_arguments("metadata cursor 超出总条目数"));
         }
-        let next_query = |position: usize| json!({"scan_id": request.scan_id, "cursor": format!("meta:{}:{position}", request.scan_id), "limit": request.limit, "max_total": request.max_total});
+        let file_start = offset.saturating_sub(1).min(metadata.files.len());
+        let mut file_values = Vec::new();
+        for index in file_start..metadata.files.len().min(file_start.saturating_add(request.limit + 1)) {
+            let mut value = serde_json::to_value(&metadata.files[index]).expect("coverage serializable");
+            if let Some(sources) = &mut metadata.sources {
+                let (project, session, source) = sources.source(index)?;
+                value["project"] = json!(project);
+                value["session"] = json!(session);
+                value["source"] = json!(source);
+            }
+            file_values.push(("files", value));
+        }
+        let next_query = |position: usize| {
+            json!({
+                "scan_id": request.scan_id,
+                "cursor": format!("meta:{}:{position}",
+                request.scan_id),
+                "limit": request.limit,
+                "max_total": request.max_total
+            })
+        };
         let make_response = |items: &[Value], dimensions: BTreeMap<&str, Value>, budgeting: bool| {
             let has_more = budgeting || offset + items.len() < total;
-            json!({"scan_id": request.scan_id, "scan_complete": metadata.scan_complete,
-                "counts_exact": metadata.counts_exact && metadata.scan_complete, "attribution_complete": metadata.counters.attribution_issues == 0,
-                "stats":metadata.counters, "offset":offset, "total":total, "returned":if budgeting { request.limit } else { items.len() },
-                "omitted":if budgeting { total } else { total - items.len() }, "remaining":if budgeting { total } else { total - offset - items.len() },
-                "dimensions":dimensions, "items":items, "has_more":has_more,
-                "next_query":if has_more { Some(next_query(offset + if budgeting { request.limit } else { items.len() })) } else { None }})
+            json!({
+                "scan_id": request.scan_id,
+                "scan_complete": metadata.scan_complete,
+                "counts_exact": metadata.counts_exact && metadata.scan_complete,
+                "attribution_complete": metadata.counters.attribution_issues == 0,
+                "stats": metadata.counters,
+                "offset": offset,
+                "total": total,
+                "returned": if budgeting {
+                    request.limit
+                } else {
+                    items.len()
+                },
+                "omitted": if budgeting {
+                    total
+                } else {
+                    total - items.len()
+                },
+                "remaining": if budgeting {
+                    total
+                } else {
+                    total - offset - items.len()
+                },
+                "dimensions": dimensions,
+                "items": items,
+                "has_more": has_more,
+                "next_query": if has_more {
+                    Some(next_query(offset + if budgeting {
+                        request.limit
+                    } else {
+                        items.len()
+                    }))
+                } else {
+                    None
+                }
+            })
         };
         let dimension_budget = totals
             .iter()
@@ -837,12 +897,8 @@ impl ScanStore {
         let mut returned = BTreeMap::<&str, usize>::new();
         let mut used = fixed_size;
         let entries = std::iter::once(("filters", metadata.filters.clone()))
-            .chain(
-                metadata
-                    .files
-                    .iter()
-                    .map(|file| ("files", serde_json::to_value(file).expect("coverage serializable"))),
-            )
+            .filter(|_| offset == 0)
+            .chain(file_values)
             .chain(metadata.summary.iter().flat_map(|(dimension, buckets)| {
                 buckets.iter().map(move |(key, count)| {
                     (
@@ -858,7 +914,8 @@ impl ScanStore {
                     .iter()
                     .map(|warning| ("warnings", json!({"warning": warning}))),
             );
-        for (dimension, value) in entries.skip(offset) {
+        let tail_skip = offset.saturating_sub(1 + metadata.files.len());
+        for (dimension, value) in entries.skip(tail_skip) {
             let item = json!({"kind":dimension, "value":value});
             let size = item.to_string().len() + 1;
             if used + size > request.max_total || items.len() == request.limit {
@@ -929,13 +986,26 @@ fn page_value(
     let mut stats =
         serde_json::to_value(&metadata.counters).map_err(|error| reader_error("serialize_error", error.to_string()))?;
     stats["returned_count"] = json!(metadata.counters.returned_count + results.len());
-    Ok(
-        json!({"scan_id": id, "page": sequence, "phase": metadata.phase, "scan_complete": metadata.scan_complete,
-        "counts_exact": metadata.counts_exact && metadata.scan_complete, "attribution_complete": metadata.counters.attribution_issues == 0,
-        "stats": stats, "results": results, "has_more": has_more, "max_total_bytes": budget.max_total,
-        "next_query": if has_more { Some(next) } else { None },
-        "metadata_query": {"scan_id": id}}),
-    )
+    Ok(json!({
+        "scan_id": id,
+        "page": sequence,
+        "phase": metadata.phase,
+        "scan_complete": metadata.scan_complete,
+        "counts_exact": metadata.counts_exact && metadata.scan_complete,
+        "attribution_complete": metadata.counters.attribution_issues == 0,
+        "stats": stats,
+        "results": results,
+        "has_more": has_more,
+        "max_total_bytes": budget.max_total,
+        "next_query": if has_more {
+            Some(next)
+        } else {
+            None
+        },
+        "metadata_query": {
+            "scan_id": id
+        }
+    }))
 }
 
 fn drive_page(
@@ -1054,9 +1124,18 @@ fn drive_page(
                 return Err(ErrorResponse {
                     error: "response_too_large".to_string(),
                     message: "当前记录和固定字段超过响应预算；记录没有被丢弃".to_string(),
-                    available: Some(
-                        json!({"required_bytes": fixed_size + row_size, "max_total_bytes": max_total, "next_query": {"mode":"scan", "cursor":format!("{id}:{sequence}"), "max_total": (fixed_size + row_size).saturating_add(64).min(search::MAX_TOTAL_LIMIT), "limit":limit, "scan_bytes":bytes, "scan_ms":milliseconds}}),
-                    ),
+                    available: Some(json!({
+                        "required_bytes": fixed_size + row_size,
+                        "max_total_bytes": max_total,
+                        "next_query": {
+                            "mode": "scan",
+                            "cursor": format!("{id}:{sequence}"),
+                            "max_total": (fixed_size + row_size).saturating_add(64).min(search::MAX_TOTAL_LIMIT),
+                            "limit": limit,
+                            "scan_bytes": bytes,
+                            "scan_ms": milliseconds
+                        }
+                    })),
                 });
             }
             break;
@@ -1090,9 +1169,18 @@ fn drive_page(
         return Err(ErrorResponse {
             error: "response_too_large".to_string(),
             message: "扫描固定字段超过预算，请按 next_query 提高 max_total；本页未消费".to_string(),
-            available: Some(
-                json!({"required_bytes":response.len(), "max_total_bytes":max_total, "next_query":{"mode":"scan", "cursor":format!("{id}:{sequence}"), "max_total":response.len().saturating_add(64).min(search::MAX_TOTAL_LIMIT), "limit":limit, "scan_bytes":bytes, "scan_ms":milliseconds}}),
-            ),
+            available: Some(json!({
+                "required_bytes": response.len(),
+                "max_total_bytes": max_total,
+                "next_query": {
+                    "mode": "scan",
+                    "cursor": format!("{id}:{sequence}"),
+                    "max_total": response.len().saturating_add(64).min(search::MAX_TOTAL_LIMIT),
+                    "limit": limit,
+                    "scan_bytes": bytes,
+                    "scan_ms": milliseconds
+                }
+            })),
         });
     }
     driver
@@ -1134,36 +1222,45 @@ fn scan_files(
     shared: &Arc<Mutex<ScanMetadata>>,
 ) -> Result<(), ErrorResponse> {
     check_work()?;
-    let inputs = search::prepare_search_inputs(config, &params)?;
-    let files = inputs.files;
-    let mut snapshots = Vec::with_capacity(files.len());
-    for (project, session, path) in files {
+    let mut snapshots = Vec::new();
+    shared
+        .lock()
+        .map_err(|_| reader_error("scan_state_error", "扫描统计不可用"))?
+        .sources = Some(SourceCatalog::new(params.clone())?);
+    let mut append = |(project, session, path): crate::session_files::SessionFile| -> Result<(), ErrorResponse> {
         check_work()?;
         let file = open_session_file(&path)
             .map_err(|error| reader_error("source_unavailable", format!("{}: {error}", path.display())))?;
         let metadata = file
             .metadata()
             .map_err(|error| reader_error("source_unavailable", error.to_string()))?;
-        let source = path.to_string_lossy().to_string();
         let mut scan = shared
             .lock()
             .map_err(|_| reader_error("scan_state_error", "扫描统计不可用"))?;
-        scan.reserve(source.len() + project.len() + session.len() + 256)?;
+        // Source names live in the existing private disk catalog; retain only snapshot and progress in memory.
+        scan.reserve(std::mem::size_of::<Metadata>() + std::mem::size_of::<FileCoverage>() + 8)?;
+        scan.sources
+            .as_mut()
+            .expect("scan source catalog")
+            .append((project, session, path), MAX_CATALOG_BYTES)?;
         scan.files.push(FileCoverage {
-            project: project.clone(),
-            session: session.clone(),
-            source: source.clone(),
+            project: String::new(),
+            session: String::new(),
+            source: String::new(),
             snapshot_bytes: metadata.len(),
             status: "pending".to_string(),
             lines: 0,
         });
-        snapshots.push(Snapshot {
-            project,
-            session,
-            path,
-            metadata,
-            source,
-        });
+        snapshots.push(metadata);
+        Ok(())
+    };
+    if params.source.is_some() || !params.sources.is_empty() {
+        for file in search::prepare_search_inputs(config, &params)?.files {
+            append(file)?;
+        }
+    } else {
+        let projects = search::get_project_dirs(config, &params)?;
+        crate::session_files::visit_session_files(&projects, &params.sessions, params.subagents, &mut append)?;
     }
     {
         let mut metadata = shared
@@ -1176,9 +1273,24 @@ fn scan_files(
             metadata.warnings.push(warning.clone());
         }
     }
-    let pattern = inputs.search_pattern;
-    for (file_index, snapshot) in snapshots.iter().enumerate() {
+    let pattern = (!params.pattern.is_empty()).then(|| parse_search_pattern(&params.pattern, params.case_sensitive));
+    for (file_index, metadata) in snapshots.into_iter().enumerate() {
         check_work()?;
+        let (project, session, path) = shared
+            .lock()
+            .map_err(|_| reader_error("scan_state_error", "扫描统计不可用"))?
+            .sources
+            .as_mut()
+            .expect("scan source catalog")
+            .source(file_index)?;
+        let snapshot = Snapshot {
+            project,
+            session,
+            source: path.to_string_lossy().into_owned(),
+            path,
+            metadata,
+        };
+        let snapshot = &snapshot;
         let file = snapshot_file(snapshot)?;
         let mut lines = RecordLines::new(file, snapshot.metadata.len());
         let mut tracker = ToolAssociationTracker::default();
@@ -1191,7 +1303,7 @@ fn scan_files(
         }
         loop {
             let mut remaining = u64::MAX;
-            let located = match lines.step(&mut remaining, Instant::now() + Duration::from_secs(120))? {
+            let mut located = match lines.step(&mut remaining, Instant::now() + Duration::from_secs(120))? {
                 LineStep::Record(record) => record,
                 LineStep::Yield => continue,
                 LineStep::End => break,
@@ -1205,8 +1317,8 @@ fn scan_files(
             }
             let mut attribution = Vec::new();
             let parsed_result = (|| {
-                let result = if let Some(line) = located.small {
-                    let parsed = std::str::from_utf8(&line)
+                let result = if let Some(line) = &located.small {
+                    let parsed = std::str::from_utf8(line)
                         .map_err(|_| reader_error("invalid_utf8", "JSONL UTF-8 无效"))
                         .and_then(|line| {
                             parse_message_record(line).map_err(|_| reader_error("parse_error", "JSONL 格式无效"))
@@ -1220,9 +1332,9 @@ fn scan_files(
                             if !line_in_ranges(located.line, &params.lines) {
                                 Ok(None)
                             } else {
-                                if time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
-                                    == TimeRangeMatch::UnparseableTimestamp
-                                {
+                                let time_match =
+                                    time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref());
+                                if time_match == TimeRangeMatch::UnparseableTimestamp {
                                     let mut metadata = shared
                                         .lock()
                                         .map_err(|_| reader_error("scan_state_error", "扫描统计不可用"))?;
@@ -1248,8 +1360,9 @@ fn scan_files(
                                         pattern: pattern.as_ref(),
                                     },
                                     located.line,
-                                    record,
+                                    &record,
                                     &blocks,
+                                    time_match,
                                     &mut attribution,
                                 )?;
                                 record_issues(shared, snapshot, located.line, &blocks, &params, Some(&attribution))?;
@@ -1283,6 +1396,7 @@ fn scan_files(
                 }
                 Ok(result)
             })();
+            lines.recycle(&mut located);
             let result = match parsed_result {
                 Ok(result) => result,
                 Err(error) if matches!(error.error.as_str(), "parse_error" | "invalid_utf8") => {
@@ -1301,11 +1415,7 @@ fn scan_files(
                     None
                 }
                 Err(mut error) => {
-                    let mut available = match error.available.take() {
-                        Some(Value::Object(available)) => available,
-                        Some(value) => serde_json::Map::from_iter([("details".to_string(), value)]),
-                        None => serde_json::Map::new(),
-                    };
+                    let available = error.details_mut();
                     for (key, value) in [
                         ("project", json!(snapshot.project)),
                         ("session", json!(snapshot.session)),
@@ -1317,7 +1427,6 @@ fn scan_files(
                     ] {
                         available.insert(key.to_string(), value);
                     }
-                    error.available = Some(Value::Object(available));
                     return Err(error);
                 }
             };
@@ -1370,7 +1479,7 @@ fn record_issues(
     shared: &Arc<Mutex<ScanMetadata>>,
     snapshot: &Snapshot,
     line: usize,
-    blocks: &[AssociatedToolBlock],
+    blocks: &[AssociatedToolBlock<'_>],
     params: &SearchParams,
     reasons: Option<&[String]>,
 ) -> Result<(), ErrorResponse> {
@@ -1478,7 +1587,89 @@ struct SourceCatalog {
     last_access: Instant,
     memory_bytes: usize,
     cached: Option<(u64, usize, usize, String)>,
+    offsets: Vec<u64>,
 }
+// Scan callers checkpoint before locking metadata because checkpoints acquire that same lock.
+impl SourceCatalog {
+    fn new(params: SearchParams) -> Result<Self, ErrorResponse> {
+        let root = catalog_root()?;
+        let name = format!("catalog-{}-{}", std::process::id(), opaque_id());
+        let directory = root.join(&name);
+        std::fs::create_dir(&directory).map_err(|error| reader_error("sources_io_error", error.to_string()))?;
+        let created = (|| {
+            set_private_permissions(&directory, 0o700)?;
+            let mut owner = open_private_output_file(&directory.join(".owner"))?;
+            std::io::Write::write_all(&mut owner, name.as_bytes())
+                .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
+            let path = directory.join("sources.jsonl");
+            drop(open_private_output_file(&path)?);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
+            Ok(Self {
+                directory: directory.clone(),
+                file: Some(file),
+                params: params.clone(),
+                bytes: 0,
+                count: 0,
+                offset: 0,
+                returned: 0,
+                sequence: 0,
+                last_access: Instant::now(),
+                memory_bytes: scan_filters(&params)?
+                    .to_string()
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_add(4096),
+                cached: None,
+                offsets: Vec::new(),
+            })
+        })();
+        if created.is_err() {
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+        created
+    }
+
+    fn append(&mut self, file: crate::session_files::SessionFile, maximum: u64) -> Result<(), ErrorResponse> {
+        let mut line = serde_json::to_vec(&file).map_err(|error| reader_error("serialize_error", error.to_string()))?;
+        line.push(b'\n');
+        if line.len() as u64 > maximum.saturating_sub(self.bytes) {
+            return Err(ErrorResponse {
+                error: "sources_disk_quota".to_string(),
+                message: "来源目录总存储超过 128 MiB，未发布清单".to_string(),
+                available: Some(json!({"max_bytes": MAX_CATALOG_BYTES, "files_enumerated": self.count,
+                    "bytes_written": self.bytes, "enumeration_complete": false, "body_scan_started": false})),
+            });
+        }
+        use std::io::{Seek, Write};
+        let output = self.file.as_mut().expect("catalog file");
+        output
+            .seek(std::io::SeekFrom::Start(self.bytes))
+            .and_then(|_| output.write_all(&line))
+            .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
+        self.offsets.push(self.bytes);
+        self.memory_bytes = self.memory_bytes.saturating_add(8);
+        self.bytes += line.len() as u64;
+        self.count += 1;
+        Ok(())
+    }
+
+    fn source(&mut self, index: usize) -> Result<crate::session_files::SessionFile, ErrorResponse> {
+        use std::io::{BufRead, Seek, SeekFrom};
+        let file = self.file.as_mut().expect("catalog file");
+        file.seek(SeekFrom::Start(self.offsets[index]))
+            .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
+        let mut line = String::new();
+        std::io::BufReader::new(file)
+            .read_line(&mut line)
+            .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
+        serde_json::from_str(&line).map_err(|error| reader_error("sources_io_error", error.to_string()))
+    }
+}
+
 impl Drop for SourceCatalog {
     fn drop(&mut self) {
         self.file.take();
@@ -1548,7 +1739,14 @@ fn catalog_store() -> Arc<Mutex<BTreeMap<String, SourceCatalog>>> {
 
 impl ScanStore {
     pub fn sources(&self, config: &Config, request: SourcesRequest) -> Result<String, ErrorResponse> {
-        use std::io::{BufRead, Seek, SeekFrom, Write};
+        use std::io::{BufRead, Seek, SeekFrom};
+        let new_catalog = request.cursor.is_none();
+        if !request.release
+            && (!(1..=128).contains(&request.params.limit.unwrap_or(128))
+                || !(search::MIN_TOTAL_LIMIT..=search::MAX_TOTAL_LIMIT).contains(&request.params.max_total))
+        {
+            return Err(invalid_arguments("sources limit 为 1..128；max_total 为 512..10000000"));
+        }
         let mut catalogs = self
             .catalogs
             .lock()
@@ -1588,72 +1786,11 @@ impl ScanStore {
             if catalogs.len() >= MAX_SCANS {
                 return Err(reader_error("sources_quota", "最多保留 4 个来源目录，请 release"));
             }
-            let root = catalog_root()?;
-            let name = format!("catalog-{}-{}", std::process::id(), opaque_id());
-            let directory = root.join(&name);
-            std::fs::create_dir(&directory).map_err(|error| reader_error("sources_io_error", error.to_string()))?;
-            let created = (|| {
-                set_private_permissions(&directory, 0o700)?;
-                let mut owner = open_private_output_file(&directory.join(".owner"))?;
-                owner
-                    .write_all(name.as_bytes())
-                    .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
-                let path = directory.join("sources.jsonl");
-                drop(open_private_output_file(&path)?);
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                    .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
-                Ok::<_, ErrorResponse>(SourceCatalog {
-                    directory: directory.clone(),
-                    file: Some(file),
-                    params: params.clone(),
-                    bytes: 0,
-                    count: 0,
-                    offset: 0,
-                    returned: 0,
-                    sequence: 0,
-                    last_access: Instant::now(),
-                    memory_bytes: scan_filters(&params)?
-                        .to_string()
-                        .len()
-                        .saturating_mul(2)
-                        .saturating_add(4096),
-                    cached: None,
-                })
-            })();
-            let mut catalog = match created {
-                Ok(catalog) => catalog,
-                Err(error) => {
-                    let _ = std::fs::remove_dir_all(&directory);
-                    return Err(error);
-                }
-            };
+            let mut catalog = SourceCatalog::new(params.clone())?;
             let remaining = MAX_CATALOG_BYTES.saturating_sub(catalogs.values().map(|catalog| catalog.bytes).sum());
-            let mut append = |file: crate::session_files::SessionFile| -> Result<(), ErrorResponse> {
+            let mut append = |file| {
                 check_work()?;
-                let mut line =
-                    serde_json::to_vec(&file).map_err(|error| reader_error("serialize_error", error.to_string()))?;
-                line.push(b'\n');
-                if line.len() as u64 > remaining.saturating_sub(catalog.bytes) {
-                    return Err(ErrorResponse {
-                        error: "sources_disk_quota".to_string(),
-                        message: "来源目录总存储超过 128 MiB，未发布清单".to_string(),
-                        available: Some(
-                            json!({"max_bytes":MAX_CATALOG_BYTES,"files_enumerated":catalog.count,"bytes_written":catalog.bytes,"enumeration_complete":false,"body_scan_started":false}),
-                        ),
-                    });
-                }
-                catalog
-                    .file
-                    .as_mut()
-                    .expect("catalog file")
-                    .write_all(&line)
-                    .map_err(|error| reader_error("sources_io_error", error.to_string()))?;
-                catalog.bytes += line.len() as u64;
-                catalog.count += 1;
-                Ok(())
+                catalog.append(file, remaining)
             };
             let enumeration = (|| {
                 if params.source.is_some() || !params.sources.is_empty() {
@@ -1667,12 +1804,12 @@ impl ScanStore {
                 Ok::<_, ErrorResponse>(())
             })();
             if let Err(mut error) = enumeration {
-                let available = error.available.get_or_insert_with(|| json!({}));
-                available["files_enumerated"] = json!(catalog.count);
-                available["enumeration_complete"] = json!(false);
-                available["body_scan_started"] = json!(false);
-                available["published"] = json!(false);
-                available["consumed_sources"] = json!(0);
+                let available = error.details_mut();
+                available.insert("files_enumerated".into(), json!(catalog.count));
+                available.insert("enumeration_complete".into(), json!(false));
+                available.insert("body_scan_started".into(), json!(false));
+                available.insert("published".into(), json!(false));
+                available.insert("consumed_sources".into(), json!(0));
                 return Err(error);
             }
             catalog
@@ -1687,6 +1824,7 @@ impl ScanStore {
         };
         if request.release {
             catalogs.remove(&id);
+            crate::record_reader::mark_output_published();
             return Ok(json!({"sources_id":id,"released":true}).to_string());
         }
         let memory_used = catalogs
@@ -1705,9 +1843,6 @@ impl ScanStore {
             check_frozen_filters(config, &catalog.params, &request.params, keys)?;
             let limit = request.params.limit.unwrap_or(128);
             let maximum = request.params.max_total;
-            if !(1..=128).contains(&limit) || !(search::MIN_TOTAL_LIMIT..=search::MAX_TOTAL_LIMIT).contains(&maximum) {
-                return Err(invalid_arguments("sources limit 为 1..128；max_total 为 512..10000000"));
-            }
             catalog.last_access = Instant::now();
             catalog
                 .file
@@ -1737,7 +1872,30 @@ impl ScanStore {
             let mut sources = Vec::new();
             let mut offset = catalog.offset;
             let mut response = String::new();
+            let mut query = search::build_next_query(&catalog.params, 0);
+            query["mode"] = json!("scan");
+            query["sources"] = json!([]);
+            query.as_object_mut().expect("query").remove("source");
+            query.as_object_mut().expect("query").remove("offset");
+            let mut next = search::build_next_query(&catalog.params, 0);
+            next["mode"] = json!("sources");
+            next["cursor"] = json!(format!("{id}:{}", sequence + 1));
+            next["limit"] = json!(limit);
+            next["max_total"] = json!(maximum);
+            next.as_object_mut().expect("query").remove("offset");
+            let next_size = next.to_string().len();
+            let mut page = json!({
+                "mode":"sources", "sources_id":id, "enumeration_complete":true, "body_scan_started":false,
+                "files_total":catalog.count, "catalog_bytes":catalog.bytes, "max_catalog_bytes":MAX_CATALOG_BYTES,
+                "source_progress":{"start":catalog.returned,"end":catalog.returned},
+                "items":[], "scan_query":query, "has_more":true, "next_query":next,
+                "release_query":{"mode":"sources","cursor":format!("{id}:{}",sequence+1),"release":true}
+            });
+            let fixed_size = page.to_string().len();
+            let mut array_bytes = 0;
+            let mut response_size = 0;
             for _ in 0..limit {
+                check_work()?;
                 let mut line = String::new();
                 if input
                     .read_line(&mut line)
@@ -1748,40 +1906,66 @@ impl ScanStore {
                 }
                 let (project, session, source): (String, String, String) =
                     serde_json::from_str(&line).map_err(|error| reader_error("sources_io_error", error.to_string()))?;
-                sources.push(source.clone());
-                items.push(json!({"project":project,"session":session,"source":source}));
-                let mut query = search::build_next_query(&catalog.params, 0);
-                query["mode"] = json!("scan");
-                query["sources"] = json!(sources);
-                query.as_object_mut().expect("query").remove("source");
-                query.as_object_mut().expect("query").remove("offset");
-                let mut next = search::build_next_query(&catalog.params, 0);
-                next["mode"] = json!("sources");
-                next["cursor"] = json!(format!("{id}:{}", sequence + 1));
-                next["limit"] = json!(limit);
-                next["max_total"] = json!(maximum);
-                next.as_object_mut().expect("query").remove("offset");
-                let consumed = catalog.returned + items.len();
-                let page = json!({"mode":"sources","sources_id":id,"enumeration_complete":true,"body_scan_started":false,"files_total":catalog.count,"catalog_bytes":catalog.bytes,"max_catalog_bytes":MAX_CATALOG_BYTES,"source_progress":{"start":catalog.returned,"end":consumed},"items":items,"scan_query":query,"has_more":consumed < catalog.count,"next_query":if consumed < catalog.count {Some(next)} else {None},"release_query":{"mode":"sources","cursor":format!("{id}:{}",sequence+1),"release":true}}).to_string();
-                if page.len() > maximum {
-                    items.pop();
-                    sources.pop();
-                    if response.is_empty() {
+                let item = json!({"project":project,"session":session,"source":source});
+                let extra =
+                    item.to_string().len() + json!(source).to_string().len() + if items.is_empty() { 0 } else { 2 };
+                let consumed = catalog.returned + items.len() + 1;
+                let mut size =
+                    fixed_size + array_bytes + extra + consumed.to_string().len() - catalog.returned.to_string().len();
+                if consumed == catalog.count {
+                    size = size + 1 + 4 - next_size;
+                }
+                if size > maximum {
+                    if items.is_empty() {
                         return Err(ErrorResponse {
                             error: "response_too_large".to_string(),
                             message: "来源目录首项超过预算，本页未消费".to_string(),
-                            available: Some(
-                                json!({"required_bytes":page.len(),"next_query":{"mode":"sources","cursor":format!("{id}:{sequence}"),"limit":limit,"max_total":page.len().saturating_add(64)}}),
-                            ),
+                            available: Some(json!({"required_bytes":size,"next_query":{
+                                "mode":"sources","cursor":format!("{id}:{sequence}"),"limit":limit,
+                                "max_total":size.saturating_add(64)
+                            }})),
                         });
                     }
                     break;
                 }
-                response = page;
+                array_bytes += extra;
+                response_size = size;
+                items.push(item);
+                sources.push(source);
                 offset += line.len() as u64;
             }
+            if !items.is_empty() {
+                let consumed = catalog.returned + items.len();
+                page["items"] = json!(items);
+                page["scan_query"]["sources"] = json!(sources);
+                page["source_progress"]["end"] = json!(consumed);
+                page["has_more"] = json!(consumed < catalog.count);
+                if consumed == catalog.count {
+                    page["next_query"] = Value::Null;
+                }
+                response = page.to_string();
+                debug_assert_eq!(response.len(), response_size);
+            }
             if response.is_empty() {
-                response = json!({"mode":"sources","sources_id":id,"enumeration_complete":true,"body_scan_started":false,"files_total":catalog.count,"catalog_bytes":catalog.bytes,"items":[],"scan_query":null,"has_more":false,"next_query":null,"release_query":{"mode":"sources","cursor":format!("{id}:{}",sequence+1),"release":true}}).to_string();
+                response = json!({
+                    "mode": "sources",
+                    "sources_id": id,
+                    "enumeration_complete": true,
+                    "body_scan_started": false,
+                    "files_total": catalog.count,
+                    "catalog_bytes": catalog.bytes,
+                    "items": [],
+                    "scan_query": null,
+                    "has_more": false,
+                    "next_query": null,
+                    "release_query": {
+                        "mode": "sources",
+                        "cursor": format!("{id}:{}",
+                        sequence+1),
+                        "release": true
+                    }
+                })
+                .to_string();
                 if response.len() > maximum {
                     return Err(reader_error("response_too_large", "来源目录固定字段超过预算"));
                 }
@@ -1795,6 +1979,7 @@ impl ScanStore {
                     "来源目录内存状态超过 32 MiB，本页未消费；请释放其他目录",
                 ));
             }
+            check_work()?;
             catalog.offset = offset;
             catalog.returned += items.len();
             catalog.sequence += 1;
@@ -1803,25 +1988,33 @@ impl ScanStore {
         })();
         let consumed_sources = catalog.returned;
         let failed = result.as_ref().err().is_some_and(|error| {
-            matches!(
-                error.error.as_str(),
-                "cancelled" | "deadline_exceeded" | "sources_io_error" | "sources_memory_quota"
-            )
+            new_catalog
+                || matches!(
+                    error.error.as_str(),
+                    "cancelled" | "deadline_exceeded" | "sources_io_error" | "sources_memory_quota"
+                )
         });
         let mut result = result;
         if let Err(error) = &mut result {
-            let available = error.available.get_or_insert_with(|| json!({}));
-            available["sources_id"] = json!(id);
-            available["consumed_sources"] = json!(consumed_sources);
-            available["released"] = json!(failed);
-            available["enumeration_complete"] = json!(true);
-            if !failed {
-                available["release_query"] =
-                    json!({"mode":"sources","cursor":format!("{id}:{sequence}"),"release":true});
+            let available = error.details_mut();
+            available.insert("sources_id".into(), json!(id));
+            available.insert("consumed_sources".into(), json!(consumed_sources));
+            available.insert("released".into(), json!(failed));
+            available.insert("enumeration_complete".into(), json!(true));
+            if failed {
+                available.remove("next_query");
+            } else {
+                available.insert(
+                    "release_query".into(),
+                    json!({"mode":"sources","cursor":format!("{id}:{sequence}"),"release":true}),
+                );
             }
         }
         if failed {
             catalogs.remove(&id);
+        }
+        if result.is_ok() {
+            crate::record_reader::mark_output_published();
         }
         result
     }
@@ -1891,7 +2084,15 @@ mod tests {
         }
     }
     fn human(content: impl Into<String>) -> Value {
-        json!({"type":"user", "uuid":"repeated-uuid", "timestamp":"2026-10-01T00:00:00Z", "message":{"role":"user", "content":content.into()}})
+        json!({
+            "type": "user",
+            "uuid": "repeated-uuid",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "message": {
+                "role": "user",
+                "content": content.into()
+            }
+        })
     }
     fn next_request(page: &Value) -> ScanRequest {
         let query = &page["next_query"];
@@ -1929,6 +2130,224 @@ mod tests {
             }
             current = page(store, fixture, next_request(&current));
         }
+    }
+
+    #[test]
+    fn mh_h02_error_details_preserve_all_original_value_shapes() {
+        for original in [
+            None,
+            Some(json!({"candidate": "fixture"})),
+            Some(json!([{"id": "fixture"}])),
+            Some(json!("fixture-detail")),
+            Some(json!(42)),
+            Some(json!(false)),
+            Some(Value::Null),
+        ] {
+            let mut error = ErrorResponse {
+                error: "fixture_error".into(),
+                message: "fixture message".into(),
+                available: original.clone(),
+            };
+            error.details_mut().insert("published".into(), json!(false));
+            let details = error.available.as_ref().unwrap();
+            match &original {
+                Some(Value::Object(fields)) => {
+                    for (key, value) in fields {
+                        assert_eq!(&details[key], value);
+                    }
+                }
+                Some(value) => assert_eq!(&details["details"], value),
+                None => assert_eq!(details.as_object().unwrap().len(), 1),
+            }
+            assert_eq!(details["published"], false);
+            assert_eq!(error.error, "fixture_error");
+            assert_eq!(error.message, "fixture message");
+        }
+    }
+
+    #[test]
+    fn mh_h02_sources_domain_errors_keep_catalog_lock_usable() {
+        let fixture = Fixture::new([human("one")]);
+        let store = ScanStore::default();
+        for (projects, all_projects, expected) in [
+            (vec!["missing".into()], false, "project_not_found"),
+            (vec!["-scan-fixture".into()], true, "invalid_arguments"),
+            (vec![], false, "no_current_project"),
+        ] {
+            let error = store
+                .sources(
+                    &fixture.config,
+                    SourcesRequest {
+                        params: SearchParams {
+                            projects,
+                            all_projects,
+                            ..SearchParams::default()
+                        },
+                        cursor: None,
+                        release: false,
+                        explicit_filters: json!({}),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.error, expected);
+            let details = error.available.unwrap();
+            assert_eq!(details["details"][0]["id"], "-scan-fixture");
+            assert_eq!(details["published"], false);
+            assert_eq!(details["files_enumerated"], 0);
+            assert!(store.catalogs.lock().unwrap().is_empty());
+        }
+        let page: Value = serde_json::from_str(
+            &store
+                .sources(
+                    &fixture.config,
+                    SourcesRequest {
+                        params: SearchParams {
+                            projects: vec!["-scan-fixture".into()],
+                            ..SearchParams::default()
+                        },
+                        cursor: None,
+                        release: false,
+                        explicit_filters: json!({}),
+                    },
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let id = page["sources_id"].as_str().unwrap();
+        let directory = store.catalogs.lock().unwrap()[id].directory.clone();
+        assert!(directory.is_dir());
+        store
+            .sources(
+                &fixture.config,
+                SourcesRequest {
+                    params: SearchParams::default(),
+                    cursor: Some(page["release_query"]["cursor"].as_str().unwrap().into()),
+                    release: true,
+                    explicit_filters: json!({}),
+                },
+            )
+            .unwrap();
+        assert!(!directory.exists());
+        assert!(store.catalogs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mh_h03_sources_commit_keeps_page_after_late_cancellation_or_expiry() {
+        let fixture = Fixture::new([human("one")]);
+        let store = ScanStore::default();
+        for code in ["cancelled", "deadline_exceeded"] {
+            for _ in 0..5 {
+                let stopped = Arc::new(AtomicBool::new(false));
+                let gate = stopped.clone();
+                let control = WorkControl::from_checkpoint(move |_| {
+                    if gate.load(Ordering::SeqCst) {
+                        Err(reader_error(code, "fixture stopped"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let response = control
+                    .run(|| {
+                        let response = store.sources(
+                            &fixture.config,
+                            SourcesRequest {
+                                params: SearchParams {
+                                    projects: vec!["-scan-fixture".into()],
+                                    ..SearchParams::default()
+                                },
+                                cursor: None,
+                                release: false,
+                                explicit_filters: json!({}),
+                            },
+                        )?;
+                        stopped.store(true, Ordering::SeqCst);
+                        check_work()?;
+                        Ok::<_, ErrorResponse>(response)
+                    })
+                    .unwrap();
+                let page: Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(page["items"].as_array().unwrap().len(), 1);
+                let id = page["sources_id"].as_str().unwrap();
+                let directory = store.catalogs.lock().unwrap()[id].directory.clone();
+                store
+                    .sources(
+                        &fixture.config,
+                        SourcesRequest {
+                            params: SearchParams::default(),
+                            cursor: Some(page["release_query"]["cursor"].as_str().unwrap().into()),
+                            release: true,
+                            explicit_filters: json!({}),
+                        },
+                    )
+                    .unwrap();
+                assert!(!directory.exists());
+                assert!(store.catalogs.lock().unwrap().is_empty());
+            }
+            let control = WorkControl::from_checkpoint(move |_| Err(reader_error(code, "fixture stopped")));
+            for _ in 0..5 {
+                let error = control
+                    .run(|| {
+                        store.sources(
+                            &fixture.config,
+                            SourcesRequest {
+                                params: SearchParams {
+                                    projects: vec!["-scan-fixture".into()],
+                                    ..SearchParams::default()
+                                },
+                                cursor: None,
+                                release: false,
+                                explicit_filters: json!({}),
+                            },
+                        )
+                    })
+                    .unwrap_err();
+                assert_eq!(error.error, code);
+                assert!(store.catalogs.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn repair_sources_invalid_first_requests_do_not_reserve_catalogs() {
+        let fixture = Fixture::new([human("one")]);
+        let store = ScanStore::default();
+        for limit in [129, 0, 129, 129, 129] {
+            let error = store
+                .sources(
+                    &fixture.config,
+                    SourcesRequest {
+                        params: SearchParams {
+                            projects: vec!["-scan-fixture".into()],
+                            limit: Some(limit),
+                            ..SearchParams::default()
+                        },
+                        cursor: None,
+                        release: false,
+                        explicit_filters: json!({}),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.error, "invalid_arguments");
+            assert!(store.catalogs.lock().unwrap().is_empty());
+        }
+        let error = store
+            .sources(
+                &fixture.config,
+                SourcesRequest {
+                    params: SearchParams {
+                        projects: vec!["-scan-fixture".into()],
+                        max_total: 512,
+                        ..SearchParams::default()
+                    },
+                    cursor: None,
+                    release: false,
+                    explicit_filters: json!({}),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.error, "response_too_large");
+        assert_eq!(error.available.as_ref().unwrap()["released"], true);
+        assert!(store.catalogs.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2100,6 +2519,24 @@ mod tests {
                 .error,
             "cursor_filter_mismatch"
         );
+        let budget_error = store
+            .sources(
+                &fixture.config,
+                SourcesRequest {
+                    params: SearchParams {
+                        max_total: 512,
+                        ..params.clone()
+                    },
+                    cursor: current["next_query"]["cursor"].as_str().map(str::to_string),
+                    release: false,
+                    explicit_filters: json!({}),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(budget_error.error, "response_too_large");
+        assert_eq!(budget_error.available.as_ref().unwrap()["released"], false);
+        assert!(budget_error.available.as_ref().unwrap()["next_query"]["cursor"].is_string());
+        assert_eq!(store.catalogs.lock().unwrap()[&id].returned, 17);
         let other = ScanStore::default();
         assert_eq!(
             other
@@ -2218,19 +2655,21 @@ mod tests {
         let project = "p".repeat(200);
         let directory = fixture.config.projects_dir.join(&project);
         fs::create_dir(&directory).unwrap();
-        for index in 0..30_000 {
+        let source_count = 65_000;
+        for index in 0..source_count {
             fs::File::create(directory.join(format!("session-{index:05}-{}.jsonl", "s".repeat(200)))).unwrap();
         }
         let store = ScanStore::default();
         let params = SearchParams {
             projects: vec![project],
             max_total: 1_000_000,
-            limit: Some(128),
+            limit: None,
             ..SearchParams::default()
         };
         let mut cursor = None;
         let mut count = 0;
         let mut previous = 0;
+        let source_started = Instant::now();
         let release = loop {
             let text = store
                 .sources(
@@ -2245,9 +2684,17 @@ mod tests {
                 .unwrap();
             assert!(text.len() <= params.max_total);
             let current: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(current["files_total"], 30000);
+            assert_eq!(current["files_total"], source_count);
             assert!(current["catalog_bytes"].as_u64().unwrap() <= MAX_CATALOG_BYTES);
             assert_eq!(current["source_progress"]["start"], previous);
+            if count == 0 {
+                assert_eq!(current["items"].as_array().unwrap().len(), 128);
+                println!(
+                    "{}",
+                    json!({"sources":source_count,"default_source_page_items":128,
+                    "enumeration_and_first_page_ms":source_started.elapsed().as_millis()})
+                );
+            }
             count += current["items"].as_array().unwrap().len();
             previous = count;
             if current["has_more"] == false {
@@ -2255,7 +2702,65 @@ mod tests {
             }
             cursor = current["next_query"]["cursor"].as_str().map(str::to_string);
         };
-        assert_eq!(count, 30000);
+        assert_eq!(count, source_count);
+        let mut request = fixture.request();
+        request.params = params.clone();
+        request.scan_ms = Some(10_000);
+        let started = Instant::now();
+        let first = page(&store, &fixture, request);
+        let (last, rows, _) = finish(&store, &fixture, first);
+        assert!(rows.is_empty());
+        assert_eq!(last["scan_complete"], true);
+        assert_eq!(last["counts_exact"], true);
+        assert_eq!(last["stats"]["files_total"], source_count);
+        assert_eq!(last["stats"]["files_scanned"], source_count);
+        let id = last["scan_id"].as_str().unwrap().to_string();
+        let entry = store.entries.lock().unwrap()[&id].clone();
+        let (metadata_bytes, catalog_bytes) = {
+            let driver = entry.driver.lock().unwrap();
+            let metadata = driver.metadata.lock().unwrap();
+            (metadata.bytes, metadata.sources.as_ref().unwrap().bytes)
+        };
+        assert!(metadata_bytes < MAX_METADATA_BYTES);
+        let mut metadata_cursor = None;
+        let mut sessions = std::collections::HashSet::new();
+        loop {
+            let text = store
+                .metadata(MetadataRequest {
+                    scan_id: id.clone(),
+                    cursor: metadata_cursor,
+                    limit: 2000,
+                    max_total: 1_000_000,
+                    release: false,
+                })
+                .unwrap();
+            assert!(text.len() <= 1_000_000);
+            let metadata: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(metadata["dimensions"]["files"]["total"], source_count);
+            for item in metadata["items"].as_array().unwrap() {
+                if item["kind"] == "files" {
+                    let value = &item["value"];
+                    assert_eq!(value["status"], "complete");
+                    assert_eq!(value["lines"], 0);
+                    assert_eq!(value["project"], params.projects[0]);
+                    let source = value["source"].as_str().unwrap();
+                    assert!(PathBuf::from(source).starts_with(&directory));
+                    assert!(sessions.insert(value["session"].as_str().unwrap().to_string()));
+                }
+            }
+            if metadata["has_more"] == false {
+                break;
+            }
+            metadata_cursor = Some(metadata["next_query"]["cursor"].as_str().unwrap().to_string());
+        }
+        assert_eq!(sessions.len(), source_count);
+        println!(
+            "{}",
+            json!({"sources":source_count,"scan_and_metadata_ms":started.elapsed().as_millis(),
+            "metadata_bytes":metadata_bytes,"catalog_bytes":catalog_bytes,"metadata_files":sessions.len(),
+            "scan_complete":true,"counts_exact":true})
+        );
+        store.release(&id).unwrap();
         store
             .sources(
                 &fixture.config,
@@ -2288,7 +2793,14 @@ mod tests {
         (equivalent.params.since, equivalent.params.until) =
             parse_time_bounds(Some("2026-10-01T02:00:00+02:00"), Some("2026-10-02T02:00:00+02:00")).unwrap();
         equivalent.params.lines = parse_optional_line_ranges_param(Some("1-3")).unwrap();
-        equivalent.explicit_filters = json!({"project":"/scan/fixture,-scan-fixture", "types":"user", "subtypes":"human", "since":"2026-10-01T02:00:00+02:00", "until":"2026-10-02T02:00:00+02:00", "lines":"1-3"});
+        equivalent.explicit_filters = json!({
+            "project": "/scan/fixture,-scan-fixture",
+            "types": "user",
+            "subtypes": "human",
+            "since": "2026-10-01T02:00:00+02:00",
+            "until": "2026-10-02T02:00:00+02:00",
+            "lines": "1-3"
+        });
         let second = page(&store, &fixture, equivalent);
         assert_eq!(second["results"][0]["line"], 2);
         let mut wrong = next_request(&second);
@@ -2313,12 +2825,65 @@ mod tests {
     fn attribution_diagnostics_only_affect_the_filtered_query_scope() {
         for inside_unknown in [false, true] {
             let mut records = vec![
-                json!({"type":"user", "uuid":"outside", "timestamp":"2026-07-01T00:00:00Z", "message":{"content":[{"type":"tool_result", "tool_use_id":"outside-unknown", "content":"outside"}]}}),
-                json!({"type":"assistant", "uuid":"known-call", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":"known", "name":"mcp__fixture__probe", "input":{}}]}}),
-                json!({"type":"user", "uuid":"known-result", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_result", "tool_use_id":"known", "content":"matched"}]}}),
+                json!({
+                    "type": "user",
+                    "uuid": "outside",
+                    "timestamp": "2026-07-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "outside-unknown",
+                                "content": "outside"
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "uuid": "known-call",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "known",
+                                "name": "mcp__fixture__probe",
+                                "input": {}
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "user",
+                    "uuid": "known-result",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "known",
+                                "content": "matched"
+                            }
+                        ]
+                    }
+                }),
             ];
             if inside_unknown {
-                records.push(json!({"type":"user", "uuid":"inside", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_result", "tool_use_id":"inside-unknown", "content":"inside"}]}}));
+                records.push(json!({
+                    "type": "user",
+                    "uuid": "inside",
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "inside-unknown",
+                                "content": "inside"
+                            }
+                        ]
+                    }
+                }));
             }
             let fixture = Fixture::new(records);
             let store = ScanStore::default();
@@ -2449,7 +3014,14 @@ mod tests {
             after["uuid"] = json!("after-cache-uuid");
             let fixture = Fixture::new([
                 human("before-cache"),
-                json!({"type":"api-request-blob", "hash":"fixture", "message":{"role":"user", "content":"x".repeat(padding)}}),
+                json!({
+                    "type": "api-request-blob",
+                    "hash": "fixture",
+                    "message": {
+                        "role": "user",
+                        "content": "x".repeat(padding)
+                    }
+                }),
                 after,
             ]);
             if padding == 0 {
@@ -2538,10 +3110,43 @@ mod tests {
 
     #[test]
     fn indexed_previews_match_small_record_filters_and_strict_recovery() {
-        let records = [32, MAX_JSONL_LINE_BYTES + 1024].into_iter().flat_map(|length| [
-            json!({"type":"assistant", "uuid":format!("call-{length}"), "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":format!("id-{length}"), "name":"mcp__fixture__probe", "input":{"password":"x".repeat(length), "note":"前缀😀 https://private.example.test"}}]}}),
-            json!({"type":"user", "uuid":format!("result-{length}"), "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_result", "tool_use_id":format!("id-{length}"), "content":format!("Authorization: Bearer {}\n尾部😀 https://private.example.test", "x".repeat(length))}]}}),
-        ]);
+        let records = [32, MAX_JSONL_LINE_BYTES + 1024].into_iter().flat_map(|length| {
+            [
+                json!({
+                    "type": "assistant",
+                    "uuid": format!("call-{length}"),
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": format!("id-{length}"),
+                                "name": "mcp__fixture__probe",
+                                "input": {
+                                    "password": "x".repeat(length),
+                                    "note": "前缀😀 https://private.example.test"
+                                }
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "user",
+                    "uuid": format!("result-{length}"),
+                    "timestamp": "2026-10-01T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": format!("id-{length}"),
+                                "content": format!("Authorization: Bearer {}\n尾部😀 https://private.example.test",
+                                "x".repeat(length))
+                            }
+                        ]
+                    }
+                }),
+            ]
+        });
         let fixture = Fixture::new(records);
         let store = ScanStore::default();
         let mut request = fixture.request();
@@ -2652,9 +3257,21 @@ mod tests {
                 String::new()
             };
             let input = json!({"note":"visible".repeat(400), "padding":padding, "url":"https://private.example.test"});
-            let fixture = Fixture::new([
-                json!({"type":"assistant", "uuid":"full-record", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":"full-call", "name":"mcp__fixture__probe", "input":input}]}}),
-            ]);
+            let fixture = Fixture::new([json!({
+                "type": "assistant",
+                "uuid": "full-record",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "full-call",
+                            "name": "mcp__fixture__probe",
+                            "input": input
+                        }
+                    ]
+                }
+            })]);
             let store = ScanStore::default();
             let mut request = fixture.request();
             request.params.structured = Some("full".to_string());
@@ -2714,9 +3331,31 @@ mod tests {
     #[test]
     fn indexed_structured_full_is_complete_json_independent_of_preview_limit() {
         let secret = format!("npm_{}", "Aa0".repeat(12));
-        let fixture = Fixture::new([
-            json!({"type":"assistant", "uuid":"full-record", "timestamp":"2026-10-01T00:00:00Z", "message":{"content":[{"type":"tool_use", "id":"full-call", "name":"mcp__fixture__full", "input":{"password":"x".repeat(MAX_JSONL_LINE_BYTES + 1024), "command":"前缀😀 Authorization: Bearer\tfixture-value", "array":[1,null,true], "note":"entire-structured-value", "zztext":format!("前缀😀 [{secret}] visible")}}]}}),
-        ]);
+        let fixture = Fixture::new([json!({
+            "type": "assistant",
+            "uuid": "full-record",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "full-call",
+                        "name": "mcp__fixture__full",
+                        "input": {
+                            "password": "x".repeat(MAX_JSONL_LINE_BYTES + 1024),
+                            "command": "前缀😀 Authorization: Bearer\tfixture-value",
+                            "array": [
+                                1,
+                                null,
+                                true
+                            ],
+                            "note": "entire-structured-value",
+                            "zztext": format!("前缀😀 [{secret}] visible")
+                        }
+                    }
+                ]
+            }
+        })]);
         let store = ScanStore::default();
         let mut request = fixture.request();
         request.params.structured = Some("full".to_string());
@@ -2728,7 +3367,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]["tool_input_redacted"],
-            json!({"password":"[redacted]", "command":"前缀😀 Authorization: [redacted]", "array":[1,null,true], "note":"entire-structured-value", "zztext":"前缀😀 [[redacted]] visible"})
+            json!({
+                "password": "[redacted]",
+                "command": "前缀😀 Authorization: [redacted]",
+                "array": [
+                    1,
+                    null,
+                    true
+                ],
+                "note": "entire-structured-value",
+                "zztext": "前缀😀 [[redacted]] visible"
+            })
         );
         assert!(rows[0]["tool_input_redacted"].get("preview").is_none());
         assert!(rows[0]["content"].as_str().unwrap().chars().count() <= 16);
@@ -2745,13 +3394,34 @@ mod tests {
             let block = if is_input {
                 json!({"type":"tool_use","id":"npm-call","name":"Bash","input":input})
             } else {
-                json!({"type":"tool_result","tool_use_id":"npm-call","content":[{"type":"text","text":text}],"is_error":false})
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": "npm-call",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text
+                        }
+                    ],
+                    "is_error": false
+                })
             };
             let original = if is_input { input.to_string() } else { block.to_string() };
             let start = original[..original.find(&secret).unwrap()].chars().count();
-            let fixture = Fixture::new([
-                json!({"type":if is_input { "assistant" } else { "user" },"uuid":"npm-record","timestamp":"2026-10-01T00:00:00Z","message":{"content":[block]}}),
-            ]);
+            let fixture = Fixture::new([json!({
+                "type": if is_input {
+                    "assistant"
+                } else {
+                    "user"
+                },
+                "uuid": "npm-record",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "content": [
+                        block
+                    ]
+                }
+            })]);
             for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
                 let store = ScanStore::default();
                 let mut request = fixture.request();
@@ -2842,9 +3512,39 @@ mod tests {
 
     #[test]
     fn empty_batches_advance_and_preserve_tool_association() {
-        let records = std::iter::once(json!({"type":"assistant", "uuid":"call-record", "timestamp":"2026-10-01T00:00:00Z", "message":{"role":"assistant", "content":[{"type":"tool_use","id":"call-id","name":"mcp__fixture__probe","input":{}}]}}))
-            .chain((0..80).map(|_| human("x".repeat(8192))))
-            .chain(std::iter::once(json!({"type":"user","uuid":"result-record","timestamp":"2026-10-01T00:00:00Z", "message":{"role":"user", "content":[{"type":"tool_result","tool_use_id":"call-id","content":"matched-result","is_error":false}]}})));
+        let records = std::iter::once(json!({
+            "type": "assistant",
+            "uuid": "call-record",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-id",
+                        "name": "mcp__fixture__probe",
+                        "input": {}
+                    }
+                ]
+            }
+        }))
+        .chain((0..80).map(|_| human("x".repeat(8192))))
+        .chain(std::iter::once(json!({
+            "type": "user",
+            "uuid": "result-record",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-id",
+                        "content": "matched-result",
+                        "is_error": false
+                    }
+                ]
+            }
+        })));
         let fixture = Fixture::new(records);
         let store = ScanStore::default();
         let mut request = fixture.request();
@@ -3149,7 +3849,24 @@ mod tests {
 
     #[test]
     fn metadata_all_dimensions_are_paginated_without_changing_counts() {
-        let fixture = Fixture::new((0..80).map(|index| json!({"type":"assistant", "uuid":format!("record-{index}"), "timestamp":"2026-10-01T00:00:00Z", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":format!("call-{index}"), "name":format!("mcp__fixture__probe_{index}"), "input":{}}]}})));
+        let fixture = Fixture::new((0..80).map(|index| {
+            json!({
+                "type": "assistant",
+                "uuid": format!("record-{index}"),
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": format!("call-{index}"),
+                            "name": format!("mcp__fixture__probe_{index}"),
+                            "input": {}
+                        }
+                    ]
+                }
+            })
+        }));
         let store = ScanStore::default();
         let first = page(&store, &fixture, fixture.request());
         let (last, _, _) = finish(&store, &fixture, first);

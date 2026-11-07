@@ -461,6 +461,16 @@ pub struct ErrorResponse {
     pub available: Option<serde_json::Value>,
 }
 
+impl ErrorResponse {
+    pub(crate) fn details_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+        let available = self.available.get_or_insert_with(|| serde_json::json!({}));
+        if !available.is_object() {
+            *available = serde_json::json!({ "details": available.take() });
+        }
+        available.as_object_mut().expect("normalized error details")
+    }
+}
+
 /// Ref 解析结果
 #[derive(Debug, Clone)]
 pub struct ParsedRef {
