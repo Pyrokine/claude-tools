@@ -49,7 +49,7 @@ test('naturally completed PTY retains its final screen until explicit close', as
     await new Promise((resolve) => setTimeout(resolve, 10))
     stream.emit('close')
 
-    const result = manager.read(ptyId, { mode: 'screen' })
+    const result = await manager.read(ptyId, { mode: 'screen' })
     assert.equal(result.active, false)
     assert.match(result.data, /PID USER CPU/)
     assert.deepEqual(manager.close(ptyId), {
@@ -58,7 +58,7 @@ test('naturally completed PTY retains its final screen until explicit close', as
         status: 'closed',
         retryable: false,
     })
-    assert.throws(() => manager.read(ptyId), /not found/)
+    await assert.rejects(manager.read(ptyId), /not found/)
 })
 
 test('PTY write reports backpressure without reporting a rejected input', async () => {
@@ -100,13 +100,13 @@ test('PTY raw output uses UTF-8 byte limits and reports discarded history until 
     stream.emit('data', output.subarray(8))
     await new Promise((resolve) => setTimeout(resolve, 10))
 
-    const retained = manager.read(ptyId, { mode: 'raw', clear: false })
+    const retained = await manager.read(ptyId, { mode: 'raw', clear: false })
     assert.equal(retained.data, '中😀')
     assert.deepEqual(Buffer.from(retained.dataBase64, 'base64'), output.subarray(-7))
     assert.equal(retained.unreadRawBytes, 7)
     assert.equal(retained.rawBufferLimit, 7)
     assert.equal(retained.rawBufferTruncated, true)
-    assert.match(manager.read(ptyId, { mode: 'screen' }).data, /中中😀/)
+    assert.match((await manager.read(ptyId, { mode: 'screen' })).data, /中中😀/)
     assert.deepEqual(
         manager.list().map(({ bufferSize, unreadRawBytes, rawBufferLimit, rawBufferTruncated }) => ({
             bufferSize,
@@ -117,14 +117,14 @@ test('PTY raw output uses UTF-8 byte limits and reports discarded history until 
         [{ bufferSize: 7, unreadRawBytes: 7, rawBufferLimit: 7, rawBufferTruncated: true }]
     )
 
-    const cleared = manager.read(ptyId, { mode: 'raw' })
+    const cleared = await manager.read(ptyId, { mode: 'raw' })
     assert.equal(cleared.data, '中😀')
     assert.equal(cleared.unreadRawBytes, 7)
     assert.equal(cleared.rawBufferTruncated, true)
     assert.equal(manager.list()[0].bufferSize, 0)
     assert.equal(manager.list()[0].unreadRawBytes, 0)
     assert.equal(manager.list()[0].rawBufferTruncated, false)
-    assert.deepEqual(manager.read(ptyId, { mode: 'raw' }), {
+    assert.deepEqual(await manager.read(ptyId, { mode: 'raw' }), {
         data: '',
         dataBase64: '',
         active: true,
@@ -161,7 +161,7 @@ test('PTY close failure retains the session for retry', async () => {
         error: 'injected close failure',
     })
     assert.equal(manager.list().length, 1)
-    assert.equal(manager.read(ptyId, { mode: 'raw' }).active, true)
+    assert.equal((await manager.read(ptyId, { mode: 'raw' })).active, true)
 })
 
 test('PTY disconnect cleanup removes sessions even when graceful close fails', async () => {
@@ -180,5 +180,5 @@ test('PTY disconnect cleanup removes sessions even when graceful close fails', a
 
     assert.equal(stream.destroyed, true)
     assert.equal(manager.list().length, 0)
-    assert.throws(() => manager.read(ptyId), /not found/)
+    await assert.rejects(manager.read(ptyId), /not found/)
 })

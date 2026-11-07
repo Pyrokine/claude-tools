@@ -99,6 +99,47 @@ test('tracked operation observes marker and close emitted before openStream retu
     assert.equal(started.expiresAt, started.finishedAt + 60_000)
 })
 
+test('MH-SSH-03 tracked operation distinguishes missing exit metadata from known outcomes', async (t) => {
+    for (const [code, signal, expected] of [
+        [undefined, undefined, 'unknown'],
+        [null, undefined, 'unknown'],
+        [undefined, '', 'unknown'],
+        [0, undefined, 'completed'],
+        [7, undefined, 'failed'],
+        [undefined, 'TERM', 'failed'],
+    ]) {
+        await t.test(`${code}/${signal}`, async (t) => {
+            const channel = createChannel()
+            const manager = new OperationManager({
+                async openStream(_alias, _command, marker, _options, adopt) {
+                    adopt(channel)
+                    channel.stderr.write(`__MCP_SSH_OPERATION__:${marker}:4321:0\n`)
+                    channel.write('fixture output')
+                },
+                async cancelRemote() {
+                    return { success: true }
+                },
+            })
+            t.after(() => manager.close())
+            const started = await manager.start('server', 'fixture')
+            channel.emit('close', code, signal)
+            const result = manager.status(started.operationId)
+            assert.equal(result.status, expected)
+            assert.equal(result.exitCode, code ?? null)
+            assert.equal(JSON.parse(JSON.stringify(result)).exitCode, code ?? null)
+            assert.equal(result.signal, signal || null)
+            assert.equal(result.pid, 4321)
+            assert.equal(result.markerVerified, true)
+            assert.notEqual(result.finishedAt, null)
+            assert.equal(result.expiresAt, result.finishedAt + result.retentionMs)
+            assert.equal(manager.read(started.operationId).stdout, 'fixture output')
+            if (expected === 'unknown') {
+                assert.match(result.error, /without an exit status.*inspect/)
+            }
+        })
+    }
+})
+
 test('tracked operation verifies marker, bounds output, reads offsets, and cancels verified PID', async (t) => {
     const channel = createChannel()
     let cancelRequest

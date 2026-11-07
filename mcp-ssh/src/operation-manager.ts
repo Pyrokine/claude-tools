@@ -250,7 +250,14 @@ export class OperationManager {
             record.stdoutTruncated && stdoutRequestedEnd === record.stdout.length ? stdoutRequestedEnd : stdoutEnd
         const remaining = maxReadBytes - stdout.length
         const stderrRequestedEnd = Math.min(record.stderr.length, stderrOffset + remaining)
-        const stderrEnd = utf8SafeEnd(record.stderr, stderrOffset, stderrRequestedEnd, 'stderr')
+        const stderrEnd = utf8SafeEnd(
+            record.stderr,
+            stderrOffset,
+            stderrRequestedEnd,
+            'stderr',
+            stderrRequestedEnd < record.stderr.length,
+            nextStdoutOffset > stdoutOffset
+        )
         if (
             record.finishedAt !== null &&
             !record.stderrTruncated &&
@@ -387,8 +394,8 @@ export class OperationManager {
             }
             this.finishStreamError(record, error)
         })
-        stream.on('close', (code: number | null, signal?: string) => {
-            const close = { type: 'close' as const, code, signal: signal ?? null }
+        stream.on('close', (code?: number | null, signal?: string) => {
+            const close = { type: 'close' as const, code: code ?? null, signal: signal || null }
             if (record.cancelInFlight) {
                 record.pendingTermination ??= close
                 return
@@ -436,6 +443,10 @@ export class OperationManager {
         this.flushMarkerBuffer(record)
         if (record.cancelRequested) {
             record.status = 'cancelled'
+        } else if (code === null && signal === null) {
+            record.status = 'unknown'
+            record.error =
+                'SSH channel closed without an exit status or signal; inspect the remote operation before repeating it'
         } else if (!record.markerVerified) {
             record.status = 'failed'
             record.error ??= 'Remote operation exited before its marker was verified'
@@ -506,7 +517,9 @@ export class OperationManager {
                 return
             }
 
-            const metadata = line.slice(expectedPrefix.length).match(/^([1-9]\d*):(0|1)(?::([1-9]\d*))?$/)
+            const metadata = line
+                .slice(expectedPrefix.length)
+                .match(/^(?<pid>[1-9]\d*):(?<processGroup>[01])(?::(?<createdAt>[1-9]\d*))?$/)
             const pid = metadata ? Number(metadata[1]) : Number.NaN
             if (!metadata || !Number.isSafeInteger(pid)) {
                 this.appendStderr(record, lineBytes)
@@ -549,7 +562,9 @@ export class OperationManager {
         const storedBytes = record.stdout.length + record.stderr.length
         const available = Math.max(0, record.maxOutputBytes - storedBytes)
         const stored = data.subarray(0, available)
-        record[stream] = Buffer.concat([record[stream], stored])
+        if (stored.length > 0) {
+            record[stream] = Buffer.concat([record[stream], stored])
+        }
         if (stored.length < data.length) {
             if (stream === 'stdout') {
                 record.stdoutTruncated = true

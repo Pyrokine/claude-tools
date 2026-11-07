@@ -84,6 +84,76 @@ function pendingConnect(manager, alias, port) {
     })
 }
 
+test('MH-SSH-03 real ssh2 channel closure retains unknown or known exit metadata', async (t) => {
+    const key = ssh2.utils.generateKeyPairSync('ed25519')
+    for (const code of [undefined, 0, 7]) {
+        await t.test(String(code), async (t) => {
+            const { manager } = createManager(t)
+            const peers = new Set()
+            const errors = []
+            const server = new ssh2.Server({ hostKeys: [key.private] }, (peer) => {
+                peers.add(peer)
+                peer.on('close', () => peers.delete(peer))
+                peer.on('error', (error) => errors.push(error))
+                peer.on('authentication', (context) => context.accept())
+                peer.on('ready', () =>
+                    peer.on('session', (accept) => {
+                        const session = accept()
+                        session.on('exec', (accept) => {
+                            const stream = accept()
+                            const record = manager.operationManager.operations.values().next().value
+                            stream.stderr.write(`__MCP_SSH_OPERATION__:${record.marker}:4321:0\n`)
+                            if (code !== undefined) {
+                                stream.exit(code)
+                            }
+                            stream.end('fixture output', () => stream.close())
+                        })
+                    })
+                )
+            })
+            await new Promise((resolve, reject) => {
+                server.once('error', reject)
+                server.listen(0, '127.0.0.1', () => resolve())
+            })
+            const client = new ssh2.Client()
+            t.after(async () => {
+                client.end()
+                for (const peer of peers) {
+                    peer.end()
+                }
+                await new Promise((resolve) => server.close(resolve))
+            })
+            await new Promise((resolve, reject) => {
+                client.once('ready', resolve)
+                client.once('error', reject)
+                client.connect({
+                    host: '127.0.0.1',
+                    port: server.address().port,
+                    username: 'fixture',
+                    password: 'synthetic',
+                    hostVerifier: () => true,
+                    readyTimeout: 10000,
+                })
+            })
+            manager.sessions.set('fixture', createSession(client))
+            const started = await manager.operationManager.start('fixture', 'fixture')
+            const record = manager.operationManager.operations.get(started.operationId)
+            if (record.finishedAt === null) {
+                await new Promise((resolve) => record.stream.once('close', resolve))
+            }
+            const result = manager.operationManager.status(started.operationId)
+            assert.equal(result.status, code === undefined ? 'unknown' : code === 0 ? 'completed' : 'failed')
+            assert.equal(result.exitCode, code ?? null)
+            assert.equal(JSON.parse(JSON.stringify(result)).exitCode, code ?? null)
+            assert.equal(result.markerVerified, true)
+            assert.equal(result.pid, 4321)
+            assert.equal(manager.operationManager.read(started.operationId).stdout, 'fixture output')
+            assert.equal(client._sock.destroyed, false)
+            assert.deepEqual(errors, [])
+        })
+    }
+})
+
 test('new direct and jump connections disable Nagle after socket creation', async (t) => {
     const { manager } = createManager(t)
     const port = await createBlackholeServer(t)
@@ -285,6 +355,81 @@ test('connect rejects conflicting configurations that reuse the same alias', asy
     assert.deepEqual(info.envKeys, ['REGION'])
 })
 
+test('I065 session listings use the ssh2 transport state before delayed close events', (t) => {
+    const { manager } = createManager(t)
+    const client = new ssh2.Client()
+    manager.sessions.set('owned-stale', createSession(client))
+    assert.throws(() => client.exec('true', () => {}), /Not connected/)
+    assert.equal(manager.listSessions()[0].connected, false)
+    assert.equal(manager.listSessionDetails()[0].connected, false)
+    assert.throws(() => manager.getSession('owned-stale'), /disconnected/)
+    client._sock = new PassThrough()
+    assert.equal(manager.listSessions()[0].connected, true)
+    client._sock.end()
+    assert.equal(manager.listSessions()[0].connected, false)
+    client._sock.destroy()
+})
+
+test('I066 implicit jump alias conflicts preserve existing sessions and share compatible jumps', async (t) => {
+    for (const scenario of ['implicit conflict', 'explicit conflict', 'compatible default']) {
+        await t.test(scenario, async (st) => {
+            const { manager } = createManager(st)
+            const jump = { host: 'jump.example.com', port: 22, username: 'owned', readyTimeout: 30000 }
+            const occupiedAlias = 'owned@jump.example.com:22'
+            let ended = 0
+            const originalClient = {
+                end() {
+                    ++ended
+                },
+            }
+            const original = {
+                ...createSession(originalClient),
+                config: { ...jump, ...(scenario === 'compatible default' ? {} : { runAs: 'application' }) },
+            }
+            manager.sessions.set(occupiedAlias, original)
+            const internal = manager.connectInternal.bind(manager)
+            let generated
+            let forwarded
+            const jumpClient = { end() {} }
+            manager.connectInternal = async (config, alias, pending) => {
+                if (config.host === jump.host && alias !== occupiedAlias) {
+                    generated = alias
+                    manager.sessions.set(alias, { ...createSession(jumpClient), config })
+                    return alias
+                }
+                return internal(config, alias, pending)
+            }
+            manager.forwardConnection = async (client) => {
+                forwarded = client
+                throw new Error('Owned forward boundary')
+            }
+            const target = {
+                host: 'target.example.com',
+                port: 22,
+                username: 'owned',
+                alias: 'owned-target',
+                readyTimeout: 30000,
+                jumpHost: { ...jump, ...(scenario === 'explicit conflict' ? { alias: occupiedAlias } : {}) },
+            }
+            await assert.rejects(
+                manager.connect(target),
+                scenario === 'explicit conflict' ? /different session configuration/ : /Owned forward boundary/
+            )
+            assert.equal(manager.sessions.get(occupiedAlias), original)
+            assert.equal(ended, 0)
+            if (scenario === 'implicit conflict') {
+                assert.match(generated, /^owned-target:jump:/)
+                assert.equal(forwarded, jumpClient)
+            } else if (scenario === 'compatible default') {
+                assert.equal(generated, undefined)
+                assert.equal(forwarded, originalClient)
+            } else {
+                assert.equal(forwarded, undefined)
+            }
+        })
+    }
+})
+
 test('cancelled jump-host connection closes a delayed forward channel', async (t) => {
     const { manager } = createManager(t)
     const jumpConfig = {
@@ -311,6 +456,7 @@ test('cancelled jump-host connection closes a delayed forward channel', async (t
         jumpHost: jumpConfig,
     }
     const pending = {
+        signal: new AbortController().signal,
         generation: manager.getConnectionGeneration('target'),
         fingerprint: manager.connectionFingerprint(targetConfig),
         cancel() {},

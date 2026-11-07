@@ -751,12 +751,31 @@ export class SessionManager {
                 }
 
                 streamRef = stream
+                stream.on('error', (error: Error) => {
+                    if (settled) {
+                        return
+                    }
+                    settled = true
+                    clearTimeout(timeoutId)
+                    endDecoders()
+                    reject(
+                        new CommandError(error.message, {
+                            failureKind: 'ssh_transport',
+                            operationStatus: 'unknown',
+                            retryable: false,
+                            stdout,
+                            stderr,
+                            ...this.outputMetadata(outputPreview()),
+                            ...this.resultMetadata(session, options, context),
+                        })
+                    )
+                })
 
                 // 密码写入 stdin，sudo -S 从 stdin 读取，不出现在命令行
                 stream.write(sudoPassword + '\n')
                 stream.end()
 
-                stream.on('close', (code: number) => {
+                stream.on('close', (code?: number | null, signal?: string) => {
                     clearTimeout(timeoutId)
                     if (settled) {
                         return
@@ -767,9 +786,9 @@ export class SessionManager {
                         success: code === 0,
                         stdout,
                         stderr,
-                        exitCode: code,
+                        exitCode: code ?? null,
                         duration: Date.now() - startTime,
-                        failureKind: code === 0 ? undefined : 'remote_command',
+                        ...this.commandExitMetadata(code, signal),
                         stdoutTruncated: stdoutTruncated || undefined,
                         stderrTruncated: stderrTruncated || undefined,
                         ...this.outputMetadata(outputPreview()),
@@ -835,7 +854,7 @@ export class SessionManager {
         return this.ptyManager.write(ptyId, data)
     }
 
-    ptyRead(ptyId: string, options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}): PtyReadResult {
+    ptyRead(ptyId: string, options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}): Promise<PtyReadResult> {
         return this.ptyManager.read(ptyId, options)
     }
 
@@ -1039,23 +1058,42 @@ export class SessionManager {
 
     private recommendedReadCommand(): string {
         return (
-            '将远端命令输出重定向到文件，例如 command > /tmp/mcp-ssh-output.txt 2>&1，' +
-            '再用 ssh_read_file(remotePath="/tmp/mcp-ssh-output.txt", tail=true, maxBytes=65536) 分块读取'
+            '将远端命令输出重定向到文件，例如 command > /tmp/mcp-ssh-output.txt 2>&1，再用 ' +
+            'ssh_read_file(remotePath="/tmp/mcp-ssh-output.txt", tail=true, ' +
+            'maxBytes=65536) 分块读取'
         )
     }
 
+    private commandExitMetadata(code: number | null | undefined, signal: string | undefined): Partial<ExecResult> {
+        if (typeof code === 'number' || signal) {
+            return {
+                exitSignal: signal,
+                failureKind: code === 0 ? undefined : 'remote_command',
+                operationStatus: code === 0 ? 'completed' : 'failed',
+            }
+        }
+        return {
+            failureKind: 'ssh_transport',
+            operationStatus: 'unknown',
+            retryable: false,
+            suggestion:
+                'SSH channel closed without an exit status; inspect the remote state ' + 'before repeating the command',
+        }
+    }
 
-
-    private emptyOutputFailureMetadata(exitCode: number, preview: OutputPreview): Partial<ExecResult> {
-        if (exitCode === 0 || preview.stdoutBytes > 0 || preview.stderrBytes > 0) {
+    private emptyOutputFailureMetadata(
+        exitCode: number | null | undefined,
+        preview: OutputPreview
+    ): Partial<ExecResult> {
+        if (typeof exitCode !== 'number' || exitCode === 0 || preview.stdoutBytes > 0 || preview.stderrBytes > 0) {
             return {}
         }
         return {
             emptyOutputFailure: true,
             recommendedReadCommand: this.recommendedReadCommand(),
             suggestion:
-                '远端命令以非零退出码结束，但没有 stdout/stderr。请检查 cwd、effectiveUser、shell/profile，' +
-                '或用 set -x / 显式重定向输出到文件后再用 ssh_read_file 读取',
+                '远端命令以非零退出码结束，但没有 stdout/stderr。请检查 cwd、effectiveUser、shell/profile，或用 ' +
+                'set -x / 显式重定向输出到文件后再用 ssh_read_file 读取',
         }
     }
 
@@ -1133,7 +1171,10 @@ export class SessionManager {
         const markerEnv = `MCP_SSH_OPERATION_MARKER=${this.escapeShellArg(marker)}`
         const markerLine = `__MCP_SSH_OPERATION__:${marker}:%s:%s\\n`
         const operationScript = this.escapeShellArg(
-            `printf ${this.escapeShellArg(markerLine)} "$$" "$1" >&2; exec sh -c ${this.escapeShellArg(command)}`
+            'printf ' +
+                `${this.escapeShellArg(markerLine)}` +
+                ' "$$" "$1" >&2; exec sh -c ' +
+                `${this.escapeShellArg(command)}`
         )
         const wrappedCommand =
             `if command -v setsid >/dev/null 2>&1; then ` +
@@ -1152,7 +1193,8 @@ export class SessionManager {
             const script = [
                 `$operationMarker = ${quotePowershell(marker)}`,
                 '$created = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks',
-                '[Console]::Error.WriteLine("__MCP_SSH_OPERATION__:{0}:{1}:0:{2}", $operationMarker, $PID, $created)',
+                '[Console]::Error.WriteLine("__MCP_SSH_OPERATION__:{0}:{1}:0:{2}", ' +
+                    '$operationMarker, $PID, $created)',
                 execution,
                 'if (-not $?) { exit 1 }',
             ].join('; ')
@@ -1185,8 +1227,11 @@ export class SessionManager {
                 }
                 try {
                     adopt(stream)
-                    if (stream.ready) void stream.ready.then(resolve, reject)
-                    else resolve()
+                    if (stream.ready) {
+                        void stream.ready.then(resolve, reject)
+                    } else {
+                        resolve()
+                    }
                 } catch (adoptionError) {
                     this.closeClientChannel(stream)
                     reject(adoptionError)
@@ -1217,7 +1262,9 @@ export class SessionManager {
                 `$expectedTicks = ${quotePowershell(processCreatedAt)}`,
                 `$expectedMarker = ${quotePowershell(marker)}`,
                 '$process = Get-CimInstance Win32_Process -Filter "ProcessId=$remotePid"',
-                'if (-not $process -or $process.CommandLine -notmatch "-EncodedCommand\\s+([A-Za-z0-9+/=]+)") { throw "process identity unavailable" }',
+                'if (-not $process -or $process.CommandLine -notmatch ' +
+                    '"-EncodedCommand\\s+([A-Za-z0-9+/=]+)") { throw "process identity ' +
+                    'unavailable" }',
                 '$script = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))',
                 'if (-not $script.Contains($expectedMarker)) { throw "operation marker mismatch" }',
                 '$start = (Get-Process -Id $remotePid).StartTime.ToUniversalTime().Ticks.ToString()',
@@ -1244,8 +1291,8 @@ export class SessionManager {
             `pid=${pid}`,
             `expected=${this.escapeShellArg(expectedMarker)}`,
             'if [ ! -r "/proc/$pid/environ" ]; then printf "operation marker unavailable" >&2; exit 3; fi',
-            'if ! tr "\\000" "\\n" < "/proc/$pid/environ" | grep -Fqx -- "$expected"; then ' +
-                'printf "operation marker mismatch" >&2; exit 4; fi',
+            'if ! tr "\\000" "\\n" < "/proc/$pid/environ" | grep -Fqx -- "$expected"; ' +
+                'then printf "operation marker mismatch" >&2; exit 4; fi',
             `kill -TERM ${signalTarget}`,
         ].join('; ')
         try {
@@ -1396,7 +1443,7 @@ export class SessionManager {
                     )
                 })
 
-                stream.on('close', (code: number) => {
+                stream.on('close', (code?: number | null, signal?: string) => {
                     if (settled) {
                         return
                     }
@@ -1407,9 +1454,9 @@ export class SessionManager {
                         success: code === 0,
                         stdout,
                         stderr,
-                        exitCode: code,
+                        exitCode: code ?? null,
                         duration: Date.now() - startTime,
-                        failureKind: code === 0 ? undefined : 'remote_command',
+                        ...this.commandExitMetadata(code, signal),
                         stdoutTruncated: stdoutTruncated || undefined,
                         stderrTruncated: stderrTruncated || undefined,
                         ...this.outputMetadata(outputPreview()),
@@ -2180,11 +2227,9 @@ export class SessionManager {
      */
     private getLoadProfileCommand(): string {
         return (
-            'case "$(basename "$SHELL" 2>/dev/null)" in ' +
-            'bash) [ -f ~/.bashrc ] && . ~/.bashrc ;; ' +
-            'zsh) [ -f ~/.zshrc ] && . ~/.zshrc ;; ' +
-            '*) [ -f ~/.profile ] && . ~/.profile ;; ' +
-            'esac 2>/dev/null; '
+            'case "$(basename "$SHELL" 2>/dev/null)" in bash) [ -f ~/.bashrc ] && . ' +
+            '~/.bashrc ;; zsh) [ -f ~/.zshrc ] && . ~/.zshrc ;; *) [ -f ~/.profile ] ' +
+            '&& . ~/.profile ;; esac 2>/dev/null; '
         )
     }
 

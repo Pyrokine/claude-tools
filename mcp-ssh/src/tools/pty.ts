@@ -85,7 +85,7 @@ async function handlePtyWrite(args: z.infer<typeof ptyWriteSchema>) {
 
 async function handlePtyRead(args: z.infer<typeof ptyReadSchema>) {
     try {
-        const readResult = sessionManager.ptyRead(args.ptyId, {
+        const readResult = await sessionManager.ptyRead(args.ptyId, {
             mode: args.mode ?? 'screen',
             clear: args.clear !== false,
         })
@@ -183,17 +183,20 @@ write 返回 accepted=true 表示数据已被本地 stream 接收。backpressure
     server.registerTool(
         'ssh_pty_read',
         {
-            description: `读取 PTY 输出
-
-两种模式：
-- screen（默认）：返回当前屏幕内容（解析后的纯文本，适合 top/btop/htop 等全屏刷新工具）
-- raw：data 为 UTF-8 文本预览，dataBase64 为原始 ANSI/二进制字节的无损 base64
-
-bufferSize、unreadRawBytes 和 rawBufferLimit 均按原始字节计数。rawBufferTruncated=true 表示本次 clear 之后已有更早的 raw 输出因上限被丢弃；raw 读取使用默认 clear=true 时，响应返回清理前的计数和标志，然后重置缓冲区。
-
-示例：
-- 获取 top 当前画面: ssh_pty_read(ptyId="xxx")
-- 获取原始输出: ssh_pty_read(ptyId="xxx", mode="raw")`,
+            description:
+                '读取 PTY 输出\n' +
+                '\n' +
+                '两种模式：\n' +
+                '- screen（默认）：返回当前屏幕内容（解析后的纯文本，适合 top/btop/htop 等全屏刷新工具）\n' +
+                '- raw：data 为 UTF-8 文本预览，dataBase64 为原始 ANSI/二进制字节的无损 base64\n' +
+                '\n' +
+                'bufferSize、unreadRawBytes 和 rawBufferLimit ' +
+                '均按原始字节计数。rawBufferTruncated=true 表示本次 clear 之后已有更早的 raw 输出因上限被丢弃；raw ' +
+                '读取使用默认 clear=true 时，响应返回清理前的计数和标志，然后重置缓冲区。\n' +
+                '\n' +
+                '示例：\n' +
+                '- 获取 top 当前画面: ssh_pty_read(ptyId="xxx")\n' +
+                '- 获取原始输出: ssh_pty_read(ptyId="xxx", mode="raw")',
             inputSchema: ptyReadSchema,
         },
         (args) => handlePtyRead(args)
@@ -222,7 +225,8 @@ bufferSize、unreadRawBytes 和 rawBufferLimit 均按原始字节计数。rawBuf
         'ssh_pty_list',
         {
             description:
-                '列出所有 PTY 会话。bufferSize、unreadRawBytes 和 rawBufferLimit 使用原始字节，rawBufferTruncated 表示更早的 raw 输出已因缓冲区上限被丢弃。',
+                '列出所有 PTY 会话。bufferSize、unreadRawBytes 和 rawBufferLimit ' +
+                '使用原始字节，rawBufferTruncated 表示更早的 raw 输出已因缓冲区上限被丢弃。',
             inputSchema: ptyListSchema,
         },
         () => handlePtyList()

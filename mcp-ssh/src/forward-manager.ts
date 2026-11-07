@@ -175,7 +175,14 @@ export class ForwardManager {
                     remotePort,
                     (err, connectedStream) => {
                         settleChannelOpen()
-                        if (err || !this.isCurrent(session) || session.lifecycle !== 'active' || !session.active) {
+                        if (
+                            err ||
+                            closed ||
+                            socket.destroyed ||
+                            !this.isCurrent(session) ||
+                            session.lifecycle !== 'active' ||
+                            !session.active
+                        ) {
                             connectedStream?.destroy()
                             closeConnection()
                             return

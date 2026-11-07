@@ -10,10 +10,17 @@ import { randomUUID } from 'crypto'
 import { z } from 'zod'
 import { classifyCommandRisk, type CommandRisk } from '../command-risk.js'
 import * as fileOps from '../file-ops.js'
-import { sessionManager } from '../session-manager.js'
+import { sftpOperationOutcome } from '../sftp-timeout.js'
 import { OpenSshError } from '../openssh.js'
 import { encodedPowershell, quotePowershell, sftpPath } from '../remote-platform.js'
-import { type ExecResult, HARD_EXEC_MAX_OUTPUT_SIZE } from '../types.js'
+import { sessionManager } from '../session-manager.js'
+import {
+    DEFAULT_EXEC_MAX_OUTPUT_SIZE,
+    DEFAULT_EXEC_TIMEOUT_MS,
+    type ExecResult,
+    HARD_EXEC_MAX_OUTPUT_SIZE,
+} from '../types.js'
+import { utf8SafeEnd } from '../utf8.js'
 import { windowsTemporaryPathScript } from '../windows-acl.js'
 import { sshPortSchema } from './schema.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js' // ========== Schemas ==========
@@ -111,7 +118,11 @@ const execParallelSchema = z.object({
 const execScriptSchema = z.object({
     alias: z.string().describe('连接别名'),
     script: z.string().describe('脚本内容'),
-    interpreter: z.string().optional().describe('解释器，默认 bash'),
+    interpreter: z.string().optional().describe('解释器可执行文件名或路径，POSIX 默认 bash，Windows 默认连接 shell'),
+    interpreterArgs: z
+        .array(z.string().refine((value) => !value.includes('\0'), '解释器参数不能包含 NUL'))
+        .optional()
+        .describe('解释器参数数组，默认空数组，例如 python3 配合 ["-I"]；每项作为独立参数传递'),
     targetUser: z.string().optional().describe('目标用户名，优先级高于 runAs'),
     runAs: z.string().optional().describe('本次脚本使用的目标用户'),
     cwd: z.string().optional().describe('工作目录（可选）'),
@@ -137,7 +148,7 @@ async function handleExec(args: z.infer<typeof execSchema>) {
         })
         return formatResult({
             ...result,
-            commandRisk: classifyCommandRisk(args.command, args.timeout, sessionManager.getCommandShell(args.alias)),
+            commandRisk: classifyCommandRisk(args.command, args.timeout ?? DEFAULT_EXEC_TIMEOUT_MS, result.shell),
         })
     } catch (error) {
         return formatError(error)
@@ -157,11 +168,7 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
             })
             return formatResult({
                 ...result,
-                commandRisk: classifyCommandRisk(
-                    args.command,
-                    args.timeout,
-                    sessionManager.getCommandShell(args.alias)
-                ),
+                commandRisk: classifyCommandRisk(args.command, args.timeout ?? DEFAULT_EXEC_TIMEOUT_MS, result.shell),
             })
         }
         const result = await sessionManager.exec(args.alias, args.command, {
@@ -173,7 +180,7 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
         })
         return formatResult({
             ...result,
-            commandRisk: classifyCommandRisk(args.command, args.timeout, sessionManager.getCommandShell(args.alias)),
+            commandRisk: classifyCommandRisk(args.command, args.timeout ?? DEFAULT_EXEC_TIMEOUT_MS, result.shell),
         })
     } catch (error) {
         return formatError(error)
@@ -195,38 +202,85 @@ async function handleExecSudo(args: z.infer<typeof execSudoSchema>) {
     }
 }
 
+const REQUEST_OUTPUT_LIMIT = 16 * 1024 * 1024
+
+type RequestOutputBudget = { remaining: number; truncated: boolean }
+
+function boundExecOutput<T extends Partial<ExecResult>>(result: T, budget: RequestOutputBudget): T {
+    const bounded = { ...result }
+    budget.truncated ||= result.stdoutTruncated === true || result.stderrTruncated === true
+    for (const field of ['stdout', 'stderr', 'stdoutHead', 'stdoutTail', 'stderrHead', 'stderrTail'] as const) {
+        const value = bounded[field]
+        if (value === undefined) {
+            continue
+        }
+        const bytes = Buffer.from(value)
+        const end = utf8SafeEnd(
+            bytes,
+            0,
+            Math.min(bytes.length, budget.remaining),
+            field,
+            budget.remaining < bytes.length,
+            true
+        )
+        bounded[field] = bytes.subarray(0, end).toString('utf8')
+        budget.remaining -= end
+        if (end < bytes.length) {
+            budget.truncated = true
+            if (field.startsWith('stdout')) {
+                bounded.stdoutTruncated = true
+            } else {
+                bounded.stderrTruncated = true
+            }
+        }
+    }
+    return bounded
+}
+
+function executionFailure(error: unknown): Partial<ExecResult> & { success: false; error: string } {
+    const details = error && typeof error === 'object' && 'details' in error ? error.details : undefined
+    return {
+        ...(details && typeof details === 'object' ? details : {}),
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+    }
+}
+
 async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
     try {
         const stopOnError = args.stopOnError !== false
-        type BatchEntry =
-            | ({ index: number; commandRedacted: true; commandRisk?: CommandRisk } & ExecResult)
-            | { index: number; commandRedacted: true; commandRisk?: CommandRisk; success: false; error: string }
+        type BatchEntry = { index: number; commandRedacted: true; commandRisk?: CommandRisk } & Partial<ExecResult>
         const results: BatchEntry[] = []
+        const budget = { remaining: REQUEST_OUTPUT_LIMIT, truncated: false }
 
         for (let i = 0; i < args.commands.length; i++) {
-            const commandRisk = classifyCommandRisk(
-                args.commands[i],
-                args.timeout,
-                sessionManager.getCommandShell(args.alias)
-            )
             try {
-                const execResult = await sessionManager.exec(args.alias, args.commands[i], { timeout: args.timeout })
+                const execResult = await sessionManager.exec(args.alias, args.commands[i], {
+                    timeout: args.timeout,
+                    maxOutputSize: Math.max(1, Math.min(DEFAULT_EXEC_MAX_OUTPUT_SIZE, budget.remaining)),
+                })
                 results.push({
                     index: i,
                     commandRedacted: true,
-                    commandRisk,
-                    ...execResult,
+                    commandRisk: classifyCommandRisk(
+                        args.commands[i],
+                        args.timeout ?? DEFAULT_EXEC_TIMEOUT_MS,
+                        execResult.shell
+                    ),
+                    ...boundExecOutput(execResult, budget),
                 })
-                if (execResult.exitCode !== 0 && stopOnError) {
+                if (!execResult.success && stopOnError) {
                     break
                 }
             } catch (err) {
+                const failure = executionFailure(err)
                 results.push({
                     index: i,
                     commandRedacted: true,
-                    commandRisk,
-                    success: false,
-                    error: err instanceof Error ? err.message : String(err),
+                    commandRisk: failure.shell
+                        ? classifyCommandRisk(args.commands[i], args.timeout ?? DEFAULT_EXEC_TIMEOUT_MS, failure.shell)
+                        : undefined,
+                    ...boundExecOutput(failure, budget),
                 })
                 if (stopOnError) {
                     break
@@ -239,6 +293,9 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
             total: args.commands.length,
             executed: results.length,
             results,
+            maxOutputBytes: REQUEST_OUTPUT_LIMIT,
+            outputBytes: REQUEST_OUTPUT_LIMIT - budget.remaining,
+            outputTruncated: budget.truncated || undefined,
         })
     } catch (error) {
         return formatError(error)
@@ -289,22 +346,19 @@ async function mapWithConcurrency<T, R>(
 async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
     try {
         const concurrency = Math.min(args.maxConcurrency ?? EXEC_PARALLEL_DEFAULT_CONCURRENCY, args.aliases.length)
+        const budget = { remaining: REQUEST_OUTPUT_LIMIT, truncated: false }
         const results = await mapWithConcurrency(args.aliases, concurrency, async (alias) => {
             try {
                 const execResult = await sessionManager.exec(alias, args.command, {
                     timeout: args.timeout,
-                    maxOutputSize: args.maxOutputSize,
+                    maxOutputSize: Math.max(
+                        1,
+                        Math.min(args.maxOutputSize ?? DEFAULT_EXEC_MAX_OUTPUT_SIZE, budget.remaining)
+                    ),
                 })
-                return {
-                    alias,
-                    ...execResult,
-                }
+                return { alias, ...boundExecOutput(execResult, budget) }
             } catch (err) {
-                return {
-                    alias,
-                    success: false,
-                    error: err instanceof Error ? err.message : String(err),
-                }
+                return { alias, ...boundExecOutput(executionFailure(err), budget) }
             }
         })
 
@@ -313,6 +367,9 @@ async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
             total: args.aliases.length,
             concurrency,
             results,
+            maxOutputBytes: REQUEST_OUTPUT_LIMIT,
+            outputBytes: REQUEST_OUTPUT_LIMIT - budget.remaining,
+            outputTruncated: budget.truncated || undefined,
         })
     } catch (error) {
         return formatError(error)
@@ -377,7 +434,7 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
     let ownsRemotePath = false
     let executionStarted = false
     try {
-        if (sessionManager.getOpenSshConnection(args.alias))
+        if (sessionManager.getOpenSshConnection(args.alias)) {
             throw new OpenSshError(
                 'The OpenSSH backend does not support temporary script uploads; use ssh_exec for inline commands',
                 {
@@ -387,8 +444,10 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
                     retryable: false,
                 }
             )
+        }
         const windows = sessionManager.getRemotePlatform(args.alias) === 'windows'
         const interpreter = args.interpreter ?? (windows ? sessionManager.getCommandShell(args.alias) : 'bash')
+        const interpreterArgs = args.interpreterArgs ?? []
         const { effectiveUser, loginUser } = resolveScriptUsers(args)
         if (windows && (args.targetUser || args.runAs || effectiveUser)) {
             sessionManager.requirePosixPrivilege(args.alias)
@@ -425,7 +484,12 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
                 throw new Error('Remote Windows temporary directory lookup failed')
             }
             remoteSftpPath = sftpPath(remotePath, sessionManager.getRemotePathStyle(args.alias))
-            await fileOps.prepareWindowsRemotePrivateFile(args.alias, remoteSftpPath, args.timeout, remotePath)
+            await fileOps.prepareWindowsRemotePrivateFile(
+                args.alias,
+                remoteSftpPath,
+                args.timeout ?? DEFAULT_EXEC_TIMEOUT_MS,
+                remotePath
+            )
             ownsRemotePath = true
         } else {
             const tempResult = await sessionManager.exec(args.alias, 'mktemp /tmp/mcp-ssh-script.XXXXXX', {
@@ -456,10 +520,18 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
         }
 
         const command = windows
-            ? interpreter.toLowerCase().startsWith('cmd')
-                ? `cmd.exe /D /C "${remotePath.replace(/"/g, '""')}"`
-                : encodedPowershell(`& ${quotePowershell(remotePath)}; if (-not $?) { exit 1 }`)
-            : `${escapeShellArg(interpreter)} ${escapeShellArg(remotePath)}`
+            ? interpreterArgs.length > 0
+                ? encodedPowershell(
+                      `& ${[interpreter, ...interpreterArgs].map(quotePowershell).join(' ')} ` +
+                          (interpreter.toLowerCase().startsWith('cmd')
+                              ? `/D /V:OFF /S /C ${quotePowershell(`"${remotePath.replace(/"/g, '""')}"`)}`
+                              : `-File ${quotePowershell(remotePath)}`) +
+                          '; exit $LASTEXITCODE'
+                  )
+                : interpreter.toLowerCase().startsWith('cmd')
+                  ? `cmd.exe /D /C "${remotePath.replace(/"/g, '""')}"`
+                  : encodedPowershell(`& ${quotePowershell(remotePath)}; if (-not $?) { exit 1 }`)
+            : [interpreter, ...interpreterArgs, remotePath].map(escapeShellArg).join(' ')
         const execOptions = {
             timeout: args.timeout,
             cwd: args.cwd,
@@ -487,14 +559,7 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
             remoteSftpPath && ownsRemotePath && (args.keepScript !== true || !executionStarted)
                 ? await cleanupRemoteScript(args.alias, remoteSftpPath, args.timeout)
                 : undefined
-        if (cleanupWarning) {
-            return formatResult({
-                success: false,
-                error: error instanceof Error ? error.message : String(error),
-                cleanupWarning,
-            })
-        }
-        return formatError(error)
+        return formatError(error, { ...sftpOperationOutcome(error), cleanupWarning })
     }
 }
 

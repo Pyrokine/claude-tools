@@ -38,6 +38,13 @@ interface PtySession {
     maxBufferSize: number
     decoder: StringDecoder
     decoderEnded: boolean
+    pendingCharacters: number
+    parsing: Promise<void>
+    parseWaiters: Set<() => void>
+    parserError?: string
+    outputPaused: boolean
+    disposed: boolean
+    detach: () => void
     active: boolean
     closedAt: number | null
 }
@@ -84,38 +91,45 @@ export class PtyManager {
             maxBufferSize,
             decoder: new StringDecoder('utf8'),
             decoderEnded: false,
+            pendingCharacters: 0,
+            parsing: Promise.resolve(),
+            parseWaiters: new Set(),
+            outputPaused: false,
+            disposed: false,
+            detach: () => undefined,
             active: true,
             closedAt: null,
         }
 
-        // 监听输出数据
-        stream.on('data', (data: Buffer) => {
+        const onData = (data: Buffer): void => {
             if (!ptySession.active || ptySession.decoderEnded) {
                 return
             }
             ptySession.lastOutputAt = Date.now()
             this.appendRaw(ptySession, data)
             this.appendOutput(ptySession, ptySession.decoder.write(data))
-        })
-
-        stream.on('close', () => {
+        }
+        const onClose = (): void => {
             if (!this.sessions.has(ptyId)) {
                 return
             }
             this.endDecoder(ptySession)
             ptySession.active = false
             ptySession.closedAt = Date.now()
-        })
-
-        stream.on('error', (err: Error) => {
-            if (!this.sessions.has(ptyId)) {
-                return
-            }
-            this.endDecoder(ptySession)
-            ptySession.active = false
-            ptySession.closedAt = Date.now()
-            terminal.write(`\n[PTY Error: ${err.message}]`)
-        })
+            ptySession.detach()
+        }
+        const onError = (err: Error): void => {
+            this.appendOutput(ptySession, `\n[PTY Error: ${err.message}]`)
+            onClose()
+        }
+        ptySession.detach = () => {
+            stream.off('data', onData)
+            stream.off('close', onClose)
+            stream.off('error', onError)
+        }
+        stream.on('data', onData)
+        stream.on('close', onClose)
+        stream.on('error', onError)
 
         this.sessions.set(ptyId, ptySession)
         return ptyId
@@ -133,9 +147,15 @@ export class PtyManager {
         }
     }
 
-    read(ptyId: string, options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}): PtyReadResult {
+    async read(ptyId: string, options: { mode?: 'screen' | 'raw'; clear?: boolean } = {}): Promise<PtyReadResult> {
         const session = this.getSession(ptyId)
         const mode = options.mode ?? 'screen'
+        if (mode === 'screen') {
+            await session.parsing
+            if (session.disposed) {
+                throw new Error(`PTY session '${ptyId}' not found`)
+            }
+        }
         const clear = options.clear !== false
         const unreadRawBytes = session.unreadRawBytes
         const rawBufferTruncated = session.rawBufferTruncated
@@ -168,6 +188,7 @@ export class PtyManager {
             rawBufferLimit: session.maxBufferSize,
             rawBufferTruncated,
             foregroundProcess: session.command,
+            ...(session.parserError ? { parserError: session.parserError } : {}),
         }
     }
 
@@ -210,7 +231,7 @@ export class PtyManager {
         this.endDecoder(session)
 
         try {
-            session.terminal.dispose()
+            this.disposeParser(session)
         } catch (error) {
             return {
                 success: false,
@@ -247,7 +268,7 @@ export class PtyManager {
             }
             this.endDecoder(session)
             try {
-                session.terminal.dispose()
+                this.disposeParser(session)
             } catch {
                 // SSH 连接已失效，继续释放本地状态
             }
@@ -282,10 +303,58 @@ export class PtyManager {
     }
 
     private appendOutput(session: PtySession, output: string): void {
-        if (output.length === 0) {
+        if (output.length === 0 || session.disposed || session.parserError) {
             return
         }
-        session.terminal.write(output)
+        session.pendingCharacters += output.length
+        if (!session.outputPaused && session.pendingCharacters >= 1024 * 1024) {
+            session.outputPaused = true
+            session.stream.pause()
+        }
+        session.parsing = new Promise<void>((resolve) => {
+            session.parseWaiters.add(resolve)
+            try {
+                session.terminal.write(output, () => {
+                    session.parseWaiters.delete(resolve)
+                    if (session.disposed) {
+                        resolve()
+                        return
+                    }
+                    session.pendingCharacters -= output.length
+                    if (
+                        session.outputPaused &&
+                        session.pendingCharacters <= 256 * 1024 &&
+                        session.active &&
+                        !session.disposed
+                    ) {
+                        session.outputPaused = false
+                        session.stream.resume()
+                    }
+                    resolve()
+                })
+            } catch (error) {
+                session.parserError = error instanceof Error ? error.message : String(error)
+                session.active = false
+                session.closedAt = Date.now()
+                session.detach()
+                session.stream.destroy()
+                for (const complete of session.parseWaiters) {
+                    complete()
+                }
+                session.parseWaiters.clear()
+            }
+        })
+    }
+
+    private disposeParser(session: PtySession): void {
+        session.detach()
+        session.disposed = true
+        for (const complete of session.parseWaiters) {
+            complete()
+        }
+        session.parseWaiters.clear()
+        session.pendingCharacters = 0
+        session.terminal.dispose()
     }
 
     private appendRaw(session: PtySession, data: Buffer): void {

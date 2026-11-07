@@ -260,6 +260,30 @@ test('pending forwardOut keeps close retryable until its callback is drained', a
     socket.destroy()
 })
 
+test('SSH-04: a late forwardOut channel is rejected after only its local socket closes', async (t) => {
+    const manager = new ForwardManager()
+    const client = new FakeClient({ deferForwardOut: true })
+    const deps = { getClient: () => client }
+    const created = await manager.forwardLocal(deps, 'server', 0, '127.0.0.1', 80)
+    t.after(() => manager.closeByAlias('server'))
+    const socket = await connect(created.localPort)
+    t.after(() => socket.destroy())
+    for (let i = 0; i < 100 && !client.forwardOutCallback; ++i) {
+        await new Promise((resolve) => setImmediate(resolve))
+    }
+    const session = manager.sessions.get(created.forwardId)
+    const local = [...session.connections][0]
+    local.destroy()
+    await new Promise((resolve) => local.once('close', resolve))
+    const late = new PassThrough()
+    client.forwardOutCallback(null, late)
+    assert.equal(late.destroyed, true)
+    assert.equal(session.active, true)
+    assert.equal(session.activeConnections, 0)
+    assert.equal(session.connections.size, 0)
+    assert.equal(session.pendingChannelOpens, 0)
+})
+
 test('local forwards bound pending SSH channel opens per alias', async () => {
     const manager = new ForwardManager()
     const client = new FakeClient({ deferForwardOut: true })

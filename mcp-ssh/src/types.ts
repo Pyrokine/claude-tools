@@ -142,7 +142,10 @@ export interface ExecResult {
     success: boolean
     stdout: string
     stderr: string
-    exitCode: number
+    exitCode: number | null
+    exitSignal?: string
+    operationStatus?: 'completed' | 'failed' | 'unknown'
+    retryable?: boolean
     duration: number // 执行时间（毫秒）
     failureKind?: 'remote_command' | 'ssh_transport' | 'timeout'
     stdoutTruncated?: boolean
@@ -162,7 +165,7 @@ export interface ExecResult {
     identity?: string
     cwd?: string
     resolvedCwd?: string
-    shell?: string
+    shell?: CommandShell
     profileLoaded?: boolean
     envInjectedKeys?: string[]
     timedOut?: boolean
@@ -286,6 +289,7 @@ export interface PtySessionInfo {
 }
 
 export interface PtyReadResult {
+    parserError?: string
     data: string
     dataBase64?: string
     active: boolean

@@ -104,37 +104,47 @@ function remoteFile(bytes, events = []) {
     }
 }
 
-test('S1: public connection passes explicit agent to ssh2, and unsupported Pageant on POSIX fails before connecting', async (t) => {
-    const dir = fixture(t, () => manager)
-    const sock = path.join(dir, 'agent.sock')
-    fs.writeFileSync(sock, '')
-    const original = Client.prototype.connect
-    const connects = []
-    Client.prototype.connect = function (config) {
-        connects.push(config)
-        Promise.resolve().then(() => this.emit('ready'))
-        return this
+test(
+    'S1: public connection passes explicit agent to ssh2, and unsupported ' +
+        'Pageant on POSIX fails before connecting',
+    async (t) => {
+        const dir = fixture(t, () => manager)
+        const sock = path.join(dir, 'agent.sock')
+        fs.writeFileSync(sock, '')
+        const original = Client.prototype.connect
+        const connects = []
+        Client.prototype.connect = function (config) {
+            connects.push(config)
+            this._sock = new PassThrough()
+            this._protocol = { disconnect() {} }
+            config.hostVerifier(fixtureHostKey, (accepted) => {
+                this.emit(accepted ? 'ready' : 'error', ...(accepted ? [] : [new Error('fixture host rejected')]))
+            })
+            return this
+        }
+        t.after(() => {
+            Client.prototype.connect = original
+        })
+        const manager = new SessionManager(path.join(dir, 'sessions.json'))
+        manager.knownHosts = new KnownHosts(fixtureTrustFile, [])
+        await manager.connect({ host: 'example.com', port: 22, username: 'test', alias: 'agent-fixture', agent: sock })
+        assert.equal(connects[0].agent, sock)
+        // A regular file is not an OpenSSH socket.
+        assert.equal(manager.getExternalTransferCapability('agent-fixture').rsyncEligible, false)
+        manager.disconnect('agent-fixture')
+        if (process.platform !== 'win32') {
+            await assert.rejects(
+                manager.connect({ host: 'example.com', port: 22, username: 'test', agent: 'pageant' }),
+                /Pageant authentication is only available/
+            )
+            assert.equal(connects.length, 1)
+        }
+        const connect = tools(registerConnectionTools).get('ssh_connect')
+        assert.ok(connect.schema.inputSchema.shape.agent)
+        assert.ok(connect.schema.inputSchema.shape.remotePlatform)
+        assert.ok(connect.schema.inputSchema.shape.commandShell)
     }
-    t.after(() => {
-        Client.prototype.connect = original
-    })
-    const manager = new SessionManager(path.join(dir, 'sessions.json'))
-    await manager.connect({ host: 'example.com', port: 22, username: 'test', alias: 'agent-fixture', agent: sock })
-    assert.equal(connects[0].agent, sock)
-    assert.equal(manager.getExternalTransferCapability('agent-fixture').rsyncEligible, false) // regular file is not an OpenSSH socket
-    manager.disconnect('agent-fixture')
-    if (process.platform !== 'win32') {
-        await assert.rejects(
-            manager.connect({ host: 'example.com', port: 22, username: 'test', agent: 'pageant' }),
-            /Pageant authentication is only available/
-        )
-        assert.equal(connects.length, 1)
-    }
-    const connect = tools(registerConnectionTools).get('ssh_connect')
-    assert.ok(connect.schema.inputSchema.shape.agent)
-    assert.ok(connect.schema.inputSchema.shape.remotePlatform)
-    assert.ok(connect.schema.inputSchema.shape.commandShell)
-})
+)
 
 test('S2/S3: POSIX, PowerShell, cmd grouping and privilege restrictions come from remote config', async (t) => {
     const ps = buildRemoteCommand('Write-Output $env:VAR', 'powershell', 'C:\\Program Files\\Case', { VAR: "a'b" })
@@ -387,12 +397,18 @@ test('S11/S12: Windows private ACL script and SSH config quoted paths preserve s
     const previous = process.env.SSH_MCP_ALLOWED_KEY_DIRS
     process.env.SSH_MCP_ALLOWED_KEY_DIRS = dir
     t.after(() => {
-        if (previous === undefined) delete process.env.SSH_MCP_ALLOWED_KEY_DIRS
-        else process.env.SSH_MCP_ALLOWED_KEY_DIRS = previous
+        if (previous === undefined) {
+            delete process.env.SSH_MCP_ALLOWED_KEY_DIRS
+        } else {
+            process.env.SSH_MCP_ALLOWED_KEY_DIRS = previous
+        }
     })
     fs.writeFileSync(
         configPath,
-        'Host test\n  HostName example.com\n  IdentityFile "~/.ssh/key with spaces"\n  IdentityAgent "C:\\Users\\Li Ming\\agent.sock"\n'
+        'Host test\n' +
+            '  HostName example.com\n' +
+            '  IdentityFile "~/.ssh/key with spaces"\n' +
+            '  IdentityAgent "C:\\Users\\Li Ming\\agent.sock"\n'
     )
     const parsed = parseSSHConfig(configPath)[0]
     assert.equal(parsed.identityFile, path.join(os.homedir(), '.ssh', 'key with spaces'))
@@ -407,13 +423,16 @@ test('S11: Windows key ACL status requires effective read access', (t) => {
     const key = path.join(fixture(t), 'key')
     fs.writeFileSync(key, 'test key')
     assert.equal(checkWindowsAcl(key, true), 'key_path_usable')
-    const denyRead = `$ErrorActionPreference = 'Stop'
-$p = $env:MCP_SSH_TEST_PRIVATE_KEY
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$acl = Get-Acl -LiteralPath $p
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity, 'ReadData', 'Deny')
-[void]$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $p -AclObject $acl`
+    const denyRead =
+        "$ErrorActionPreference = 'Stop'\n" +
+        '$p = $env:MCP_SSH_TEST_PRIVATE_KEY\n' +
+        '$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Us' +
+        'er\n' +
+        '$acl = Get-Acl -LiteralPath $p\n' +
+        '$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($ident' +
+        "ity, 'ReadData', 'Deny')\n" +
+        '[void]$acl.AddAccessRule($rule)\n' +
+        'Set-Acl -LiteralPath $p -AclObject $acl'
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', denyRead], {
         env: { ...process.env, MCP_SSH_TEST_PRIVATE_KEY: key },
         encoding: 'utf8',
@@ -423,54 +442,58 @@ Set-Acl -LiteralPath $p -AclObject $acl`
     assert.equal(checkWindowsAcl(key), 'key_acl_unverified')
 })
 
-test('S13/S14: atomic overwrite rejects missing negotiated extension and shell-specific risk avoids search terms', async (t) => {
-    const originalSftp = sessionManager.getSftp
-    sessionManager.getSftp = async () => ({ _extensions: {}, end() {} })
-    t.after(() => {
-        sessionManager.getSftp = originalSftp
-    })
-    assert.deepEqual(await atomicReplaceCapability('test'), {
-        atomicReplaceSupported: false,
-        reason: 'posix-rename@openssh.com was not negotiated',
-    })
-    assert.equal(classifyCommandRisk('grep -R secret /logs', 30_000), undefined)
-    assert.equal(classifyCommandRisk('rm -r /data', 30_000)?.level, 'high')
-    assert.equal(classifyCommandRisk('rm --recursive /data', 30_000)?.level, 'high')
-    assert.equal(classifyCommandRisk('grep -R "rm -r" /logs', 30_000), undefined)
-    assert.equal(classifyCommandRisk("grep -- '--token' /logs", 30_000), undefined)
-    assert.equal(classifyCommandRisk("grep -- 'systemctl restart service' /logs", 30_000), undefined)
-    assert.equal(classifyCommandRisk('grep -R "Authorization: Bearer" /logs', 30_000), undefined)
-    assert.equal(
-        classifyCommandRisk("Select-String -Pattern 'Remove-Item -Recurse' -Path logfile", 30_000, 'powershell'),
-        undefined
-    )
-    assert.equal(classifyCommandRisk('findstr /C:"del C:\\Data" logfile', 30_000, 'cmd'), undefined)
-    assert.equal(
-        classifyCommandRisk('curl -H "Authorization: Bearer value" https://example.com', 30_000)?.categories.includes(
-            'credential-bearing'
-        ),
-        true
-    )
-    assert.equal(classifyCommandRisk('python app.py', 30_000), undefined)
-    assert.equal(classifyCommandRisk('Remove-Item -Recurse C:\\Data', 30_000, 'powershell')?.level, 'high')
-    assert.equal(classifyCommandRisk('echo secret-marker', 30_000, 'cmd'), undefined)
-    assert.equal(classifyCommandRisk('taskkill /F /PID 123', 30_000, 'cmd')?.level, 'high')
-    assert.equal(classifyCommandRisk('del C:\\Data\\file.txt', 30_000, 'cmd')?.level, 'high')
-    assert.equal(
-        classifyCommandRisk('Get-ChildItem -Recurse C:\\', undefined, 'powershell')?.categories.includes(
-            'long-running'
-        ),
-        true
-    )
-    assert.equal(classifyCommandRisk('dir /s C:\\', undefined, 'cmd')?.categories.includes('long-running'), true)
-    assert.equal(classifyCommandRisk('curl --token=xyz', 30_000)?.categories.includes('credential-bearing'), true)
-    const file = tools(registerFileTools).get('ssh_upload')
-    assert.ok(file.schema.inputSchema.shape.atomic)
-    assert.ok(file.schema.inputSchema.shape.remotePath)
-    const execution = tools(registerExecTools)
-    assert.ok(execution.get('ssh_exec').schema.inputSchema.shape.maxOutputSize)
-    assert.ok(execution.get('ssh_quick_exec').schema.inputSchema.shape.remotePlatform)
-})
+test(
+    'S13/S14: atomic overwrite rejects missing negotiated extension and ' + 'shell-specific risk avoids search terms',
+    async (t) => {
+        const originalSftp = sessionManager.getSftp
+        sessionManager.getSftp = async () => ({ _extensions: {}, end() {} })
+        t.after(() => {
+            sessionManager.getSftp = originalSftp
+        })
+        assert.deepEqual(await atomicReplaceCapability('test'), {
+            atomicReplaceSupported: false,
+            reason: 'posix-rename@openssh.com was not negotiated',
+        })
+        assert.equal(classifyCommandRisk('grep -R secret /logs', 30_000), undefined)
+        assert.equal(classifyCommandRisk('rm -r /data', 30_000)?.level, 'high')
+        assert.equal(classifyCommandRisk('rm --recursive /data', 30_000)?.level, 'high')
+        assert.equal(classifyCommandRisk('grep -R "rm -r" /logs', 30_000), undefined)
+        assert.equal(classifyCommandRisk("grep -- '--token' /logs", 30_000), undefined)
+        assert.equal(classifyCommandRisk("grep -- 'systemctl restart service' /logs", 30_000), undefined)
+        assert.equal(classifyCommandRisk('grep -R "Authorization: Bearer" /logs', 30_000), undefined)
+        assert.equal(
+            classifyCommandRisk("Select-String -Pattern 'Remove-Item -Recurse' -Path logfile", 30_000, 'powershell'),
+            undefined
+        )
+        assert.equal(classifyCommandRisk('findstr /C:"del C:\\Data" logfile', 30_000, 'cmd'), undefined)
+        assert.equal(
+            classifyCommandRisk(
+                'curl -H "Authorization: Bearer value" https://example.com',
+                30_000
+            )?.categories.includes('credential-bearing'),
+            true
+        )
+        assert.equal(classifyCommandRisk('python app.py', 30_000), undefined)
+        assert.equal(classifyCommandRisk('Remove-Item -Recurse C:\\Data', 30_000, 'powershell')?.level, 'high')
+        assert.equal(classifyCommandRisk('echo secret-marker', 30_000, 'cmd'), undefined)
+        assert.equal(classifyCommandRisk('taskkill /F /PID 123', 30_000, 'cmd')?.level, 'high')
+        assert.equal(classifyCommandRisk('del C:\\Data\\file.txt', 30_000, 'cmd')?.level, 'high')
+        assert.equal(
+            classifyCommandRisk('Get-ChildItem -Recurse C:\\', undefined, 'powershell')?.categories.includes(
+                'long-running'
+            ),
+            true
+        )
+        assert.equal(classifyCommandRisk('dir /s C:\\', undefined, 'cmd')?.categories.includes('long-running'), true)
+        assert.equal(classifyCommandRisk('curl --token=xyz', 30_000)?.categories.includes('credential-bearing'), true)
+        const file = tools(registerFileTools).get('ssh_upload')
+        assert.ok(file.schema.inputSchema.shape.atomic)
+        assert.ok(file.schema.inputSchema.shape.remotePath)
+        const execution = tools(registerExecTools)
+        assert.ok(execution.get('ssh_exec').schema.inputSchema.shape.maxOutputSize)
+        assert.ok(execution.get('ssh_quick_exec').schema.inputSchema.shape.remotePlatform)
+    }
+)
 
 test('S14: cmd command risk preserves literal quotes, caret escapes, and command separators', () => {
     const commands = [
@@ -568,133 +591,139 @@ test('S14: Windows command risk preserves timeout bounds and credential diagnost
     }
 })
 
-test('S4: Windows script refuses to send content before ACL verification and cleans its empty SFTP file', async (t) => {
-    const alias = 'windows-script-fixture'
-    const manager = sessionManager
-    const originalExec = manager.exec
-    const originalSftp = manager.getSftp
-    const writes = []
-    const removed = []
-    manager.sessions.set(alias, {
-        client: {},
-        config: { host: 'example.com', username: 'fixture', remotePlatform: 'windows', commandShell: 'powershell' },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
-    t.after(() => {
-        manager.exec = originalExec
-        manager.getSftp = originalSftp
-        manager.sessions.delete(alias)
-    })
-    manager.exec = async (_alias, command) => {
-        const decoded = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
-        if (decoded.includes('GetTempPath')) {
-            assert.match(decoded, /GetAccessRules/)
-            assert.match(decoded, /DeleteSubdirectoriesAndFiles/)
-            const filename = decoded.match(/mcp-ssh-script-[a-f0-9-]+\.ps1/)?.[0]
-            assert.ok(filename)
-            return { success: true, stdout: `C:\\Temp\\${filename}\r\n`, stderr: '', exitCode: 0 }
+test(
+    'S4: Windows script refuses to send content before ACL verification and ' + 'cleans its empty SFTP file',
+    async (t) => {
+        const alias = 'windows-script-fixture'
+        const manager = sessionManager
+        const originalExec = manager.exec
+        const originalSftp = manager.getSftp
+        const writes = []
+        const removed = []
+        manager.sessions.set(alias, {
+            client: {},
+            config: { host: 'example.com', username: 'fixture', remotePlatform: 'windows', commandShell: 'powershell' },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
+        })
+        t.after(() => {
+            manager.exec = originalExec
+            manager.getSftp = originalSftp
+            manager.sessions.delete(alias)
+        })
+        manager.exec = async (_alias, command) => {
+            const decoded = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
+            if (decoded.includes('GetTempPath')) {
+                assert.match(decoded, /GetAccessRules/)
+                assert.match(decoded, /DeleteSubdirectoriesAndFiles/)
+                const filename = decoded.match(/mcp-ssh-script-[a-f0-9-]+\.ps1/)?.[0]
+                assert.ok(filename)
+                return { success: true, stdout: `C:\\Temp\\${filename}\r\n`, stderr: '', exitCode: 0 }
+            }
+            assert.match(decoded, /SetAccessRuleProtection/)
+            return { success: false, stdout: 'insecure', stderr: 'ACL denied', exitCode: 1 }
         }
-        assert.match(decoded, /SetAccessRuleProtection/)
-        return { success: false, stdout: 'insecure', stderr: 'ACL denied', exitCode: 1 }
-    }
-    manager.getSftp = async () => ({
-        createWriteStream(name, options) {
-            writes.push({ name, options })
-            return new Writable({
-                write(chunk, _encoding, cb) {
-                    writes.push(Buffer.from(chunk))
-                    cb()
-                },
-            })
-        },
-        unlink(name, callback) {
-            removed.push(name)
-            callback(null)
-        },
-        end() {},
-    })
-    const handler = tools(registerExecTools).get('ssh_exec_script').handler
-    const response = content(await handler({ alias, script: 'credential=private', keepScript: true }))
-    assert.equal(response.success, false)
-    assert.match(response.error, /privacy_not_enforced_on_windows/)
-    assert.equal(writes.length, 1)
-    assert.equal(writes[0].options.flags, 'wx')
-    assert.deepEqual(removed, [writes[0].name])
-})
-
-test('S6: Windows tracked operation captures PID and creation ticks and verifies identity before tree termination', async (t) => {
-    const dir = fixture(t, () => manager)
-    const manager = new SessionManager(path.join(dir, 'sessions.json'))
-    let stream
-    let commandSent
-    manager.sessions.set('win', {
-        client: {
-            exec(command, _options, cb) {
-                commandSent = command
-                stream = new EventEmitter()
-                stream.stderr = new EventEmitter()
-                stream.destroy = () => {}
-                stream.close = () => {}
-                cb(null, stream)
+        manager.getSftp = async () => ({
+            createWriteStream(name, options) {
+                writes.push({ name, options })
+                return new Writable({
+                    write(chunk, _encoding, cb) {
+                        writes.push(Buffer.from(chunk))
+                        cb()
+                    },
+                })
+            },
+            unlink(name, callback) {
+                removed.push(name)
+                callback(null)
             },
             end() {},
-        },
-        config: {
-            host: 'example.com',
-            port: 22,
-            username: 'fixture',
-            remotePlatform: 'windows',
-            commandShell: 'powershell',
-        },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
-    t.after(() => manager.operationManager.close())
-    const operation = await manager.operationStart('win', 'Start-Sleep 30')
-    const outer = Buffer.from(commandSent.split(' ').at(-1), 'base64').toString('utf16le')
-    const innerEncoded = outer.match(
-        /powershell\.exe -NoProfile -NonInteractive -EncodedCommand ([A-Za-z0-9+/=]+)/
-    )?.[1]
-    const inner = Buffer.from(innerEncoded, 'base64').toString('utf16le')
-    const marker = inner.match(/\$operationMarker = '([a-f0-9]+)'/)?.[1]
-    assert.ok(marker)
-    stream.stderr.emit('data', Buffer.from(`__MCP_SSH_OPERATION__:${marker}:4321:0:123456789\n`))
-    assert.equal(manager.operationStatus(operation.operationId).processCreatedAt, '123456789')
-    const originalExec = manager.exec
-    manager.exec = async (_alias, command) => {
-        const encodedScript = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
-        assert.match(encodedScript, /Get-CimInstance Win32_Process/)
-        assert.match(encodedScript, /Get-Process -Id \$remotePid/)
-        assert.match(encodedScript, /taskkill\.exe \/PID \$remotePid \/T \/F/)
-        assert.ok(encodedScript.includes(marker))
-        return { success: true, stdout: '', stderr: '', exitCode: 0 }
+        })
+        const handler = tools(registerExecTools).get('ssh_exec_script').handler
+        const response = content(await handler({ alias, script: 'credential=private', keepScript: true }))
+        assert.equal(response.success, false)
+        assert.match(response.error, /privacy_not_enforced_on_windows/)
+        assert.equal(writes.length, 1)
+        assert.equal(writes[0].options.flags, 'wx')
+        assert.deepEqual(removed, [writes[0].name])
     }
-    t.after(() => {
-        manager.exec = originalExec
-    })
-    const cancelled = await manager.operationCancel(operation.operationId)
-    assert.equal(cancelled.success, true)
-    assert.equal(cancelled.cancelRequested, true)
-    assert.equal(cancelled.cancellationStatus, 'requested')
-    manager.exec = async () => ({ success: false, stdout: '', stderr: 'process identity unavailable', exitCode: 3 })
-    const unverified = await manager.operationCancel(operation.operationId)
-    assert.equal(unverified.success, false)
-    assert.equal(unverified.cancellationStatus, 'unknown')
-    assert.equal(unverified.status, 'running')
-    assert.deepEqual(await manager.cancelRemoteOperation('win', 4321, marker, false, {}, undefined), {
-        success: false,
-        cancellationStatus: 'unsupported',
-        error: 'unsupported_remote_platform: process creation time is unavailable',
-    })
-    manager.disconnect('win')
-})
+)
+
+test(
+    'S6: Windows tracked operation captures PID and creation ticks and ' + 'verifies identity before tree termination',
+    async (t) => {
+        const dir = fixture(t, () => manager)
+        const manager = new SessionManager(path.join(dir, 'sessions.json'))
+        let stream
+        let commandSent
+        manager.sessions.set('win', {
+            client: {
+                exec(command, _options, cb) {
+                    commandSent = command
+                    stream = new EventEmitter()
+                    stream.stderr = new EventEmitter()
+                    stream.destroy = () => {}
+                    stream.close = () => {}
+                    cb(null, stream)
+                },
+                end() {},
+            },
+            config: {
+                host: 'example.com',
+                port: 22,
+                username: 'fixture',
+                remotePlatform: 'windows',
+                commandShell: 'powershell',
+            },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
+        })
+        t.after(() => manager.operationManager.close())
+        const operation = await manager.operationStart('win', 'Start-Sleep 30')
+        const outer = Buffer.from(commandSent.split(' ').at(-1), 'base64').toString('utf16le')
+        const innerEncoded = outer.match(
+            /powershell\.exe -NoProfile -NonInteractive -EncodedCommand (?<encoded>[A-Za-z0-9+/=]+)/
+        )?.[1]
+        const inner = Buffer.from(innerEncoded, 'base64').toString('utf16le')
+        const marker = inner.match(/\$operationMarker = '(?<marker>[a-f0-9]+)'/)?.[1]
+        assert.ok(marker)
+        stream.stderr.emit('data', Buffer.from(`__MCP_SSH_OPERATION__:${marker}:4321:0:123456789\n`))
+        assert.equal(manager.operationStatus(operation.operationId).processCreatedAt, '123456789')
+        const originalExec = manager.exec
+        manager.exec = async (_alias, command) => {
+            const encodedScript = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
+            assert.match(encodedScript, /Get-CimInstance Win32_Process/)
+            assert.match(encodedScript, /Get-Process -Id \$remotePid/)
+            assert.match(encodedScript, /taskkill\.exe \/PID \$remotePid \/T \/F/)
+            assert.ok(encodedScript.includes(marker))
+            return { success: true, stdout: '', stderr: '', exitCode: 0 }
+        }
+        t.after(() => {
+            manager.exec = originalExec
+        })
+        const cancelled = await manager.operationCancel(operation.operationId)
+        assert.equal(cancelled.success, true)
+        assert.equal(cancelled.cancelRequested, true)
+        assert.equal(cancelled.cancellationStatus, 'requested')
+        manager.exec = async () => ({ success: false, stdout: '', stderr: 'process identity unavailable', exitCode: 3 })
+        const unverified = await manager.operationCancel(operation.operationId)
+        assert.equal(unverified.success, false)
+        assert.equal(unverified.cancellationStatus, 'unknown')
+        assert.equal(unverified.status, 'running')
+        assert.deepEqual(await manager.cancelRemoteOperation('win', 4321, marker, false, {}, undefined), {
+            success: false,
+            cancellationStatus: 'unsupported',
+            error: 'unsupported_remote_platform: process creation time is unavailable',
+        })
+        manager.disconnect('win')
+    }
+)
 
 test('S10: SSH exec output budget is UTF-8 bytes, and PTY raw base64 preserves arbitrary bytes', async (t) => {
     const dir = fixture(t, () => manager)
@@ -779,51 +808,54 @@ test('S13: public atomic upload checks negotiated SFTP capability before a write
     assert.equal(writes, 0)
 })
 
-test('S1/S2/S8: ssh_connect public arguments reach the session manager without changing local platform defaults', async (t) => {
-    const originalConnect = sessionManager.connect
-    const originalInfo = sessionManager.getSessionConnectionInfo
-    let connectedConfig
-    sessionManager.connect = async (config) => {
-        connectedConfig = config
-        return 'fixture'
-    }
-    sessionManager.getSessionConnectionInfo = () => ({
-        alias: 'fixture',
-        identity: 'tester@example.com:22',
-        loginUser: 'tester',
-        runAs: undefined,
-        host: 'example.com',
-        port: 22,
-        defaultEnvKeys: [],
-        envKeys: [],
-        hasJumpHost: false,
-        remotePlatform: 'windows',
-        commandShell: 'cmd',
-        remotePathStyle: 'win32',
-    })
-    t.after(() => {
-        sessionManager.connect = originalConnect
-        sessionManager.getSessionConnectionInfo = originalInfo
-    })
-    const result = content(
-        await tools(registerConnectionTools).get('ssh_connect').handler({
+test(
+    'S1/S2/S8: ssh_connect public arguments reach the session manager without ' + 'changing local platform defaults',
+    async (t) => {
+        const originalConnect = sessionManager.connect
+        const originalInfo = sessionManager.getSessionConnectionInfo
+        let connectedConfig
+        sessionManager.connect = async (config) => {
+            connectedConfig = config
+            return 'fixture'
+        }
+        sessionManager.getSessionConnectionInfo = () => ({
+            alias: 'fixture',
+            identity: 'tester@example.com:22',
+            loginUser: 'tester',
+            runAs: undefined,
             host: 'example.com',
-            user: 'tester',
-            agent: '\\\\.\\pipe\\openssh-ssh-agent',
+            port: 22,
+            defaultEnvKeys: [],
+            envKeys: [],
+            hasJumpHost: false,
             remotePlatform: 'windows',
             commandShell: 'cmd',
             remotePathStyle: 'win32',
-            rsyncExecutable: 'C:\\Program Files\\rsync.exe',
-            rsyncProfile: 'native-win32',
         })
-    )
-    assert.equal(result.success, true)
-    assert.equal(connectedConfig.agent, '\\\\.\\pipe\\openssh-ssh-agent')
-    assert.equal(connectedConfig.remotePlatform, 'windows')
-    assert.equal(connectedConfig.commandShell, 'cmd')
-    assert.equal(connectedConfig.rsyncProfile, 'native-win32')
-    assert.equal(connectedConfig.rsyncExecutable, 'C:\\Program Files\\rsync.exe')
-})
+        t.after(() => {
+            sessionManager.connect = originalConnect
+            sessionManager.getSessionConnectionInfo = originalInfo
+        })
+        const result = content(
+            await tools(registerConnectionTools).get('ssh_connect').handler({
+                host: 'example.com',
+                user: 'tester',
+                agent: '\\\\.\\pipe\\openssh-ssh-agent',
+                remotePlatform: 'windows',
+                commandShell: 'cmd',
+                remotePathStyle: 'win32',
+                rsyncExecutable: 'C:\\Program Files\\rsync.exe',
+                rsyncProfile: 'native-win32',
+            })
+        )
+        assert.equal(result.success, true)
+        assert.equal(connectedConfig.agent, '\\\\.\\pipe\\openssh-ssh-agent')
+        assert.equal(connectedConfig.remotePlatform, 'windows')
+        assert.equal(connectedConfig.commandShell, 'cmd')
+        assert.equal(connectedConfig.rsyncProfile, 'native-win32')
+        assert.equal(connectedConfig.rsyncExecutable, 'C:\\Program Files\\rsync.exe')
+    }
+)
 
 test(
     'S3/S5/S7: public Windows tools reject privileges and POSIX verification ' + 'before remote side effects',
@@ -924,65 +956,116 @@ test('S5/S9: public file reads map Windows SFTP paths and expose encoding and ba
     assert.deepEqual(requested, Array(4).fill('/C:/Space Here/file.txt'))
 })
 
-test('S4: Windows script writes content only after verified ACL, executes selected shell, and uses SFTP cleanup', async (t) => {
-    const alias = 'windows-script-success'
+test(
+    'S4: Windows script writes content only after verified ACL, executes ' + 'selected shell, and uses SFTP cleanup',
+    async (t) => {
+        const alias = 'windows-script-success'
+        const originalExec = sessionManager.exec
+        const originalSftp = sessionManager.getSftp
+        const order = []
+        const bodies = []
+        const sftpPaths = []
+        sessionManager.sessions.set(alias, {
+            client: {},
+            config: {
+                host: 'example.com',
+                username: 'tester',
+                remotePlatform: 'windows',
+                commandShell: 'cmd',
+                remotePathStyle: 'sftp-posix',
+            },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
+        })
+        sessionManager.exec = async (_alias, command) => {
+            const decoded = command.startsWith('powershell.exe')
+                ? Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
+                : command
+            if (decoded.includes('GetTempPath')) {
+                order.push('path')
+                return {
+                    success: true,
+                    stdout: `C:\\Temp\\${decoded.match(/mcp-ssh-script-[a-f0-9-]+\.cmd/)[0]}\r\n`,
+                    stderr: '',
+                    exitCode: 0,
+                }
+            }
+            if (decoded.includes('SetAccessRuleProtection')) {
+                order.push('acl')
+                assert.match(decoded, /C:\\Temp\\mcp-ssh-script-/)
+                assert.doesNotMatch(decoded, /\/C:\/Temp/)
+                return { success: true, stdout: 'usable\r\n', stderr: '', exitCode: 0 }
+            }
+            order.push('exec')
+            assert.match(command, /^cmd\.exe \/D \/C "C:\\Temp\\mcp-ssh-script-/)
+            return { success: true, stdout: 'executed', stderr: '', exitCode: 0 }
+        }
+        sessionManager.getSftp = async () => ({
+            createWriteStream(name, options) {
+                sftpPaths.push(name)
+                order.push(options.flags)
+                return new Writable({
+                    write(chunk, _encoding, callback) {
+                        bodies.push(Buffer.from(chunk))
+                        callback()
+                    },
+                })
+            },
+            unlink(name, callback) {
+                sftpPaths.push(name)
+                order.push('cleanup')
+                callback(null)
+            },
+            end() {},
+        })
+        t.after(() => {
+            sessionManager.exec = originalExec
+            sessionManager.getSftp = originalSftp
+            sessionManager.sessions.delete(alias)
+        })
+        const result = content(
+            await tools(registerExecTools)
+                .get('ssh_exec_script')
+                .handler({ alias, script: 'echo test', interpreter: 'cmd' })
+        )
+        assert.equal(result.success, true)
+        assert.deepEqual(order, ['path', 'wx', 'acl', 'w', 'exec', 'cleanup'])
+        assert.equal(sftpPaths.length, 3)
+        assert.ok(sftpPaths.every((item) => item.startsWith('/C:/Temp/mcp-ssh-script-')))
+        assert.equal(Buffer.concat(bodies).toString(), '@chcp 65001>nul || exit /b 1\r\necho test')
+    }
+)
+
+test('I005 Windows interpreter args reach the selected host after private script preparation', async (t) => {
+    const alias = 'owned-windows-argv'
     const originalExec = sessionManager.exec
     const originalSftp = sessionManager.getSftp
-    const order = []
-    const bodies = []
-    const sftpPaths = []
-    sessionManager.sessions.set(alias, {
-        client: {},
-        config: {
-            host: 'example.com',
-            username: 'tester',
-            remotePlatform: 'windows',
-            commandShell: 'cmd',
-            remotePathStyle: 'sftp-posix',
-        },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
+    let invocation
     sessionManager.exec = async (_alias, command) => {
-        const decoded = command.startsWith('powershell.exe')
-            ? Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
-            : command
+        const decoded = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
         if (decoded.includes('GetTempPath')) {
-            order.push('path')
-            return {
-                success: true,
-                stdout: `C:\\Temp\\${decoded.match(/mcp-ssh-script-[a-f0-9-]+\.cmd/)[0]}\r\n`,
-                stderr: '',
-                exitCode: 0,
-            }
+            const name = decoded.match(/mcp-ssh-script-[a-f0-9-]+\.(?:cmd|ps1)/)?.[0]
+            assert.ok(name)
+            return { success: true, stdout: `C:\\Temp\\${name}\r\n`, stderr: '', exitCode: 0 }
         }
         if (decoded.includes('SetAccessRuleProtection')) {
-            order.push('acl')
-            assert.match(decoded, /C:\\Temp\\mcp-ssh-script-/)
-            assert.doesNotMatch(decoded, /\/C:\/Temp/)
             return { success: true, stdout: 'usable\r\n', stderr: '', exitCode: 0 }
         }
-        order.push('exec')
-        assert.match(command, /^cmd\.exe \/D \/C "C:\\Temp\\mcp-ssh-script-/)
-        return { success: true, stdout: 'executed', stderr: '', exitCode: 0 }
+        invocation = decoded
+        return { success: true, stdout: 'owned', stderr: '', exitCode: 0 }
     }
     sessionManager.getSftp = async () => ({
-        createWriteStream(name, options) {
-            sftpPaths.push(name)
-            order.push(options.flags)
+        createWriteStream() {
             return new Writable({
-                write(chunk, _encoding, callback) {
-                    bodies.push(Buffer.from(chunk))
+                write(_chunk, _encoding, callback) {
                     callback()
                 },
             })
         },
-        unlink(name, callback) {
-            sftpPaths.push(name)
-            order.push('cleanup')
+        unlink(_name, callback) {
             callback(null)
         },
         end() {},
@@ -992,19 +1075,35 @@ test('S4: Windows script writes content only after verified ACL, executes select
         sessionManager.getSftp = originalSftp
         sessionManager.sessions.delete(alias)
     })
-    const result = content(
-        await tools(registerExecTools)
-            .get('ssh_exec_script')
-            .handler({ alias, script: 'echo test', interpreter: 'cmd' })
-    )
-    assert.equal(result.success, true)
-    assert.deepEqual(order, ['path', 'wx', 'acl', 'w', 'exec', 'cleanup'])
-    assert.equal(sftpPaths.length, 3)
-    assert.ok(sftpPaths.every((item) => item.startsWith('/C:/Temp/mcp-ssh-script-')))
-    assert.equal(Buffer.concat(bodies).toString(), '@chcp 65001>nul || exit /b 1\r\necho test')
+    const tool = tools(registerExecTools).get('ssh_exec_script')
+    for (const interpreter of ['cmd', 'powershell']) {
+        await t.test(interpreter, async () => {
+            sessionManager.sessions.set(alias, {
+                client: {},
+                connected: true,
+                manualClose: false,
+                reconnectAttempts: 0,
+                connectedAt: 1,
+                lastUsedAt: 1,
+                config: {
+                    host: 'example.com',
+                    username: 'owned',
+                    remotePlatform: 'windows',
+                    commandShell: interpreter,
+                    remotePathStyle: 'sftp-posix',
+                },
+            })
+            const interpreterArgs = interpreter === 'cmd' ? ['/Q'] : ['-NoProfile', '-ExecutionPolicy', 'RemoteSigned']
+            const args = tool.schema.inputSchema.parse({ alias, script: 'echo owned', interpreter, interpreterArgs })
+            const result = content(await tool.handler(args))
+            assert.equal(result.success, true, JSON.stringify(result))
+            assert.ok(invocation.startsWith(`& '${interpreter}' `))
+            assert.ok(invocation.includes(interpreterArgs.map((value) => `'${value}'`).join(' ')))
+            assert.match(invocation, interpreter === 'cmd' ? /\/D \/V:OFF \/S \/C/ : /-File 'C:\\Temp\\mcp-ssh-script-/)
+            assert.ok(invocation.endsWith('; exit $LASTEXITCODE'))
+        })
+    }
 })
-
-
 
 test('S4: Windows script bodies preserve Unicode for PowerShell and switch cmd to UTF-8', (t) => {
     const psBody = windowsScriptContent(
@@ -2130,14 +2229,22 @@ test('R4: IdentityAgent none allows password and disables environment agent acro
     process.env.SSH_AUTH_SOCK = '/nonexistent/environment-agent.sock'
     Client.prototype.connect = function (config) {
         connects.push(config)
-        Promise.resolve().then(() => this.emit('ready'))
+        this._sock = new PassThrough()
+        this._protocol = { disconnect() {} }
+        config.hostVerifier(fixtureHostKey, (accepted) => {
+            this.emit(accepted ? 'ready' : 'error', ...(accepted ? [] : [new Error('fixture host rejected')]))
+        })
         return this
     }
     const manager = new SessionManager(path.join(root, 'sessions.json'))
+    manager.knownHosts = new KnownHosts(fixtureTrustFile, [])
     t.after(() => {
         Client.prototype.connect = originalConnect
-        if (oldSocket === undefined) delete process.env.SSH_AUTH_SOCK
-        else process.env.SSH_AUTH_SOCK = oldSocket
+        if (oldSocket === undefined) {
+            delete process.env.SSH_AUTH_SOCK
+        } else {
+            process.env.SSH_AUTH_SOCK = oldSocket
+        }
         manager.operationManager.close()
     })
     await manager.connect({
@@ -2180,68 +2287,92 @@ test('R4: IdentityAgent none allows password and disables environment agent acro
     await manager.persistQueue
 })
 
-test('R4: public SSH config preserves none with keys, Host defaults, ProxyJump, and explicit overrides', async (t) => {
-    const root = fixture(t)
-    const configPath = path.join(root, 'config')
-    const oldAllowed = process.env.SSH_MCP_ALLOWED_KEY_DIRS
-    const oldTemplates = process.env.SSH_MCP_TEMPLATES
-    const originalConnect = sessionManager.connect
-    const originalInfo = sessionManager.getSessionConnectionInfo
-    process.env.SSH_MCP_ALLOWED_KEY_DIRS = root
-    process.env.SSH_MCP_TEMPLATES = JSON.stringify({ explicit: { agent: '/fixture/template.sock' } })
-    fs.writeFileSync(
-        configPath,
-        `Host *\n  User tester\n  IdentityAgent none\nHost password\n  HostName example.com\nHost target\n  HostName example.com\n  IdentityFile "${path.join(root, 'key')}"\n  ProxyJump hop\nHost hop\n  HostName bastion.example.com\n  IdentityFile "${path.join(root, 'jump-key')}"\n`
-    )
-    const configs = []
-    sessionManager.connect = async (config) => {
-        configs.push(config)
-        return config.alias
+test(
+    'R4: public SSH config preserves none with keys, Host defaults, ' + 'ProxyJump, and explicit overrides',
+    async (t) => {
+        const root = fixture(t)
+        const configPath = path.join(root, 'config')
+        const oldAllowed = process.env.SSH_MCP_ALLOWED_KEY_DIRS
+        const oldTemplates = process.env.SSH_MCP_TEMPLATES
+        const originalConnect = sessionManager.connect
+        const originalInfo = sessionManager.getSessionConnectionInfo
+        process.env.SSH_MCP_ALLOWED_KEY_DIRS = root
+        process.env.SSH_MCP_TEMPLATES = JSON.stringify({ explicit: { agent: '/fixture/template.sock' } })
+        fs.writeFileSync(
+            configPath,
+            'Host *\n' +
+                '  User tester\n' +
+                '  IdentityAgent none\n' +
+                'Host password\n' +
+                '  HostName example.com\n' +
+                'Host target\n' +
+                '  HostName example.com\n' +
+                '  IdentityFile "' +
+                `${path.join(root, 'key')}` +
+                '"\n' +
+                '  ProxyJump hop\n' +
+                'Host hop\n' +
+                '  HostName bastion.example.com\n' +
+                '  IdentityFile "' +
+                `${path.join(root, 'jump-key')}` +
+                '"\n'
+        )
+        const configs = []
+        sessionManager.connect = async (config) => {
+            configs.push(config)
+            return config.alias
+        }
+        sessionManager.getSessionConnectionInfo = (alias) => ({
+            alias,
+            identity: 'tester@example.com:22',
+            loginUser: 'tester',
+            host: 'example.com',
+            port: 22,
+            defaultEnvKeys: [],
+            envKeys: [],
+        })
+        t.after(() => {
+            sessionManager.connect = originalConnect
+            sessionManager.getSessionConnectionInfo = originalInfo
+            if (oldAllowed === undefined) {
+                delete process.env.SSH_MCP_ALLOWED_KEY_DIRS
+            } else {
+                process.env.SSH_MCP_ALLOWED_KEY_DIRS = oldAllowed
+            }
+            if (oldTemplates === undefined) {
+                delete process.env.SSH_MCP_TEMPLATES
+            } else {
+                process.env.SSH_MCP_TEMPLATES = oldTemplates
+            }
+        })
+        const handler = tools(registerConnectionTools).get('ssh_connect').handler
+        for (const args of [
+            { configHost: 'password', password: 'fixture' },
+            { configHost: 'target' },
+            { configHost: 'target', agent: '/fixture/explicit.sock' },
+            { configHost: 'target', template: 'explicit' },
+            {
+                configHost: 'target',
+                template: 'explicit',
+                agent: '/fixture/argument.sock',
+                jumpHost: { host: 'jump.example.com', user: 'other', agent: '/fixture/jump.sock' },
+            },
+        ]) {
+            const result = content(await handler({ configPath, ...args }))
+            assert.equal(result.success, true, JSON.stringify(result))
+        }
+        assert.equal(configs[0].agent, 'none')
+        assert.equal(configs[0].password, 'fixture')
+        assert.equal(configs[1].agent, 'none')
+        assert.equal(configs[1].privateKeyPath, path.join(root, 'key'))
+        assert.equal(configs[1].jumpHost.agent, 'none')
+        assert.equal(configs[1].jumpHost.privateKeyPath, path.join(root, 'jump-key'))
+        assert.equal(configs[2].agent, '/fixture/explicit.sock')
+        assert.equal(configs[3].agent, '/fixture/template.sock')
+        assert.equal(configs[4].agent, '/fixture/argument.sock')
+        assert.equal(configs[4].jumpHost.agent, '/fixture/jump.sock')
     }
-    sessionManager.getSessionConnectionInfo = (alias) => ({
-        alias,
-        identity: 'tester@example.com:22',
-        loginUser: 'tester',
-        host: 'example.com',
-        port: 22,
-        defaultEnvKeys: [],
-        envKeys: [],
-    })
-    t.after(() => {
-        sessionManager.connect = originalConnect
-        sessionManager.getSessionConnectionInfo = originalInfo
-        if (oldAllowed === undefined) delete process.env.SSH_MCP_ALLOWED_KEY_DIRS
-        else process.env.SSH_MCP_ALLOWED_KEY_DIRS = oldAllowed
-        if (oldTemplates === undefined) delete process.env.SSH_MCP_TEMPLATES
-        else process.env.SSH_MCP_TEMPLATES = oldTemplates
-    })
-    const handler = tools(registerConnectionTools).get('ssh_connect').handler
-    for (const args of [
-        { configHost: 'password', password: 'fixture' },
-        { configHost: 'target' },
-        { configHost: 'target', agent: '/fixture/explicit.sock' },
-        { configHost: 'target', template: 'explicit' },
-        {
-            configHost: 'target',
-            template: 'explicit',
-            agent: '/fixture/argument.sock',
-            jumpHost: { host: 'jump.example.com', user: 'other', agent: '/fixture/jump.sock' },
-        },
-    ]) {
-        const result = content(await handler({ configPath, ...args }))
-        assert.equal(result.success, true, JSON.stringify(result))
-    }
-    assert.equal(configs[0].agent, 'none')
-    assert.equal(configs[0].password, 'fixture')
-    assert.equal(configs[1].agent, 'none')
-    assert.equal(configs[1].privateKeyPath, path.join(root, 'key'))
-    assert.equal(configs[1].jumpHost.agent, 'none')
-    assert.equal(configs[1].jumpHost.privateKeyPath, path.join(root, 'jump-key'))
-    assert.equal(configs[2].agent, '/fixture/explicit.sock')
-    assert.equal(configs[3].agent, '/fixture/template.sock')
-    assert.equal(configs[4].agent, '/fixture/argument.sock')
-    assert.equal(configs[4].jumpHost.agent, '/fixture/jump.sock')
-})
+)
 
 test(
     'R1/R4: sensitive Windows upload reaches rsync while IdentityAgent none ' + 'removes the environment socket',

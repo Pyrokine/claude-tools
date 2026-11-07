@@ -8,7 +8,8 @@ SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.)
 [![Node](https://img.shields.io/badge/node-%3E%3D20.19-green.svg)](https://nodejs.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
-![Linux](https://img.shields.io/badge/Linux-tested-success) ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
+![Linux](https://img.shields.io/badge/Linux-tested-success)
+![macOS](https://img.shields.io/badge/macOS-untested-yellow)
 ![Windows](https://img.shields.io/badge/Windows-untested-yellow)
 
 ## Migrating to 3.0
@@ -17,23 +18,79 @@ SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.)
 Recalculate budgets for non-ASCII output and check `stdoutTruncated` / `stderrTruncated`; `maxOutputSize=3` can return
 one Chinese character, not three. Text responses end at a complete character boundary.
 
-PTY `bufferSize` and list-result `bufferSize`, together with `unreadRawBytes` and `rawBufferLimit` in read/list results,
-now count raw bytes. A raw read with `clear=true` returns the counts and `rawBufferTruncated` state before clearing; the
-next read reflects the cleared buffer. Use `dataBase64` for exact ANSI or binary output and `data` for a UTF-8 preview.
+PTY `bufferSize` and list-result `bufferSize` , together with `unreadRawBytes` and `rawBufferLimit` in read/list
+results,
+now count raw bytes. A raw read with `clear=true` returns the counts and `rawBufferTruncated` state before clearing;
+the
+next read reflects the cleared buffer. Use `dataBase64` for exact ANSI or binary output and `data` for a UTF-8
+preview.
 
 File reads accept `encoding` (`auto`, `utf8`, `utf16le`, `utf16be`, `gbk`) and lossless `binary=true`. Keep offsets in
-bytes and continue with `next_offset`; `auto` detects encoding at the file start, including for later pages. A U+FEFF at
-a nonzero offset remains content. A budget too small for the next complete text character returns an error instead of an
-empty page; malformed encoding at EOF also fails. Binary reads advance byte by byte. `lineRange` metadata describes only
+bytes and continue with `next_offset` ; `auto` detects encoding at the file start, including for later pages. A U+FEFF
+at
+a nonzero offset remains content. A budget too small for the next complete text character returns an error instead of
+an
+empty page; malformed encoding at EOF also fails. Binary reads advance byte by byte. `lineRange` metadata describes
+only
 the returned prefix, including whether its last line ends with a newline.
 
 Windows connections require `remotePlatform="windows"`; local Windows does not change the remote default. Set
 `commandShell` and `remotePathStyle` for the host, and an explicit `rsyncProfile` when using rsync with Windows. The
 Windows behavior and examples below remain available.
 
+## Host key trust
+
+The default ssh2 backend checks the server key before user authentication, including each bastion, forwarded target,
+and
+reconnect. It also verifies every rekey with a fresh verification budget, while the initial handshake retains its
+original connection deadline. It reads `~/.ssh/known_hosts`, `~/.ssh/known_hosts2`, and standard system
+`ssh_known_hosts` files. An unknown host uses trust on first use (TOFU): its key is saved to `~/.ssh/known_hosts`
+before
+authentication proceeds. Connection results include the target's `hostKey.status` (`added` or `known`) and SHA-256
+fingerprint; `hostKeys` lists the verified host, port, status, and fingerprint for every hop. Preload a verified key
+to
+authenticate the first connection independently of the network path.
+
+Existing trusted keys automatically take priority during host-key algorithm negotiation. A saved ECDSA key remains
+usable
+when the server also offers Ed25519; an RSA pin also covers RSA SHA2 signatures. This applies to every hop and
+reconnect,
+with the negotiated key still checked against the saved key bytes before authentication.
+
+Changed, revoked, or damaged matching keys stop the connection before authentication or during rekey.
+Key mismatch errors include `details.hostKey`: the negotiated algorithm, presented key type and SHA-256 fingerprint,
+and matching saved fingerprints with their `known_hosts` file and line. Existing trust records remain unchanged.
+A rekey trust failure cancels automatic reconnect for that client and its dependent targets. A target failure
+preserves
+the shared bastion and unrelated aliases. Explicit connect or reconnect verifies trust again; ordinary network loss
+retains automatic reconnect. Hashed hostnames, host/port pairs, IPv6, multiple names, wildcard patterns, and negated
+patterns are supported. Matching CA or host-certificate entries require the OpenSSH backend. Concurrent first-use
+writes
+use an exclusive owner-directory lock with a bounded, cancellable wait. A complete owner record is published before
+writing trust. A confirmed exited owner is recovered automatically within the same verified local process domain:
+Linux uses the `/proc` boot ID and PID namespace, macOS uses `kern.bootsessionuuid`, and Windows queries the kernel's
+`SystemBootEnvironmentInformation.BootIdentifier` through the built-in PowerShell. Live or reused PIDs, denied
+liveness
+checks, and unavailable or mismatched boot/domain identities retain the lock until the wait expires or is canceled.
+Legacy
+empty `.mcp-lock` files have no owner record and remain in place; remove one only after establishing that no older
+writer is still using it.
+
+Trust writes append to the existing file, preserving its records, comments, permissions, and Windows DACLs. If
+writing,
+flushing, closing, cancellation, or the deadline fails after append starts, the connection fails before authentication
+and reports an unknown, possibly partial append. Existing bytes are retained without truncation or rollback, including
+records another writer has already saved; inspect the reported partial state before retrying. Trust files may be
+publicly readable, but untrusted writers are rejected. A known read-only record remains usable, while an unknown host
+fails when trust cannot be saved.
+
+`ProxyJump none` disables the configured jump. An explicit or template `jumpHost` overrides `ProxyJump` before its
+configuration is validated. OpenSSH master trust remains independent, as described below.
+
 ## Reusing an existing OpenSSH master
 
-The default `backend="ssh2"` retains password/key authentication, bastion connections, SFTP, PTY, and forwarding. Choose
+The default `backend="ssh2"` retains password/key authentication, bastion connections, SFTP, PTY, and forwarding.
+Choose
 `backend="openssh"` to reuse a master already opened by your terminal:
 
 ```text
@@ -43,7 +100,8 @@ ssh_sync(alias="shared", localPath="/local/data", remotePath="/remote/data", dir
 ```
 
 `ssh -G` resolves the effective host, user, port, and `ControlPath`; an explicit `controlPath` overrides the socket
-path. Custom `configPath` files retain the existing path and size checks. OpenSSH evaluates its normal `Host`, `Match`,
+path. Custom `configPath` files retain the existing path and size checks. OpenSSH evaluates its normal `Host` ,
+`Match` ,
 `Include`, and `ProxyJump` configuration, including user-configured `Match exec` commands. Execution then uses the
 resolved target and socket without rereading that configuration.
 
@@ -51,14 +109,20 @@ This backend only reuses existing connections. A missing, replaced, or disconnec
 command and rsync channels use a failing proxy if multiplexing fails, so they cannot start another SSH connection or
 switch to ssh2/SFTP. Do not pass password, key, agent, or `jumpHost` authentication parameters in this mode.
 
-Connection results include `backend`, `masterReused`, `masterPid`, `identityStatus="master_trusted"`, and observed login
-metadata. Trust belongs to the user-selected master, as in native OpenSSH multiplexing. Socket ownership, configuration
+Connection results include `backend` , `masterReused` , `masterPid` , `identityStatus="master_trusted"` , and observed
+login
+metadata. Trust belongs to the user-selected master, as in native OpenSSH multiplexing. Socket ownership,
+configuration
 conflicts, and login-user mismatches are checked; the response does not claim independent host identity authentication
 from `ssh -G` or `ssh -O check`.
 
 Commands, tracked operations, file metadata, and rsync synchronization work on local and remote POSIX systems. Sync
-requires local/remote rsync and remote GNU `find`, `stat`, `head`, and `realpath`; missing capabilities fail explicitly.
-Bounded directory manifests and streamed SHA-256 checks use the same master and do not require an ssh2 session or a
+requires local/remote rsync and remote GNU `find` , `stat` , `head` , and `realpath` ; missing capabilities fail
+explicitly.
+The error's `details` preserves `code`, `backend`, `reason`, and `retryable`, such as
+`reason="local_rsync_unavailable"`.
+Bounded directory manifests and streamed SHA-256 checks use the same master and do not require a session using ssh2 or
+a
 remote Python installation. Separate SFTP tools, temporary script uploads, PTY, forwarding, and Windows combinations
 return `unsupported_backend`.
 
@@ -163,17 +227,21 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 | `ssh_reconnect`     | Reconnect a disconnected session                     |
 | `ssh_config_list`   | List hosts from ~/.ssh/config                        |
 
-`ssh_list_sessions()` returns `backend`, `alias`, canonical `identity`, `runAs`, `connected`, and `lastUsedAt`; OpenSSH
-entries also include `masterReused` and `identityStatus`. Use `detail=true` for connection details or `fields=[...]` to
-select fields. Neither mode returns `keyPath`.
+`ssh_list_sessions()` returns `backend` , `alias` , canonical `identity` , `runAs` , `connected` , and `lastUsedAt` ;
+OpenSSH
+entries also include `masterReused` and `identityStatus` . Use `detail=true` for connection details or `fields=[...]`
+to
+select fields. Neither mode returns `keyPath`. For ssh2, `connected` checks the underlying socket's writable/open state, so a dead transport is reported disconnected before a delayed close event arrives. An implicit bastion alias that conflicts with another live connection uses a target-scoped alias; compatible bastions are still shared, and an explicitly chosen conflicting alias returns an error.
 
-ssh2 connections enable TCP_NODELAY to reduce waiting between interactive commands and small-file SFTP requests. Direct,
+ssh2 connections enable TCP_NODELAY to reduce waiting between interactive commands and small-file SFTP requests.
+Direct,
 jump-host, and replacement connections share this behavior without an additional option.
 
 `ssh_reconnect` invalidates operations, PTYs, forwards, and cached transfer capability bound to the old client before
 the replacement connection is published. Automatic reconnect timers are bound to the session and client that scheduled
 them, so an old timer cannot disconnect a newer session with the same alias. A delayed `close` from the old client
-cannot leave stale resources attached to the alias. If a target connection is canceled while a jump-host `forwardOut` is
+cannot leave stale resources attached to the alias. If a target connection is canceled while a jump-host `forwardOut`
+is
 pending, a channel returned by the delayed callback is destroyed before the connection attempt fails.
 
 ### Command Execution
@@ -187,6 +255,8 @@ pending, a channel returned by the delayed callback is destroyed before the conn
 | `ssh_exec_parallel` | Execute command on multiple hosts in parallel |
 | `ssh_quick_exec`    | One-shot: connect, execute, disconnect        |
 | `ssh_exec_script`   | Upload and run a temporary remote script      |
+
+`ssh_exec_script.interpreter` is an executable name or path. Pass flags separately as `interpreterArgs`, such as `interpreter="python3", interpreterArgs=["-I"]`. Each array entry is one escaped argument; omitting the array preserves the default empty argument list. POSIX defaults to bash; Windows defaults to the connection shell and retains its cmd or PowerShell script invocation.
 
 For a Windows remote, `ssh_exec_script` saves PowerShell scripts as UTF-8 with BOM so Windows PowerShell reads Unicode
 correctly. CMD scripts switch to code page 65001 before running UTF-8 commands; an unavailable code page stops
@@ -215,6 +285,8 @@ execution. POSIX scripts retain their original content.
 | `ssh_mkdir`      | Create remote directory                  |
 | `ssh_sync`       | Smart sync with rsync (fallback to SFTP) |
 
+`ssh_read_file` accepts regular files, including empty files. A directory is rejected before opening a read stream with guidance to use `ssh_list_dir`; other non-regular targets return a type error.
+
 ### PTY Sessions (Persistent Interactive Terminal)
 
 | Tool             | Description                                                          |
@@ -237,7 +309,8 @@ execution. POSIX scripts retain their original content.
 
 ## Windows and cross-platform SSH
 
-Set `remotePlatform="windows"` on connections to a Windows host. The default is `posix`, regardless of the client's OS.
+Set `remotePlatform="windows"` on connections to a Windows host. The default is `posix` , regardless of the client's
+OS.
 Use `commandShell="powershell"` (default on Windows) or `"cmd"`, and set `remotePathStyle="win32"` (default) or
 `"sftp-posix"` if the server exposes `/C:/...` paths. `cwd` and `env` are grouped with the command in the selected
 shell; unsupported cmd expansion in injected values is rejected. `ssh_quick_exec` also accepts `remotePlatform`,
@@ -245,19 +318,36 @@ shell; unsupported cmd expansion in injected values is rejected. `ssh_quick_exec
 `unsupported_remote_platform` before issuing a remote command.
 
 ```text
-ssh_connect(host="example.com", user="tester", agent="\\\\.\\pipe\\openssh-ssh-agent", remotePlatform="windows", commandShell="powershell", remotePathStyle="win32", rsyncProfile="native-win32")
+ssh_connect(
+  host="example.com",
+  user="tester",
+  agent="\\\\.\\pipe\\openssh-ssh-agent",
+  remotePlatform="windows",
+  commandShell="powershell",
+  remotePathStyle="win32",
+  rsyncProfile="native-win32"
+)
 ssh_exec(alias="tester@example.com:22", command="Get-Location", cwd="C:\\Test Data", env={REGION:"test"})
-ssh_read_file(alias="tester@example.com:22", remotePath="C:\\Test Data\\report.txt", lineRange="1-20", encoding="utf16le")
+ssh_read_file(
+  alias="tester@example.com:22",
+  remotePath="C:\\Test Data\\report.txt",
+  lineRange="1-20",
+  encoding="utf16le"
+)
 ```
 
-`ssh_connect(agent="...")` passes the socket or pipe to ssh2, including OpenSSH named pipes and ssh2's `agent="pageant"`
+`ssh_connect(agent="...")` passes the socket or pipe to ssh2, including OpenSSH named pipes and ssh2's
+`agent="pageant"`
 on Windows. SSH config `IdentityAgent` supplies a socket when there is no explicit agent or private key.
-`IdentityAgent none` (or `agent="none"`) disables agent authentication and environment socket fallback, including with a
+`IdentityAgent none` (or `agent="none"` ) disables agent authentication and environment socket fallback, including
+with a
 private key and on ProxyJump hosts; password and key authentication remain available. An explicit argument or template
-`agent` takes precedence over SSH config. Reconnect preserves this choice, and external OpenSSH/rsync also disables the
+`agent` takes precedence over SSH config. Reconnect preserves this choice, and external OpenSSH/rsync also disables
+the
 environment agent when `none` is selected. The connection result reports `remotePlatform`, `commandShell`,
 `remotePathStyle`, and `keyAclStatus` for Windows private keys. Existing private keys are checked but never modified:
-`key_acl_insecure` and `key_acl_unverified` reject authentication. Windows session files and temporary downloads receive
+`key_acl_insecure` and `key_acl_unverified` reject authentication. Windows session files and temporary downloads
+receive
 and verify private DACLs before they contain data. Windows scripts and atomic uploads create an empty temporary file
 through SFTP, verify its DACL, then write content; cleanup uses SFTP. Windows tracked operations report the PID and
 creation time. Cancellation checks the process command line for its random marker and creation time before
@@ -265,15 +355,20 @@ creation time. Cancellation checks the process command line for its random marke
 channel as proof of cancellation. Windows ACL and process behavior need a native Windows or Windows SSH host for
 end-to-end verification.
 
-`ssh_read_file` reads `lineRange` through SFTP, including CRLF and UTF-8, UTF-16LE/BE, or GBK (`encoding="auto"` detects
-a BOM at the start). `binary=true` returns the bytes as base64 in `content` and `content_base64`. Byte offsets apply to
-the remote file. GBK byte-offset reads and tails are rejected because a random byte offset cannot prove a GBK character
+`ssh_read_file` reads `lineRange` through SFTP, including CRLF and UTF-8, UTF-16LE/BE, or GBK (`encoding="auto"`
+detects
+a BOM at the start). `binary=true` returns the bytes as base64 in `content` and `content_base64` . Byte offsets apply
+to
+the remote file. GBK byte-offset reads and tails are rejected because a random byte offset cannot prove a GBK
+character
 boundary; use `lineRange` or `binary=true`. Use an explicit UTF-16 encoding for nonzero offsets. `maxOutputSize` for
 exec caps each stdout/stderr text body by UTF-8 bytes; `stdoutTruncated` and `stderrTruncated` signal truncation
-separately. PTY raw reads include `dataBase64` containing the unmodified buffered bytes; `data` remains a text preview.
+separately. PTY raw reads include `dataBase64` containing the unmodified buffered bytes; `data` remains a text
+preview.
 
 Directory verification traverses SFTP with entry, depth, file-size, and total-hash budgets; POSIX `verify.owner` and
-`verify.mode` are rejected on Windows. For a Windows directory, `verify.aclSddl` compares the expected DACL SDDL of the
+`verify.mode` are rejected on Windows. For a Windows directory, `verify.aclSddl` compares the expected DACL SDDL of
+the
 remote root separately. `ssh_upload(atomic=true)` checks the SFTP `posix-rename@openssh.com` capability before
 transferring data to replace an existing target; unsupported or unverified replacement leaves that target untouched.
 `ssh_sync` uses `rsyncProfile` (`posix`, `native-win32`, `msys2`, `cygwin`) and optional `rsyncExecutable` on the
@@ -285,7 +380,8 @@ Before either upload transport starts, Windows directory sync checks source name
 are applied. Potential collisions are compared using Windows ordinal case rules and the existing destination parent
 directory's case-sensitive flag. A confirmed collision returns `windows_filename_collision`; a missing parent,
 unavailable shell, timeout, or incomplete query returns `case_semantics_unverified` before any upload or directory
-creation, including in dry-run mode. Already-existing case-sensitive directories can keep case-distinct names. The check
+creation, including in dry-run mode. Already-existing case-sensitive directories can keep case-distinct names. The
+check
 does not infer rules for new directories from their ancestors. No candidate means no additional PowerShell or exec
 requirement, so SFTP-only uploads remain supported; POSIX uploads retain their name semantics.
 
@@ -339,8 +435,21 @@ Execute the same command on multiple connected hosts:
 ```
 
 Each host result keeps the same execution metadata as `ssh_exec`, including `failureKind`, `effectiveUser`, `cwd`,
-truncation fields, and diagnostic suggestions. `ssh_exec_parallel` limits one call to 32 aliases, runs up to 4 hosts at
-a time by default (configurable with `maxConcurrency`, max 8), and accepts `maxOutputSize` to cap each host result.
+truncation fields, and diagnostic suggestions. `ssh_exec_parallel` limits one call to 32 aliases, runs up to 4 hosts
+at
+a time by default (configurable with `maxConcurrency` , max 8), and accepts `maxOutputSize` to cap each host result.
+Both
+parallel and batch calls share a 16 MiB request budget for stdout/stderr and head/tail previews. `outputBytes`,
+`maxOutputBytes` , and `outputTruncated` describe that budget; each command retains its byte counts and truncation
+flags.
+Exhausting the budget truncates text while preserving every command's actual success, exit status, and batch
+`executed`
+count. A later disconnect or failed diagnostic preserves results already returned by completed commands.
+
+A channel closed without an exit status returns `exitCode=null`, `failureKind="ssh_transport"`,
+`operationStatus="unknown"` , and `retryable=false` , with any captured output. Inspect the remote state before
+repeating
+that command. A reported exit signal is retained as `exitSignal` and classified as a known remote command failure.
 
 ### Basic: Connect and Execute
 
@@ -353,8 +462,11 @@ ssh_disconnect(alias="myserver")
 ### Connection Templates and runAs
 
 Templates can be provided through `SSH_MCP_TEMPLATES` or `~/.mcp-ssh/templates.json`. Explicit tool arguments override
-template values. Each selected template is validated before connection. SSH ports must be integers from 1 through 65535;
-an invalid template error identifies its name and field without returning its authentication values.
+template values. Each selected template is validated before connection. SSH ports must be integers from 1 through
+65535;
+an invalid template error identifies its name and field without returning its authentication values. Invalid JSON
+errors
+report only the source and available numeric position or line/column, never source-text excerpts.
 
 ```json
 {
@@ -411,25 +523,33 @@ Perfect for scenarios where you SSH as root but need to run commands as another 
    // Output: appuser
 ```
 
-By default, the shell profile is loaded so environment variables are available. Non-interactive `su -c` sessions do not
+By default, the shell profile is loaded so environment variables are available. Non-interactive `su -c` sessions do
+not
 execute rc files automatically. Bash (`.bashrc`), zsh (`.zshrc`), and other shells (`.profile`) are supported. Disable
 this behavior with `loadProfile=false`.
 
-`ssh_exec`, `ssh_exec_as_user`, and `ssh_exec_sudo` use the same identity precedence: `useLoginUser=true` uses the login
+`ssh_exec` , `ssh_exec_as_user` , and `ssh_exec_sudo` use the same identity precedence: `useLoginUser=true` uses the
+login
 user; otherwise a per-call `runAs` overrides the session `runAs`; otherwise the session `runAs` applies.
 
 `ssh_exec` and `ssh_exec_as_user` return execution metadata: `loginUser`, `effectiveUser`, `identity`, `cwd`,
-`resolvedCwd`, `shell`, `profileLoaded`, `envInjectedKeys`, `failureKind`, `stdoutBytes`, `stderrBytes`, and truncation
+`resolvedCwd` , `shell` , `profileLoaded` , `envInjectedKeys` , `failureKind` , `stdoutBytes` , `stderrBytes` , and
+truncation
 hints. Large output returns `stdoutHead`, `stdoutTail`, `stderrHead`, `stderrTail`, and `recommendedReadCommand`.
-Timeout errors include the same head/tail fields from output produced before the timeout. Stdout and stderr are decoded
+Timeout errors include the same head/tail fields from output produced before the timeout. Stdout and stderr are
+decoded
 incrementally, so a UTF-8 character split across SSH data chunks is returned intact. `commandRisk` reports
 shell-specific destructive, privilege, credential-argument, process-control, and resource-use signals; read-only
 searches containing a credential word and ordinary Python/Node commands are not flagged solely for those words.
 
-`commandRisk` is diagnostic metadata and does not change command execution or its result. POSIX classification treats
+`commandRisk` is diagnostic metadata and does not change command execution or its result.
+Search risk uses the execution timeout, including the default 30 seconds. Searches with timeouts at most five minutes
+and `find` commands with a numeric `-maxdepth` are treated as bounded; separate unbounded searches and continuous
+commands such as `tail -f` retain their risk signals. POSIX classification treats
 here-doc bodies as input, supports quoted and partially quoted delimiters, backslash quoting, `<<-`, and multiple
 here-docs, and resumes after an exact, case-sensitive delimiter. Unquoted here-docs and double-quoted arguments still
-expose active command substitutions. A Shell background `&` at EOF is reported; `&&`, redirections, escaped ampersands,
+expose active command substitutions. A Shell background `&` at EOF is reported; `&&` , redirections, escaped
+ampersands,
 and quoted input are not background operators.
 
 ### Tracked long-running commands
@@ -443,10 +563,12 @@ ssh_operation_read(operationId="op_xxx", stdoutOffset=0, stderrOffset=0, maxByte
 ssh_operation_cancel(operationId="op_xxx")
 ```
 
-The start call returns an unpredictable `operationId`. The server creates the record before requesting the SSH channel,
+The start call returns an unpredictable `operationId` . The server creates the record before requesting the SSH
+channel,
 keeps bounded stdout and stderr buffers, records the remote PID after verifying a per-operation marker, and expires
 terminal records after `retentionMs`. `startTimeoutMs` bounds channel setup, defaults to 30 seconds, and accepts up to
-10 minutes. A timeout returns the `operationId` in error details, keeps a queryable `unknown` record, and blocks another
+10 minutes. A timeout returns the `operationId` in error details, keeps a queryable `unknown` record, and blocks
+another
 pending start on that alias until the original channel request settles or the alias is disconnected. `maxOutputBytes`
 defaults to 1 MiB and accepts up to 8 MiB. `retentionMs` defaults to 1 hour and accepts up to 24 hours.
 `ssh_operation_read.maxBytes` defaults to 64 KiB and accepts up to 1 MiB. Cancellation is refused until the marker and
@@ -457,8 +579,13 @@ period. Delayed exec, sudo, SFTP, PTY-start, and operation-start callbacks from 
 are rejected and their channels are destroyed. A sudo callback that arrives after timeout is also closed before any
 password is written. Operation listeners are installed inside the SSH exec callback before it returns, so a short
 command that emits its marker and closes immediately still enters a terminal state with `finishedAt` and `expiresAt`
-set. If the SSH session disconnects while a tracked command is active, its status becomes `unknown`; the server does not
-claim that the remote process stopped. `ssh_exec` keeps its existing synchronous timeout behavior.
+set. If the SSH session disconnects while a tracked command is active, its status becomes `unknown` ; the server does
+not
+claim that the remote process stopped. A channel that closes without an exit status or signal also becomes `unknown`,
+with `exitCode=null` and retained output, marker, PID and retention metadata. Inspect the remote command before
+repeating
+it. Known exit codes, signals and confirmed cancellation keep their respective terminal states. `ssh_exec` keeps its
+existing synchronous timeout behavior.
 
 Tracked POSIX commands use `setsid -w` when available to wait for the command, including when `setsid` forks. Nonzero
 command exits produce `failed`; a zero exit can still have stderr output. Commands execute under `sh`, so Bash-only
@@ -496,8 +623,10 @@ ssh_exec_script(alias="server", script=<script-above>, timeout=30000)
 ssh_read_file(alias="server", remotePath="/tmp/mcp-log-errors.txt", maxBytes=65536)
 ```
 
-This keeps log querying in the general command and file tools instead of adding a separate log-specific MCP surface. The
-`ssh_exec_script.timeout` value applies while uploading the temporary script, preparing its permissions, and running it.
+This keeps log querying in the general command and file tools instead of adding a separate log-specific MCP surface.
+The
+`ssh_exec_script.timeout` value applies while uploading the temporary script, preparing its permissions, and running
+it.
 A stalled SFTP upload therefore ends on the requested timeout instead of using the default SFTP budget.
 
 ### With Environment Variables
@@ -552,24 +681,30 @@ ssh_read_file(alias="server", remotePath="/var/log/app.log", lineRange="120-180"
 ```
 
 `ssh_upload` returns local path policy diagnostics, remote parent probing, remote target metadata, and optional
-verification checks. `atomic=true` writes an unpredictable same-directory temporary path with exclusive SFTP creation,
+verification checks. Default uploads omit `verification`; requesting a check, such as `verifySize=true`, adds it.
+`atomic=true` writes an unpredictable same-directory temporary path with exclusive SFTP creation,
 returns `diagnostics.tempRemotePath`, verifies the temporary file, and renames it only after every requested check
-passes. Responses distinguish `finalRemotePath` from the actual verification target: `verifiedRemotePath` identifies the
+passes. Responses distinguish `finalRemotePath` from the actual verification target: `verifiedRemotePath` identifies
+the
 path that was probed, and atomic verification also returns `verifiedTempRemotePath`. `verification.actual.remotePath`
 continues to describe the file that was actually verified, even after that temporary path has been renamed. Interpret
 the final state with `targetReplaced` and `targetReplacementStatus`. An existing target is replaced with the OpenSSH
 `posix-rename@openssh.com` extension; a new target uses standard SFTP rename. If the client cannot send the rename
-request, the response reports `operationStatus="failed"`, `targetReplaced=false`, and
-`targetReplacementStatus="not_replaced"`. An error returned after the request was sent cannot prove whether the server
-committed it, so the response reports `operationStatus="unknown"`, `targetReplaced=null`, and
+request or the server explicitly rejects it, the response reports `operationStatus="failed"` , `targetReplaced=false`
+, and
+`targetReplacementStatus="not_replaced"` . A lost completion reply after dispatch leaves the replacement unconfirmed;
+the response reports `operationStatus="unknown"` , `targetReplaced=null` , and
 `targetReplacementStatus="unknown"`; inspect the target before retrying. Temporary-file cleanup is attempted in both
 cases. `verifySize`, `verifyMd5`, `verifyMode`, `verifyOwner`, and `verifyMtime` add explicit transfer checks. Parent
-and target probes, recursive directory creation, file hashing, rename, and temporary-file cleanup use SFTP. The standard
+and target probes, recursive directory creation, file hashing, rename, and temporary-file cleanup use SFTP. The
+standard
 upload path works on SFTP-only servers and does not require GNU `stat`, `md5sum`, `sha256sum`, `mkdir`, `mv`, or `rm`
 commands. Directory manifest verification also reads the remote tree through SFTP.
 
-`ssh_download` writes to a same-directory temporary file with mode `0600`, then renames it over the requested local path
-after the SFTP stream closes and the transferred byte count matches the size reported by SFTP `stat`. A new target keeps
+`ssh_download` writes to a same-directory temporary file with mode `0600` , then renames it over the requested local
+path
+after the SFTP stream closes and the transferred byte count matches the size reported by SFTP `stat` . A new target
+keeps
 mode `0600`. Replacing a regular file preserves its `rwx` bits but does not copy setuid, setgid, or sticky bits. A
 symlink, directory, or other non-regular target is rejected before the remote read starts. A failed, truncated, or
 aborted download removes the temporary file and leaves an existing local target unchanged. SFTP directory listings
@@ -580,11 +715,21 @@ stdout/stderr, with the effective user, cwd, and a suggested follow-up read comm
 defaults to 1 MiB and rejects `maxBytes` above 16 MiB before remote transfer. It returns `total_size`, `read_offset`,
 `requested_offset`, `read_bytes`, `read_end`, `next_offset`, `remaining_bytes`, `sample_kind`, and `truncated` so
 callers can distinguish a full read, head, tail, byte-range, or line-range sample. Text reads never split a UTF-8
-character. Use `next_offset` for the next range request. `lineRange` scans via SFTP without running remote shell tools.
+character. Use `next_offset` for the next range request. `lineRange` scans via SFTP without running remote shell
+tools.
 
-`ssh_upload`, `ssh_download`, `ssh_read_file`, `ssh_write_file`, `ssh_list_dir`, `ssh_file_info`, and `ssh_mkdir` accept
-`timeout` for one SFTP operation. It defaults to 10 minutes and accepts up to one hour. A timeout returns
-`operationStatus="unknown"` and `retryable=true`; check the affected remote or local path before retrying.
+`ssh_upload` , `ssh_download` , `ssh_read_file` , `ssh_write_file` , `ssh_list_dir` , `ssh_file_info` , and
+`ssh_mkdir` accept
+`timeout` for one SFTP operation. It defaults to 10 minutes and accepts up to one hour. Timeouts retain local and
+remote probe diagnostics. Uploads and writes report `operationStatus="unknown"` when an
+OPEN, WRITE, or CLOSE request was dispatched without a completion reply. Explicit server refusal returns `failed` .
+Read-only upload preflight failures also return `failed` ,
+with `failureStage="preflight"` and zero acknowledged bytes.
+`failureStage`, the affected path, and `acknowledgedBytes` preserve the confirmed progress; `retryable=false` prevents
+automatic replay of writes. Inspect that path before another write. Atomic upload errors identify the temporary path
+separately from `finalRemotePath`; a failed temporary upload leaves the final target unchanged.
+Download errors report `failed` and distinguish temporary transfer from `local_rename` ; an existing target remains
+intact.
 
 `ssh_list_dir` and `ssh_file_info` return `mode` as the numeric `07777` permission mask and `permissions` as display
 text. The text uses `s`/`S` for setuid and setgid and `t`/`T` for sticky. `verifyMode` accepts four-digit octal values
@@ -597,14 +742,20 @@ from the display text.
 Entries retain directory-first, name-based ordering, and `showHidden=false` excludes dot-prefixed names. Supplying any
 filter or pagination parameter enables bounded responses, with defaults of 100 entries and 64 KiB per page.
 
-| Parameter        | Type                          | Contract                                                                                                             |
-| ---------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `namePattern`    | string                        | Case-sensitive name match using the same `*` and `?` wildcard rules as sync exclusions; other characters are literal |
-| `modifiedAfter`  | ISO 8601 string with timezone | Inclusive modification-time lower bound, such as `2026-01-01T00:00:00Z`                                              |
-| `modifiedBefore` | ISO 8601 string with timezone | Exclusive modification-time upper bound; it must be at or after `modifiedAfter`                                      |
-| `offset`         | nonnegative integer           | Position in the filtered, sorted entries; default `0`                                                                |
-| `limit`          | positive integer              | Maximum returned entries; default `100` in bounded mode                                                              |
-| `maxBytes`       | positive integer              | UTF-8 byte budget for the emitted JSON text, including metadata and formatting; default `65536` in bounded mode      |
+| Parameter        | Type                   | Default                 |
+| ---------------- | ---------------------- | ----------------------- |
+| `namePattern`    | string                 | None                    |
+| `modifiedAfter`  | ISO 8601 with timezone | None                    |
+| `modifiedBefore` | ISO 8601 with timezone | None                    |
+| `offset`         | Nonnegative integer    | `0`                     |
+| `limit`          | Positive integer       | `100` in bounded mode   |
+| `maxBytes`       | Positive integer       | `65536` in bounded mode |
+
+`namePattern` is case-sensitive and uses sync exclusions' `*` and `?`; other characters match literally.
+`modifiedAfter` is inclusive, for example `2026-01-01T00:00:00Z` . `modifiedBefore` is exclusive and must be at or
+after
+`modifiedAfter`. `offset` selects the position in the filtered, sorted entries; `limit` bounds the returned count.
+`maxBytes` counts emitted UTF-8 JSON, including metadata and formatting.
 
 Name, time, and hidden-file conditions are combined with AND. The time interval is `[modifiedAfter, modifiedBefore)`;
 equal bounds return an empty result. Bounded results include `count` for this page, `total_count` for all matching
@@ -619,20 +770,25 @@ ssh_list_dir(
 )
 ```
 
-The byte budget covers successful JSON text, not the MCP protocol envelope. If page metadata or the next complete entry
+The byte budget covers successful JSON text, not the MCP protocol envelope. If page metadata or the next complete
+entry
 cannot fit, the tool returns `LIST_DIR_MAX_BYTES_TOO_SMALL`, `requiredBytes`, and an unchanged `offset`/`next_offset`;
 raise `maxBytes` and retry that offset. Error diagnostics can exceed the requested budget. Entries are never split or
 silently skipped to fit a page.
 
-Each call performs a complete SFTP `readdir` before filtering and paging the response. This is response pagination, not
+Each call performs a complete SFTP `readdir` before filtering and paging the response. This is response pagination,
+not
 incremental remote enumeration or a frozen snapshot; directory changes between calls can shift offsets. Internal
-listing, recursive downloads, sync, and directory verification retain their existing enumeration contracts. The default
+listing, recursive downloads, sync, and directory verification retain their existing enumeration contracts. The
+default
 ssh2/SFTP backend is unchanged; OpenSSH master mode still rejects standalone SFTP directory listing.
 
 ### Directory sync with rsync or SFTP
 
-With the default ssh2 backend, smart sync selects rsync for a direct connection with a validated key path or usable SSH
-agent. Password, inline-key, jump-host, and other routes that cannot be passed safely to a separate OpenSSH process use
+With the default ssh2 backend, smart sync selects rsync for a direct connection with a validated key path or usable
+SSH
+agent. Password, inline-key, jump-host, and other routes that cannot be passed safely to a separate OpenSSH process
+use
 SFTP directly. The OpenSSH master backend always uses its selected master and requires rsync:
 
 ```
@@ -683,27 +839,44 @@ ssh_sync(..., delete=true, verify={deletions: true})
 
 A directory source always means “copy the source directory contents into the destination root” in both rsync and SFTP
 mode. Directory sources reject `recursive=false`. Relative exclude patterns are evaluated against the path below the
-source root; patterns without `/` match each basename.
+source root; patterns without `/` match each basename. A trailing `/` restricts a pattern to directories:
+`provider/` skips directories with that basename and their contents while retaining regular files named `provider`.
+
+A single-file upload requires an existing remote parent directory. A known missing parent or a parent that is a file fails before upload with `failureStage="remote_prepare"` and `REMOTE_PARENT_NOT_FOUND` or `REMOTE_PARENT_NOT_DIRECTORY`; use `ssh_mkdir` for a missing parent. Directory sync retains its recursive creation behavior. Downloads create missing local parents; an rsync parent-preparation failure returns `failureStage="local_prepare"` before the transfer process starts.
+
+Clients requesting `_meta.progressToken` receive `notifications/progress` from SFTP and rsync transfers, including recursive sync, at most once per second while transfer bytes advance. `progress` is an increasing notification sequence; `message` reports the current file's bytes and percentage, with its total when known. Calls without a token keep the same transfer result. Cancellation stops later notifications. Notification errors produce a warning, with `progressWarning` when available, while the transfer retains its own outcome. The operation deadline and the client's absolute request deadline remain separate from progress-driven idle-timeout resets.
 
 For a regular file, `verify.sha256`, `verify.owner`, `verify.mode`, and Windows `verify.aclSddl` apply to the actual
-transferred file in either direction. The result uses `kind="single_file"` and includes the file digest, not a directory
-root hash. `verify.count`, `verify.deletions`, and `verify.staleFiles` require a directory source and are rejected
-before transfer for a file. A known source file larger than the requested hash budget is also rejected before transfer.
+transferred file in either direction. The result uses `kind="single_file"` and includes the file digest, not a
+directory
+root hash. Set `verify.sha256=true` to compute and compare digests; omitting it or setting it to `false` skips both
+local and remote hashing, including the SFTP transport check. `verify.count`, `verify.deletions`, and
+`verify.staleFiles`
+require a directory source and are rejected before transfer for a file. A known source file larger than the requested
+hash budget is also rejected before transfer.
 
-Directory verification builds bounded local and remote manifests. It can compare entry count, an SHA-256 root manifest,
+Directory verification builds bounded local and remote manifests. It can compare entry count, an SHA-256 root
+manifest,
 owner, all four octal mode digits (including setuid, setgid, and sticky), stale entries, and deletion results.
-`verify.deletions=true` requires `delete=true`; it records the destination before transfer and only checks whether those
-deletion candidates disappeared. `staleFiles` independently checks every extra destination entry. The response contains
+`verify.deletions=true` requires `delete=true` ; it records the destination before transfer and only checks whether
+those
+deletion candidates disappeared. `staleFiles` independently checks every extra destination entry. The response
+contains
 summaries and at most 20 mismatch samples, not the full manifest. The default limits are 10,000 entries, 256 MiB per
-hashed file, and 1 GiB total hashed bytes. Set `verify.maxEntries`, `verify.maxFileBytes`, and `verify.maxTotalBytes` to
-raise them, up to 50,000 entries, 4 GiB per file, and 16 GiB total. Symlinks or unsupported filesystem entries that were
+hashed file, and 1 GiB total hashed bytes. Set `verify.maxEntries` , `verify.maxFileBytes` , and
+`verify.maxTotalBytes` to
+raise them, up to 50,000 entries, 4 GiB per file, and 16 GiB total. Symlinks or unsupported filesystem entries that
+were
 skipped make verification explicitly `skipped` instead of reporting a partial match.
 
 If verification is requested, a mismatch, skipped check, or verification error sets top-level `success=false` while
 `transferSuccess` still reports whether transfer completed. `verificationStatus`, `verificationSuccess`, and
-`failedChecks` describe the verification outcome. SFTP single-file transfers also include local and remote size, mode or
-permissions, mtime, owner/group, and a streamed SFTP SHA-256 comparison. `verifyOwner` and `verifyMode` apply to upload
-single-file sync; `verify.owner` and `verify.mode` work for files and directory manifests. Verification does not run
+`failedChecks` describe the verification outcome. SFTP single-file transfers also include local and remote size, mode
+or
+permissions, mtime, and owner/group, plus a streamed SFTP SHA-256 comparison when `verify.sha256=true`.
+`verifyOwner` and `verifyMode` apply to upload
+single-file sync; directory, download, or dry-run requests using these scalar fields are rejected before transfer.
+Use `verify.owner` and `verify.mode` for files and directory manifests. Verification does not run
 `chown` or `chmod`. New SFTP directories use destination-side default permissions, and new SFTP downloads use `0600`;
 replacing an existing local regular file preserves its `rwx` bits. These permissions can differ from the source even
 when content and owner match, so a requested mode check can fail after a completed transfer.
@@ -714,15 +887,49 @@ OpenSSH process. OpenSSH master sessions bypass this credential selection and do
 `preflightTimeout`, `connectTimeout`, and `operationTimeout` independently bound capability probing, rsync SSH setup,
 and the overall transfer; their defaults are 10 seconds, 30 seconds, and 10 minutes. When the session is not eligible
 for rsync, the response returns `rsyncProbe.status="skipped"` with the route decision reason instead of omitting the
-probe. Rsync mode sets `StrictHostKeyChecking=accept-new`. SFTP does not support `delete=true`; such a request fails
-explicitly instead of claiming deletion. If you require strict host key verification and management, use SFTP mode.
+probe. The sync deadline also covers parent metadata probes, SFTP acquisition, per-file transfer, and verification;
+parent probes outside sync retain their 10-second default. Canceling or exhausting the deadline blocks subsequent
+OPEN,
+MKDIR, and rename requests. Requests already sent can remain `unknown`. Local and remote directory traversal, content
+hashing, deletion baselines and post-transfer ACL checks share that absolute deadline. Verification timeout closes
+owned
+hash streams and stops later checks, while preserving completed file and byte counters and `transferSuccess` ; the
+result
+has `success=false` and a timed-out verification outcome.
 
-When symlinks are skipped, verification describes the incomplete tree. For downloads, exclude those links and repeat the
+Directory root digests sort paths by their UTF-8 bytes, independent of enumeration order or locale. Case-distinct and
+Unicode NFC/NFD-distinct names remain separate entries; file names are not normalized.
+
+Rsync mode sets `StrictHostKeyChecking=accept-new` ; SFTP uses the established ssh2 connection's known_hosts policy.
+For
+the full OpenSSH host-certificate and configuration policy, reuse an existing OpenSSH master. SFTP does not support
+`delete=true`; such a request fails explicitly instead of claiming deletion. Rsync statistics count complete itemized
+lines from the entire stdout stream in both directions, independently of the bounded output preview; `outputTruncated`
+indicates an omitted preview suffix.
+
+When symlinks are skipped, verification describes the incomplete tree. For downloads, exclude those links and repeat
+the
 sync and verification; `followSymlinks` only controls uploads. Directory transfer failures retain known successful
-file/byte counts and failure counters. A timeout can leave remote state `unknown` even when some files completed.
+file/byte counts and failure counters. Single-file transfers register their file and byte counts as soon as upload
+finishes or an atomic download is published, before hash verification. A verification timeout retains those counts and
+reports verification as `unknown`; completed bytes do not establish a hash match. A timeout can leave remote state
+`unknown` even when some files completed.
+
+SFTP counts an upload only after all WRITE replies and the server CLOSE reply succeed. A WRITE failure or an early
+close fails the
+transfer, including when no error event is emitted. Concurrent directory uploads settle requests already issued before
+returning the partial file, byte, and failure counters.
+
+Recursive downloads check the real local destination against the allow-list before each directory side effect,
+including
+existing symlink ancestors. Symlinks resolving inside the allowed range remain usable. On Windows, each sibling-name
+check uses the target directory's native case flag and ordinal comparison, preserves exact-name updates, and reports
+an
+error when native name semantics cannot be queried.
 
 `ssh_upload(timeout=...)` applies that timeout to each metadata, digest, transfer, verification, rename, and cleanup
-operation. A cleanup failure is reported separately. Tracked output ending with an incomplete UTF-8 character returns an
+operation. A cleanup failure is reported separately. Tracked output ending with an incomplete UTF-8 character returns
+an
 explicit encoding error once the operation is terminal; pending partial characters can still complete while running.
 
 ### Persistent PTY Sessions (top, tmux, etc.)
@@ -763,15 +970,24 @@ ssh_pty_write(ptyId="pty_1_xxx", data="\x02d")
 
 `ssh_pty_read` and `ssh_pty_list` expose `lastInputAt`, `lastOutputAt`, `lastReadAt`, `unreadRawBytes`,
 `rawBufferLimit`, `rawBufferTruncated`, and `foregroundProcess`. List entries also expose `bufferSize`. These size
-fields count bytes. PTY screen output is decoded incrementally. Raw output preserves the original bytes in `dataBase64`,
-including invalid or partial UTF-8; `data` is a text preview. `rawBufferTruncated=true` means older raw output since the
-last clear was discarded at the byte limit. A raw read uses `clear=true` by default: its response reports the pre-clear
-byte count and truncation flag, then resets the raw buffer and flag. Screen reads do not clear raw state. When a finite
+fields count bytes. PTY screen output is decoded incrementally. Raw output preserves the original bytes in
+`dataBase64` ,
+including invalid or partial UTF-8; `data` is a text preview. `rawBufferTruncated=true` means older raw output since
+the
+last clear was discarded at the byte limit. A raw read uses `clear=true` by default: its response reports the
+pre-clear
+byte count and truncation flag, then resets the raw buffer and flag. Screen reads do not clear raw state. When a
+finite
 command exits naturally, its final screen remains readable with `active=false` until explicit close or the
 closed-session retention expires (5 minutes by default, configurable with `SSH_MCP_PTY_CLOSED_RETENTION_MS`).
 `ssh_pty_write` returns `accepted=true` when the local stream accepts data. `backpressured=true` only reports a full
-buffer and does not mean the input was discarded. `ssh_pty_close` reports `closed`, `not_found`, `failed`, or `unknown`;
-retryable close failures keep the PTY state for a later retry.
+buffer and does not mean the input was discarded. `ssh_pty_close` reports `closed` , `not_found` , `failed` , or
+`unknown` ;
+retryable close failures keep the PTY state for a later retry. Screen reads wait until previously queued xterm writes
+have been parsed, including the final output before `active=false`. The output channel pauses at 1,048,576 unparsed
+UTF-16 code units and resumes at 262,144 units; this parser backpressure is separate from the raw byte limit and
+input-side `backpressured` flag. Parser failures close the output channel and return `parserError` alongside retained
+raw output.
 
 Common control sequences:
 
@@ -808,13 +1024,15 @@ ssh_forward_close(forwardId="fwd_1_xxx", mode="force", timeoutMs=5000)
 
 A successful close means the local `server.close` or remote `unforwardIn` callback completed. The result includes
 `listenerReleased`, `remoteUnforwarded`, `activeConnections`, `closeMode`, and `retryable`. `ssh_forward_list` exposes
-`lifecycle` and `acceptingConnections`; a `closing` forward remains retryable but no longer accepts traffic. Timeout or
+`lifecycle` and `acceptingConnections` ; a `closing` forward remains retryable but no longer accepts traffic. Timeout
+or
 callback failure keeps the forward in `ssh_forward_list`, so the same `forwardId` can be retried. After a successful
 local close, the port can be rebound immediately. `remotePort=0` returns the actual allocated port and uses that port
 for incoming connection routing and `unforwardIn`.
 
 Forward creation is tracked before `listen` or `forwardIn` completes. Disconnect cancels pending creation, closes a
-local listener if it appears later, and removes a remotely allocated listener returned by a delayed callback. A forward
+local listener if it appears later, and removes a remotely allocated listener returned by a delayed callback. A
+forward
 stops accepting new local or remote connections as soon as close begins. Delayed `forwardOut`, close, and unforward
 callbacks check the same lifecycle record before changing state, so a closed forward cannot reappear in
 `ssh_forward_list`. Each local connection tracks both the local socket and the SSH `forwardOut` channel. Closing or
@@ -847,8 +1065,10 @@ accumulate. Disconnect the alias to release a channel request that never complet
 | `readyTimeout`          | number | 30000           | Wait for SSH ready in ms, max 600000     |
 | `jumpHost.readyTimeout` | number | top-level value | Jump-host ready timeout, max 600000      |
 
-Connection failures return `failureStage`, `retryable`, and a bounded suggestion. `failureStage` is one of `preflight`,
-`authentication`, `ready_timeout`, `transport_or_handshake`, or `unknown`; multi-hop failures may also include
+Connection failures return `failureStage` , `retryable` , and a bounded suggestion. `failureStage` is one of
+`preflight` ,
+`authentication` , `ready_timeout` , `transport_or_handshake` , `host_key` , or `unknown` ; multi-hop failures may
+also include
 `connectionStep` as `key_read`, `jump_connect`, `jump_forward`, or `target_connect`.
 
 ### Exec Options
@@ -864,7 +1084,8 @@ Connection failures return `failureStage`, `retryable`, and a bounded suggestion
 | `useLoginUser`  | boolean | false         | Skip session-level runAs                   |
 | `loadProfile`   | boolean | true          | Load target user's shell profile for runAs |
 
-When `cwd` or `env` is set, the generated shell command chains `cd` and each validated `export` with `&&`, then runs the
+When `cwd` or `env` is set, the generated shell command chains `cd` and each validated `export` with `&&` , then runs
+the
 entire requested command as one escaped `eval` argument in the active login shell. A failed directory change or export
 prevents every part of the requested command from running, including text after `;`, newlines, or `||`, while Bash/Zsh
 syntax keeps the same interpreter semantics as a direct SSH command.
@@ -918,7 +1139,8 @@ Files exceeding these limits are rejected before being read.
 | `false` (default) | Skip and report in `skippedSymlinks` | Skip with `--no-links`            |
 | `true`            | Upload the link target contents      | Follow with `-L` / `--copy-links` |
 
-Both transports skip device and special filesystem entries. SFTP returns `skippedUnsupported` and up to 10 sample paths;
+Both transports skip device and special filesystem entries. SFTP returns `skippedUnsupported` and up to 10 sample
+paths;
 rsync uses `--no-devices --no-specials`. Directory verification also reports skipped symlinks and unsupported entries
 and does not treat an incomplete manifest as a match.
 

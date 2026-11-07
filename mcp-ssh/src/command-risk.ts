@@ -128,7 +128,7 @@ function withoutQuotedText(command: string, shell: CommandShell): string {
                     const bodyStart = index
                     let bodyEnd = limit
                     let afterDelimiter = limit
-                    // Delimiters are case-sensitive; input quotes never change Shell quote state.
+                    // Delimiters are case-sensitive; input quotes never change shell quote state.
                     for (let lineStart = index; lineStart < limit;) {
                         let lineEnd = lineStart
                         let line = ''
@@ -204,7 +204,15 @@ export function classifyCommandRisk(
             add('service-control', 'service_control')
         }
         if (!timeout || timeout > 300_000) {
-            if (/\b(?:find\s+\S+|grep\s+-\S*[rR])\b/.test(executable)) {
+            if (
+                executable
+                    .split(/[;&|\n]/)
+                    .some(
+                        (part) =>
+                            (/\bfind(?=\s|$)/.test(part) && !/(?:^|\s)-maxdepth\s+\d+(?=\s|$)/.test(part)) ||
+                            /\bgrep\s+(?:-\S*[rR]|--(?:recursive|dereference-recursive))\b/.test(part)
+                    )
+            ) {
                 add('long-running', 'unbounded_search')
             }
         }

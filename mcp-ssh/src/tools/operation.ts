@@ -133,10 +133,12 @@ export function registerOperationTools(server: McpServer): void {
     server.registerTool(
         'ssh_operation_start',
         {
-            description: `启动可跟踪的长时间远端命令
-
-返回不可预测的 operationId。channel 建立受 startTimeoutMs 限制，等待期间 record 可通过 list 查询；超时 details 返回 operationId。
-输出保存在有硬上限的内存缓冲区中，完成后按 retentionMs 自动过期。普通 ssh_exec 的同步和 timeout 行为不变。`,
+            description:
+                '启动可跟踪的长时间远端命令\n' +
+                '\n' +
+                '返回不可预测的 operationId。channel 建立受 startTimeoutMs 限制，等待期间 record 可通过 list ' +
+                '查询；超时 details 返回 operationId。\n' +
+                '输出保存在有硬上限的内存缓冲区中，完成后按 retentionMs 自动过期。普通 ssh_exec 的同步和 timeout 行为不变。',
             inputSchema: operationStartSchema,
         },
         (args) => handleOperationStart(args)
@@ -164,7 +166,8 @@ export function registerOperationTools(server: McpServer): void {
         'ssh_operation_cancel',
         {
             description:
-                '校验远端 operation marker 和进程身份后执行取消；POSIX 发送 TERM，Windows 在 PID、创建时间和 marker 验证后执行 taskkill /T /F；无法证明身份时拒绝取消',
+                '校验远端 operation marker 和进程身份后执行取消；POSIX 发送 TERM，Windows 在 PID、创建时间和 ' +
+                'marker 验证后执行 taskkill /T /F；无法证明身份时拒绝取消',
             inputSchema: operationIdSchema,
         },
         (args) => handleOperationCancel(args)

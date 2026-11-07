@@ -682,25 +682,65 @@ test('command risk recognizes real background operators after quoted and escaped
     }
 })
 
-test('command risk distinguishes background operators from conjunctions, redirection, and quoted arithmetic', () => {
-    const commands = [
-        'true && printf done',
-        'printf x 2>&1',
-        'printf x &>/tmp/example.log',
-        'printf x 3<&0',
-        'printf x >&2',
-        'printf x >>/tmp/example.log',
-        'printf "%s\\n" "$((0100600 & 0777))"',
-        'printf "%s\\n" "https://example.com/?a=1&b=2"',
-    ]
-    for (const command of commands) {
-        assert.equal(classifyCommandRisk(command, 30_000), undefined, command)
+test(
+    'command risk distinguishes background operators from conjunctions, ' + 'redirection, and quoted arithmetic',
+    () => {
+        const commands = [
+            'true && printf done',
+            'printf x 2>&1',
+            'printf x &>/tmp/example.log',
+            'printf x 3<&0',
+            'printf x >&2',
+            'printf x >>/tmp/example.log',
+            'printf "%s\\n" "$((0100600 & 0777))"',
+            'printf "%s\\n" "https://example.com/?a=1&b=2"',
+        ]
+        for (const command of commands) {
+            assert.equal(classifyCommandRisk(command, 30_000), undefined, command)
+        }
     }
+)
+
+test('G091: bounded find does not hide a separate unbounded search or destructive command', () => {
+    for (const command of ['find /tmp -maxdepth 2 -name file', 'find /tmp -maxdepth 0']) {
+        assert.equal(classifyCommandRisk(command), undefined, command)
+        assert.equal(classifyCommandRisk(command, 600_000), undefined, command)
+    }
+    for (const command of [
+        'find /tmp -maxdepth invalid',
+        'find /tmp -maxdepth 1; find /var',
+        'find /tmp -maxdepth 1; grep -R x /var',
+        'grep --recursive x /var',
+    ]) {
+        assert.ok(classifyCommandRisk(command, 600_000)?.signals.includes('unbounded_search'), command)
+    }
+    assert.equal(classifyCommandRisk('find /tmp -maxdepth 1; rm /tmp/file', 600_000)?.level, 'high')
+    assert.equal(classifyCommandRisk('tail -f /tmp/log', 30_000)?.level, 'high')
 })
 
-
-
-
+test('G091: public exec and batch classify with their effective default timeout', async (t) => {
+    const handlers = new Map()
+    registerExecTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+    const calls = []
+    t.mock.method(sessionManager, 'exec', async (_alias, command, options) => {
+        calls.push({ command, timeout: options.timeout })
+        return { success: true, stdout: 'synthetic', stderr: '', exitCode: 0, shell: 'posix' }
+    })
+    for (const timeout of [undefined, 30_000, 600_000, 0]) {
+        const command = 'find /tmp -name fixture'
+        const result = JSON.parse((await handlers.get('ssh_exec')({ alias: 'g091', command, timeout })).content[0].text)
+        assert.equal(Boolean(result.commandRisk), timeout === 600_000 || timeout === 0)
+        const batch = JSON.parse(
+            (await handlers.get('ssh_exec_batch')({ alias: 'g091', commands: [command], timeout })).content[0].text
+        )
+        assert.equal(Boolean(batch.results[0].commandRisk), timeout === 600_000 || timeout === 0)
+    }
+    assert.equal(calls.length, 8)
+})
 
 test('command risk preserves the inclusive bounded-search timeout boundary', () => {
     for (const command of ['find /tmp/example -name file', 'grep -R pattern /tmp/example']) {
@@ -716,103 +756,115 @@ test('command risk preserves the inclusive bounded-search timeout boundary', () 
     }
 })
 
-test('ssh_exec command risk is diagnostic-only and preserves mocked execution results for each shell', async (t) => {
-    const handlers = new Map()
-    registerExecTools({
-        registerTool(name, _definition, handler) {
-            handlers.set(name, handler)
-        },
-    })
-    const originalExec = sessionManager.exec
-    const originalShell = sessionManager.getCommandShell
-    t.after(() => {
-        sessionManager.exec = originalExec
-        sessionManager.getCommandShell = originalShell
-    })
+test(
+    'ssh_exec command risk is diagnostic-only and preserves mocked execution ' + 'results for each shell',
+    async (t) => {
+        const handlers = new Map()
+        registerExecTools({
+            registerTool(name, _definition, handler) {
+                handlers.set(name, handler)
+            },
+        })
+        const originalExec = sessionManager.exec
+        const originalShell = sessionManager.getCommandShell
+        t.after(() => {
+            sessionManager.exec = originalExec
+            sessionManager.getCommandShell = originalShell
+        })
 
-    for (const [shell, command, category, signal] of [
-        ['posix', 'rm -rf /tmp/example', 'destructive', 'destructive_command'],
-        ['cmd', 'del C:\\Data\\file.txt', 'destructive', 'destructive_command'],
-        ['powershell', 'Remove-Item -Recurse C:\\Data', 'destructive', 'destructive_command'],
-        ['posix', "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY"],
-        ['posix', "cat <<'EOF'\nit's input\nEOF\nsleep 1 &", 'process-control', 'background_task'],
-        ['posix', 'cat <<EOF\n$(rm -rf /tmp/example)\nEOF', 'destructive', 'destructive_command'],
-        ['posix', 'printf "%s" "$(rm -rf /tmp/example)"', 'destructive', 'destructive_command'],
-    ]) {
-        sessionManager.getCommandShell = () => shell
-        for (const success of [true, false]) {
-            const calls = []
-            const execution = {
-                success,
-                stdout: 'mock output',
-                stderr: success ? '' : 'mock execution failure',
-                exitCode: success ? 0 : 1,
+        for (const [shell, command, category, signal] of [
+            ['posix', 'rm -rf /tmp/example', 'destructive', 'destructive_command'],
+            ['cmd', 'del C:\\Data\\file.txt', 'destructive', 'destructive_command'],
+            ['powershell', 'Remove-Item -Recurse C:\\Data', 'destructive', 'destructive_command'],
+            ['posix', "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY"],
+            ['posix', "cat <<'EOF'\nit's input\nEOF\nsleep 1 &", 'process-control', 'background_task'],
+            ['posix', 'cat <<EOF\n$(rm -rf /tmp/example)\nEOF', 'destructive', 'destructive_command'],
+            ['posix', 'printf "%s" "$(rm -rf /tmp/example)"', 'destructive', 'destructive_command'],
+        ]) {
+            sessionManager.getCommandShell = () => shell
+            for (const success of [true, false]) {
+                const calls = []
+                const execution = {
+                    success,
+                    shell,
+                    stdout: 'mock output',
+                    stderr: success ? '' : 'mock execution failure',
+                    exitCode: success ? 0 : 1,
+                }
+                sessionManager.exec = async (alias, receivedCommand, options) => {
+                    calls.push({ alias, command: receivedCommand, timeout: options.timeout })
+                    return execution
+                }
+                const response = await handlers.get('ssh_exec')({ alias: 'risk-fixture', command, timeout: 30_000 })
+                const result = JSON.parse(response.content[0].text)
+                const { commandRisk, ...returnedExecution } = result
+                assert.deepEqual(returnedExecution, execution)
+                if (category) {
+                    assert.equal(commandRisk.level, 'high', command)
+                    assert.deepEqual(commandRisk.categories, [category], command)
+                    assert.deepEqual(commandRisk.signals, [signal], command)
+                } else {
+                    assert.equal(commandRisk, undefined, command)
+                }
+                assert.deepEqual(calls, [{ alias: 'risk-fixture', command, timeout: 30_000 }])
             }
-            sessionManager.exec = async (alias, receivedCommand, options) => {
-                calls.push({ alias, command: receivedCommand, timeout: options.timeout })
-                return execution
-            }
-            const response = await handlers.get('ssh_exec')({ alias: 'risk-fixture', command, timeout: 30_000 })
-            const result = JSON.parse(response.content[0].text)
-            const { commandRisk, ...returnedExecution } = result
-            assert.deepEqual(returnedExecution, execution)
-            if (category) {
-                assert.equal(commandRisk.level, 'high', command)
-                assert.deepEqual(commandRisk.categories, [category], command)
-                assert.deepEqual(commandRisk.signals, [signal], command)
-            } else {
-                assert.equal(commandRisk, undefined, command)
-            }
-            assert.deepEqual(calls, [{ alias: 'risk-fixture', command, timeout: 30_000 }])
         }
     }
-})
+)
 
-test('ssh_exec_batch command risk does not stop a successful mocked batch or replace execution failures', async (t) => {
-    const handlers = new Map()
-    registerExecTools({
-        registerTool(name, _definition, handler) {
-            handlers.set(name, handler)
-        },
-    })
-    const originalExec = sessionManager.exec
-    const originalShell = sessionManager.getCommandShell
-    const commands = [
-        'rm -rf /tmp/example',
-        'printf done',
-        "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY",
-        "cat <<'EOF'\nit's input\nEOF\nsleep 1 &",
-    ]
-    const calls = []
-    sessionManager.getCommandShell = () => 'posix'
-    sessionManager.exec = async (_alias, command) => {
-        calls.push(command)
-        return { success: true, stdout: 'mock output', stderr: '', exitCode: 0 }
+test(
+    'ssh_exec_batch command risk does not stop a successful mocked batch or ' + 'replace execution failures',
+    async (t) => {
+        const handlers = new Map()
+        registerExecTools({
+            registerTool(name, _definition, handler) {
+                handlers.set(name, handler)
+            },
+        })
+        const originalExec = sessionManager.exec
+        const originalShell = sessionManager.getCommandShell
+        const commands = [
+            'rm -rf /tmp/example',
+            'printf done',
+            "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY",
+            "cat <<'EOF'\nit's input\nEOF\nsleep 1 &",
+        ]
+        const calls = []
+        sessionManager.getCommandShell = () => 'posix'
+        sessionManager.exec = async (_alias, command) => {
+            calls.push(command)
+            return { success: true, stdout: 'mock output', stderr: '', exitCode: 0, shell: 'posix' }
+        }
+        t.after(() => {
+            sessionManager.exec = originalExec
+            sessionManager.getCommandShell = originalShell
+        })
+
+        const handler = handlers.get('ssh_exec_batch')
+        const success = JSON.parse((await handler({ alias: 'risk-fixture', commands })).content[0].text)
+        assert.equal(success.success, true)
+        assert.equal(success.executed, commands.length)
+        assert.deepEqual(calls, commands)
+        assert.deepEqual(success.results[0].commandRisk.signals, ['destructive_command'])
+        assert.equal(success.results[1].commandRisk, undefined)
+        assert.equal(success.results[2].commandRisk, undefined)
+        assert.deepEqual(success.results[3].commandRisk.signals, ['background_task'])
+
+        sessionManager.exec = async () => {
+            throw Object.assign(new Error('injected execution failure'), { details: { shell: 'posix' } })
+        }
+        const failure = JSON.parse((await handler({ alias: 'risk-fixture', commands })).content[0].text)
+        assert.equal(failure.success, false)
+        assert.equal(failure.executed, 1)
+        assert.equal(failure.results[0].error, 'injected execution failure')
+        assert.deepEqual(failure.results[0].commandRisk.signals, ['destructive_command'])
+        sessionManager.exec = async () => {
+            throw new Error('shell unavailable')
+        }
+        const unknown = JSON.parse((await handler({ alias: 'risk-fixture', commands })).content[0].text)
+        assert.equal(unknown.results[0].commandRisk, undefined)
     }
-    t.after(() => {
-        sessionManager.exec = originalExec
-        sessionManager.getCommandShell = originalShell
-    })
-
-    const handler = handlers.get('ssh_exec_batch')
-    const success = JSON.parse((await handler({ alias: 'risk-fixture', commands })).content[0].text)
-    assert.equal(success.success, true)
-    assert.equal(success.executed, commands.length)
-    assert.deepEqual(calls, commands)
-    assert.deepEqual(success.results[0].commandRisk.signals, ['destructive_command'])
-    assert.equal(success.results[1].commandRisk, undefined)
-    assert.equal(success.results[2].commandRisk, undefined)
-    assert.deepEqual(success.results[3].commandRisk.signals, ['background_task'])
-
-    sessionManager.exec = async () => {
-        throw new Error('injected execution failure')
-    }
-    const failure = JSON.parse((await handler({ alias: 'risk-fixture', commands })).content[0].text)
-    assert.equal(failure.success, false)
-    assert.equal(failure.executed, 1)
-    assert.equal(failure.results[0].error, 'injected execution failure')
-    assert.deepEqual(failure.results[0].commandRisk.signals, ['destructive_command'])
-})
+)
 
 test('transfer outcome makes mismatched and skipped verification fail top-level success', () => {
     const mismatch = buildTransferOutcome(true, true, { checks: { mode: false } })
@@ -1491,7 +1543,104 @@ test('I051 SDK sync progress reaches clients for both SFTP directions and direct
     }
 })
 
-
+test('I051 notification failures keep transfers visible and cancelled probes cannot start a transfer', async (t) => {
+    const root = makeTempDir(t)
+    const source = path.join(root, 'source')
+    const target = path.join(root, 'target')
+    fs.writeFileSync(source, Buffer.alloc(256 * 1024, 42))
+    const originalSftp = sessionManager.getSftp
+    const originalCapability = sessionManager.getExternalTransferCapability
+    sessionManager.getExternalTransferCapability = () => ({ rsyncEligible: false, decisionReason: 'owned_sftp' })
+    sessionManager.getSftp = async () => fixtureSftp()
+    t.after(() => {
+        sessionManager.getSftp = originalSftp
+        sessionManager.getExternalTransferCapability = originalCapability
+    })
+    const handlers = new Map()
+    registerFileTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+    const handler = handlers.get('ssh_sync')
+    const args = { alias: 'owned-progress', direction: 'upload', localPath: source, remotePath: target }
+    const warnings = []
+    t.mock.method(console, 'warn', (...values) => warnings.push(values.join(' ')))
+    let notifications = 0
+    const result = JSON.parse(
+        (
+            await handler(args, {
+                signal: new AbortController().signal,
+                _meta: { progressToken: 0 },
+                sendNotification: async () => {
+                    ++notifications
+                    throw new Error('Owned notification failure')
+                },
+            })
+        ).content[0].text
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(result.success, true, JSON.stringify(result))
+    assert.equal(notifications, 1)
+    assert.ok(warnings.some((message) => message.includes('Owned notification failure')))
+    const noToken = JSON.parse(
+        (
+            await handler(args, {
+                signal: new AbortController().signal,
+                sendNotification: async () => {
+                    throw new Error('Unexpected progress without token')
+                },
+            })
+        ).content[0].text
+    )
+    assert.equal(noToken.success, true)
+    let reached
+    let lateStat
+    let writes = 0
+    const ready = new Promise((resolve) => {
+        reached = resolve
+    })
+    sessionManager.getSftp = async () => ({
+        stat(_name, callback) {
+            lateStat = callback
+            reached()
+        },
+        createWriteStream() {
+            ++writes
+            throw new Error('Unexpected transfer after cancellation')
+        },
+        end() {},
+    })
+    const abort = new AbortController()
+    const pending = handler(args, {
+        signal: abort.signal,
+        _meta: { progressToken: 'owned-cancel' },
+        sendNotification: async () => {
+            ++notifications
+        },
+    })
+    await ready
+    abort.abort(new Error('Owned request cancelled'))
+    let timer
+    try {
+        const cancelled = await Promise.race([
+            pending,
+            new Promise((resolve) => {
+                timer = setTimeout(() => resolve(null), 300)
+            }),
+        ])
+        assert.ok(cancelled, 'Cancellation did not stop the metadata probe')
+        assert.equal(JSON.parse(cancelled.content[0].text).success, false)
+        lateStat(null, { size: 0, mode: 0o040755 })
+        await new Promise((resolve) => setImmediate(resolve))
+        assert.equal(writes, 0)
+        assert.equal(notifications, 1)
+    } finally {
+        clearTimeout(timer)
+        lateStat(null, { size: 0, mode: 0o040755 })
+        await pending
+    }
+})
 
 test('I019 missing remote parents return actionable preparation failures before an upload', async (t) => {
     const root = makeTempDir(t)
@@ -1531,7 +1680,68 @@ test('I019 missing remote parents return actionable preparation failures before 
     assert.equal(writes, 0)
 })
 
-
+test('I005 exec_script preserves interpreter argv and legacy execution through the registered tool', async (t) => {
+    const root = makeTempDir(t)
+    const remote = path.join(root, 'owned script.py')
+    const marker = path.join(root, 'unexpected')
+    const originalExec = sessionManager.exec
+    const originalSftp = sessionManager.getSftp
+    const handlers = new Map()
+    registerExecTools({
+        registerTool(name, definition, handler) {
+            handlers.set(name, { definition, handler })
+        },
+    })
+    sessionManager.exec = async (_alias, command) => {
+        if (command === 'mktemp /tmp/mcp-ssh-script.XXXXXX') {
+            return { success: true, stdout: remote + '\n', stderr: '', exitCode: 0 }
+        }
+        const result = await exec(command)
+        return { ...result, success: true, exitCode: 0, shell: 'posix' }
+    }
+    sessionManager.getSftp = async () => ({
+        createWriteStream: (name, options) => fs.createWriteStream(name, options),
+        unlink: (name, callback) => fs.unlink(name, callback),
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.exec = originalExec
+        sessionManager.getSftp = originalSftp
+    })
+    const { definition, handler } = handlers.get('ssh_exec_script')
+    const literal = `a b ' quote ; $(touch ${marker})`
+    for (const item of [
+        { name: 'legacy', script: 'printf legacy', expected: 'legacy' },
+        {
+            name: 'isolated',
+            interpreter: 'python3',
+            interpreterArgs: ['-I'],
+            script: 'import sys; print(sys.flags.isolated)',
+            expected: '1',
+        },
+        {
+            name: 'literal argument',
+            interpreter: 'python3',
+            interpreterArgs: ['-I', '-X', `owned=${literal}`],
+            script: 'import sys; print(sys._xoptions["owned"])',
+            expected: literal,
+        },
+    ]) {
+        await t.test(item.name, async () => {
+            const response = await handler(definition.inputSchema.parse({ alias: 'owned-interpreter', ...item }))
+            const result = JSON.parse(response.content[0].text)
+            assert.equal(result.success, true, JSON.stringify(result))
+            assert.equal(result.stdout.trim(), item.expected)
+            assert.equal(fs.existsSync(remote), false)
+            assert.equal(fs.existsSync(marker), false)
+        })
+    }
+    assert.equal(definition.inputSchema.safeParse({ alias: 'owned', script: '', interpreterArgs: [1] }).success, false)
+    assert.equal(
+        definition.inputSchema.safeParse({ alias: 'owned', script: '', interpreterArgs: ['a\0b'] }).success,
+        false
+    )
+})
 
 test('I046 read_file rejects directories and other nonregular targets before creating a stream', async (t) => {
     const originalSftp = sessionManager.getSftp
@@ -2342,9 +2552,92 @@ test('MH-SSH-01 OpenSSH manifests consume one absolute deadline across remote ph
     ])
 })
 
+test('G060: trailing slash excludes directories without excluding same-name regular files', async (t) => {
+    for (const [name, pattern] of [
+        ['provider', 'provider/'],
+        ['nested/provider', 'provider/'],
+        ['nested/provider', 'nested/provider/'],
+    ]) {
+        assert.equal(matchesDirectoryExclude(name, [pattern], true), true)
+        assert.equal(matchesDirectoryExclude(name, [pattern], false), false)
+    }
+    const source = makeTempDir(t)
+    fs.mkdirSync(path.join(source, 'provider'))
+    fs.writeFileSync(path.join(source, 'provider', 'ignored'), 'excluded')
+    fs.mkdirSync(path.join(source, 'kept'))
+    fs.writeFileSync(path.join(source, 'kept', 'provider'), 'retained')
+    const request = { count: true, sha256: true }
+    const local = await createLocalDirectoryManifest(source, request, ['provider/'])
+    const remote = await createRemoteDirectoryManifest(fixtureSftp(), source, request, ['provider/'])
+    assert.deepEqual(
+        local.entries.map((entry) => entry.path),
+        ['.', 'kept', 'kept/provider']
+    )
+    assert.deepEqual(
+        remote.entries.map((entry) => entry.path),
+        ['.', 'kept', 'kept/provider']
+    )
+    assert.equal(local.rootSha256, remote.rootSha256)
+})
 
-
-
+test('G086: unsupported scalar owner/mode requests reject before any transfer or remote probe', async (t) => {
+    const handlers = new Map()
+    registerFileTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+    let sftpCalls = 0
+    t.mock.method(sessionManager, 'getSftp', async () => {
+        ++sftpCalls
+        throw new Error('unexpected remote probe')
+    })
+    const directory = makeTempDir(t)
+    const file = path.join(directory, 'file')
+    fs.writeFileSync(file, 'synthetic')
+    for (const options of [
+        { verifyOwner: 0 },
+        { verifyMode: '0644' },
+        { verifyOwner: 'synthetic', verifyMode: '0644' },
+    ]) {
+        for (const [localPath, direction, dryRun] of [
+            [directory, 'upload', false],
+            [directory, 'download', false],
+            [file, 'upload', true],
+        ]) {
+            const result = JSON.parse(
+                (
+                    await handlers.get('ssh_sync')({
+                        alias: 'g086',
+                        localPath,
+                        remotePath: '/synthetic/target',
+                        direction,
+                        dryRun,
+                        ...options,
+                    })
+                ).content[0].text
+            )
+            assert.equal(result.success, false)
+            assert.equal(result.transferSuccess, false)
+            assert.equal(result.code, 'UNSUPPORTED_SYNC_VERIFICATION')
+        }
+    }
+    assert.equal(sftpCalls, 0)
+    const missing = JSON.parse(
+        (
+            await handlers.get('ssh_sync')({
+                alias: 'g086',
+                localPath: path.join(directory, 'missing'),
+                remotePath: '/synthetic/target',
+                direction: 'upload',
+                verifyMode: '0644',
+            })
+        ).content[0].text
+    )
+    assert.equal(missing.success, false)
+    assert.match(missing.error, /not exist|ENOENT/i)
+    assert.equal(sftpCalls, 0)
+})
 
 test('directory manifests stream hashes, apply excludes, and compare local with remote output', async (t) => {
     const directory = makeTempDir(t)
@@ -3236,7 +3529,41 @@ test(
     }
 )
 
-
+test('R29-SSH-02: script writes and download publication retain their error stages', async (t) => {
+    await t.test('script CLOSE response loss never starts execution', async (t) => {
+        const { directory, call } = await r29SftpFixture(t, 'close')
+        const target = path.join(directory, 'bad.txt')
+        let execs = 0
+        t.mock.method(sessionManager, 'exec', async () => {
+            assert.equal(++execs, 1)
+            return { success: true, stdout: target + '\n', stderr: '', exitCode: 0 }
+        })
+        const result = await call('ssh_exec_script', { script: 'printf not-executed', timeout: 1000 })
+        assert.equal(result.operationStatus, 'unknown', JSON.stringify(result))
+        assert.equal(result.failureStage, 'close')
+        assert.equal(result.acknowledgedBytes, Buffer.byteLength('printf not-executed'))
+        assert.equal(execs, 1)
+    })
+    await t.test('local rename rejection preserves the old destination', async (t) => {
+        const { directory, call } = await r29SftpFixture(t)
+        const remotePath = path.join(directory, 'remote.txt')
+        const localPath = path.join(directory, 'local.txt')
+        fs.writeFileSync(remotePath, 'new-content')
+        fs.writeFileSync(localPath, 'old-content')
+        t.mock.method(fs.promises, 'rename', async () => {
+            throw Object.assign(new Error('synthetic local rename refusal'), { code: 'EACCES' })
+        })
+        const result = await call('ssh_download', { remotePath, localPath, timeout: 2000 })
+        assert.equal(result.operationStatus, 'failed', JSON.stringify(result))
+        assert.equal(result.failureStage, 'local_rename')
+        assert.equal(result.targetReplaced, false)
+        assert.equal(fs.readFileSync(localPath, 'utf8'), 'old-content')
+        assert.equal(
+            fs.readdirSync(directory).some((name) => name.includes('.mcp-tmp-')),
+            false
+        )
+    })
+})
 
 test('R29-SSH: stdio MCP reports CLOSE loss and rekey trust failure', async (t) => {
     const fixture = await r29SftpFixture(t, 'close')

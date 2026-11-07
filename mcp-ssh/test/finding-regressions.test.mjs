@@ -268,17 +268,178 @@ test('MH-SSH-01 download deletion baselines stop before transfer when their budg
     await Promise.resolve()
 })
 
+test('SSH-05/12: full operation buffers stop copying and mixed UTF-8 pages make progress', async (t) => {
+    const stream = new PassThrough()
+    stream.stderr = new PassThrough()
+    const manager = new OperationManager({
+        async openStream(_alias, _command, marker, _options, adopt) {
+            adopt(stream)
+            stream.stderr.write(`__MCP_SSH_OPERATION__:${marker}:4321:0\n`)
+        },
+        async cancelRemote() {
+            return { success: true }
+        },
+    })
+    t.after(() => manager.close())
+    const { operationId } = await manager.start('fixture', 'output', { maxOutputBytes: 1024 })
+    stream.write('abc')
+    stream.stderr.write('中')
+    const first = manager.read(operationId, { maxBytes: 4 })
+    assert.equal(first.stdout, 'abc')
+    assert.equal(first.stderr, '')
+    assert.equal(first.nextStderrOffset, 0)
+    assert.equal(manager.read(operationId, { stdoutOffset: 3, maxBytes: 3 }).stderr, '中')
+    stream.write(Buffer.alloc(1024))
+    const record = manager.operations.get(operationId)
+    const retained = record.stdout
+    stream.write(Buffer.alloc(1024))
+    assert.equal(record.stdout, retained)
+    assert.equal(manager.status(operationId).stdoutTruncated, true)
+})
 
+test('SSH-06: completed exec and batch results survive a later disconnect', async (t) => {
+    const tools = handlers(registerExecTools)
+    let executions = 0
+    patch(t, sessionManager, 'getCommandShell', () => {
+        throw new Error('disconnected')
+    })
+    patch(t, sessionManager, 'exec', async () => {
+        ++executions
+        if (executions > 1) {
+            throw new Error('disconnected')
+        }
+        return { success: true, stdout: 'COMPLETED', stderr: '', exitCode: 0, duration: 1, shell: 'posix' }
+    })
+    const single = content(await tools.get('ssh_exec')({ alias: 'fixture', command: 'true' }))
+    assert.equal(single.stdout, 'COMPLETED')
+    executions = 0
+    const batch = content(await tools.get('ssh_exec_batch')({ alias: 'fixture', commands: ['true', 'true'] }))
+    assert.equal(batch.results[0].stdout, 'COMPLETED')
+    assert.equal(batch.executed, 2)
+    assert.equal(batch.results[1].success, false)
+})
 
+test('SSH-REQUEST-BUDGET: parallel and batch keep statuses under a cumulative output cap', async (t) => {
+    const tools = handlers(registerExecTools)
+    let executions = 0
+    patch(t, sessionManager, 'getCommandShell', () => 'posix')
+    patch(t, sessionManager, 'exec', async () => {
+        ++executions
+        return {
+            success: true,
+            stdout: '中'.repeat(1024 * 1024),
+            stderr: '',
+            exitCode: 0,
+            duration: 1,
+            shell: 'posix',
+            stdoutBytes: 3 * 1024 * 1024,
+        }
+    })
+    for (const [tool, args] of [
+        ['ssh_exec_parallel', { aliases: Array.from({ length: 12 }, (_, i) => `fixture-${i}`), command: 'true' }],
+        ['ssh_exec_batch', { alias: 'fixture', commands: Array(12).fill('true') }],
+    ]) {
+        const before = executions
+        const result = content(await tools.get(tool)(args))
+        const bytes = result.results.reduce(
+            (sum, entry) => sum + Buffer.byteLength(entry.stdout) + Buffer.byteLength(entry.stderr),
+            0
+        )
+        assert.ok(bytes <= 16 * 1024 * 1024, `${tool}: ${bytes} bytes`)
+        assert.equal(result.results.length, 12)
+        assert.equal(executions - before, 12)
+        assert.ok(result.results.every((entry) => entry.success && entry.exitCode === 0))
+        assert.ok(result.outputTruncated)
+        assert.ok(result.results.some((entry) => entry.stdoutTruncated))
+    }
+})
 
+test('SSH-10/11: invalid JSON is safe, ProxyJump none disables hops, explicit hops override config', async (t) => {
+    patch(t, process.env, 'SSH_MCP_TEMPLATES', '{"fixture":{"password":S10X}}')
+    const connect = handlers(registerConnectionTools).get('ssh_connect')
+    const error = content(await connect({ template: 'fixture' }))
+    assert.equal(JSON.stringify(error).includes('S10X'), false)
+    assert.match(error.error, /JSON/)
+    assert.equal(parseProxyJump('none'), null)
+    assert.equal(parseProxyJump(' NONE '), null)
+})
 
+test('SSH-13/17: screen waits for final xterm parse and output applies backpressure', async (t) => {
+    const stream = new PassThrough()
+    stream.close = () => stream.emit('close')
+    const manager = new PtyManager()
+    const id = await manager.start(
+        {
+            async execPty() {
+                return stream
+            },
+        },
+        'fixture',
+        'output',
+        { bufferSize: 1024 }
+    )
+    t.after(() => manager.close(id))
+    stream.emit('data', Buffer.from('FINAL OUTPUT'))
+    stream.emit('close')
+    const screen = await manager.read(id)
+    assert.equal(screen.active, false)
+    assert.match(screen.data, /FINAL OUTPUT/)
+    const second = new PassThrough()
+    second.close = () => second.emit('close')
+    const secondId = await manager.start(
+        {
+            async execPty() {
+                return second
+            },
+        },
+        'fixture',
+        'burst',
+        { bufferSize: 1024 }
+    )
+    t.after(() => manager.close(secondId))
+    second.emit('data', Buffer.alloc(1024 * 1024, 65))
+    assert.equal(second.isPaused(), true)
+    await manager.read(secondId)
+    assert.equal(second.isPaused(), false)
+    assert.equal((await manager.read(secondId, { mode: 'raw' })).rawBufferLimit, 1024)
+})
 
-
-
-
-
-
-
+test('SSH-14: close without exit status preserves unknown; exit signals remain remote failures', async (t) => {
+    const manager = new SessionManager(path.join(temporary(t), 'sessions.json'))
+    const client = new EventEmitter()
+    let stream
+    client.exec = (_command, _options, callback) => {
+        stream = new PassThrough()
+        stream.stderr = new PassThrough()
+        stream.close = () => {}
+        callback(null, stream)
+    }
+    manager.sessions.set('fixture', {
+        client,
+        config: { host: 'example.com', port: 22, username: 'fixture' },
+        connected: true,
+        connectedAt: 1,
+        lastUsedAt: 1,
+        manualClose: false,
+    })
+    for (const sudo of [false, true]) {
+        const pending = sudo ? manager.execSudo('fixture', 'true', 'synthetic') : manager.exec('fixture', 'true')
+        stream.emit('data', Buffer.from('CONFIRMED OUTPUT'))
+        stream.emit('close')
+        const result = await pending
+        assert.equal(result.operationStatus, 'unknown')
+        assert.equal(result.failureKind, 'ssh_transport')
+        assert.equal(result.exitCode, null)
+        assert.equal(result.stdout, 'CONFIRMED OUTPUT')
+        assert.equal(result.retryable, false)
+    }
+    const pending = manager.exec('fixture', 'true')
+    stream.emit('close', null, 'TERM')
+    const signalled = await pending
+    assert.equal(signalled.failureKind, 'remote_command')
+    assert.equal(signalled.exitSignal, 'TERM')
+    assert.equal(signalled.operationStatus, 'failed')
+})
 
 test('SSH-02: a late SFTP resource cannot OPEN or MKDIR after cancellation', async (t) => {
     const directory = temporary(t)
@@ -381,7 +542,28 @@ for (const direction of ['upload', 'download']) {
     }
 }
 
-
+test('SSH-15: completed single-file bytes remain visible when hash verification times out', async (t) => {
+    const directory = temporary(t)
+    const source = path.join(directory, 'source')
+    const target = path.join(directory, 'target')
+    fs.writeFileSync(source, 'DATA')
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+    const sftp = sftpFixture()
+    let verificationReads = 0
+    sftp.createReadStream = () => {
+        ++verificationReads
+        globalThis.queueMicrotask(() => t.mock.timers.tick(51))
+        return new Readable({ read() {} })
+    }
+    sftpSession(t, sftp)
+    const result = await syncFiles('fixture', source, target, 'upload', { operationTimeout: 50 })
+    assert.equal(verificationReads, 1)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'DATA')
+    assert.equal(result.filesTransferred, 1)
+    assert.equal(result.bytesTransferred, 4)
+    assert.equal(result.verification.status, 'unknown')
+    assert.equal(result.operationStatus, 'unknown')
+})
 
 test('SSH-02: directory cancellation before a delayed stat cannot issue MKDIR', async (t) => {
     const source = temporary(t)
@@ -598,7 +780,38 @@ test('I009 and I051 rsync prepares download parents and parses split progress wi
     assert.equal(fs.readFileSync(path.join(root, 'blocked'), 'utf8'), 'preserved')
 })
 
-
+test('SSH-11: public config selection skips overridden ProxyJump validation', async (t) => {
+    const directory = temporary(t)
+    const configPath = path.join(directory, 'config')
+    patch(t, process.env, 'SSH_MCP_ALLOWED_KEY_DIRS', directory)
+    patch(t, process.env, 'SSH_MCP_TEMPLATES', '')
+    fs.writeFileSync(
+        configPath,
+        'Host fixture\n  HostName example.com\n  User fixture\n  ProxyJump missing-user.example.com\n'
+    )
+    let selected
+    patch(t, sessionManager, 'listSessionDetails', () => [])
+    patch(t, sessionManager, 'connect', async (config) => {
+        selected = config
+        return 'fixture'
+    })
+    patch(t, sessionManager, 'getSessionConnectionInfo', () => ({
+        alias: 'fixture',
+        identity: 'fixture@example.com:22',
+        backend: 'ssh2',
+        host: 'example.com',
+        port: 22,
+    }))
+    const connect = handlers(registerConnectionTools).get('ssh_connect')
+    const explicit = content(
+        await connect({ configHost: 'fixture', configPath, jumpHost: { host: 'jump.example.com', user: 'fixture' } })
+    )
+    assert.equal(explicit.success, true)
+    assert.equal(selected.jumpHost.host, 'jump.example.com')
+    fs.writeFileSync(configPath, 'Host fixture\n  HostName example.com\n  User fixture\n  ProxyJump none\n')
+    assert.equal(content(await connect({ configHost: 'fixture', configPath })).success, true)
+    assert.equal(selected.jumpHost, undefined)
+})
 
 test('SSH-02: directory timeout prevents a late acquired resource from making directories', async (t) => {
     const directory = temporary(t)
@@ -667,4 +880,28 @@ test('SSH-16: SFTP acquisition and stat share one metadata deadline', async (t) 
     assert.ok(ended >= 1)
 })
 
-
+test('SSH-17: parser rejection closes the channel while keeping raw bytes readable', async (t) => {
+    const stream = new PassThrough()
+    stream.close = () => stream.emit('close')
+    const manager = new PtyManager()
+    const id = await manager.start(
+        {
+            async execPty() {
+                return stream
+            },
+        },
+        'fixture',
+        'output'
+    )
+    t.after(() => manager.close(id))
+    manager.sessions.get(id).terminal.write = () => {
+        throw new Error('fixture parser rejection')
+    }
+    stream.emit('data', Buffer.from('READABLE RAW'))
+    const result = await manager.read(id, { mode: 'raw' })
+    assert.equal(result.active, false)
+    assert.equal(result.data, 'READABLE RAW')
+    assert.equal(result.parserError, 'fixture parser rejection')
+    assert.equal(stream.destroyed, true)
+    assert.equal(manager.sessions.get(id).parseWaiters.size, 0)
+})
