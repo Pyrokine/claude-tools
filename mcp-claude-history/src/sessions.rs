@@ -54,7 +54,7 @@ pub fn list_sessions(
 
         // 统计行数并获取时间范围和主题
         let stats = get_session_stats(&path, redaction)?;
-        redacted_count += stats.topic_redacted_count;
+        redacted_count += stats.topic_redacted_count + stats.title_redacted_count;
 
         sessions.push(SessionInfo {
             id: session_id.clone(),
@@ -63,6 +63,8 @@ pub fn list_sessions(
             start_time: stats.start_time,
             end_time: stats.end_time,
             size_bytes,
+            title: stats.title,
+            title_redacted_count: stats.title_redacted_count,
             topic: stats.topic,
             topic_redacted_count: stats.topic_redacted_count,
             skipped_oversized_lines: stats.skipped_oversized_lines,
@@ -93,9 +95,19 @@ struct SessionStats {
     line_count: usize,
     start_time: String,
     end_time: String,
+    title: Option<String>,
+    title_redacted_count: usize,
     topic: Option<String>,
     topic_redacted_count: usize,
     skipped_oversized_lines: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionTitle {
+    #[serde(rename = "type")]
+    record_type: String,
+    #[serde(rename = "customTitle")]
+    title: String,
 }
 
 fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> Result<SessionStats, ErrorResponse> {
@@ -109,6 +121,8 @@ fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> R
     let mut line_count = 0;
     let mut start_time = String::new();
     let mut end_time = String::new();
+    let mut title = None;
+    let mut title_redacted_count = 0;
     let mut topic: Option<String> = None;
     let mut topic_redacted_count = 0usize;
     let mut skipped_oversized_lines = 0usize;
@@ -131,8 +145,7 @@ fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> R
         };
         line_count += 1;
 
-        // 只解析时间字段，不解析整个消息
-        if let Ok(record) = serde_json::from_str::<MessageRecord>(&line) {
+        if let Ok(Some(record)) = parse_message_record(&line) {
             if start_time.is_empty() {
                 start_time = record.timestamp.clone();
             }
@@ -155,6 +168,14 @@ fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> R
                     preview
                 });
             }
+        } else if let Ok(record) = serde_json::from_str::<SessionTitle>(&line)
+            && record.record_type == "custom-title"
+            && !record.title.trim().is_empty()
+        {
+            let redaction = redact_text_with_mode(&record.title, redaction_mode);
+            title_redacted_count = redaction.count;
+            let (preview, truncated) = truncate_content(&redaction.text, 100);
+            title = Some(if truncated { format!("{preview}...") } else { preview });
         }
     }
 
@@ -162,6 +183,8 @@ fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> R
         line_count,
         start_time,
         end_time,
+        title,
+        title_redacted_count,
         topic,
         topic_redacted_count,
         skipped_oversized_lines,
@@ -194,6 +217,104 @@ mod tests {
     use std::env;
     use std::io::Write;
     use std::process;
+
+    #[test]
+    fn latest_custom_title_maps_session_id_without_replacing_topic() {
+        let tmp = env::temp_dir().join(format!("mcp-sessions-title-{}", process::id()));
+        fs::create_dir_all(tmp.join("project")).unwrap();
+        let records = [
+            serde_json::json!({"type": "custom-title", "customTitle": "HDMap_1"}),
+            serde_json::json!({
+                "uuid": "user-1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": "original topic"}
+            }),
+            serde_json::json!({"type": "custom-title", "customTitle": "HDMap_3"}),
+            serde_json::json!({"type": "custom-title", "customTitle": "  "}),
+            serde_json::json!({"type": "custom-title", "customTitle": null}),
+            serde_json::json!({"type": "summary", "customTitle": "not a title"}),
+            serde_json::json!({
+                "uuid": "assistant-1", "type": "assistant", "timestamp": "2026-01-01T00:01:00Z",
+                "customTitle": "not a metadata record", "message": {"content": "answer"}
+            }),
+        ];
+        fs::write(
+            tmp.join("project/session-title.jsonl"),
+            records.iter().map(|record| format!("{record}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let response = list_sessions(
+            &Config {
+                projects_dir: tmp.clone(),
+            },
+            Some("project"),
+            RedactionMode::Auto,
+        )
+        .unwrap();
+        let session = serde_json::to_value(&response.sessions[0]).unwrap();
+        assert_eq!(session["id"], "session-title");
+        assert_eq!(session["title"], "HDMap_3");
+        assert_eq!(session["topic"], "original topic");
+        assert_eq!(session["line_count"], records.len());
+        assert_eq!(session["start_time"], "2026-01-01T00:00:00Z");
+        assert_eq!(session["end_time"], "2026-01-01T00:01:00Z");
+        assert!(session.get("title_redacted_count").is_none());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn custom_titles_are_redacted_before_preview_and_are_optional() {
+        let tmp = env::temp_dir().join(format!("mcp-sessions-title-redaction-{}", process::id()));
+        fs::create_dir_all(tmp.join("project")).unwrap();
+        let title = format!(
+            "token=TITLE_TEST_SECRET https://title.example.test {}",
+            "中".repeat(110)
+        );
+        fs::write(
+            tmp.join("project/title.jsonl"),
+            format!("{}\n", serde_json::json!({"type":"custom-title", "customTitle":title})),
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("project/untitled.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "uuid":"user-1", "type":"user", "timestamp":"2026-01-01T00:00:00Z",
+                    "message":{"content":"original topic"}
+                })
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            projects_dir: tmp.clone(),
+        };
+        for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+            let response = list_sessions(&config, Some("project"), mode).unwrap();
+            let titled = response.sessions.iter().find(|session| session.id == "title").unwrap();
+            let untitled = response
+                .sessions
+                .iter()
+                .find(|session| session.id == "untitled")
+                .unwrap();
+            let value = serde_json::to_value(titled).unwrap();
+            let preview = value["title"].as_str().unwrap();
+            assert_eq!(preview.chars().count(), 103);
+            assert!(preview.ends_with("..."));
+            assert_eq!(preview.contains("TITLE_TEST_SECRET"), mode == RedactionMode::Off);
+            assert_eq!(preview.contains("title.example.test"), mode != RedactionMode::Strict);
+            assert_eq!(
+                value["title_redacted_count"].as_u64().unwrap_or(0),
+                response.redaction.redacted_count as u64
+            );
+            assert_eq!(
+                value["title_redacted_count"].as_u64().unwrap_or(0) > 0,
+                mode != RedactionMode::Off
+            );
+            assert!(serde_json::to_value(untitled).unwrap().get("title").is_none());
+            assert_eq!(untitled.topic.as_deref(), Some("original topic"));
+        }
+        fs::remove_dir_all(tmp).unwrap();
+    }
 
     #[test]
     fn missing_session_file_is_not_reported_as_an_empty_session() {

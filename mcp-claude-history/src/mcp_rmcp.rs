@@ -749,7 +749,9 @@ impl McpHistoryService {
         run_history_work(request, move || list_projects(&cfg), tool_text_result).await
     }
 
-    #[tool(description = "List project sessions. Topics are redacted before preview; redaction defaults to auto.")]
+    #[tool(
+        description = "List project sessions with UUIDs and optional custom titles. Titles and topics are redacted before preview; redaction defaults to auto."
+    )]
     async fn history_sessions(
         &self,
         Parameters(p): Parameters<SessionsToolParams>,

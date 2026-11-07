@@ -437,6 +437,10 @@ pub struct SessionInfo {
     pub end_time: String,
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub title_redacted_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
     #[serde(skip_serializing_if = "is_zero")]
     pub topic_redacted_count: usize,

@@ -53,6 +53,18 @@
 
 **预期**：错误信息明确（不挂死）
 
+### sessions-04: 名称与 UUID
+
+**步骤**：受控会话依次写入消息、多个 `custom-title`、空名称及普通消息里的同名字段，通过 history_sessions 读取
+
+**预期**：`title` 为最后一个非空自定义名称，`id` 与 `topic` 保持原值，内部标题不改变消息时间范围，物理行数包含这些记录；没有自定义名称时省略 title
+
+### sessions-05: 名称脱敏
+
+**步骤**：受控名称包含合成 token、域名与超过 100 字符的 Unicode 文本，分别使用 auto、strict 与 off
+
+**预期**：名称先按策略脱敏再生成 100 字符预览，超长时附省略号，title_redacted_count 与汇总计数一致；off 保留原始名称内容，主题继续独立处理
+
 ---
 
 ## 3. search（按关键词搜索）
@@ -92,13 +104,17 @@
 
 **步骤**：在隔离 HOME/TMPDIR 创建自有主 JSONL、`<session>/subagents/agent-local.jsonl`、
 `<session>/remote-agents/agent-remote.jsonl`、`<session>/subagents/workflows/<run>/agent-nested.jsonl` 和同级
-`journal.jsonl`，分别省略 subagents、传 false 和 true 对每组分别查询全部会话、父 ID、各子 ID，覆盖普通、summary、aggregate、dry_run、output，以及 limit 和 max_total 续查读取公开 MCP
+`journal.jsonl`，分别省略 subagents、传 false 和 true 对每组分别查询全部会话、父 ID、各子
+ID，覆盖普通、summary、aggregate、dry_run、output，以及 limit 和
+max_total 续查读取公开 MCP
 schema，核对 subagents 的默认值和文件范围说明
 
 **预期**：省略与 false 只含主文件，true 纳入直接 subagent、remote-agent 与已识别的嵌套 Workflow
 agent，journal 不参与检索 sessions 匹配文件自身 ID，父 ID 不自动包含子会话，未选中的子 ID 返回 session_not_found
 normal 成功响应始终回显布尔型
-`stats.effective_filters.subagents`，false 不省略；scan 通过 metadata 的 filters 条目回显 coverage、导出与 CLI/MCP 使用相同来源，续查不重复或遗漏，schema 说明默认值和实际支持的布局
+`stats.effective_filters.subagents`，false 不省略；scan 通过 metadata 的 filters 条目回显 coverage、导出与 CLI/MCP
+使用相同来源，续查不重复或遗漏，
+schema 说明默认值和实际支持的布局
 
 ### search-06: subagents flag CLI 与 MCP 一致
 
@@ -214,13 +230,15 @@ history_search(
 ### search-14a: 内容完整性与工具归因
 
 **步骤**：在独立 fixture 中分别构造
-`unknown_id`、`missing_id`、`ambiguous_parent`，再添加正常用户文字；分别通过关键词、`subtypes=human`、时间和行范围排除工具记录；再查询匹配的工具记录，以及用
+`unknown_id`、`missing_id`、`ambiguous_parent`，再添加正常用户文字；分别通过关键词、`subtypes=human`
+、时间和行范围排除工具记录；再查询匹配的工具记录，以及用
 `servers/tools` 筛选无法确认归属的记录；对普通、`summary`、`aggregate` 和 JSONL 导出重复查询
 
 **预期**：被排除的工具记录不影响内容完整性，也不进入归因诊断；匹配工具记录的关联缺失仅进入
 `stats.attribution_incomplete_reasons` 和记录级
 `metadata_incomplete_reason`，正文搜索仍完整；工具名称或服务筛选无法确认时，返回
-`tool_filter_unverifiable`，`complete=false`、`total_matches_exact=false`；manifest 与响应的归因原因一致，真实 parse/read 错误及容量限制仍保持不完整语义
+`tool_filter_unverifiable`，`complete=false`、`total_matches_exact=false`；manifest 与响应的归因原因一致，真实 parse/read
+错误及容量限制仍保持不完整语义
 
 ### search-14b: 扫描路径不挤占命中消息
 
@@ -230,7 +248,7 @@ history_search(
 `total/returned/omitted` 必要字段和首条记录能够容纳时不返回空结果；实际仍超预算时返回
 `response_too_large`、真实所需字节和不跳过首条的恢复查询按返回预算重新查询可读取该条记录，不能删除遗漏诊断来满足旧预算，展示删减不改变原本精确的匹配数
 
-### search-14c: 容量与读取缺口的四模式计数
+### search-14c: 容量与读取缺口在四种模式下的计数
 
 **步骤**：分别构造单条 record 超过 2,048 个 tool block、跨 record 超过 2,048 个 pending ID、pending 字段累计超过 8
 MiB 的 fixture，每组保留一条短命中对普通、summary、aggregate 和 output 重复查询，再使用读取失败与损坏 JSON
@@ -245,20 +263,28 @@ fixture；同时执行 search-14a 的归因矩阵
 
 **步骤**：准备排序相邻的两个 session，第一个含 5 条 UUID 各异的短于 8 MiB 的合法命中行，每条正文约 7
 MiB；第二个只有一条短命中对普通、summary 和 output 使用 `max_content=100`
-查询，再缩小响应字节预算并检查导出 manifest 对 aggregate 分别使用超过 50,000 个独立 UUID、超过 50,000 条空 UUID 命中，以及总 UUID 字节超过 32
+查询，再缩小响应字节预算并检查导出 manifest 对 aggregate 分别使用超过 50,000 个独立 UUID、超过 50,000 条空 UUID 命中，以及总
+UUID 字节超过 32
 MiB 的 fixture，并在后面保留第二个 session 重复全部文件可扫描、空文件、首文件读取失败和零文件场景；同一 fixture 再执行
 `dry_run=true`
 
 **预期**：32 MiB 结果缓存停止后，`files_scanned=1`，`searched_files` 只含第一个 session，`skipped_files`
-只含第二个 aggregate 的去重、命中及字节容量停止使用相同的实际前缀语义；当前文件中途停止仍属于已尝试范围，打开失败也计入尝试数响应与 manifest 的两个路径集合无交集，预算缩减后的剩余路径不改变归属；全扫描时 skipped 为空，零文件时两个集合都为空
+只含第二个 aggregate 的去重、命中及字节容量停止使用相同的实际前缀语义；当前文件中途停止仍属于已尝试范围，打开失败也计入尝试数响应与
+manifest 的两个路径集合无交集，预算缩减后的剩余路径不改变归属；全扫描时
+skipped 为空，零文件时两个集合都为空
 `dry_run` 不读取正文，`files_scanned=0`，单独返回完整计划范围
 
 ### search-14e: 混合工具名与筛选关联
 
 **步骤**：在隔离 fixture 中写入
-`Bash`、`mcp__mcp-ssh__ssh_exec`、两个 server 的 read/write 工具，以及各自的 tool_result；分别混合查询本地名与完整 MCP 名、两个指定 server/tool 组合、短名和显式 servers，再加入多工具 record 与 harness/payload 错误条件对普通、summary、aggregate、JSONL 导出比较命中集；用 limit 和 max_total 分别触发分页与预算续查，再测试 slice 的预算续查；通过 dry_run 检查有效过滤条件
+`Bash`、`mcp__mcp-ssh__ssh_exec`、两个 server 的 read/write 工具，以及各自的 tool_result；分别混合查询本地名与完整 MCP
+名、两个指定 server/tool 组合、
+短名和显式 servers，再加入多工具 record 与 harness/payload 错误条件对普通、summary、aggregate、JSONL 导出比较命中集；用 limit
+和 max_total 分别触发分页与预算续查，
+再测试 slice 的预算续查；通过 dry_run 检查有效过滤条件
 
-**预期**：混合查询不排除本地工具，完整名称只匹配指定的 server/tool 组合，不匹配交叉组合；短名继续跨 server 匹配显式 servers 与 tools 按 AND 组合，错误条件与工具名必须在同一 block 满足
+**预期**：混合查询不排除本地工具，完整名称只匹配指定的 server/tool 组合，不匹配交叉组合；短名继续跨 server 匹配显式 servers
+与 tools 按 AND 组合，错误条件与工具名必须在同一 block 满足
 `stats.effective_filters.tools` 和 `next_query.tools`
 保留完整名称，servers 不包含推导值；续查不遗漏、不重复命中，导出与内联结果一致；dry_run 不读取正文
 
@@ -293,6 +319,12 @@ manifest 含 `mode="off"`、`enabled=false`、`rules=[]`、`raw_available=true`
 **预期**：三种模式都能通过 `FAR_NEEDLE` 命中；auto 和 strict 的响应及导出不含 `fixture_secret`，off 保留完整原文；
 `max_content` 只限制结果预览，不改变搜索集合
 
+### search-17a-json: 完整 JSON 正文的标量脱敏
+
+**步骤**：在自有 fixture 的普通记录和超过 8 MiB 的记录中写入完整 JSON 正文，包含敏感键的数字、布尔值、null、字符串、嵌套对象及非敏感对照；将相同正文嵌入 tool-result text，分别通过 search、get 和完整导出使用 auto、strict、off，解析外层结果及内层正文，并检查相交 range
+
+**预期**：auto 和 strict 将敏感值替换为 JSON 字符串标记，内外两层 JSON 均可解析，非敏感字段与类型保持，普通与流式路径结果一致；脱敏计数准确，range 沿用原始字符坐标，off 逐字保留原文
+
 ### search-17b: Unicode 转义字段名与字面反斜杠
 
 **步骤**：在隔离 fixture 中用下面的构造保留字段名的字面反斜杠，不要先解析后重序列化 `body`
@@ -307,7 +339,9 @@ const literal = JSON.stringify({ ['pass' + String.fromCharCode(92) + 'u0077ord']
 
 将 `body` 原样写入 user 字符串、嵌套 JSON、带前缀或 fenced JSON、序列化 tool input 和 tool-result `text` 使用
 `JSON.stringify(body)` 及再次 `JSON.stringify` 构造多层嵌入文本，并加入 `literal`
-作为不应反复解码的对照分别用 auto、strict 和 off 调用 get、search、context、trace、sessions；前四个工具分别导出并按返回路径读取正文及 manifest 对含中文前缀的原文，使用只覆盖敏感值内部或部分字符的 get
+作为不应反复解码的对照分别用 auto、strict 和 off 调用 get、search、context、trace、sessions；前四个工具分别导出并按返回路径读取正文及
+manifest 对含中文前缀的原文，
+使用只覆盖敏感值内部或部分字符的 get
 range，再读取导出结果
 
 **预期**：auto 和 strict 的内联、会话主题、tool-result 文本及导出均不出现 `fixture_secret`，相交 range 返回 `[redacted]`
@@ -319,11 +353,16 @@ range，再读取导出结果
 **步骤**：在隔离 HOME/TMPDIR 的自有 JSONL 中，将 `token = text(node, 1)`、
 `sorted(values, key=lambda x: x['durationNs'])`、`process_key = path.name.rsplit('.', 1)[0]`
 分别写入普通文本、fenced 文本、JSON
-String 和工具输入使用无效测试值覆盖直接赋值、普通及转义敏感 JSON、无字段名的调用参数、内层敏感赋值或 JSON、lambda 返回字符串、字符串拼接、未闭合表达式和超过 32 层的括号，增加中文前缀及只覆盖测试值内部的 range 分别调用 auto、strict、off 的 get、search、context、trace，比较内联与导出；用内层裸敏感赋值验证保留表达式仍继续扫描
+String 和工具输入使用无效测试值覆盖直接赋值、普通及转义敏感 JSON、无字段名的调用参数、内层敏感赋值或 JSON、lambda
+返回字符串、字符串拼接、未闭合表达式和超过 32 层的括号，增加中文前缀及只覆盖测试值内部的
+range 分别调用 auto、strict、off 的 get、search、context、trace，比较内联与导出；用内层裸敏感赋值验证保留表达式仍继续扫描
 
-**预期**：三个代码原例在三种模式下保持完整，auto/strict 的测试值及其内部 range 不泄漏，off 返回对应原文字符串参数、返回字符串的 lambda、拼接和不满足有限语法的候选 RHS 整体遮蔽下标字段名和方法
+**预期**：三个代码原例在三种模式下保持完整，auto/strict 的测试值及其内部 range 不泄漏，off 返回对应原文字符串参数、返回字符串的
+lambda、拼接和不满足有限语法的候选 RHS 整体遮蔽下标字段名和方法
 `(标点分隔符, 整数)[下标]`
-按语法位置判断，不以任意短字符串、熵值或函数名称豁免括号深度最多 32，未闭合或超限时不得留下未检查尾部；带引号的 JSON 敏感键与结构化敏感字段仍整值脱敏内层敏感字段、Authorization/Cookie 检测保持，全文替换后按原 Unicode
+按语法位置判断，不以任意短字符串、熵值或函数名称豁免括号深度最多 32，未闭合或超限时不得留下未检查尾部；带引号的 JSON
+敏感键与结构化敏感字段仍整值脱敏内层敏感字段、Authorization/Cookie 检测保持，全文替换后按原
+Unicode
 range 选取，直接返回和导出一致
 
 将 `token=fixture-secret`、带字符串参数及未闭合的 RHS 放入 JSON 的 `command`
@@ -341,55 +380,82 @@ range 分别用 auto、strict、off 调用 get 的正文与 tool_input、normal/
 search、context、trace、sessions，并读取各入口的导出正文与 manifest
 range 只选择测试密码内部的部分字符，继续消费 scan 的 next_query，直到完成
 
-**预期**：auto 和 strict 的预览、结构化值、会话主题及导出均不包含测试密码，range 与密码值相交时只返回脱敏标记 LANG、SSHPASS_FD、SSHPASS_FILE 保持原值，超大输入的非敏感长文本完整保留，off 返回原文及对应原始 range 导出 manifest 的脱敏模式、完整性和字节数与实际文件一致，文件权限符合现有私有输出合同；不读取或复用真实认证材料
+**预期**：auto 和 strict 的预览、结构化值、会话主题及导出均不包含测试密码，range 与密码值相交时只返回脱敏标记
+LANG、SSHPASS_FD、SSHPASS_FILE 保持原值，超大输入的非敏感长文本完整保留，
+off 返回原文及对应原始 range 导出 manifest 的脱敏模式、完整性和字节数与实际文件一致，文件权限符合现有私有输出合同；不读取或复用真实认证材料
 
 ### search-17e: 命令行密码参数脱敏
 
 **步骤**：在隔离 HOME/TMPDIR 的自有 JSONL 中，使用合成测试密码构造
 `wget --user fixture-user --password <test-value> --preserve-permissions`，并覆盖
 `--http-password`、`--ftp-password`、`--proxy-password`
-的空白、等号、单双引号值及转义 JSON 增加引号前后相邻的普通字符、转义空格、单引号中的反斜杠、转义引号，以及 tab、换行、回车分隔分别测试参数位于命令末尾和后面还有非敏感参数的情况；在 JSON 字符串中增加空值与缺少值的命令，保留后续 note 字段测试密码包含点、逗号、方括号和大括号，增加
+的空白、等号、单双引号值及转义 JSON 增加引号前后相邻的普通字符、转义空格、单引号中的反斜杠、转义引号，以及
+tab、换行、回车分隔分别测试参数位于命令末尾和后面还有非敏感参数的情况；在 JSON 字符串中增加空值与缺少值的命令，
+保留后续 note 字段测试密码包含点、逗号、方括号和大括号，增加
 `--ask-password`、`--password-file fixture-path` 及普通说明文字对照将命令分别写入普通正文、tool input、tool
 result 和嵌套 JSON 字符串，其中一条输入超过 8
 MiB，密码位于长文本之后分别用 auto、strict、off 调用 sessions、get 正文与 tool_input、normal/scan
 search、context、trace 和文件导出使用中文与 emoji 前缀计算原始 Unicode
 range，分别选择密码内部、相邻后缀和转义空格中的部分字符；继续消费 scan 的 next_query，直到完成
 
-**预期**：auto/strict 将整个密码参数替换为一个脱敏标记，不能留下相邻片段或转义空格后的密码内容，range 与任一参数片段相交时只返回该标记所有入口、预览、结构化值及导出不含测试密码或其范围片段，带点的密码不能被当作代码属性链保留空值和缺少值的命令不越过外层字符串边界，note、用户名、后续非敏感参数、非密码 env 和长文本保持原值负例不被当作密码值参数，off 保留完整原文及对应 range 导出 manifest 的脱敏模式、完整性、UTF-8 字节数和私有文件权限与实际文件一致，不读取或复用真实凭证
+**预期**：auto/strict 将整个密码参数替换为一个脱敏标记，不能留下相邻片段或转义空格后的密码内容，range
+与任一参数片段相交时只返回该标记所有入口、预览、结构化值及导出不含测试密码或其范围片段，
+带点的密码不能被当作代码属性链保留空值和缺少值的命令不越过外层字符串边界，note、用户名、后续非敏感参数、非密码 env
+和长文本保持原值负例不被当作密码值参数，off 保留完整原文及对应 range 导出 manifest 的脱敏模式、
+完整性、UTF-8 字节数和私有文件权限与实际文件一致，不读取或复用真实凭证
 
 ### search-17f: token 返回文字中的 UUID 脱敏
 
 **步骤**：在隔离 HOME/TMPDIR 的自有 JSONL 中，用合成 UUID 构造
 `token created, returned a new UUID <value>`、`令牌创建成功，返回新 UUID <value>`
-和 Markdown 返回文字加入普通 session/operation
-UUID、不同 JSON 字段、实际换行、字面反斜杠加 n、返回会话 UUID 的负例覆盖中文长上下文、嵌套 JSON 字符串、tool
+和 Markdown 返回文字，分别将完整语句放在换行、回车和制表符之后，再序列化为嵌套工具参数
+加入普通 session/operation UUID、不同 JSON 字段、实际换行、字面反斜杠加 n、返回会话 UUID 的负例，负例中的 token 标签与返回子句分处两行
+覆盖中文长上下文、嵌套 JSON 字符串、tool
 input/result、64 KiB 缓冲边界和超过 8
 MiB 的输入与结果，UUID 位于长文本之后分别用 auto、strict、off 调用 sessions、get 正文与结构化 view、normal/scan
 search、context、trace 和文件导出使用中文与 emoji 前缀计算原始 Unicode
 range，只选择 UUID 内部的部分字符，并完整消费 scan 的 next_query
 
-**预期**：auto/strict 只替换明确 token 返回语句中的 UUID 值，负例、标识及非敏感长文本保持原值普通文本、嵌套结果与分块投影使用相同规则，range 与 UUID 相交时返回完整脱敏标记，off 返回原文及对应 range 导出 manifest 的模式、完整性、UTF-8 字节数与实际文件一致，文件权限为 0600，不读取真实认证配置或复用真实值
+**预期**：auto/strict 只替换明确 token 返回语句中的 UUID 值，负例、标识及非敏感长文本保持原值普通文本、嵌套结果与分块投影使用相同规则，range
+与 UUID 相交时返回完整脱敏标记，off 返回原文及对应
+range 导出 manifest 的模式、完整性、UTF-8 字节数与实际文件一致，文件权限为 0600，不读取真实认证配置或复用真实值
 
 ### search-17g: 私有位置名称后的双冒号
 
 **步骤**：在隔离 HOME/TMPDIR 的自有 JSONL 中，写入 `ghost_appearance :: description`、`host::method()`、
 `url::parse()`、`endpoint::status` 和 `domain::lookup`，覆盖普通消息和超过 8 MiB 的消息加入
-`host: fixture-machine`、`password::fixture-secret`、`host:::1`、带引号的 host 字段、双冒号后独立私有 IP/URL 及命名空间调用内的敏感赋值分别用 auto、strict、off 调用 get、normal/scan
+`host: fixture-machine`、`password::fixture-secret`、`host:::1`、带引号的 host 字段、双冒号后独立私有 IP/URL
+及命名空间调用内的敏感赋值分别用 auto、strict、
+off 调用 get、normal/scan
 search、context、trace 和导出，选择双冒号与敏感值内部的原始 Unicode range，完整消费 scan 的 next_query
 
-**预期**：未加引号、恰好两个冒号且仅在 strict 中敏感的位置名称保持原文，普通与超大读取结果一致凭证字段、引用字段、三冒号值、内层敏感赋值和独立私有 IP/URL 保持原有保护，敏感范围不泄漏局部值，off 保留原文直接返回、预览与完整导出使用同一规则，不读取或复用真实认证材料
+**预期**：未加引号、恰好两个冒号且仅在 strict 中敏感的位置名称保持原文，普通与超大读取结果一致凭证字段、引用字段、三冒号值、内层敏感赋值和独立私有
+IP/URL 保持原有保护，敏感范围不泄漏局部值，off 保留原文直接返回、
+预览与完整导出使用同一规则，不读取或复用真实认证材料
 
 ### search-17h: 独立 npm token 脱敏
 
 **步骤**：在隔离 HOME/TMPDIR 的自有 JSONL 中，使用小写 `npm_`
 加 36 个合成 ASCII 字母或数字构造测试值，不读取或使用真实凭证将测试值放入独立正文、普通字段和数组，以及 `printf`
 格式串之后的独立引号参数；覆盖 tool input、tool
-result、嵌套 JSON 字符串和 record 视图加入 35/37 位正文、大写前缀、非法正文字符、相连的 ASCII/Unicode 标识符、普通 npm 名称、占位符、非敏感参数和合法代码表达式作为对照将测试值放在当前 reader 的实际缓冲边界两侧，并构造超过 8
-MiB 的输入和结果，保留长的非敏感前缀分别以 auto、strict、off 调用 sessions、get 的 content/tool_input/tool_result/record、normal/scan
-search 的 full/preview、context、trace 及导出，完整消费 scan 的 next_query 和预览中的 get 恢复指针使用中文、emoji 和原始 Unicode 坐标选择测试值内部、完整值及相邻边界范围；检查与赋值、Authorization、strict
+result、嵌套 JSON 字符串和 record 视图，分别在换行、回车和制表符之后放置独立测试值，并覆盖对应的序列化转义形式
+加入 35/37 位正文、大写前缀、非法正文字符、相连的 ASCII/Unicode 标识符、普通 npm 名称、占位符、非敏感参数和合法代码表达式作为对照；转义换行后的值紧邻
+Unicode 字母或组合字符时仍保留原值
+将测试值放在当前
+reader 的实际缓冲边界两侧，并构造超过 8
+MiB 的输入和结果，保留长的非敏感前缀分别以 auto、strict、off 调用 sessions、get 的
+content/tool_input/tool_result/record、normal/scan
+search 的 full/preview、context、trace 及导出，完整消费 scan 的 next_query 和预览中的 get 恢复指针使用中文、emoji 和原始
+Unicode 坐标选择测试值内部、
+完整值及相邻边界范围；检查与赋值、Authorization、strict
 URL 重叠时的替换计数，并读取完整导出正文与 manifest
 
-**预期**：auto/strict 在所有入口和视图中遮蔽完整测试值，范围与测试值任意部分相交时返回完整脱敏标记，重叠区间只计一次两种读取路径保持相同规则，普通字段、相邻非敏感参数和长文本保持原有内容，结构化 JSON 有效，负例不被独立 token 规则误判 normal、aggregate 和 output 通过索引读取合法大记录，字面 pattern 检查完整逻辑正文，regex 超限明确报告未检查范围；超预算时返回现有明确错误和恢复信息，不通过增加预算或完整加载超大记录替代有界读取 off 返回完整原值及对应原始范围，计数为零；导出 manifest 的模式、字节数、完整性和私有权限与实际文件一致，凭证形状、单词边界和模式行为与双语 README 一致
+**预期**：auto/strict 在所有入口和视图中遮蔽完整测试值，范围与测试值任意部分相交时返回完整脱敏标记，重叠区间只计一次两种读取路径保持相同规则，普通字段、相邻非敏感参数和长文本保持原有内容，结构化
+JSON 有效，
+负例不被独立 token 规则误判 normal、aggregate 和 output 通过索引读取合法大记录，字面 pattern 检查完整逻辑正文，regex
+超限明确报告未检查范围；超预算时返回现有明确错误和恢复信息，
+不通过增加预算或完整加载超大记录替代有界读取 off 返回完整原值及对应原始范围，计数为零；导出 manifest
+的模式、字节数、完整性和私有权限与实际文件一致，凭证形状、单词边界和模式行为与双语 README 一致
 
 ### search-18: 过滤参数校验
 
@@ -411,8 +477,8 @@ URL 重叠时的替换计数，并读取完整导出正文与 manifest
 **步骤**：创建至少 80 个 session 和不同 tool 桶，用 normal、`summary=true, limit=0, max_total=4096` 查询逐项核对
 `stats.metadata_dimensions`，原样执行 `next_query`；对 limit 分页和正文预算删减分别查询
 
-**预期**：被删维度可辨识，`total=returned+omitted`，空数组不被解释为真实零分布扫描无缺口时
-`total_matches_exact=true`，展示删减和 `has_more` 不改变精确计数首次保留 `limit=0` 的零结果合同，下一页 `limit>=1`
+**预期**：可以辨识被省略的维度，`total=returned+omitted`，空数组不被解释为真实零分布；扫描无缺口时
+`total_matches_exact=true`，展示删减和 `has_more` 不改变精确计数；首次保留 `limit=0` 的零结果合同，下一页 `limit>=1`
 且 offset 前进，最终 UTF-8 JSON 不超过预算
 
 ### search-21: structured full、preview 与 get 指针
@@ -420,15 +486,40 @@ URL 重叠时的替换计数，并读取完整导出正文与 manifest
 **步骤**：创建超过响应预算的 tool input/result，分别显式传 `structured=full` 和 `preview` 在原始业务 JSON 中加入同名
 `get`、`original_bytes`、`budget_preview` 字段，再原样调用响应给出的 get 指针与预算恢复查询
 
-**预期**：full 不会静默转 preview，无法容纳时明确拒绝并报告占用；提高到建议预算后保留完整脱敏结构 preview 的恢复指针包含真实完整 ref、project、source、view、block，不能由业务字段替换，完整获取和预览指向同一记录
+**预期**：full 不会静默转 preview，无法容纳时明确拒绝并报告占用；提高到建议预算后保留完整脱敏结构 preview 的恢复指针包含真实完整
+ref、project、source、view、block，不能由业务字段替换，
+完整获取和预览指向同一记录
 
 ### search-22: 普通预算性能与取消
 
 **步骤**：显式执行 ignored 的 `normal_summary_phase_measurement`，使用 200、1000、5000 对合成 tool_use/tool_result，保留
-`all=true, max_total=38000, redaction="strict", servers="mcp-ssh", since="2026-07-14T00:00:00Z", subagents=true, subtypes="tool_use", summary=true, types="assistant", until="2026-10-12T12:33:55.391Z"`，不传 limit，再通过公开 stdio
+`all=true, max_total=38000, redaction="strict", servers="mcp-ssh", since="2026-07-14T00:00:00Z"`、
+`subagents=true, subtypes="tool_use", summary=true, types="assistant", until="2026-10-12T12:33:55.391Z"`
+，不传 limit，再通过公开 stdio
 SDK 给正在读取与计算的 normal 请求发送取消，分别检查读取、预算处理和最终 JSON 序列化路径
 
-**预期**：记录读取、解析、脱敏、汇总、完整序列化、预算与完整请求的实际耗时，不把独立 pass 相加为严格阶段分解预算删除维度或尾部结果时不反复序列化全部结果，返回连续前缀与可前进的 next_query，精确计数保持取消后实际来源读取和 CPU 工作停止，不能只验证客户端 AbortError，也不能把取消改为普通 read_error 后返回成功
+**预期**：记录读取、解析、脱敏、汇总、完整序列化、预算与完整请求的实际耗时，不把独立 pass
+相加为严格阶段分解预算删除维度或尾部结果时不反复序列化全部结果，返回连续前缀与可前进的 next_query，
+精确计数保持取消后实际来源读取和 CPU 工作停止，不能只验证客户端 AbortError，也不能把取消改为普通 read_error 后返回成功
+
+### search-normal-performance: 全文匹配与大记录索引
+
+**步骤**：显式执行 ignored 的 `normal_search_phase_measurement`，分别记录相同规模非命中文本、tool input 和内部缓存的解析、关联与匹配耗时
+执行 `tool_association_borrows_payload_and_preserves_rendering`，检查普通工具记录筛选前借用原 payload，关联 key、块下标、失败属性与 auto／strict／off 渲染保持
+执行 `record_lines_reuse_consumed_buffers_with_bounded_capacity`，检查连续普通行归还后复用容量，保留实际字节计量，超过原行上限的容量不保留
+时间筛选同时覆盖范围内外及无效 timestamp，核对行范围外调用与范围内结果的关联、排除类型的无效时间计数，以及 normal／scan 的计数和诊断
+执行 `case_insensitive_match_positions_preserve_unicode_expansion_and_word_rules`，检查 ASCII、中文、emoji、Unicode 小写展开、Greek sigma、AND/OR/排除词及命中预览位置
+执行 `mixed_ascii_lowercase_preserves_every_unicode_scalar_and_original_position`，逐一对照所有合法 Unicode scalar 的原逐字符 lowercase 结果及原始命中位置
+执行 `streamed_ascii_case_folding_matches_ordinary_unicode_word_rules`，对照普通与流式匹配的大小写、Unicode 展开、Greek sigma、词项及位置语义
+执行 `indexed_string_runs_preserve_boundaries_escapes_and_scan_budgets`，覆盖读取块边界、JSON 转义、代理项、非法控制字符和小批次续查，并对照 `internal_record_classification_matches_ordinary_parser` 的大记录耗时
+执行 `text_cursor_ascii_runs_preserve_projection_and_seek` 与 `text_cursor_ascii_runs_preserve_cancellation_and_byte_accounting`，检查连续 ASCII、canonical 输出、跨缓冲 Unicode／转义、双向 seek、取消及实际读取字节计量
+执行 `record_lines_preserve_byte_boundaries_snapshots_and_batch_accounting`，检查所有字节值、CRLF、跨缓冲、无结尾换行、冻结终点和小批次读取计量
+执行 `bounded_jsonl_lines_preserve_chunks_utf8_errors_and_byte_accounting` 及现有超大行、读取失败控制，检查会话统计读取的分块、UTF-8 错误后续读、大小上限和字节计量
+使用同一组合成普通与超过 8 MiB 的记录，交替执行基线和候选的 normal／scan 查询，分别记录 CPU 与 wall 耗时、精确命中、行数和 metadata 完成状态
+在独立候选 MCP 中执行经授权的原全项目时间范围 regex 查询和精确 operationId 查询，保留原 project、subagents、pattern、limit 与响应预算，分别记录返回状态、耗时、来源与行数、命中计数和完整性诊断
+
+**预期**：匹配使用完整提取正文，Unicode 字符位置和词项语义保持；索引完整验证字符串并保留真实字节跨度，批次预算与取消继续生效
+实际查询在原 120 秒期限与 32 MiB 结果缓存上限内返回；读取、解析、归因、来源变化或配额缺口继续按原字段报告，结果预览数量不充当来源覆盖范围
 
 ### search-23: 公开 schema 与参数说明
 
@@ -436,27 +527,38 @@ SDK 给正在读取与计算的 normal 请求发送取消，分别检查读取�
 读取 pattern、regex、output/output_format、subagents、mode/cursor/scan 预算和 structured 参数验证普通 AND/OR/排除词项、Rust
 regex 不支持的 look-around/backreference、合法 JSONL 导出、错误的 `.json` search 导出和 `cwd:` 绝对路径
 
-**预期**：schema、CLI 与双语 README 说明相同合同，合法请求按约定执行，不支持的格式和路径明确拒绝新增参数由正式字段解析，不进入被忽略的 extra，完整 next_query 保留有效范围
+**预期**：schema、CLI 与双语 README 说明相同合同，合法请求按约定执行，不支持的格式和路径明确拒绝新增参数由正式字段解析，不进入被忽略的
+extra，完整 next_query 保留有效范围
 
 ---
 
 ### search-24: normal 大记录与 regex 精确边界
 
 **步骤**：在自有临时历史目录中创建超过 8
-MiB 的合法消息、超大 tool_use 和对应 tool_result，匹配词位于尾部，覆盖 Unicode、AND/OR/排除词、行范围、工具筛选、重复 UUID 与非单调时间；再加入物理行超过 8
+MiB 的合法消息、超大 tool_use 和对应 tool_result，匹配词位于尾部，覆盖 Unicode、AND/OR/排除词、行范围、工具筛选、重复 UUID
+与非单调时间；再加入物理行超过 8
 MiB 但逻辑正文很短的记录、合法 api-request-blob、坏 JSON、非法 UTF-8 和缺字段消息通过公开 CLI 与 stdio
 MCP 对 normal、summary、aggregate、preview/full
 output 重复查询；aggregate 的超大工具输入同时覆盖省略 structured 的默认请求和显式 preview 请求
 
-**预期**：字面检索覆盖完整逻辑正文，时间排序和 UUID 去重保持，工具关联在行过滤前更新；合法内部记录不计为损坏无文件输出的 aggregate 只返回统计，默认 structured 不触发工具结构的响应预算错误，工具筛选与 UUID 去重后的精确计数保持一致 regex 对不超过 8
-MiB 的逻辑正文精确匹配，超限返回 regex_content_limit、受影响 source/line 和 total_matches_exact=false，保留其余结果坏输入继续报告实际位置，合法大记录不出现 oversized_jsonl_lines 缺口
+**预期**：字面检索覆盖完整逻辑正文，时间排序和 UUID 去重保持，工具关联在行过滤前更新；合法内部记录不计为损坏无文件输出的
+aggregate 只返回统计，默认 structured 不触发工具结构的响应预算错误，工具筛选与
+UUID 去重后的精确计数保持一致 regex 对不超过 8
+MiB 的逻辑正文精确匹配，超限返回 regex_content_limit、受影响 source/line 和
+total_matches_exact=false，保留其余结果坏输入继续报告实际位置，合法大记录不出现
+oversized_jsonl_lines 缺口
 
 ### search-25: 全文导出与事务边界
 
-**步骤**：生成带尾标记的 4515 字符消息及嵌套工具字段，分别使用 output_content=preview/full、structured=preview/full 和 auto/strict/off 导出加入 thinking/text 与 tool_use/tool_result 混合消息，工具块位于原始 content 数组的非零下标；再加入超过 8
+**步骤**：生成带尾标记的 4515 字符消息及嵌套工具字段，分别使用 output_content=preview/full、structured=preview/full 和
+auto/strict/off 导出加入
+thinking/text 与 tool_use/tool_result 混合消息，工具块位于原始 content 数组的非零下标；再加入超过 8
 MiB 的合法正文和能触发 20,000 条或 16 MiB 上限的消息，在排序与写入间模拟来源追加、替换、截短、取消和写入失败
 
-**预期**：preview 保持原有截断，full 正文完整且脱敏，structured 独立选择结构输出；混合消息按选中工具块的实际类型导出，保留原始 block 下标，工具结果结构保留 content 字段；manifest 的 record_set_complete、content_complete、unexported_range 与实际文件一致容量停止保留上一条完整 JSONL，来源变化、取消或写入失败时不发布半成品，旧 bundle 保留，权限保持私有
+**预期**：preview 保持原有截断，full 正文完整且脱敏，structured 独立选择结构输出；混合消息按选中工具块的实际类型导出，保留原始
+block 下标，工具结果结构保留 content 字段；manifest 的
+record_set_complete、content_complete、unexported_range 与实际文件一致容量停止保留上一条完整 JSONL，来源变化、取消或写入失败时不发布半成品，旧
+bundle 保留，权限保持私有
 
 ## 4. get（获取完整消息）
 
@@ -475,15 +577,17 @@ MiB 的合法正文和能触发 20,000 条或 16 MiB 上限的消息，在排序
 ### get-02a: range 与敏感值交集
 
 **步骤**：fixture 正文使用
-`前缀 password=fixture_secret 后缀`按原始 Unicode 字符位置分别读取完整 secret、左侧部分、右侧部分和字段名不在 range 内的 secret，再用 strict 模式重复；其中一组结果写入
+`前缀 password=fixture_secret 后缀`按原始 Unicode 字符位置分别读取完整 secret、左侧部分、右侧部分和字段名不在 range 内的
+secret，再用 strict 模式重复；其中一组结果写入
 `output`
 
-**预期**：auto 和 strict 的每个相交 range 只返回脱敏标记，不出现 secret 的任何局部字符；range 前后的普通字符按原始坐标保留；导出正文和 manifest 使用同一结果，manifest 的
+**预期**：auto 和 strict 的每个相交 range 只返回脱敏标记，不出现 secret 的任何局部字符；range 前后的普通字符按原始坐标保留；导出正文和
+manifest 使用同一结果，manifest 的
 `sample_kind="range"` 且 redaction count 非零
 
 ### get-02b: 合法空 range
 
-**步骤**：在敏感值内部、敏感值左右边缘、普通正文和 Unicode 字符处设置
+**步骤**：在敏感值内部、敏感值左右两侧边缘、普通正文和 Unicode 字符处设置
 `start=end`，分别读取 content、tool_input、record 视图及超过 8
 MiB 的记录，再导出一组结果，对起点等于原文长度、超出长度和反向范围分别请求
 
@@ -518,6 +622,11 @@ MiB 的记录，再导出一组结果，对起点等于原文长度、超出长�
 
 **预期**：1 通过；2、3 被拒绝；canonicalize 防止 symlink escape
 
+**目录复用对照**：分别以 `tmp:`、`cwd:` 显式文件名导出，再把返回的带点导出目录原样用于 `output`，设置 `overwrite=true`
+并选择较短的 range
+同时验证绝对目录、对应前缀相对目录和带末尾分隔符的目录写法，正文与 manifest 仍发布到同一目录，内容符合所选
+range；普通新文件名仍按文件处理
+
 ### get-07: TooLarge 直接给 head/tail
 
 **步骤**：找一条 content_size > 100000 的消息，运行 `history_get(ref="<ref>")`
@@ -548,7 +657,11 @@ MiB 的 progress/system、file-history-snapshot 根对象，包含没有消息�
 `password`、无凭证标记和中文 emoji 通过公开 MCP `history_get(view="record")` 和 CLI `get --view record`
 分别执行 auto、strict、off、Unicode range 与完整 output，再验证 `block`、非法 view、非对象根值和默认 content/tool 视图
 
-**预期**：record 返回规范化、按所选模式脱敏的整条原对象，原 type、内部结构与无凭证标记保留；auto/strict 遮蔽嵌套秘密，off 只用于自有无效凭证并保留原对象 range 使用脱敏前规范化文本的 Unicode 字符位置，与敏感值任何部分相交都返回完整脱敏标记，不泄露后缀；输出 manifest 为 v2、view=record、complete=true，字节数与文件一致，目录与文件保持私有权限 record 不接受 block，非法 view 与非对象根值明确拒绝，不单独生成图片文件；默认正文与工具块视图行为保持，不把原内部对象计为普通消息或业务完成证据
+**预期**：record 返回规范化、按所选模式脱敏的整条原对象，原 type、内部结构与无凭证标记保留；auto/strict 遮蔽嵌套秘密，off
+只用于自有无效凭证并保留原对象 range 使用脱敏前规范化文本的 Unicode
+字符位置，与敏感值任何部分相交都返回完整脱敏标记，不泄露后缀；输出 manifest 为
+v2、view=record、complete=true，字节数与文件一致，目录与文件保持私有权限 record 不接受 block，非法 view
+与非对象根值明确拒绝，不单独生成图片文件；默认正文与工具块视图行为保持，不把原内部对象计为普通消息或业务完成证据
 
 ---
 
@@ -801,39 +914,50 @@ search 跳过并报告坏行；scan 的详细位置与合法后缀按 scan-07 �
 tool_result，使用第 31714 行及第 100002 行作 ref，分别调用 context/trace，传入
 `before=0, after=1, types="user", subtypes="tool_result", max_content=1500, max_total=3500`
 
-**预期**：两种工具均返回锚点及下一条匹配的 tool_result，不因会话总消息数报错；trace 使用跨度内未显示的 tool_use 关联结果，敏感字段保持脱敏，完整紧凑 JSON 不超过 3500
+**预期**：两种工具均返回锚点及下一条匹配的 tool_result，不因会话总消息数报错；trace 使用跨度内未显示的 tool_use
+关联结果，敏感字段保持脱敏，完整紧凑 JSON 不超过 3500
 UTF-8 字节
 
 ### history-boundary-05：稀疏匹配和范围边界
 
-**步骤**：构造超过 5000 条消息的 fixture，使匹配项之间包含超过 2000 条非匹配消息；分别测试 before/after 的零值、缺省值、稀疏匹配、无后续匹配，以及 until_type 双向最近边界和无边界；对 until_ref 测试相同端点、双向端点、跨 session、非法 ref、缺失端点和有效但跨度超限的端点
+**步骤**：构造超过 5000 条消息的 fixture，使匹配项之间包含超过 2000 条非匹配消息；分别测试 before/after
+的零值、缺省值、稀疏匹配、无后续匹配，以及 until_type 双向最近边界和无边界；对
+until_ref 测试相同端点、双向端点、跨 session、非法 ref、缺失端点和有效但跨度超限的端点
 
 **预期**：before/after 联合匹配 type、subtype 与脱敏后的 pattern，锚点始终包含；已经超出保留窗口的必要匹配项仍报
-`session_window_limit`，不能被当作不存在后续没有匹配时不把非匹配尾部计入最终窗口，后来出现匹配且选定跨度超限时才报错 until_type 不将锚点自身作为边界，无边界只选锚点；until_ref 包含两端，缺失报
+`session_window_limit`，不能被当作不存在后续没有匹配时不把非匹配尾部计入最终窗口，后来出现匹配且选定跨度超限时才报错
+until_type 不将锚点自身作为边界，无边界只选锚点；until_ref 包含两端，缺失报
 `ref_not_found`，非法或跨 session 报 `ref_invalid`
 context 两项计数均缺省时扩展到 EOF，仅指定 before 时 after 为零；trace 计数模式缺省前后各 20 条
 
 ### history-boundary-06：窗口容量、读取诊断和导出
 
 **步骤**：分别选择跨度为 2000/2001 条的窗口，以及原始 JSONL 字节数（含换行）恰为 32
-MiB/多一字节的窗口；在锚点之前和已满足范围之后放置坏行与超大行，再模拟索引和正文读取之间文件截短、所选行损坏或类型变化；按反向 ref 范围导出，并用过滤条件仅保留锚点
+MiB/多一个字节的窗口；在锚点之前和已满足范围之后放置坏行与超大行，再模拟索引和正文读取之间文件截短、所选行损坏或类型变化；按反向
+ref 范围导出，并用过滤条件仅保留锚点
 
-**预期**：恰好达到容量上限时成功，超限明确报错；诊断保留已扫描前缀的错误计数，不统计未扫描后缀；文件变化明确失败，不返回部分成功导出正文中的锚点标记、消息数、脱敏内容与响应一致，manifest 的行数和完整性与实际选定范围一致
+**预期**：恰好达到容量上限时成功，超限明确报错；诊断保留已扫描前缀的错误计数，不统计未扫描后缀；文件变化明确失败，不返回部分成功导出正文中的锚点标记、消息数、脱敏内容与响应一致，manifest
+的行数和完整性与实际选定范围一致
 
 ### history-output-01：唯一目录、覆盖和失败恢复
 
 **步骤**：同一 `output="tmp:mcp-history-test/export"` 连续导出两次，再对第一次的目录使用 `overwrite=true`；尝试覆盖没有
 `.mcp-history-bundle` 归属标记的目录执行 `get.rs`
-中的中断恢复测试，分别模拟旧目录已移到备份、新目录已发布、目录被更改，以及其他进程的恢复记录未满 30 秒、已满 30 秒但进程仍在运行、已满 30 秒且进程已退出Windows 上使用无共享权限的目录句柄占用旧目录后再尝试覆盖
+中的中断恢复测试，分别模拟旧目录已移到备份、新目录已发布、目录被更改，以及其他进程的恢复记录未满 30 秒、已满 30 秒但进程仍在运行、已满
+30 秒且进程已退出Windows 上使用无共享权限的目录句柄占用旧目录后再尝试覆盖
 
-**预期**：默认两次导出返回不同目录，正文与 manifest 位于同一目录；只有已标记目录允许显式覆盖被占用或权限不足时返回错误，旧目录可用，不混用新旧文件；中断后再次覆盖会恢复旧目录或确认新目录并清理旧备份，其他进程的恢复记录未满 30 秒或原进程仍在运行时返回
+**预期**：默认两次导出返回不同目录，正文与 manifest
+位于同一目录；只有已标记目录允许显式覆盖被占用或权限不足时返回错误，旧目录可用，不混用新旧文件；中断后再次覆盖会恢复旧目录或确认新目录并清理旧备份，其他进程的恢复记录未满
+30 秒或原进程仍在运行时返回
 `output_busy`；状态无法确认时返回 `output_restore_failed`，原目录和备份均保留
 
 Windows runner 同时执行
-`export_bundle_publishes_together_and_requires_explicit_overwrite`、`export_sync_failure_preserves_existing_bundle_and_removes_staging`
+`export_bundle_publishes_together_and_requires_explicit_overwrite`、
+`export_sync_failure_preserves_existing_bundle_and_removes_staging`
 与中断恢复测试，覆盖正常发布、覆盖、缺失暂存 manifest 和同步错误
 
-**预期**：同步现有文件时句柄具备写权限，同步过程保留原内容并要求文件已经存在，失败继续向调用方返回错误，未发布的暂存目录被清理，原 bundle 保持完整；目录同步只按对应平台合同执行
+**预期**：同步现有文件时句柄具备写权限，同步过程保留原内容并要求文件已经存在，失败继续向调用方返回错误，未发布的暂存目录被清理，原
+bundle 保持完整；目录同步只按对应平台合同执行
 
 ### history-output-02：Windows 原生路径和 DACL
 
@@ -841,17 +965,23 @@ Windows runner 同时执行
 
 **步骤**：以现存盘符、UNC 与 extended
 UNC 路径查询同一项目，对大小写别名和多个项目匹配同一路径的 fixture 分别测试逐个尝试
-`tmp:sample:stream.txt`、`tmp:CON.txt`、尾随空格或点号、控制字符、非法符号路径为受控空文件添加显式 Everyone 读取 ACE，再设置私有 DACL 并检查该 ACE 已删除；对不存在的路径设置 DACL 并检查报错创建目录、含空格正文文件和 manifest 后检查 DACL
+`tmp:sample:stream.txt`、`tmp:CON.txt`、尾随空格或点号、控制字符、非法符号路径为受控空文件添加显式 Everyone 读取 ACE，再设置私有
+DACL 并检查该 ACE 已删除；对不存在的路径设置
+DACL 并检查报错创建目录、含空格正文文件和 manifest 后检查 DACL
 
 **预期**：路径别名指向同一项目；歧义明确返回
 `project_ambiguous`非法输出路径被拒绝且不产生文件；私有 DACL 限定当前用户和系统必需主体，无法创建或验证时返回
 `privacy_not_enforced_on_windows`，不把 POSIX mode 当作验证证据
 
-通过 Bash 和原生 PowerShell 分别执行 `cargo test --locked utils::tests::windows_private -- --nocapture` 与 `cargo test --locked get::tests::`，每条命令均须成功
+通过 Bash 和原生 PowerShell 分别执行 `cargo test --locked utils::tests::windows_private -- --nocapture` 与
+`cargo test --locked get::tests::`，每条命令均须成功
 
 使用独立临时 fixture，对目录和文件分别设置当前用户、SYSTEM、Administrators 和内置 Users 组 owner，读取实际 owner 后调用权限函数
 
-**预期**：当前用户、SYSTEM 和 Administrators owner 均可设置私有 DACL，owner 保持原值，DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，显式 Everyone ACE 被删除；Users 组 owner 返回 `privacy_not_enforced_on_windows`，错误包含该 SID，owner、DACL 和正文保持原样，可信 owner 集合不作为 DACL 授权集合
+**预期**：当前用户、SYSTEM 和 Administrators
+owner 均可设置私有 DACL，owner 保持原值，DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，显式 Everyone
+ACE 被删除；Users 组 owner 返回
+`privacy_not_enforced_on_windows`，错误包含该 SID，owner、DACL 和正文保持原样，可信 owner 集合不作为 DACL 授权集合
 
 测试仅修改自建临时对象，原生 owner 设置失败须报告 fixture 失败，不能记为通过或以模拟值替代
 
@@ -865,7 +995,8 @@ schema，并传入旧值 `none`、`raw`
 
 ### history-output-04：临时会话自动清理范围
 
-**步骤**：在独立测试根目录中创建带新归属标记的已退出进程会话和运行中进程会话，再创建旧版标记目录与无标记目录；先按当前时间执行清理，再用超过 24 小时的测试时钟执行清理Linux 和 Windows
+**步骤**：在独立测试根目录中创建带新归属标记的已退出进程会话和运行中进程会话，再创建旧版标记目录与无标记目录；先按当前时间执行清理，再用超过
+24 小时的测试时钟执行清理Linux 和 Windows
 runner 都执行 `get.rs` 的对应单元测试
 
 **预期**：只有超过 24 小时且原进程已退出的新标记会话被清理；运行中的会话、未到期会话、旧版标记目录和无标记目录均保留`tmp:`
@@ -888,40 +1019,52 @@ runner 都执行 `get.rs` 的对应单元测试
 ### scan-02: 空批次、低预算与最近页重放
 
 **步骤**：使用跨多个 16
-KiB 缓冲的记录，在低 scan_bytes 下查询无命中和远处命中把响应预算降低到单条记录无法容纳，再按错误中的 next_query 恢复；重复最近成功请求，再改变其预算和冻结筛选
+KiB 缓冲的记录，在低 scan_bytes 下查询无命中和远处命中把响应预算降低到单条记录无法容纳，再按错误中的 next_query
+恢复；重复最近成功请求，再改变其预算和冻结筛选
 
-**预期**：空批次有可推进的 cursor，不能按空结果宣告结束；预算拒绝保留记录和当前页，不跳过、不重复最近成功页按原预算原样重放，累计数不重复增加；不同重放预算、冻结筛选和旧 cursor 明确拒绝 scan_bytes 统计索引与投影等处理读取，不要求等于文件唯一字节数
+**预期**：空批次有可推进的 cursor，不能按空结果宣告结束；预算拒绝保留记录和当前页，不跳过、不重复最近成功页按原预算原样重放，累计数不重复增加；不同重放预算、冻结筛选和旧
+cursor 明确拒绝 scan_bytes
+统计索引与投影等处理读取，不要求等于文件唯一字节数
 
 ### scan-03: 快照、取消、释放与实例
 
 **步骤**：扫描期间分别追加后缀、截短、替换来源；用另一个 MCP 实例消费原 cursor 在持续处理的大记录上发送 SDK
 RequestOptions.signal 取消，再读取同一 scan_id 的 metadata 显式 release 未完成扫描，检查停止后线程、读取和 CPU 状态；执行过期状态测试
 
-**预期**：追加后缀不计入冻结快照，截短、替换和检测到的来源变化明确失败，跨实例拒绝取消和 release 实际终止工作，取消后扫描状态不可续用，不删除旧数据或用户导出；过期状态明确拒绝，不返回假成功
+**预期**：追加后缀不计入冻结快照，截短、替换和检测到的来源变化明确失败，跨实例拒绝取消和 release
+实际终止工作，取消后扫描状态不可续用，不删除旧数据或用户导出；过期状态明确拒绝，不返回假成功
 
 ### scan-04: metadata 全维度分页
 
 **步骤**：完成含多个 project/session/tool 桶、warning 和未知 tool_use_id 的扫描，用较小 limit/max_total 逐页消费 metadata
 next_query 核对所有 files、filters、summary、issues 与 warnings，分别在完成前、失败后与 release 后调用
 
-**预期**：完成前返回 scan_in_progress，完成或失败后稳定分页，每项包含 kind/value，各维度 total=returned+omitted 累加各页 returned 得到维度 total，完整 files 清单与实际扫描一致，缺口和归因有真实 source/ref/reason
+**预期**：完成前返回 scan_in_progress，完成或失败后稳定分页，每项包含 kind/value，各维度 total=returned+omitted 累加各页
+returned 得到维度 total，完整 files
+清单与实际扫描一致，缺口和归因有真实 source/ref/reason
 scan_complete、counts_exact、attribution_complete 分开报告，未知关联不得按顺序猜配；释放后 cursor 不可用
 
 ### scan-05: 超大记录与大窗口
 
 **步骤**：使用超过 8
-MiB 的合法 tool_result，前一条为对应 tool_use，后一条为普通消息把匹配词放在远处，秘密跨多个缓冲边界；验证 scan、get 的原 Unicode
+MiB 的合法 tool_result，前一条为对应 tool_use，后一条为普通消息把匹配词放在远处，秘密跨多个缓冲边界；验证 scan、get 的原
+Unicode
 range、tool_input/tool_result
 view，以及 source 指定的 context/trace 锚点对多个工具块分别使用原始 content 数组 block 下标，并读取导出正文与 manifest
 
-**预期**：大记录在完整逻辑正文上匹配，有界预览不泄漏秘密或改变匹配集合相交 range 返回脱敏标记，结构视图与原块一致，context/trace 保留前后位置和真实工具关联，完整结果可通过 get/output 恢复合法大行不再被 get/context/trace 当作缺失，窗口消息数与原始字节容量仍有效，格式损坏与资源配额明确报告
+**预期**：大记录在完整逻辑正文上匹配，有界预览不泄漏秘密或改变匹配集合相交 range 返回脱敏标记，结构视图与原块一致，context/trace
+保留前后位置和真实工具关联，完整结果可通过 get/output 恢复合法大行不再被
+get/context/trace 当作缺失，窗口消息数与原始字节容量仍有效，格式损坏与资源配额明确报告
 
 ### scan-06: 来源歧义、布局与安全边界
 
-**步骤**：在直接 subagent 和 Workflow 目录各建同名 agent 文件，先按短 ref 查询，再使用 search/metadata 返回的 source 调用 get/context/trace 与 CLI
+**步骤**：在直接 subagent 和 Workflow 目录各建同名 agent 文件，先按短 ref 查询，再使用 search/metadata 返回的 source 调用
+get/context/trace 与 CLI
 --source 增加未知布局、root 外路径、ref/project 不匹配和受支持布局内的链接，Windows 条件下增加 reparse/junction 与同长度替换文件
 
-**预期**：未指定 source 时明确返回 session_ambiguous，指定真实 source 时三种读取入口选中同一物理文件父 ID 不自动展开，journal 不进入来源；越界、不匹配、链接和不支持布局不能被 source 参数用作任意文件读取通道 Windows 条件结果独立记录，Linux 验证不能替代 Windows 原生证据
+**预期**：未指定 source 时明确返回 session_ambiguous，指定真实 source 时三种读取入口选中同一物理文件父 ID 不自动展开，journal
+不进入来源；越界、不匹配、链接和不支持布局不能被 source
+参数用作任意文件读取通道 Windows 条件结果独立记录，Linux 验证不能替代 Windows 原生证据
 
 ### scan-07: 损坏记录的实际位置与合法后缀
 
@@ -929,7 +1072,9 @@ view，以及 source 指定的 context/trace 锚点对多个工具块分别使�
 JSON、非法 UTF-8 的超大记录和合法消息原样消费 scan
 next_query 至结束，再读取全部 metadata；另用资源超限记录检查非解析错误
 
-**预期**：前后合法消息均按真实物理行返回，四条坏记录计入 invalid_records，metadata 的 issue 含真实 source/ref/line 和解析原因 scan_complete=true、counts_exact=false，不把坏行计为已经完整检查；非解析错误仍明确失败，保留已有恢复参数与来源坐标
+**预期**：前后合法消息均按真实物理行返回，四条坏记录计入 invalid_records，metadata 的 issue 含真实 source/ref/line 和解析原因
+scan_complete=true、
+counts_exact=false，不把坏行计为已经完整检查；非解析错误仍明确失败，保留已有恢复参数与来源坐标
 
 ### scan-07a: 内部 API 缓存记录
 
@@ -944,18 +1089,26 @@ MiB 产生缺口，其他坏记录仍产生可定位诊断，缺字段的对话�
 
 ### scan-08: 大小记录的结构预览与严格脱敏恢复
 
-**步骤**：普通和超大 tool_input/tool_result 含相同工具、时间筛选、长秘密、Unicode 与私有 URL，分别查询 structured=preview 和 full 原样执行 preview 或拒绝响应中的 get 指针，普通 full 预算拒绝按 next_query 恢复；允许处理中先返回可推进空页
+**步骤**：普通和超大 tool_input/tool_result 含相同工具、时间筛选、长秘密、Unicode 与私有 URL，分别查询 structured=preview 和
+full 原样执行 preview 或拒绝响应中的
+get 指针，普通 full 预算拒绝按 next_query 恢复；允许处理中先返回可推进空页
 
 **预期**：大小记录的 matched_filters 一致，get 指针保留 redaction=strict 和精确 source/view/block
-original_bytes 等于恢复的完整脱敏 JSON 的 UTF-8 字节数，preview 使用字符上限且不泄漏秘密，full 不自动转换为 preview 超大 full 无法容纳时错误保留位置与 get 指针，正常预算续查保留未消费记录，不重复或跳过
+original_bytes 等于恢复的完整脱敏 JSON 的 UTF-8 字节数，preview 使用字符上限且不泄漏秘密，full 不自动转换为 preview 超大
+full 无法容纳时错误保留位置与 get 指针，
+正常预算续查保留未消费记录，不重复或跳过
 
 ### scan-09: 长字段候选与原始范围
 
 **步骤**：在超过 8 MiB 的合法消息正文中加入超过 4
-KiB 的普通和敏感字段名，覆盖无引号、单引号、双引号、Unicode、嵌套 JSON 转义及无效字符串转义将敏感词放在缓冲边界两侧，分别使用末尾 key、中间 key 和末尾 pwd，保留远处匹配词与合法后缀通过 scan、get 原始 Unicode
+KiB 的普通和敏感字段名，覆盖无引号、单引号、双引号、Unicode、嵌套 JSON 转义及无效字符串转义将敏感词放在缓冲边界两侧，分别使用末尾
+key、中间 key 和末尾 pwd，保留远处匹配词与合法后缀通过 scan、get 原始
+Unicode
 range、source 指定的 context/trace 验证，并与普通记录的完整脱敏结果比较；另用真正超长 JSON 对象键及来源读取错误检查边界
 
-**预期**：长正文中的字段候选不触发字段长度拒绝，敏感值仍脱敏，普通字段及中间 key 不被误替换，pwd 只匹配完整字段名无效字符串转义按原始字段文本判定，读取或取消错误不被当作转义失败忽略；有脱敏替换时沿用正文头部预览，远处匹配记录仍返回原 Unicode
+**预期**：长正文中的字段候选不触发字段长度拒绝，敏感值仍脱敏，普通字段及中间 key 不被误替换，pwd
+只匹配完整字段名无效字符串转义按原始字段文本判定，读取或取消错误不被当作转义失败忽略；有脱敏替换时沿用正文头部预览，
+远处匹配记录仍返回原 Unicode
 range 与前后消息位置保持，真正 JSON 对象键仍受每键 4 KiB 解码后 UTF-8 索引限制
 
 ### scan-10: metadata 配额诊断
@@ -963,35 +1116,126 @@ range 与前后消息位置保持，真正 JSON 对象键仍受每键 4 KiB 解�
 **步骤**：使用自有来源清单分别触发枚举阶段和记录阶段的 metadata 配额，检查错误后完整消费 metadata_query，再 release
 
 **预期**：scan_metadata_quota 保留 32
-MiB 上限，返回 metadata_bytes_used、requested_bytes、max_metadata_bytes、remaining_bytes、files_enumerated 和 scan_phase 占用与剩余配额满足上限，申请量大于剩余额度，拒绝不改变已记账占用；字节数为配额记账值，不是进程 RSS 失败 metadata 保留已枚举来源与实际处理状态，未完成来源不标成 complete，release 后 cursor 不可用，已有导出和其他临时资料保留
+MiB 上限，返回 metadata_bytes_used、requested_bytes、max_metadata_bytes、remaining_bytes、files_enumerated 和 scan_phase
+占用与剩余配额满足上限，申请量大于剩余额度，拒绝不改变已记账占用；字节数为配额记账值，不是进程 RSS 失败 metadata
+保留已枚举来源与实际处理状态，未完成来源不标成 complete，release 后 cursor 不可用，
+已有导出和其他临时资料保留
 
 ### scan-11: 精确来源选择与续查
 
 **步骤**：在隔离 fixture 中建立两个同名 agent 来源，先验证不带 source 时拒绝，再逐一带 source 调用 normal、scan 和 CLI
 `--source`
-使用 limit=1 与低响应预算连续消费 next_query，读取全部 metadata 并 release；尝试改变冻结 source 分别使用相对路径、历史根外路径、未知布局、链接、项目或会话不匹配，以及未启用 subagents 的子会话来源核对公开 schema 与正常有效筛选、matched_filters、next_query 和扫描 filters 中的 source
+使用 limit=1 与低响应预算连续消费 next_query，读取全部 metadata 并 release；尝试改变冻结 source
+分别使用相对路径、历史根外路径、未知布局、链接、项目或会话不匹配，以及未启用 subagents
+的子会话来源核对公开 schema 与正常有效筛选、matched_filters、next_query 和扫描 filters 中的 source
 
-**预期**：每次只返回指定物理文件，metadata 的 files_total=1，续查保留 source，冻结来源变更返回 cursor_filter_mismatch 省略项目时采用来源所在项目，显式项目与会话范围取交集，所有不合法来源明确拒绝未指定 source 的同名会话仍拒绝，32
+**预期**：每次只返回指定物理文件，metadata 的 files_total=1，续查保留 source，冻结来源变更返回 cursor_filter_mismatch
+省略项目时采用来源所在项目，显式项目与会话范围取交集，
+所有不合法来源明确拒绝未指定 source 的同名会话仍拒绝，32
 MiB 配额和来源根归属检查保持，失败扫描状态可 release
 
 ---
 
 ### sources-01: 冻结目录、分组与生命周期
 
-**步骤**：在自有临时目录生成 30,000 个长路径来源，使旧 scan metadata 记账超过 32
-MiB，执行 sources_catalog_exceeds_old_metadata_scope_without_buffering_paths 的 ignored 资源回归用 MCP
-sources 模式逐页消费 items 与 scan_query，测试 limit、字节预算、最近页重放、冻结条件变更、跨实例、sources/source 互斥、项目和 session 交集及同 ID 物理来源核对 128
+**步骤**：在自有临时目录生成 65,000 个长路径来源，使旧 scan metadata 记账超过 32
+MiB，执行 sources_catalog_exceeds_old_metadata_scope_without_buffering_paths 的 ignored 资源回归；省略 limit 使用默认 128 条来源页，记录首轮枚举与首个 128 条页面耗时，再消费完整目录；直接 scan 完成后逐页核对全部 coverage，来源、session 和 project 无遗漏或重复，记录 metadata 内存记账与目录字节数，保持 32 MiB 诊断上限，用 MCP
+sources 模式逐页消费 items 与 scan_query，测试 limit、字节预算、最近页重放、冻结条件变更、跨实例、sources/source 互斥、项目和
+session 交集及同 ID 物理来源核对 128
 MiB 总存储、32
 MiB 内存记账、20 分钟空闲 TTL 与访问续期，覆盖 release、取消、失败和正常退出清理；强制终止残留仅在所属进程退出且过期后清理
 
-**预期**：来源页并集无重复或遗漏，枚举与正文进度独立，每组不超过 128 个来源，正文在分组开始时冻结预算拒绝不消费目录项，配额拒绝不发布半成品，改变冻结条件或使用其他实例 cursor 明确报错，自有清单按生命周期清理
+**预期**：来源页并集无重复或遗漏，枚举与正文进度独立，每组不超过 128 个来源，正文在分组开始时冻结预算拒绝不消费目录项，配额拒绝不发布半成品，改变冻结条件或使用其他实例
+cursor 明确报错，自有清单按生命周期清理
+
+### broad-pattern: 跨项目、子会话与近期文件名 pattern
+
+**步骤**：执行 `broad_normal_and_scan_preserve_filename_pattern_and_recent_date_filters`，在四个项目的主会话、普通子会话及 workflow 子会话中放置合成缓存、旧日期命中、近期文件名命中与非命中消息，通过公开 MCP history_search 分别消费 normal 和 scan 的全部页，再消费 metadata
+执行 `raw_record_parser_preserves_null_missing_unknown_and_duplicate_fields`，与原 Value 解析结果比较缺字段、null、重复字段、未知字段和损坏 JSON；显式执行 ignored 的 `raw_record_parser_phase_measurement` 记录相同合成缓存的解析对照
+
+**预期**：两种模式均返回全部 12 个物理来源的近期正文命中，文件名 pattern 不充当来源过滤；扫描完整性、物理行号与时间、类型筛选保持，未知缓存仍跳过，非法记录继续报告诊断，输出 `query_ms` 和解析耗时只作为合成环境测量
 
 ### sources-02: 公开 grouped CLI 失败边界
 
 **步骤**：执行 search --mode scan --grouped
---project=<fixture>，完整消费 kind=sources/body/metadata 与 group；分别模拟初始来源配额失败、已经返回正文后的来源变动及写 stdout 失败
+--project=<fixture>，完整消费 kind=sources/body/metadata 与 group；分别模拟初始来源配额失败、已经返回正文后的来源变动及写
+stdout 失败
 
-**预期**：同一进程完成目录、正文、metadata 和 release，成功来源无遗漏或重复仅初始枚举且尚未返回正文的配额失败能够缩小分组，其他失败退出非零，报告已输出页数、条数、失败来源与未消费分组，保留正文消费边界
+**预期**：同一进程完成目录、正文、metadata 和
+release，成功来源无遗漏或重复仅初始枚举且尚未返回正文的配额失败能够缩小分组，其他失败退出非零，报告已输出页数、条数、失败来源与未消费分组，保留正文消费边界
+
+### repair-paths: 绝对路径与真实链接语义
+
+**步骤**：隔离 HOME、CWD、TMPDIR，用合成历史通过 CLI get 和 MCP history_get 导出目录及显式文件，分别传入允许根下的
+`missing/../../escape`、`missing/../inside`、普通绝对路径、`tmp:` 和 `cwd:` 路径，链接可用时加入指向嵌套目录的
+`link/../inside` 及外向链接
+
+**预期**：越界目录和文件路径在创建目录前返回 `invalid_output_dir`，合法父目录写法保留，返回路径与实际写入位置一致，`..`
+按已有链接的真实目标解释，相对父目录和外向链接仍拒绝，唯一 bundle、overwrite 归属及事务恢复用例继续适用
+
+### repair-authorization: 普通与 indexed 认证值
+
+**步骤**：使用合成 Basic、Bearer、自定义 scheme、Digest、AWS SigV2 和 AWS SigV4 认证值，对 Authorization 与
+Proxy-Authorization 覆盖整体引用值、凭证冒号、SignedHeaders 分号、带引号参数、空凭证、下一条 header 与后续诊断
+共享语料覆盖 0–3 层 JSON 编码，合法 JSON 字符串中的 Unicode 转义分别位于 header 名称首字及内部字符、Proxy 名称与连字符、冒号、scheme、参数名、空白、等号、逗号、分号和引号
+加入无 JSON 引号范围的字面转义、单层范围内的双反斜杠、正常字段和闭合引号作为负例
+将相同记录分别保持为普通行及填充至超过 8 MiB 的索引行，覆盖 normal/scan/context/trace
+对普通正文、Bash tool_use 和 tool_result，分别经公开 get 的 content、record、tool_input、tool_result、凭证内部 range
+和事务导出读取，对照 `auto`、`strict`、`off`
+
+**预期**：auto 和 strict 完整遮蔽 scheme 与凭证，整体引用值与带引号认证参数均无残留，后续 header 与诊断文本保留；普通和
+indexed 对照显式期待结果，凭证内部 range 仅返回一个标记，自定义 scheme 的冒号前后凭证分别检查，off 精确保留原文或原始范围
+导出正文与内联结果相同，manifest 的脱敏计数、原文字符数、输出字符数及字节数准确
+
+### repair-message-integrity: 普通与索引消息完整性
+
+**步骤**：对 user 和 assistant 创建缺少 `message`、`message:null`、`message:{}`、`message:{"content":""}` 四类合成记录
+物理行分别小于、等于和超过 8 MiB，在合成 HOME 中经公开 stdio MCP 读取 content 和 record
+使用 normal、scan、context、trace 比较缺字段诊断，保留合法空消息和合法后缀；context/trace 选定窗口保持在 32 MiB 内
+
+**预期**：缺少 `message` 的 content 读取均返回 `parse_error`，搜索和窗口读取报告解析缺口，scan metadata 保留 source/line
+null、空对象和空正文仍返回空字符串，record 仍能读取完整原对象及内部元数据，大小记录使用相同规则
+
+### repair-budget: 编码工作量与取消边界
+
+**步骤**：执行 `repair_h03_context_encoding_work_is_linear` 和
+`repair_h03_trace_encoding_work_is_linear_and_cancellable`，通过测试专用计数统计实际 JSON 编码字节，覆盖 2,000
+条消息、Unicode、转义、工具摘要和
+association
+issue；对真实导出分别在发布前取消、发布成功后取消
+
+**预期**：条目预算计算只编码每项一次，最终整体校验一次，编码累计字节受输入大小与最终响应大小的线性界限约束，完整响应满足
+max_total，锚点保留且工具摘要完整；发布前取消清理暂存并保留旧 bundle，发布后返回真实成功路径，
+下一次请求继续独立检查取消
+
+### repair-scan-errors: CLI 正文与辅助诊断
+
+**步骤**：用正文超出 max_total 的合成来源执行普通和 grouped CLI
+scan；再使前一组成功、当前组先返回部分正文后遇到预算错误，比较直接 MCP scan 的预算错误与同实例加大预算续查
+
+**预期**：CLI 主错误保持 `response_too_large`
+和 required_bytes，metadata 失败仅作为 metadata_error；保留 body_pages_returned、body_rows_returned、失败来源、当前
+group、completed_groups
+和未消费分组，退出码非零；清理后的 cursor 不作为续查参数返回，restart_query 从该组开头重新读取，MCP 存活实例的预算续查继续有效
+
+### repair-sources: 首次失败释放与既有 cursor 恢复
+
+**步骤**：通过公开 MCP
+sources 连续提交五次 limit=129 与 limit=0，再执行合法 limit=1；为首次调用设置不足的 max_total，已有目录续页也设置不足预算，随后调整预算并重放最近页，最后
+release
+
+**预期**：无效 limit 在枚举前拒绝且不占四个目录名额，首次响应失败释放新目录并报告 released=true；已有 cursor 的预算错误不消费项目，保留
+next_query 与 release_query，调整预算后继续，
+最近页重放、显式释放与 TTL 用例继续适用
+
+### sources-domain-error-and-commit
+
+**步骤**：在同一 ScanStore 和公开 MCP 实例中，依次请求不存在的项目、all/project 冲突和没有当前项目，随后执行合法 sources 和
+release
+测试错误详情原值为对象、数组、标量及 None；连续五次在首次页提交前取消，再分别在页提交完成后取消或到期，重放最近页并释放目录
+
+**预期**：原领域错误、候选列表和原详情保留，错误详情扩展不触发 panic，目录锁与后续合法请求仍可用
+提交前失败清理新清单且不占目录配额；提交后保留成功页、cursor 和 release_query，重放可用，释放后私有清单删除，下一次请求独立检查取消
 
 ## 附录 A：已知限制 / KNOWN-LIMIT
 

@@ -4,9 +4,10 @@ English | [中文](README_zh.md)
 
 A conversation history search tool for Claude Code
 
-Module version: 2.1.1
+Module version: 2.2.0
 
-This release fixes Windows history-file reads after path canonicalization, private export creation when started from PowerShell 7, and atomic publication of export bundles
+Session lists show custom titles alongside UUIDs. Large-history searches preserve exact match counts, filtering and
+pagination.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)
@@ -38,7 +39,9 @@ use the returned paths, completeness, byte counts, and redaction metadata.
 
 For context and trace, `max_total` limits the final compact JSON response in UTF-8 bytes, including metadata and trace
 `tool_calls`; JSON-RPC and MCP framing are excluded. Character counts or message-text lengths cannot substitute for this
-budget. A response that cannot retain the anchor and required metadata returns `response_too_large`.
+budget. A response that cannot retain the anchor and required metadata returns `response_too_large`. Budget reduction
+checks cancellation between items. Cancellation or timeout before export publication leaves the previous bundle intact;
+once publication succeeds, the response returns the published paths even if cancellation arrives afterward.
 
 A date-only `until=YYYY-MM-DD` is an exclusive boundary at 00:00 UTC on the next day, so it includes the requested date
 in full. `today` uses the UTC calendar. RFC3339 `until` remains inclusive at the specified instant.
@@ -129,51 +132,55 @@ case-insensitive. If several projects resolve to that path, the call returns `pr
 | `project`   | string | current | Project ID                                    |
 | `redaction` | string | auto    | `auto`, `strict`, or `off` for session topics |
 
-Session topics are redacted before their 100-character preview is created. The response includes aggregate `redaction`
-metadata and `topic_redacted_count` when a session topic had replacements.
+Each session keeps its UUID in `id` and its first user topic in `topic`. Optional `title` is the last nonblank `custom-title` name from the session, so a name such as `HDMap_3` can be mapped to that UUID. Sessions without a custom name omit `title`.
+
+Titles and topics are redacted before their 100-character preview is created. The response includes aggregate `redaction` metadata, plus `title_redacted_count` or `topic_redacted_count` when that field had replacements.
 
 ### history_search
 
-| Parameter                 | Type     | Default                | Description                                                      |
-| ------------------------- | -------- | ---------------------- | ---------------------------------------------------------------- |
-| `mode`                    | string   | normal                 | `normal`, incremental `scan`, or paged `sources`                 |
-| `cursor`                  | string   | -                      | Use the returned scan `next_query`                               |
-| `scan_bytes`              | number   | 16777216               | Per-batch processing budget, 16384 to 268435456 bytes            |
-| `scan_ms`                 | number   | 1000                   | Per-batch active-time budget, 10 to 10000 ms                     |
-| `structured`              | string   | mode-dependent         | `full` in normal, `preview` in scan; explicit choice is retained |
-| `pattern`                 | string   | ""                     | Search pattern; empty returns all                                |
-| `project`                 | string   | current                | Project IDs, comma-separated                                     |
-| `all`                     | boolean  | false                  | Search all projects                                              |
-| `sessions`                | string   | -                      | Session IDs, comma-separated                                     |
-| `sources`                 | string[] | -                      | Up to 128 exact sources, mutually exclusive with `source`        |
-| `output_content`          | string   | preview                | Export body `preview` or `full`, independent from `structured`   |
-| `release`                 | boolean  | false                  | Release a sources catalog using its cursor                       |
-| `source`                  | string   | -                      | Exact physical source returned by search or scan metadata        |
-| `since`                   | string   | -                      | RFC3339 instant, UTC date, or `today` (inclusive)                |
-| `until`                   | string   | -                      | RFC3339 instant (inclusive), UTC date, or `today`                |
-| `types`                   | string   | assistant,user,summary | Message types, comma-separated                                   |
-| `subtypes`                | string   | -                      | Message subtypes, comma-separated                                |
-| `servers`                 | string   | -                      | MCP server filter, comma-separated                               |
-| `tools`                   | string   | -                      | MCP tool filter, comma-separated                                 |
-| `lines`                   | string   | -                      | Line ranges, e.g. 100-200, !300-400                              |
-| `regex`                   | boolean  | false                  | Use regex                                                        |
-| `case_sensitive`          | boolean  | false                  | Use case-sensitive matching                                      |
-| `subagents`               | boolean  | false                  | Include sidechain and remote-agent transcripts                   |
-| `summary`                 | boolean  | false                  | Include grouped counts in `stats.summary`                        |
-| `aggregate`               | boolean  | false                  | Return grouped counts without result rows                        |
-| `dry_run`                 | boolean  | false                  | Preview selected files without reading content                   |
-| `failed_tool_results`     | boolean  | false                  | Require harness-level `is_error=true`                            |
-| `tool_payload_errors`     | boolean  | false                  | Require an error in the tool JSON payload                        |
-| `output`                  | string   | -                      | Export result bundle; relative paths use temp storage            |
-| `overwrite`               | boolean  | false                  | Replace an existing owned export bundle                          |
-| `output_format`           | string   | jsonl                  | `jsonl`                                                          |
-| `redaction`               | string   | auto                   | `auto`, `strict`, or `off`                                       |
-| `offset`                  | number   | 0                      | Skip N results; incompatible with `slice`                        |
-| `limit`                   | number   | -                      | Max results; incompatible with `slice`                           |
-| `slice`                   | string   | -                      | Slice messages after filtering and sorting                       |
-| `max_content`             | number   | 4000                   | Regular preview limit (1 to 1,000,000)                           |
-| `max_content_tool_result` | number   | 500                    | Tool-result preview limit (1 to 1,000,000)                       |
-| `max_total`               | number   | 40000                  | Compact response limit (512 to 10,000,000 bytes)                 |
+| Parameter                 | Type     | Default                | Description                                       |
+| ------------------------- | -------- | ---------------------- | ------------------------------------------------- |
+| `mode`                    | string   | normal                 | `normal`, incremental `scan`, or paged `sources`  |
+| `cursor`                  | string   | -                      | Use the returned scan `next_query`                |
+| `scan_bytes`              | number   | 16777216               | Batch bytes, 16384 to 268435456                   |
+| `scan_ms`                 | number   | 1000                   | Per-batch active-time budget, 10 to 10000 ms      |
+| `structured`              | string   | mode-dependent         | normal: `full`; scan: `preview`; explicit kept    |
+| `pattern`                 | string   | ""                     | Search pattern; empty returns all                 |
+| `project`                 | string   | current                | Project IDs, comma-separated                      |
+| `all`                     | boolean  | false                  | Search all projects                               |
+| `sessions`                | string   | -                      | Session IDs, comma-separated                      |
+| `sources`                 | string[] | -                      | Up to 128 exact paths; excludes `source`          |
+| `output_content`          | string   | preview                | `preview` or `full`; independent of `structured`  |
+| `release`                 | boolean  | false                  | Release a sources catalog using its cursor        |
+| `source`                  | string   | -                      | Exact path from search or scan metadata           |
+| `since`                   | string   | -                      | RFC3339 instant, UTC date, or `today` (inclusive) |
+| `until`                   | string   | -                      | RFC3339 (inclusive), UTC date, or `today`         |
+| `types`                   | string   | assistant,user,summary | Message types, comma-separated                    |
+| `subtypes`                | string   | -                      | Message subtypes, comma-separated                 |
+| `servers`                 | string   | -                      | MCP server filter, comma-separated                |
+| `tools`                   | string   | -                      | MCP tool filter, comma-separated                  |
+| `lines`                   | string   | -                      | Line ranges, e.g. 100-200, !300-400               |
+| `regex`                   | boolean  | false                  | Use regex                                         |
+| `case_sensitive`          | boolean  | false                  | Use case-sensitive matching                       |
+| `subagents`               | boolean  | false                  | Include sidechain and remote-agent transcripts    |
+| `summary`                 | boolean  | false                  | Include grouped counts in `stats.summary`         |
+| `aggregate`               | boolean  | false                  | Return grouped counts without result rows         |
+| `dry_run`                 | boolean  | false                  | Preview selected files without reading content    |
+| `failed_tool_results`     | boolean  | false                  | Require harness-level `is_error=true`             |
+| `tool_payload_errors`     | boolean  | false                  | Require an error in the tool JSON payload         |
+| `output`                  | string   | -                      | Export bundle; relative paths use temp storage    |
+| `overwrite`               | boolean  | false                  | Replace an existing owned export bundle           |
+| `output_format`           | string   | jsonl                  | `jsonl`                                           |
+| `redaction`               | string   | auto                   | `auto`, `strict`, or `off`                        |
+| `offset`                  | number   | 0                      | Skip N results; incompatible with `slice`         |
+| `limit`                   | number   | -                      | Max results; incompatible with `slice`            |
+| `slice`                   | string   | -                      | Slice messages after filtering and sorting        |
+| `max_content`             | number   | 4000                   | Regular preview limit (1 to 1,000,000)            |
+| `max_content_tool_result` | number   | 500                    | Tool-result preview limit (1 to 1,000,000)        |
+| `max_total`               | number   | 40000                  | Compact response bytes, 512 to 10,000,000         |
+
+Without `project` or `all`, search uses the current project. `sessions` filters that selected project scope; use
+`all=true` to find sessions across projects, or set `project` explicitly. `all=true` and `project` are mutually exclusive.
 
 `subagents=false` (the default) searches only main JSONL files. `true` includes direct agent files under
 `<session>/subagents/`, `<session>/remote-agents/`, and the known nested layout
@@ -192,8 +199,9 @@ the current history root are accepted. Relative paths, paths outside that root, 
 Default `types` includes `summary`, which means context-compression summaries are searchable. Use `types=assistant,user`
 when you only want original conversation turns. Valid types are `assistant`, `user`, `summary`, `system`, and `other`.
 Valid subtypes are `human`, `tool_result`, `meta`, `text`, `tool_use`, `thinking`, `empty`, `summary`, `system`, and
-`other`. `types=user,subtypes=human` selects ordinary user-shaped records. It is a classification heuristic, not proof
-that a person authored the message. A known subtype supplied through `types` is accepted for compatibility and moved to
+`other`. `types=user,subtypes=human` selects ordinary user-shaped records; the author's identity remains unverified.
+Read custom session names through the `title` field returned by `history_sessions`. A known subtype supplied through
+`types` is accepted for compatibility and moved to
 `subtypes`; unknown types and subtypes return `invalid_arguments`.
 
 `failed_tool_results` keeps the old harness-level meaning and only checks `tool_result.is_error`; `tool_payload_errors`
@@ -233,28 +241,42 @@ unattempted suffix, and the two lists do not overlap. Keyword hits are in `resul
 content and lists the planned files instead of actual scan coverage.
 
 Search output uses `redaction=auto` by default for message content, `tool_use` previews, and structured tool fields.
-`auto` covers Authorization headers plus common password, token, cookie, API key, secret, private key, and key path
-fields, including the `SSHPASS` password environment variable. `strict` also redacts private key blocks, private host
+`auto` covers Authorization and Proxy-Authorization headers plus common password, token, cookie, API key, secret,
+private key, and key path fields, including the `SSHPASS` password environment variable. `strict` also redacts private
+key blocks, private host
 names, and URLs. `off` returns raw content and records `enabled=false` in the manifest. Redacted results include
 `redacted=true` and `raw_available=true`; export manifests include redaction metadata. JSON field names are interpreted
 using their decoded string value, including Unicode escapes and embedded escaped JSON. Literal backslashes in a field
 name are not repeatedly decoded. Replacements keep original value positions and leave nonsensitive text and formatting
-unchanged.
+unchanged. Both authorization headers cover Basic, Bearer, Digest, custom schemes, AWS SigV2 and AWS SigV4, including
+fully quoted values, quoted parameters, opaque credentials containing colons in custom schemes, and semicolons in
+SignedHeaders. Inside each JSON string scope, header names and colons, scheme
+names, parameter names and separators use decoded characters, including Unicode escapes. Literal escapes outside a
+JSON string and double backslashes within one scope remain literal; decoding follows the actual enclosing scopes.
+Plain text and JSON-encoded
+tool strings retain trailing diagnostic text, the next header and later JSON fields. Normal and indexed records use the
+same boundaries; ranges
+overlapping a credential return one redaction marker.
+
+Complete JSON message bodies remain valid JSON after redaction, including JSON embedded in tool-result text. Sensitive numbers, booleans, nulls and strings become JSON string markers; nonsensitive values keep their original types. Ranges still use the original character offsets, and `off` preserves the original text.
 
 Auto and strict also redact complete npm access tokens: lowercase `npm_` followed by exactly 36 ASCII alphanumeric
 characters, with Unicode word boundaries on both sides. This includes standalone values and separately quoted command
-arguments in text, structured tool fields, record views, and exports. Shorter or longer values and surrounding
+arguments in text, structured tool fields, record views, and exports, including values after escaped newlines, carriage
+returns and tabs. Shorter or longer values and surrounding
 identifiers retain their existing behavior; `off` preserves the original value.
 
 Command lines redact the values of `--password`, `--http-password`, `--ftp-password`, and `--proxy-password` with
 whitespace or `=` separators, including quoted values and escaped JSON. The complete argument is redacted, including
 adjacent quoted and unquoted parts and escaped spaces. Enclosing JSON string boundaries and empty values leave later
-fields unchanged. User names and nonsensitive arguments remain visible; `off` preserves the original command.
+fields unchanged. Usernames and nonsensitive arguments remain visible; `off` preserves the original command.
 
 Auto and strict redact UUID values in compact token-return statements such as
 `token created, returned a new UUID <value>` and `令牌创建成功，返回新 UUID <value>`. The token label and return clause
 must be on the same line, with no more than 256 intervening characters; separate JSON fields and line breaks do not form
-one statement. Only the UUID value is replaced. Ordinary session, ref, and operation identifiers remain visible; `off`
+one statement. A statement may start after a newline, carriage return, or tab, including their escaped forms in
+serialized
+tool fields. Only the UUID value is replaced. Ordinary session, ref, and operation identifiers remain visible; `off`
 preserves the original text.
 
 For unquoted assignment names and named arguments, a bounded RHS scan preserves complete calls, attribute chains,
@@ -280,8 +302,9 @@ outputs receive a unique suffix; explicit file names such as `results.jsonl` bec
 `results.export-<unique>/results.jsonl` by default. With `overwrite=true`, the stable destination is
 `results.export/results.jsonl`. To replace a unique file export, pass its returned content path as `output` with
 `overwrite=true`. `output.results` for search, `output.content` for the other tools, `output.manifest`, and
-`output_path` where provided give the actual paths. To replace an existing owned export directory, set `overwrite=true`
-(CLI: `--overwrite`); unrelated directories cannot be replaced. Files are staged beside the destination before
+`output_path` where provided give the actual paths. To replace an existing owned export directory, pass that directory
+as `output` and set `overwrite=true` (CLI: `--overwrite`), including when its name contains dots; unrelated directories
+cannot be replaced. Files are staged beside the destination before
 publication. An interrupted replacement is recovered on the next `overwrite=true` request. Recovery from another process
 requires a record older than 30 seconds and confirmation that the publishing process has exited; otherwise it returns
 `output_busy`. If publication did not finish, the previous bundle is restored. A verified new bundle is kept and its
@@ -291,14 +314,16 @@ or verification failures return `privacy_not_enforced_on_windows`. On MCP startu
 sessions older than 24 hours are removed only when their ownership marker matches and their process has exited. Legacy
 directories, unmarked directories, and `cwd:` output are preserved. Successful `tmp:` exports include the cleanup
 condition in `output.retention`; `cwd:` exports omit that field. Each temporary session is limited to 256 entries and
-128 MiB.
+128 MiB. Absolute output paths must resolve inside the current working directory or the controlled temporary session.
+Existing symlink targets are resolved before `..`, including paths with missing final directories. Relative paths
+continue to reject `..` components.
 
 Before publication, existing content and manifest files are synchronized without creating or truncating them. Windows
 file synchronization uses a writable handle. A synchronization failure returns an error before replacing an existing
 bundle and removes the unpublished staging directory.
 
-On Windows, export paths may be owned by the current user, SYSTEM, or Administrators. The owner remains unchanged;
-the protected DACL grants only the current user FullControl Allow, with no inherited entries. Other owners are rejected
+On Windows, export paths may be owned by the current user, SYSTEM, or Administrators. The owner remains unchanged; the
+protected DACL grants only the current user FullControl Allow, with no inherited entries. Other owners are rejected
 before changing the DACL, and the error includes the owner SID.
 
 Exported search rows use the same filtering, timestamp ordering, and de-duplication as inline results, subject to a
@@ -325,8 +350,11 @@ included. The response reports `serialized_bytes`, `max_total_bytes`, `limits_ap
 #### Normal response budgets
 
 Normal search retains timestamp ordering, UUID de-duplication, regex, and slice. Collection stops at 50,000 matches or
-32 MiB of cached results and reports the gap; use scan to traverse the full source set. Rust regex does not support
-look-around or backreferences.
+32 MiB of cached results and reports the gap. Each request has a 120-second execution deadline. `limit` bounds returned
+rows; matching still examines the selected sources. Use scan for incremental progress through the full source set.
+Rust regex does not support look-around or backreferences. Normal search and scan validate complete JSON while leaving ignored cache payloads and
+unknown envelope fields unmaterialized. Filename patterns still match message content, with unchanged date, type,
+association, and redaction rules; they do not select source paths. Use `source` for an exact physical file.
 
 Metadata reduced by `max_total` is listed in `stats.metadata_dimensions`, keyed by fields such as
 `coverage.searched_files` and `summary.by_tool`. Each affected dimension reports `total`, `returned`, and `omitted`; a
@@ -358,7 +386,14 @@ Use `history_search(mode="sources", ...)` to freeze and page supported source pa
 returned `release_query` when finished. Sources are stored in private disk manifests, capped at 128 MiB total per
 instance; retained catalog state is capped at 32 MiB, with at most four catalogs. Access renews a 20-minute idle TTL.
 Release, expiration, enumeration failure, and normal process exit remove manifests. After a forced exit, a later catalog
-request removes expired owned manifests only after confirming the owner process has exited.
+request removes expired owned manifests only after confirming the owner process has exited. Invalid limits are rejected
+before source enumeration. A failed first page releases its new catalog; retry the initial filters with a corrected
+budget. Budget errors on existing cursors preserve their continuation and do not consume source items. Project-selection
+errors retain their domain code and candidate list, and the same server accepts a corrected request.
+
+Cancellation or expiry before a page commits releases a newly created catalog. After commit, late cancellation or expiry
+keeps the successful page, its continuation and release query. Replaying the last page and releasing its catalog remain
+available; later requests check their own cancellation and deadline.
 
 `sources` selects up to 128 exact paths in normal or scan mode and is mutually exclusive with `source`. Project,
 session, and subagent conditions intersect this list. Explicit source groups may contain same-ID physical files. A scan
@@ -367,8 +402,11 @@ freezes file bytes when that group starts; separate groups are not one globally 
 `search --mode sources` prints catalog pages. `search --mode scan --grouped` consumes each catalog group, all body
 pages, and all metadata pages in the same process. Its NDJSON adds `kind=sources|body|metadata` and `group`. An initial
 enumeration metadata-quota error may divide a group before any body rows have returned. Other failures report returned
-page/row counts, the failed group, queued unconsumed groups, and the remaining catalog query; they exit nonzero and do
-not replay a partly consumed group. CLI cursors remain process-local.
+page/row counts, the failed group, and queued unconsumed groups; they exit nonzero and do not replay a partly consumed
+group. The body error remains primary, with metadata failures under `metadata_error`. CLI cleanup releases process-local
+cursors, so errors provide `restart_query` and `restart_sources_query` instead of expired continuation credentials.
+`restart_query` starts that group's body again, including previously returned rows; `restart_sources_query` starts
+source enumeration again. `required_bytes` remains available for budget errors.
 
 #### Incremental scan
 
@@ -392,11 +430,15 @@ Normal search and indexed scans skip internal metadata, including `api-request-b
 UUID. These records remain readable with `history_get(view="record")`. Malformed JSON, invalid UTF-8, and incomplete
 conversation messages still produce diagnostics.
 
+Frozen source names are stored in a private catalog, capped at 128 MiB per scan, instead of duplicating long paths in
+metadata memory. Coverage pages restore every project, session, and source unchanged. The 32 MiB diagnostic metadata
+quota remains active. Catalogs are removed when the scan is released, expires, is canceled, or the process exits normally.
+
 Cursors belong to the running MCP instance. Repeating the most recently successful request with the same budgets replays
 its response. Changed replay budgets, frozen filters, stale cursors, and another instance return explicit errors. A
 record that cannot fit is retained, and `response_too_large.available.next_query` points to the unconsumed page. The
 instance retains at most four scans; idle scans expire after 20 minutes and metadata is limited to 32 MiB per scan.
-Release state when finished. Cancellation stops reads and CPU work; a cancelled scan releases its cursor state. A
+Release state when finished. Cancellation stops reads and CPU work; a canceled scan releases its cursor state. A
 `scan_metadata_quota` error reports `metadata_bytes_used`, `requested_bytes`, `max_metadata_bytes`, `remaining_bytes`,
 `files_enumerated`, and `scan_phase`. The byte values describe quota accounting, not process RSS. Reduce the query by
 project or session, read the failed scan's metadata, and release its state; the 32 MiB limit remains in force.
@@ -415,7 +457,7 @@ metadata pages. Identify result pages by `results` and metadata pages by `items`
 | `max_total` | number  | 40000    | Compact UTF-8 JSON budget, 512 to 10000000 bytes        |
 | `release`   | boolean | false    | Stop and release scan state; incompatible with `cursor` |
 
-Metadata pagination is stable after the scan completes or fails. Before then it returns `scan_in_progress`. Each item
+Metadata pagination is stable after the scan completes or fails. Before then, it returns `scan_in_progress`. Each item
 has `kind` and `value`; `dimensions` reports the total, returned, and omitted item counts for every dimension. Follow
 metadata `next_query` until `has_more=false`, then call with `scan_id` and `release=true`. Release does not remove user
 exports.
@@ -450,7 +492,8 @@ that selected view. Oversized JSONL records are indexed before rendering the ran
 original record types and internal payloads that the default content view does not display, even when message metadata
 is absent. It does not preserve source whitespace or key order, accept `block`, or extract image files. Range offsets
 refer to the normalized object before redaction; source boundaries, output quotas, and private export permissions remain
-unchanged. Default content and tool views keep their existing behavior.
+unchanged. Content and tool views require complete message records at every size. User or assistant records missing
+`message` return `parse_error`; `message:null`, `message:{}`, and an empty content string remain valid.
 
 Search results and preview get pointers include `source`. If a ref selects several physical files, the reference readers
 return `session_ambiguous` with candidate sources. Pass a returned source unchanged to get, context, or trace, or use
@@ -486,10 +529,13 @@ The anchor message (specified by `ref`) is always included. `before`/`after` cou
 
 Local context and trace queries support sessions with more than 100,000 messages. Limits apply to the selected span: all
 valid messages in that span, including those hidden by display filters, count toward the 2,000-message and 32 MiB
-limits. Exceeding either returns `session_window_limit` or `session_window_memory_limit`, respectively. Diagnostics
-cover the scanned prefix only; an unread suffix is not checked. Valid `.jsonl` session metadata records are ignored
-without warnings; malformed JSON and incomplete message records produce warnings. Valid oversized records use the shared
-index and retain message positions and tool pairing.
+limits. Exceeding either returns `session_window_limit` or `session_window_memory_limit`, respectively. When matching
+messages are separated by many hidden records, even a small `before`/`after` count can exceed the span limit. Use a nearby
+`until_ref` to bound the span, or `history_search` to retrieve matching messages. Diagnostics cover the scanned prefix
+only; an unread suffix is not checked. Valid `.jsonl` session metadata records are ignored
+without warnings; malformed JSON and incomplete message records produce warnings. User or assistant records with UUID,
+type and timestamp but no `message` field count as incomplete. Valid oversized records use the shared index and retain
+message positions and tool pairing.
 
 `truncated=true` is returned when either a message exceeds `max_content` or the complete UTF-8 JSON response exceeds
 `max_total`. If even the anchor and metadata cannot fit, the call returns `response_too_large`.
