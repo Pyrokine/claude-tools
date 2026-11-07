@@ -2,11 +2,39 @@ import { createHash } from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import type { SFTPWrapper, Stats } from 'ssh2'
-import type { RemotePathStyle } from './types.js'
-import { remoteJoin } from './remote-platform.js'
 import { formatFileMode } from './file-mode.js'
 import type { OpenSshConnection } from './openssh.js'
+import { remoteJoin } from './remote-platform.js'
+import { withSftpOperationTimeout } from './sftp-timeout.js'
 import { escapeShellArg } from './tools/utils.js'
+import type { RemotePathStyle } from './types.js'
+
+export type DirectoryVerificationControl = { deadline: number; signal: AbortSignal }
+
+export function remainingVerificationTimeout(control: DirectoryVerificationControl): number {
+    if (control.signal.aborted) {
+        throw control.signal.reason
+    }
+    const remaining = control.deadline - Date.now()
+    if (remaining <= 0) {
+        throw new Error('directory verification exhausted the sync operation timeout')
+    }
+    return remaining
+}
+
+async function withDirectoryVerificationBudget<T>(
+    action: () => Promise<T>,
+    control?: DirectoryVerificationControl,
+    cancel?: () => void
+): Promise<T> {
+    if (!control) {
+        return action()
+    }
+    const timeout = remainingVerificationTimeout(control)
+    const result = await withSftpOperationTimeout(action(), timeout, () => cancel?.(), control.signal)
+    remainingVerificationTimeout(control)
+    return result
+}
 
 export const DIRECTORY_VERIFY_MAX_ENTRIES = 50_000
 export const DIRECTORY_VERIFY_MAX_MISMATCHES = 20
@@ -50,9 +78,15 @@ export type DirectoryManifest = {
     unsupportedSamples: string[]
 }
 
-function rootHash(entries: ManifestEntry[]): string {
+function rootHash(entries: ManifestEntry[], control?: DirectoryVerificationControl): string {
+    if (control) {
+        remainingVerificationTimeout(control)
+    }
     const hash = createHash('sha256')
-    for (const entry of [...entries].sort((a, b) => a.path.localeCompare(b.path))) {
+    for (const entry of [...entries].sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)))) {
+        if (control) {
+            remainingVerificationTimeout(control)
+        }
         hash.update(
             JSON.stringify({
                 path: entry.path,
@@ -66,28 +100,57 @@ function rootHash(entries: ManifestEntry[]): string {
     return hash.digest('hex')
 }
 
-async function hashFile(filePath: string, size: number, maxBytes: number): Promise<string> {
-    const hash = createHash('sha256')
-    let readBytes = 0
-    for await (const chunk of fs.createReadStream(filePath)) {
-        readBytes += Buffer.byteLength(chunk)
-        if (readBytes > maxBytes) {
-            throw new Error('local file grew beyond directory manifest hash budget')
-        }
-        hash.update(chunk)
+async function hashFile(
+    filePath: string,
+    size: number,
+    maxBytes: number,
+    control?: DirectoryVerificationControl
+): Promise<string> {
+    if (control) {
+        remainingVerificationTimeout(control)
     }
-    if (readBytes !== size) {
-        throw new Error('local file changed during manifest hashing')
+    const stream = fs.createReadStream(filePath)
+    try {
+        return await withDirectoryVerificationBudget(
+            async () => {
+                const hash = createHash('sha256')
+                let readBytes = 0
+                for await (const chunk of stream) {
+                    readBytes += Buffer.byteLength(chunk)
+                    if (readBytes > maxBytes) {
+                        throw new Error('local file grew beyond directory manifest hash budget')
+                    }
+                    hash.update(chunk)
+                }
+                if (readBytes !== size) {
+                    throw new Error('local file changed during manifest hashing')
+                }
+                return hash.digest('hex')
+            },
+            control,
+            () => {
+                stream.destroy()
+            }
+        )
+    } finally {
+        stream.destroy()
     }
-    return hash.digest('hex')
 }
 
-export function matchesDirectoryExclude(relativePath: string, patterns: string[] | undefined): boolean {
+export function matchesDirectoryExclude(
+    relativePath: string,
+    patterns: string[] | undefined,
+    isDirectory: boolean = false
+): boolean {
     const normalizedPath = relativePath.replace(/^\.\//, '').replace(/^\//, '')
     const basename = path.posix.basename(normalizedPath)
     return Boolean(
         patterns?.some((pattern) => {
-            const normalizedPattern = pattern.replace(/^\//, '')
+            const directoryOnly = pattern.endsWith('/')
+            if (directoryOnly && !isDirectory) {
+                return false
+            }
+            const normalizedPattern = pattern.replace(/^\//, '').replace(/\/$/, '')
             const candidate = normalizedPattern.includes('/') ? normalizedPath : basename
             const matches = new Uint8Array(candidate.length + 1)
             matches[0] = 1
@@ -122,7 +185,8 @@ export async function createLocalDirectoryManifest(
     rootPath: string,
     request: DirectoryVerifyRequest,
     exclude?: string[],
-    followSymlinks: boolean = false
+    followSymlinks: boolean = false,
+    control?: DirectoryVerificationControl
 ): Promise<DirectoryManifest> {
     const maxEntries = Math.min(request.maxEntries ?? 10_000, DIRECTORY_VERIFY_MAX_ENTRIES)
     const maxFileBytes = Math.min(
@@ -133,7 +197,7 @@ export async function createLocalDirectoryManifest(
         request.maxTotalBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_TOTAL_BYTES,
         DIRECTORY_VERIFY_MAX_TOTAL_BYTES
     )
-    const rootStats = await fs.promises.stat(rootPath)
+    const rootStats = await withDirectoryVerificationBudget(() => fs.promises.stat(rootPath), control)
     if (!rootStats.isDirectory()) {
         throw new Error(`directory verification root is not a directory: ${rootPath}`)
     }
@@ -154,29 +218,38 @@ export async function createLocalDirectoryManifest(
     let limitReason: DirectoryManifestLimitReason | undefined
 
     const visit = async (currentPath: string, relativeBase: string): Promise<void> => {
-        const realPath = await fs.promises.realpath(currentPath)
+        const realPath = await withDirectoryVerificationBudget(() => fs.promises.realpath(currentPath), control)
         if (activeDirectories.has(realPath)) {
             skippedSymlinks++
             return
         }
         activeDirectories.add(realPath)
         try {
-            for (const name of await fs.promises.readdir(currentPath)) {
+            for (const name of await withDirectoryVerificationBudget(() => fs.promises.readdir(currentPath), control)) {
+                if (control) {
+                    remainingVerificationTimeout(control)
+                }
                 const relativePath = relativeBase ? `${relativeBase}/${name}` : name
                 if (matchesDirectoryExclude(relativePath, exclude)) {
+                    continue
+                }
+                const fullPath = path.join(currentPath, name)
+                const linkStats = await withDirectoryVerificationBudget(() => fs.promises.lstat(fullPath), control)
+                const stats =
+                    linkStats.isSymbolicLink() && followSymlinks
+                        ? await withDirectoryVerificationBudget(() => fs.promises.stat(fullPath), control)
+                        : linkStats
+                if (matchesDirectoryExclude(relativePath, exclude, stats.isDirectory())) {
                     continue
                 }
                 if (entries.length >= maxEntries) {
                     limitReason = 'entries'
                     return
                 }
-                const fullPath = path.join(currentPath, name)
-                const linkStats = await fs.promises.lstat(fullPath)
                 if (linkStats.isSymbolicLink() && !followSymlinks) {
                     skippedSymlinks++
                     continue
                 }
-                const stats = linkStats.isSymbolicLink() ? await fs.promises.stat(fullPath) : linkStats
                 if (stats.isDirectory()) {
                     entries.push({
                         path: relativePath,
@@ -203,7 +276,8 @@ export async function createLocalDirectoryManifest(
                         sha256 = await hashFile(
                             fullPath,
                             stats.size,
-                            Math.min(maxFileBytes, maxTotalBytes - hashedBytes)
+                            Math.min(maxFileBytes, maxTotalBytes - hashedBytes),
+                            control
                         )
                         hashedBytes += stats.size
                     }
@@ -231,7 +305,7 @@ export async function createLocalDirectoryManifest(
     return {
         entries,
         count: entries.length,
-        rootSha256: rootHash(entries),
+        rootSha256: rootHash(entries, control),
         limited: limitReason !== undefined,
         limitReason,
         skippedSymlinks,
@@ -246,7 +320,8 @@ export async function createRemoteDirectoryManifest(
     request: DirectoryVerifyRequest,
     exclude?: string[],
     followSymlinks: boolean = false,
-    style: RemotePathStyle = 'posix'
+    style: RemotePathStyle = 'posix',
+    control?: DirectoryVerificationControl
 ): Promise<DirectoryManifest> {
     const maxEntries = Math.min(request.maxEntries ?? 10_000, DIRECTORY_VERIFY_MAX_ENTRIES)
     const maxFileBytes = Math.min(
@@ -259,13 +334,21 @@ export async function createRemoteDirectoryManifest(
     )
     const join = (parent: string, child: string): string => remoteJoin(style, parent, child)
     const stat = (remotePath: string): Promise<Stats> =>
-        new Promise((resolve, reject) => {
-            sftp.stat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
-        })
+        withDirectoryVerificationBudget(
+            () =>
+                new Promise((resolve, reject) => {
+                    sftp.stat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
+                }),
+            control
+        )
     const lstat = (remotePath: string): Promise<Stats> =>
-        new Promise((resolve, reject) => {
-            sftp.lstat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
-        })
+        withDirectoryVerificationBudget(
+            () =>
+                new Promise((resolve, reject) => {
+                    sftp.lstat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)))
+                }),
+            control
+        )
     const root = await stat(rootPath)
     if ((root.mode & 0o170000) !== 0o040000) {
         throw new Error('remote directory verification root is not a directory')
@@ -290,30 +373,42 @@ export async function createRemoteDirectoryManifest(
             limitReason = 'depth'
             return
         }
-        const resolved = await new Promise<string>((resolve, reject) => {
-            sftp.realpath(directory, (error, result) => (error ? reject(error) : resolve(result)))
-        })
+        const resolved = await withDirectoryVerificationBudget(
+            () =>
+                new Promise<string>((resolve, reject) => {
+                    sftp.realpath(directory, (error, result) => (error ? reject(error) : resolve(result)))
+                }),
+            control
+        )
         if (active.has(resolved)) {
             ++skippedSymlinks
             return
         }
         active.add(resolved)
-        const handle = await new Promise<Buffer>((resolve, reject) => {
-            sftp.opendir(directory, (error, result) => (error ? reject(error) : resolve(result)))
-        })
+        const handle = await withDirectoryVerificationBudget(
+            () =>
+                new Promise<Buffer>((resolve, reject) => {
+                    sftp.opendir(directory, (error, result) => (error ? reject(error) : resolve(result)))
+                }),
+            control
+        )
         try {
             while (!limitReason) {
-                const batch = await new Promise<Array<{ filename: string; attrs: Stats }> | null>((resolve, reject) => {
-                    sftp.readdir(handle, (error, list) => {
-                        if (error && (error as Error & { code?: number }).code === 1) {
-                            resolve(null)
-                        } else if (error) {
-                            reject(error)
-                        } else {
-                            resolve(list)
-                        }
-                    })
-                })
+                const batch = await withDirectoryVerificationBudget(
+                    () =>
+                        new Promise<Array<{ filename: string; attrs: Stats }> | null>((resolve, reject) => {
+                            sftp.readdir(handle, (error, list) => {
+                                if (error && (error as Error & { code?: number }).code === 1) {
+                                    resolve(null)
+                                } else if (error) {
+                                    reject(error)
+                                } else {
+                                    resolve(list)
+                                }
+                            })
+                        }),
+                    control
+                )
                 if (!batch) {
                     break
                 }
@@ -326,17 +421,20 @@ export async function createRemoteDirectoryManifest(
                     if (matchesDirectoryExclude(relativePath, exclude)) {
                         continue
                     }
+                    const fullPath = join(directory, name)
+                    const link = await lstat(fullPath)
+                    const stats = (link.mode & 0o170000) === 0o120000 && followSymlinks ? await stat(fullPath) : link
+                    if (matchesDirectoryExclude(relativePath, exclude, (stats.mode & 0o170000) === 0o040000)) {
+                        continue
+                    }
                     if (entries.length >= maxEntries) {
                         limitReason = 'entries'
                         break
                     }
-                    const fullPath = join(directory, name)
-                    const link = await lstat(fullPath)
                     if ((link.mode & 0o170000) === 0o120000 && !followSymlinks) {
                         ++skippedSymlinks
                         continue
                     }
-                    const stats = (link.mode & 0o170000) === 0o120000 ? await stat(fullPath) : link
                     if ((stats.mode & 0o170000) === 0o040000) {
                         entries.push(entry(relativePath, 'directory', stats))
                         await visit(fullPath, relativePath, depth + 1)
@@ -356,17 +454,33 @@ export async function createRemoteDirectoryManifest(
                             }
                             const digest = createHash('sha256')
                             let actualSize = 0
-                            for await (const chunk of sftp.createReadStream(fullPath)) {
-                                actualSize += Buffer.byteLength(chunk)
-                                if (actualSize > maxFileBytes) {
-                                    limitReason = 'file_bytes'
-                                    break
-                                }
-                                if (hashedBytes + actualSize > maxTotalBytes) {
-                                    limitReason = 'total_bytes'
-                                    break
-                                }
-                                digest.update(chunk)
+                            if (control) {
+                                remainingVerificationTimeout(control)
+                            }
+                            const stream = sftp.createReadStream(fullPath)
+                            try {
+                                await withDirectoryVerificationBudget(
+                                    async () => {
+                                        for await (const chunk of stream) {
+                                            actualSize += Buffer.byteLength(chunk)
+                                            if (actualSize > maxFileBytes) {
+                                                limitReason = 'file_bytes'
+                                                break
+                                            }
+                                            if (hashedBytes + actualSize > maxTotalBytes) {
+                                                limitReason = 'total_bytes'
+                                                break
+                                            }
+                                            digest.update(chunk)
+                                        }
+                                    },
+                                    control,
+                                    () => {
+                                        stream.destroy()
+                                    }
+                                )
+                            } finally {
+                                stream.destroy()
                             }
                             if (limitReason) {
                                 break
@@ -391,16 +505,22 @@ export async function createRemoteDirectoryManifest(
             }
         } finally {
             active.delete(resolved)
-            await new Promise<void>((resolve, reject) =>
-                sftp.close(handle, (error) => (error ? reject(error) : resolve()))
-            )
+            if (!control?.signal.aborted) {
+                await withDirectoryVerificationBudget(
+                    () =>
+                        new Promise<void>((resolve, reject) =>
+                            sftp.close(handle, (error) => (error ? reject(error) : resolve()))
+                        ),
+                    control
+                )
+            }
         }
     }
     await visit(rootPath, '', 0)
     return {
         entries,
         count: entries.length,
-        rootSha256: rootHash(entries),
+        rootSha256: rootHash(entries, control),
         limited: limitReason !== undefined,
         limitReason,
         skippedSymlinks,
@@ -415,12 +535,18 @@ export async function createOpenSshDirectoryManifest(
     request: DirectoryVerifyRequest,
     timeout: number,
     exclude?: string[],
-    followSymlinks: boolean = false
+    followSymlinks: boolean = false,
+    control?: DirectoryVerificationControl
 ): Promise<DirectoryManifest> {
-    const deadline = Date.now() + timeout
+    const deadline = Math.min(Date.now() + timeout, control?.deadline ?? Infinity)
     const remaining = (): number => {
+        if (control) {
+            remainingVerificationTimeout(control)
+        }
         const value = deadline - Date.now()
-        if (value <= 0) throw new Error('OpenSSH directory verification exhausted its timeout')
+        if (value <= 0) {
+            throw new Error('OpenSSH directory verification exhausted its timeout')
+        }
         return value
     }
     const maxEntries = Math.min(request.maxEntries ?? 10_000, DIRECTORY_VERIFY_MAX_ENTRIES)
@@ -433,7 +559,9 @@ export async function createOpenSshDirectoryManifest(
         DIRECTORY_VERIFY_MAX_TOTAL_BYTES
     )
     const rootBytes = await connection.capture(`realpath -ze -- ${escapeShellArg(rootPath)}`, remaining(), 64 * 1024)
-    if (rootBytes.at(-1) !== 0) throw new Error('OpenSSH realpath did not return a complete path')
+    if (rootBytes.at(-1) !== 0) {
+        throw new Error('OpenSSH realpath did not return a complete path')
+    }
     const root = new TextDecoder('utf8', { fatal: true }).decode(rootBytes.subarray(0, -1))
     if (((await connection.stat(root, remaining())).mode & 0o170000) !== 0o040000) {
         throw new Error('remote directory verification root is not a directory')
@@ -450,6 +578,7 @@ export async function createOpenSshDirectoryManifest(
     const limit = new Error('OpenSSH manifest resource limit reached')
     const decoder = new TextDecoder('utf8', { fatal: true, ignoreBOM: true })
     const consumeEntry = (): void => {
+        remaining()
         const [relative, kind, sizeText, modeText, owner, fullPath] = fields
         fields.length = 0
         const parts = relative.split('/')
@@ -458,9 +587,16 @@ export async function createOpenSshDirectoryManifest(
         }
         if (
             relative &&
-            parts.some((_part, index) => matchesDirectoryExclude(parts.slice(0, index + 1).join('/'), exclude))
-        )
+            parts.some((_part, index) =>
+                matchesDirectoryExclude(
+                    parts.slice(0, index + 1).join('/'),
+                    exclude,
+                    index < parts.length - 1 || kind === 'd'
+                )
+            )
+        ) {
             return
+        }
         if (relative && parts.length > 64) {
             limitReason = 'depth'
             throw limit
@@ -475,7 +611,9 @@ export async function createOpenSshDirectoryManifest(
         }
         if (kind !== 'f' && kind !== 'd') {
             ++skippedUnsupported
-            if (unsupportedSamples.length < 10) unsupportedSamples.push(relative)
+            if (unsupportedSamples.length < 10) {
+                unsupportedSamples.push(relative)
+            }
             return
         }
         const size = Number(sizeText)
@@ -500,7 +638,12 @@ export async function createOpenSshDirectoryManifest(
     const format = '%P\\0%y\\0%s\\0%m\\0%U\\0%p\\0'
     try {
         await connection.consume(
-            `LC_ALL=C find ${followSymlinks ? '-L' : '-P'} ${escapeShellArg(root)} -maxdepth 65 -printf ${escapeShellArg(format)}`,
+            'LC_ALL=C find ' +
+                `${followSymlinks ? '-L' : '-P'}` +
+                ' ' +
+                `${escapeShellArg(root)}` +
+                ' -maxdepth 65 -printf ' +
+                `${escapeShellArg(format)}`,
             (chunk) => {
                 metadataBytes += chunk.length
                 if (metadataBytes > metadataLimit) {
@@ -512,20 +655,30 @@ export async function createOpenSshDirectoryManifest(
                 while ((end = pending.indexOf(0)) >= 0) {
                     fields.push(decoder.decode(pending.subarray(0, end)))
                     pending = pending.subarray(end + 1)
-                    if (fields.length === 6) consumeEntry()
+                    if (fields.length === 6) {
+                        consumeEntry()
+                    }
                 }
-                if (pending.length > 64 * 1024) throw new Error('OpenSSH manifest field exceeded its byte budget')
+                if (pending.length > 64 * 1024) {
+                    throw new Error('OpenSSH manifest field exceeded its byte budget')
+                }
             },
             remaining()
         )
-        if (pending.length || fields.length) throw new Error('OpenSSH manifest ended with incomplete metadata')
+        if (pending.length || fields.length) {
+            throw new Error('OpenSSH manifest ended with incomplete metadata')
+        }
     } catch (error) {
-        if (error !== limit) throw error
+        if (error !== limit) {
+            throw error
+        }
     }
     if (!limitReason && request.sha256) {
         let hashedBytes = 0
         for (const entry of entries) {
-            if (entry.type !== 'file') continue
+            if (entry.type !== 'file') {
+                continue
+            }
             if (entry.size > maxFileBytes) {
                 limitReason = 'file_bytes'
                 break
@@ -547,7 +700,7 @@ export async function createOpenSshDirectoryManifest(
     return {
         entries,
         count: entries.length,
-        rootSha256: rootHash(entries),
+        rootSha256: rootHash(entries, control),
         limited: limitReason !== undefined,
         limitReason,
         skippedSymlinks,

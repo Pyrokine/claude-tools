@@ -4,9 +4,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { Readable, Writable } from 'node:stream'
+import { PassThrough, Readable, Writable } from 'node:stream'
 import test from 'node:test'
-import { Client } from 'ssh2'
+import ssh2, { Client } from 'ssh2'
+import { KnownHosts } from '../dist/known-hosts.js'
 
 import { classifyCommandRisk } from '../dist/command-risk.js'
 import { createRemoteDirectoryManifest } from '../dist/directory-verification.js'
@@ -40,6 +41,9 @@ import { registerPtyTools } from '../dist/tools/pty.js'
 import { expandTilde } from '../dist/tools/utils.js'
 import { checkWindowsAcl, windowsAclScript, windowsTemporaryPathScript } from '../dist/windows-acl.js'
 
+const fixtureHostKey = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public).getPublicSSH()
+const fixtureTrustFile = path.join(os.homedir(), '.ssh', `known_hosts-fixture-${process.pid}`)
+
 function fixture(t, getManager) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-windows-'))
     t.after(async () => {
@@ -61,9 +65,9 @@ function prepareCaseSensitiveDirectory(t, directory) {
             timeout: 5000,
         })
         if (result.error || result.status !== 0) {
-            t.skip(
-                `NTFS case-sensitive source directory unavailable: ${result.error?.message ?? (result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`)}`
-            )
+            const reason =
+                result.error?.message ?? (result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`)
+            t.skip(`NTFS case-sensitive source directory unavailable: ${reason}`)
             return false
         }
     }
@@ -821,60 +825,63 @@ test('S1/S2/S8: ssh_connect public arguments reach the session manager without c
     assert.equal(connectedConfig.rsyncExecutable, 'C:\\Program Files\\rsync.exe')
 })
 
-test('S3/S5/S7: public Windows tools reject privileges and POSIX verification before remote side effects', async (t) => {
-    const alias = 'win-public-negative'
-    let sshCalls = 0
-    let sftpCalls = 0
-    sessionManager.sessions.set(alias, {
-        client: {
-            exec() {
-                ++sshCalls
+test(
+    'S3/S5/S7: public Windows tools reject privileges and POSIX verification ' + 'before remote side effects',
+    async (t) => {
+        const alias = 'win-public-negative'
+        let sshCalls = 0
+        let sftpCalls = 0
+        sessionManager.sessions.set(alias, {
+            client: {
+                exec() {
+                    ++sshCalls
+                },
             },
-        },
-        config: { host: 'example.com', username: 'tester', remotePlatform: 'windows', commandShell: 'powershell' },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
-    const originalSftp = sessionManager.getSftp
-    sessionManager.getSftp = async () => {
-        ++sftpCalls
-        throw new Error('SFTP should not start')
-    }
-    t.after(() => {
-        sessionManager.getSftp = originalSftp
-        sessionManager.sessions.delete(alias)
-    })
-    const commands = tools(registerExecTools)
-    for (const [name, args] of [
-        ['ssh_exec_as_user', { command: 'whoami' }],
-        ['ssh_exec_sudo', { command: 'whoami' }],
-        ['ssh_exec', { command: 'whoami', runAs: 'other' }],
-    ]) {
-        const result = content(await commands.get(name).handler({ alias, ...args }))
-        assert.equal(result.details.code, 'unsupported_remote_platform')
-    }
-    const files = tools(registerFileTools)
-    const upload = content(
-        await files
-            .get('ssh_upload')
-            .handler({ alias, localPath: '/not-read', remotePath: 'C:\\test.txt', verifyMode: '0600' })
-    )
-    assert.equal(upload.code, 'unsupported_remote_platform')
-    const sync = content(
-        await files.get('ssh_sync').handler({
-            alias,
-            localPath: '/not-read',
-            remotePath: 'C:\\target',
-            direction: 'upload',
-            verify: { owner: true },
+            config: { host: 'example.com', username: 'tester', remotePlatform: 'windows', commandShell: 'powershell' },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
         })
-    )
-    assert.equal(sync.code, 'unsupported_remote_platform')
-    assert.deepEqual({ sshCalls, sftpCalls }, { sshCalls: 0, sftpCalls: 0 })
-})
+        const originalSftp = sessionManager.getSftp
+        sessionManager.getSftp = async () => {
+            ++sftpCalls
+            throw new Error('SFTP should not start')
+        }
+        t.after(() => {
+            sessionManager.getSftp = originalSftp
+            sessionManager.sessions.delete(alias)
+        })
+        const commands = tools(registerExecTools)
+        for (const [name, args] of [
+            ['ssh_exec_as_user', { command: 'whoami' }],
+            ['ssh_exec_sudo', { command: 'whoami' }],
+            ['ssh_exec', { command: 'whoami', runAs: 'other' }],
+        ]) {
+            const result = content(await commands.get(name).handler({ alias, ...args }))
+            assert.equal(result.details.code, 'unsupported_remote_platform')
+        }
+        const files = tools(registerFileTools)
+        const upload = content(
+            await files
+                .get('ssh_upload')
+                .handler({ alias, localPath: '/not-read', remotePath: 'C:\\test.txt', verifyMode: '0600' })
+        )
+        assert.equal(upload.code, 'unsupported_remote_platform')
+        const sync = content(
+            await files.get('ssh_sync').handler({
+                alias,
+                localPath: '/not-read',
+                remotePath: 'C:\\target',
+                direction: 'upload',
+                verify: { owner: true },
+            })
+        )
+        assert.equal(sync.code, 'unsupported_remote_platform')
+        assert.deepEqual({ sshCalls, sftpCalls }, { sshCalls: 0, sftpCalls: 0 })
+    }
+)
 
 test('S5/S9: public file reads map Windows SFTP paths and expose encoding and base64 bytes', async (t) => {
     const alias = 'win-public-read'
@@ -893,7 +900,7 @@ test('S5/S9: public file reads map Windows SFTP paths and expose encoding and ba
     sessionManager.getSftp = async () => ({
         stat(remotePath, callback) {
             requested.push(remotePath)
-            callback(null, { size: bytes.length })
+            callback(null, { size: bytes.length, mode: 0o100644 })
         },
         createReadStream(remotePath) {
             requested.push(remotePath)
@@ -997,6 +1004,8 @@ test('S4: Windows script writes content only after verified ACL, executes select
     assert.equal(Buffer.concat(bodies).toString(), '@chcp 65001>nul || exit /b 1\r\necho test')
 })
 
+
+
 test('S4: Windows script bodies preserve Unicode for PowerShell and switch cmd to UTF-8', (t) => {
     const psBody = windowsScriptContent(
         "if ([int][char]'中' -eq 20013) { 'ok' } else { throw 'encoding mismatch' }",
@@ -1066,61 +1075,75 @@ test('S4: remote script cleanup respects the caller timeout when SFTP stops resp
     assert.equal(closed, 1)
 })
 
-test('S8: an explicit Windows rsync profile maps remote drive paths and quotes the remote executable', async (t) => {
-    if (process.platform === 'win32') {
-        t.skip('POSIX fake executable fixture; Windows-native rsync needs Windows runner')
-        return
+test(
+    'S8: an explicit Windows rsync profile maps remote drive paths and quotes ' + 'the remote executable',
+    async (t) => {
+        if (process.platform === 'win32') {
+            t.skip('POSIX fake executable fixture; Windows-native rsync needs Windows runner')
+            return
+        }
+        const dir = fixture(t)
+        const bin = path.join(dir, 'bin')
+        fs.mkdirSync(bin)
+        const source = path.join(dir, 'source.txt')
+        const argsFile = path.join(dir, 'rsync-arguments.txt')
+        fs.writeFileSync(source, 'data')
+        fs.writeFileSync(path.join(bin, 'ssh'), '#!/bin/sh\nexit 0\n')
+        fs.writeFileSync(path.join(bin, 'rsync'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$MCP_TEST_RSYNC_ARGS"\n')
+        fs.chmodSync(path.join(bin, 'ssh'), 0o755)
+        fs.chmodSync(path.join(bin, 'rsync'), 0o755)
+        const oldPath = process.env.PATH
+        const oldArgs = process.env.MCP_TEST_RSYNC_ARGS
+        const originalExec = sessionManager.exec
+        const originalCapability = sessionManager.getExternalTransferCapability
+        process.env.PATH = `${bin}${path.delimiter}${oldPath ?? ''}`
+        process.env.MCP_TEST_RSYNC_ARGS = argsFile
+        sessionManager.exec = async () => ({
+            success: true,
+            stdout: 'C:\\Rsync Tools\\rsync.exe',
+            stderr: '',
+            exitCode: 0,
+        })
+        sessionManager.getExternalTransferCapability = () => ({
+            alias: 'windows-rsync',
+            host: 'example.com',
+            port: 22,
+            username: 'tester',
+            identity: 'tester@example.com:22',
+            authMethod: 'agent',
+            hasJumpHost: false,
+            routeSafeForOpenSsh: true,
+            rsyncEligible: true,
+            decisionReason: 'direct_ssh_agent_socket',
+            rsyncExecutable: 'C:\\Rsync Tools\\rsync.exe',
+            rsyncProfile: 'msys2',
+            commandShell: 'powershell',
+            remotePathStyle: 'win32',
+        })
+        t.after(() => {
+            sessionManager.exec = originalExec
+            sessionManager.getExternalTransferCapability = originalCapability
+            clearRsyncCache('windows-rsync')
+            if (oldPath === undefined) {
+                delete process.env.PATH
+            } else {
+                process.env.PATH = oldPath
+            }
+            if (oldArgs === undefined) {
+                delete process.env.MCP_TEST_RSYNC_ARGS
+            } else {
+                process.env.MCP_TEST_RSYNC_ARGS = oldArgs
+            }
+        })
+        const result = await syncFiles('windows-rsync', source, 'C:\\Remote Files\\target.txt', 'upload')
+        assert.equal(result.success, true)
+        assert.equal(result.selectedTransport, 'rsync')
+        const args = fs.readFileSync(argsFile, 'utf8').split('\n').filter(Boolean)
+        assert.ok(args.includes('--protect-args'))
+        assert.ok(args.some((arg) => arg.includes("--rsync-path=& 'C:\\Rsync Tools\\rsync.exe'")))
+        assert.ok(args.includes('tester@example.com:/c/Remote Files/target.txt'))
     }
-    const dir = fixture(t)
-    const bin = path.join(dir, 'bin')
-    fs.mkdirSync(bin)
-    const source = path.join(dir, 'source.txt')
-    const argsFile = path.join(dir, 'rsync-arguments.txt')
-    fs.writeFileSync(source, 'data')
-    fs.writeFileSync(path.join(bin, 'ssh'), '#!/bin/sh\nexit 0\n')
-    fs.writeFileSync(path.join(bin, 'rsync'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$MCP_TEST_RSYNC_ARGS"\n')
-    fs.chmodSync(path.join(bin, 'ssh'), 0o755)
-    fs.chmodSync(path.join(bin, 'rsync'), 0o755)
-    const oldPath = process.env.PATH
-    const oldArgs = process.env.MCP_TEST_RSYNC_ARGS
-    const originalExec = sessionManager.exec
-    const originalCapability = sessionManager.getExternalTransferCapability
-    process.env.PATH = `${bin}${path.delimiter}${oldPath ?? ''}`
-    process.env.MCP_TEST_RSYNC_ARGS = argsFile
-    sessionManager.exec = async () => ({ success: true, stdout: 'C:\\Rsync Tools\\rsync.exe', stderr: '', exitCode: 0 })
-    sessionManager.getExternalTransferCapability = () => ({
-        alias: 'windows-rsync',
-        host: 'example.com',
-        port: 22,
-        username: 'tester',
-        identity: 'tester@example.com:22',
-        authMethod: 'agent',
-        hasJumpHost: false,
-        routeSafeForOpenSsh: true,
-        rsyncEligible: true,
-        decisionReason: 'direct_ssh_agent_socket',
-        rsyncExecutable: 'C:\\Rsync Tools\\rsync.exe',
-        rsyncProfile: 'msys2',
-        commandShell: 'powershell',
-        remotePathStyle: 'win32',
-    })
-    t.after(() => {
-        sessionManager.exec = originalExec
-        sessionManager.getExternalTransferCapability = originalCapability
-        clearRsyncCache('windows-rsync')
-        if (oldPath === undefined) delete process.env.PATH
-        else process.env.PATH = oldPath
-        if (oldArgs === undefined) delete process.env.MCP_TEST_RSYNC_ARGS
-        else process.env.MCP_TEST_RSYNC_ARGS = oldArgs
-    })
-    const result = await syncFiles('windows-rsync', source, 'C:\\Remote Files\\target.txt', 'upload')
-    assert.equal(result.success, true)
-    assert.equal(result.selectedTransport, 'rsync')
-    const args = fs.readFileSync(argsFile, 'utf8').split('\n').filter(Boolean)
-    assert.ok(args.includes('--protect-args'))
-    assert.ok(args.some((arg) => arg.includes("--rsync-path=& 'C:\\Rsync Tools\\rsync.exe'")))
-    assert.ok(args.includes('tester@example.com:/c/Remote Files/target.txt'))
-})
+)
 
 test('S8: remote shell mismatch falls back before rsync transfers data', async (t) => {
     if (process.platform === 'win32') {
@@ -1185,8 +1208,11 @@ test('S8: remote shell mismatch falls back before rsync transfers data', async (
         sessionManager.getExternalTransferCapability = originalCapability
         sessionManager.getSftp = originalSftp
         clearRsyncCache('rsync-shell-mismatch')
-        if (oldPath === undefined) delete process.env.PATH
-        else process.env.PATH = oldPath
+        if (oldPath === undefined) {
+            delete process.env.PATH
+        } else {
+            process.env.PATH = oldPath
+        }
     })
     const result = await syncFiles('rsync-shell-mismatch', source, 'C:\\Remote\\item.txt', 'upload')
     assert.equal(result.success, true)
@@ -1242,75 +1268,78 @@ test('S10: public PTY raw output returns lossless base64 for invalid UTF-8 bytes
     assert.equal(raw.rawBufferTruncated, true)
 })
 
-test('S7: public directory sync verifies Windows ACL separately from POSIX metadata using SFTP manifest', async (t) => {
-    const dir = fixture(t)
-    const localPath = path.join(dir, 'empty')
-    fs.mkdirSync(localPath)
-    const alias = 'win-directory-acl'
-    const originalSftp = sessionManager.getSftp
-    const originalExec = sessionManager.exec
-    sessionManager.sessions.set(alias, {
-        client: {},
-        config: {
-            host: 'example.com',
-            username: 'tester',
-            password: 'test',
-            remotePlatform: 'windows',
-            commandShell: 'powershell',
-            remotePathStyle: 'win32',
-        },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
-    let manifestReads = 0
-    const sftp = {
-        stat(_remotePath, callback) {
-            callback(null, { size: 0, mode: 0o040755, uid: 0, gid: 0, mtime: 1, atime: 1 })
-        },
-        realpath(remotePath, callback) {
-            callback(null, remotePath)
-        },
-        opendir(_remotePath, callback) {
-            callback(null, Buffer.from('handle'))
-        },
-        readdir(_handle, callback) {
-            ++manifestReads
-            callback(Object.assign(new Error('EOF'), { code: 1 }))
-        },
-        close(_handle, callback) {
-            callback(null)
-        },
-        end() {},
+test(
+    'S7: public directory sync verifies Windows ACL separately from POSIX ' + 'metadata using SFTP manifest',
+    async (t) => {
+        const dir = fixture(t)
+        const localPath = path.join(dir, 'empty')
+        fs.mkdirSync(localPath)
+        const alias = 'win-directory-acl'
+        const originalSftp = sessionManager.getSftp
+        const originalExec = sessionManager.exec
+        sessionManager.sessions.set(alias, {
+            client: {},
+            config: {
+                host: 'example.com',
+                username: 'tester',
+                password: 'test',
+                remotePlatform: 'windows',
+                commandShell: 'powershell',
+                remotePathStyle: 'win32',
+            },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
+        })
+        let manifestReads = 0
+        const sftp = {
+            stat(_remotePath, callback) {
+                callback(null, { size: 0, mode: 0o040755, uid: 0, gid: 0, mtime: 1, atime: 1 })
+            },
+            realpath(remotePath, callback) {
+                callback(null, remotePath)
+            },
+            opendir(_remotePath, callback) {
+                callback(null, Buffer.from('handle'))
+            },
+            readdir(_handle, callback) {
+                ++manifestReads
+                callback(Object.assign(new Error('EOF'), { code: 1 }))
+            },
+            close(_handle, callback) {
+                callback(null)
+            },
+            end() {},
+        }
+        sessionManager.getSftp = async () => sftp
+        sessionManager.exec = async (_alias, command) => {
+            const script = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
+            assert.match(script, /Get-Acl -LiteralPath 'C:\\Remote Data'/)
+            return { success: true, stdout: 'D:PAI(A;;FA;;;SY)\r\n', stderr: '', exitCode: 0 }
+        }
+        t.after(() => {
+            sessionManager.exec = originalExec
+            sessionManager.getSftp = originalSftp
+            sessionManager.sessions.delete(alias)
+        })
+        const result = content(
+            await tools(registerFileTools)
+                .get('ssh_sync')
+                .handler({
+                    alias,
+                    localPath,
+                    remotePath: 'C:\\Remote Data',
+                    direction: 'upload',
+                    verify: { aclSddl: 'D:PAI(A;;FA;;;SY)' },
+                })
+        )
+        assert.equal(result.success, true)
+        assert.equal(result.verification.checks.acl, true)
+        assert.ok(manifestReads > 0)
     }
-    sessionManager.getSftp = async () => sftp
-    sessionManager.exec = async (_alias, command) => {
-        const script = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
-        assert.match(script, /Get-Acl -LiteralPath 'C:\\Remote Data'/)
-        return { success: true, stdout: 'D:PAI(A;;FA;;;SY)\r\n', stderr: '', exitCode: 0 }
-    }
-    t.after(() => {
-        sessionManager.exec = originalExec
-        sessionManager.getSftp = originalSftp
-        sessionManager.sessions.delete(alias)
-    })
-    const result = content(
-        await tools(registerFileTools)
-            .get('ssh_sync')
-            .handler({
-                alias,
-                localPath,
-                remotePath: 'C:\\Remote Data',
-                direction: 'upload',
-                verify: { aclSddl: 'D:PAI(A;;FA;;;SY)' },
-            })
-    )
-    assert.equal(result.success, true)
-    assert.equal(result.verification.checks.acl, true)
-    assert.ok(manifestReads > 0)
-})
+)
 
 test('S9: public Win32 list, mkdir, and file-info use remote separators and names', async (t) => {
     const alias = 'win-path-tools'
@@ -1371,119 +1400,192 @@ test('S9: public Win32 list, mkdir, and file-info use remote separators and name
     assert.deepEqual(created, ['C:\\Data Root\\sub', 'C:\\Data Root\\sub\\nested'])
 })
 
-test('S9: Windows directory download refuses case-folded name collisions before writing', async (t) => {
-    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
-    const originalSftp = sessionManager.getSftp
-    const alias = 'case-collision-download'
-    const localPath = path.join(fixture(t), 'target')
-    let reads = 0
-    sessionManager.sessions.set(alias, {
-        client: {},
-        config: { host: 'example.com', username: 'fixture', password: 'test' },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
-    sessionManager.getSftp = async () => ({
-        stat(_name, callback) {
-            callback(null, { size: 0, mode: 0o040755, uid: 0, gid: 0, mtime: 1, atime: 1 })
-        },
-        readdir(_name, callback) {
-            callback(
-                null,
-                ['a.txt', 'A.txt'].map((filename) => ({
-                    filename,
-                    attrs: { size: 1, mode: 0o100644, uid: 0, gid: 0, mtime: 1, atime: 1 },
-                }))
-            )
-        },
-        createReadStream() {
-            ++reads
-            throw new Error('collision must prevent downloads')
-        },
-        end() {},
-    })
-    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' })
-    t.after(() => {
-        Object.defineProperty(process, 'platform', originalPlatform)
-        sessionManager.getSftp = originalSftp
-        sessionManager.sessions.delete(alias)
-    })
-    const result = await syncFiles(alias, localPath, '/remote', 'download')
-    assert.equal(result.success, false)
-    assert.match(result.output, /Windows local filename collision/)
-    assert.equal(reads, 0)
-    assert.equal(fs.existsSync(localPath), false)
-})
-
-test('S11/S13: Windows atomic upload refuses to write contents until the temporary file has a private DACL', async (t) => {
-    const dir = fixture(t)
-    const source = path.join(dir, 'source.txt')
-    fs.writeFileSync(source, 'secret payload')
-    const alias = 'win-atomic-private'
-    const originalSftp = sessionManager.getSftp
-    const originalExec = sessionManager.exec
-    sessionManager.sessions.set(alias, {
-        client: {},
-        config: {
-            host: 'example.com',
-            username: 'tester',
-            remotePlatform: 'windows',
-            commandShell: 'powershell',
-            remotePathStyle: 'win32',
-        },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
-    const writes = []
-    const removed = []
-    sessionManager.getSftp = async () => ({
-        _extensions: { 'posix-rename@openssh.com': '1' },
-        stat(_path, callback) {
-            callback(null, { size: 4, mode: 0o100644, uid: 0, gid: 0, mtime: 1, atime: 1 })
-        },
-        createWriteStream(remotePath, options) {
-            writes.push({ remotePath, flags: options.flags })
-            return new Writable({
-                write(_chunk, _encoding, callback) {
-                    assert.fail('private ACL check must precede content')
-                    callback()
-                },
-            })
-        },
-        unlink(remotePath, callback) {
-            removed.push(remotePath)
-            callback(null)
-        },
-        end() {},
-    })
-    sessionManager.exec = async () => ({ success: false, stdout: 'insecure', stderr: 'ACL denied', exitCode: 1 })
-    t.after(() => {
-        sessionManager.getSftp = originalSftp
-        sessionManager.exec = originalExec
-        sessionManager.sessions.delete(alias)
-    })
-    const response = content(
-        await tools(registerFileTools).get('ssh_upload').handler({
-            alias,
-            localPath: source,
-            remotePath: 'C:\\Data\\old.txt',
-            atomic: true,
+test(
+    'S9: native Windows directory download refuses ordinal name collisions before writing',
+    { skip: process.platform !== 'win32' },
+    async (t) => {
+        const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+        const originalSftp = sessionManager.getSftp
+        const alias = 'case-collision-download'
+        const localPath = path.join(fixture(t), 'target')
+        let reads = 0
+        sessionManager.sessions.set(alias, {
+            client: {},
+            config: { host: 'example.com', username: 'fixture', password: 'test' },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
         })
-    )
-    assert.equal(response.success, false)
-    assert.match(response.error, /privacy_not_enforced_on_windows/)
-    assert.deepEqual(
-        writes.map((item) => item.flags),
-        ['wx']
-    )
-    assert.deepEqual(removed, [writes[0].remotePath])
-})
+        sessionManager.getSftp = async () => ({
+            stat(_name, callback) {
+                callback(null, { size: 0, mode: 0o040755, uid: 0, gid: 0, mtime: 1, atime: 1 })
+            },
+            readdir(_name, callback) {
+                callback(
+                    null,
+                    ['a.txt', 'A.txt'].map((filename) => ({
+                        filename,
+                        attrs: { size: 1, mode: 0o100644, uid: 0, gid: 0, mtime: 1, atime: 1 },
+                    }))
+                )
+            },
+            createReadStream() {
+                ++reads
+                throw new Error('collision must prevent downloads')
+            },
+            end() {},
+        })
+        Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' })
+        t.after(() => {
+            Object.defineProperty(process, 'platform', originalPlatform)
+            sessionManager.getSftp = originalSftp
+            sessionManager.sessions.delete(alias)
+        })
+        const result = await syncFiles(alias, localPath, '/remote', 'download')
+        assert.equal(result.success, false)
+        assert.match(result.output, /Windows local filename collision/)
+        assert.equal(reads, 0)
+        assert.equal(fs.existsSync(localPath), false)
+    }
+)
+
+test(
+    'SSH-18: native NTFS download uses ordinal Unicode names and directory-specific case flags',
+    { skip: process.platform !== 'win32' },
+    async (t) => {
+        const directory = fixture(t)
+        const alias = 'native-download-names'
+        const originalSftp = sessionManager.getSftp
+        let names = []
+        sessionManager.sessions.set(alias, {
+            client: {},
+            config: { host: 'example.com', port: 22, username: 'fixture', password: 'synthetic' },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
+        })
+        sessionManager.getSftp = async () => ({
+            stat(_name, callback) {
+                callback(null, { size: 0, mode: 0o040755 })
+            },
+            readdir(remote, callback) {
+                callback(
+                    null,
+                    remote === '/source'
+                        ? names.map((filename) => ({ filename, attrs: { size: 0, mode: 0o040755 } }))
+                        : []
+                )
+            },
+            end() {},
+        })
+        t.after(() => {
+            sessionManager.getSftp = originalSftp
+            sessionManager.sessions.delete(alias)
+        })
+        names = ['å', 'å']
+        const unicodeTarget = path.join(directory, 'unicode')
+        const unicode = await syncFiles(alias, unicodeTarget, '/source', 'download')
+        assert.equal(unicode.success, true, unicode.output)
+        assert.deepEqual(fs.readdirSync(unicodeTarget).sort(), [...names].sort())
+        names = ['σ', 'ς']
+        const sigmaTarget = path.join(directory, 'sigma')
+        const sigma = await syncFiles(alias, sigmaTarget, '/source', 'download')
+        assert.equal(sigma.success, false)
+        assert.match(sigma.output, /Windows local filename collision/)
+        assert.equal(fs.existsSync(sigmaTarget), false)
+        names = ['Exact']
+        const exactTarget = path.join(directory, 'exact')
+        fs.mkdirSync(path.join(exactTarget, 'Exact'), { recursive: true })
+        fs.writeFileSync(path.join(exactTarget, 'Exact', 'keep.txt'), 'preserved')
+        assert.equal((await syncFiles(alias, exactTarget, '/source', 'download')).success, true)
+        assert.equal(fs.readFileSync(path.join(exactTarget, 'Exact', 'keep.txt'), 'utf8'), 'preserved')
+        await t.test('case-sensitive directory keeps A and a distinct', async (child) => {
+            const sensitive = path.join(directory, 'sensitive')
+            fs.mkdirSync(sensitive)
+            if (!prepareCaseSensitiveDirectory(child, sensitive)) {
+                return
+            }
+            names = ['A', 'a']
+            const result = await syncFiles(alias, sensitive, '/source', 'download')
+            assert.equal(result.success, true, result.output)
+            assert.deepEqual(fs.readdirSync(sensitive).sort(), ['A', 'a'])
+        })
+    }
+)
+
+test(
+    'S11/S13: Windows atomic upload refuses to write contents until the ' + 'temporary file has a private DACL',
+    async (t) => {
+        const dir = fixture(t)
+        const source = path.join(dir, 'source.txt')
+        fs.writeFileSync(source, 'secret payload')
+        const alias = 'win-atomic-private'
+        const originalSftp = sessionManager.getSftp
+        const originalExec = sessionManager.exec
+        sessionManager.sessions.set(alias, {
+            client: {},
+            config: {
+                host: 'example.com',
+                username: 'tester',
+                remotePlatform: 'windows',
+                commandShell: 'powershell',
+                remotePathStyle: 'win32',
+            },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
+        })
+        const writes = []
+        const removed = []
+        sessionManager.getSftp = async () => ({
+            _extensions: { 'posix-rename@openssh.com': '1' },
+            stat(_path, callback) {
+                callback(null, { size: 4, mode: 0o100644, uid: 0, gid: 0, mtime: 1, atime: 1 })
+            },
+            createWriteStream(remotePath, options) {
+                writes.push({ remotePath, flags: options.flags })
+                return new Writable({
+                    write(_chunk, _encoding, callback) {
+                        assert.fail('private ACL check must precede content')
+                        callback()
+                    },
+                })
+            },
+            unlink(remotePath, callback) {
+                removed.push(remotePath)
+                callback(null)
+            },
+            end() {},
+        })
+        sessionManager.exec = async () => ({ success: false, stdout: 'insecure', stderr: 'ACL denied', exitCode: 1 })
+        t.after(() => {
+            sessionManager.getSftp = originalSftp
+            sessionManager.exec = originalExec
+            sessionManager.sessions.delete(alias)
+        })
+        const response = content(
+            await tools(registerFileTools).get('ssh_upload').handler({
+                alias,
+                localPath: source,
+                remotePath: 'C:\\Data\\old.txt',
+                atomic: true,
+            })
+        )
+        assert.equal(response.success, false)
+        assert.match(response.error, /privacy_not_enforced_on_windows/)
+        assert.deepEqual(
+            writes.map((item) => item.flags),
+            ['wx']
+        )
+        assert.deepEqual(removed, [writes[0].remotePath])
+    }
+)
 
 test('S7: streamed manifest enforces byte budget when a remote file grows after stat', async () => {
     let pages = 0
@@ -1501,8 +1603,11 @@ test('S7: streamed manifest enforces byte budget when a remote file grows after 
             callback(null, Buffer.from('dir'))
         },
         readdir(_handle, callback) {
-            if (pages++ === 0) callback(null, [{ filename: 'growing.txt', attrs: {} }])
-            else callback(Object.assign(new Error('EOF'), { code: 1 }))
+            if (pages++ === 0) {
+                callback(null, [{ filename: 'growing.txt', attrs: {} }])
+            } else {
+                callback(Object.assign(new Error('EOF'), { code: 1 }))
+            }
         },
         createReadStream() {
             return Readable.from([Buffer.from('expanded')])
@@ -1520,7 +1625,9 @@ test('R1: public Windows upload refuses case collisions before any transfer or m
     const root = fixture(t)
     const source = path.join(root, 'source')
     fs.mkdirSync(source)
-    if (!prepareCaseSensitiveDirectory(t, source)) return
+    if (!prepareCaseSensitiveDirectory(t, source)) {
+        return
+    }
     fs.writeFileSync(path.join(source, 'a.txt'), 'lower')
     fs.writeFileSync(path.join(source, 'A.txt'), 'upper')
     assert.deepEqual(fs.readdirSync(source).sort(), ['A.txt', 'a.txt'])
@@ -1582,199 +1689,229 @@ test('R1: public Windows upload refuses case collisions before any transfer or m
     assert.deepEqual(events, ['query'])
 })
 
-test('R1: upload preflight shares traversal rules and rejects unverified candidates for both transports', async (t) => {
-    const root = fixture(t)
-    const originalSftp = sessionManager.getSftp
-    const originalExec = sessionManager.exec
-    const originalCapability = sessionManager.getExternalTransferCapability
-    const alias = 'case-preflight-matrix'
-    t.after(() => {
-        sessionManager.getSftp = originalSftp
-        sessionManager.exec = originalExec
-        sessionManager.getExternalTransferCapability = originalCapability
-        sessionManager.sessions.delete(alias)
-    })
-    const cases = [
-        { names: ['a.txt', 'A.txt'], collision: ['A.txt', 'a.txt'] },
-        { names: ['a.txt', 'A.txt'], caseSensitive: true, writes: 2 },
-        { names: ['a.txt', 'A.txt'], platform: 'posix', writes: 2, queries: 0 },
-        { names: ['a.txt', 'different.txt'], writes: 2, queries: 0 },
-        { names: ['a.txt', 'A.txt'], exclude: ['A.txt'], writes: 1, queries: 0 },
-        { names: ['a.txt', 'A.txt'], symlink: true, writes: 1, queries: 0 },
-        { names: ['a.txt', 'A.txt'], symlink: true, followSymlinks: true, collision: ['A.txt', 'a.txt'] },
-        { names: ['a.txt', 'A.txt'], loop: true, followSymlinks: true, writes: 1, queries: 0 },
-        { names: ['a', 'A'], directory: true, collision: ['A', 'a'] },
-        { names: ['a.txt', 'A.txt'], nested: true, collision: ['A.txt', 'a.txt'] },
-        { names: ['σ.txt', 'ς.txt'], collision: ['σ.txt', 'ς.txt'] },
-        { names: ['中.txt', 'other.txt'], writes: 2 },
-        {
-            names: ['a.txt', 'A.txt'],
-            reply: { success: false, exitCode: 1, stderr: 'parent missing' },
-            unverified: true,
-        },
-        { names: ['a.txt', 'A.txt'], reply: { timedOut: true }, unverified: true },
-        { names: ['a.txt', 'A.txt'], reply: { stdoutTruncated: true }, unverified: true },
-        { names: ['a.txt', 'A.txt'], reply: { stderrTruncated: true }, unverified: true },
-        { names: ['a.txt', 'A.txt'], stdout: '{"caseSensitive":true}', unverified: true },
-        { names: ['a.txt', 'A.txt'], stdout: '{"caseSensitive":false,"collision":[]}', unverified: true },
-        { names: ['a.txt', 'A.txt'], stdout: '{', unverified: true },
-        { names: ['a.txt', 'A.txt'], noShell: true, unverified: true },
-    ]
-    for (const [index, spec] of cases.entries()) {
-        for (const transport of ['sftp', 'rsync']) {
-            if (transport === 'rsync' && spec.writes !== undefined) continue
-            for (const dryRun of spec.writes === undefined ? [false, true] : [false]) {
-                await t.test(`case=${index}, transport=${transport}, dryRun=${dryRun}`, async (t) => {
-                    const source = path.join(root, `source-${index}-${transport}-${dryRun}`)
-                    fs.mkdirSync(source)
-                    const entries = spec.nested ? path.join(source, 'nested') : source
-                    if (spec.nested) {
-                        fs.mkdirSync(entries)
-                        fs.writeFileSync(path.join(source, 'earlier.txt'), 'must not transfer before nested checks')
-                    }
-                    if (new Set(spec.names.map((name) => name.toUpperCase())).size !== spec.names.length) {
-                        if (!prepareCaseSensitiveDirectory(t, entries)) return
-                    }
-                    fs.writeFileSync(path.join(entries, spec.names[0]), 'one')
-                    const second = path.join(entries, spec.names[1])
-                    if (spec.loop) fs.symlinkSync(entries, second, 'dir')
-                    else if (spec.symlink) fs.symlinkSync(path.join(entries, spec.names[0]), second, 'file')
-                    else if (spec.directory) fs.mkdirSync(second)
-                    else fs.writeFileSync(second, 'two')
-                    assert.deepEqual(fs.readdirSync(entries).sort(), [...spec.names].sort())
-                    let queries = 0
-                    let capabilityCalls = 0
-                    const writes = []
-                    const created = []
-                    sessionManager.sessions.set(alias, {
-                        client: {},
-                        config: {
-                            host: 'example.com',
-                            username: 'test',
-                            password: 'test',
-                            remotePlatform: spec.platform ?? 'windows',
-                        },
-                        connected: true,
-                        connectedAt: 1,
-                        lastUsedAt: 1,
-                        reconnectAttempts: 0,
-                        manualClose: false,
-                    })
-                    sessionManager.getExternalTransferCapability = (...args) => {
-                        ++capabilityCalls
-                        if (transport === 'rsync')
-                            throw new Error('rsync selection must not start before rejected preflight')
-                        return originalCapability.apply(sessionManager, args)
-                    }
-                    sessionManager.exec = async (_alias, command, options) => {
-                        ++queries
-                        if (spec.queries === 0) assert.fail('no candidate must not require a shell')
-                        assert.ok(options.timeout > 0)
-                        const script = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
-                        assert.match(script, /CreateFileW\(parent, 128, 7, IntPtr.Zero, 3, 128 \| 33554432/)
-                        assert.match(script, /GetFileInformationByHandleEx\(handle, 23, out info, 4\)/)
-                        assert.match(script, /CompareStringOrdinal\(left, left.Length, right, right.Length, true\)/)
-                        if (spec.nested) assert.match(script, /C:\\Target\\nested/)
-                        if (spec.noShell) throw new Error('shell unavailable')
-                        return {
-                            success: true,
-                            exitCode: 0,
-                            stderr: '',
-                            stdout:
-                                spec.stdout ??
-                                JSON.stringify({
-                                    caseSensitive: spec.caseSensitive ?? false,
-                                    collision: spec.collision ?? null,
-                                }),
-                            ...spec.reply,
+test(
+    'R1: upload preflight shares traversal rules and rejects unverified ' + 'candidates for both transports',
+    async (t) => {
+        const root = fixture(t)
+        const originalSftp = sessionManager.getSftp
+        const originalExec = sessionManager.exec
+        const originalCapability = sessionManager.getExternalTransferCapability
+        const alias = 'case-preflight-matrix'
+        t.after(() => {
+            sessionManager.getSftp = originalSftp
+            sessionManager.exec = originalExec
+            sessionManager.getExternalTransferCapability = originalCapability
+            sessionManager.sessions.delete(alias)
+        })
+        const cases = [
+            { names: ['a.txt', 'A.txt'], collision: ['A.txt', 'a.txt'] },
+            { names: ['a.txt', 'A.txt'], caseSensitive: true, writes: 2 },
+            { names: ['a.txt', 'A.txt'], platform: 'posix', writes: 2, queries: 0 },
+            { names: ['a.txt', 'different.txt'], writes: 2, queries: 0 },
+            { names: ['a.txt', 'A.txt'], exclude: ['A.txt'], writes: 1, queries: 0 },
+            { names: ['a.txt', 'A.txt'], symlink: true, writes: 1, queries: 0 },
+            { names: ['a.txt', 'A.txt'], symlink: true, followSymlinks: true, collision: ['A.txt', 'a.txt'] },
+            { names: ['a.txt', 'A.txt'], loop: true, followSymlinks: true, writes: 1, queries: 0 },
+            { names: ['a', 'A'], directory: true, collision: ['A', 'a'] },
+            { names: ['a.txt', 'A.txt'], nested: true, collision: ['A.txt', 'a.txt'] },
+            { names: ['σ.txt', 'ς.txt'], collision: ['σ.txt', 'ς.txt'] },
+            { names: ['中.txt', 'other.txt'], writes: 2 },
+            {
+                names: ['a.txt', 'A.txt'],
+                reply: { success: false, exitCode: 1, stderr: 'parent missing' },
+                unverified: true,
+            },
+            { names: ['a.txt', 'A.txt'], reply: { timedOut: true }, unverified: true },
+            { names: ['a.txt', 'A.txt'], reply: { stdoutTruncated: true }, unverified: true },
+            { names: ['a.txt', 'A.txt'], reply: { stderrTruncated: true }, unverified: true },
+            { names: ['a.txt', 'A.txt'], stdout: '{"caseSensitive":true}', unverified: true },
+            { names: ['a.txt', 'A.txt'], stdout: '{"caseSensitive":false,"collision":[]}', unverified: true },
+            { names: ['a.txt', 'A.txt'], stdout: '{', unverified: true },
+            { names: ['a.txt', 'A.txt'], noShell: true, unverified: true },
+        ]
+        for (const [index, spec] of cases.entries()) {
+            for (const transport of ['sftp', 'rsync']) {
+                if (transport === 'rsync' && spec.writes !== undefined) {
+                    continue
+                }
+                for (const dryRun of spec.writes === undefined ? [false, true] : [false]) {
+                    await t.test(`case=${index}, transport=${transport}, dryRun=${dryRun}`, async (t) => {
+                        const source = path.join(root, `source-${index}-${transport}-${dryRun}`)
+                        fs.mkdirSync(source)
+                        const entries = spec.nested ? path.join(source, 'nested') : source
+                        if (spec.nested) {
+                            fs.mkdirSync(entries)
+                            fs.writeFileSync(path.join(source, 'earlier.txt'), 'must not transfer before nested checks')
                         }
-                    }
-                    sessionManager.getSftp = async () => ({
-                        stat(_name, cb) {
-                            cb(null, { mode: 0o040755, size: 0 })
-                        },
-                        mkdir(name, cb) {
-                            created.push(name)
-                            cb(null)
-                        },
-                        createWriteStream(name) {
-                            writes.push(name)
-                            return new Writable({
-                                write(_bytes, _encoding, cb) {
-                                    cb()
-                                },
-                            })
-                        },
-                        end() {},
-                    })
-                    const result = content(
-                        await tools(registerFileTools).get('ssh_sync').handler({
-                            alias,
-                            localPath: source,
-                            remotePath: 'C:\\Target',
-                            direction: 'upload',
-                            dryRun,
-                            exclude: spec.exclude,
-                            followSymlinks: spec.followSymlinks,
+                        if (new Set(spec.names.map((name) => name.toUpperCase())).size !== spec.names.length) {
+                            if (!prepareCaseSensitiveDirectory(t, entries)) {
+                                return
+                            }
+                        }
+                        fs.writeFileSync(path.join(entries, spec.names[0]), 'one')
+                        const second = path.join(entries, spec.names[1])
+                        if (spec.loop) {
+                            fs.symlinkSync(entries, second, 'dir')
+                        } else if (spec.symlink) {
+                            fs.symlinkSync(path.join(entries, spec.names[0]), second, 'file')
+                        } else if (spec.directory) {
+                            fs.mkdirSync(second)
+                        } else {
+                            fs.writeFileSync(second, 'two')
+                        }
+                        assert.deepEqual(fs.readdirSync(entries).sort(), [...spec.names].sort())
+                        let queries = 0
+                        let capabilityCalls = 0
+                        const writes = []
+                        const created = []
+                        sessionManager.sessions.set(alias, {
+                            client: {},
+                            config: {
+                                host: 'example.com',
+                                username: 'test',
+                                password: 'test',
+                                remotePlatform: spec.platform ?? 'windows',
+                            },
+                            connected: true,
+                            connectedAt: 1,
+                            lastUsedAt: 1,
+                            reconnectAttempts: 0,
+                            manualClose: false,
                         })
-                    )
-                    assert.equal(
-                        result.success,
-                        spec.writes !== undefined,
-                        JSON.stringify({ index, transport, dryRun, result })
-                    )
-                    assert.equal(queries, spec.queries ?? 1)
-                    if (spec.writes === undefined) {
-                        assert.match(
-                            result.error ?? result.output,
-                            spec.unverified ? /case_semantics_unverified/ : /windows_filename_collision/
+                        sessionManager.getExternalTransferCapability = (...args) => {
+                            ++capabilityCalls
+                            if (transport === 'rsync') {
+                                throw new Error('rsync selection must not start before rejected preflight')
+                            }
+                            return originalCapability.apply(sessionManager, args)
+                        }
+                        sessionManager.exec = async (_alias, command, options) => {
+                            ++queries
+                            if (spec.queries === 0) {
+                                assert.fail('no candidate must not require a shell')
+                            }
+                            assert.ok(options.timeout > 0)
+                            const script = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
+                            assert.match(script, /CreateFileW\(parent, 128, 7, IntPtr.Zero, 3, 128 \| 33554432/)
+                            assert.match(script, /GetFileInformationByHandleEx\(handle, 23, out info, 4\)/)
+                            assert.match(
+                                script,
+                                new RegExp('CompareStringOrdinal\\(left, left.Length, right, right.Length, true\\)', '')
+                            )
+                            if (spec.nested) {
+                                assert.match(script, /C:\\Target\\nested/)
+                            }
+                            if (spec.noShell) {
+                                throw new Error('shell unavailable')
+                            }
+                            return {
+                                success: true,
+                                exitCode: 0,
+                                stderr: '',
+                                stdout:
+                                    spec.stdout ??
+                                    JSON.stringify({
+                                        caseSensitive: spec.caseSensitive ?? false,
+                                        collision: spec.collision ?? null,
+                                    }),
+                                ...spec.reply,
+                            }
+                        }
+                        sessionManager.getSftp = async () => ({
+                            stat(_name, cb) {
+                                cb(null, { mode: 0o040755, size: 0 })
+                            },
+                            mkdir(name, cb) {
+                                created.push(name)
+                                cb(null)
+                            },
+                            createWriteStream(name) {
+                                writes.push(name)
+                                return new Writable({
+                                    write(_bytes, _encoding, cb) {
+                                        cb()
+                                    },
+                                })
+                            },
+                            end() {},
+                        })
+                        const result = content(
+                            await tools(registerFileTools).get('ssh_sync').handler({
+                                alias,
+                                localPath: source,
+                                remotePath: 'C:\\Target',
+                                direction: 'upload',
+                                dryRun,
+                                exclude: spec.exclude,
+                                followSymlinks: spec.followSymlinks,
+                            })
                         )
-                        assert.equal(capabilityCalls, 0)
-                        assert.equal(writes.length, 0)
-                        assert.equal(created.length, 0)
-                    } else {
-                        assert.equal(writes.length, spec.writes)
-                    }
-                })
+                        assert.equal(
+                            result.success,
+                            spec.writes !== undefined,
+                            JSON.stringify({ index, transport, dryRun, result })
+                        )
+                        assert.equal(queries, spec.queries ?? 1)
+                        if (spec.writes === undefined) {
+                            assert.match(
+                                result.error ?? result.output,
+                                spec.unverified ? /case_semantics_unverified/ : /windows_filename_collision/
+                            )
+                            assert.equal(capabilityCalls, 0)
+                            assert.equal(writes.length, 0)
+                            assert.equal(created.length, 0)
+                        } else {
+                            assert.equal(writes.length, spec.writes)
+                        }
+                    })
+                }
             }
         }
     }
-})
+)
 
-test('R2: public UTF-16 reads reject insufficient budgets and malformed EOF without zero-progress pages', async (t) => {
-    const originalSftp = sessionManager.getSftp
-    const originalStyle = sessionManager.getRemotePathStyle
-    sessionManager.getRemotePathStyle = () => 'posix'
-    t.after(() => {
-        sessionManager.getSftp = originalSftp
-        sessionManager.getRemotePathStyle = originalStyle
-    })
-    const handler = tools(registerFileTools).get('ssh_read_file').handler
-    for (const encoding of ['utf16le', 'utf16be']) {
-        for (const [text, maxBytes] of [
-            ['A', 1],
-            ['😀A', 2],
-            ['😀A', 3],
-        ]) {
-            const bytes = Buffer.from(text, 'utf16le')
-            if (encoding === 'utf16be') bytes.swap16()
-            sessionManager.getSftp = async () => remoteFile(bytes)
-            const result = content(await handler({ alias: 'fixture', remotePath: '/file', encoding, maxBytes }))
-            assert.equal(result.success, false, `${encoding}: ${maxBytes}`)
-            assert.match(result.error, /maxBytes is too small/)
-        }
-        for (const bytes of [Buffer.from([0x41]), Buffer.from(encoding === 'utf16le' ? [0x00, 0xd8] : [0xd8, 0x00])]) {
-            sessionManager.getSftp = async () => remoteFile(bytes)
-            for (const lineRange of [undefined, '1']) {
-                const result = content(
-                    await handler({ alias: 'fixture', remotePath: '/file', encoding, lineRange, maxBytes: 8 })
-                )
-                assert.equal(result.success, false, `${encoding}: invalid EOF ${lineRange}`)
-                assert.match(result.error, /Invalid/)
+test(
+    'R2: public UTF-16 reads reject insufficient budgets and malformed EOF ' + 'without zero-progress pages',
+    async (t) => {
+        const originalSftp = sessionManager.getSftp
+        const originalStyle = sessionManager.getRemotePathStyle
+        sessionManager.getRemotePathStyle = () => 'posix'
+        t.after(() => {
+            sessionManager.getSftp = originalSftp
+            sessionManager.getRemotePathStyle = originalStyle
+        })
+        const handler = tools(registerFileTools).get('ssh_read_file').handler
+        for (const encoding of ['utf16le', 'utf16be']) {
+            for (const [text, maxBytes] of [
+                ['A', 1],
+                ['😀A', 2],
+                ['😀A', 3],
+            ]) {
+                const bytes = Buffer.from(text, 'utf16le')
+                if (encoding === 'utf16be') {
+                    bytes.swap16()
+                }
+                sessionManager.getSftp = async () => remoteFile(bytes)
+                const result = content(await handler({ alias: 'fixture', remotePath: '/file', encoding, maxBytes }))
+                assert.equal(result.success, false, `${encoding}: ${maxBytes}`)
+                assert.match(result.error, /maxBytes is too small/)
+            }
+            for (const bytes of [
+                Buffer.from([0x41]),
+                Buffer.from(encoding === 'utf16le' ? [0x00, 0xd8] : [0xd8, 0x00]),
+            ]) {
+                sessionManager.getSftp = async () => remoteFile(bytes)
+                for (const lineRange of [undefined, '1']) {
+                    const result = content(
+                        await handler({ alias: 'fixture', remotePath: '/file', encoding, lineRange, maxBytes: 8 })
+                    )
+                    assert.equal(result.success, false, `${encoding}: invalid EOF ${lineRange}`)
+                    assert.match(result.error, /Invalid/)
+                }
             }
         }
     }
-})
+)
 
 test('R3: public line-range metadata describes only returned bytes across chunks and encodings', async (t) => {
     const originalSftp = sessionManager.getSftp
@@ -1788,7 +1925,9 @@ test('R3: public line-range metadata describes only returned bytes across chunks
     for (const encoding of ['utf8', 'utf16le', 'utf16be']) {
         const width = encoding === 'utf8' ? 1 : 2
         const bytes = Buffer.from('hello\r\nworld\r\n', encoding === 'utf8' ? 'utf8' : 'utf16le')
-        if (encoding === 'utf16be') bytes.swap16()
+        if (encoding === 'utf16be') {
+            bytes.swap16()
+        }
         for (const binary of [false, true]) {
             for (const split of [1, 5, bytes.length]) {
                 for (const [budget, expectedEnd, terminated] of [
@@ -1836,7 +1975,9 @@ test('R2/R3: decoded prefixes, BOM progress, binary bytes, and EOF boundaries re
     for (const encoding of ['utf8', 'utf16le', 'utf16be']) {
         const width = encoding === 'utf8' ? 1 : 2
         const bytes = Buffer.from('a\n😀\n', encoding === 'utf8' ? 'utf8' : 'utf16le')
-        if (encoding === 'utf16be') bytes.swap16()
+        if (encoding === 'utf16be') {
+            bytes.swap16()
+        }
         sessionManager.getSftp = async () => ({
             ...remoteFile(bytes),
             createReadStream() {
@@ -1869,7 +2010,9 @@ test('R2/R3: decoded prefixes, BOM progress, binary bytes, and EOF boundaries re
     }
     for (const encoding of ['utf16le', 'utf16be']) {
         const bytes = Buffer.from(String.fromCharCode(0xfeff) + 'A😀B', 'utf16le')
-        if (encoding === 'utf16be') bytes.swap16()
+        if (encoding === 'utf16be') {
+            bytes.swap16()
+        }
         const requested = []
         sessionManager.getSftp = async () => ({
             ...remoteFile(bytes),
@@ -1902,7 +2045,9 @@ test('R2/R3: decoded prefixes, BOM progress, binary bytes, and EOF boundaries re
         assert.equal(third.remaining_bytes, 0)
         assert.equal(requested.length, 4)
         const invalid = Buffer.concat([Buffer.from('a\n', 'utf16le'), Buffer.from([0x41])])
-        if (encoding === 'utf16be') invalid.subarray(0, 4).swap16()
+        if (encoding === 'utf16be') {
+            invalid.subarray(0, 4).swap16()
+        }
         sessionManager.getSftp = async () => remoteFile(invalid)
         const malformed = content(await handler({ alias: 'fixture', remotePath: '/file', encoding, lineRange: '1-2' }))
         assert.equal(malformed.success, false)
@@ -1944,33 +2089,38 @@ test('R2/R3: decoded prefixes, BOM progress, binary bytes, and EOF boundaries re
     }
 })
 
-test('R2: a tail budget that contains only a character fragment fails instead of returning an empty success', async (t) => {
-    const originalSftp = sessionManager.getSftp
-    const originalStyle = sessionManager.getRemotePathStyle
-    sessionManager.getRemotePathStyle = () => 'posix'
-    t.after(() => {
-        sessionManager.getSftp = originalSftp
-        sessionManager.getRemotePathStyle = originalStyle
-    })
-    const handler = tools(registerFileTools).get('ssh_read_file').handler
-    for (const encoding of ['utf8', 'utf16le', 'utf16be']) {
-        const bytes = Buffer.from('😀', encoding === 'utf8' ? 'utf8' : 'utf16le')
-        if (encoding === 'utf16be') bytes.swap16()
-        sessionManager.getSftp = async () => remoteFile(bytes)
-        for (const maxBytes of [1, 2, 3]) {
-            const result = content(
-                await handler({ alias: 'fixture', remotePath: '/file', encoding, tail: true, maxBytes })
-            )
-            assert.equal(result.success, false, `${encoding}/${maxBytes}`)
-            assert.match(result.error, /maxBytes is too small/)
+test(
+    'R2: a tail budget that contains only a character fragment fails instead ' + 'of returning an empty success',
+    async (t) => {
+        const originalSftp = sessionManager.getSftp
+        const originalStyle = sessionManager.getRemotePathStyle
+        sessionManager.getRemotePathStyle = () => 'posix'
+        t.after(() => {
+            sessionManager.getSftp = originalSftp
+            sessionManager.getRemotePathStyle = originalStyle
+        })
+        const handler = tools(registerFileTools).get('ssh_read_file').handler
+        for (const encoding of ['utf8', 'utf16le', 'utf16be']) {
+            const bytes = Buffer.from('😀', encoding === 'utf8' ? 'utf8' : 'utf16le')
+            if (encoding === 'utf16be') {
+                bytes.swap16()
+            }
+            sessionManager.getSftp = async () => remoteFile(bytes)
+            for (const maxBytes of [1, 2, 3]) {
+                const result = content(
+                    await handler({ alias: 'fixture', remotePath: '/file', encoding, tail: true, maxBytes })
+                )
+                assert.equal(result.success, false, `${encoding}/${maxBytes}`)
+                assert.match(result.error, /maxBytes is too small/)
+            }
         }
+        sessionManager.getSftp = async () => remoteFile(Buffer.from([0x80]))
+        const malformed = content(
+            await handler({ alias: 'fixture', remotePath: '/file', encoding: 'utf8', tail: true, maxBytes: 8 })
+        )
+        assert.equal(malformed.success, false)
     }
-    sessionManager.getSftp = async () => remoteFile(Buffer.from([0x80]))
-    const malformed = content(
-        await handler({ alias: 'fixture', remotePath: '/file', encoding: 'utf8', tail: true, maxBytes: 8 })
-    )
-    assert.equal(malformed.success, false)
-})
+)
 
 test('R4: IdentityAgent none allows password and disables environment agent across reconnect', async (t) => {
     const root = fixture(t, () => manager)
@@ -2093,93 +2243,104 @@ test('R4: public SSH config preserves none with keys, Host defaults, ProxyJump, 
     assert.equal(configs[4].jumpHost.agent, '/fixture/jump.sock')
 })
 
-test('R1/R4: sensitive Windows upload reaches rsync while IdentityAgent none removes the environment socket', async (t) => {
-    if (process.platform === 'win32') {
-        t.skip('POSIX fake process fixture; native Windows rsync requires a Windows runner')
-        return
-    }
-    const root = fixture(t)
-    const bin = path.join(root, 'bin')
-    const source = path.join(root, 'source')
-    fs.mkdirSync(bin)
-    fs.mkdirSync(source)
-    fs.writeFileSync(path.join(source, 'a.txt'), 'one')
-    fs.writeFileSync(path.join(source, 'A.txt'), 'two')
-    const keyPath = path.join(root, 'key')
-    fs.writeFileSync(keyPath, 'fixture-key', { mode: 0o600 })
-    const record = path.join(root, 'calls')
-    const script =
-        '#!/bin/sh\n[ "${SSH_AUTH_SOCK+x}" != x ] || exit 91\nprintf "%s\\n" "$0 $*" >> "$MCP_TEST_PROCESS_RECORD"\nexit 0\n'
-    for (const name of ['ssh', 'rsync']) fs.writeFileSync(path.join(bin, name), script, { mode: 0o755 })
-    const previous = {
-        PATH: process.env.PATH,
-        SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
-        MCP_TEST_PROCESS_RECORD: process.env.MCP_TEST_PROCESS_RECORD,
-    }
-    process.env.PATH = `${bin}${path.delimiter}${previous.PATH ?? ''}`
-    process.env.SSH_AUTH_SOCK = '/fixture/environment.sock'
-    process.env.MCP_TEST_PROCESS_RECORD = record
-    const alias = 'sensitive-case-rsync'
-    const originalExec = sessionManager.exec
-    const originalSftp = sessionManager.getSftp
-    const commands = []
-    sessionManager.sessions.set(alias, {
-        client: {},
-        config: {
-            host: 'example.com',
-            username: 'tester',
-            privateKeyPath: keyPath,
-            agent: 'none',
-            remotePlatform: 'windows',
-            commandShell: 'powershell',
-            remotePathStyle: 'sftp-posix',
-            rsyncProfile: 'msys2',
-        },
-        connected: true,
-        connectedAt: 1,
-        lastUsedAt: 1,
-        reconnectAttempts: 0,
-        manualClose: false,
-    })
-    sessionManager.exec = async (_alias, command) => {
-        commands.push(command)
-        if (command.includes('-EncodedCommand')) {
-            const decoded = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
-            assert.match(decoded, /\$parent = 'C:\\Target'/)
-            return { success: true, stdout: '{"caseSensitive":true,"collision":null}', stderr: '', exitCode: 0 }
+test(
+    'R1/R4: sensitive Windows upload reaches rsync while IdentityAgent none ' + 'removes the environment socket',
+    async (t) => {
+        if (process.platform === 'win32') {
+            t.skip('POSIX fake process fixture; native Windows rsync requires a Windows runner')
+            return
         }
-        return { success: true, stdout: 'rsync', stderr: '', exitCode: 0 }
-    }
-    sessionManager.getSftp = async () => {
-        assert.fail('accepted rsync path must not fall back to SFTP')
-    }
-    t.after(() => {
-        sessionManager.exec = originalExec
-        sessionManager.getSftp = originalSftp
-        sessionManager.sessions.delete(alias)
-        clearRsyncCache(alias)
-        for (const [name, value] of Object.entries(previous)) {
-            if (value === undefined) delete process.env[name]
-            else process.env[name] = value
+        const root = fixture(t)
+        const bin = path.join(root, 'bin')
+        const source = path.join(root, 'source')
+        fs.mkdirSync(bin)
+        fs.mkdirSync(source)
+        fs.writeFileSync(path.join(source, 'a.txt'), 'one')
+        fs.writeFileSync(path.join(source, 'A.txt'), 'two')
+        const keyPath = path.join(root, 'key')
+        fs.writeFileSync(keyPath, 'fixture-key', { mode: 0o600 })
+        const record = path.join(root, 'calls')
+        const script =
+            '#!/bin/sh\n' +
+            '[ "${SSH_AUTH_SOCK+x}" != x ] || exit 91\n' +
+            'printf "%s\\n" "$0 $*" >> "$MCP_TEST_PROCESS_RECORD"\n' +
+            'exit 0\n'
+        for (const name of ['ssh', 'rsync']) {
+            fs.writeFileSync(path.join(bin, name), script, { mode: 0o755 })
         }
-    })
-    const capability = sessionManager.getExternalTransferCapability(alias)
-    assert.equal(capability.rsyncEligible, true)
-    assert.equal(capability.agent, 'none')
-    const result = content(
-        await tools(registerFileTools)
-            .get('ssh_sync')
-            .handler({ alias, localPath: source, remotePath: '/C:/Target', direction: 'upload' })
-    )
-    assert.equal(result.success, true, JSON.stringify(result))
-    assert.equal(result.selectedTransport, 'rsync')
-    assert.equal(commands.length, 2)
-    const calls = fs.readFileSync(record, 'utf8')
-    assert.match(calls, /IdentityAgent=none/)
-    assert.match(calls, /-i /)
-    assert.match(calls, /rsync -avz/)
-    assert.equal(process.env.SSH_AUTH_SOCK, '/fixture/environment.sock')
-})
+        const previous = {
+            PATH: process.env.PATH,
+            SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
+            MCP_TEST_PROCESS_RECORD: process.env.MCP_TEST_PROCESS_RECORD,
+        }
+        process.env.PATH = `${bin}${path.delimiter}${previous.PATH ?? ''}`
+        process.env.SSH_AUTH_SOCK = '/fixture/environment.sock'
+        process.env.MCP_TEST_PROCESS_RECORD = record
+        const alias = 'sensitive-case-rsync'
+        const originalExec = sessionManager.exec
+        const originalSftp = sessionManager.getSftp
+        const commands = []
+        sessionManager.sessions.set(alias, {
+            client: {},
+            config: {
+                host: 'example.com',
+                username: 'tester',
+                privateKeyPath: keyPath,
+                agent: 'none',
+                remotePlatform: 'windows',
+                commandShell: 'powershell',
+                remotePathStyle: 'sftp-posix',
+                rsyncProfile: 'msys2',
+            },
+            connected: true,
+            connectedAt: 1,
+            lastUsedAt: 1,
+            reconnectAttempts: 0,
+            manualClose: false,
+        })
+        sessionManager.exec = async (_alias, command) => {
+            commands.push(command)
+            if (command.includes('-EncodedCommand')) {
+                const decoded = Buffer.from(command.split(' ').at(-1), 'base64').toString('utf16le')
+                assert.match(decoded, /\$parent = 'C:\\Target'/)
+                return { success: true, stdout: '{"caseSensitive":true,"collision":null}', stderr: '', exitCode: 0 }
+            }
+            return { success: true, stdout: 'rsync', stderr: '', exitCode: 0 }
+        }
+        sessionManager.getSftp = async () => {
+            assert.fail('accepted rsync path must not fall back to SFTP')
+        }
+        t.after(() => {
+            sessionManager.exec = originalExec
+            sessionManager.getSftp = originalSftp
+            sessionManager.sessions.delete(alias)
+            clearRsyncCache(alias)
+            for (const [name, value] of Object.entries(previous)) {
+                if (value === undefined) {
+                    delete process.env[name]
+                } else {
+                    process.env[name] = value
+                }
+            }
+        })
+        const capability = sessionManager.getExternalTransferCapability(alias)
+        assert.equal(capability.rsyncEligible, true)
+        assert.equal(capability.agent, 'none')
+        const result = content(
+            await tools(registerFileTools)
+                .get('ssh_sync')
+                .handler({ alias, localPath: source, remotePath: '/C:/Target', direction: 'upload' })
+        )
+        assert.equal(result.success, true, JSON.stringify(result))
+        assert.equal(result.selectedTransport, 'rsync')
+        assert.equal(commands.length, 2)
+        const calls = fs.readFileSync(record, 'utf8')
+        assert.match(calls, /IdentityAgent=none/)
+        assert.match(calls, /-i /)
+        assert.match(calls, /rsync -avz/)
+        assert.equal(process.env.SSH_AUTH_SOCK, '/fixture/environment.sock')
+    }
+)
 
 test('S8: rsync transfer failure never replays a possibly partial transfer via SFTP', async (t) => {
     if (process.platform === 'win32') {
@@ -2225,8 +2386,11 @@ test('S8: rsync transfer failure never replays a possibly partial transfer via S
         sessionManager.getExternalTransferCapability = originalCapability
         sessionManager.getSftp = originalSftp
         clearRsyncCache('no-replay')
-        if (oldPath === undefined) delete process.env.PATH
-        else process.env.PATH = oldPath
+        if (oldPath === undefined) {
+            delete process.env.PATH
+        } else {
+            process.env.PATH = oldPath
+        }
     })
     const result = await syncFiles('no-replay', source, '/remote/target.txt', 'upload')
     assert.equal(result.success, false)

@@ -44,24 +44,48 @@ export function parseExpectedFileMode(value: string): number | undefined {
         return Number.parseInt(trimmed, 8) & FILE_MODE_MASK
     }
 
-    const match = /^(?:[-dl?])?([r-][w-][xSs-][r-][w-][xSs-][r-][w-][xTt-])$/.exec(trimmed)
+    const match = /^[-dl?]?(?<permissions>[r-][w-][xSs-][r-][w-][xSs-][r-][w-][xTt-])$/.exec(trimmed)
     if (!match) {
         return undefined
     }
 
     const bits = match[1]
     let mode = 0
-    if (bits[0] === 'r') mode |= 0o400
-    if (bits[1] === 'w') mode |= 0o200
-    if (bits[2] === 'x' || bits[2] === 's') mode |= 0o100
-    if (bits[2] === 's' || bits[2] === 'S') mode |= 0o4000
-    if (bits[3] === 'r') mode |= 0o040
-    if (bits[4] === 'w') mode |= 0o020
-    if (bits[5] === 'x' || bits[5] === 's') mode |= 0o010
-    if (bits[5] === 's' || bits[5] === 'S') mode |= 0o2000
-    if (bits[6] === 'r') mode |= 0o004
-    if (bits[7] === 'w') mode |= 0o002
-    if (bits[8] === 'x' || bits[8] === 't') mode |= 0o001
-    if (bits[8] === 't' || bits[8] === 'T') mode |= 0o1000
+    if (bits[0] === 'r') {
+        mode |= 0o400
+    }
+    if (bits[1] === 'w') {
+        mode |= 0o200
+    }
+    if (bits[2] === 'x' || bits[2] === 's') {
+        mode |= 0o100
+    }
+    if (bits[2] === 's' || bits[2] === 'S') {
+        mode |= 0o4000
+    }
+    if (bits[3] === 'r') {
+        mode |= 0o040
+    }
+    if (bits[4] === 'w') {
+        mode |= 0o020
+    }
+    if (bits[5] === 'x' || bits[5] === 's') {
+        mode |= 0o010
+    }
+    if (bits[5] === 's' || bits[5] === 'S') {
+        mode |= 0o2000
+    }
+    if (bits[6] === 'r') {
+        mode |= 0o004
+    }
+    if (bits[7] === 'w') {
+        mode |= 0o002
+    }
+    if (bits[8] === 'x' || bits[8] === 't') {
+        mode |= 0o001
+    }
+    if (bits[8] === 't' || bits[8] === 'T') {
+        mode |= 0o1000
+    }
     return mode
 }

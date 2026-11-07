@@ -6,6 +6,8 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js'
+import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js'
 import { randomBytes } from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -14,21 +16,21 @@ import {
     compareDirectoryManifests,
     createEmptyDirectoryManifest,
     createLocalDirectoryManifest,
-    createRemoteDirectoryManifest,
     createOpenSshDirectoryManifest,
-    matchesDirectoryExclude,
-    DIRECTORY_VERIFY_MAX_ENTRIES,
+    createRemoteDirectoryManifest,
     DIRECTORY_VERIFY_DEFAULT_MAX_FILE_BYTES,
     DIRECTORY_VERIFY_DEFAULT_MAX_TOTAL_BYTES,
+    DIRECTORY_VERIFY_MAX_ENTRIES,
     DIRECTORY_VERIFY_MAX_FILE_BYTES,
     DIRECTORY_VERIFY_MAX_TOTAL_BYTES,
     type DirectoryManifest,
+    type DirectoryVerificationControl,
     type DirectoryVerifyRequest,
+    matchesDirectoryExclude,
+    remainingVerificationTimeout,
 } from '../directory-verification.js'
 import { FILE_CREATE_MODE_MASK, formatFileMode, parseExpectedFileMode } from '../file-mode.js'
 import * as fileOps from '../file-ops.js'
-import { sessionManager } from '../session-manager.js'
-import { withSftpOperationTimeout } from '../sftp-timeout.js'
 import {
     encodedPowershell,
     quotePowershell,
@@ -38,7 +40,10 @@ import {
     remoteShellPath,
     sftpPath,
 } from '../remote-platform.js'
+import { sessionManager } from '../session-manager.js'
+import { SftpOperationTimeoutError, sftpOperationOutcome, withSftpOperationTimeout } from '../sftp-timeout.js'
 import { buildTransferOutcome } from '../transfer-outcome.js'
+import type { TransferProgress } from '../types.js'
 import { operationTimeoutSchema } from './schema.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js'
 
@@ -103,10 +108,12 @@ const writeFileSchema = z.object({
 
 function compareDirectoryTimes(left: string, right: string): number {
     const milliseconds = Date.parse(left) - Date.parse(right)
-    if (milliseconds !== 0) return milliseconds
+    if (milliseconds !== 0) {
+        return milliseconds
+    }
     // 保留 ISO 8601 的亚毫秒部分，避免 Date.parse 截断时间边界
     const [leftFraction, rightFraction] = [left, right].map((value) =>
-        (value.match(/\.(\d+)/)?.[1].slice(3) ?? '').replace(/0+$/, '')
+        (value.match(/\.(?<fraction>\d+)/)?.[1].slice(3) ?? '').replace(/0+$/, '')
     )
     return leftFraction < rightFraction ? -1 : leftFraction > rightFraction ? 1 : 0
 }
@@ -117,13 +124,11 @@ const listDirSchema = z
         remotePath: z.string().describe('远程目录路径'),
         showHidden: z.boolean().optional().describe('是否显示隐藏文件'),
         namePattern: z.string().optional().describe('名称通配模式，复用同步 exclude 的 * 和 ? 规则，区分大小写'),
-        modifiedAfter: z
-            .string()
+        modifiedAfter: z.iso
             .datetime({ offset: true })
             .optional()
             .describe('修改时间下界，包含；使用带时区的 ISO 8601 时间'),
-        modifiedBefore: z
-            .string()
+        modifiedBefore: z.iso
             .datetime({ offset: true })
             .optional()
             .describe('修改时间上界，不包含；使用带时区的 ISO 8601 时间'),
@@ -174,12 +179,21 @@ const syncSchema = z.object({
     preflightTimeout: z.number().int().positive().max(60000).optional().describe('传输能力预检超时，默认 10000ms'),
     connectTimeout: z.number().int().positive().max(120000).optional().describe('rsync SSH 连接超时，默认 30000ms'),
     operationTimeout: z.number().int().positive().max(3600000).optional().describe('同步操作超时，默认 600000ms'),
-    verifyOwner: z.union([z.string(), z.number()]).optional().describe('upload 后校验远端 owner（用户名或 uid）'),
-    verifyMode: z.string().optional().describe('upload 后校验远端权限，例如 0644、4755 或 -rwsr-xr-x'),
+    verifyOwner: z
+        .union([z.string(), z.number()])
+        .optional()
+        .describe('仅非 dryRun 单文件 upload 校验远端 owner（用户名或 uid），目录用 verify.owner'),
+    verifyMode: z
+        .string()
+        .optional()
+        .describe('仅非 dryRun 单文件 upload 校验远端权限，例如 0644、4755 或 -rwsr-xr-x，目录用 verify.mode'),
     verify: z
         .object({
             count: z.boolean().optional().describe('校验目录条目数'),
-            sha256: z.boolean().optional().describe('校验文件 SHA-256 或目录 SHA-256 root manifest'),
+            sha256: z
+                .boolean()
+                .optional()
+                .describe('显式启用文件 SHA-256 或目录 SHA-256 root manifest 校验，默认 false'),
             owner: z.boolean().optional().describe('逐项校验 owner'),
             mode: z.boolean().optional().describe('逐项校验 POSIX mode；Windows 不支持'),
             aclSddl: z
@@ -241,18 +255,6 @@ class VerificationStageError extends Error {
     }
 }
 
-function sftpOperationOutcome(error: unknown): Record<string, unknown> {
-    if (!error || typeof error !== 'object') {
-        return {}
-    }
-    const details = 'details' in error ? (error as { details?: unknown }).details : undefined
-    if (details && typeof details === 'object' && 'operationStatus' in details) {
-        return details as Record<string, unknown>
-    }
-    const cause = 'cause' in error ? (error as { cause?: unknown }).cause : undefined
-    return sftpOperationOutcome(cause)
-}
-
 function formatFileOperationError(error: unknown) {
     const operationOutcome = sftpOperationOutcome(error)
     if (Object.keys(operationOutcome).length === 0) {
@@ -284,6 +286,18 @@ function verificationErrorDetails(error: unknown): Record<string, unknown> {
         error: error instanceof Error ? error.message : String(error),
         retryable: false,
     }
+}
+
+function syncVerificationError(error: unknown, control: DirectoryVerificationControl): unknown {
+    if (!control.signal.aborted && Date.now() < control.deadline) {
+        return error
+    }
+    return new VerificationStageError(
+        'verification_timeout',
+        'Sync verification exceeded the operation timeout',
+        true,
+        { status: 'unknown', timedOut: true, cause: error instanceof Error ? error.message : String(error) }
+    )
 }
 
 function summarizeLocalPathProbe(probe: LocalPathProbe): Record<string, unknown> {
@@ -328,11 +342,11 @@ function normalizeRemotePath(alias: string, remotePath: string): string {
     return sftpPath(remotePath, sessionManager.getRemotePathStyle(alias))
 }
 
-async function probeRemoteParent(alias: string, remotePath: string, timeout?: number) {
+async function probeRemoteParent(alias: string, remotePath: string, timeout?: number, signal?: AbortSignal) {
     const parent = remoteDirname(sessionManager.getRemotePathStyle(alias), remotePath)
     const probeMethod = sessionManager.getOpenSshConnection(alias) ? ('openssh' as const) : ('sftp' as const)
     try {
-        const result = await probeRemoteFile(alias, parent, timeout)
+        const result = await probeRemoteFile(alias, parent, timeout, signal)
         return {
             exists: result.exists,
             isDirectory: result.exists ? result.isDirectory : false,
@@ -414,14 +428,14 @@ function isRemoteMissingError(error: unknown): boolean {
     }
     const code = 'code' in error ? (error as { code?: unknown }).code : undefined
     const message = error instanceof Error ? error.message : String(error)
-    return code === 2 || code === 'ENOENT' || /no such file|not found/i.test(message)
+    return code === 2 || code === 'ENOENT' || /no such file|^(?:file |remote path )?not found$/i.test(message)
 }
 
-async function probeRemoteFile(alias: string, remotePath: string, timeout: number = 10000) {
+async function probeRemoteFile(alias: string, remotePath: string, timeout: number = 10000, signal?: AbortSignal) {
     const probeMethod = sessionManager.getOpenSshConnection(alias) ? ('openssh' as const) : ('sftp' as const)
     let info: Awaited<ReturnType<typeof fileOps.getFileInfo>>
     try {
-        info = await fileOps.getFileInfo(alias, remotePath, timeout)
+        info = await fileOps.getFileInfo(alias, remotePath, timeout, undefined, signal)
     } catch (error) {
         if (isRemoteMissingError(error)) {
             return { exists: false as const, remotePath, probeMethod }
@@ -430,7 +444,7 @@ async function probeRemoteFile(alias: string, remotePath: string, timeout: numbe
             'remote_probe',
             `Remote file stat failed: ${error instanceof Error ? error.message : String(error)}`,
             true,
-            { operation: 'stat', probeMethod }
+            { operation: 'stat', probeMethod, ...sftpOperationOutcome(error) }
         )
     }
     return {
@@ -526,11 +540,12 @@ function displayExpectedMode(mode: string): string | undefined {
 
 async function buildSyncVerificationChecks(
     args: z.infer<typeof syncSchema>,
-    remote: Awaited<ReturnType<typeof probeRemoteFile>>
+    remote: Awaited<ReturnType<typeof probeRemoteFile>>,
+    timeout: number
 ): Promise<Record<string, boolean>> {
     const checks: Record<string, boolean> = {}
     if (args.verifyOwner !== undefined) {
-        const expectedOwnerId = await resolveExpectedOwnerId(args.alias, args.verifyOwner)
+        const expectedOwnerId = await resolveExpectedOwnerId(args.alias, args.verifyOwner, timeout)
         checks.owner = remote.exists && String(remote.ownerId) === expectedOwnerId
     }
     if (args.verifyMode !== undefined) {
@@ -566,7 +581,7 @@ async function resolveSyncUploadVerificationPath(
 async function buildSyncUploadVerification(
     args: z.infer<typeof syncSchema>,
     local: ReturnType<typeof fileOps.probeLocalPath>,
-    timeout: number
+    control: DirectoryVerificationControl
 ): Promise<Record<string, unknown> | undefined> {
     if (args.verifyOwner === undefined && args.verifyMode === undefined) {
         return undefined
@@ -586,17 +601,14 @@ async function buildSyncUploadVerification(
             suggestion: '目录权限校验请使用 verify.owner 或 verify.mode',
         }
     }
-    if (timeout <= 0) {
-        throw new VerificationStageError(
-            'verification_timeout',
-            'sync operation timeout was exhausted before owner/mode verification started',
-            true
-        )
-    }
-
-    const verificationRemotePath = await resolveSyncUploadVerificationPath(args, local, timeout)
-    const remote = await probeRemoteFile(args.alias, verificationRemotePath, timeout)
-    const checks = await buildSyncVerificationChecks(args, remote)
+    const verificationRemotePath = await resolveSyncUploadVerificationPath(
+        args,
+        local,
+        remainingVerificationTimeout(control)
+    )
+    const remote = await probeRemoteFile(args.alias, verificationRemotePath, remainingVerificationTimeout(control))
+    const checks = await buildSyncVerificationChecks(args, remote, remainingVerificationTimeout(control))
+    remainingVerificationTimeout(control)
     const matched = Object.values(checks).every(Boolean)
     return {
         kind: 'owner_mode',
@@ -621,19 +633,35 @@ async function captureRemoteDirectoryManifest(
     request: DirectoryVerifyRequest,
     exclude: string[] | undefined,
     followSymlinks: boolean | undefined,
-    timeout: number
+    control: DirectoryVerificationControl
 ): Promise<DirectoryManifest> {
     const connection = sessionManager.getOpenSshConnection(alias)
-    if (connection)
-        return createOpenSshDirectoryManifest(connection, remotePath, request, timeout, exclude, followSymlinks)
-    const requestSftp = sessionManager.getSftp(alias)
-    const sftp = await withSftpOperationTimeout(requestSftp, timeout, () => {
-        void requestSftp.then(
-            (late) => late.end(),
-            () => undefined
+    if (connection) {
+        return createOpenSshDirectoryManifest(
+            connection,
+            remotePath,
+            request,
+            remainingVerificationTimeout(control),
+            exclude,
+            followSymlinks,
+            control
         )
-    })
+    }
+    const timeout = remainingVerificationTimeout(control)
+    const requestSftp = sessionManager.getSftp(alias)
+    const sftp = await withSftpOperationTimeout(
+        requestSftp,
+        timeout,
+        () => {
+            void requestSftp.then(
+                (late) => late.end(),
+                () => undefined
+            )
+        },
+        control.signal
+    )
     try {
+        const remaining = remainingVerificationTimeout(control)
         return await withSftpOperationTimeout(
             createRemoteDirectoryManifest(
                 sftp,
@@ -641,10 +669,12 @@ async function captureRemoteDirectoryManifest(
                 request,
                 exclude,
                 followSymlinks,
-                sessionManager.getRemotePathStyle(alias)
+                sessionManager.getRemotePathStyle(alias),
+                control
             ),
-            timeout,
-            () => sftp.end()
+            remaining,
+            () => sftp.end(),
+            control.signal
         )
     } catch (error) {
         throw new VerificationStageError(
@@ -675,22 +705,15 @@ function deletionManifestRequest(request: DirectoryVerifyRequest): DirectoryVeri
 
 async function captureDeletionBaseline(
     args: z.infer<typeof syncSchema>,
-    remainingTimeout: () => number
+    control: DirectoryVerificationControl
 ): Promise<DirectoryManifest | undefined> {
     if (!args.verify?.deletions || args.dryRun) {
         return undefined
     }
+    remainingVerificationTimeout(control)
     const request = deletionManifestRequest(args.verify)
     if (args.direction === 'upload') {
-        const probeTimeout = remainingTimeout()
-        if (probeTimeout <= 0) {
-            throw new VerificationStageError(
-                'verification_timeout',
-                'sync operation timeout was exhausted before deletion baseline capture started',
-                true
-            )
-        }
-        const remote = await probeRemoteFile(args.alias, args.remotePath, probeTimeout)
+        const remote = await probeRemoteFile(args.alias, args.remotePath, remainingVerificationTimeout(control))
         if (!remote.exists) {
             return createEmptyDirectoryManifest()
         }
@@ -702,21 +725,13 @@ async function captureDeletionBaseline(
                 { remotePath: args.remotePath, fileType: remote.fileType }
             )
         }
-        const manifestTimeout = remainingTimeout()
-        if (manifestTimeout <= 0) {
-            throw new VerificationStageError(
-                'verification_timeout',
-                'sync operation timeout was exhausted before deletion baseline manifest started',
-                true
-            )
-        }
         return captureRemoteDirectoryManifest(
             args.alias,
             args.remotePath,
             request,
             args.exclude,
             directoryVerificationFollowsSymlinks(args),
-            manifestTimeout
+            control
         )
     }
 
@@ -737,7 +752,8 @@ async function captureDeletionBaseline(
             local.resolvedPath,
             request,
             args.exclude,
-            directoryVerificationFollowsSymlinks(args)
+            directoryVerificationFollowsSymlinks(args),
+            control
         )
     } catch (error) {
         throw new VerificationStageError(
@@ -751,28 +767,22 @@ async function captureDeletionBaseline(
 async function buildSingleFileSyncVerification(
     args: z.infer<typeof syncSchema>,
     local: LocalPathProbe,
-    timeout: number
+    control: DirectoryVerificationControl
 ): Promise<Record<string, unknown> | undefined> {
-    if (!args.verify) return undefined
-    if (args.dryRun)
+    if (!args.verify) {
+        return undefined
+    }
+    if (args.dryRun) {
         return { kind: 'single_file', skipped: true, reason: 'file verification is not executed during dryRun' }
-    if (!local.exists || !local.isFile)
+    }
+    if (!local.exists || !local.isFile) {
         throw new VerificationStageError(
             'local_manifest',
             'File verification requires the transferred local file',
             false
         )
-    const deadline = Date.now() + timeout
-    const remaining = (): number => {
-        const value = deadline - Date.now()
-        if (value <= 0)
-            throw new VerificationStageError(
-                'verification_timeout',
-                'sync operation timeout was exhausted during file verification',
-                true
-            )
-        return value
     }
+    const remaining = (): number => remainingVerificationTimeout(control)
     const remotePath =
         args.direction === 'upload'
             ? await resolveSyncUploadVerificationPath(args, local, remaining())
@@ -782,9 +792,12 @@ async function buildSingleFileSyncVerification(
         file: remote.exists && remote.isFile,
         size: remote.exists && remote.size === local.size,
     }
-    if (args.verify.owner)
+    if (args.verify.owner) {
         checks.owner = remote.exists && String(remote.ownerId) === String(fs.statSync(local.resolvedPath).uid)
-    if (args.verify.mode) checks.mode = remote.exists && remote.modeValue === local.modeValue
+    }
+    if (args.verify.mode) {
+        checks.mode = remote.exists && remote.modeValue === local.modeValue
+    }
     let localSha256: string | undefined
     let remoteSha256: string | undefined
     if (args.verify.sha256 && remote.exists && remote.isFile) {
@@ -792,14 +805,26 @@ async function buildSingleFileSyncVerification(
             args.verify.maxFileBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_FILE_BYTES,
             args.verify.maxTotalBytes ?? DIRECTORY_VERIFY_DEFAULT_MAX_TOTAL_BYTES
         )
-        if (local.size > maxBytes || remote.size > maxBytes)
+        if (local.size > maxBytes || remote.size > maxBytes) {
             return { kind: 'single_file', skipped: true, reason: 'file verification byte budget exceeded', maxBytes }
+        }
         ;[localSha256, remoteSha256] = await Promise.all([
-            fileOps.hashLocalFile(local.resolvedPath, 'sha256', remaining(), { maxBytes, expectedSize: local.size }),
-            fileOps.hashRemoteFileDigest(args.alias, remotePath, 'sha256', remaining(), {
-                maxBytes,
-                expectedSize: remote.size,
-            }),
+            Promise.resolve().then(() =>
+                fileOps.hashLocalFile(local.resolvedPath, 'sha256', remaining(), { maxBytes, expectedSize: local.size })
+            ),
+            Promise.resolve().then(() =>
+                fileOps.hashRemoteFileDigest(
+                    args.alias,
+                    remotePath,
+                    'sha256',
+                    remaining(),
+                    {
+                        maxBytes,
+                        expectedSize: remote.size,
+                    },
+                    control.signal
+                )
+            ),
         ])
         checks.sha256 = localSha256 === remoteSha256
         const after = await probeRemoteFile(args.alias, remotePath, remaining())
@@ -812,20 +837,27 @@ async function buildSingleFileSyncVerification(
         ) {
             throw new VerificationStageError('remote_probe', 'Remote file changed during sync verification', true)
         }
-    } else if (args.verify.sha256) checks.sha256 = false
+    } else if (args.verify.sha256) {
+        checks.sha256 = false
+    }
     if (args.verify.aclSddl) {
         const command = encodedPowershell(
-            `$acl = Get-Acl -LiteralPath ${quotePowershell(remoteShellPath(remotePath, sessionManager.getRemotePathStyle(args.alias)))}; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)`
+            '$acl = Get-Acl -LiteralPath ' +
+                `${quotePowershell(remoteShellPath(remotePath, sessionManager.getRemotePathStyle(args.alias)))}` +
+                '; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.Acce' +
+                'ssControlSections]::Access)'
         )
         const result = await sessionManager.exec(args.alias, command, {
             timeout: remaining(),
             useLoginUser: true,
             maxOutputSize: 8192,
         })
-        if (!result.success || result.stdoutTruncated)
+        if (!result.success || result.stdoutTruncated) {
             throw new VerificationStageError('remote_probe', 'Windows remote ACL could not be verified', true)
+        }
         checks.acl = result.stdout.trim() === args.verify.aclSddl
     }
+    remaining()
     return {
         kind: 'single_file',
         matched: Object.values(checks).every(Boolean),
@@ -841,7 +873,7 @@ async function buildSingleFileSyncVerification(
 async function buildDirectorySyncVerification(
     args: z.infer<typeof syncSchema>,
     local: ReturnType<typeof fileOps.probeLocalPath>,
-    timeout: number,
+    control: DirectoryVerificationControl,
     deletionBaseline?: DirectoryManifest
 ): Promise<Record<string, unknown> | undefined> {
     if (!args.verify) {
@@ -853,13 +885,7 @@ async function buildDirectorySyncVerification(
     if (!local.exists || !local.isDirectory) {
         return { kind: 'directory', skipped: true, reason: 'bounded directory verification requires a local directory' }
     }
-    if (timeout <= 0) {
-        throw new VerificationStageError(
-            'verification_timeout',
-            'sync operation timeout was exhausted before directory verification started',
-            true
-        )
-    }
+    remainingVerificationTimeout(control)
     const request: DirectoryVerifyRequest = args.verify
     const remoteManifest = await captureRemoteDirectoryManifest(
         args.alias,
@@ -867,7 +893,7 @@ async function buildDirectorySyncVerification(
         request,
         args.exclude,
         directoryVerificationFollowsSymlinks(args),
-        timeout
+        control
     )
     let localManifest: Awaited<ReturnType<typeof createLocalDirectoryManifest>>
     try {
@@ -875,7 +901,8 @@ async function buildDirectorySyncVerification(
             local.resolvedPath,
             request,
             args.exclude,
-            directoryVerificationFollowsSymlinks(args)
+            directoryVerificationFollowsSymlinks(args),
+            control
         )
     } catch (error) {
         throw new VerificationStageError(
@@ -900,10 +927,13 @@ async function buildDirectorySyncVerification(
     }
     if (request.aclSddl && !('skipped' in comparison)) {
         const command = encodedPowershell(
-            `$acl = Get-Acl -LiteralPath ${quotePowershell(remoteShellPath(args.remotePath, sessionManager.getRemotePathStyle(args.alias)))}; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)`
+            '$acl = Get-Acl -LiteralPath ' +
+                `${quotePowershell(remoteShellPath(args.remotePath, sessionManager.getRemotePathStyle(args.alias)))}` +
+                '; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.Acce' +
+                'ssControlSections]::Access)'
         )
         const result = await sessionManager.exec(args.alias, command, {
-            timeout,
+            timeout: remainingVerificationTimeout(control),
             useLoginUser: true,
             maxOutputSize: 8192,
         })
@@ -916,6 +946,7 @@ async function buildDirectorySyncVerification(
         comparison.matched = comparison.matched === true && aclMatch
         comparison.acl = { matched: aclMatch, expected: request.aclSddl, actual: result.stdout.trim() }
     }
+    remainingVerificationTimeout(control)
     return comparison
 }
 
@@ -992,7 +1023,9 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             return formatResult({
                 success: false,
                 code: 'unsupported_remote_platform',
-                error: 'Windows SFTP owner/mode metadata cannot verify POSIX permissions; use Windows ACL verification',
+                error:
+                    'Windows SFTP owner/mode metadata cannot verify POSIX permissions; use ' +
+                    'Windows ACL verification',
             })
         }
     } catch (error) {
@@ -1035,9 +1068,11 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
     try {
         remoteBefore = await probeRemoteFile(args.alias, args.remotePath, args.timeout)
     } catch (error) {
-        return formatResult({
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
+        return formatError(error, {
+            ...sftpOperationOutcome(error),
+            operationStatus: 'failed',
+            failureStage: 'preflight',
+            acknowledgedBytes: 0,
             diagnostics: {
                 local: summarizeLocalPathProbe(local),
                 remoteParent,
@@ -1061,12 +1096,14 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                 })
             }
         } catch (error) {
-            return formatResult({
-                success: false,
+            return formatError(error, {
+                ...sftpOperationOutcome(error),
+                operationStatus: 'failed',
+                failureStage: 'preflight',
+                acknowledgedBytes: 0,
                 code: 'atomic_replace_unverified',
                 atomicReplaceSupported: null,
                 targetReplaced: false,
-                error: error instanceof Error ? error.message : String(error),
             })
         }
     }
@@ -1171,7 +1208,9 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                     args.timeout
                 )
             } catch (error) {
-                const renameNotStarted = error instanceof fileOps.RemoteRenameNotStartedError
+                const renameOutcome = sftpOperationOutcome(error)
+                const renameNotStarted =
+                    renameOutcome.operationStatus === 'failed' || error instanceof fileOps.RemoteRenameNotStartedError
                 const renameError = error instanceof Error ? error.message : String(error)
                 let cleanupWarning: string | undefined
                 try {
@@ -1182,11 +1221,14 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                 return formatResult({
                     success: false,
                     transferSuccess: true,
+                    ...renameOutcome,
+                    acknowledgedBytes: uploadResult.size,
                     operationStatus: renameNotStarted ? 'failed' : 'unknown',
-                    retryable: true,
+                    retryable: false,
                     error: renameNotStarted
                         ? `Atomic SFTP rename request was not sent; target was not replaced: ${renameError}`
-                        : `Atomic SFTP rename response failed; target replacement state is unknown: ${renameError}`,
+                        : 'Atomic SFTP rename response failed; target replacement state is unknown: ' +
+                          `${renameError}`,
                     cleanupWarning,
                     atomic: true,
                     atomicReplaceSupported,
@@ -1246,11 +1288,10 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
                 cleanupWarning = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
             }
         }
-        return formatResult({
-            success: false,
+        return formatError(error, {
             ...sftpOperationOutcome(error),
-            error: error instanceof Error ? error.message : String(error),
             cleanupWarning,
+            targetReplaced: args.atomic ? false : undefined,
             atomicReplaceSupported,
             finalRemotePath: args.remotePath,
             diagnostics: {
@@ -1278,10 +1319,10 @@ async function handleDownload(args: z.infer<typeof downloadSchema>) {
         )
         return formatResult({ ...downloadResult, message: `Downloaded to ${args.localPath}` })
     } catch (error) {
-        return formatResult({
-            success: false,
+        return formatError(error, {
             ...sftpOperationOutcome(error),
-            error: error instanceof Error ? error.message : String(error),
+            operationStatus: 'failed',
+            targetReplaced: false,
             diagnostics: {
                 local: summarizeLocalPathProbe(fileOps.probeLocalPath(args.localPath)),
                 localParent: summarizeLocalPathProbe(fileOps.probeLocalPath(path.dirname(args.localPath))),
@@ -1386,7 +1427,7 @@ async function handleListDir(args: z.infer<typeof listDirSchema>) {
                 ...formatResult({
                     success: false,
                     code: 'LIST_DIR_MAX_BYTES_TOO_SMALL',
-                    error: 'maxBytes is too small for directory page metadata and the next complete entry, if any',
+                    error: 'maxBytes is too small for directory page metadata and the next complete ' + 'entry, if any',
                     offset,
                     next_offset: offset,
                     maxBytes,
@@ -1433,7 +1474,10 @@ async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
     }
 }
 
-async function handleSync(args: z.infer<typeof syncSchema>) {
+async function handleSync(
+    args: z.infer<typeof syncSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     const startedAt = Date.now()
     try {
         args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
@@ -1458,6 +1502,15 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
     } catch (error) {
         return formatError(error)
     }
+    const ownerModeRequested = args.verifyOwner !== undefined || args.verifyMode !== undefined
+    if (ownerModeRequested && (args.direction !== 'upload' || args.dryRun)) {
+        return formatResult({
+            success: false,
+            transferSuccess: false,
+            code: 'UNSUPPORTED_SYNC_VERIFICATION',
+            error: 'verifyOwner/verifyMode require a non-dryRun single-file upload; use verify.owner/verify.mode for directory or download verification',
+        })
+    }
     if (args.verify?.deletions && args.delete !== true) {
         return formatResult({
             success: false,
@@ -1466,7 +1519,8 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
         })
     }
     const operationTimeout = args.operationTimeout ?? 600_000
-    const remainingTimeout = (): number => operationTimeout - (Date.now() - startedAt)
+    const deadline = startedAt + operationTimeout
+    const remainingTimeout = (): number => deadline - Date.now()
     try {
         if (args.direction === 'upload') {
             fileOps.validateSyncUploadSource(args.localPath, args.followSymlinks === true)
@@ -1488,17 +1542,104 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
         args.localPath,
         args.direction === 'upload' && args.followSymlinks === true
     )
-    const diagnostics: Record<string, unknown> = {
-        localBefore: summarizeLocalPathProbe(localBefore),
-        remoteParent: await probeRemoteParent(args.alias, args.remotePath),
+    const diagnostics: Record<string, unknown> = { localBefore: summarizeLocalPathProbe(localBefore) }
+    if (ownerModeRequested && localBefore.exists && localBefore.isDirectory) {
+        return formatResult({
+            success: false,
+            transferSuccess: false,
+            code: 'UNSUPPORTED_SYNC_VERIFICATION',
+            error: 'verifyOwner/verifyMode require a single-file upload; use verify.owner/verify.mode for directory verification',
+            diagnostics,
+        })
     }
+    const controller = new AbortController()
+    const control: DirectoryVerificationControl = {
+        deadline,
+        signal: extra?.signal ? AbortSignal.any([controller.signal, extra.signal]) : controller.signal,
+    }
+    let progressWarning: string | undefined
+    let lastProgressAt = -Infinity
+    let progress = 0
+    let progressPending = false
+    const progressToken = extra?._meta?.progressToken
+    const onProgress =
+        progressToken === undefined
+            ? undefined
+            : (update: TransferProgress): void => {
+                  if (
+                      control.signal?.aborted ||
+                      progressPending ||
+                      progressWarning ||
+                      Date.now() - lastProgressAt < 1000
+                  ) {
+                      return
+                  }
+                  lastProgressAt = Date.now()
+                  progressPending = true
+                  const current = ++progress
+                  void Promise.resolve()
+                      .then(() =>
+                          control.signal?.aborted
+                              ? undefined
+                              : extra!.sendNotification({
+                                    method: 'notifications/progress',
+                                    params: {
+                                        progressToken,
+                                        progress: current,
+                                        message:
+                                            `${args.direction === 'upload' ? '上传' : '下载'}：${update.transferred} bytes，${update.percent}%` +
+                                            (update.total > 0 ? `，当前文件共 ${update.total} bytes` : ''),
+                                    },
+                                })
+                      )
+                      .catch((error: unknown) => {
+                          progressWarning = `MCP progress notification failed: ${error instanceof Error ? error.message : String(error)}`
+                          console.warn(`[ssh_sync] ${progressWarning}`)
+                      })
+                      .finally(() => {
+                          progressPending = false
+                      })
+              }
+    const timer = setTimeout(
+        () => controller.abort(new SftpOperationTimeoutError(operationTimeout)),
+        Math.max(0, remainingTimeout())
+    )
     try {
+        control.signal?.throwIfAborted()
+        const probeTimeout = remainingTimeout()
+        if (probeTimeout <= 0) {
+            throw new Error('sync operation timeout was exhausted before remote probing')
+        }
+        diagnostics.remoteParent = await probeRemoteParent(args.alias, args.remotePath, probeTimeout, control.signal)
+        if (remainingTimeout() <= 0) {
+            throw new Error('sync operation timeout was exhausted before transfer started')
+        }
         const remoteSource =
             args.direction === 'download'
-                ? await fileOps.getFileInfo(args.alias, args.remotePath, remainingTimeout())
+                ? await fileOps.getFileInfo(args.alias, args.remotePath, remainingTimeout(), undefined, control.signal)
                 : undefined
         const sourceIsDirectory =
             args.direction === 'upload' ? localBefore.exists && localBefore.isDirectory : remoteSource!.isDirectory
+        const remoteParent = diagnostics.remoteParent as { exists?: boolean; isDirectory?: boolean }
+        if (
+            args.direction === 'upload' &&
+            !sourceIsDirectory &&
+            !args.dryRun &&
+            (remoteParent.exists === false || (remoteParent.exists === true && remoteParent.isDirectory === false))
+        ) {
+            return formatResult({
+                success: false,
+                transferSuccess: false,
+                operationStatus: 'failed',
+                failureStage: 'remote_prepare',
+                code: remoteParent.exists === false ? 'REMOTE_PARENT_NOT_FOUND' : 'REMOTE_PARENT_NOT_DIRECTORY',
+                error:
+                    remoteParent.exists === false
+                        ? '远端父目录不存在，请先用 ssh_mkdir 创建后重新上传'
+                        : '远端父路径是文件，请改用目录作为父路径',
+                diagnostics,
+            })
+        }
         if (!sourceIsDirectory && (args.verify?.count || args.verify?.deletions || args.verify?.staleFiles)) {
             return formatResult({
                 success: false,
@@ -1527,7 +1668,7 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
         }
         let deletionBaseline: DirectoryManifest | undefined
         try {
-            deletionBaseline = await captureDeletionBaseline(args, remainingTimeout)
+            deletionBaseline = await captureDeletionBaseline(args, control)
             if (deletionBaseline) {
                 diagnostics.deletionBaseline = {
                     count: deletionBaseline.count,
@@ -1539,7 +1680,8 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
                 }
             }
         } catch (error) {
-            const verification = verificationErrorDetails(error)
+            const failure = syncVerificationError(error, control)
+            const verification = verificationErrorDetails(failure)
             return formatResult({
                 success: false,
                 transferSuccess: false,
@@ -1547,7 +1689,9 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
                 verificationSuccess: false,
                 verificationStatus: 'error',
                 failedChecks: ['deletions'],
-                error: `Deletion baseline capture failed: ${error instanceof Error ? error.message : String(error)}`,
+                error:
+                    'Deletion baseline capture failed: ' +
+                    `${failure instanceof Error ? failure.message : String(failure)}`,
                 verification,
                 diagnostics,
             })
@@ -1567,10 +1711,14 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
             exclude: args.exclude,
             recursive: args.recursive,
             followSymlinks: args.followSymlinks,
+            verifySha256: args.verify?.sha256 === true,
             preflightTimeout: args.preflightTimeout,
             connectTimeout: args.connectTimeout,
             operationTimeout: transferTimeout,
+            deadline,
+            signal: control.signal,
             remotePathStyle: sessionManager.getRemotePathStyle(args.alias),
+            onProgress,
         })
         const localAfter = fileOps.probeLocalPath(
             args.localPath,
@@ -1596,24 +1744,25 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
                 const ownerModeVerification = await buildSyncUploadVerification(
                     args,
                     args.direction === 'upload' ? localBefore : localAfter,
-                    remainingTimeout()
+                    control
                 )
                 const contentVerification = sourceIsDirectory
                     ? await buildDirectorySyncVerification(
                           args,
                           args.direction === 'upload' ? localBefore : localAfter,
-                          remainingTimeout(),
+                          control,
                           deletionBaseline
                       )
                     : await buildSingleFileSyncVerification(
                           args,
                           args.direction === 'upload' ? localBefore : transferredLocal,
-                          remainingTimeout()
+                          control
                       )
+                remainingVerificationTimeout(control)
                 verification = mergeSyncVerification(undefined, ownerModeVerification, contentVerification)
             } catch (error) {
-                verificationError = error
-                verification = mergeSyncVerification(undefined, verificationErrorDetails(error), undefined)
+                verificationError = syncVerificationError(error, control)
+                verification = mergeSyncVerification(undefined, verificationErrorDetails(verificationError), undefined)
             }
         }
         const outcome = buildTransferOutcome(syncResult.success, verificationRequested, verification, verificationError)
@@ -1632,13 +1781,16 @@ async function handleSync(args: z.infer<typeof syncSchema>) {
             localPath: args.localPath,
             remotePath: args.remotePath,
             diagnostics,
+            ...(progressWarning ? { progressWarning } : {}),
         })
     } catch (error) {
-        return formatResult({
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
+        return formatError(error, {
+            ...sftpOperationOutcome(error),
             diagnostics,
+            ...(progressWarning ? { progressWarning } : {}),
         })
+    } finally {
+        clearTimeout(timer)
     }
 }
 
@@ -1658,7 +1810,8 @@ export function registerFileTools(server: McpServer): void {
         'ssh_download',
         {
             description:
-                '从远程服务器原子下载文件。新文件使用 0600，替换普通文件时保留其 rwx 权限；symlink、目录和其他非普通目标会被拒绝。timeout 限制单个 SFTP 操作，超时后远端传输状态可能未知。',
+                '从远程服务器原子下载文件。新文件使用 0600，替换普通文件时保留其 rwx 权限；symlink、目录和其他非普通目标会被拒绝。timeout ' +
+                '限制单个 SFTP 操作，超时后远端传输状态可能未知。',
             inputSchema: downloadSchema,
         },
         (args) => handleDownload(args)
@@ -1686,7 +1839,8 @@ export function registerFileTools(server: McpServer): void {
         'ssh_list_dir',
         {
             description:
-                '列出远程目录内容，返回数值 mode 和 permissions 文本；名称与修改时间条件取交集，使用筛选或分页参数时默认最多 100 条、65536 UTF-8 字节，使用 next_offset 续查；完整 readdir 后分页，目录变化时不保证快照一致性',
+                '列出远程目录内容，返回数值 mode 和 permissions 文本；名称与修改时间条件取交集，使用筛选或分页参数时默认最多 100 ' +
+                '条、65536 UTF-8 字节，使用 next_offset 续查；完整 readdir 后分页，目录变化时不保证快照一致性',
             inputSchema: listDirSchema,
         },
         (args) => handleListDir(args)
@@ -1713,23 +1867,27 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_sync',
         {
-            description: `智能文件同步（支持目录递归）
-
-只有直连且使用已校验 key path 或可用 SSH agent 的 session 才探测 rsync；password、inline key 和 jump host session 使用 SFTP
-满足 rsync 条件且本地、远端均可用 rsync 时使用 rsync，否则使用 SFTP
-rsync 可实现增量传输，对大目录同步效率更高
-
-用途：
-- 同步本地目录到远程
-- 从远程同步目录到本地
-- 支持排除特定文件/目录
-
-示例：
-- 上传目录: ssh_sync(alias="server", localPath="/local/dir", remotePath="/remote/dir", direction="upload")
-- 下载目录: ssh_sync(alias="server", localPath="/local/dir", remotePath="/remote/dir", direction="download")
-- 排除文件: ssh_sync(..., exclude=["*.log", "node_modules"])`,
+            description:
+                '智能文件同步（支持目录递归）\n' +
+                '\n' +
+                '只有直连且使用已校验 key path 或可用 SSH agent 的 session 才探测 rsync；password、inline ' +
+                'key 和 jump host session 使用 SFTP\n' +
+                '满足 rsync 条件且本地、远端均可用 rsync 时使用 rsync，否则使用 SFTP\n' +
+                'rsync 可实现增量传输，对大目录同步效率更高\n' +
+                '\n' +
+                '用途：\n' +
+                '- 同步本地目录到远程\n' +
+                '- 从远程同步目录到本地\n' +
+                '- 支持排除特定文件/目录\n' +
+                '\n' +
+                '示例：\n' +
+                '- 上传目录: ssh_sync(alias="server", localPath="/local/dir", ' +
+                'remotePath="/remote/dir", direction="upload")\n' +
+                '- 下载目录: ssh_sync(alias="server", localPath="/local/dir", ' +
+                'remotePath="/remote/dir", direction="download")\n' +
+                '- 排除文件: ssh_sync(..., exclude=["*.log", "node_modules"])',
             inputSchema: syncSchema,
         },
-        (args) => handleSync(args)
+        (args, extra) => handleSync(args, extra)
     )
 }

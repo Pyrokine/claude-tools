@@ -1,4 +1,11 @@
 import assert from 'node:assert/strict'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { generateKeyPairSync } from 'node:crypto'
+import ssh2 from 'ssh2'
+import { KnownHosts } from '../dist/known-hosts.js'
 import { exec as execCallback, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
@@ -6,12 +13,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import test from 'node:test'
+import { clearTimeout } from 'node:timers'
 import { promisify } from 'node:util'
 import { classifyCommandRisk } from '../dist/command-risk.js'
 import {
-    createRemoteDirectoryManifest,
     compareDirectoryManifests,
     createLocalDirectoryManifest,
+    createOpenSshDirectoryManifest,
+    createRemoteDirectoryManifest,
     matchesDirectoryExclude,
 } from '../dist/directory-verification.js'
 import {
@@ -75,15 +84,31 @@ function fixtureSftp() {
             read.add(directory)
             callback(
                 null,
-                fs.readdirSync(directory).map((filename) => ({ filename, attrs: {} }))
+                fs.readdirSync(directory).map((filename) => {
+                    const stats = fs.statSync(path.join(directory, filename))
+                    return {
+                        filename,
+                        attrs: {
+                            mode: stats.mode,
+                            size: stats.size,
+                            uid: stats.uid,
+                            gid: stats.gid,
+                            mtime: Math.floor(stats.mtimeMs / 1000),
+                            atime: Math.floor(stats.atimeMs / 1000),
+                        },
+                    }
+                })
             )
         },
         close(_handle, callback) {
             callback(null)
         },
-        createReadStream(remotePath) {
-            return fs.createReadStream(remotePath)
+        createReadStream(remotePath, options) {
+            return fs.createReadStream(remotePath, options)
         },
+        createWriteStream: (name, options) => fs.createWriteStream(name, options),
+        mkdir: (name, attributes, callback = attributes) => fs.mkdir(name, callback),
+        end() {},
     }
 }
 
@@ -130,7 +155,9 @@ test('SFTP reads preserve U+FEFF at nonzero offsets and later line starts', asyn
     assert.equal(line.content, '﻿second\n')
     for (const bigEndian of [false, true]) {
         const utf16 = Buffer.from('﻿A﻿B', 'utf16le')
-        if (bigEndian) utf16.swap16()
+        if (bigEndian) {
+            utf16.swap16()
+        }
         fs.writeFileSync(localPath, utf16)
         const page = await readFile('unused', localPath, { offset: 4 })
         assert.equal(page.encoding, bigEndian ? 'utf16be' : 'utf16le')
@@ -183,6 +210,111 @@ test('failed recursive upload retains successful parent-directory statistics', a
     assert.equal(fs.readFileSync(path.join(target, 'done.txt'), 'utf8'), 'retained')
 })
 
+test('SFTP upload rejects errored and unfinished streams that close without error events', async (t) => {
+    const directory = makeTempDir(t)
+    const source = path.join(directory, 'source.txt')
+    fs.writeFileSync(source, 'data')
+    const originalGetSftp = sessionManager.getSftp
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+    for (const failure of ['write_error', 'unfinished']) {
+        let errorEvents = 0
+        sessionManager.getSftp = async () => ({
+            createWriteStream() {
+                const stream = new Writable({
+                    autoDestroy: false,
+                    emitClose: false,
+                    write(_chunk, _encoding, callback) {
+                        this.destroy()
+                        if (failure === 'write_error') {
+                            callback(new Error('fixture SFTP WRITE failed'))
+                        }
+                    },
+                    destroy(error, callback) {
+                        setImmediate(() => {
+                            callback(error)
+                            this.emit('close')
+                        })
+                    },
+                })
+                stream.on('error', () => {
+                    ++errorEvents
+                })
+                return stream
+            },
+            end() {},
+        })
+        await assert.rejects(
+            () => uploadFile('fixture', source, path.join(directory, 'target.txt')),
+            failure === 'write_error' ? /fixture SFTP WRITE failed/ : /closed before finish/
+        )
+        assert.equal(errorEvents, 0)
+    }
+    sessionManager.getSftp = async () => ({
+        createWriteStream(remotePath, options) {
+            return fs.createWriteStream(remotePath, options)
+        },
+        end() {},
+    })
+    const target = path.join(directory, 'complete.txt')
+    assert.equal((await uploadFile('fixture', source, target)).success, true)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'data')
+})
+
+test('SFTP upload accepts acknowledged close before finish and rejects incomplete acknowledgements', async (t) => {
+    const directory = makeTempDir(t)
+    const source = path.join(directory, 'source.txt')
+    const originalGetSftp = sessionManager.getSftp
+    t.after(() => {
+        sessionManager.getSftp = originalGetSftp
+    })
+    for (const [content, acknowledged] of [
+        ['data', true],
+        ['', true],
+        ['data', false],
+    ]) {
+        fs.writeFileSync(source, content)
+        let stream
+        sessionManager.getSftp = async () => ({
+            createWriteStream() {
+                stream = new Writable({
+                    autoDestroy: false,
+                    emitClose: false,
+                    write(chunk, _encoding, callback) {
+                        if (acknowledged) {
+                            this.bytesWritten += chunk.length
+                        }
+                        callback()
+                    },
+                    final(callback) {
+                        this.destroy()
+                        callback()
+                    },
+                    destroy(error, callback) {
+                        setImmediate(() => {
+                            callback(error)
+                            this.emit('close')
+                        })
+                    },
+                })
+                stream.bytesWritten = 0
+                return stream
+            },
+            end() {},
+        })
+        const upload = uploadFile('fixture', source, path.join(directory, 'target.txt'))
+        if (acknowledged) {
+            assert.equal((await upload).success, true)
+        } else {
+            await assert.rejects(upload, /closed before finish/)
+        }
+        assert.equal(stream.writableFinished, false)
+        assert.equal(stream.writableEnded, true)
+        assert.equal(stream.writableLength, 0)
+    }
+})
+
 test('upload timeout bounds metadata, digest, and failed verification cleanup', async (t) => {
     const directory = makeTempDir(t)
     const localPath = path.join(directory, 'source.txt')
@@ -197,7 +329,7 @@ test('upload timeout bounds metadata, digest, and failed verification cleanup', 
         syncBuiltinESMExports()
     })
     const payload = fs.readFileSync(localPath)
-    fs.createReadStream = () => Readable.from([payload])
+    assert.equal(Reflect.defineProperty(fs, 'createReadStream', { value: () => Readable.from([payload]) }), true)
     syncBuiltinESMExports()
     for (const phase of ['metadata', 'digest', 'cleanup']) {
         const streams = new Set()
@@ -226,16 +358,22 @@ test('upload timeout bounds metadata, digest, and failed verification cleanup', 
                 })
             },
             createReadStream() {
-                if (phase === 'digest') reachedPhase = true
+                if (phase === 'digest') {
+                    reachedPhase = true
+                }
                 const stream = new Readable({ read() {} })
                 streams.add(stream)
                 return stream
             },
             unlink() {
-                if (phase === 'cleanup') reachedPhase = true
+                if (phase === 'cleanup') {
+                    reachedPhase = true
+                }
             },
             end() {
-                for (const stream of streams) stream.destroy()
+                for (const stream of streams) {
+                    stream.destroy()
+                }
             },
         })
         const started = Date.now()
@@ -252,8 +390,20 @@ test('upload timeout bounds metadata, digest, and failed verification cleanup', 
         assert.equal(result.success, false, phase)
         assert.equal(reachedPhase, true, `${phase}: ${JSON.stringify(result)}`)
         assert.ok(Date.now() - started < 2000, phase)
-        if (phase === 'cleanup') assert.match(result.cleanupWarning, /timed out/)
-        if (phase === 'digest') assert.equal(result.verificationStatus, 'error')
+        if (phase === 'metadata') {
+            assert.equal(response.isError, true)
+            assert.equal(result.operationStatus, 'failed')
+            assert.equal(result.failureStage, 'preflight')
+            assert.equal(result.acknowledgedBytes, 0)
+            assert.equal(result.retryable, true)
+            assert.equal(result.diagnostics.remoteProbe.operationStatus, 'unknown')
+        }
+        if (phase === 'cleanup') {
+            assert.match(result.cleanupWarning, /timed out/)
+        }
+        if (phase === 'digest') {
+            assert.equal(result.verificationStatus, 'error')
+        }
     }
 })
 
@@ -548,6 +698,10 @@ test('command risk distinguishes background operators from conjunctions, redirec
     }
 })
 
+
+
+
+
 test('command risk preserves the inclusive bounded-search timeout boundary', () => {
     for (const command of ['find /tmp/example -name file', 'grep -R pattern /tmp/example']) {
         for (const timeout of [1, 30_000, 300_000]) {
@@ -737,197 +891,210 @@ test('file mode metadata and permission text preserve special bits', async () =>
     assert.equal(files[0].permissions, '-rwsr-xr-x')
 })
 
-test('public directory listing filters intersections and bounds pages without truncating internal enumeration', async (t) => {
-    const handlers = new Map()
-    registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
-    const entry = handlers.get('ssh_list_dir')
-    const epoch = Date.parse('2026-01-01T00:00:00Z') / 1000
-    const attrs = { size: 7, mode: 0o100644, uid: 1, gid: 2, mtime: epoch, atime: epoch }
-    let entries = Array.from({ length: 120 }, (_, index) => ({
-        filename: `file-${String(index).padStart(3, '0')}.log`,
-        attrs: { ...attrs, mtime: epoch + index },
-    }))
-    entries.push(
-        { filename: 'z-directory', attrs: { ...attrs, mode: 0o40755 } },
-        { filename: '.hidden.log', attrs: { ...attrs, mtime: epoch + 5 } },
-        { filename: 'a+b[1].txt', attrs },
-        { filename: '中文😀.txt', attrs },
-        { filename: 'a\nb.txt', attrs }
-    )
-    const originalGetSftp = sessionManager.getSftp
-    let reads = 0
-    sessionManager.getSftp = async () => ({
-        readdir(_remotePath, callback) {
-            ++reads
-            callback(null, entries)
-        },
-        end() {},
-    })
-    t.after(() => {
-        sessionManager.getSftp = originalGetSftp
-    })
-    const call = async (options = {}) => {
-        const response = await entry.handler(
-            entry.definition.inputSchema.parse({ alias: 'fixture', remotePath: '/remote/中文', ...options })
+test(
+    'public directory listing filters intersections and bounds pages without ' + 'truncating internal enumeration',
+    async (t) => {
+        const handlers = new Map()
+        registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
+        const entry = handlers.get('ssh_list_dir')
+        const epoch = Date.parse('2026-01-01T00:00:00Z') / 1000
+        const attrs = { size: 7, mode: 0o100644, uid: 1, gid: 2, mtime: epoch, atime: epoch }
+        let entries = Array.from({ length: 120 }, (_, index) => ({
+            filename: `file-${String(index).padStart(3, '0')}.log`,
+            attrs: { ...attrs, mtime: epoch + index },
+        }))
+        entries.push(
+            { filename: 'z-directory', attrs: { ...attrs, mode: 0o40755 } },
+            { filename: '.hidden.log', attrs: { ...attrs, mtime: epoch + 5 } },
+            { filename: 'a+b[1].txt', attrs },
+            { filename: '中文😀.txt', attrs },
+            { filename: 'a\nb.txt', attrs }
         )
-        return { response, data: JSON.parse(response.content[0].text) }
-    }
-    const legacy = (await call()).data
-    assert.deepEqual(Object.keys(legacy), ['success', 'path', 'count', 'files'])
-    assert.equal(legacy.count, 124)
-    assert.equal(legacy.files[0].name, 'z-directory')
-    assert.equal((await call({ showHidden: true })).data.count, 125)
-    assert.equal((await call({ timeout: 1000 })).data.has_more, undefined)
-    const first = await call({ namePattern: '*' })
-    assert.equal(first.data.count, 100)
-    assert.equal(first.data.total_count, 124)
-    assert.equal(first.data.has_more, true)
-    assert.equal(first.data.next_offset, 100)
-    assert.ok(Buffer.byteLength(first.response.content[0].text, 'utf8') <= 65536)
-    assert.deepEqual(first.data.files, legacy.files.slice(0, 100))
-    const names = []
-    let offset = 0
-    for (;;) {
-        const page = await call({ offset, limit: 17, maxBytes: 7000 })
-        assert.ok(Buffer.byteLength(page.response.content[0].text, 'utf8') <= 7000)
-        assert.equal(page.data.count, page.data.files.length)
-        assert.equal(page.data.next_offset, offset + page.data.count)
-        names.push(...page.data.files.map((file) => file.name))
-        if (!page.data.has_more) break
-        assert.ok(page.data.next_offset > offset)
-        offset = page.data.next_offset
-    }
-    assert.deepEqual(
-        names,
-        legacy.files.map((file) => file.name)
-    )
-    const interval = {
-        namePattern: '*.log',
-        modifiedAfter: '2026-01-01T08:00:05+08:00',
-        modifiedBefore: '2026-01-01T00:00:08Z',
-    }
-    const filtered = (await call(interval)).data
-    assert.deepEqual(
-        filtered.files.map((file) => file.name),
-        ['file-005.log', 'file-006.log', 'file-007.log']
-    )
-    assert.equal(filtered.has_more, false)
-    assert.equal(filtered.next_offset, 3)
-    assert.equal((await call({ ...interval, showHidden: true })).data.count, 4)
-    assert.equal((await call({ modifiedAfter: '2026-01-01T00:01:59Z' })).data.count, 1)
-    assert.equal((await call({ modifiedBefore: '2026-01-01T00:00:01Z' })).data.count, 5)
-    assert.equal(
-        (await call({ namePattern: '*.log', modifiedAfter: '2026-01-01T00:00:00.0001Z' })).data.total_count,
-        119
-    )
-    assert.equal((await call({ namePattern: '*.log', modifiedBefore: '2026-01-01T00:00:00.0001Z' })).data.count, 1)
-    assert.equal((await call({ ...interval, modifiedBefore: '2026-01-01T00:00:05.000000Z' })).data.count, 0)
-    for (const [namePattern, expected] of [
-        ['a+b[1].txt', ['a+b[1].txt']],
-        ['中文??.txt', ['中文😀.txt']],
-        ['a*b.txt', ['a\nb.txt']],
-        ['FILE-*.log', []],
-        ['no-match', []],
-    ]) {
+        const originalGetSftp = sessionManager.getSftp
+        let reads = 0
+        sessionManager.getSftp = async () => ({
+            readdir(_remotePath, callback) {
+                ++reads
+                callback(null, entries)
+            },
+            end() {},
+        })
+        t.after(() => {
+            sessionManager.getSftp = originalGetSftp
+        })
+        const call = async (options = {}) => {
+            const response = await entry.handler(
+                entry.definition.inputSchema.parse({ alias: 'fixture', remotePath: '/remote/中文', ...options })
+            )
+            return { response, data: JSON.parse(response.content[0].text) }
+        }
+        const legacy = (await call()).data
+        assert.deepEqual(Object.keys(legacy), ['success', 'path', 'count', 'files'])
+        assert.equal(legacy.count, 124)
+        assert.equal(legacy.files[0].name, 'z-directory')
+        assert.equal((await call({ showHidden: true })).data.count, 125)
+        assert.equal((await call({ timeout: 1000 })).data.has_more, undefined)
+        const first = await call({ namePattern: '*' })
+        assert.equal(first.data.count, 100)
+        assert.equal(first.data.total_count, 124)
+        assert.equal(first.data.has_more, true)
+        assert.equal(first.data.next_offset, 100)
+        assert.ok(Buffer.byteLength(first.response.content[0].text, 'utf8') <= 65536)
+        assert.deepEqual(first.data.files, legacy.files.slice(0, 100))
+        const names = []
+        let offset = 0
+        for (;;) {
+            const page = await call({ offset, limit: 17, maxBytes: 7000 })
+            assert.ok(Buffer.byteLength(page.response.content[0].text, 'utf8') <= 7000)
+            assert.equal(page.data.count, page.data.files.length)
+            assert.equal(page.data.next_offset, offset + page.data.count)
+            names.push(...page.data.files.map((file) => file.name))
+            if (!page.data.has_more) {
+                break
+            }
+            assert.ok(page.data.next_offset > offset)
+            offset = page.data.next_offset
+        }
         assert.deepEqual(
-            (await call({ namePattern })).data.files.map((file) => file.name),
-            expected
+            names,
+            legacy.files.map((file) => file.name)
         )
+        const interval = {
+            namePattern: '*.log',
+            modifiedAfter: '2026-01-01T08:00:05+08:00',
+            modifiedBefore: '2026-01-01T00:00:08Z',
+        }
+        const filtered = (await call(interval)).data
+        assert.deepEqual(
+            filtered.files.map((file) => file.name),
+            ['file-005.log', 'file-006.log', 'file-007.log']
+        )
+        assert.equal(filtered.has_more, false)
+        assert.equal(filtered.next_offset, 3)
+        assert.equal((await call({ ...interval, showHidden: true })).data.count, 4)
+        assert.equal((await call({ modifiedAfter: '2026-01-01T00:01:59Z' })).data.count, 1)
+        assert.equal((await call({ modifiedBefore: '2026-01-01T00:00:01Z' })).data.count, 5)
+        assert.equal(
+            (await call({ namePattern: '*.log', modifiedAfter: '2026-01-01T00:00:00.0001Z' })).data.total_count,
+            119
+        )
+        assert.equal((await call({ namePattern: '*.log', modifiedBefore: '2026-01-01T00:00:00.0001Z' })).data.count, 1)
+        assert.equal((await call({ ...interval, modifiedBefore: '2026-01-01T00:00:05.000000Z' })).data.count, 0)
+        for (const [namePattern, expected] of [
+            ['a+b[1].txt', ['a+b[1].txt']],
+            ['中文??.txt', ['中文😀.txt']],
+            ['a*b.txt', ['a\nb.txt']],
+            ['FILE-*.log', []],
+            ['no-match', []],
+        ]) {
+            assert.deepEqual(
+                (await call({ namePattern })).data.files.map((file) => file.name),
+                expected
+            )
+        }
+        const empty = (await call({ ...interval, modifiedBefore: interval.modifiedAfter })).data
+        assert.equal(empty.total_count, 0)
+        assert.equal(empty.has_more, false)
+        assert.equal(empty.next_offset, 0)
+        const beyond = (await call({ offset: 1000 })).data
+        assert.deepEqual(beyond.files, [])
+        assert.equal(beyond.has_more, false)
+        assert.equal(beyond.next_offset, 1000)
+        const beforeInvalid = reads
+        for (const invalid of [
+            { offset: -1 },
+            { offset: 0.5 },
+            { offset: Number.MAX_SAFE_INTEGER + 1 },
+            { limit: 0 },
+            { limit: 1.5 },
+            { maxBytes: 0 },
+            { maxBytes: -1 },
+            { modifiedAfter: 'not-a-date' },
+            { modifiedBefore: '2026-02-30T00:00:00Z' },
+            { modifiedAfter: '2026-01-01T00:00:00' },
+            { ...interval, modifiedBefore: '2026-01-01T00:00:04Z' },
+            { modifiedAfter: '2026-01-01T00:00:00.0002Z', modifiedBefore: '2026-01-01T00:00:00.0001Z' },
+        ]) {
+            await assert.rejects(call(invalid))
+        }
+        assert.equal(reads, beforeInvalid)
+        assert.equal((await listDir('fixture', '/remote/中文', true)).length, 125)
+        entries.push({ filename: '../unsafe', attrs })
+        const unsafe = await call({ namePattern: 'no-match', offset: 1000, limit: 1 })
+        assert.equal(unsafe.response.isError, true)
+        assert.match(unsafe.data.error, /unsafe entry name/)
     }
-    const empty = (await call({ ...interval, modifiedBefore: interval.modifiedAfter })).data
-    assert.equal(empty.total_count, 0)
-    assert.equal(empty.has_more, false)
-    assert.equal(empty.next_offset, 0)
-    const beyond = (await call({ offset: 1000 })).data
-    assert.deepEqual(beyond.files, [])
-    assert.equal(beyond.has_more, false)
-    assert.equal(beyond.next_offset, 1000)
-    const beforeInvalid = reads
-    for (const invalid of [
-        { offset: -1 },
-        { offset: 0.5 },
-        { offset: Number.MAX_SAFE_INTEGER + 1 },
-        { limit: 0 },
-        { limit: 1.5 },
-        { maxBytes: 0 },
-        { maxBytes: -1 },
-        { modifiedAfter: 'not-a-date' },
-        { modifiedBefore: '2026-02-30T00:00:00Z' },
-        { modifiedAfter: '2026-01-01T00:00:00' },
-        { ...interval, modifiedBefore: '2026-01-01T00:00:04Z' },
-        { modifiedAfter: '2026-01-01T00:00:00.0002Z', modifiedBefore: '2026-01-01T00:00:00.0001Z' },
-    ]) {
-        await assert.rejects(call(invalid))
-    }
-    assert.equal(reads, beforeInvalid)
-    assert.equal((await listDir('fixture', '/remote/中文', true)).length, 125)
-    entries.push({ filename: '../unsafe', attrs })
-    const unsafe = await call({ namePattern: 'no-match', offset: 1000, limit: 1 })
-    assert.equal(unsafe.response.isError, true)
-    assert.match(unsafe.data.error, /unsafe entry name/)
-})
+)
 
-test('public directory byte budget measures emitted UTF-8 JSON and never advances past an oversized entry', async (t) => {
-    const handlers = new Map()
-    registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
-    const entry = handlers.get('ssh_list_dir')
-    const attrs = { size: 7, mode: 0o100644, uid: 1, gid: 2, mtime: 0, atime: 0 }
-    let entries = [{ filename: '中文😀"line\nfile.txt', attrs }]
-    const originalGetSftp = sessionManager.getSftp
-    sessionManager.getSftp = async () => ({
-        readdir(_remotePath, callback) {
-            callback(null, entries)
-        },
-        end() {},
-    })
-    t.after(() => {
-        sessionManager.getSftp = originalGetSftp
-    })
-    const call = async (options = {}) => {
-        const response = await entry.handler(
-            entry.definition.inputSchema.parse({ alias: 'fixture', remotePath: '/remote/中文', limit: 1, ...options })
-        )
-        return { response, data: JSON.parse(response.content[0].text) }
-    }
-    const full = await call()
-    const bytes = Buffer.byteLength(full.response.content[0].text, 'utf8')
-    assert.ok(bytes > full.response.content[0].text.length)
-    const exact = await call({ maxBytes: bytes })
-    assert.equal(exact.response.content[0].text, full.response.content[0].text)
-    for (const maxBytes of [1, bytes - 1]) {
-        const failed = await call({ maxBytes })
+test(
+    'public directory byte budget measures emitted UTF-8 JSON and never ' + 'advances past an oversized entry',
+    async (t) => {
+        const handlers = new Map()
+        registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
+        const entry = handlers.get('ssh_list_dir')
+        const attrs = { size: 7, mode: 0o100644, uid: 1, gid: 2, mtime: 0, atime: 0 }
+        let entries = [{ filename: '中文😀"line\nfile.txt', attrs }]
+        const originalGetSftp = sessionManager.getSftp
+        sessionManager.getSftp = async () => ({
+            readdir(_remotePath, callback) {
+                callback(null, entries)
+            },
+            end() {},
+        })
+        t.after(() => {
+            sessionManager.getSftp = originalGetSftp
+        })
+        const call = async (options = {}) => {
+            const response = await entry.handler(
+                entry.definition.inputSchema.parse({
+                    alias: 'fixture',
+                    remotePath: '/remote/中文',
+                    limit: 1,
+                    ...options,
+                })
+            )
+            return { response, data: JSON.parse(response.content[0].text) }
+        }
+        const full = await call()
+        const bytes = Buffer.byteLength(full.response.content[0].text, 'utf8')
+        assert.ok(bytes > full.response.content[0].text.length)
+        const exact = await call({ maxBytes: bytes })
+        assert.equal(exact.response.content[0].text, full.response.content[0].text)
+        for (const maxBytes of [1, bytes - 1]) {
+            const failed = await call({ maxBytes })
+            assert.equal(failed.response.isError, true)
+            assert.equal(failed.data.success, false)
+            assert.equal(failed.data.code, 'LIST_DIR_MAX_BYTES_TOO_SMALL')
+            assert.equal(failed.data.offset, 0)
+            assert.equal(failed.data.next_offset, 0)
+            assert.ok(failed.data.requiredBytes > maxBytes)
+        }
+        entries = [
+            { filename: 'a.txt', attrs },
+            { filename: `z-${'中文'.repeat(100)}.txt`, attrs },
+        ]
+        const small = await call()
+        const maxBytes = Buffer.byteLength(small.response.content[0].text, 'utf8')
+        const page = await call({ limit: 100, maxBytes })
+        assert.equal(page.data.count, 1)
+        assert.equal(page.data.has_more, true)
+        assert.equal(page.data.next_offset, 1)
+        const failed = await call({ offset: page.data.next_offset, maxBytes })
         assert.equal(failed.response.isError, true)
-        assert.equal(failed.data.success, false)
-        assert.equal(failed.data.code, 'LIST_DIR_MAX_BYTES_TOO_SMALL')
-        assert.equal(failed.data.offset, 0)
-        assert.equal(failed.data.next_offset, 0)
-        assert.ok(failed.data.requiredBytes > maxBytes)
+        assert.equal(failed.data.next_offset, 1)
+        assert.equal(failed.data.offset, 1)
+        entries = Array.from({ length: 120 }, (_, index) => ({ filename: `${index}-${'中文'.repeat(100)}.txt`, attrs }))
+        const defaultBudget = await call({ limit: 100 })
+        assert.ok(defaultBudget.data.count > 0 && defaultBudget.data.count < 100)
+        assert.equal(defaultBudget.data.has_more, true)
+        assert.ok(Buffer.byteLength(defaultBudget.response.content[0].text, 'utf8') <= 65536)
+        entries = []
+        const empty = await call()
+        const emptyBytes = Buffer.byteLength(empty.response.content[0].text, 'utf8')
+        assert.equal((await call({ maxBytes: emptyBytes })).data.success, true)
+        assert.equal((await call({ maxBytes: emptyBytes - 1 })).response.isError, true)
     }
-    entries = [
-        { filename: 'a.txt', attrs },
-        { filename: `z-${'中文'.repeat(100)}.txt`, attrs },
-    ]
-    const small = await call()
-    const maxBytes = Buffer.byteLength(small.response.content[0].text, 'utf8')
-    const page = await call({ limit: 100, maxBytes })
-    assert.equal(page.data.count, 1)
-    assert.equal(page.data.has_more, true)
-    assert.equal(page.data.next_offset, 1)
-    const failed = await call({ offset: page.data.next_offset, maxBytes })
-    assert.equal(failed.response.isError, true)
-    assert.equal(failed.data.next_offset, 1)
-    assert.equal(failed.data.offset, 1)
-    entries = Array.from({ length: 120 }, (_, index) => ({ filename: `${index}-${'中文'.repeat(100)}.txt`, attrs }))
-    const defaultBudget = await call({ limit: 100 })
-    assert.ok(defaultBudget.data.count > 0 && defaultBudget.data.count < 100)
-    assert.equal(defaultBudget.data.has_more, true)
-    assert.ok(Buffer.byteLength(defaultBudget.response.content[0].text, 'utf8') <= 65536)
-    entries = []
-    const empty = await call()
-    const emptyBytes = Buffer.byteLength(empty.response.content[0].text, 'utf8')
-    assert.equal((await call({ maxBytes: emptyBytes })).data.success, true)
-    assert.equal((await call({ maxBytes: emptyBytes - 1 })).response.isError, true)
-})
+)
 
 test('atomic upload paths are unpredictable and exclusive SFTP writes refuse reuse', async (t) => {
     const directory = makeTempDir(t)
@@ -1198,7 +1365,7 @@ test('SFTP read pagination returns whole UTF-8 characters and next byte offsets'
     sessionManager.getSftp = async () => ({
         _extensions: { 'posix-rename@openssh.com': '1' },
         stat(_remotePath, callback) {
-            callback(null, { size: content.length })
+            callback(null, { size: content.length, mode: 0o100600 })
         },
         createReadStream(_remotePath, { start, end }) {
             return Readable.from([content.subarray(start, end + 1)])
@@ -1224,6 +1391,7 @@ test('SFTP read pagination returns whole UTF-8 characters and next byte offsets'
 })
 
 test('SFTP timeout reports an unknown remote operation state and ignores late callbacks', async (t) => {
+    t.mock.method(Date, 'now', () => 1700000000000)
     const originalGetSftp = sessionManager.getSftp
     let ended = false
     let statCallback
@@ -1252,6 +1420,149 @@ test('SFTP timeout reports an unknown remote operation state and ignores late ca
     assert.equal(ended, true)
     statCallback(null, { size: 0, mode: 0o100644, uid: 1, gid: 1, mtime: 0, atime: 0 })
     await new Promise((resolve) => setImmediate(resolve))
+})
+
+test('I051 SDK sync progress reaches clients for both SFTP directions and directory recursion', async (t) => {
+    const root = makeTempDir(t)
+    const originalSftp = sessionManager.getSftp
+    const originalCapability = sessionManager.getExternalTransferCapability
+    sessionManager.getExternalTransferCapability = () => ({ rsyncEligible: false, decisionReason: 'owned_sftp' })
+    sessionManager.getSftp = async () => fixtureSftp()
+    t.after(() => {
+        sessionManager.getSftp = originalSftp
+        sessionManager.getExternalTransferCapability = originalCapability
+    })
+    for (const direction of ['upload', 'download']) {
+        for (const directory of [false, true]) {
+            await t.test(`${direction}/${directory ? 'directory' : 'file'}`, async () => {
+                const name = `${direction}-${directory}`
+                const source = path.join(root, name + '-source')
+                const target = path.join(root, name + '-target')
+                const data = Buffer.alloc(256 * 1024, 42)
+                if (directory) {
+                    fs.mkdirSync(path.join(source, 'nested'), { recursive: true })
+                    fs.writeFileSync(path.join(source, 'nested', 'owned.bin'), data)
+                } else {
+                    fs.writeFileSync(source, data)
+                }
+                const server = new McpServer({ name: 'owned-progress-server', version: '3.1.0' })
+                const client = new Client({ name: 'owned-progress-client', version: '1.0.0' })
+                registerFileTools(server)
+                const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+                try {
+                    await server.connect(serverTransport)
+                    await client.connect(clientTransport)
+                    const notifications = []
+                    const args = {
+                        alias: 'owned-progress',
+                        direction,
+                        localPath: direction === 'upload' ? source : target,
+                        remotePath: direction === 'upload' ? target : source,
+                    }
+                    const response = await client.callTool({ name: 'ssh_sync', arguments: args }, undefined, {
+                        onprogress: (progress) => notifications.push(progress),
+                    })
+                    const result = JSON.parse(response.content[0].text)
+                    assert.equal(result.success, true, JSON.stringify(result))
+                    assert.ok(notifications.length > 0)
+                    assert.match(notifications[0].message, /bytes/)
+                    assert.ok(
+                        notifications.every(
+                            (item, index) => index === 0 || item.progress > notifications[index - 1].progress
+                        )
+                    )
+                    assert.deepEqual(
+                        fs.readFileSync(directory ? path.join(target, 'nested', 'owned.bin') : target),
+                        data
+                    )
+                    if (!directory) {
+                        const ordinary = await client.callTool({ name: 'ssh_sync', arguments: args })
+                        assert.equal(JSON.parse(ordinary.content[0].text).success, true)
+                    }
+                } finally {
+                    const cleanup = await Promise.allSettled([client.close(), server.close()])
+                    assert.deepEqual(
+                        cleanup.filter((item) => item.status === 'rejected'),
+                        []
+                    )
+                }
+            })
+        }
+    }
+})
+
+
+
+test('I019 missing remote parents return actionable preparation failures before an upload', async (t) => {
+    const root = makeTempDir(t)
+    const source = path.join(root, 'owned.txt')
+    fs.writeFileSync(source, 'owned')
+    const originalSftp = sessionManager.getSftp
+    let writes = 0
+    sessionManager.getSftp = async () => ({
+        ...fixtureSftp(),
+        createWriteStream() {
+            ++writes
+            throw new Error('Unexpected upload')
+        },
+        end() {},
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalSftp
+    })
+    const handlers = new Map()
+    registerFileTools({
+        registerTool(name, _definition, handler) {
+            handlers.set(name, handler)
+        },
+    })
+    const response = await handlers.get('ssh_sync')({
+        alias: 'owned-parent',
+        localPath: source,
+        remotePath: path.join(root, 'missing', 'owned.txt'),
+        direction: 'upload',
+    })
+    const result = JSON.parse(response.content[0].text)
+    assert.equal(result.success, false)
+    assert.equal(result.code, 'REMOTE_PARENT_NOT_FOUND')
+    assert.equal(result.operationStatus, 'failed')
+    assert.equal(result.failureStage, 'remote_prepare')
+    assert.match(result.error, /ssh_mkdir/)
+    assert.equal(writes, 0)
+})
+
+
+
+test('I046 read_file rejects directories and other nonregular targets before creating a stream', async (t) => {
+    const originalSftp = sessionManager.getSftp
+    let mode = 0o040755
+    let ended = 0
+    let streams = 0
+    sessionManager.getSftp = async () => ({
+        stat(_name, callback) {
+            callback(null, { size: 0, mode })
+        },
+        createReadStream() {
+            ++streams
+            throw new Error('Unexpected read stream')
+        },
+        end() {
+            ++ended
+        },
+    })
+    t.after(() => {
+        sessionManager.getSftp = originalSftp
+    })
+    for (mode of [0o040755, 0o010644]) {
+        await assert.rejects(readFile('owned-read', '/owned/target'), /directory|regular file/i)
+        assert.equal(streams, 0)
+    }
+    mode = 0o100600
+    const empty = await readFile('owned-read', '/owned/empty')
+    assert.equal(empty.content, '')
+    assert.equal(empty.size, 0)
+    assert.equal(streams, 0)
+    assert.equal(ended, 3)
 })
 
 test('exec_script applies its timeout while uploading the temporary script', async (t) => {
@@ -1780,7 +2091,7 @@ test('atomic upload reports an unknown target state when rename commits but its 
     assert.equal(result.operationStatus, 'unknown')
     assert.equal(result.targetReplaced, null)
     assert.equal(result.targetReplacementStatus, 'unknown')
-    assert.equal(result.retryable, true)
+    assert.equal(result.retryable, false)
     assert.equal(remoteFiles.get('/remote/target.txt').toString(), 'replacement')
 })
 
@@ -1858,7 +2169,7 @@ test('atomic upload reports a definite non-replacement when rename cannot be sta
     assert.equal(result.operationStatus, 'failed')
     assert.equal(result.targetReplaced, false)
     assert.equal(result.targetReplacementStatus, 'not_replaced')
-    assert.equal(result.retryable, true)
+    assert.equal(result.retryable, false)
     assert.equal(remoteFiles.get('/remote/target.txt').toString(), 'original')
     assert.equal(
         Array.from(remoteFiles.keys()).some((remotePath) => remotePath.includes('.mcp-tmp-')),
@@ -1924,6 +2235,117 @@ test('atomic upload collision does not delete another operation temporary file',
     assert.equal(unlinkCalls, 0)
 })
 
+test('MH-SSH-02 root digests do not depend on Unicode collation or enumeration order', async (t) => {
+    const directory = makeTempDir(t)
+    const names = ['a.txt', 'A.txt', 'z.txt', 'é.txt', 'é.txt', '文.txt', '😀.txt']
+    for (const name of names) {
+        fs.writeFileSync(path.join(directory, name), `data:${name}`)
+    }
+    if (fs.readdirSync(directory).length !== names.length) {
+        t.skip('the filesystem does not preserve all case- and Unicode-distinct fixture names')
+        return
+    }
+    const request = { sha256: true, count: true }
+    const local = await createLocalDirectoryManifest(directory, request)
+    for (const order of [names, [...names].reverse(), [...names.slice(3), ...names.slice(0, 3)]]) {
+        const sftp = fixtureSftp()
+        let returned = false
+        sftp.readdir = (_handle, callback) => {
+            if (returned) {
+                callback(Object.assign(new Error('EOF'), { code: 1 }))
+                return
+            }
+            returned = true
+            callback(
+                null,
+                order.map((filename) => ({ filename, attrs: {} }))
+            )
+        }
+        const remote = await createRemoteDirectoryManifest(sftp, directory, request)
+        const result = compareDirectoryManifests(local, remote, request)
+        assert.equal(remote.rootSha256, local.rootSha256)
+        assert.equal(result.matched, true, JSON.stringify(result))
+        assert.equal(result.summary.contentMismatch, 0)
+        assert.equal(result.summary.missing, 0)
+        assert.equal(result.summary.stale, 0)
+        assert.equal(result.summary.typeMismatch, 0)
+    }
+    fs.writeFileSync(path.join(directory, 'é.txt'), 'different content')
+    const changed = await createRemoteDirectoryManifest(fixtureSftp(), directory, request)
+    const mismatch = compareDirectoryManifests(local, changed, request)
+    assert.equal(mismatch.matched, false)
+    assert.equal(mismatch.summary.contentMismatch, 1)
+})
+
+test('MH-SSH-01 OpenSSH manifests consume one absolute deadline across remote phases', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 })
+    const calls = []
+    const controller = new AbortController()
+    const connection = {
+        async capture(_command, timeout) {
+            calls.push(['capture', timeout])
+            t.mock.timers.tick(30)
+            return Buffer.from('/fixture\0')
+        },
+        async stat(_path, timeout) {
+            calls.push(['stat', timeout])
+            t.mock.timers.tick(30)
+            return { mode: 0o040755 }
+        },
+        async consume(_command, receive, timeout) {
+            calls.push(['consume', timeout])
+            t.mock.timers.tick(30)
+            receive(
+                Buffer.from(
+                    [
+                        '',
+                        'd',
+                        '0',
+                        '755',
+                        '1000',
+                        '/fixture',
+                        'one.txt',
+                        'f',
+                        '4',
+                        '644',
+                        '1000',
+                        '/fixture/one.txt',
+                        'two.txt',
+                        'f',
+                        '4',
+                        '644',
+                        '1000',
+                        '/fixture/two.txt',
+                    ].join('\0') + '\0'
+                )
+            )
+        },
+        async hashFile(_path, _algorithm, timeout) {
+            calls.push(['hash', timeout])
+            t.mock.timers.tick(20)
+            return 'f'.repeat(64)
+        },
+    }
+    await assert.rejects(
+        () =>
+            createOpenSshDirectoryManifest(connection, '/fixture', { sha256: true }, 1000, undefined, false, {
+                deadline: 1100,
+                signal: controller.signal,
+            }),
+        /timeout/
+    )
+    assert.deepEqual(calls, [
+        ['capture', 100],
+        ['stat', 70],
+        ['consume', 40],
+        ['hash', 10],
+    ])
+})
+
+
+
+
+
 test('directory manifests stream hashes, apply excludes, and compare local with remote output', async (t) => {
     const directory = makeTempDir(t)
     fs.mkdirSync(path.join(directory, 'sub'))
@@ -1968,41 +2390,44 @@ test('directory mode verification includes setuid, setgid, and sticky bits', asy
 })
 
 // noinspection LongLine — 回归测试标题完整描述两个独立校验维度
-test('directory verification uses relative excludes and deletion baselines independently from stale checks', async (t) => {
-    const root = makeTempDir(t)
-    const source = path.join(root, 'source')
-    const baseline = path.join(root, 'baseline')
-    const actual = path.join(root, 'actual')
-    for (const directory of [source, baseline, actual]) {
-        fs.mkdirSync(path.join(directory, 'sub', 'cache'), { recursive: true })
-        fs.writeFileSync(path.join(directory, 'keep.txt'), 'keep')
-        fs.writeFileSync(path.join(directory, 'sub', 'cache', 'ignored.txt'), 'ignored')
+test(
+    'directory verification uses relative excludes and deletion baselines ' + 'independently from stale checks',
+    async (t) => {
+        const root = makeTempDir(t)
+        const source = path.join(root, 'source')
+        const baseline = path.join(root, 'baseline')
+        const actual = path.join(root, 'actual')
+        for (const directory of [source, baseline, actual]) {
+            fs.mkdirSync(path.join(directory, 'sub', 'cache'), { recursive: true })
+            fs.writeFileSync(path.join(directory, 'keep.txt'), 'keep')
+            fs.writeFileSync(path.join(directory, 'sub', 'cache', 'ignored.txt'), 'ignored')
+        }
+        fs.writeFileSync(path.join(baseline, 'stale.txt'), 'stale')
+
+        const request = { deletions: true }
+        const exclude = ['sub/cache/**']
+        const expectedManifest = await createLocalDirectoryManifest(source, request, exclude)
+        const baselineManifest = await createLocalDirectoryManifest(baseline, request, exclude)
+        const actualManifest = await createLocalDirectoryManifest(actual, request, exclude)
+        const comparison = compareDirectoryManifests(expectedManifest, actualManifest, request, baselineManifest)
+
+        assert.equal(matchesDirectoryExclude('sub/cache/ignored.txt', exclude), true)
+        assert.equal(matchesDirectoryExclude('other/cache/ignored.txt', exclude), false)
+        assert.equal(comparison.matched, true)
+        assert.equal(comparison.checks.deletions, true)
+        assert.equal(comparison.checks.staleFiles, true)
+        assert.equal(comparison.summary.deletionCandidates, 1)
+        assert.equal(comparison.summary.deletedEntries, 1)
+
+        fs.writeFileSync(path.join(actual, 'stale.txt'), 'stale')
+        const actualWithStale = await createLocalDirectoryManifest(actual, request, exclude)
+        const failed = compareDirectoryManifests(expectedManifest, actualWithStale, request, baselineManifest)
+        assert.equal(failed.matched, false)
+        assert.equal(failed.checks.deletions, false)
+        assert.equal(failed.checks.staleFiles, true)
+        assert.equal(failed.summary.remainingDeletionCandidates, 1)
     }
-    fs.writeFileSync(path.join(baseline, 'stale.txt'), 'stale')
-
-    const request = { deletions: true }
-    const exclude = ['sub/cache/**']
-    const expectedManifest = await createLocalDirectoryManifest(source, request, exclude)
-    const baselineManifest = await createLocalDirectoryManifest(baseline, request, exclude)
-    const actualManifest = await createLocalDirectoryManifest(actual, request, exclude)
-    const comparison = compareDirectoryManifests(expectedManifest, actualManifest, request, baselineManifest)
-
-    assert.equal(matchesDirectoryExclude('sub/cache/ignored.txt', exclude), true)
-    assert.equal(matchesDirectoryExclude('other/cache/ignored.txt', exclude), false)
-    assert.equal(comparison.matched, true)
-    assert.equal(comparison.checks.deletions, true)
-    assert.equal(comparison.checks.staleFiles, true)
-    assert.equal(comparison.summary.deletionCandidates, 1)
-    assert.equal(comparison.summary.deletedEntries, 1)
-
-    fs.writeFileSync(path.join(actual, 'stale.txt'), 'stale')
-    const actualWithStale = await createLocalDirectoryManifest(actual, request, exclude)
-    const failed = compareDirectoryManifests(expectedManifest, actualWithStale, request, baselineManifest)
-    assert.equal(failed.matched, false)
-    assert.equal(failed.checks.deletions, false)
-    assert.equal(failed.checks.staleFiles, true)
-    assert.equal(failed.summary.remainingDeletionCandidates, 1)
-})
+)
 
 test('directory manifests report unsupported entries and follow a symlinked root', async (t) => {
     if (process.platform === 'win32') {
@@ -2073,7 +2498,9 @@ test('rsync directory sync uses source contents and skips links and special entr
     fs.writeFileSync(path.join(bin, 'ssh'), '#!/bin/sh\nexit 0\n')
     fs.writeFileSync(
         path.join(bin, 'rsync'),
-        '#!/bin/sh\nprintf "%s\\n" "$@" > "$MCP_TEST_RSYNC_ARGS"\nprintf "Number of regular files transferred: 1\\n"\n'
+        '#!/bin/sh\n' +
+            'printf "%s\\n" "$@" > "$MCP_TEST_RSYNC_ARGS"\n' +
+            'printf "Number of regular files transferred: 1\\n"\n'
     )
     fs.chmodSync(path.join(bin, 'ssh'), 0o755)
     fs.chmodSync(path.join(bin, 'rsync'), 0o755)
@@ -2513,4 +2940,436 @@ test('session summaries stay brief while internal transfer capability retains ro
     const unavailableAgent = manager.getExternalTransferCapability('agent-session')
     assert.equal(unavailableAgent.rsyncEligible, false)
     assert.equal(unavailableAgent.decisionReason, 'ssh_agent_socket_unavailable')
+})
+
+async function r29SftpFixture(t, faultStage, rejectRequest = false, timeoutResponse = false) {
+    const testHome = process.env.SSH_MCP_TEST_HOME
+    assert.ok(testHome, 'Run real SFTP regressions through test/run-tests.mjs')
+    assert.equal(process.env.HOME, testHome)
+    assert.equal(process.env.USERPROFILE, testHome)
+    assert.equal(sessionManager.persistPath, path.join(testHome, '.ssh-mcp-pro', 'sessions.json'))
+    t.diagnostic(JSON.stringify({ testHome, persistPath: sessionManager.persistPath, persistence: 'enabled' }))
+    const directory = makeTempDir(t)
+    const beforeTrust = sessionManager.knownHosts
+    const beforeAllow = process.env.SSH_MCP_ALLOWED_KEY_DIRS
+    process.env.SSH_MCP_ALLOWED_KEY_DIRS = directory
+    sessionManager.knownHosts = new KnownHosts(path.join(directory, 'known_hosts'), [])
+    const privateKey = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({
+        type: 'sec1',
+        format: 'pem',
+    })
+    const peers = new Set()
+    const handles = new Map()
+    const requests = []
+    let sequence = 0
+    let authentications = 0
+    const attributes = (stats) => ({
+        mode: stats.mode,
+        size: stats.size,
+        uid: stats.uid,
+        gid: stats.gid,
+        atime: Math.floor(stats.atimeMs / 1000),
+        mtime: Math.floor(stats.mtimeMs / 1000),
+    })
+    const server = new ssh2.Server({ hostKeys: [privateKey] }, (peer) => {
+        peers.add(peer)
+        peer.on('error', () => {})
+        peer.on('authentication', (context) => {
+            ++authentications
+            context.accept()
+        })
+        peer.on('ready', () =>
+            peer.on('session', (accept) => {
+                accept().on('sftp', (accept) => {
+                    const sftp = accept()
+                    sftp.on('error', () => {})
+                    const response = (stage, id, filename, action, success) => {
+                        requests.push({ stage, filename })
+                        const fault = stage === faultStage && path.basename(filename).includes('bad.txt')
+                        if (fault && rejectRequest) {
+                            sftp.status(id, 3, 'synthetic refusal')
+                            return
+                        }
+                        try {
+                            action()
+                        } catch (error) {
+                            sftp.status(id, error.code === 'ENOENT' ? 2 : 4, error.message)
+                            return
+                        }
+                        if (fault) {
+                            if (!timeoutResponse) {
+                                sftp.destroy()
+                            }
+                            return
+                        }
+                        success()
+                    }
+                    sftp.on('STAT', (id, filename) => {
+                        try {
+                            sftp.attrs(id, attributes(fs.statSync(filename)))
+                        } catch {
+                            sftp.status(id, 2)
+                        }
+                    })
+                    sftp.on('LSTAT', (id, filename) => {
+                        try {
+                            sftp.attrs(id, attributes(fs.lstatSync(filename)))
+                        } catch {
+                            sftp.status(id, 2)
+                        }
+                    })
+                    sftp.on('FSTAT', (id, handle) =>
+                        sftp.attrs(id, attributes(fs.fstatSync(handles.get(handle.toString()).fd)))
+                    )
+                    sftp.on('MKDIR', (id, filename) => {
+                        try {
+                            fs.mkdirSync(filename)
+                            sftp.status(id, 0)
+                        } catch {
+                            sftp.status(id, 4)
+                        }
+                    })
+                    sftp.on('OPEN', (id, filename, flags, attrs) => {
+                        let handle
+                        response(
+                            'open',
+                            id,
+                            filename,
+                            () => {
+                                const mode = flags & 32 ? 'wx' : flags & 4 ? 'a' : flags & 8 ? 'w' : 'r'
+                                const fd = fs.openSync(filename, mode, attrs.mode ?? 0o600)
+                                handle = Buffer.from(String(++sequence))
+                                handles.set(handle.toString(), { fd, filename })
+                            },
+                            () => sftp.handle(id, handle)
+                        )
+                    })
+                    sftp.on('FSETSTAT', (id, handle, attrs) => {
+                        if (attrs.mode !== undefined) {
+                            fs.fchmodSync(handles.get(handle.toString()).fd, attrs.mode)
+                        }
+                        sftp.status(id, 0)
+                    })
+                    sftp.on('WRITE', (id, handle, offset, data) => {
+                        const { fd, filename } = handles.get(handle.toString())
+                        response(
+                            'write',
+                            id,
+                            filename,
+                            () => fs.writeSync(fd, data, 0, data.length, offset),
+                            () => sftp.status(id, 0)
+                        )
+                    })
+                    sftp.on('READ', (id, handle, offset, length) => {
+                        const bytes = Buffer.alloc(length)
+                        const read = fs.readSync(handles.get(handle.toString()).fd, bytes, 0, length, offset)
+                        if (read) {
+                            sftp.data(id, bytes.subarray(0, read))
+                        } else {
+                            sftp.status(id, 1)
+                        }
+                    })
+                    sftp.on('CLOSE', (id, handle) => {
+                        const entry = handles.get(handle.toString())
+                        response(
+                            'close',
+                            id,
+                            entry.filename,
+                            () => {
+                                fs.closeSync(entry.fd)
+                                handles.delete(handle.toString())
+                            },
+                            () => sftp.status(id, 0)
+                        )
+                    })
+                    sftp.on('RENAME', (id, from, to) =>
+                        response(
+                            'rename',
+                            id,
+                            to,
+                            () => fs.renameSync(from, to),
+                            () => sftp.status(id, 0)
+                        )
+                    )
+                    sftp.on('REMOVE', (id, filename) => {
+                        try {
+                            fs.unlinkSync(filename)
+                            sftp.status(id, 0)
+                        } catch {
+                            sftp.status(id, 2)
+                        }
+                    })
+                })
+            })
+        )
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const alias = `r29-${process.pid}`
+    t.after(async () => {
+        sessionManager.disconnect(alias)
+        sessionManager.knownHosts = beforeTrust
+        if (beforeAllow === undefined) {
+            delete process.env.SSH_MCP_ALLOWED_KEY_DIRS
+        } else {
+            process.env.SSH_MCP_ALLOWED_KEY_DIRS = beforeAllow
+        }
+        for (const peer of peers) {
+            peer.end()
+        }
+        for (const { fd } of handles.values()) {
+            fs.closeSync(fd)
+        }
+        await new Promise((resolve) => server.close(resolve))
+    })
+    await sessionManager.connect({
+        host: '127.0.0.1',
+        port: server.address().port,
+        username: 'synthetic',
+        password: 'synthetic',
+        alias,
+    })
+    const callbacks = new Map()
+    registerFileTools({
+        registerTool(name, _schema, callback) {
+            callbacks.set(name, callback)
+        },
+    })
+    registerExecTools({
+        registerTool(name, _schema, callback) {
+            callbacks.set(name, callback)
+        },
+    })
+    const call = async (name, args) => {
+        const reply = await callbacks.get(name)({ alias, ...args })
+        return JSON.parse(reply.content[0].text)
+    }
+    return { directory, alias, call, requests, peers, authentications: () => authentications }
+}
+
+test('R29-SSH-02: real SFTP request outcomes reach upload, write, sync and atomic tools', async (t) => {
+    for (const stage of ['open', 'write', 'close', 'rename']) {
+        for (const refusal of [false, true]) {
+            for (const entry of stage === 'rename' ? ['atomic'] : ['upload', 'write', 'sync', 'atomic']) {
+                await t.test(`${entry} ${stage} ${refusal ? 'refused' : 'response lost'}`, async (t) => {
+                    const { directory, call, requests } = await r29SftpFixture(t, stage, refusal)
+                    const source = path.join(directory, 'source.txt')
+                    const remotePath = path.join(directory, 'bad.txt')
+                    fs.writeFileSync(source, 'acknowledged-content')
+                    let result
+                    if (entry === 'write') {
+                        result = await call('ssh_write_file', {
+                            remotePath,
+                            content: 'acknowledged-content',
+                            timeout: 1000,
+                        })
+                    } else if (entry === 'sync') {
+                        result = await call('ssh_sync', {
+                            localPath: source,
+                            remotePath,
+                            direction: 'upload',
+                            operationTimeout: 1000,
+                            verifySha256: false,
+                        })
+                    } else {
+                        result = await call('ssh_upload', {
+                            localPath: source,
+                            remotePath,
+                            atomic: entry === 'atomic',
+                            timeout: 1000,
+                        })
+                    }
+                    assert.equal(result.success, false, JSON.stringify(result))
+                    assert.equal(result.operationStatus, refusal ? 'failed' : 'unknown', JSON.stringify(result))
+                    assert.equal(result.failureStage, stage, JSON.stringify(result))
+                    assert.equal(result.retryable, false)
+                    assert.equal(result.acknowledgedBytes, stage === 'close' || stage === 'rename' ? 20 : 0)
+                    if (entry === 'atomic') {
+                        assert.equal(result.targetReplaced, stage === 'rename' && !refusal ? null : false)
+                    }
+                    const mutation = requests.filter((request) => request.stage === stage)
+                    assert.equal(mutation.length, 1)
+                })
+            }
+        }
+    }
+})
+
+test(
+    'R29-SSH-02: successful write CLOSE, timeout and mixed directory ' + 'statistics retain their meanings',
+    async (t) => {
+        await t.test('write success and CLOSE timeout', async (t) => {
+            const { directory, call } = await r29SftpFixture(t, 'close', false, true)
+            const good = await call('ssh_write_file', {
+                remotePath: path.join(directory, 'good.txt'),
+                content: 'done',
+                timeout: 2000,
+            })
+            assert.equal(good.success, true)
+            const result = await call('ssh_write_file', {
+                remotePath: path.join(directory, 'bad.txt'),
+                content: 'done',
+                timeout: 150,
+            })
+            assert.equal(result.operationStatus, 'unknown')
+            assert.equal(result.failureStage, 'close')
+            assert.equal(result.acknowledgedBytes, 4)
+        })
+        await t.test('confirmed sibling survives a lost CLOSE', async (t) => {
+            const { directory, call } = await r29SftpFixture(t, 'close')
+            const source = path.join(directory, 'source')
+            const target = path.join(directory, 'target')
+            fs.mkdirSync(path.join(source, 'nested'), { recursive: true })
+            fs.writeFileSync(path.join(source, 'good.txt'), 'done')
+            fs.writeFileSync(path.join(source, 'nested', 'bad.txt'), 'unknown')
+            const result = await call('ssh_sync', {
+                localPath: source,
+                remotePath: target,
+                direction: 'upload',
+                operationTimeout: 3000,
+            })
+            assert.equal(result.operationStatus, 'unknown', JSON.stringify(result))
+            assert.equal(result.filesTransferred, 1)
+            assert.equal(result.bytesTransferred, 4)
+            assert.equal(result.stats.added, 1)
+            assert.equal(result.stats.failed, 1)
+        })
+    }
+)
+
+
+
+test('R29-SSH: stdio MCP reports CLOSE loss and rekey trust failure', async (t) => {
+    const fixture = await r29SftpFixture(t, 'close')
+    const home = fs.mkdtempSync(path.join(process.env.SSH_MCP_TEST_HOME, 'stdio-r29-'))
+    const trustFile = path.join(home, '.ssh', 'known_hosts')
+    fs.mkdirSync(path.dirname(trustFile), { mode: 0o700 })
+    fs.copyFileSync(path.join(fixture.directory, 'known_hosts'), trustFile)
+    fs.chmodSync(trustFile, 0o600)
+    const bootstrap = path.join(fixture.directory, 'stdio-bootstrap.mjs')
+    const moduleUrl = (name) => new URL('../dist/' + name, import.meta.url).href
+    fs.writeFileSync(
+        bootstrap,
+        `
+import assert from 'node:assert/strict'
+import path from 'node:path'
+import { sessionManager } from ${JSON.stringify(moduleUrl('session-manager.js'))}
+import { KnownHosts } from ${JSON.stringify(moduleUrl('known-hosts.js'))}
+const home = process.env.SSH_MCP_TEST_HOME
+assert.ok(home)
+assert.equal(process.env.HOME, home)
+assert.equal(process.env.USERPROFILE, home)
+assert.equal(sessionManager.persistPath, path.join(home, '.ssh-mcp-pro', 'sessions.json'))
+sessionManager.knownHosts = new KnownHosts(path.join(home, '.ssh', 'known_hosts'), [])
+const proof = JSON.stringify({ testHome: home, persistPath: sessionManager.persistPath })
+process.stderr.write(proof + String.fromCharCode(10))
+await import(${JSON.stringify(moduleUrl('index.js'))})
+`
+    )
+    const env = { ...process.env, HOME: home, USERPROFILE: home, SSH_MCP_TEST_HOME: home }
+    for (const name of [
+        'SSH_AUTH_SOCK',
+        'SSH_MCP_TEMPLATES',
+        'SSH_MCP_ALLOWED_KEY_DIRS',
+        'SSH_MCP_FILE_OPS_ALLOW_DIRS',
+    ]) {
+        delete env[name]
+    }
+    const client = new Client({ name: 'ssh-r29-stdio', version: '1.0.0' })
+    const transport = new StdioClientTransport({ command: process.execPath, args: [bootstrap], env, stderr: 'pipe' })
+    let stderr = ''
+    transport.stderr?.on('data', (chunk) => {
+        stderr += chunk
+    })
+    const initialPeers = new Set(fixture.peers)
+    const exchange = async (name, args) => {
+        const response = await client.callTool({ name, arguments: args })
+        return { response, body: JSON.parse(response.content[0].text) }
+    }
+    try {
+        await client.connect(transport)
+        const tools = await client.listTools()
+        for (const name of ['ssh_connect', 'ssh_upload', 'ssh_sync', 'ssh_list_sessions', 'ssh_file_info']) {
+            assert.ok(tools.tools.some((tool) => tool.name === name))
+        }
+        const config = sessionManager.getSession(fixture.alias).config
+        const connected = await exchange('ssh_connect', {
+            alias: 'stdio-r29',
+            host: '127.0.0.1',
+            port: config.port,
+            user: 'synthetic',
+            password: 'synthetic',
+        })
+        assert.equal(connected.body.success, true, stderr)
+        const peer = [...fixture.peers].find((candidate) => !initialPeers.has(candidate))
+        assert.ok(peer)
+        const source = path.join(fixture.directory, 'stdio-source.txt')
+        fs.writeFileSync(source, 'DATA')
+        const upload = await exchange('ssh_upload', {
+            alias: 'stdio-r29',
+            localPath: source,
+            remotePath: path.join(fixture.directory, 'stdio-bad.txt'),
+            timeout: 2000,
+        })
+        assert.equal(upload.body.operationStatus, 'unknown', JSON.stringify(upload.body))
+        assert.equal(upload.body.failureStage, 'close')
+        assert.equal(upload.body.acknowledgedBytes, 4)
+        const directory = path.join(fixture.directory, 'stdio-source')
+        fs.mkdirSync(path.join(directory, 'nested'), { recursive: true })
+        fs.writeFileSync(path.join(directory, 'good.txt'), 'DONE')
+        fs.writeFileSync(path.join(directory, 'nested', 'bad.txt'), 'UNKNOWN')
+        const sync = await exchange('ssh_sync', {
+            alias: 'stdio-r29',
+            localPath: directory,
+            remotePath: path.join(fixture.directory, 'stdio-target'),
+            direction: 'upload',
+            operationTimeout: 3000,
+        })
+        assert.equal(sync.body.operationStatus, 'unknown', JSON.stringify(sync.body))
+        assert.equal(sync.body.failureStage, 'close')
+        assert.equal(sync.body.filesTransferred, 1)
+        assert.equal(sync.body.bytesTransferred, 4)
+        assert.equal(sync.body.acknowledgedBytes, 7)
+        const counts = { connections: fixture.peers.size, authentications: fixture.authentications() }
+        const replacement = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({
+            type: 'sec1',
+            format: 'pem',
+        })
+        peer._protocol._hostKeys['ecdsa-sha2-nistp256'] = ssh2.utils.parseKey(replacement)
+        const closed = new Promise((resolve) => peer.once('close', resolve))
+        peer.rekey()
+        await closed
+        await new Promise((resolve) => setTimeout(resolve, 5250))
+        assert.deepEqual({ connections: fixture.peers.size, authentications: fixture.authentications() }, counts)
+        const sessions = await exchange('ssh_list_sessions', {})
+        assert.equal(sessions.body.sessions.find((item) => item.alias === 'stdio-r29').connected, false)
+        const rejected = await exchange('ssh_file_info', {
+            alias: 'stdio-r29',
+            remotePath: path.join(fixture.directory, 'stdio-target'),
+        })
+        assert.equal(rejected.body.details.failureStage, 'host_key')
+        assert.equal(rejected.body.details.retryable, false)
+        const bootstrapProof = stderr.split('\n').find((line) => line.includes('"testHome"'))
+        assert.ok(bootstrapProof, stderr)
+        t.diagnostic(
+            JSON.stringify({
+                layer: 'stdio-MCP',
+                isolation: JSON.parse(bootstrapProof),
+                toolsListed: tools.tools.length,
+                connected: connected.body,
+                upload: upload.body,
+                sync: sync.body,
+                rekey: {
+                    sessions: sessions.body,
+                    rejected: rejected.body,
+                    countsBefore: counts,
+                    countsAfter: { connections: fixture.peers.size, authentications: fixture.authentications() },
+                },
+            })
+        )
+    } catch (error) {
+        t.diagnostic(stderr)
+        throw error
+    } finally {
+        await client.close()
+    }
 })

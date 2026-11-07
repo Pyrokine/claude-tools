@@ -41,7 +41,8 @@ export function utf8SafeEnd(
     start: number,
     requestedEnd: number,
     stream: string,
-    limitedByMaxBytes: boolean = requestedEnd < buffer.length
+    limitedByMaxBytes: boolean = requestedEnd < buffer.length,
+    allowEmpty: boolean = false
 ): number {
     let end = requestedEnd
     if (limitedByMaxBytes) {
@@ -60,7 +61,7 @@ export function utf8SafeEnd(
         }
     }
 
-    if (end === start && requestedEnd > start && limitedByMaxBytes) {
+    if (end === start && requestedEnd > start && limitedByMaxBytes && !allowEmpty) {
         throw new Error(`maxBytes is too small to read the next UTF-8 character from ${stream}`)
     }
     return end
