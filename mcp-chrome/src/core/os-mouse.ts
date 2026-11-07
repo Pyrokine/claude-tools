@@ -7,6 +7,7 @@
  */
 import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
+import { setTimeout as delay } from 'node:timers/promises'
 import { generateBezierPath, getMouseMoveDelay } from '../anti-detection/behavior.js'
 import { sanitizeErrorMessage } from './error-sanitizer.js'
 import { OsMouseError, TimeoutError } from './errors.js'
@@ -21,7 +22,7 @@ const MIN_PATH_STEPS = 12
 export type ExecFileFn = (
     file: string,
     args: readonly string[],
-    options?: { timeout?: number }
+    options?: { timeout?: number; signal?: AbortSignal }
 ) => Promise<{ stdout: string; stderr: string }>
 
 export type SleepFn = (ms: number) => Promise<void>
@@ -54,17 +55,23 @@ export interface TurnstileOsClickInput {
     screenPoint?: ScreenClickPoint | null
     viewport?: ViewportMetrics | null
     clickSource?: TurnstileClickSource | null
+    clickTargetKind?: 'widget' | 'verify' | null
     title?: string | null
+    url?: string
 }
+
+export type NativePointerProbe = () => Promise<{ position: ScreenClickPoint; since: number }>
 
 export interface OsLeftClickDeps {
     deadline?: number
+    signal?: AbortSignal
     platform?: NodeJS.Platform
     execFile?: ExecFileFn
     sleep?: SleepFn
     warn?: (message: string) => void
     from?: ScreenClickPoint
     path?: ScreenClickPoint[]
+    refreshPoint?: (probe?: NativePointerProbe) => Promise<ScreenClickPoint>
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -77,10 +84,6 @@ function asInt(value: number): number {
 
 function isEnoent(error: unknown): boolean {
     return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
-}
-
-function defaultSleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 export function roundScreenPoint(x: number, y: number): ScreenClickPoint {
@@ -234,7 +237,7 @@ function toolMissing(tool: string, suggestion: string): OsMouseError {
 }
 
 function wrapExecError(tool: string, error: unknown, suggestion: string): OsMouseError | TimeoutError {
-    if (error instanceof TimeoutError) {
+    if (error instanceof TimeoutError || error instanceof OsMouseError) {
         return error
     }
     if (isEnoent(error)) {
@@ -291,17 +294,20 @@ export function buildOsMovePath(from: ScreenClickPoint, to: ScreenClickPoint): S
     return points
 }
 
-function budgetedExecFile(execFile: ExecFileFn, deadline?: number): ExecFileFn {
-    if (deadline === undefined) {
-        return execFile
-    }
+function budgetedExecFile(execFile: ExecFileFn, deadline?: number, signal?: AbortSignal): ExecFileFn {
     return (file, args, options) =>
         withNavigationBudget(
             () =>
                 execFile(file, args, {
-                    timeout: Math.min(options?.timeout ?? EXEC_TIMEOUT_MS, remainingNavigationTimeout(deadline)),
+                    ...options,
+                    signal,
+                    timeout:
+                        deadline === undefined
+                            ? options?.timeout
+                            : Math.min(options?.timeout ?? EXEC_TIMEOUT_MS, remainingNavigationTimeout(deadline)),
                 }),
-            deadline
+            deadline,
+            signal
         )
 }
 
@@ -316,10 +322,17 @@ async function getLinuxPointer(execFile: ExecFileFn): Promise<ScreenClickPoint> 
 }
 
 export async function getFocusedWindowOrigin(
-    deps: { platform?: NodeJS.Platform; execFile?: ExecFileFn; pageTitle?: string | null; deadline?: number } = {}
+    deps: {
+        platform?: NodeJS.Platform
+        execFile?: ExecFileFn
+        pageTitle?: string | null
+        deadline?: number
+        signal?: AbortSignal
+    } = {}
 ): Promise<FocusedWindowGeometry> {
+    deps.signal?.throwIfAborted()
     const platform = deps.platform ?? process.platform
-    const execFile = budgetedExecFile(deps.execFile ?? execFileDefault, deps.deadline)
+    const execFile = budgetedExecFile(deps.execFile ?? execFileDefault, deps.deadline, deps.signal)
     const pageTitle = deps.pageTitle?.trim() ?? ''
     if (platform !== 'linux') {
         throw new OsMouseError(
@@ -341,6 +354,7 @@ export async function getFocusedWindowOrigin(
         const activeWindow = await execFile('xdotool', ['getactivewindow'], { timeout: EXEC_TIMEOUT_MS })
         windowId = activeWindow.stdout.trim()
         if (!/^\d+$/.test(windowId)) {
+            // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new Error('xdotool 返回了无效的活动窗口 ID')
         }
         const name = await execFile('xdotool', ['getwindowname', windowId], { timeout: EXEC_TIMEOUT_MS })
@@ -389,7 +403,9 @@ export async function getFocusedWindowOrigin(
     } catch (error) {
         throw wrapExecError('xprop', error, 'Linux 需要可用的 xprop 才能核对 X11 窗口边距')
     }
-    const extents = frameProperties.match(/^_GTK_FRAME_EXTENTS\(CARDINAL\) = (\d+), (\d+), (\d+), (\d+)\s*$/m)
+    const extents = frameProperties.match(
+        /^_GTK_FRAME_EXTENTS\(CARDINAL\) = (?<left>\d+), (?<right>\d+), (?<top>\d+), (?<bottom>\d+)\s*$/m
+    )
     if (!extents && !/^_GTK_FRAME_EXTENTS:\s+(?:not found\.|no such atom on any window\.)\s*$/m.test(frameProperties)) {
         throw new OsMouseError(
             'TURNSTILE_OS_CLICK_UNAVAILABLE',
@@ -407,8 +423,9 @@ export async function getFocusedWindowOrigin(
 
 export async function resolveTurnstileOsClickPoint(
     input: TurnstileOsClickInput,
-    deps: { platform?: NodeJS.Platform; execFile?: ExecFileFn; deadline?: number } = {}
+    deps: { platform?: NodeJS.Platform; execFile?: ExecFileFn; deadline?: number; signal?: AbortSignal } = {}
 ): Promise<ScreenClickPoint> {
+    deps.signal?.throwIfAborted()
     const platform = deps.platform ?? process.platform
     if (input.clickPoint && input.viewport) {
         const { x, y } = input.clickPoint
@@ -424,12 +441,18 @@ export async function resolveTurnstileOsClickPoint(
     }
     if (platform === 'linux' && input.clickPoint && input.viewport) {
         const origin = await getFocusedWindowOrigin({ ...deps, pageTitle: input.title })
+        deps.signal?.throwIfAborted()
         return composeWindowClickPoint(input.clickPoint, input.viewport, origin)
     }
     return resolveScreenClickPoint(input, platform)
 }
 
-async function moveLinuxPath(path: ScreenClickPoint[], execFile: ExecFileFn, sleep: SleepFn): Promise<void> {
+async function moveLinuxPath(
+    path: ScreenClickPoint[],
+    execFile: ExecFileFn,
+    sleep: SleepFn,
+    pressAndRelease?: (file: string, down: readonly string[], up: readonly string[]) => Promise<void>
+): Promise<void> {
     try {
         for (const point of path) {
             await execFile('xdotool', ['mousemove', String(point.x), String(point.y)], {
@@ -438,7 +461,11 @@ async function moveLinuxPath(path: ScreenClickPoint[], execFile: ExecFileFn, sle
             await sleep(getMouseMoveDelay())
         }
         await sleep(80 + Math.random() * 80)
-        await execFile('xdotool', ['click', '--delay', '80', '1'], { timeout: EXEC_TIMEOUT_MS })
+        if (pressAndRelease) {
+            await pressAndRelease('xdotool', ['mousedown', '1'], ['mouseup', '1'])
+        } else {
+            await execFile('xdotool', ['click', '--delay', '80', '1'], { timeout: EXEC_TIMEOUT_MS })
+        }
     } catch (error) {
         throw wrapExecError('xdotool', error, 'Linux 需要可用的 xdotool，且当前会话是 X11')
     }
@@ -447,17 +474,27 @@ async function moveLinuxPath(path: ScreenClickPoint[], execFile: ExecFileFn, sle
 async function clickDarwin(
     path: ScreenClickPoint[],
     execFile: ExecFileFn,
-    warn: (message: string) => void
+    warn: (message: string) => void,
+    pressAndRelease?: (file: string, down: readonly string[], up: readonly string[]) => Promise<void>,
+    beforeFallbackClick?: () => Promise<boolean>
 ): Promise<void> {
     const moves = path.map((point) => `m:${point.x},${point.y}`)
     try {
-        await execFile('cliclick', ['-e', '12', ...moves, 'w:120', 'c:.'], { timeout: PATH_EXEC_TIMEOUT_MS })
+        await execFile('cliclick', ['-e', '12', ...moves, 'w:120', ...(pressAndRelease ? [] : ['c:.'])], {
+            timeout: PATH_EXEC_TIMEOUT_MS,
+        })
+        if (pressAndRelease) {
+            await pressAndRelease('cliclick', ['dd:.'], ['du:.'])
+        }
         return
     } catch (error) {
         if (!isEnoent(error)) {
             throw wrapExecError('cliclick', error, 'macOS 需要辅助功能权限，或安装 cliclick')
         }
         warn('[MCP] macOS 未安装 cliclick，使用 osascript 完成点击，鼠标不会沿拟人路径移动')
+    }
+    if (beforeFallbackClick && !(await beforeFallbackClick())) {
+        return
     }
     const end = path[path.length - 1]
     if (!end) {
@@ -476,7 +513,7 @@ async function clickDarwin(
     }
 }
 
-function windowsClickScript(path: ScreenClickPoint[]): string {
+function windowsClickScript(path: ScreenClickPoint[], phase: 'click' | 'move' | 'down' | 'up' = 'click'): string {
     const moves = path.map(
         (point) => `[Win32.OsMouse]::SetCursorPos(${point.x}, ${point.y}); Start-Sleep -Milliseconds 8`
     )
@@ -487,19 +524,34 @@ function windowsClickScript(path: ScreenClickPoint[]): string {
     ].join(' ')
     return [
         `Add-Type -MemberDefinition '${memberDefinition}' -Name OsMouse -Namespace Win32 -PassThru | Out-Null`,
-        ...moves,
-        'Start-Sleep -Milliseconds 80',
-        '[Win32.OsMouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)',
-        'Start-Sleep -Milliseconds 50',
-        '[Win32.OsMouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)',
+        ...(phase === 'move' || phase === 'click' ? [...moves, 'Start-Sleep -Milliseconds 80'] : []),
+        ...(phase === 'down' || phase === 'click' ? ['[Win32.OsMouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)'] : []),
+        ...(phase === 'click' ? ['Start-Sleep -Milliseconds 50'] : []),
+        ...(phase === 'up' || phase === 'click' ? ['[Win32.OsMouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)'] : []),
     ].join('; ')
 }
 
-async function clickWin32(path: ScreenClickPoint[], execFile: ExecFileFn): Promise<void> {
+async function clickWin32(
+    path: ScreenClickPoint[],
+    execFile: ExecFileFn,
+    pressAndRelease?: (file: string, down: readonly string[], up: readonly string[]) => Promise<void>
+): Promise<void> {
     try {
-        await execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', windowsClickScript(path)], {
-            timeout: PATH_EXEC_TIMEOUT_MS,
-        })
+        await execFile(
+            'powershell.exe',
+            ['-NoProfile', '-NonInteractive', '-Command', windowsClickScript(path, pressAndRelease ? 'move' : 'click')],
+            {
+                timeout: PATH_EXEC_TIMEOUT_MS,
+            }
+        )
+        if (pressAndRelease) {
+            const args = ['-NoProfile', '-NonInteractive', '-Command']
+            await pressAndRelease(
+                'powershell.exe',
+                [...args, windowsClickScript([], 'down')],
+                [...args, windowsClickScript([], 'up')]
+            )
+        }
     } catch (error) {
         throw wrapExecError('powershell.exe', error, 'Windows 需要可用的 PowerShell，才能发送系统鼠标点击')
     }
@@ -523,28 +575,95 @@ async function resolveMovePath(
 
 export async function osLeftClick(x: number, y: number, deps: OsLeftClickDeps = {}): Promise<void> {
     const point = roundScreenPoint(x, y)
+    deps.signal?.throwIfAborted()
     const platform = deps.platform ?? process.platform
-    const execFile = budgetedExecFile(deps.execFile ?? execFileDefault, deps.deadline)
+    const execFile = budgetedExecFile(deps.execFile ?? execFileDefault, deps.deadline, deps.signal)
     const sleep: SleepFn = (ms) =>
         withNavigationBudget(
             () =>
-                (deps.sleep ?? defaultSleep)(
-                    deps.deadline === undefined ? ms : Math.min(ms, remainingNavigationTimeout(deps.deadline))
-                ),
-            deps.deadline
+                deps.sleep
+                    ? deps.sleep(
+                          deps.deadline === undefined ? ms : Math.min(ms, remainingNavigationTimeout(deps.deadline))
+                      )
+                    : delay(ms, undefined, { signal: deps.signal }),
+            deps.deadline,
+            deps.signal
         )
+    const beforePress = async (): Promise<boolean> => {
+        if (!deps.refreshPoint) {
+            return true
+        }
+        const probe: NativePointerProbe = async () => {
+            const position = await getLinuxPointer(execFile)
+            if (!position) {
+                throw new OsMouseError('TURNSTILE_OS_CLICK_UNAVAILABLE', '无法读取当前原生指针', '检查 X11 指针状态')
+            }
+            const since = Date.now()
+            const step = position.x > 0 ? -1 : 1
+            await execFile('xdotool', ['mousemove_relative', '--', String(step), '0'], { timeout: EXEC_TIMEOUT_MS })
+            await execFile('xdotool', ['mousemove_relative', '--', String(-step), '0'], { timeout: EXEC_TIMEOUT_MS })
+            return { position, since }
+        }
+        const updated = await withNavigationBudget(
+            () => deps.refreshPoint!(platform === 'linux' ? probe : undefined),
+            deps.deadline,
+            deps.signal
+        )
+        const refreshed = roundScreenPoint(updated.x, updated.y)
+        if (refreshed.x === point.x && refreshed.y === point.y) {
+            return true
+        }
+        await osLeftClick(refreshed.x, refreshed.y, { ...deps, from: point, path: undefined })
+        return false
+    }
+    const pressAndRelease =
+        deps.signal === undefined && !deps.refreshPoint
+            ? undefined
+            : async (file: string, down: readonly string[], up: readonly string[]): Promise<void> => {
+                  if (!(await beforePress())) {
+                      return
+                  }
+                  deps.signal?.throwIfAborted()
+                  if (deps.deadline !== undefined) {
+                      remainingNavigationTimeout(deps.deadline)
+                  }
+                  try {
+                      await execFile(file, down, { timeout: EXEC_TIMEOUT_MS })
+                      await sleep(50)
+                  } finally {
+                      // A dispatched press may have reached the OS even when its subprocess was cancelled.
+                      await withNavigationBudget(
+                          () => (deps.execFile ?? execFileDefault)(file, up, { timeout: EXEC_TIMEOUT_MS }),
+                          Date.now() + EXEC_TIMEOUT_MS
+                      ).catch((error: unknown) => {
+                          throw new OsMouseError(
+                              'OS_MOUSE_UNAVAILABLE',
+                              `系统鼠标释放失败，按键状态未知: ${sanitizeErrorMessage(error)}`,
+                              '检查系统鼠标按键状态，释放按键后再继续操作',
+                              {
+                                  tool: file,
+                                  failureStage: 'release',
+                                  releaseStatus: 'unknown',
+                                  actionExecuted: 'unknown',
+                                  actionStatus: 'unknown',
+                                  retryable: false,
+                              }
+                          )
+                      })
+                  }
+              }
     const warn = deps.warn ?? console.warn
     const path = await resolveMovePath(point, { ...deps, platform }, execFile)
     if (platform === 'linux') {
-        await moveLinuxPath(path, execFile, sleep)
+        await moveLinuxPath(path, execFile, sleep, pressAndRelease)
         return
     }
     if (platform === 'darwin') {
-        await clickDarwin(path, execFile, warn)
+        await clickDarwin(path, execFile, warn, pressAndRelease, deps.refreshPoint ? beforePress : undefined)
         return
     }
     if (platform === 'win32') {
-        await clickWin32(path, execFile)
+        await clickWin32(path, execFile, pressAndRelease)
         return
     }
     throw new OsMouseError(

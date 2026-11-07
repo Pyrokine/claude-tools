@@ -124,6 +124,7 @@ export class HttpClient {
     private statusHandler: StatusHandler | null = null
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null
     private reconnectAttempts = 0
+    private reconnectPorts = new Set<number>()
     private shouldReconnect = true
     private generation = 0
     private connectingGeneration: number | null = null
@@ -158,13 +159,13 @@ export class HttpClient {
         return this.connections.get(port)?.instanceId ?? null
     }
 
-    async setPairingToken(token: string): Promise<void> {
+    async setPairingToken(token: string, reconnect = true): Promise<void> {
         this.pairingToken = token.trim()
         this.pairingTokenLoaded = true
         this.disconnect()
         const generation = this.generation
         await chrome.storage.local.set({ [PAIRING_TOKEN_STORAGE_KEY]: this.pairingToken })
-        if (generation === this.generation && this.pairingToken) {
+        if (generation === this.generation && this.pairingToken && reconnect) {
             await this.connect()
         }
     }
@@ -173,12 +174,12 @@ export class HttpClient {
         return (await this.getPairingToken()).length > 0
     }
 
-    async setAllowInsecureNoToken(allow: boolean): Promise<void> {
+    async setAllowInsecureNoToken(allow: boolean, reconnect = true): Promise<void> {
         this.allowInsecureNoToken = allow
         this.disconnect()
         const generation = this.generation
         await chrome.storage.local.set({ [ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY]: allow })
-        if (generation === this.generation && allow) {
+        if (generation === this.generation && allow && reconnect) {
             await this.connect()
         }
     }
@@ -243,7 +244,7 @@ export class HttpClient {
 
             const ports = this.getConnectedPorts()
 
-            if (ports.length === 0 && this.shouldReconnect) {
+            if ((ports.length === 0 || this.reconnectPorts.size > 0) && this.shouldReconnect) {
                 this.scheduleReconnect()
             }
 
@@ -262,6 +263,7 @@ export class HttpClient {
         this.lastDiscoverySummary = null
         this.lastServerFailureSummary = ''
         this.stopReconnect()
+        this.reconnectPorts.clear()
 
         for (const controller of this.pendingHealthChecks) {
             controller.abort()
@@ -399,6 +401,7 @@ export class HttpClient {
                     return
                 }
                 conn.ready = true
+                this.reconnectPorts.delete(port)
                 this.resetHeartbeat(port)
                 this.statusHandler?.('connected', this.getConnectedPorts().length)
                 finishCandidate(true)
@@ -496,6 +499,7 @@ export class HttpClient {
             this.statusHandler?.('disconnected', 0)
         }
         if (this.shouldReconnect) {
+            this.reconnectPorts.add(port)
             this.scheduleReconnect()
         }
     }

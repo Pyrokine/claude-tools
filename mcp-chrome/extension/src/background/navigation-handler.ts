@@ -473,26 +473,45 @@ export class NavigationHandler {
                     throw error
                 }
                 const tab = await getExistingTab(tabId)
-                if (!isRestrictedUrl(tab.url)) {
-                    const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
-                    if (frame && !frame.errorOccurred) {
-                        // 原生历史不可用时，仅在可注入的文档上尝试页面历史
-                        remainingNavigationTimeout(deadline)
-                        await chrome.scripting
-                            .executeScript({
-                                target: { tabId },
-                                world: 'MAIN',
-                                func: (step: 'back' | 'forward') => history[step](),
-                                args: [direction],
-                            })
-                            .catch((error: unknown) => {
-                                const msg = error instanceof Error ? error.message : String(error)
-                                if (/Cannot access|Frame with ID \d+ is showing error page/i.test(msg)) {
-                                    throw new ExpectedOperationError(msg)
+                if (isRestrictedUrl(tab.url)) {
+                    return false
+                }
+                const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
+                if (!frame || frame.errorOccurred) {
+                    return false
+                }
+                // 原生历史不可用时，仅在文档仍有对应历史的情况下派发页面导航
+                remainingNavigationTimeout(deadline)
+                const results = await chrome.scripting
+                    .executeScript({
+                        target: { tabId },
+                        world: 'MAIN',
+                        func: (step: 'back' | 'forward') => {
+                            const navigation = (
+                                window as Window & {
+                                    navigation?: { canGoBack: boolean; canGoForward: boolean }
                                 }
-                                throw error
-                            })
-                    }
+                            ).navigation
+                            if (
+                                history.length <= 1 ||
+                                navigation?.[step === 'back' ? 'canGoBack' : 'canGoForward'] === false
+                            ) {
+                                return false
+                            }
+                            history[step]()
+                            return true
+                        },
+                        args: [direction],
+                    })
+                    .catch((error: unknown) => {
+                        const msg = error instanceof Error ? error.message : String(error)
+                        if (/Cannot access|Frame with ID \d+ is showing error page/i.test(msg)) {
+                            throw new ExpectedOperationError(msg)
+                        }
+                        throw error
+                    })
+                if (results?.[0]?.result === false) {
+                    return false
                 }
             }
             return await navigation.promise

@@ -175,6 +175,18 @@ test('explicit launch process options skip connected Extension; default launch r
     }
 });
 
+test('CF cleanup with no event observation sends no new action to a legacy Extension', async () => {
+    const bridge = new ExtensionBridge();
+    bridge.setCurrentTargetId('101');
+    bridge.httpServer.sendCommand = async () => {
+        throw Error('Legacy Extension action must not be invoked');
+    };
+    const state = await bridge.suspendBrowserEventsForChallenge();
+    assert.equal(state.suspended, true);
+    assert.equal(state.fetchEnabled, false);
+    assert.equal(bridge.hasBrowserEventObservation(), false);
+});
+
 test('deselect still clears unobserved attached state when native detach rejects', async () => {
     const session = getSession();
     const replacement = {

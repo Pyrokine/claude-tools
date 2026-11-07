@@ -54,5 +54,13 @@ if (-not $ExecutablePath -or -not (Test-Path -LiteralPath $ExecutablePath -PathT
     throw 'Chrome/Chromium not found; pass -ExecutablePath or install Chrome'
 }
 New-Item -ItemType Directory -Force -Path $ProfileDir | Out-Null
-& $ExecutablePath "--remote-debugging-port=$Port" '--remote-debugging-address=127.0.0.1' "--user-data-dir=$ProfileDir" '--no-first-run' '--no-default-browser-check' 'about:blank'
+$chromeArguments = @(
+    "--remote-debugging-port=$Port",
+    '--remote-debugging-address=127.0.0.1',
+    "--user-data-dir=$ProfileDir",
+    '--no-first-run',
+    '--no-default-browser-check',
+    'about:blank'
+)
+& $ExecutablePath @chromeArguments
 if ($LASTEXITCODE -ne 0) { throw "Chrome exited with code $LASTEXITCODE" }

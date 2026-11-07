@@ -1246,7 +1246,24 @@ export class ExtensionBridge implements IBrowserDriver {
         this.browserEventTargets.delete(String(tabId ?? this.requireCurrentTabId()))
     }
 
-    async getViewportMetrics(frameId?: number): Promise<unknown> {
+    async getViewportMetrics(
+        frameId?: number,
+        pointerProbe?: {
+            operation: 'start' | 'read' | 'stop'
+            id: string
+            documentId?: string
+            since?: number
+            position?: { x: number; y: number }
+        },
+        timeout?: number
+    ): Promise<unknown> {
+        if (pointerProbe) {
+            return this.sendBudgetedCommand(
+                'viewport_metrics',
+                { tabId: this.requireCurrentTabId(), pointerProbe },
+                timeout
+            )
+        }
         const selectedFrameId = frameId ?? this.currentFrameId
         return this.httpServer.sendCommand('viewport_metrics', {
             tabId: this.requireCurrentTabId(),

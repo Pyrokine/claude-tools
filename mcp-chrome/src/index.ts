@@ -35,7 +35,23 @@ const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url),
  * 创建 MCP Server
  */
 function createServer(): McpServer {
-    const server = new McpServer({ name: 'mcp-chrome', version: pkg.version }, { capabilities: { tools: {} } })
+    const server = new McpServer(
+        { name: 'mcp-chrome', version: pkg.version },
+        {
+            capabilities: { tools: {} },
+            instructions: [
+                '常规网页浏览、页面交互和文件上传优先使用 mcp-chrome；',
+                '文件上传调用 input 的 upload 事件，files 支持绝对、相对及 ~/ 路径，沿用当前页面和 Extension/CDP 连接；',
+                'Chrome DevTools 用于浏览器或扩展诊断，以及本服务未覆盖的明确任务；',
+                '先 browse list，按 metadata.taskHint/note/origin 选择合适页面，后台 attach 复用；',
+                '确无合适页才 manage newPage，并设置 taskHint 为可读任务名，note 写明临时、产物或可复用用途；newPage 始终创建新页；',
+                '默认在现有普通窗口后台创建，按可信任务分组；原生分组仅 Extension 支持；',
+                '任务完成后，仅用已有 close/release 处理明确页面集合，默认只关闭本任务 origin=created 且 note 明确临时的页；',
+                '保留 adopted/unknown、产物、可复用测试页和混合用户组，释放本任务临时取得且已不用的权限；',
+                '显式授权关闭仍沿原受控页合同执行；断线与闲置不关闭页面',
+            ].join(''),
+        }
+    )
 
     registerBrowseTool(server)
     registerInputTool(server)

@@ -52,6 +52,7 @@ import {
     generateAccessibilityTree,
     getComputedStyleFromElement,
     inspectChallengePage,
+    observeNativePointer,
     installActionabilityHelpers,
     performActionableClick,
     performClick,
@@ -442,20 +443,83 @@ export class ContentHandler {
         ])
     }
 
-    async getViewportMetrics(
-        params: unknown,
-        context: ActionContext
-    ): Promise<{
-        screenX: number
-        screenY: number
-        innerWidth: number
-        innerHeight: number
-        outerWidth: number
-        outerHeight: number
-        devicePixelRatio: number
-    }> {
+    async getViewportMetrics(params: unknown, context: ActionContext): Promise<unknown> {
         const p = ViewportMetricsSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'viewport_metrics')
+        const probe = p.pointerProbe
+        if (probe) {
+            assertActionActive(context)
+            const probeDeadline = p.deadline ?? context.deadline ?? Date.now() + 30_000
+            const readPointer = () =>
+                chrome.scripting.executeScript({
+                    target: { tabId, allFrames: true },
+                    world: 'ISOLATED',
+                    func: observeNativePointer,
+                    args: [probe.operation, probe.id, probeDeadline],
+                })
+            let results = await readPointer()
+            const root = results.find((entry) => entry.frameId === 0)
+            if (probe.operation === 'stop') {
+                return { stopped: true }
+            }
+            if (
+                !root?.documentId ||
+                root.result?.active !== true ||
+                (probe.documentId && root.documentId !== probe.documentId)
+            ) {
+                throw new Error('原生指针校准的主文档已变化')
+            }
+            if (probe.operation === 'start') {
+                return { documentId: root.documentId }
+            }
+            const selectSample = () =>
+                results
+                    .filter((entry) => {
+                        const sample = entry.result?.sample
+                        return (
+                            entry.result?.active === true &&
+                            sample &&
+                            probe.position &&
+                            probe.since !== undefined &&
+                            sample.at >= probe.since &&
+                            sample.screenX === probe.position.x &&
+                            sample.screenY === probe.position.y
+                        )
+                    })
+                    .sort((a, b) => b.result!.sample!.at - a.result!.sample!.at)[0]
+            let sampled = selectSample()
+            while (!sampled) {
+                assertActionActive(context)
+                remainingNavigationTimeout(probeDeadline)
+                await new Promise((resolve) => setTimeout(resolve, 10))
+                results = await readPointer()
+                sampled = selectSample()
+            }
+            const sample = sampled.result?.sample
+            if (!sample || !sampled.documentId) {
+                throw new Error('未收到本次原生移动的可信指针事件')
+            }
+            if (sample.previousAt === undefined || sample.previousAt < probe.since! || !sample.sameTarget) {
+                throw new Error('原生指针校准未保持在同一控件内')
+            }
+            const offset =
+                sampled.frameId === 0 ? { x: 0, y: 0 } : await getFrameOffset(tabId, sampled.frameId, context)
+            if (!offset) {
+                throw new Error('原生指针事件的 frame 偏移无法核实')
+            }
+            const frame = await chrome.webNavigation.getFrame({ tabId, frameId: sampled.frameId })
+            const currentRoot = await chrome.webNavigation.getFrame({ tabId, frameId: 0 })
+            if (frame?.documentId !== sampled.documentId || currentRoot?.documentId !== root.documentId) {
+                throw new Error('原生指针事件的文档已变化')
+            }
+            assertActionActive(context)
+            return {
+                documentId: root.documentId,
+                at: sample.at,
+                x: sample.screenX - (sample.clientX + offset.x) * sample.scale,
+                y: sample.screenY - (sample.clientY + offset.y) * sample.scale,
+            }
+        }
         const results = await chrome.scripting
             .executeScript({
                 target: { tabId, frameIds: [p.frameId ?? 0] },

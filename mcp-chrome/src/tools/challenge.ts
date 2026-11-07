@@ -1,6 +1,8 @@
+import { setTimeout as delay } from 'node:timers/promises'
+import { inspectChallengePage } from '../core/challenge-page.js'
 import type { ViewportMetrics } from '../core/os-mouse.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
-import { StructuredToolError, TimeoutError } from '../core/errors.js'
+import { OsMouseError, StructuredToolError, TimeoutError } from '../core/errors.js'
 import { remainingNavigationTimeout, withNavigationBudget } from '../core/utils.js'
 
 export const CHALLENGE_POLL_MS = 500
@@ -75,6 +77,7 @@ export interface ChallengePageSnapshot {
     textHits: string[]
     originResponsePending: boolean
     turnstilePresent: boolean
+    turnstileState?: 'none' | 'pending' | 'completed' | 'expired'
     clickPoint: ChallengeClickPoint | null
     clickTargetKind: ChallengeClickTargetKind | null
     clickSource: ChallengeClickSource | null
@@ -90,6 +93,7 @@ export interface ChallengeWaitResult {
     clearanceCookiePresent: boolean
     challengeKind: Exclude<ChallengeKind, 'denied'>
     originResponsePending: boolean
+    browserEvents?: Record<string, unknown>
 }
 
 export interface ChallengeHost {
@@ -102,7 +106,15 @@ export interface ChallengeHost {
     getCookies(filter?: { name?: string }): Promise<unknown>
     mouseMove(x: number, y: number): Promise<void>
     mouseClick(button?: 'left' | 'middle' | 'right' | 'back' | 'forward', clickCount?: number): Promise<void>
-    clickTurnstile?(snapshot: ChallengePageSnapshot, timeout?: number): Promise<void>
+    clickTurnstile?(
+        snapshot: ChallengePageSnapshot,
+        timeout?: number,
+        signal?: AbortSignal,
+        refreshSnapshot?: (timeout?: number) => Promise<ChallengePageSnapshot>
+    ): Promise<void>
+    suspendBrowserEventsForChallenge?(): Promise<Record<string, unknown>>
+    hasBrowserEventObservation?(): boolean
+    browserEvents?(action: 'read', command: { type: 'dialog'; limit: number }): Promise<Record<string, unknown>>
 }
 
 export abstract class ChallengeError extends Error {
@@ -115,7 +127,8 @@ export abstract class ChallengeError extends Error {
         readonly actionStatus: 'not_started' | 'completed',
         readonly waitedMs: number,
         readonly challengeKind: ChallengeKind,
-        readonly mode: 'extension' | 'cdp' | 'none'
+        readonly mode: 'extension' | 'cdp' | 'none',
+        readonly browserEvents?: Record<string, unknown>
     ) {
         super(message)
         this.name = this.constructor.name
@@ -132,13 +145,24 @@ export class ChallengeTimeoutError extends ChallengeError {
         waitedMs: number,
         challengeKind: ChallengeKind,
         mode: 'extension' | 'cdp' | 'none',
-        readonly clickedTurnstile = false
+        readonly clickedTurnstile = false,
+        browserEvents?: Record<string, unknown>
     ) {
-        super(`页面访问验证未在超时内完成（已等待 ${waitedMs}ms）`, action, actionStatus, waitedMs, challengeKind, mode)
+        super(
+            `页面访问验证未在超时内完成（已等待 ${waitedMs}ms）`,
+            action,
+            actionStatus,
+            waitedMs,
+            challengeKind,
+            mode,
+            browserEvents
+        )
         this.suggestion =
-            mode === 'cdp'
-                ? '当前请求使用 CDP。先确认 Chrome Extension 已连接，再不传 port 重试；仅在需要独立浏览器时保留 CDP'
-                : '增加 timeout 后重试同一操作。交互式验证码、IP 声誉和 Bot Fight Mode 无法仅靠等待或点击 checkbox 完成'
+            actionStatus === 'completed'
+                ? '原动作已执行，等待页面验证结束后核验业务结果，勿重放原动作'
+                : mode === 'cdp'
+                  ? '当前请求使用 CDP。先确认 Chrome Extension 已连接，再不传 port 重试；仅在需要独立浏览器时保留 CDP'
+                  : '增加 timeout 后重试同一操作。交互式验证码、IP 声誉和 Bot Fight Mode 无法仅靠等待或点击 checkbox 完成'
     }
 
     toJSON() {
@@ -153,9 +177,10 @@ export class ChallengeTimeoutError extends ChallengeError {
             clickedTurnstile: this.clickedTurnstile,
             mode: this.mode,
             waitedMs: this.waitedMs,
+            ...(this.browserEvents ? { browserEvents: this.browserEvents } : {}),
             autoRetry: false,
-            retryable: true,
-            nextAction: 'retry_with_longer_timeout',
+            retryable: this.actionStatus === 'not_started',
+            nextAction: this.actionStatus === 'completed' ? 'wait_and_verify' : 'retry_with_longer_timeout',
             error: {
                 code: this.code,
                 message: this.message,
@@ -173,9 +198,10 @@ export class ChallengeDeniedError extends ChallengeError {
         action: string,
         actionStatus: 'not_started' | 'completed',
         waitedMs: number,
-        mode: 'extension' | 'cdp' | 'none'
+        mode: 'extension' | 'cdp' | 'none',
+        browserEvents?: Record<string, unknown>
     ) {
-        super('页面拒绝访问（Cloudflare Access denied）', action, actionStatus, waitedMs, 'denied', mode)
+        super('页面拒绝访问（Cloudflare Access denied）', action, actionStatus, waitedMs, 'denied', mode, browserEvents)
     }
 
     toJSON() {
@@ -189,6 +215,7 @@ export class ChallengeDeniedError extends ChallengeError {
             challengeKind: 'denied',
             mode: this.mode,
             waitedMs: this.waitedMs,
+            ...(this.browserEvents ? { browserEvents: this.browserEvents } : {}),
             autoRetry: false,
             retryable: false,
             nextAction: 'stop',
@@ -202,169 +229,16 @@ export class ChallengeDeniedError extends ChallengeError {
 }
 
 //noinspection SpellCheckingInspection -- 模板中的浏览器 API 字段名
-export const CHALLENGE_INSPECT_SCRIPT = `(() => {
-  const challengeSelectors = ${JSON.stringify(CHALLENGE_SELECTORS)};
-  const deniedSelectors = ${JSON.stringify(DENIED_SELECTORS)};
-  const widgetSelectors = ${JSON.stringify(TURNSTILE_WIDGET_SELECTORS)};
-  const verifyButtonSelectors = ${JSON.stringify(TURNSTILE_VERIFY_BUTTON_SELECTORS)};
-  const frameSelectors = ${JSON.stringify(TURNSTILE_FRAME_SELECTORS)};
-  const titleNeedles = ${JSON.stringify(CHALLENGE_TITLE_NEEDLES)};
-  const textMarkers = ${JSON.stringify(CHALLENGE_TEXT_MARKERS)};
-  const originResponsePendingTextMarkers = ${JSON.stringify(ORIGIN_RESPONSE_PENDING_TEXT_MARKERS)};
-  const title = document.title || '';
-  const url = location.href || '';
-  const visibleBodyText = (
-    document.body && document.body.innerText ? document.body.innerText : ''
-  ).replace(/\\s+/g, ' ');
-  const isVisible = (el) => {
-    if (!el) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const bringIntoView = (el) => {
-    if (!el || typeof el.scrollIntoView !== 'function') return;
-    el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
-  };
-  const hits = (selectors) => selectors.filter((selector) => {
-    try { return Array.from(document.querySelectorAll(selector)).some(isVisible); } catch { return false; }
-  });
-  const isCloudflareFrame = (el) => {
-    if (!el) return false;
-    const tag = String(el.tagName || '').toUpperCase();
-    if (tag === 'IFRAME') {
-      const src = String(el.getAttribute('src') || el.src || '');
-      return src.includes('challenges.cloudflare.com') || src.includes('turnstile');
-    }
-    return Boolean(el.closest && el.closest(frameSelectors.join(',')));
-  };
-  const selectorHits = hits(challengeSelectors);
-  const deniedHits = hits(deniedSelectors);
-  const widgetHits = hits(widgetSelectors);
-  const frameHits = hits(frameSelectors);
-  const cloudflareFramePresent = Array.from(document.querySelectorAll('iframe')).some((el) => isCloudflareFrame(el));
-  const normalizedTitle = title.trim().toLowerCase().replace(/…/g, '...');
-  const titlePending = titleNeedles.some((needle) => normalizedTitle.includes(String(needle).toLowerCase()));
-  const textHits = textMarkers.filter((marker) => visibleBodyText.toLowerCase().includes(String(marker).toLowerCase()));
-  const originResponsePending = originResponsePendingTextMarkers.some((marker) =>
-    visibleBodyText.toLowerCase().includes(String(marker).toLowerCase())
-  );
-  const interstitialPending = selectorHits.length > 0 || titlePending || textHits.length > 0;
-  const findVisibleTurnstileBox = () => {
-    const input = document.querySelector('input[name="cf-turnstile-response"]');
-    if (!input) return null;
-    const candidates = [];
-    let node = input.parentElement;
-    while (node && node !== document.documentElement) {
-      if (isVisible(node)) {
-        const rect = node.getBoundingClientRect();
-        if (rect.width >= 120 && rect.height >= 40) candidates.push(node);
-      }
-      node = node.parentElement;
-    }
-    if (candidates.length === 0) return null;
-    return candidates.find((el) => {
-      const rect = el.getBoundingClientRect();
-      return rect.width >= 250 && rect.width <= 340 && rect.height >= 50 && rect.height <= 85;
-    }) || candidates[0];
-  };
-  const hostVerify = Array.from(document.querySelectorAll(verifyButtonSelectors.join(','))).find(isVisible) ||
-    Array.from(document.querySelectorAll('button')).find((el) => {
-      const text = (el.textContent || '').trim();
-      return isVisible(el) && (text === 'Verify you are human' || text === '请验证您是真人');
-    });
-  const turnstileBox = !originResponsePending && (interstitialPending || widgetHits.length > 0)
-    ? findVisibleTurnstileBox() : null;
-  const turnstilePresent =
-    widgetHits.length > 0 ||
-    Boolean(hostVerify) ||
-    (!originResponsePending && interstitialPending &&
-      (cloudflareFramePresent || frameHits.length > 0 || Boolean(turnstileBox)));
-  const useIframeClick = turnstilePresent && (cloudflareFramePresent || (
-    !hostVerify &&
-    interstitialPending &&
-    Boolean(document.querySelector('input[name="cf-turnstile-response"]'))
-  ));
-  const pointFromRect = (rect, kind) => {
-    if (!rect || rect.width < 8 || rect.height < 8) return null;
-    const y = Math.round(rect.top + Math.min(rect.height, 65) / 2);
-    if (kind === 'verify') {
-      return { x: Math.round(rect.left + rect.width / 2), y };
-    }
-    const widgetWidth = Math.min(rect.width, 300);
-    return { x: Math.round(rect.left + Math.min(20, Math.max(14, widgetWidth / 15))), y };
-  };
-  let clickPoint = null;
-  let clickTargetKind = null;
-  let clickSource = null;
-  const setClickTarget = (el, kind) => {
-    if (!el) return;
-    bringIntoView(el);
-    const point = pointFromRect(el.getBoundingClientRect(), kind);
-    if (!point) return;
-    clickPoint = point;
-    clickTargetKind = kind;
-    clickSource = isCloudflareFrame(el) || useIframeClick ? 'iframe' : 'page';
-  };
-  if (hostVerify) {
-    setClickTarget(hostVerify, 'verify');
-  }
-  if (!clickPoint && turnstileBox) {
-    const boxRect = turnstileBox.getBoundingClientRect();
-    if (boxRect.width <= 340 && boxRect.height <= 85) {
-      setClickTarget(turnstileBox, 'widget');
-    }
-  }
-  if (!clickPoint && turnstilePresent) {
-    const frame = Array.from(document.querySelectorAll(frameSelectors.join(','))).find(isVisible);
-    if (frame) {
-      setClickTarget(frame, 'widget');
-    }
-  }
-  if (!clickPoint && turnstilePresent) {
-    const widget = Array.from(document.querySelectorAll(widgetSelectors.join(','))).find(isVisible);
-    if (widget) {
-      setClickTarget(widget, 'widget');
-    }
-  }
-  if (!clickPoint && turnstileBox) {
-    setClickTarget(turnstileBox, 'widget');
-  }
-  const viewport = {
-    screenX: Number(window.screenX),
-    screenY: Number(window.screenY),
-    innerWidth: Number(window.innerWidth),
-    innerHeight: Number(window.innerHeight),
-    outerWidth: Number(window.outerWidth),
-    outerHeight: Number(window.outerHeight),
-    devicePixelRatio: Number(window.devicePixelRatio || 1),
-  };
-  const horizontal = Math.max(0, viewport.outerWidth - viewport.innerWidth);
-  const vertical = Math.max(0, viewport.outerHeight - viewport.innerHeight);
-  const chromeLeft = Math.round(horizontal / 2);
-  const chromeTop = Math.max(0, vertical - horizontal);
-  const screenPoint = clickPoint
-    ? {
-        x: Math.round(viewport.screenX + chromeLeft + clickPoint.x),
-        y: Math.round(viewport.screenY + chromeTop + clickPoint.y),
-      }
-    : null;
-  return {
-    title,
-    url,
-    selectorHits,
-    deniedHits,
-    textHits,
-    originResponsePending,
-    turnstilePresent,
-    clickPoint,
-    clickTargetKind,
-    clickSource,
-    screenPoint,
-    viewport,
-  };
-})()`
+export const CHALLENGE_INSPECT_SCRIPT = `(${inspectChallengePage.toString()})(${JSON.stringify({
+    challengeSelectors: CHALLENGE_SELECTORS,
+    deniedSelectors: DENIED_SELECTORS,
+    widgetSelectors: TURNSTILE_WIDGET_SELECTORS,
+    verifyButtonSelectors: TURNSTILE_VERIFY_BUTTON_SELECTORS,
+    frameSelectors: TURNSTILE_FRAME_SELECTORS,
+    titleNeedles: CHALLENGE_TITLE_NEEDLES,
+    textMarkers: CHALLENGE_TEXT_MARKERS,
+    originResponsePendingTextMarkers: ORIGIN_RESPONSE_PENDING_TEXT_MARKERS,
+})})`
 
 function normalizeChallengeTitle(title: string): string {
     return title.trim().toLowerCase().replace(/…/g, '...')
@@ -507,6 +381,7 @@ function normalizeChallengeSnapshot(
         textHits: Array.isArray(snapshot?.textHits) ? snapshot.textHits : [],
         originResponsePending: Boolean(snapshot?.originResponsePending),
         turnstilePresent: Boolean(snapshot?.turnstilePresent),
+        ...(snapshot?.turnstileState ? { turnstileState: snapshot.turnstileState } : {}),
         clickPoint,
         clickTargetKind:
             snapshot?.clickTargetKind === 'verify' || snapshot?.clickTargetKind === 'widget'
@@ -587,12 +462,13 @@ export async function waitForChallenge(
         actionStatus?: 'not_started' | 'completed'
         now?: () => number
         sleep?: (ms: number) => Promise<void>
+        signal?: AbortSignal
     }
 ): Promise<ChallengeWaitResult> {
     const timeout = options.timeout ?? DEFAULT_TIMEOUT
     const actionStatus = options.actionStatus ?? 'completed'
     const now = options.now ?? Date.now
-    const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+    const sleep = options.sleep ?? ((ms: number) => delay(ms, undefined, { signal: options.signal }))
     const startedAt = now()
     const deadline = () => Date.now() + Math.max(1, timeout - (now() - startedAt))
     let lastInspectAt = startedAt
@@ -603,9 +479,11 @@ export async function waitForChallenge(
     let jsOnlyInterstitial = false
     let emptyInspectCount = 0
     let finalOriginResponseCheckStarted = false
+    let browserEvents: Record<string, unknown> | undefined
+    let observersSuspended = false
     const readWithinBudget = async <T>(operation: () => Promise<T>): Promise<T> => {
         try {
-            return await withNavigationBudget(operation, deadline())
+            return await withNavigationBudget(operation, deadline(), options.signal)
         } catch (error) {
             if (error instanceof TimeoutError || (error instanceof StructuredToolError && error.code === 'TIMEOUT')) {
                 throw new ChallengeTimeoutError(
@@ -614,11 +492,34 @@ export async function waitForChallenge(
                     Math.max(0, now() - startedAt),
                     clickedTurnstile ? 'turnstile' : observedKind,
                     host.getMode(),
-                    clickedTurnstile
+                    clickedTurnstile,
+                    browserEvents
                 )
             }
             throw error
         }
+    }
+    const suspendObservers = async (): Promise<void> => {
+        if (observersSuspended || !host.suspendBrowserEventsForChallenge) {
+            return
+        }
+        browserEvents = await readWithinBudget(() => host.suspendBrowserEventsForChallenge!())
+        if (browserEvents.suspended !== true || browserEvents.fetchEnabled === true) {
+            throw new StructuredToolError(
+                'CHALLENGE_OBSERVATION_CLEANUP_FAILED',
+                '页面验证前未能释放当前请求控制，已保留实际状态',
+                '读取 browserEvents 中的暂停请求及清理错误，处理后再等待页面验证',
+                {
+                    action: options.action,
+                    actionExecuted: actionStatus === 'completed',
+                    actionStatus,
+                    verificationStatus: 'blocked',
+                    browserEvents,
+                    retryable: false,
+                }
+            )
+        }
+        observersSuspended = true
     }
 
     while (true) {
@@ -630,18 +531,47 @@ export async function waitForChallenge(
                 Math.max(0, now() - startedAt),
                 clickedTurnstile ? 'turnstile' : observedKind,
                 host.getMode(),
-                clickedTurnstile
+                clickedTurnstile,
+                browserEvents
             )
+        }
+        if (host.hasBrowserEventObservation?.() && host.browserEvents) {
+            const events = await readWithinBudget(() => host.browserEvents!('read', { type: 'dialog', limit: 1000 }))
+            const dialog = Array.isArray(events.logs)
+                ? events.logs.find((entry: { state?: string }) => entry.state === 'pending')
+                : undefined
+            if (dialog) {
+                throw new StructuredToolError(
+                    'DIALOG_OPEN',
+                    '页面对话框等待处理，页面验证尚未执行',
+                    '使用 manage(action="dialog") 处理返回的 ref，再检查原操作结果',
+                    {
+                        ref: dialog.ref,
+                        actionExecuted: actionStatus === 'completed',
+                        actionStatus,
+                        verificationStatus: 'blocked',
+                        retryable: false,
+                    }
+                )
+            }
         }
         const header = await readWithinBudget(() => host.getChallengeState())
         const headerPending = header?.state === 'pending'
         const title = await readWithinBudget(() => readPageTitle(host))
         if (DENIED_TITLE_PREFIXES.some((prefix) => title.trim().toLowerCase().startsWith(prefix))) {
-            throw new ChallengeDeniedError(options.action, actionStatus, Math.max(0, now() - startedAt), host.getMode())
+            await suspendObservers()
+            throw new ChallengeDeniedError(
+                options.action,
+                actionStatus,
+                Math.max(0, now() - startedAt),
+                host.getMode(),
+                browserEvents
+            )
         }
         let snapshot: ChallengePageSnapshot | undefined
         if (titleLooksLikeChallenge(title)) {
             observedKind = observedKind === 'none' ? 'js' : observedKind
+            await suspendObservers()
             const passiveGraceMs =
                 host.getMode() === 'extension' ? CHALLENGE_EXTENSION_PASSIVE_GRACE_MS : CHALLENGE_INSPECT_GRACE_MS
             const elapsed = now() - startedAt
@@ -685,7 +615,17 @@ export async function waitForChallenge(
         }
         const kind = classifyChallengeSnapshot(snapshot, headerPending)
         if (kind === 'denied') {
-            throw new ChallengeDeniedError(options.action, actionStatus, Math.max(0, now() - startedAt), host.getMode())
+            await suspendObservers()
+            throw new ChallengeDeniedError(
+                options.action,
+                actionStatus,
+                Math.max(0, now() - startedAt),
+                host.getMode(),
+                browserEvents
+            )
+        }
+        if (kind === 'turnstile' || (kind === 'js' && snapshot.inspected)) {
+            await suspendObservers()
         }
         if (kind !== 'none' && (kind === 'turnstile' || snapshotInspected(snapshot) || observedKind === 'none')) {
             observedKind = kind
@@ -699,6 +639,7 @@ export async function waitForChallenge(
                     observedKind === 'none' ? false : await readWithinBudget(() => hasClearanceCookie(host)),
                 challengeKind: observedKind,
                 originResponsePending: snapshot.originResponsePending,
+                ...(browserEvents ? { browserEvents } : {}),
             }
         }
 
@@ -722,18 +663,33 @@ export async function waitForChallenge(
                 const clickPoint = snapshot.clickPoint
                 try {
                     if (host.clickTurnstile) {
-                        await withNavigationBudget(
-                            () => host.clickTurnstile!(clickSnapshot, Math.max(0, timeout - (now() - startedAt))),
-                            clickDeadline
-                        )
+                        const click = () =>
+                            host.clickTurnstile!(
+                                clickSnapshot,
+                                Math.max(0, timeout - (now() - startedAt)),
+                                options.signal,
+                                (remaining = CHALLENGE_INSPECT_TIMEOUT_MS) =>
+                                    readChallengeSnapshot(host, Math.min(CHALLENGE_INSPECT_TIMEOUT_MS, remaining))
+                            )
+                        // iframe 路径自行处理取消与有界释放，完成后才结束 tab 锁
+                        if (clickSnapshot.clickSource === 'iframe') {
+                            await click()
+                        } else {
+                            await withNavigationBudget(click, clickDeadline, options.signal)
+                        }
                     } else {
-                        await withNavigationBudget(() => host.mouseMove(clickPoint.x, clickPoint.y), clickDeadline)
-                        await withNavigationBudget(() => host.mouseClick('left'), clickDeadline)
+                        await withNavigationBudget(
+                            () => host.mouseMove(clickPoint.x, clickPoint.y),
+                            clickDeadline,
+                            options.signal
+                        )
+                        await withNavigationBudget(() => host.mouseClick('left'), clickDeadline, options.signal)
                     }
                 } catch (error) {
                     if (
                         error instanceof TimeoutError ||
-                        (error instanceof StructuredToolError && error.code === 'TIMEOUT')
+                        (error instanceof StructuredToolError && error.code === 'TIMEOUT') ||
+                        (error instanceof OsMouseError && error.context.failureStage === 'release')
                     ) {
                         Object.assign(error.context, {
                             action: options.action,
@@ -764,10 +720,11 @@ export async function waitForChallenge(
                 Math.max(elapsed, timeout),
                 clickedTurnstile ? 'turnstile' : observedKind === 'none' ? kind : observedKind,
                 host.getMode(),
-                clickedTurnstile
+                clickedTurnstile,
+                browserEvents
             )
         }
-        await sleep(Math.min(CHALLENGE_POLL_MS, timeout - elapsed))
+        await readWithinBudget(() => sleep(Math.min(CHALLENGE_POLL_MS, timeout - elapsed)))
     }
 }
 
@@ -775,13 +732,33 @@ export async function resolveChallenge(
     host: ChallengeHost,
     action: string,
     actionStatus: 'not_started' | 'completed' = 'completed',
-    timeout?: number
+    timeout?: number,
+    signal?: AbortSignal
 ): Promise<ChallengeWaitResult> {
-    return waitForChallenge(host, { action, actionStatus, timeout })
+    try {
+        return await waitForChallenge(host, { action, actionStatus, timeout, signal })
+    } catch (error) {
+        if (!signal?.aborted || (error instanceof OsMouseError && error.context.failureStage === 'release')) {
+            throw error
+        }
+        throw new StructuredToolError(
+            'CANCELLED',
+            error instanceof Error ? error.message : String(error),
+            '请求已取消，请读取当前页面核验已执行动作的结果',
+            {
+                action,
+                actionExecuted: actionStatus === 'completed',
+                actionStatus,
+                verificationStatus: 'cancelled',
+                verificationActionExecuted: 'unknown',
+                retryable: false,
+            }
+        )
+    }
 }
 
 export function challengeResultFields(result: ChallengeWaitResult): Record<string, unknown> {
-    if (result.challengeKind === 'none' && !result.originResponsePending) {
+    if (result.challengeKind === 'none' && !result.originResponsePending && !result.browserEvents) {
         return {}
     }
     return {
@@ -791,5 +768,6 @@ export function challengeResultFields(result: ChallengeWaitResult): Record<strin
         clickedTurnstile: result.clickedTurnstile,
         clearanceCookiePresent: result.clearanceCookiePresent,
         ...(result.originResponsePending ? { originResponsePending: true } : {}),
+        ...(result.browserEvents ? { browserEvents: result.browserEvents } : {}),
     }
 }

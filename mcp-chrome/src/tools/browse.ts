@@ -499,7 +499,8 @@ async function handleBrowse(
                                             unifiedSession,
                                             'open',
                                             'completed',
-                                            Math.max(0, deadline - Date.now())
+                                            Math.max(0, deadline - Date.now()),
+                                            signal
                                         )
                                         return {
                                             success: true,
@@ -536,7 +537,8 @@ async function handleBrowse(
                                                   unifiedSession,
                                                   'back',
                                                   'completed',
-                                                  Math.max(0, deadline - Date.now())
+                                                  Math.max(0, deadline - Date.now()),
+                                                  signal
                                               )
                                             : undefined
                                         return {
@@ -581,7 +583,8 @@ async function handleBrowse(
                                                   unifiedSession,
                                                   'forward',
                                                   'completed',
-                                                  Math.max(0, deadline - Date.now())
+                                                  Math.max(0, deadline - Date.now()),
+                                                  signal
                                               )
                                             : undefined
                                         return {
@@ -627,7 +630,8 @@ async function handleBrowse(
                                             unifiedSession,
                                             'refresh',
                                             'completed',
-                                            Math.max(0, deadline - Date.now())
+                                            Math.max(0, deadline - Date.now()),
+                                            signal
                                         )
                                         return {
                                             success: true,

@@ -32,6 +32,12 @@ export class LogManager {
     private consoleMessages = new Map<number, ConsoleMessage[]>()
     private networkRequests = new Map<number, NetworkRequest[]>()
     private consoleSequences = new Map<number, number>()
+    private consoleHandoffs = new Map<
+        number,
+        { binding: string; events: Array<{ contextId: number; message: ConsoleMessage }> }
+    >()
+    private consoleContexts = new Map<number, Map<number, { frameId?: string; isDefault?: boolean }>>()
+    private consoleFallbackFrames = new Map<number, string>()
     private networkSequences = new Map<number, number>()
     private challengeRequired = new Map<number, boolean>()
     private mainFrameIds = new Map<number, string>()
@@ -59,7 +65,32 @@ export class LogManager {
     /** 替换 console 消息列表（清理或覆盖场景） */
     setConsole(tabId: number, messages: ConsoleMessage[]): void {
         this.assignConsoleSequences(tabId, messages)
-        this.consoleMessages.set(tabId, messages)
+        this.consoleMessages.set(tabId, messages.slice(-1000))
+    }
+
+    beginConsoleHandoff(tabId: number, binding: string, fallbackFrameId?: string): void {
+        if (fallbackFrameId) {
+            this.consoleFallbackFrames.set(tabId, fallbackFrameId)
+        } else {
+            this.consoleFallbackFrames.delete(tabId)
+        }
+        this.consoleHandoffs.set(tabId, { binding, events: [] })
+    }
+
+    hasConsoleHandoff(tabId: number): boolean {
+        return this.consoleHandoffs.has(tabId)
+    }
+
+    cancelConsoleHandoff(tabId: number): void {
+        const handoff = this.consoleHandoffs.get(tabId)
+        this.consoleHandoffs.delete(tabId)
+        if (handoff) {
+            this.setConsole(tabId, [...this.getConsole(tabId), ...handoff.events.map((event) => event.message)])
+        }
+    }
+
+    getConsoleContexts(tabId: number): number[] {
+        return [...(this.consoleContexts.get(tabId)?.keys() ?? [])]
     }
 
     /** 是否已为 tab 初始化 network 缓冲 */
@@ -106,15 +137,48 @@ export class LogManager {
 
     /** debugger 断开后请求结束事件不可恢复，保持不确定状态直到新主文档或 tab cleanup */
     handleDebuggerDetach(tabId: number): void {
+        this.cancelConsoleHandoff(tabId)
+        this.consoleFallbackFrames.delete(tabId)
+        this.consoleContexts.delete(tabId)
         this.networkObserved.delete(tabId)
         this.pendingRequests.delete(tabId)
         this.pendingUncertain.add(tabId)
         this.mainFrameIds.delete(tabId)
     }
 
-    handleEvent(tabId: number, method: string, params: unknown): void {
+    handleEvent(tabId: number, method: string, params: unknown, sessionId?: string): void {
+        if (!sessionId && method === 'Runtime.executionContextCreated') {
+            const p = params as { context: { id: number; auxData?: { frameId?: string; isDefault?: boolean } } }
+            const contexts =
+                this.consoleContexts.get(tabId) ?? new Map<number, { frameId?: string; isDefault?: boolean }>()
+            contexts.set(p.context.id, p.context.auxData ?? {})
+            this.consoleContexts.set(tabId, contexts)
+        } else if (!sessionId && method === 'Runtime.executionContextDestroyed') {
+            this.consoleContexts.get(tabId)?.delete((params as { executionContextId: number }).executionContextId)
+        } else if (!sessionId && method === 'Runtime.executionContextsCleared') {
+            this.consoleFallbackFrames.delete(tabId)
+            this.consoleContexts.delete(tabId)
+        } else if (!sessionId && method === 'Runtime.bindingCalled') {
+            const p = params as { name: string; payload: string; executionContextId: number }
+            const handoff = this.consoleHandoffs.get(tabId)
+            if (handoff?.binding === p.name) {
+                const payload = JSON.parse(p.payload) as { hooked: boolean; messages: ConsoleMessage[] }
+                // The page binding is the atomic boundary, independent of event text or clock resolution.
+                const native = handoff.events.filter(
+                    (event) => !payload.hooked || event.contextId !== p.executionContextId
+                )
+                this.setConsole(tabId, [
+                    ...this.getConsole(tabId),
+                    ...payload.messages,
+                    ...native.map((event) => event.message),
+                ])
+                this.consoleHandoffs.delete(tabId)
+                this.consoleFallbackFrames.delete(tabId)
+            }
+        }
         if (method === 'Runtime.consoleAPICalled') {
             const p = params as {
+                executionContextId: number
                 type: string
                 args: Array<{ type: string; value?: unknown; description?: string }>
                 timestamp: number
@@ -130,7 +194,20 @@ export class LogManager {
                 message.url = p.stackTrace.callFrames[0].url
                 message.lineNumber = p.stackTrace.callFrames[0].lineNumber
             }
+            const context = sessionId ? undefined : this.consoleContexts.get(tabId)?.get(p.executionContextId)
+            if (context?.isDefault && context.frameId === this.consoleFallbackFrames.get(tabId)) {
+                return
+            }
+            const handoff = sessionId ? undefined : this.consoleHandoffs.get(tabId)
+            if (handoff) {
+                handoff.events.push({ contextId: p.executionContextId, message })
+                if (handoff.events.length > 1000) {
+                    handoff.events.shift()
+                }
+                return
+            }
             const messages = this.consoleMessages.get(tabId) || []
+            this.assignConsoleSequences(tabId, [message])
             messages.push(message)
             // 批量删除：用 10% 缓冲 + splice，避免每次 shift 触发 O(N) 拷贝
             if (messages.length > 1100) {
@@ -206,7 +283,9 @@ export class LogManager {
                     this.pendingUncertain.add(tabId)
                     if (!wasUncertain) {
                         console.warn(
-                            `[MCP] Pending request tracking exceeded ${PENDING_MAX_PER_TAB} entries for tab ${tabId}; networkidle will remain unavailable until tab cleanup`
+                            `[MCP] Pending request tracking exceeded ${PENDING_MAX_PER_TAB} entries ` +
+                                `for tab ${tabId}; ` +
+                                'networkidle will remain unavailable until tab cleanup'
                         )
                     }
                 }
@@ -261,6 +340,9 @@ export class LogManager {
     }
 
     cleanupTab(tabId: number): void {
+        this.consoleHandoffs.delete(tabId)
+        this.consoleFallbackFrames.delete(tabId)
+        this.consoleContexts.delete(tabId)
         this.consoleMessages.delete(tabId)
         this.networkRequests.delete(tabId)
         this.consoleSequences.delete(tabId)
@@ -340,7 +422,8 @@ export class LogManager {
                 if (now - req._addedAt > PENDING_TTL_MS && !req._ttlWarned) {
                     req._ttlWarned = true
                     console.warn(
-                        `[MCP] Pending request ${requestId} (${req.url}) has remained active for more than ${PENDING_TTL_MS}ms`
+                        `[MCP] Pending request ${requestId} (${req.url}) ` +
+                            `has remained active for more than ${PENDING_TTL_MS}ms`
                     )
                 }
             }

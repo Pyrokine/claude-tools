@@ -262,30 +262,77 @@ class SessionManager implements IBrowserDriver {
      * 只有连接失败时才启动新浏览器
      */
     async launch(options: LaunchOptions = {}): Promise<TargetInfo> {
+        const scope = this.requestContext?.()
+        const signal = scope?.signal
+        const deadline = Math.min(scope?.deadline ?? Infinity, Date.now() + (options.timeout ?? DEFAULT_TIMEOUT))
+        const remaining = () => {
+            signal?.throwIfAborted()
+            return remainingNavigationTimeout(deadline)
+        }
+        remaining()
         return this.withLock(async () => {
+            remaining()
             const port = options.port ?? 0
+            const processParameters = [
+                options.executablePath,
+                options.headless,
+                options.userDataDir,
+                options.incognito,
+            ].some((value) => value !== undefined)
+            if (this.isConnected()) {
+                throw new DriverCapabilityError('已有 CDP 连接，未关闭或替换现有浏览器；请显式结束原连接后启动')
+            }
+            if (port > 0 && processParameters) {
+                try {
+                    await getBrowserWSEndpoint('127.0.0.1', port, remaining(), signal)
+                } catch (error) {
+                    if (error instanceof TimeoutError) {
+                        throw error
+                    }
+                    remaining()
+                    /* No running endpoint: the requested process options can be applied. */
+                }
+                const targets = await getTargets('127.0.0.1', port, remaining(), signal).catch((error) => {
+                    if (error instanceof TimeoutError) {
+                        throw error
+                    }
+                    remaining()
+                    return null
+                })
+                remaining()
+                if (targets) {
+                    throw new DriverCapabilityError('启动端口已有浏览器，无法对该进程应用显式启动参数，未创建页面')
+                }
+            }
 
             // 如果指定了端口，先尝试连接已运行的浏览器
-            if (port > 0) {
+            if (port > 0 && !processParameters) {
+                let reuseClient: CDPClient | undefined
                 try {
-                    const endpoint = await getBrowserWSEndpoint('127.0.0.1', port)
+                    const endpoint = await getBrowserWSEndpoint('127.0.0.1', port, remaining(), signal)
                     // 连接成功，复用已有浏览器
+                    remaining()
                     this.resetState()
                     this.stealthMode = options.stealth ?? 'safe'
-                    this.cdp = new CDPClient()
-                    await this.cdp.connect(endpoint, options.timeout)
+                    reuseClient = new CDPClient(() => this.requestContext?.())
+                    this.cdp = reuseClient
+                    await reuseClient.connect(endpoint, remaining())
+                    remaining()
                     // 记录端口（connect 模式没有 launcher）
                     this.connectedPort = port
 
                     // 获取现有页面
-                    const targets = await getTargets('127.0.0.1', port)
+                    const targets = await getTargets('127.0.0.1', port, remaining(), signal)
+                    remaining()
                     let pageTarget = targets.find((t) => t.type === 'page')
 
                     // 如果没有页面或 attach 失败，创建新 tab
                     if (pageTarget) {
                         try {
-                            await this.attachToTargetInternal(pageTarget.id)
+                            await this.attachToTargetInternal(pageTarget.id, deadline)
+                            remaining()
                         } catch {
+                            remaining()
                             // attach 失败，创建新 tab
                             pageTarget = undefined
                         }
@@ -293,7 +340,9 @@ class SessionManager implements IBrowserDriver {
 
                     if (!pageTarget) {
                         // 创建新 tab（在已有窗口）
+                        remaining()
                         const newTarget = await this.newPageInternal()
+                        remaining()
                         return {
                             ...newTarget,
                             reused: true,
@@ -309,43 +358,70 @@ class SessionManager implements IBrowserDriver {
                         reused: true,
                         targetCreated: false,
                     }
-                } catch {
+                } catch (error) {
+                    reuseClient?.close()
+                    if (this.cdp === reuseClient) {
+                        this.cdp = null
+                    }
+                    if (error instanceof TimeoutError) {
+                        throw error
+                    }
+                    remaining()
                     // 连接失败，继续启动新浏览器
                 }
             }
 
             // 关闭现有会话
+            remaining()
             this.resetState()
 
             // 保存 stealth 模式
             this.stealthMode = options.stealth ?? 'safe'
 
             // 启动浏览器
-            this.launcher = new BrowserLauncher()
-            const endpoint = await this.launcher.launch(options)
+            remaining()
+            const launcher = new BrowserLauncher()
+            this.launcher = launcher
+            let client: CDPClient | undefined
+            try {
+                const endpoint = await launcher.launch({ ...options, timeout: remaining() }, signal, deadline)
+                remaining()
 
-            // 连接 CDP
-            this.cdp = new CDPClient()
-            await this.cdp.connect(endpoint, options.timeout)
+                // 连接 CDP
+                client = new CDPClient(() => this.requestContext?.())
+                this.cdp = client
+                await client.connect(endpoint, remaining())
+                remaining()
 
-            // 获取第一个页面
-            const targets = await getTargets('127.0.0.1', this.launcher.port)
-            const pageTarget = targets.find((t) => t.type === 'page')
+                // 获取第一个页面
+                const targets = await getTargets('127.0.0.1', launcher.port, remaining(), signal)
+                remaining()
+                const pageTarget = targets.find((t) => t.type === 'page')
+                if (!pageTarget) {
+                    throw new Error('未找到页面')
+                }
 
-            if (!pageTarget) {
-                throw new Error('未找到页面')
+                // 附加到页面
+                await this.attachToTargetInternal(pageTarget.id, deadline)
+                remaining()
+                return {
+                    targetId: pageTarget.id,
+                    type: pageTarget.type,
+                    url: pageTarget.url,
+                    title: pageTarget.title,
+                }
+            } catch (error) {
+                client?.close()
+                if (this.cdp === client) {
+                    this.cdp = null
+                }
+                launcher.close()
+                if (this.launcher === launcher) {
+                    this.launcher = null
+                }
+                throw error
             }
-
-            // 附加到页面
-            await this.attachToTargetInternal(pageTarget.id)
-
-            return {
-                targetId: pageTarget.id,
-                type: pageTarget.type,
-                url: pageTarget.url,
-                title: pageTarget.title,
-            }
-        })
+        }, deadline)
     }
 
     /**
@@ -2662,14 +2738,15 @@ class SessionManager implements IBrowserDriver {
     /**
      * 关闭页面
      */
-    async closePage(targetId: string): Promise<void> {
+    async closePage(targetId: string): Promise<PageManagementResult> {
         if (!targetId) {
             throw new TargetNotFoundError('targetId is required')
         }
         return this.withLock(async () => {
             this.ensureConnected()
             const targets = await this.listTargets()
-            if (!targets.some((target) => target.targetId === targetId)) {
+            const before = targets.find((target) => target.targetId === targetId)
+            if (!before) {
                 throw new TargetNotFoundError(targetId)
             }
             const id = targetId
@@ -2697,6 +2774,7 @@ class SessionManager implements IBrowserDriver {
                 this.clearAttachedTargetState()
             }
             this.targetLogs.delete(id)
+            return { targetId: id, before, after: null }
         })
     }
 

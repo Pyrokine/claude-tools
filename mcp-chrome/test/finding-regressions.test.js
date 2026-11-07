@@ -494,6 +494,200 @@ async function withPageFixture(mode, run) {
     }
 }
 
+test('CF navigation returns live metadata after verification without replaying the action', async (t) => {
+    for (const mode of ['extension', 'cdp']) {
+        for (const action of ['open', 'back', 'forward', 'refresh']) {
+            await t.test(`${mode} ${action}`, async () => {
+                await withPageFixture(mode, async ({ unified, driver, state }) => {
+                    let navigations = 0;
+                    const final = {
+                        url: 'https://example.com/login?token=fixture-secret',
+                        title: 'Business page',
+                        managed: mode === 'extension',
+                    };
+                    const navigate = async () => {
+                        ++navigations;
+                        state.actionCompleted = true;
+                        return { navigated: true };
+                    };
+                    const restoreDriver = patchProperties(mode === 'extension' ? driver : getSession(), {
+                        getPageSnapshot: async (targetId) => ({
+                            targetId,
+                            url:
+                                state.actionCompleted && targetId === '202'
+                                    ? final.url
+                                    : `https://example.com/${targetId}`,
+                            revision: `r${targetId}`,
+                        }),
+                    });
+                    const restore = patchProperties(unified, {
+                        getState: () => ({
+                            url: 'https://example.com/?__cf_chl_rt_tk=old',
+                            title: 'Just a moment...',
+                            managed: true,
+                        }),
+                        getLiveState: async () => final,
+                        evaluate: async () => ({ title: final.title, inspected: true }),
+                        inspectChallenge: async () => ({ title: final.title, inspected: true }),
+                        navigate,
+                        goBack: navigate,
+                        goForward: navigate,
+                        reload: navigate,
+                    });
+                    try {
+                        const response = await registeredTool(registerBrowseTool)({
+                            action,
+                            targetId: '202',
+                            url: 'https://example.com/start',
+                            timeout: 1000,
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.isError, undefined, response.content[0].text);
+                        assert.equal(body.title, final.title);
+                        assert.equal(new URL(body.url).pathname, '/login');
+                        assert.equal(body.url.includes('fixture-secret'), false);
+                        assert.equal(body.url, body.pageContext.after.url);
+                        assert.equal(body.managed, mode === 'extension');
+                        assert.equal(body.pageContext.targetId, '202');
+                        assert.equal(state.current, '101');
+                        assert.equal(navigations, 1);
+                    } finally {
+                        restore();
+                        restoreDriver();
+                    }
+                });
+            });
+        }
+    }
+});
+
+test('CF navigation keeps origin-response pending while returning the current page metadata', async () => {
+    for (const mode of ['extension', 'cdp']) {
+        await withPageFixture(mode, async ({ unified }) => {
+            const live = {
+                url: 'https://example.com/waiting',
+                title: 'Verification completed',
+                managed: mode === 'extension',
+            };
+            const snapshot = { ...live, originResponsePending: true, inspected: true };
+            let navigations = 0;
+            const restore = patchProperties(unified, {
+                navigate: async () => {
+                    ++navigations;
+                },
+                getLiveState: async () => live,
+                inspectChallenge: async () => snapshot,
+                evaluate: async () => snapshot,
+            });
+            try {
+                const response = await registeredTool(registerBrowseTool)({
+                    action: 'open',
+                    targetId: '202',
+                    url: live.url,
+                    timeout: 1000,
+                });
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(response.isError, undefined, response.content[0].text);
+                assert.equal(body.originResponsePending, true);
+                assert.equal(body.challengeResolved, true);
+                assert.equal(body.title, live.title);
+                assert.equal(body.url, live.url);
+                assert.equal(navigations, 1);
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('CF navigation preserves completed state when final metadata fails or exhausts the budget', async (t) => {
+    for (const mode of ['extension', 'cdp']) {
+        for (const failure of ['timeout', 'missing', 'pending']) {
+            await t.test(`${mode} ${failure}`, async () => {
+                await withPageFixture(mode, async ({ unified, state }) => {
+                    let navigations = 0;
+                    let metadataTimeout;
+                    const restore = patchProperties(unified, {
+                        navigate: async () => {
+                            ++navigations;
+                            state.actionCompleted = true;
+                        },
+                        getLiveState: async (timeout) => {
+                            if (timeout === undefined) {
+                                return { url: 'https://example.com/202', title: 'Owned page' };
+                            }
+                            metadataTimeout = timeout;
+                            if (failure === 'timeout') {
+                                throw new TimeoutError('final metadata timeout');
+                            }
+                            if (failure === 'missing') {
+                                state.targets.delete('202');
+                                return null;
+                            }
+                            return new Promise(() => {});
+                        },
+                        evaluate: async () => ({ title: 'Owned page', inspected: true }),
+                    });
+                    try {
+                        const started = performance.now();
+                        const response = await registeredTool(registerBrowseTool)({
+                            action: 'open',
+                            targetId: '202',
+                            url: 'https://example.com/start',
+                            timeout: 80,
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.isError, true, response.content[0].text);
+                        assert.equal(body.error.code, failure === 'missing' ? 'TARGET_NOT_FOUND' : 'TIMEOUT');
+                        assert.equal(body.error.context.actionExecuted, true);
+                        assert.equal(body.error.context.actionStatus, 'completed');
+                        assert.equal(body.error.context.failureStage, 'metadata');
+                        assert.equal(body.error.context.retryable, false);
+                        assert.equal(body.pageContext.targetId, '202');
+                        assert.ok(metadataTimeout > 0 && metadataTimeout <= 80);
+                        assert.ok(performance.now() - started < 1000);
+                        assert.equal(navigations, 1);
+                    } finally {
+                        restore();
+                    }
+                });
+            });
+        }
+    }
+});
+
+test('CF navigation leaves attach and empty history on the existing cached metadata path', async () => {
+    for (const mode of ['extension', 'cdp']) {
+        for (const action of ['attach', 'back', 'forward']) {
+            await withPageFixture(mode, async ({ unified }) => {
+                const restore = patchProperties(unified, {
+                    getLiveState: async () => assert.fail('no additional live state request'),
+                    goBack: async () => ({ navigated: false }),
+                    goForward: async () => ({ navigated: false }),
+                });
+                try {
+                    const response = await registeredTool(registerBrowseTool)({
+                        action,
+                        targetId: '202',
+                        timeout: 1000,
+                    });
+                    const body = JSON.parse(response.content[0].text);
+                    assert.equal(response.isError, undefined, response.content[0].text);
+                    assert.equal(body.title, 'Owned page');
+                    assert.equal(body.challengeResolved, undefined);
+                    if (action === 'attach') {
+                        assert.equal(body.activated, false);
+                    } else {
+                        assert.equal(body.navigated, false);
+                    }
+                } finally {
+                    restore();
+                }
+            });
+        }
+    }
+});
+
 test('live state forwards the remaining timeout to both backend queries', async () => {
     for (const mode of ['extension', 'cdp']) {
         await withPageFixture(mode, async ({ unified, driver, state }) => {
@@ -907,8 +1101,20 @@ test('F3 CDP tools retain full match counts and collect diagnostics before leavi
         let diagnosticReads = 0;
         const cdp = {
             async send(method) {
-                if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
-                if (method === 'DOM.querySelectorAll') return { nodeIds: Array.from({ length: 15 }, (_, i) => i + 1) };
+                if (method === 'Runtime.evaluate') {
+                    return { result: { objectId: 'query-result' } };
+                }
+                if (method === 'Runtime.getProperties') {
+                    return {
+                        result: [
+                            { name: 'count', value: { value: 15 } },
+                            { name: 'node', value: { subtype: 'null' } },
+                        ],
+                    };
+                }
+                if (method === 'Runtime.releaseObject') {
+                    return {};
+                }
                 throw new CDPError(`unexpected ${method}`);
             },
         };
@@ -2254,7 +2460,10 @@ test('C19 evaluate retains origin-wait fields across action, verification and ou
     const evaluate = registeredTool(registerEvaluateTool);
     for (const mode of ['extension', 'cdp']) {
         for (const scenario of ['success', 'action-failure', 'verification-failure', 'output-failure']) {
-            await t.test(`${mode} ${scenario}`, async () => {
+            await t.test(`${mode} ${scenario}`, async (context) => {
+                if (scenario === 'verification-failure') {
+                    context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+                }
                 await withPageFixture(mode, async ({ unified }) => {
                     let executions = 0;
                     let inspections = 0;
@@ -2283,20 +2492,29 @@ test('C19 evaluate retains origin-wait fields across action, verification and ou
                                 ++inspections;
                                 return snapshot;
                             }
-                            if (script !== 'owned-action') return false;
+                            if (script !== 'owned-action') {
+                                return { matched: false };
+                            }
                             ++executions;
-                            if (scenario === 'action-failure') throw new Error('Evaluation failed: owned-action');
+                            if (scenario === 'action-failure') {
+                                throw new Error('Evaluation failed: owned-action');
+                            }
                             return scenario === 'output-failure' ? 1n : 'owned-result';
                         },
                     });
                     try {
-                        const response = await evaluate({
+                        const pending = evaluate({
                             targetId: '202',
                             script: 'owned-action',
                             ...(scenario === 'verification-failure'
                                 ? { postCondition: { script: 'false', timeout: 1 } }
                                 : {}),
                         });
+                        if (scenario === 'verification-failure') {
+                            await new Promise((resolve) => setImmediate(resolve));
+                            context.mock.timers.tick(1);
+                        }
+                        const response = await pending;
                         const body = JSON.parse(response.content[0].text);
                         assert.equal(body.originResponsePending, true);
                         assert.equal(body.challengeResolved, true);
@@ -2311,6 +2529,7 @@ test('C19 evaluate retains origin-wait fields across action, verification and ou
                             assert.equal(body.success, true);
                             assert.equal(body.result, 'owned-result');
                         } else if (scenario === 'verification-failure') {
+                            context.diagnostic(JSON.stringify({ mode, timeout: 1, postCondition: body.postCondition }));
                             assert.equal(body.success, false);
                             assert.equal(body.verificationStatus, 'not_matched');
                             assert.equal(body.failureStage, 'verification');
@@ -2319,7 +2538,7 @@ test('C19 evaluate retains origin-wait fields across action, verification and ou
                             assert.equal(body.failureStage, scenario === 'output-failure' ? 'output' : 'action');
                         }
                         assert.equal(executions, 1);
-                        assert.equal(inspections, 1);
+                        assert.equal(inspections, scenario === 'action-failure' ? 1 : 2);
                     } finally {
                         restore();
                     }
@@ -7875,6 +8094,68 @@ test('R29-CH-01 navigation waits and close redact only display URLs in both back
     }
 });
 
+test('R29-CH-01 real CDP close returns affected state through both registered tools', async (t) => {
+    const url = 'https://example.com/owned?token=close-owned-secret&name=report';
+    for (const [register, action] of [
+        [registerBrowseTool, 'close'],
+        [registerManageTool, 'closePage'],
+    ]) {
+        for (const outcome of ['success', 'refused', 'missing']) {
+            await t.test(`${action}/${outcome}`, async () =>
+                withPageFixture('cdp', async ({ state }) => {
+                    const session = getSession();
+                    const before = { id: '202', targetId: '202', type: 'page', url, title: 'Owned close target' };
+                    const commands = [];
+                    const restore = patchProperties(session, {
+                        cdp: {
+                            isConnected: true,
+                            async send(method, params) {
+                                commands.push({ method, params });
+                                if (outcome === 'success') {
+                                    state.targets.delete(params.targetId);
+                                }
+                                return { success: outcome === 'success' };
+                            },
+                        },
+                        currentTargetId: '101',
+                        pendingPageCondition: null,
+                        listTargets: async () => (outcome === 'missing' ? [] : [before]),
+                        closePage: Object.getPrototypeOf(session).closePage,
+                    });
+                    try {
+                        const response = await registeredTool(register)({ action, targetId: '202' });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.content[0].text.includes('close-owned-secret'), false);
+                        assert.equal(state.current, '101');
+                        if (outcome === 'success') {
+                            assert.equal(body.success, true, response.content[0].text);
+                            assert.equal(body.affected.targetId, '202');
+                            assert.equal(body.affected.before.title, before.title);
+                            assert.equal(
+                                body.affected.before.url,
+                                'https://example.com/owned?token=[REDACTED]&name=report'
+                            );
+                            assert.equal(body.affected.after, null);
+                            assert.equal(state.targets.has('202'), false);
+                            assert.equal(before.url, url);
+                        } else {
+                            assert.equal(response.isError, true);
+                            assert.equal(body.affected, undefined);
+                            assert.equal(state.targets.has('202'), true);
+                        }
+                        assert.deepEqual(
+                            commands,
+                            outcome === 'missing' ? [] : [{ method: 'Target.closeTarget', params: { targetId: '202' } }]
+                        );
+                    } finally {
+                        restore();
+                    }
+                })
+            );
+        }
+    }
+});
+
 test('R29-CH-02 completed CDP waits read live title and URL with the remaining deadline', async () => {
     for (const scenario of ['live', 'failed', 'expired']) {
         await withPageFixture('cdp', async () => {
@@ -11625,6 +11906,46 @@ test('wait full deadline observes a visible condition after the diagnostic reser
         } finally {
             restore();
             restoreSession();
+        }
+    });
+});
+
+test('Extension target diagnostics preserve fifteen matches beyond the requested nth and candidate limit', async () => {
+    await withPageFixture('extension', async ({ unified, state }) => {
+        const matches = Array.from({ length: 15 }, (_, index) => ({
+            refId: 'owned-' + index,
+            tag: 'button',
+            text: 'Candidate ' + index,
+            rect: { x: index, y: 0, width: 20, height: 20 },
+        }));
+        const restore = patchProperties(unified, {
+            isExtensionConnected: () => true,
+            find: async (_selector, _text, _xpath, _timeout, _semantic, nth) =>
+                nth === undefined ? matches : matches.slice(nth, nth + 1),
+            getLiveState: async () => ({ url: 'https://example.com/' + state.current, managed: true }),
+            getChallengeState: async () => null,
+            inspectChallenge: async () => ({ title: 'Ordinary', inspected: true }),
+            evaluate: async (source) =>
+                source.includes('activeElement')
+                    ? { candidates: matches.slice(0, 10), activeElement: null, matchCount: 15 }
+                    : { title: 'Ordinary', selectorHits: [], deniedHits: [], turnstilePresent: false },
+        });
+        try {
+            for (const [register, args] of [
+                [registerInputTool, { events: [{ type: 'click', target: { css: '.mcp-ch-many', nth: 30 } }] }],
+                [registerExtractTool, { type: 'text', target: { css: '.mcp-ch-many', nth: 30 } }],
+                [registerWaitTool, { for: 'element', target: { css: '.mcp-ch-many', nth: 30 } }],
+            ]) {
+                const response = await registeredTool(register)({ ...args, targetId: '202', timeout: 500 });
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(body.error.context.matchCount, 15, response.content[0].text);
+                assert.equal(body.error.context.nth, 30);
+                assert.ok(body.error.context.candidates.length <= 10);
+                assert.equal(state.current, '101');
+                assert.deepEqual(state.dispatched, []);
+            }
+        } finally {
+            restore();
         }
     });
 });

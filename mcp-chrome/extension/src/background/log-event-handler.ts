@@ -191,30 +191,31 @@ export class LogEventHandler {
     }
 
     /** 卸载 fallback console hook，把残留日志合并到 logManager，并报告清理结果 */
-    async flushAndUninstallConsoleHook(tabId: number): Promise<boolean> {
+    async flushAndUninstallConsoleHook(tabId: number, binding?: string): Promise<boolean> {
         try {
             const tab = await getExistingTab(tabId)
             if (isRestrictedUrl(tab.url)) {
                 return true
             }
-            const results = await chrome.scripting.executeScript({
-                target: { tabId, frameIds: [0] },
-                func: () => {
-                    type ConsoleFn = (...args: unknown[]) => void
-                    type ConsoleRecord = Record<string, ConsoleFn>
-                    type ConsoleHookState = {
-                        active: boolean
-                        logs: unknown[]
-                        originals: ConsoleRecord
-                        wrappers: ConsoleRecord
-                    }
-                    type McpWindow = Window & { __mcpConsoleHook?: ConsoleHookState }
-                    const mcpWin = window as McpWindow
-                    const state = mcpWin.__mcpConsoleHook
-                    if (!state) {
-                        return []
-                    }
-                    const residual = state.logs.splice(0, state.logs.length)
+            const uninstall = (handoffBinding?: string) => {
+                type ConsoleFn = (...args: unknown[]) => void
+                type ConsoleRecord = Record<string, ConsoleFn>
+                type ConsoleHookState = {
+                    active: boolean
+                    logs: unknown[]
+                    originals: ConsoleRecord
+                    wrappers: ConsoleRecord
+                }
+                type McpWindow = Window & { __mcpConsoleHook?: ConsoleHookState }
+                const mcpWin = window as McpWindow
+                const state = mcpWin.__mcpConsoleHook
+                const residual = state?.logs ?? []
+                if (handoffBinding) {
+                    const notify = Reflect.get(mcpWin, handoffBinding) as (payload: string) => void
+                    notify(JSON.stringify({ hooked: !!state, messages: residual }))
+                }
+                if (state) {
+                    state.logs = []
                     state.active = false
                     for (const level of ['log', 'warn', 'error', 'info', 'debug'] as const) {
                         const current = (console as unknown as ConsoleRecord)[level]
@@ -223,18 +224,31 @@ export class LogEventHandler {
                         }
                     }
                     Reflect.deleteProperty(mcpWin, '__mcpConsoleHook')
-                    return residual
-                },
-                world: 'MAIN',
-            })
-            const residual = (results[0]?.result as ConsoleMessage[]) ?? []
-            const injectionError = (results[0] as { error?: { message?: string } } | undefined)?.error
-            if (injectionError) {
-                throw new Error(injectionError.message ?? String(injectionError))
+                }
+                return residual
             }
-            if (residual.length > 0) {
-                const existing = this.logManager.getConsole(tabId) ?? []
-                this.logManager.setConsole(tabId, [...existing, ...residual])
+            if (binding) {
+                const result = (await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                    expression: `(${uninstall.toString()})(${JSON.stringify(binding)})`,
+                    returnByValue: true,
+                })) as { exceptionDetails?: { text?: string } }
+                if (result.exceptionDetails || this.logManager.hasConsoleHandoff(tabId)) {
+                    throw new Error(result.exceptionDetails?.text ?? 'Console handoff boundary was not received')
+                }
+            } else {
+                const results = await chrome.scripting.executeScript({
+                    target: { tabId, frameIds: [0] },
+                    func: uninstall,
+                    world: 'MAIN',
+                })
+                const residual = (results[0]?.result as ConsoleMessage[]) ?? []
+                const injectionError = (results[0] as { error?: { message?: string } } | undefined)?.error
+                if (injectionError) {
+                    throw new Error(injectionError.message ?? String(injectionError))
+                }
+                if (residual.length > 0) {
+                    this.logManager.setConsole(tabId, [...this.logManager.getConsole(tabId), ...residual])
+                }
             }
             return true
         } catch (e) {
@@ -284,9 +298,57 @@ export class LogEventHandler {
     private async enableConsole(tabId: number): Promise<{ success: boolean }> {
         try {
             await this.debuggerManager.ensureAttached(tabId)
-            await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {})
-            // Service Worker 重启后内存中的 blocked 状态会丢失，成功 attach 时仍需探测并卸载页面 hook
-            await this.flushAndUninstallConsoleHook(tabId)
+            const binding = `__mcpConsoleHandoff_${crypto.randomUUID().replaceAll('-', '')}`
+            const tab = await getExistingTab(tabId)
+            let fallbackFrameId: string | undefined
+            if (!isRestrictedUrl(tab.url)) {
+                const probe = await chrome.scripting.executeScript({
+                    target: { tabId, frameIds: [0] },
+                    world: 'MAIN',
+                    func: () =>
+                        !!(window as Window & { __mcpConsoleHook?: { active: boolean } }).__mcpConsoleHook?.active,
+                })
+                if (probe[0]?.result === true) {
+                    const tree = (await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree', {})) as {
+                        frameTree: { frame: { id: string } }
+                    }
+                    fallbackFrameId = tree.frameTree.frame.id
+                }
+            }
+            this.logManager.beginConsoleHandoff(tabId, binding, fallbackFrameId)
+            let failure: unknown
+            try {
+                await chrome.debugger.sendCommand({ tabId }, 'Runtime.addBinding', { name: binding })
+                await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {})
+                // A native binding hands ownership over in the same page task that uninstalls the hook.
+                if (!(await this.flushAndUninstallConsoleHook(tabId, binding))) {
+                    throw new ExpectedOperationError('Console source handoff failed; page hook cleanup is incomplete')
+                }
+            } catch (error) {
+                failure = error
+            } finally {
+                this.logManager.cancelConsoleHandoff(tabId)
+                try {
+                    await chrome.debugger.sendCommand({ tabId }, 'Runtime.removeBinding', { name: binding })
+                } catch (error) {
+                    console.warn('[logs] console handoff binding cleanup failed:', error)
+                    failure ??= error
+                }
+                for (const contextId of this.logManager.getConsoleContexts(tabId)) {
+                    try {
+                        await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                            expression: `delete globalThis[${JSON.stringify(binding)}]`,
+                            contextId,
+                        })
+                    } catch (error) {
+                        console.warn(`[logs] console handoff context ${contextId} cleanup failed:`, error)
+                        failure ??= error
+                    }
+                }
+            }
+            if (failure) {
+                throw failure
+            }
         } catch (err) {
             if (err instanceof DebuggerBlockedError) {
                 await assertScriptable(tabId)
@@ -367,15 +429,7 @@ export class LogEventHandler {
                 })
                 const injected = (results[0]?.result as ConsoleMessage[]) ?? []
                 if (injected.length > 0) {
-                    const seen = new Set<string>()
-                    messages = [...messages, ...injected].filter((message) => {
-                        const key = `${message.timestamp}|${message.text}`
-                        if (seen.has(key)) {
-                            return false
-                        }
-                        seen.add(key)
-                        return true
-                    })
+                    messages = [...messages, ...injected]
                 }
             }
         } catch (error) {
@@ -426,6 +480,8 @@ export class LogEventHandler {
     }
 
     private async withConsoleLock<T>(tabId: number, action: () => Promise<T>): Promise<T> {
+        // 先同步登记队列尾项，再由后续 await 等待前序请求
+        // noinspection ES6MissingAwait
         const previous = this.consoleLocks.get(tabId) ?? Promise.resolve()
         let release = () => {}
         const current = new Promise<void>((resolve) => {

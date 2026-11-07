@@ -82,10 +82,18 @@ test('CH-08 ordinary verification buttons use page input while Cloudflare frames
             querySelector: (selector) =>
                 selector === 'input[name="cf-turnstile-response"]' ? { parentElement: wrapper } : null,
             querySelectorAll: (selector) => {
-                if (selector === 'button') return [element('BUTTON', 'Settings'), button];
-                if (selector === 'iframe' || selector.includes('iframe[src')) return scenario.frame ? [frame] : [];
-                if (selector === '#cf-please-wait') return [element('DIV')];
-                if (selector === '.cf-turnstile' || selector === 'div') return [wrapper];
+                if (selector === 'button') {
+                    return [element('BUTTON', 'Settings'), button];
+                }
+                if (selector === 'iframe' || selector.includes('iframe[src')) {
+                    return scenario.frame ? [frame] : [];
+                }
+                if (selector === '#cf-please-wait') {
+                    return [element('DIV')];
+                }
+                if (selector === '.cf-turnstile' || selector === 'div') {
+                    return [wrapper];
+                }
                 return [];
             },
         };
@@ -139,7 +147,15 @@ test('C24 CDP inspection does not infer a widget from an unrelated div beside a 
 });
 
 test('F4 inspection distinguishes visible verification evidence from leftover frames and hidden body text', () => {
-    for (const kind of ['visible-body', 'hidden-body', 'residual-frame', 'residual-input', 'origin-pending', 'widget', 'verify']) {
+    for (const kind of [
+        'visible-body',
+        'hidden-body',
+        'residual-frame',
+        'residual-input',
+        'origin-pending',
+        'widget',
+        'verify',
+    ]) {
         let scrolls = 0;
         const root = {};
         const element = (tagName) => ({
@@ -161,18 +177,26 @@ test('F4 inspection distinguishes visible verification evidence from leftover fr
                 title: kind === 'origin-pending' ? 'Just a moment...' : 'Ordinary',
                 documentElement: root,
                 body: {
-                    innerText: kind === 'visible-body'
-                        ? '正在进行安全验证'
-                        : kind === 'origin-pending'
-                          ? 'Verification successful. Waiting for origin response'
-                          : 'Ready',
+                    innerText:
+                        kind === 'visible-body'
+                            ? '正在进行安全验证'
+                            : kind === 'origin-pending'
+                              ? 'Verification successful. Waiting for origin response'
+                              : 'Ready',
                     textContent: '正在进行安全验证',
                 },
-                querySelector: () => (['residual-input', 'origin-pending'].includes(kind) ? { parentElement: widget } : null),
+                querySelector: () =>
+                    ['residual-input', 'origin-pending'].includes(kind) ? { parentElement: widget } : null,
                 querySelectorAll: (selector) => {
-                    if (['residual-frame', 'origin-pending'].includes(kind) && selector.includes('iframe')) return [frame];
-                    if (kind === 'widget' && selector.includes('.cf-turnstile')) return [widget];
-                    if (kind === 'verify' && selector === 'button') return [button];
+                    if (['residual-frame', 'origin-pending'].includes(kind) && selector.includes('iframe')) {
+                        return [frame];
+                    }
+                    if (kind === 'widget' && selector.includes('.cf-turnstile')) {
+                        return [widget];
+                    }
+                    if (kind === 'verify' && selector === 'button') {
+                        return [button];
+                    }
                     return [];
                 },
             },
@@ -182,7 +206,9 @@ test('F4 inspection distinguishes visible verification evidence from leftover fr
         const expected = kind === 'visible-body' ? 'js' : ['widget', 'verify'].includes(kind) ? 'turnstile' : 'none';
         assert.equal(classifyChallengeSnapshot({ ...snapshot, inspected: true }, true), expected, kind);
         assert.equal(scrolls > 0, ['widget', 'verify'].includes(kind), kind);
-        if (expected !== 'turnstile') assert.equal(snapshot.clickPoint, null, kind);
+        if (expected !== 'turnstile') {
+            assert.equal(snapshot.clickPoint, null, kind);
+        }
     }
 });
 
@@ -203,10 +229,15 @@ test('C24 Linux native coordinates use client-window geometry and asymmetric GTK
             platform: 'linux',
             execFile: async (file, args) => {
                 calls.push({ file, args: [...args] });
-                if (args[0] === 'getactivewindow') return { stdout: '8388612\n', stderr: '' };
-                if (args[0] === 'getwindowname') return { stdout: 'Just a moment... - Google Chrome\n', stderr: '' };
-                if (args[0] === 'getwindowgeometry')
+                if (args[0] === 'getactivewindow') {
+                    return { stdout: '8388612\n', stderr: '' };
+                }
+                if (args[0] === 'getwindowname') {
+                    return { stdout: 'Just a moment... - Google Chrome\n', stderr: '' };
+                }
+                if (args[0] === 'getwindowgeometry') {
                     return { stdout: 'X=90\nY=70\nWIDTH=1040\nHEIGHT=780\n', stderr: '' };
+                }
                 assert.equal(file, 'xprop');
                 assert.deepEqual([...args], ['-id', '8388612', '_GTK_FRAME_EXTENTS']);
                 return { stdout: '_GTK_FRAME_EXTENTS(CARDINAL) = 22, 22, 19, 25\n', stderr: '' };
@@ -275,13 +306,18 @@ test('C24 X11 coordinates preserve scaling and reject unverified geometry or fra
                         platform: 'linux',
                         execFile: async (file, args) => {
                             if (file === 'xprop') {
-                                if (specimen.missingTool) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+                                if (specimen.missingTool) {
+                                    throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+                                }
                                 return { stdout: specimen.extents, stderr: '' };
                             }
                             assert.equal(file, 'xdotool');
-                            if (args[0] === 'getactivewindow') return { stdout: '8388612\n', stderr: '' };
-                            if (args[0] === 'getwindowname')
+                            if (args[0] === 'getactivewindow') {
+                                return { stdout: '8388612\n', stderr: '' };
+                            }
+                            if (args[0] === 'getwindowname') {
                                 return { stdout: 'Just a moment... - Google Chrome\n', stderr: '' };
+                            }
                             assert.deepEqual([...args], ['getwindowgeometry', '--shell', '8388612']);
                             return {
                                 stdout: `X=90\nY=70\nWIDTH=${specimen.width}\nHEIGHT=${specimen.height}\n`,
@@ -299,7 +335,9 @@ test('C24 X11 coordinates preserve scaling and reject unverified geometry or fra
                         error.code,
                         specimen.missingTool ? 'OS_MOUSE_UNAVAILABLE' : 'TURNSTILE_OS_CLICK_UNAVAILABLE'
                     );
-                    if (specimen.missingTool) assert.match(error.message, /xprop/);
+                    if (specimen.missingTool) {
+                        assert.match(error.message, /xprop/);
+                    }
                     return true;
                 });
             }
@@ -2156,7 +2194,11 @@ test('CH-08 Challenge timeout and access denied fail without exporting cookie va
         mouseClick: async () => {
             throw new Error('Cloudflare iframe 不得走页面鼠标');
         },
-        clickTurnstile: async () => {
+        clickTurnstile: async (snapshot, timeout, _signal, refresh) => {
+            assert.equal(typeof refresh, 'function');
+            const current = await refresh(timeout);
+            assert.equal(current.clickTargetKind, snapshot.clickTargetKind);
+            assert.deepEqual(current.clickPoint, snapshot.clickPoint);
             sequentialOsCount += 1;
         },
     };
@@ -2235,7 +2277,12 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     // noinspection LongLine — 正则需要验证四个相邻 enable 调用的完整顺序
     assert.match(
         sessionSource,
-        /this\.send\('Page.enable', undefined, remaining\(\)\),\s*this\.send\('DOM.enable', undefined, remaining\(\)\),\s*this\.send\('Network.enable', undefined, remaining\(\)\),\s*this\.send\('Log.enable', undefined, remaining\(\)\)/
+        new RegExp(
+            String.raw`this\.send\('Page.enable', undefined, remaining\(\)\),\s*` +
+                String.raw`this\.send\('DOM.enable', undefined, remaining\(\)\),\s*` +
+                String.raw`this\.send\('Network.enable', undefined, remaining\(\)\),\s*` +
+                String.raw`this\.send\('Log.enable', undefined, remaining\(\)\)`
+        )
     );
     assert.doesNotMatch(
         sessionSource,
@@ -2254,14 +2301,20 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     assert.match(contentHandlerSource, /world: 'ISOLATED'/);
     assert.match(contentHandlerSource, /getViewportMetrics/);
     assert.match(contentHandlerSource, /inspectChallengePage/);
-    assert.match(pageScriptsSource, /export function inspectChallengePage/);
-    const [unifiedSessionSource, browseSource, inputSource, evaluateSource, challengeSource] = await Promise.all([
+    assert.match(
+        pageScriptsSource,
+        /export \{ inspectChallengePage } from '\.\.\/\.\.\/\.\.\/src\/core\/challenge-page\.js'/
+    );
+    const inspectorSource = await readFile(new URL('../src/core/challenge-page.ts', import.meta.url), 'utf8');
+    assert.match(inspectorSource, /export function inspectChallengePage/);
+    const [unifiedSessionSource, browseSource, inputSource, evaluateSource, challengeToolSource] = await Promise.all([
         readFile(new URL('../src/core/unified-session.ts', import.meta.url), 'utf8'),
         readFile(new URL('../src/tools/browse.ts', import.meta.url), 'utf8'),
         readFile(new URL('../src/tools/input.ts', import.meta.url), 'utf8'),
         readFile(new URL('../src/tools/evaluate.ts', import.meta.url), 'utf8'),
         readFile(new URL('../src/tools/challenge.ts', import.meta.url), 'utf8'),
     ]);
+    const challengeSource = challengeToolSource + '\n' + inspectorSource;
     assert.match(browseSource, /resolveChallenge/);
     assert.match(unifiedSessionSource, /private cdpExplicitlySelected = false/);
     assert.match(unifiedSessionSource, /this\.activeMode === 'cdp' && this\.cdpExplicitlySelected/);
@@ -2273,14 +2326,14 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     assert.doesNotMatch(inputSource, /unifiedSession\.enableNetwork\(\)/);
     assert.doesNotMatch(evaluateSource, /unifiedSession\.enableNetwork\(\)/);
     assert.match(challengeSource, /CHALLENGE_TIMEOUT/);
-    assert.match(challengeSource, /!originResponsePending && interstitialPending &&/);
+    assert.match(challengeSource, /!originResponsePending &&\s+interstitialPending &&/);
     assert.match(challengeSource, /cloudflareFramePresent \|\| frameHits.length > 0 \|\| Boolean\(turnstileBox\)/);
     assert.match(challengeSource, /CHALLENGE_INSPECT_GRACE_MS/);
     assert.match(challengeSource, /CHALLENGE_EXTENSION_PASSIVE_GRACE_MS/);
     assert.match(challengeSource, /emptyInspectCount/);
     assert.match(challengeSource, /inspectChallenge/);
     assert.match(challengeSource, /lastInspectAt = startedAt/);
-    assert.match(challengeSource, /TURNSTILE_WIDGET_SELECTORS = \['#turnstile-wrapper', '\.cf-turnstile'\]/);
+    assert.match(challengeSource, /TURNSTILE_WIDGET_SELECTORS = \['#turnstile-wrapper', '\.cf-turnstile']/);
     assert.match(challengeSource, /'precise'/);
     assert.match(challengeSource, /clickedTargetKinds/);
     assert.match(challengeSource, /clickTargetKind/);
@@ -2310,9 +2363,7 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
     assert.doesNotMatch(unifiedSessionSource, /await this\.focusWindow\(/);
     assert.match(challengeSource, /host\.getMode\(\) === 'extension'/);
     assert.doesNotMatch(challengeSource, /pageTitle\.live/);
-    for (const source of [challengeSource, pageScriptsSource]) {
-        assert.match(source, /el\.scrollIntoView\(\{ block: 'center', inline: 'nearest', behavior: 'instant' \}\)/);
-    }
+    assert.match(inspectorSource, /el\.scrollIntoView\(\{ block: 'center', inline: 'nearest', behavior: 'instant' }\)/);
     assert.match(challengeSource, /请稍候/);
     assert.match(challengeSource, /正在进行安全验证/);
     assert.doesNotMatch(challengeSource, /snapshot\.clickPoint && !clickedTurnstile/);

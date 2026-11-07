@@ -10,6 +10,7 @@ import { homedir, platform } from 'os'
 import { join, win32 } from 'path'
 import { BrowserNotFoundError, TimeoutError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT, type LaunchOptions } from '../core/types.js'
+import { remainingNavigationTimeout } from '../core/utils.js'
 
 /**
  * 默认 profile 目录（固定路径，保留 cookies 和登录状态）
@@ -60,9 +61,11 @@ function readWindowsAppPaths(): string[] {
                     timeout: 2000,
                 })
                 if (result.status === 0) {
-                    const value = result.stdout.match(/REG_(?:EXPAND_)?SZ\s+([^\r\n]+)/i)?.[1]?.trim()
+                    const value = result.stdout.match(/REG_(?:EXPAND_)?SZ\s+(?<registryValue>[^\r\n]+)/i)?.[1]?.trim()
                     if (value) {
-                        paths.push(value.replace(/%([^%]+)%/g, (raw, key: string) => process.env[key] ?? raw))
+                        paths.push(
+                            value.replace(/%(?<variable>[^%]+)%/g, (raw, key: string) => process.env[key] ?? raw)
+                        )
                     }
                 }
             }
@@ -115,7 +118,7 @@ export class BrowserLauncher {
     /**
      * 启动浏览器
      */
-    async launch(options: LaunchOptions = {}): Promise<string> {
+    async launch(options: LaunchOptions = {}, signal?: AbortSignal, deadline?: number): Promise<string> {
         const {
             executablePath,
             port = 0,
@@ -124,6 +127,10 @@ export class BrowserLauncher {
             userDataDir,
             timeout = DEFAULT_TIMEOUT,
         } = options
+
+        deadline = Math.min(deadline ?? Infinity, Date.now() + timeout)
+        signal?.throwIfAborted()
+        remainingNavigationTimeout(deadline)
 
         // 查找 Chrome
         const chromePath = executablePath ?? findChrome()
@@ -159,16 +166,20 @@ export class BrowserLauncher {
         }
 
         // 构建启动参数
+        signal?.throwIfAborted()
+        remainingNavigationTimeout(deadline)
         const args = this.buildArgs({ port, incognito, headless, userDataDir })
 
         // 启动进程
+        signal?.throwIfAborted()
+        remainingNavigationTimeout(deadline)
         this.process = spawn(chromePath, args, {
             detached: false,
             stdio: ['ignore', 'pipe', 'pipe'],
         })
 
         // 等待 CDP 端点就绪
-        return this.waitForEndpoint(timeout)
+        return this.waitForEndpoint(Math.max(0, deadline - Date.now()), signal)
     }
 
     /**
@@ -245,17 +256,18 @@ export class BrowserLauncher {
     /**
      * 等待 CDP 端点就绪
      */
-    private waitForEndpoint(timeout: number): Promise<string> {
+    private waitForEndpoint(timeout: number, signal?: AbortSignal): Promise<string> {
         return new Promise((resolve, reject) => {
             if (!this.process) {
                 reject(new Error('浏览器进程未启动'))
                 return
             }
 
+            const child = this.process
             let settled = false
             let stderr = ''
             let stderrLineBuffer = ''
-            const stderrStream = this.process.stderr
+            const stderrStream = child.stderr
             const timer = setTimeout(() => {
                 fail(new TimeoutError(`等待浏览器启动超时 (${timeout}ms)`), true)
             }, timeout)
@@ -263,11 +275,16 @@ export class BrowserLauncher {
             const cleanup = () => {
                 clearTimeout(timer)
                 stderrStream?.removeListener('data', onStderr)
-                this.process?.removeListener('error', onError)
-                this.process?.removeListener('exit', onExit)
+                child.removeListener('error', onError)
+                child.removeListener('exit', onExit)
+                signal?.removeEventListener('abort', onAbort)
             }
             const finish = (url: string) => {
                 if (settled) {
+                    return
+                }
+                if (signal?.aborted) {
+                    onAbort()
                     return
                 }
                 settled = true
@@ -280,12 +297,15 @@ export class BrowserLauncher {
                 }
                 settled = true
                 cleanup()
-                if (killProcess && this.process && !this.process.killed) {
-                    this.process.kill()
+                if (killProcess && !child.killed) {
+                    child.kill()
+                }
+                if (this.process === child && killProcess) {
                     this.process = null
                 }
                 reject(error)
             }
+            const onAbort = () => fail(signal?.reason ?? new Error('Request cancelled'), true)
             const onStderr = (data: Buffer) => {
                 const chunk = data.toString()
                 stderr += chunk
@@ -336,8 +356,12 @@ export class BrowserLauncher {
             }
 
             stderrStream?.on('data', onStderr)
-            this.process.on('error', onError)
-            this.process.on('exit', onExit)
+            child.on('error', onError)
+            child.on('exit', onExit)
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+            }
         })
     }
 }

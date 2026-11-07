@@ -381,7 +381,7 @@ export class DebuggerManager {
             const tabId = source.tabId
 
             // 日志相关事件委托给 LogManager
-            this.logManager.handleEvent(tabId, method, params)
+            this.logManager.handleEvent(tabId, method, params, source.sessionId)
             for (const consume of this.eventConsumers) {
                 consume(tabId, method, params, source.sessionId)
             }

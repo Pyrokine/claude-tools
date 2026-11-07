@@ -60,17 +60,19 @@ async function updateStatus() {
             disconnectBtn.disabled = false
         } else {
             statusIndicator.className = 'status-indicator disconnected'
-            statusText.textContent = '未连接'
+            statusText.textContent = response.paused ? '已暂停自动连接' : '未连接'
             connectBtn.disabled = false
             disconnectBtn.disabled = true
         }
 
         allowInsecureNoTokenInput.checked = response.allowInsecureNoToken === true
-        authHelp.textContent = response.pairingTokenConfigured
-            ? '已配置 token，只连接同 token 的 MCP Server'
-            : response.allowInsecureNoToken
-              ? '未配置 token，将自动连接本地 MCP Server'
-              : '未配置 token，不会连接未认证的 MCP Server'
+        authHelp.textContent = response.paused
+            ? '点击连接恢复，重载扩展或重启浏览器后自动连接'
+            : response.pairingTokenConfigured
+              ? '已配置 token，只连接同 token 的 MCP Server'
+              : response.allowInsecureNoToken
+                ? '未配置 token，将自动连接本地 MCP Server'
+                : '未配置 token，不会连接未认证的 MCP Server'
     } catch (error) {
         console.error('Failed to get status:', error)
         statusIndicator.className = 'status-indicator disconnected'
@@ -88,10 +90,12 @@ readAccess.addEventListener('change', async () => {
     readAccess.disabled = true
     try {
         if (tabId === undefined || !Number.isSafeInteger(port)) {
+            // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new Error('未选择活动页面或 MCP Server')
         }
         const result = await chrome.runtime.sendMessage({ type: 'SET_READ_ACCESS', port, tabId, allow })
         if (!result?.success) {
+            // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new Error(result?.error ?? '只读授权失败')
         }
         await updateStatus()
@@ -128,6 +132,7 @@ saveTokenBtn.addEventListener('click', async () => {
     try {
         const response = await chrome.runtime.sendMessage({ type: 'SET_PAIRING_TOKEN', token: pairingTokenInput.value })
         if (response?.error || response?.success !== true) {
+            // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new Error(response?.error ?? '保存 token 失败')
         }
         pairingTokenInput.value = ''
@@ -148,6 +153,7 @@ allowInsecureNoTokenInput.addEventListener('change', async () => {
             allow: allowInsecureNoTokenInput.checked,
         })
         if (response?.error || response?.success !== true) {
+            // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new Error(response?.error ?? '保存无 token 连接设置失败')
         }
         await updateStatus()

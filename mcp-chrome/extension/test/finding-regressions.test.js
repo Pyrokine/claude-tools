@@ -498,6 +498,38 @@ test('F5 failed initialization blocks actions and the next keepalive retries res
     );
 });
 
+test('MH-CH-02 pause restoration retries in the same worker and preserves explicit choices', async (t) => {
+    for (const recovery of ['status', 'keepalive']) {
+        await t.test(recovery, async () => {
+            const fixture = createTabManagementFixture();
+            const get = fixture.chrome.storage.session.get;
+            let reads = 0;
+            fixture.chrome.storage.session.get = async (key) => {
+                if (key === 'mcp_connection_paused' && ++reads === 1) {
+                    throw new Error('pause read refused');
+                }
+                return get(key);
+            };
+            const background = await isolatedBackground(fixture);
+            await waitUntil(() => background.errors.length > 0);
+            assert.equal(background.client.connections, 0);
+            if (recovery === 'status') {
+                assert.equal((await background.message({ type: 'GET_STATUS' })).paused, false);
+            }
+            fixture.chrome.alarms.onAlarm.emit({ name: 'mcp-keepalive' });
+            await waitUntil(() => background.client.connections === 1);
+            assert.equal(reads, 2);
+            assert.equal((await background.message({ type: 'DISCONNECT' })).success, true);
+            assert.equal(background.client.disconnects, 1);
+            assert.equal(fixture.chrome.storage.sessionValues.mcp_connection_paused, true);
+            assert.equal((await background.message({ type: 'GET_STATUS' })).paused, true);
+            await background.message({ type: 'CONNECT' });
+            assert.equal(background.client.connections, 2);
+            assert.equal(fixture.chrome.storage.sessionValues.mcp_connection_paused, false);
+        });
+    }
+});
+
 test('MH-CH-02 pending pause reads cannot prevent disconnect or overwrite its newer state', async () => {
     const fixture = createTabManagementFixture();
     const get = fixture.chrome.storage.session.get;
@@ -1962,10 +1994,18 @@ test('CH-08 serialized inspection recognizes visible verification buttons withou
             querySelector: (selector) =>
                 selector === 'input[name="cf-turnstile-response"]' ? { parentElement: wrapper } : null,
             querySelectorAll: (selector) => {
-                if (selector === 'button') return [element('BUTTON', 'Settings'), button];
-                if (selector === 'iframe' || selector.includes('iframe[src')) return scenario.frame ? [frame] : [];
-                if (selector === '#cf-please-wait') return [element('DIV')];
-                if (selector === '.cf-turnstile' || selector === 'div') return [wrapper];
+                if (selector === 'button') {
+                    return [element('BUTTON', 'Settings'), button];
+                }
+                if (selector === 'iframe' || selector.includes('iframe[src')) {
+                    return scenario.frame ? [frame] : [];
+                }
+                if (selector === '#cf-please-wait') {
+                    return [element('DIV')];
+                }
+                if (selector === '.cf-turnstile' || selector === 'div') {
+                    return [wrapper];
+                }
                 return [];
             },
         };
@@ -5496,6 +5536,85 @@ test('C05 policy changes invalidate sockets before storage persistence settles',
     }
 });
 
+test('C05 disconnected servers keep retrying while another server remains connected', async () => {
+    const timers = new Map();
+    const statuses = [];
+    const owners = [];
+    let nextTimer = 0;
+    FakeWebSocket.instances = [];
+    const restore = installGlobals({
+        WebSocket: FakeWebSocket,
+        chrome: { runtime: { getURL: (path) => path, getManifest: () => ({ version: 'test' }) } },
+        setTimeout: (callback, delay) => {
+            const id = ++nextTimer;
+            timers.set(id, { callback, delay });
+            return id;
+        },
+        clearTimeout: (id) => timers.delete(id),
+    });
+    const client = new HttpClient();
+    try {
+        client.onStatusChange((...status) => statuses.push(status));
+        client.onConnectionClosed((owner) => owners.push(owner));
+        const oldSocket = new FakeWebSocket('ws://127.0.0.1:19222/old');
+        const survivingSocket = new FakeWebSocket('ws://127.0.0.1:19223/');
+        for (const [port, ws] of [
+            [19222, oldSocket],
+            [19223, survivingSocket],
+        ]) {
+            ws.open();
+            client.connections.set(port, {
+                ws,
+                heartbeatTimer: null,
+                ready: true,
+                requests: new Map(),
+                instanceId: String(port),
+            });
+        }
+        client.removeConnection(19222, oldSocket);
+        assert.notEqual(client.reconnectTimer, null);
+        assert.equal(timers.get(client.reconnectTimer).delay, 1000);
+        assert.deepEqual(owners, ['19222']);
+        assert.deepEqual(statuses, [['connected', 1]]);
+        let restarted = false;
+        client.checkPort = async (port) => ({ healthy: port === 19223 || (restarted && port === 19222) });
+        let timer = timers.get(client.reconnectTimer);
+        timers.delete(client.reconnectTimer);
+        await timer.callback();
+        assert.notEqual(client.reconnectTimer, null);
+        assert.equal(timers.get(client.reconnectTimer).delay, 1500);
+        assert.equal(client.connections.get(19223).ws, survivingSocket);
+        assert.equal(survivingSocket.readyState, FakeWebSocket.OPEN);
+        restarted = true;
+        timer = timers.get(client.reconnectTimer);
+        timers.delete(client.reconnectTimer);
+        const retry = timer.callback();
+        for (let turn = 0; turn < 20 && FakeWebSocket.instances.length < 3; turn++) {
+            await Promise.resolve();
+        }
+        assert.equal(FakeWebSocket.instances.length, 3);
+        const replacement = FakeWebSocket.instances[2];
+        replacement.open();
+        await retry;
+        assert.deepEqual(client.getConnectedPorts(), [19222, 19223]);
+        assert.equal(client.reconnectTimer, null);
+        assert.equal(client.reconnectPorts.size, 0);
+        client.removeConnection(19222, oldSocket);
+        assert.equal(client.connections.get(19222).ws, replacement);
+        assert.equal(client.reconnectTimer, null);
+        client.removeConnection(19222, replacement);
+        const cancelled = timers.get(client.reconnectTimer).callback;
+        client.disconnect();
+        assert.equal(client.reconnectTimer, null);
+        assert.equal(client.reconnectPorts.size, 0);
+        await cancelled();
+        assert.equal(FakeWebSocket.instances.length, 3);
+    } finally {
+        client.disconnect();
+        restore();
+    }
+});
+
 test('C05 stale socket close cannot remove a replacement connection on the same port', () => {
     FakeWebSocket.instances = [];
     const client = new HttpClient();
@@ -6933,6 +7052,354 @@ test(
     }
 );
 
+for (const mode of ['pending', 'read', 'clear', 'restart', 'native']) {
+    test(`C07 Runtime replay handoff retains each event exactly once (${mode})`, async () => {
+        let manager = new LogManager();
+        const managers = [manager];
+        const history = [];
+        let native = false;
+        const event = (type, text, executionContextId = 1) => ({
+            type,
+            args: [{ value: text }],
+            timestamp: 1234,
+            executionContextId,
+        });
+        const page = vm.createContext({
+            window: {},
+            Date: { now: () => 1234 },
+            console: Object.fromEntries(
+                ['log', 'warn', 'error', 'info', 'debug'].map((level) => [
+                    level,
+                    (...args) => {
+                        const record = event(level, args.map(String).join(' '));
+                        history.push(record);
+                        if (native) {
+                            manager.handleEvent(1, 'Runtime.consoleAPICalled', record);
+                        }
+                    },
+                ])
+            ),
+        });
+        let blocked = mode !== 'native';
+        const command = consoleHandoffCommands(
+            page,
+            () => manager,
+            () => {
+                native = true;
+                for (const record of history) {
+                    manager.handleEvent(1, 'Runtime.consoleAPICalled', record);
+                }
+                if (mode !== 'native') {
+                    vm.runInContext("console.error('same'); console.error('same')", page);
+                }
+                manager.handleEvent(1, 'Runtime.consoleAPICalled', event('log', 'iframe', 2));
+                manager.handleEvent(1, 'Runtime.exceptionThrown', {
+                    timestamp: 1234,
+                    exceptionDetails: { text: 'exception' },
+                });
+            }
+        );
+        const restore = installGlobals({
+            chrome: {
+                storage: createStorage(),
+                tabs: { get: async () => ({ id: 1, url: 'https://test.example', groupId: 10 }) },
+                debugger: {
+                    sendCommand: async (target, method, params) => {
+                        const result = await command(target, method, params);
+                        if (method === 'Runtime.evaluate' && !params.expression.startsWith('delete ')) {
+                            vm.runInContext("console.error('same'); console.error('same')", page);
+                        }
+                        return result;
+                    },
+                },
+                scripting: {
+                    executeScript: async ({ func }) => [{ result: vm.runInContext(`(${func.toString()})()`, page) }],
+                },
+            },
+        });
+        const debuggerManager = {
+            ensureAttached: async () => {
+                if (blocked) {
+                    throw new DebuggerBlockedError(1);
+                }
+            },
+        };
+        let handler = new LogEventHandler(manager, debuggerManager);
+        const context = { mcpWindowId: null, mcpTabGroupId: 10 };
+        try {
+            await markManagedTab(1);
+            if (blocked) {
+                await handler.consoleEnable({ tabId: 1 }, context);
+            }
+            vm.runInContext("console.error('same'); console.error('same')", page);
+            let first;
+            if (mode === 'read') {
+                first = [...(await handler.consoleGet({ tabId: 1 }, context)).messages];
+            }
+            if (mode === 'clear') {
+                await handler.consoleClear({ tabId: 1 }, context);
+            }
+            if (mode === 'restart') {
+                manager = new LogManager();
+                managers.push(manager);
+                handler = new LogEventHandler(manager, debuggerManager);
+            }
+            blocked = false;
+            await handler.consoleEnable({ tabId: 1 }, context);
+            const messages = (await handler.consoleGet({ tabId: 1 }, context)).messages;
+            assert.equal(
+                messages.filter((message) => message.text === 'same').length,
+                mode === 'clear' || mode === 'native' ? 4 : 6
+            );
+            assert.equal(messages.filter((message) => message.text === 'iframe').length, 1);
+            assert.equal(messages.filter((message) => message.text === 'exception').length, 1);
+            assert.equal(new Set(messages.map((message) => message.sequence)).size, messages.length);
+            if (first) {
+                assert.deepEqual(
+                    messages.slice(0, 2).map((message) => message.sequence),
+                    first.map((message) => message.sequence)
+                );
+            }
+            assert.equal(vm.runInContext('window.__mcpConsoleHook', page), undefined);
+            assert.equal(
+                Object.keys(page).some((key) => key.startsWith('__mcpConsoleHandoff_')),
+                false
+            );
+            assert.equal(manager.hasConsoleHandoff(1), false);
+            assert.deepEqual((await handler.consoleGet({ tabId: 1 }, context)).messages, messages);
+        } finally {
+            for (const item of managers) {
+                globalThis.clearInterval(item.sweepTimer);
+            }
+            await unmarkManagedTab(1);
+            restore();
+        }
+    });
+}
+
+for (const [removeFails, actionFails] of [
+    [false, false],
+    [true, false],
+    [true, true],
+]) {
+    test(`C07 Runtime binding cleanup attempts every context (${removeFails}, ${actionFails})`, async () => {
+        const manager = new LogManager();
+        const page = vm.createContext({ window: {} });
+        const attempts = [];
+        const warnings = [];
+        const actionError = new Error('owned action failure');
+        const removeError = new Error('owned remove failure');
+        const contextError = new Error('owned first context failure');
+        const command = consoleHandoffCommands(page, () => manager);
+        for (const id of [1, 2]) {
+            manager.handleEvent(1, 'Runtime.executionContextCreated', { context: { id } });
+        }
+        const restore = installGlobals({
+            console: { ...globalThis.console, warn: (...args) => warnings.push(args) },
+            chrome: {
+                storage: createStorage(),
+                tabs: { get: async () => ({ id: 1, url: 'https://test.example', groupId: 10 }) },
+                scripting: { executeScript: async () => [{ result: false }] },
+                debugger: {
+                    sendCommand: async (target, method, params) => {
+                        if (method === 'Runtime.enable' && actionFails) {
+                            throw actionError;
+                        }
+                        if (method === 'Runtime.removeBinding') {
+                            attempts.push('remove');
+                            if (removeFails) {
+                                throw removeError;
+                            }
+                        }
+                        if (method === 'Runtime.evaluate' && params.contextId !== undefined) {
+                            attempts.push(params.contextId);
+                            if (params.contextId === 1) {
+                                throw contextError;
+                            }
+                        }
+                        return command(target, method, params);
+                    },
+                },
+            },
+        });
+        try {
+            await markManagedTab(1);
+            const handler = new LogEventHandler(manager, { ensureAttached: async () => {} });
+            const expected = actionFails ? actionError : removeFails ? removeError : contextError;
+            await assert.rejects(
+                handler.consoleEnable({ tabId: 1 }, { mcpWindowId: null, mcpTabGroupId: 10 }),
+                (error) => error === expected
+            );
+            assert.deepEqual(attempts, ['remove', 1, 2]);
+            assert.equal(
+                warnings.filter(([message]) => message.startsWith('[logs] console handoff')).length,
+                removeFails ? 2 : 1
+            );
+            assert.equal(manager.hasConsoleHandoff(1), false);
+        } finally {
+            globalThis.clearInterval(manager.sweepTimer);
+            await unmarkManagedTab(1);
+            restore();
+        }
+    });
+}
+
+test('C07 failed Runtime handoff keeps hook ownership through the next ordinary read', async () => {
+    const manager = new LogManager();
+    const history = [];
+    let native = false;
+    let blocked = true;
+    let rejectBoundary = true;
+    const record = (text, executionContextId = 1) => ({
+        type: 'error',
+        args: [{ value: text }],
+        timestamp: 1234,
+        executionContextId,
+    });
+    const page = vm.createContext({
+        window: {},
+        Date: { now: () => 1234 },
+        console: Object.fromEntries(
+            ['log', 'warn', 'error', 'info', 'debug'].map((level) => [
+                level,
+                (...args) => {
+                    const value = record(args.map(String).join(' '));
+                    history.push(value);
+                    if (native) {
+                        manager.handleEvent(1, 'Runtime.consoleAPICalled', value);
+                    }
+                },
+            ])
+        ),
+    });
+    const command = consoleHandoffCommands(
+        page,
+        () => manager,
+        () => {
+            if (!native) {
+                native = true;
+                for (const value of history) {
+                    manager.handleEvent(1, 'Runtime.consoleAPICalled', value);
+                }
+                manager.handleEvent(1, 'Runtime.consoleAPICalled', record('iframe', 2));
+                manager.handleEvent(1, 'Runtime.exceptionThrown', {
+                    timestamp: 1234,
+                    exceptionDetails: { text: 'exception' },
+                });
+            }
+        }
+    );
+    const restore = installGlobals({
+        chrome: {
+            storage: createStorage(),
+            tabs: { get: async () => ({ id: 1, url: 'https://test.example', groupId: 10 }) },
+            scripting: {
+                executeScript: async ({ func }) => [{ result: vm.runInContext(`(${func.toString()})()`, page) }],
+            },
+            debugger: {
+                sendCommand: async (target, method, params) => {
+                    if (rejectBoundary && method === 'Runtime.evaluate' && !params.expression.startsWith('delete ')) {
+                        throw new Error('owned boundary failure');
+                    }
+                    return command(target, method, params);
+                },
+            },
+        },
+    });
+    const handler = new LogEventHandler(manager, {
+        ensureAttached: async () => {
+            if (blocked) {
+                throw new DebuggerBlockedError(1);
+            }
+        },
+    });
+    const context = { mcpWindowId: null, mcpTabGroupId: 10 };
+    try {
+        await markManagedTab(1);
+        await handler.consoleEnable({ tabId: 1 }, context);
+        vm.runInContext("console.error('same'); console.error('same')", page);
+        blocked = false;
+        await assert.rejects(handler.consoleEnable({ tabId: 1 }, context), /Console source handoff failed/);
+        const first = (await handler.consoleGet({ tabId: 1 }, context)).messages;
+        assert.equal(first.filter((message) => message.text === 'same').length, 2);
+        assert.equal(first.filter((message) => message.text === 'iframe').length, 1);
+        assert.equal(first.filter((message) => message.text === 'exception').length, 1);
+        const sequences = first.filter((message) => message.text === 'same').map((message) => message.sequence);
+        vm.runInContext("console.error('same')", page);
+        const next = (await handler.consoleGet({ tabId: 1 }, context)).messages;
+        assert.equal(next.filter((message) => message.text === 'same').length, 3);
+        assert.deepEqual(
+            next
+                .filter((message) => message.text === 'same')
+                .slice(0, 2)
+                .map((message) => message.sequence),
+            sequences
+        );
+        rejectBoundary = false;
+        await handler.consoleEnable({ tabId: 1 }, context);
+        assert.equal(
+            (await handler.consoleGet({ tabId: 1 }, context)).messages.filter((message) => message.text === 'same')
+                .length,
+            3
+        );
+    } finally {
+        globalThis.clearInterval(manager.sweepTimer);
+        await unmarkManagedTab(1);
+        restore();
+    }
+});
+
+test('C07 Runtime handoff retains OOPIF events with the same executionContextId', () => {
+    const manager = new LogManager();
+    let emit;
+    const restore = installGlobals({
+        chrome: {
+            debugger: {
+                onDetach: { addListener() {} },
+                onEvent: {
+                    addListener(listener) {
+                        emit = listener;
+                    },
+                },
+            },
+        },
+    });
+    try {
+        const debuggerManager = new DebuggerManager(manager);
+        debuggerManager.attachedTabs.add(1);
+        debuggerManager.setupListeners();
+        manager.beginConsoleHandoff(1, 'owned-handoff');
+        emit({ tabId: 1 }, 'Runtime.executionContextCreated', { context: { id: 1 } });
+        emit({ tabId: 1, sessionId: 'child' }, 'Runtime.executionContextCreated', { context: { id: 2 } });
+        emit({ tabId: 1, sessionId: 'child' }, 'Runtime.executionContextDestroyed', { executionContextId: 1 });
+        emit({ tabId: 1, sessionId: 'child' }, 'Runtime.executionContextsCleared', {});
+        const record = { type: 'error', args: [{ value: 'same' }], timestamp: 1234, executionContextId: 1 };
+        emit({ tabId: 1 }, 'Runtime.consoleAPICalled', record);
+        emit({ tabId: 1, sessionId: 'child' }, 'Runtime.consoleAPICalled', record);
+        assert.equal(manager.getConsole(1).length, 1);
+        emit({ tabId: 1 }, 'Runtime.bindingCalled', {
+            name: 'owned-handoff',
+            executionContextId: 1,
+            payload: JSON.stringify({
+                hooked: true,
+                messages: [{ source: 'console-api', level: 'error', text: 'same', timestamp: 1234 }],
+            }),
+        });
+        assert.equal(manager.getConsole(1).length, 2);
+        assert.deepEqual(
+            manager.getConsole(1).map((message) => message.sequence),
+            [1, 2]
+        );
+        assert.deepEqual(manager.getConsoleContexts(1), [1]);
+        manager.cleanupTab(1);
+        assert.deepEqual(manager.getConsoleContexts(1), []);
+        assert.equal(manager.hasConsoleHandoff(1), false);
+    } finally {
+        globalThis.clearInterval(manager.sweepTimer);
+        restore();
+    }
+});
+
 test('C07 concurrent console reads cannot overwrite a later fallback drain', async () => {
     const page = vm.createContext({
         window: {
@@ -7393,6 +7860,94 @@ test('Extension history uses fallback only for scriptable no-history pages and c
                 await unmarkManagedTab(tab.id);
                 restore();
             }
+        }
+    }
+});
+
+test('C-R11 empty history returns before the original deadline and preserves valid page fallback', async (t) => {
+    for (const direction of ['back', 'forward']) {
+        for (const scenario of [
+            'single',
+            'boundary',
+            'restricted',
+            'missing-frame',
+            'error-page',
+            'legacy-fallback',
+            'modern-fallback',
+        ]) {
+            await t.test(`${direction}/${scenario}`, async () => {
+                const tab = {
+                    id: 9813,
+                    url: scenario === 'restricted' ? 'chrome://settings/' : 'https://example.com/current',
+                };
+                const onUpdated = chromeEvent();
+                const onCommitted = chromeEvent();
+                const fallback = scenario.endsWith('-fallback');
+                let historyActions = 0;
+                let injections = 0;
+                const history = {
+                    length: scenario === 'single' ? 1 : 2,
+                    [direction]() {
+                        ++historyActions;
+                        tab.url = 'https://example.com/next';
+                        onUpdated.emit(tab.id, { url: tab.url });
+                    },
+                };
+                const restore = installGlobals({
+                    window: {
+                        navigation:
+                            scenario === 'legacy-fallback'
+                                ? undefined
+                                : { canGoBack: fallback, canGoForward: fallback },
+                    },
+                    history,
+                    chrome: {
+                        storage: createStorage(),
+                        tabs: {
+                            async get() {
+                                return tab;
+                            },
+                            onUpdated,
+                            async goBack() {
+                                throw new Error('Cannot find a next page in history.');
+                            },
+                            async goForward() {
+                                throw new Error('Cannot find a next page in history.');
+                            },
+                        },
+                        webNavigation: {
+                            onCommitted,
+                            async getFrame() {
+                                return scenario === 'missing-frame'
+                                    ? null
+                                    : { errorOccurred: scenario === 'error-page' };
+                            },
+                        },
+                        scripting: {
+                            async executeScript({ func, args }) {
+                                ++injections;
+                                return [{ result: func(...args) }];
+                            },
+                        },
+                    },
+                });
+                try {
+                    await markManagedTab(tab.id);
+                    const handler = new NavigationHandler({});
+                    const result = await handler[direction === 'back' ? 'goBack' : 'goForward'](
+                        { tabId: tab.id, timeout: 60 },
+                        createActionContext()
+                    );
+                    assert.equal(result.navigated, fallback);
+                    assert.equal(historyActions, fallback ? 1 : 0);
+                    assert.equal(injections, ['restricted', 'missing-frame', 'error-page'].includes(scenario) ? 0 : 1);
+                    assert.equal(onUpdated.size, 0);
+                    assert.equal(onCommitted.size, 0);
+                } finally {
+                    await unmarkManagedTab(tab.id);
+                    restore();
+                }
+            });
         }
     }
 });

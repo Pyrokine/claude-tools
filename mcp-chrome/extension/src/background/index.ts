@@ -30,8 +30,26 @@ import {
 const httpClient = new HttpClient()
 const actionHandler = new ActionHandler()
 let connectionGeneration = 0
+let manuallyPaused = false
+let pauseRestored: Promise<void> | null = null
 
-
+function restorePauseState(): Promise<void> {
+    if (pauseRestored === null) {
+        const generation = connectionGeneration
+        const restoration = chrome.storage.session.get('mcp_connection_paused').then((state) => {
+            if (generation === connectionGeneration) {
+                manuallyPaused = state.mcp_connection_paused === true
+            }
+        })
+        pauseRestored = restoration
+        void restoration.catch(() => {
+            if (pauseRestored === restoration) {
+                pauseRestored = null
+            }
+        })
+    }
+    return pauseRestored
+}
 httpClient.onConnectionClosed((instanceId) => {
     void revokeReadGrants(instanceId).catch((error) => console.error('[MCP] Read grant cleanup failed:', error))
     void actionHandler
@@ -101,26 +119,37 @@ chrome.runtime.onMessage.addListener((message: InternalMessage, sender, sendResp
 
 async function handleInternalMessage(message: InternalMessage, sender: chrome.runtime.MessageSender): Promise<unknown> {
     switch (message.type) {
-        case 'CONNECT':
+        case 'CONNECT': {
+            const generation = ++connectionGeneration
+            manuallyPaused = false
+            pauseRestored = Promise.resolve()
+            await chrome.storage.session.set({ mcp_connection_paused: false })
+            if (generation !== connectionGeneration) {
+                return { connected: 0, ports: [] }
+            }
             return connectAfterRestore()
+        }
 
         case 'DISCONNECT':
+            manuallyPaused = true
             ++connectionGeneration
+            pauseRestored = Promise.resolve()
             httpClient.disconnect()
+            await chrome.storage.session.set({ mcp_connection_paused: true })
             return { success: true }
 
         case 'SET_PAIRING_TOKEN':
-            await restoreManagedTabs()
-            await httpClient.setPairingToken(message.token)
+            await Promise.all([restoreManagedTabs(), restorePauseState()])
+            await httpClient.setPairingToken(message.token, !manuallyPaused)
             return { success: true }
 
         case 'SET_ALLOW_INSECURE_NO_TOKEN':
-            await restoreManagedTabs()
-            await httpClient.setAllowInsecureNoToken(message.allow)
+            await Promise.all([restoreManagedTabs(), restorePauseState()])
+            await httpClient.setAllowInsecureNoToken(message.allow, !manuallyPaused)
             return { success: true }
 
         case 'GET_STATUS': {
-            await restoreManagedTabs()
+            await Promise.all([restoreManagedTabs(), restorePauseState()])
             const servers = httpClient.getConnectedServers()
             const managed = Number.isSafeInteger(message.tabId) && isManagedTab({ id: message.tabId })
             const readAccess =
@@ -134,6 +163,7 @@ async function handleInternalMessage(message: InternalMessage, sender: chrome.ru
                     : []
             return {
                 connected: httpClient.isConnected(),
+                paused: manuallyPaused,
                 ports: httpClient.getConnectedPorts(),
                 managed,
                 readAccess,
@@ -313,8 +343,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 async function connectAfterRestore(): Promise<{ connected: number; ports: number[] }> {
     const requestedGeneration = connectionGeneration
-    await restoreManagedTabs()
-    if (requestedGeneration !== connectionGeneration) {
+    await Promise.all([restoreManagedTabs(), restorePauseState()])
+    if (manuallyPaused || requestedGeneration !== connectionGeneration) {
         return { connected: 0, ports: [] }
     }
     return httpClient.connect()

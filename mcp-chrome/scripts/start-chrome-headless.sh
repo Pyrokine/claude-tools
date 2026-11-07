@@ -21,6 +21,8 @@ elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
         CHROME_PATH="google-chrome-stable"
     elif command -v chromium &> /dev/null; then
         CHROME_PATH="chromium"
+    elif command -v chromium-browser &> /dev/null; then
+        CHROME_PATH="chromium-browser"
     else
         echo "Error: Chrome/Chromium not found"
         exit 1

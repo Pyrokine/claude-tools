@@ -309,6 +309,16 @@ export const EvaluateSchema = z.object({
 export const ViewportMetricsSchema = z.object({
     tabId: tabIdOpt,
     frameId: frameIdOpt,
+    deadline: z.number().nonnegative().optional(),
+    pointerProbe: z
+        .object({
+            operation: z.enum(['start', 'read', 'stop']),
+            id: z.string().min(1).max(100),
+            documentId: z.string().optional(),
+            since: z.number().finite().optional(),
+            position: z.object({ x: z.number().finite(), y: z.number().finite() }).optional(),
+        })
+        .optional(),
 })
 
 export const ChallengeInspectSchema = z.object({

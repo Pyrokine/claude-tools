@@ -59,6 +59,7 @@ import {
     asViewportMetrics,
     osLeftClick,
     resolveTurnstileOsClickPoint,
+    type NativePointerProbe,
     type TurnstileOsClickInput,
     type ViewportMetrics,
 } from './os-mouse.js'
@@ -355,7 +356,20 @@ class UnifiedSessionManager {
             stealth?: 'off' | 'safe' | 'aggressive'
         } = {}
     ): Promise<TargetInfo & { mode: ConnectionMode }> {
-        const extensionReady = this.cdpExplicitlySelected ? false : await this.ensureExtensionConnected(options.timeout)
+        this.assertRequestActive()
+        const explicitProcess = [
+            options.port,
+            options.executablePath,
+            options.headless,
+            options.userDataDir,
+            options.incognito,
+        ].some((value) => value !== undefined)
+        if (explicitProcess && getCdpSession().isConnected()) {
+            throw new DriverCapabilityError('显式启动参数要求新的独立浏览器；当前已有 CDP 连接，未关闭或替换现有浏览器')
+        }
+        const extensionReady =
+            explicitProcess || this.cdpExplicitlySelected ? false : await this.ensureExtensionConnected(options.timeout)
+        this.assertRequestActive()
         // 优先检查 Extension 是否已连接，如果断开则等待重连（受 timeout 约束）
         if (extensionReady) {
             // newPage 会设置 currentTabId，需要加锁
@@ -365,6 +379,9 @@ class UnifiedSessionManager {
             this.activeMode = 'extension'
             this.cdpExplicitlySelected = false
             this.recordPageUse(result.targetId, true)
+            if (result.metadata) {
+                this.rememberPageMetadata(result.targetId, result.metadata)
+            }
             return {
                 targetId: result.targetId,
                 type: result.type ?? 'page',
@@ -378,7 +395,7 @@ class UnifiedSessionManager {
         // Fallback 到 CDP 模式
         const target = await getCdpSession().launch(options)
         this.activeMode = 'cdp'
-        this.cdpExplicitlySelected = false
+        this.cdpExplicitlySelected = explicitProcess
         this.recordPageUse(target.targetId, target.targetCreated ?? target.reused !== true)
         return {
             ...target,
@@ -2115,9 +2132,21 @@ class UnifiedSessionManager {
      * Turnstile 点击：同页控件走页面鼠标；Cloudflare iframe 只在已聚焦窗口的活动受控 tab 上使用系统鼠标
      */
     // noinspection JSUnusedGlobalSymbols — resolveChallenge 通过 ChallengeHost 结构类型调用
-    async clickTurnstile(snapshot: TurnstileOsClickInput, timeout?: number): Promise<void> {
-        const deadline = timeout === undefined ? undefined : Date.now() + timeout
-        const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
+    async clickTurnstile(
+        snapshot: TurnstileOsClickInput,
+        timeout?: number,
+        signal?: AbortSignal,
+        refreshSnapshot?: (timeout?: number) => Promise<TurnstileOsClickInput>
+    ): Promise<void> {
+        const scope = this.tabLockContext.getStore()
+        signal ??= scope?.signal
+        signal?.throwIfAborted()
+        const deadline =
+            timeout === undefined ? scope?.deadline : Math.min(Date.now() + timeout, scope?.deadline ?? Infinity)
+        const remaining = () => {
+            signal?.throwIfAborted()
+            return deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+        }
         if (snapshot.clickSource !== 'iframe') {
             const point = snapshot.clickPoint
             if (!point) {
@@ -2127,23 +2156,25 @@ class UnifiedSessionManager {
                     '重新检查页面状态后再重试；交互式验证码无法自动完成'
                 )
             }
-            const driver = await withNavigationBudget(() => this.getDriver(remaining()), deadline)
+            const driver = await withNavigationBudget(() => this.getDriver(remaining()), deadline, signal)
             if (this.isExtensionConnected()) {
                 await withNavigationBudget(
                     () => driver.stealthClick(point.x, point.y, 'left', 1, undefined, remaining()),
-                    deadline
+                    deadline,
+                    signal
                 )
                 return
             }
-            const frameOffset = this.currentFrameOffset
-            const clickPoint =
-                frameOffset && this.inputMode !== 'stealth'
-                    ? { x: point.x + frameOffset.x, y: point.y + frameOffset.y }
-                    : point
+            const clickPoint = await withNavigationBudget(
+                () => getCdpSession().mapFramePoint(point, remaining()),
+                deadline,
+                signal
+            )
             this.currentMousePosition = clickPoint
             await withNavigationBudget(
                 () => driver.inputMouse('mouseMoved', clickPoint.x, clickPoint.y, { modifiers: this.modifiers }),
-                deadline
+                deadline,
+                signal
             )
             await withNavigationBudget(
                 () =>
@@ -2159,7 +2190,8 @@ class UnifiedSessionManager {
                         },
                         remaining()
                     ),
-                deadline
+                deadline,
+                signal
             )
             return
         }
@@ -2179,7 +2211,7 @@ class UnifiedSessionManager {
                 '先 browse attach 到受控测试页，把该页放到已经聚焦的窗口并保持为活动 tab 后重试'
             )
         }
-        const topology = await this.listTopology(remaining())
+        const topology = await withNavigationBudget(() => this.listTopology(remaining()), deadline, signal)
         const windowInfo = topology?.windows.find((item) =>
             item.tabs.some((tab) => String(tab.id) === targetId || tab.targetId === targetId)
         )
@@ -2213,47 +2245,146 @@ class UnifiedSessionManager {
                 '先把受控测试页设为该窗口的活动 tab，且窗口已经聚焦后再重试'
             )
         }
-        await withNavigationBudget(() => this.extensionBridge!.debuggerDetach(undefined, remaining()), deadline)
-        const viewport = await withNavigationBudget(() => this.readViewportMetrics(0), deadline)
-        const refreshedTopology = await this.listTopology(remaining())
-        const refreshedWindow = refreshedTopology?.windows.find((item) =>
-            item.tabs.some((candidate) => String(candidate.id) === targetId || candidate.targetId === targetId)
-        )
-        const refreshedTab = refreshedWindow?.tabs.find(
-            (candidate) => String(candidate.id) === targetId || candidate.targetId === targetId
-        )
-        const refreshedActiveTabId = refreshedWindow?.activeTabId
-        if (
-            !refreshedWindow?.focused ||
-            refreshedTab?.managed !== true ||
-            (refreshedTab.active !== true &&
-                (refreshedActiveTabId === undefined || String(refreshedActiveTabId) !== targetId))
-        ) {
-            throw new OsMouseError(
-                'TURNSTILE_OS_CLICK_UNAVAILABLE',
-                '系统鼠标点击前，受控测试页的窗口或活动 tab 已变化',
-                '重新聚焦受控测试页并保持为活动 tab 后重试'
+        await withNavigationBudget(() => this.extensionBridge!.debuggerDetach(undefined, remaining()), deadline, signal)
+        const pointerId = process.platform === 'linux' ? randomUUID() : undefined
+        let pointerDocumentId: string | undefined
+        const resolvePoint = async (refresh: boolean, probe?: NativePointerProbe) => {
+            const current =
+                refresh && refreshSnapshot
+                    ? await withNavigationBudget(() => refreshSnapshot(remaining()), deadline, signal)
+                    : snapshot
+            if (
+                !current.clickPoint ||
+                current.clickSource !== 'iframe' ||
+                current.clickTargetKind !== snapshot.clickTargetKind ||
+                current.url !== snapshot.url
+            ) {
+                throw new OsMouseError(
+                    'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                    '系统鼠标按下前，页面或验证控件已变化',
+                    '重新检查页面验证状态后再重试'
+                )
+            }
+            const viewport = await withNavigationBudget(() => this.readViewportMetrics(0), deadline, signal)
+            const refreshedTopology = await withNavigationBudget(() => this.listTopology(remaining()), deadline, signal)
+            const refreshedWindow = refreshedTopology?.windows.find((item) =>
+                item.tabs.some((candidate) => String(candidate.id) === targetId || candidate.targetId === targetId)
             )
+            const refreshedTab = refreshedWindow?.tabs.find(
+                (candidate) => String(candidate.id) === targetId || candidate.targetId === targetId
+            )
+            const refreshedActiveTabId = refreshedWindow?.activeTabId
+            if (
+                !refreshedWindow?.focused ||
+                refreshedTab?.managed !== true ||
+                (refreshedTab.active !== true &&
+                    (refreshedActiveTabId === undefined || String(refreshedActiveTabId) !== targetId))
+            ) {
+                throw new OsMouseError(
+                    'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                    '系统鼠标点击前，受控测试页的窗口或活动 tab 已变化',
+                    '重新聚焦受控测试页并保持为活动 tab 后重试'
+                )
+            }
+            const frameOffset = this.currentFrameOffset
+            const clickPoint = frameOffset
+                ? { x: current.clickPoint.x + frameOffset.x, y: current.clickPoint.y + frameOffset.y }
+                : current.clickPoint
+            const estimate = await withNavigationBudget(
+                () =>
+                    resolveTurnstileOsClickPoint(
+                        { ...current, clickPoint, screenPoint: null, viewport },
+                        { deadline, signal }
+                    ),
+                deadline,
+                signal
+            )
+            if (!pointerId || !probe) {
+                return estimate
+            }
+            const request = await probe()
+            const origin = (await withNavigationBudget(
+                () =>
+                    this.extensionBridge!.getViewportMetrics(
+                        0,
+                        { operation: 'read', id: pointerId, documentId: pointerDocumentId, ...request },
+                        remaining()
+                    ),
+                deadline,
+                signal
+            )) as { x?: number; y?: number }
+            if (
+                typeof origin.x !== 'number' ||
+                !Number.isFinite(origin.x) ||
+                typeof origin.y !== 'number' ||
+                !Number.isFinite(origin.y)
+            ) {
+                throw new OsMouseError(
+                    'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                    '未取得可信原生指针原点',
+                    '重新检查当前受控页面'
+                )
+            }
+            return {
+                x: Math.round(origin.x + clickPoint.x * viewport.devicePixelRatio),
+                y: Math.round(origin.y + clickPoint.y * viewport.devicePixelRatio),
+            }
         }
-        const frameOffset = this.currentFrameOffset
-        const clickPoint =
-            snapshot.clickPoint && frameOffset
-                ? { x: snapshot.clickPoint.x + frameOffset.x, y: snapshot.clickPoint.y + frameOffset.y }
-                : snapshot.clickPoint
-        const screen = await withNavigationBudget(
-            () =>
-                resolveTurnstileOsClickPoint(
+        let clickError: { error: unknown } | undefined
+        try {
+            if (pointerId) {
+                const started = (await withNavigationBudget(
+                    () =>
+                        this.extensionBridge!.getViewportMetrics(0, { operation: 'start', id: pointerId }, remaining()),
+                    deadline,
+                    signal
+                )) as { documentId?: string }
+                pointerDocumentId = started.documentId
+                if (!pointerDocumentId) {
+                    throw new OsMouseError(
+                        'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                        '原生指针观察器未取得文档身份',
+                        '重新检查当前受控页面'
+                    )
+                }
+            }
+            const screen = await resolvePoint(false)
+            // 请求取消后仍须等待必要的鼠标释放完成，再结束 tab 锁
+            await osLeftClick(screen.x, screen.y, {
+                deadline,
+                signal,
+                refreshPoint: (probe) => resolvePoint(true, probe),
+            })
+        } catch (error) {
+            clickError = { error }
+        }
+        if (pointerId) {
+            try {
+                await this.tabLockContext.run(
                     {
-                        ...snapshot,
-                        clickPoint,
-                        screenPoint: null,
-                        viewport,
+                        ...scope,
+                        session: this,
+                        signal: undefined,
+                        deadline: Date.now() + 5000,
+                        budgetError: undefined,
+                        userAction: undefined,
+                        pendingPageCondition: null,
+                        keyboardFocus: undefined,
+                        inputCleanup: undefined,
                     },
-                    { deadline }
-                ),
-            deadline
-        )
-        await withNavigationBudget(() => osLeftClick(screen.x, screen.y, { deadline }), deadline)
+                    () => this.extensionBridge!.getViewportMetrics(0, { operation: 'stop', id: pointerId }, 5000)
+                )
+            } catch (error) {
+                console.warn('[MCP] Native pointer observer cleanup failed:', error)
+                if (clickError?.error instanceof Error) {
+                    Object.assign(clickError.error, { pointerCleanupError: error })
+                }
+                clickError ??= { error }
+            }
+        }
+        if (clickError) {
+            throw clickError.error
+        }
     }
 
     // noinspection JSUnusedGlobalSymbols — resolveChallenge 通过 ChallengeHost 结构类型调用
