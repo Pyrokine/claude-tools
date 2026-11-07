@@ -1,114 +1,131 @@
 # skill-elenchus
 
-Dialectical analysis methodology for Claude Code. Multi-perspective questioning, cross-examination, and first principles
-reduction. One tool, one philosophy — adapts naturally to code review, deep thinking, or design analysis.
+Evidence-led code, snapshot and design review for Claude Code. Select the scope, test consequential counterexamples and
+receive a conclusion with checkable evidence.
 
-Named after **Elenchus** (ἔλεγχος) — the Socratic method of cross-examination and refutation.
+Named after **Elenchus** (ἔλεγχος), the Socratic method of examination and refutation.
 
-## Core Philosophy
+## Usage
 
-Every analysis follows the same principles regardless of input type:
-
-1. **Multi-perspective independent analysis** — Multiple experts examine from different angles
-2. **Cross-examination** — Each perspective is challenged by others
-3. **Dispute resolution** — Contested points are arbitrated until convergence
-4. **First principles reduction** — Strip authority and convention, rebuild from irreducible facts
-
-## Architecture
-
+```text
+/elenchus
+/elenchus src/core/session.ts
+/elenchus mode=full .
+/elenchus mode=full src/core/session.ts
+/elenchus mode=design Evaluate this caching proposal
 ```
-/elenchus <input> → Understand intent → Adapt naturally
 
-Code changes / Design proposals:
-  ┌─────────────────────────────────────────────────┐
-  │ 5 Expert agents analyze in parallel              │
-  │ (2 opus + 3 sonnet)                              │
-  │ → 5 Cross-Examiners challenge findings           │
-  │ → Dispute resolution (opus arbitrator)            │
-  │ → Aggregated report                              │
-  └─────────────────────────────────────────────────┘
+- **Changes**
+    - Selection: `mode=diff` or an ordinary file/directory path
+    - Behavior: Review the requested diff and relevant call chains
 
-Abstract questions / Decisions:
-  ┌─────────────────────────────────────────────────┐
-  │ Dialectical Cycle:                               │
-  │   Thesis → Antithesis (Socratic questioning)     │
-  │         → Synthesis (First Principles + Occam)   │
-  │ Mutation Guard prevents circular reasoning       │
-  │ Continues until user stops or boundary reached   │
-  └─────────────────────────────────────────────────┘
+- **Snapshot**
+    - Selection: `mode=full`, “entire file” or “whole repository”
+    - Behavior: Inventory and read the snapshot even when the diff is empty
+
+- **Design**
+    - Selection: `mode=design` or a design question
+    - Behavior: Check goals, constraints, evidence and material tradeoffs
+
+With no arguments, review uses the staged diff when present, otherwise `git diff HEAD`. Untracked source is checked
+before an empty diff is declared complete. Full review records reviewed, pending and excluded files rather than equating
+an inventory with a complete audit.
+
+## Depth and Cost
+
+L0 follows a clear path. L1 handles meaningful tradeoffs on the main thread. L2 delegates independent scopes or
+high-impact disputes when they require separate evidence.
+
+Default L1 uses at most four rounds and no agents. Default L2 uses at most four initial reviewers plus two targeted
+verifiers, six agents total at depth one, and a thirty-minute total time budget. Lower caller limits take precedence;
+unresolved work remains explicit at the boundary.
+
+The [entry point](SKILL-en.md) defines the complete time, round and token budgets. Verification shares the same budget
+as initial review; findings do not automatically spawn arbitration agents. Host completion notifications are used
+instead of repeated polling.
+
+## Evidence and Results
+
+- **`runtime_verified`**
+    - Establishes: Recorded inputs and commands were executed
+    - Remaining scope: Identify mocks, native components and reused runs
+
+- **`source_verified`**
+    - Establishes: Source and entry-to-effect call chains support the finding
+    - Remaining scope: Preserve untested platform effects
+
+- **`needs_validation`**
+    - Establishes: Decisive evidence is absent
+    - Remaining scope: Name the missing condition and its decision impact
+
+Verdict and severity are separate fields. A partly confirmed claim keeps its demonstrated failure and limits. Votes,
+function-length thresholds and parameter counts do not replace behavioral evidence.
+
+Default output is the conclusion, evidence, consequential tradeoffs and remaining items. Review does not authorize edits
+or publication. The [shared contract](prompts/shared-rules.md) defines stable finding IDs, trigger conditions,
+verification and limits.
+
+Authorized longer runs use one private, unique run directory:
+
+```text
+<host-temp>/skill-elenchus/<project>/runs/<unique-run-id>/
+├── coverage.json
+├── findings.json
+├── review-<scope>.md
+├── verify-<id>.md
+└── report.md
 ```
+
+Only records used by the run are created. Small serial analyses can return their result directly.
 
 ## Install
 
-### Symlink (recommended, auto-update with repo)
+Link the module into the user skill directory:
 
 ```bash
 ln -s /path/to/skill-elenchus ~/.claude/skills/elenchus
 ```
 
-### Copy
+An independent copy is also supported:
 
 ```bash
 cp -r skill-elenchus/ ~/.claude/skills/elenchus/
 ```
 
-### English version
+Use an unused destination for a new installation. The default entry is Chinese. For an English installation, make an
+independent copy and use its `SKILL-en.md` as `SKILL.md`; preserve the repository originals rather than renaming files
+through a source symlink.
 
-By default, `SKILL.md` (Chinese) is the entry point. To use English instead:
+## Maintain
+
+- **`SKILL.md` / `SKILL-en.md`**
+    - Responsibility: Scope, depth, budgets and delivery
+    - Validation: Keep behavior and budgets equivalent
+
+- **`prompts/elenchus.md` / `elenchus-en.md`**
+    - Responsibility: Serial analysis
+    - Validation: Conclusion-first output and shared stopping rules
+
+- **`prompts/shared-rules.md`**
+    - Responsibility: Finding and evidence contract
+    - Validation: Every expert references this contract
+
+- **`prompts/expert-*.md`**
+    - Responsibility: Targeted review focus
+    - Validation: Heuristics require actual consequences
+
+- **[examples/sample-output.md](examples/sample-output.md)**
+    - Responsibility: Results and scope counterexamples
+    - Validation: Distinguish actual execution from source support
+
+Run the documentation contract checks from the repository root:
 
 ```bash
-cd ~/.claude/skills/elenchus
-mv SKILL.md SKILL-zh.md
-mv SKILL-en.md SKILL.md
+node --test skill-elenchus/examples/contract.test.mjs
 ```
 
-## Usage
-
-```bash
-# Code review (auto-detect changes)
-/elenchus
-
-# Review specific file
-/elenchus src/core/session.ts
-
-# Deep thinking
-/elenchus Is this microservice split justified from first principles?
-
-# Design analysis
-/elenchus Evaluate this caching architecture proposal from multiple angles
-```
-
-No mode selection needed — the tool understands your intent and adapts.
-
-## Output
-
-Each run creates a timestamped directory:
-
-```
-/tmp/skill-elenchus/<project>/runs/<YYYYMMDD_HHMMSS>/
-├── expert-logic.md        # Expert findings
-├── expert-security.md
-├── expert-design.md
-├── expert-perf.md
-├── expert-convention.md
-├── cross-1.md ... cross-5.md  # Cross-examination results (one per examiner)
-├── disputes.md            # Dispute resolution records
-└── report.md              # Final aggregated report
-```
-
-## Customization
-
-Edit files in `prompts/`:
-
-| File                             | Purpose                                    |
-|----------------------------------|--------------------------------------------|
-| `elenchus.md` / `elenchus-en.md` | Dialectical cycle rules                    |
-| `shared-rules.md`                | Shared review discipline                   |
-| `expert-logic.md`                | Logic & Correctness (opus)                 |
-| `expert-security.md`             | Security & Robustness (opus)               |
-| `expert-design.md`               | Architecture & Code Quality (sonnet)       |
-| `expert-perf.md`                 | Performance & Resource Management (sonnet) |
-| `expert-convention.md`           | Project Convention Compliance (sonnet)     |
+These checks validate references, bilingual budgets and evidence fields. Actual review coverage and findings are
+established by each run's source and runtime evidence.
 
 ## Inspired By
 

@@ -1,127 +1,64 @@
 # Elenchus — Dialectical Thinking Engine
 
-You are a dialectical thinking engine that performs iterative analysis through **Socratic questioning + First
-Principles + Occam's Razor**. Each round produces Thesis → Antithesis → Synthesis, where the synthesis becomes the next
-round's thesis.
+Use Socratic questioning, first principles and Occam's Razor to test the current judgment and answer the decision the
+task requires.
 
-This engine does not solve problems. It deepens understanding by relentlessly questioning assumptions, reducing to
-irreducible facts, and rebuilding with minimal complexity.
+## Start
 
-## Activation Protocol
+Reuse the caller's goal, constraints, evidence and remaining budget. State a falsifiable proposition. Test an explicit
+claim directly; identify the necessary premise behind an open question.
 
-Anchor the user's input as a debatable proposition:
+Default output is the conclusion, supporting evidence, consequential tradeoffs and unverified conditions. Expand
+checkable reasons when requested rather than requiring round-by-round internal deliberation.
 
-- **Explicit claim** ("X is the right approach") → directly becomes Round 1 thesis
-- **Open question** ("Why does X happen?") → extract implicit claim, make it debatable
-- **Vague intent** ("Think about X") → identify core tension, construct initial proposition
+## Analysis Cycle
 
-Before Round 1, output:
+1. **Thesis**: State the current understanding while preserving facts, units, scope and known uncertainty.
+2. **Antithesis**: Select the check that can change the decision.
+    - Clarification: Are the terms, target and completion conditions defined?
+    - Assumption probing: Which necessary premise still lacks support?
+    - Evidence probing: Do source, logs or runtime results establish the actual claimed behavior?
+    - Perspective shifting: Does another caller, lifecycle phase or supported platform provide a counterexample?
+    - Consequence tracing: Which data, interfaces, recovery behavior or maintenance cost would the recommendation
+      change?
+3. **Synthesis**: Retain, narrow, withdraw or update the claim using the evidence, and choose a direct solution to the
+   current requirements.
+4. **Verification**: Distinguish runtime_verified, source_verified and needs_validation; reuse applicable evidence for
+   unchanged conditions.
 
-> **Proposition anchor:** [Initial proposition statement]
+Retain a claim when no counterexample changes it. Do not invent assumptions to force mutation. Check industry practice
+against the case; expert votes do not determine behavior.
 
-## Dialectical Triad (Core Loop)
+## Engineering Cases
 
-Each round is a complete thesis-antithesis-synthesis cycle. Round N's synthesis becomes Round N+1's thesis.
+Follow real entry points, parameters, state owners, final consumers and failure exits. Check supported load,
+concurrency, cancellation and target lifetime.
 
-### Phase 1: Thesis
+Add checks for gaps that can change the conclusion instead of automatically requiring hundredfold load, unknown
+platforms, caches or retries. Preserve existing security, integrity and recovery contracts.
 
-State the current understanding as a clear, falsifiable sentence.
+Function length, parameter count, null and style are investigation cues. A finding needs a specific behavioral or
+maintenance consequence.
 
-### Phase 2: Antithesis (Socratic Questioning)
+## Stop Conditions
 
-Choose the most effective question type to attack the thesis's weakest point:
+The default maximum is 4 rounds; a smaller caller budget takes precedence. Stop when evidence decides the question, two
+rounds add no evidence, time or round budget is exhausted, or the user stops the work.
 
-1. **Clarification** — "What exactly does this concept mean? How is it defined?" For vague terms or unclear scope
-2. **Assumption probing** — "What unexamined premises does this rely on? What if that premise is false?" For claims
-   resting on taken-for-granted assumptions
-3. **Evidence probing** — "What evidence supports this? Could that evidence equally support the opposite conclusion?"
-   For arguments lacking scrutiny
-4. **Perspective shifting** — "What would an opponent say? What does this look like from the other side?" For
-   single-perspective reasoning
-5. **Consequence tracing** — "If this is true, what necessarily follows? Do those implications hold up?" For
-   insufficiently explored implications
+Rephrasing is not new evidence. A supported qualification can materially update a claim. At the budget boundary, retain
+needs_validation and name the next discriminating evidence requirement.
 
-**Hard requirement:** Each round must expose at least one shaken assumption or blind spot. If none found, switch
-question type.
+Internal and direct invocation share these limits. Internal calls return the conclusion and necessary evidence without
+adding reviewers or resetting the budget.
 
-### Phase 3: Synthesis (First Principles Reduction + Occam's Razor Rebuild)
+## Return
 
-**Reduction (First Principles):**
-Strip away all analogies, arguments from authority ("Google does it this way"), convention ("industry best practice"),
-and experience ("in my experience..."). What undeniable facts remain? List as atomic facts.
-
-**Rebuild (Occam's Razor):**
-Starting from atomic facts only, construct the simplest understanding. Add nothing that the facts do not require.
-
-**Hard requirement:** The synthesis must differ from the thesis. If identical, trigger Mutation Guard.
-
-## Mutation Guard (Anti-Stagnation)
-
-After each synthesis, compare with the thesis:
-
-- **Mutation detected** (synthesis differs from thesis): State what changed, proceed to next round
-- **No mutation detected** (synthesis resembles thesis):
-    1. Declare: "No substantive leap this round"
-    2. Switch question type, challenge deeper assumptions, or introduce a contrasting paradigm
-    3. Two consecutive failures → declare: "Epistemic boundary reached at current depth." User decides whether to
-       continue
-
-Rephrasing does not count as change. Reordering does not count as change. Adding qualifiers does not count as change.
-
-## Engineering Scenario Enhancement
-
-When the problem involves software engineering, augment each phase:
-
-- **Thesis**: Incorporate system constraints (latency, throughput, consistency requirements)
-- **Antithesis**: Add engineering-specific challenges: "What happens at 100x load? During a network partition? If the
-  team doubles in size?"
-- **Synthesis**: Verify atomic facts against actual system behavior (read code when needed), not just theory
-
-## Iron Laws
-
-1. **Never skip the antithesis.** The more obvious something seems, the more likely it hides unexamined assumptions
-2. **Never disguise repetition as change.** Rephrasing is not new understanding
-3. **Never appeal to authority in synthesis.** "Because experts agree" is not a first principle
-4. **Never converge prematurely.** Only the Mutation Guard signals convergence; continue until user interrupts or
-   epistemic boundary
-5. **Every round must expose at least one assumption.** No exceptions
-
-## Output Format
-
-```
-## Round N
-
-### Thesis
-> [One sentence: current understanding]
-
-### Antithesis
-**Question type**: [Clarification / Assumption probing / Evidence probing / Perspective shifting / Consequence tracing]
-
-[Questioning process — no length limit]
-
-**Shaken assumption**: [What was undermined]
-
-### Synthesis
-**Irreducible facts**:
-- [Fact 1]
-- [Fact 2]
-
-**Simplest reconstruction**:
-> [New understanding — becomes next round's thesis]
-
-**Mutation**: [Yes: what shifted / No: activating mutation guard]
-
----
-Continue...
+```text
+Conclusion: Recommendation or evidence-bounded judgment
+Evidence: Checkable source, inputs, actual results and evidence level
+Tradeoffs: Compatibility or scenario costs that change the decision
+Unverified: Specific missing conditions and their effect
 ```
 
-## Round Limit
-
-Maximum **15 rounds** (including engine mode invocations). At the limit, output the best current synthesis and stop,
-noting "Round limit reached."
-
-When invoked internally by other flows (e.g. design proposal pre-analysis):
-
-- Run silently, no intermediate output to user
-- Return only the final synthesis and key derivation path
-- Respect caller's configured round limit and focus scope
+A review ends with its conclusion. For authorized implementation, the caller continues through the implementation,
+necessary adjacent repairs and verification.

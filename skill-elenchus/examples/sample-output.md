@@ -1,113 +1,98 @@
-# Sample Review Output
+# Scope and Evidence Examples
 
-This is an example of what `/elenchus` produces for a TypeScript project.
+These examples define review behavior and illustrative result shapes. They are not execution records for a particular
+repository.
 
----
+## 1 A Clean Snapshot Still Has a Review Target
 
-## Terminal Output (Summary)
+Input:
 
-```
-Code Review Report — mcp-chrome
-Scope: git diff HEAD (3 files changed)
-Date: 2025-03-27 14:30:00
-
-┌──────────┬───────┐
-│ Severity │ Count │
-├──────────┼───────┤
-│ CRITICAL │     1 │
-│ HIGH     │     3 │
-│ MEDIUM   │     5 │
-│ LOW      │     2 │
-│ Total    │    11 │
-└──────────┴───────┘
-
-┌───────────────────────────────┬───────┐
-│ Verdict                       │ Count │
-├───────────────────────────────┼───────┤
-│ CONFIRMED (unanimous)         │     6 │
-│ CONFIRMED (majority)          │     2 │
-│ SUSTAINED (after arbitration) │     1 │
-│ DEEPENED                      │     1 │
-│ OVERTURNED                    │     1 │
-│ UNRESOLVED                    │     0 │
-└───────────────────────────────┴───────┘
-
---- CRITICAL ---
-
-[FINDING]
-id: E1-001
-file: src/core/session.ts
-line: 142
-severity: CRITICAL
-category: logic
-description: Runtime.Timestamp is already epoch milliseconds, but the code multiplies by 1000, producing timestamps 1000x too large
-evidence: `timestamp: Math.round(p.timestamp * 1000),  // Runtime.Timestamp`
-impact: All network log timestamps will be in year 50000+, making log correlation impossible
-suggestion: Remove the `* 1000`: `timestamp: Math.round(p.timestamp),`
-[/FINDING]
-→ CONFIRMED by 4/4 cross-reviewers
-
---- HIGH ---
-
-[FINDING]
-id: E2-001
-file: extension/src/background/actions.ts
-line: 287-295
-severity: HIGH
-category: security
-description: RegExp constructed from user input without sanitizing catastrophic backtracking patterns
-evidence: `const re = new RegExp(urlPattern);`
-impact: Malicious URL pattern like `(a+)+$` can freeze the extension process via ReDoS
-suggestion: Detect nested quantifier patterns before constructing RegExp; limit input length
-[/FINDING]
-→ CONFIRMED by 3/4 cross-reviewers, DEEPENED by Expert 4 (also affects performance)
-
-[... more findings ...]
-
-MEDIUM: 5 findings | LOW: 2 findings
-Full report: /tmp/skill-elenchus/mcp-chrome/runs/20250327_143000/report.md
+```text
+/elenchus mode=full .
 ```
 
-## Output Directory Structure
+The repository has no staged, unstaged or untracked changes. Full mode still inventories the selected snapshot and
+follows its entry points. The report states the pinned commit, files actually reviewed and unresolved coverage.
 
+Illustrative coverage:
+
+```json
+{
+    "mode": "full",
+    "reviewed": ["src/entry.ts", "src/worker.ts"],
+    "pending": ["src/export.ts"],
+    "excluded": [{ "path": "dist/", "reason": "generated output; source selected for review" }]
+}
 ```
-/tmp/skill-elenchus/mcp-chrome/runs/20250327_143000/
-├── expert-logic.md        # Expert 1 raw findings
-├── expert-security.md     # Expert 2 raw findings
-├── expert-design.md       # Expert 3 raw findings
-├── expert-perf.md         # Expert 4 raw findings
-├── expert-convention.md   # Expert 5 raw findings
-├── cross-1.md ... cross-5.md  # Cross-examination results (one per examiner)
-├── disputes.md            # Dispute resolution records
-└── report.md              # Final aggregated report
+
+The remaining export file prevents a claim of complete repository coverage. Its presence does not establish a defect.
+
+## 2 A Clean Diff Can Finish Without Reviewing the Snapshot
+
+Input:
+
+```text
+/elenchus mode=diff src/
 ```
 
-## Dispute Example
+The requested diff is empty and no in-scope untracked source remains. Report no changes and stop. Do not reinterpret
+this request as a full repository audit.
 
-```markdown
-# Dispute: E1-002 — src/tools/input.ts:89
+A new untracked source file is a separate case: identify it before declaring the requested scope empty.
 
-## Original Finding (Expert 1 — Logic)
-setTimeout with delay > 2^31-1 ms silently fires immediately in Node.js.
-The description says "无上限" but the actual limit is ~24.8 days.
+## 3 A Design Heuristic Is Not a Finding
 
-## Challenge (Cross-Reviewer 3)
-This is a tool description string, not runtime code. The description
-is user-facing documentation. Even if a user sets timeout to 2^31,
-the setTimeout behavior is a Node.js platform concern, not a bug
-in this code.
+Input:
 
-## Arbitration — Round 1
-SUSTAINED. While the description is documentation, it's misleading
-documentation that could lead users to set values causing silent
-misbehavior. The code should either document the limit or clamp
-the value. The description "无上限" is factually incorrect.
-
-## Arbitration — Round 2 (requested: original finding was about description, not code)
-SUSTAINED. The review scope includes documentation correctness.
-A description claiming "no limit" when a hard platform limit exists
-at 2^31-1 ms is a documentation bug (category: convention, not logic).
-Severity downgraded from HIGH to MEDIUM.
-
-Final verdict: SUSTAINED (MEDIUM)
+```text
+/elenchus mode=design Assess this optional-value API
 ```
+
+The proposal uses null for a documented absent value, and its callers handle that state. Null alone is not a defect. A
+long function or several related parameters likewise requires a concrete correctness or maintenance consequence before
+it becomes a finding.
+
+If an omitted caller decides whether absence is safe, retain needs_validation for that question rather than inventing a
+failure or approving the contract without evidence.
+
+## 4 Evidence Levels Describe Different Work
+
+- **`runtime_verified`**
+    - Appropriate claim: The stated input caused the recorded failure
+    - Record: Exact executed command, result, real components and mocks
+
+- **`source_verified`**
+    - Appropriate claim: The reachable implementation violates the stated contract
+    - Record: Verified path/line, trigger, consumers and untested native effects
+
+- **`needs_validation`**
+    - Appropriate claim: The available material does not decide the critical behavior
+    - Record: Missing caller, platform condition or discriminating test
+
+A mocked frame switch can support a source-level identity defect while the real browser's scheduling remains untested. A
+cumulative byte calculation describes work performed across iterations, not peak memory.
+
+Reused evidence retains its original provenance. Running a helper does not establish that a public registration passes
+the required arguments into it.
+
+## 5 Report Shape
+
+The [shared finding contract](../prompts/shared-rules.md) supplies IDs, verdicts, evidence levels, triggers,
+verification and limits. A final report leads with supported conclusions, then groups the evidence and unfinished scope.
+
+For a partly confirmed claim, preserve the demonstrated failure and correct the unsupported condition. For a refuted
+claim, retain the counter-evidence. A source defect can be confirmed without claiming an unexecuted native test passed.
+
+A time or agent boundary leaves explicit pending work. It does not authorize discarding lower-severity findings or
+starting a new arbitration chain with a fresh budget.
+
+## 6 Contract Checks
+
+From the repository root:
+
+```bash
+node --test skill-elenchus/examples/contract.test.mjs
+```
+
+The checks validate scope declarations, equivalent bilingual budgets, shared evidence fields, references and these
+examples. Actual review findings require source or runtime evidence from the reviewed target.
