@@ -1,5 +1,162 @@
 # Changelog
 
+## v1.19.0 - Unreleased / 未发布
+
+## Versions
+
+- mcp-claude-history: 2.1.1 → 2.2.0
+- mcp-chrome: 3.0.1 → 3.1.0
+- mcp-chrome Extension: 3.0.1 → 3.1.0
+- mcp-ssh: 3.1.0 → 3.2.0
+- skill-cc-session-fix: updated, no standalone version
+- skill-elenchus: 1.1.1 → 1.2.0
+
+## What's Changed
+
+### mcp-claude-history
+
+- feat: Show custom session titles alongside UUIDs, with independent title redaction and bounded previews
+- fix: Resolve large multi-project and subagent search timeouts while preserving exact counts, ordering, UUID
+  de-duplication, filtering and pagination
+- fix: Preserve source selection, scan metadata, tool attribution and byte budgets across search, context, trace and
+  export paths
+- fix: Keep complete JSON bodies parseable after redaction in normal records, streamed records and exports, while preserving original character ranges
+
+### mcp-chrome
+
+- feat: Observe and handle browser dialogs, retain original response and download bytes, inspect WebSocket/SSE
+  messages, and control requests and HTTP authentication within the selected page
+- feat: Upload local files through Extension and CDP, with bounded size and explicit selection results
+- fix: Preserve original errors, action completion, retryability and request deadlines across preparation, navigation,
+  cancellation and output failures
+- fix: Use current frame-local coordinates for background input and release held keys and browser resources after
+  cancellation
+- fix: Calibrate Challenge OS mouse coordinates during debugger-banner animations, preserving the path hover and original request deadline
+- fix: Preserve fallback console calls once when debugger collection resumes, without duplicating Runtime history or restoring cleared calls
+- fix: Deliver native background key events and editing commands with request-scoped focus emulation; restore the original setting before verification, keep the actual tab and window focus unchanged, and report temporary document visibility and cleanup failures
+- fix: Respect document-scoped read access and preserve cookie isolation and diagnostic redaction
+- fix: Redact input find and replacement values from locator error logs
+- fix: Avoid native mouse release after a rejected press when background element clicks use synthetic events, while retaining cleanup for unknown results
+- fix: Reconnect a restarted MCP Server without waiting for periodic discovery or interrupting other server connections
+- fix: Preserve named input values and traverse deeply nested state trees without reading sensitive input values
+- fix: Use the full element-wait deadline and return actual locator match counts across both backends
+- fix: Retire navigation-expired Fetch references while keeping native parameter refusals recoverable
+- fix: Apply network URL filters to paused requests and authentication events before limiting results, preserving pending requests during log clearing
+- fix: Keep CDP native event handling independent of the connection request's expired deadline, cancellation and action state, while preserving each explicit command's request budget
+- fix: Preserve the selected target when a failed lookup or closed-page response finishes
+- fix: Return the actual before/after state when CDP closes a page through browse or manage
+- fix: Redact credentials and sensitive query values in URL-bearing headers and raw handshake metadata
+- fix: Keep dispatched CDP context-loss results unknown and reject unsupported iframe retry policies before execution
+- fix: Return specific frame and selector errors across both backends and stop invalid selector retries
+- fix: Support cross-origin and open-Shadow iframe actions without extending the request deadline
+- fix: Return promptly when native and page history have no entry, preserving valid history navigation and request deadlines
+- fix: Keep iframe probes independent of background-page timers and loading siblings, and release them on cancellation
+- fix: Keep stable input targets actionable beside looping, unrelated scrollers
+- fix: Update Zod to 4.6.7 and compatible locked dependencies for upstream validation, HTTP parsing, URI and address security fixes
+
+### mcp-ssh
+
+- feat: Pass interpreter options as separate `interpreterArgs` values when executing temporary scripts
+- feat: Report SFTP and rsync transfer progress through MCP notifications, with visible notification failures and
+  cancellation-aware delivery
+- fix: Verify SSH host keys before authentication and preserve per-hop identity diagnostics and existing trust records
+- fix: Preserve completed transfers, partial byte counts and failure stages across timeouts, cancellation and lost SFTP
+  replies
+- fix: Validate read targets, synchronization parents, Windows filenames and ACLs before the affected file operations
+- fix: Update Zod to 4.6.7 and compatible locked dependencies for upstream validation, HTTP parsing, URI and address security fixes
+
+### skill-cc-session-fix
+
+- fix: Validate retained JSONL rows, UUID chains and timestamp relationships before repair, keeping unsafe truncation
+  recommendations out of automatic guidance
+- fix: Preserve private recovery copies, UTF-8 content, final newlines and non-thinking content during repairs and
+  session forks
+
+### skill-elenchus
+
+- feat: Separate diff, full-snapshot and design review scopes from analysis depth, including empty-diff snapshots and
+  untracked source files
+- fix: Share evidence levels and total review budgets across roles, and report pending coverage and unresolved findings
+
+### Publishing
+
+- ci: Require the same-commit cross-platform workflow before npm authentication and GitHub Release publishing,
+  including macOS, minimum supported runtimes and both public Skill test suites
+
+---
+
+## 版本
+
+- mcp-claude-history: 2.1.1 → 2.2.0
+- mcp-chrome: 3.0.1 → 3.1.0
+- mcp-chrome Extension: 3.0.1 → 3.1.0
+- mcp-ssh: 3.1.0 → 3.2.0
+- skill-cc-session-fix：已更新，无独立版本号
+- skill-elenchus: 1.1.1 → 1.2.0
+
+## 更新内容
+
+### mcp-claude-history
+
+- feat: 会话列表同时显示自定义名称与 UUID，名称独立脱敏并限制预览长度
+- fix: 修复大规模跨项目及子会话检索超时，保留精确计数、排序、UUID 去重、筛选条件和分页
+- fix: 搜索、上下文、调用追踪与导出保留来源选择、扫描元数据、工具归属及字节预算
+- fix: 普通、流式记录及导出的完整 JSON 正文脱敏后保持可解析，range 保留原字符坐标
+
+### mcp-chrome
+
+- feat: 观察和处理浏览器对话框，保留原响应与下载字节，读取 WebSocket/SSE 消息，请求控制与 HTTP 认证限定在所选页面
+- feat: 通过 Extension 和 CDP 上传本地文件，限制文件总大小并明确返回选择结果
+- fix: 准备、导航、取消及返回值读取失败时，保留原始错误、动作完成状态、重试建议与请求期限
+- fix: 后台输入使用当前 frame 的局部坐标，取消后释放按键和浏览器资源
+- fix: debugger 提示条动画期间校准 Challenge 系统鼠标坐标，保持路径悬停与原请求期限
+- fix: debugger 恢复采集时，fallback console 调用各保留一次，Runtime 历史不重复追加，已清除调用保持已清除
+- fix: 后台原生按键和编辑命令按请求管理焦点模拟，验证前恢复原设置，实际标签页与窗口焦点保持，并返回临时可见性提示和清理错误
+- fix: 遵守文档范围内的读取权限，保留 Cookie 隔离与诊断脱敏
+- fix: 定位错误日志中的 input find 与替换值采用同一脱敏规则
+- fix: 后台元素单击改用合成事件时，按下明确未执行则跳过原生释放，未知回执继续清理
+- fix: 单个 MCP Server 重启后沿既有退避自动重连，其他 Server 的连接保持，无需等待定期发现
+- fix: state 保留命名输入框当前值，深层节点遍历保持敏感字段零读取
+- fix: 元素等待使用完整期限，两种后端返回实际定位匹配数量
+- fix: 导航使 Fetch 暂停引用失效后结束旧引用，原生参数拒绝仍可使用原引用纠正
+- fix: 暂停请求和认证事件按请求 URL 过滤后再限量，清除日志时保留仍需处理的请求
+- fix: CDP 原生事件处理独立于连接请求的过期期限、取消和动作状态，显式命令继续遵守各自的请求预算
+- fix: 定位失败及关闭页响应结束后保留原默认目标
+- fix: CDP 经 browse 或 manage 关闭页面后返回实际 before/after 状态
+- fix: URL header 与原始握手 metadata 遮蔽凭证和敏感查询值
+- fix: CDP 脚本派发后 context 丢失时保留结果不明状态，未支持的 iframe 重试策略在执行前明确拒绝
+- fix: 两种后端返回明确的 frame 与 selector 错误，停止非法 selector 的重复查询
+- fix: 支持跨源与 open ShadowRoot 内的 iframe 操作，frame 准备沿用原请求期限
+- fix: 原生及页面均无可用历史时及时返回，保留有效历史导航和请求剩余预算
+- fix: iframe 探测等待不依赖后台页面定时器或兄弟 frame 加载完成，取消后释放探测资源
+- fix: 无关容器循环滚动时，稳定输入目标仍可操作
+- fix: 将 Zod 更新至 4.6.7，同步兼容依赖的上游安全修复，覆盖验证、HTTP 解析、URI 与地址处理
+
+### mcp-ssh
+
+- feat: 临时脚本执行通过 `interpreterArgs` 传递独立解释器参数
+- feat: SFTP 与 rsync 通过 MCP 通知报告传输进度，通知失败可见，取消后停止后续通知
+- fix: 认证前验证 SSH 主机密钥，保留各跳身份诊断与已有信任记录
+- fix: 超时、取消或 SFTP 应答丢失时，保留已完成传输、部分字节数与失败阶段
+- fix: 文件操作前验证读取目标、同步父目录、Windows 文件名与 ACL
+- fix: 将 Zod 更新至 4.6.7，同步兼容依赖的上游安全修复，覆盖验证、HTTP 解析、URI 与地址处理
+
+### skill-cc-session-fix
+
+- fix: 修复前验证保留的 JSONL 记录、UUID 链与时间关系，自动建议遵守安全截断边界
+- fix: 修复和创建新会话时，保留私有恢复副本、UTF-8 内容、末尾换行及非 thinking 内容
+
+### skill-elenchus
+
+- feat: 差异、完整快照和设计评审范围独立于分析深度，完整快照包含空 diff 与未跟踪源码
+- fix: 各角色共用证据分级和总评审预算，报告待审范围与未完成裁定
+
+### 发布流程
+
+- ci: npm 认证和 GitHub Release 发布依赖同提交的跨平台工作流，包含 macOS、最低支持运行时及两个公开 Skill 的测试
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.18.2...v1.19.0
+
 ## v1.18.2 - 2026-10-27
 
 ## Versions
@@ -13,35 +170,45 @@
 
 ### mcp-claude-history
 
-- feat: Add paged source catalogs, exact `sources` selection and grouped scans through MCP and CLI, with explicit catalog release
+- feat: Add paged source catalogs, exact `sources` selection and grouped scans through MCP and CLI, with explicit
+  catalog release
 - fix: Search oversized records in normal and aggregate modes while preserving filters, redaction and match counts
 - fix: Export full content independently of response previews and preserve mixed text, thinking and tool blocks
 - fix: Correct Windows history-file paths and private export creation when started from PowerShell 7
 - fix: Restore atomic Windows export publication and keep existing bundles when replacement fails
-- fix: Accept Windows SYSTEM and Administrators owners for export paths while preserving owner identity and current-user-only DACLs
+- fix: Accept Windows SYSTEM and Administrators owners for export paths while preserving owner identity and
+  current-user-only DACLs
 
 ### mcp-chrome
 
-- fix: Restore managed pages across Extension reloads using document identity, and serialize initialization with later state changes
-- fix: Dispatch ordinary background Extension element clicks through the existing atomic click path, including iframe targets, without a preparatory mouse move or action replay
+- fix: Restore managed pages across Extension reloads using document identity, and serialize initialization with later
+  state changes
+- fix: Dispatch ordinary background Extension element clicks through the existing atomic click path, including iframe
+  targets, without a preparatory mouse move or action replay
 - fix: Preserve iframe identity, valid script arguments and request deadlines across page operations
 - fix: Distinguish unavailable native contexts from verification-script errors and preserve the completed action state
 - fix: Return actual locator match counts and bounded candidates without unrelated window-focus suggestions
-- fix: Detect visible English and Chinese challenge content, preserve passive title waiting and native system-mouse handling, and retain existing debugger sessions on ordinary pages
-- fix: Read genuine older Extension group summaries without extra topology requests, keeping missing and malformed data distinct
-- fix: Preserve input-value redaction, native error details and document-scoped logs across successful and failed operations
+- fix: Detect visible English and Chinese challenge content, preserve passive title waiting and native system-mouse
+  handling, and retain existing debugger sessions on ordinary pages
+- fix: Read genuine older Extension group summaries without extra topology requests, keeping missing and malformed data
+  distinct
+- fix: Preserve input-value redaction, native error details and document-scoped logs across successful and failed
+  operations
 - chore: Update the Extension's Vite build dependency to 8.1.6
 
 ### mcp-ssh
 
-- feat: Add an opt-in OpenSSH backend that reuses an existing ControlMaster without opening a new authenticated connection
+- feat: Add an opt-in OpenSSH backend that reuses an existing ControlMaster without opening a new authenticated
+  connection
 - feat: Add name/time filters, entry limits, offsets and UTF-8 response-byte budgets to SFTP directory listing
 - feat: Add explicit bounded verification for individual files and directory synchronization
-- fix: Preserve transport capabilities, remote-operation state and visible errors when a requested operation is unsupported or fails
+- fix: Preserve transport capabilities, remote-operation state and visible errors when a requested operation is
+  unsupported or fails
 
 ### Publishing
 
-- ci: Add GitHub Actions Trusted Publishing with exact-commit checks, isolated OIDC permissions and validation of the selected tarballs against npm registry metadata
+- ci: Add GitHub Actions Trusted Publishing with exact-commit checks, isolated OIDC permissions and validation of the
+  selected tarballs against npm registry metadata
 - ci: Run Windows export-transaction tests before building the Rust release artifacts
 - ci: Check Windows private ACLs and export transactions through native PowerShell as well as Bash
 
@@ -105,7 +272,8 @@
 
 ### mcp-claude-history
 
-- feat: Add paged source catalogs, exact `sources` selection and grouped scans through MCP and CLI, with explicit catalog release
+- feat: Add paged source catalogs, exact `sources` selection and grouped scans through MCP and CLI, with explicit
+  catalog release
 - fix: Search oversized records in normal and aggregate modes while preserving filters, redaction and match counts
 - fix: Export full content independently of response previews and preserve mixed text, thinking and tool blocks
 - fix: Correct Windows history-file paths and private export creation when started from PowerShell 7
@@ -113,26 +281,34 @@
 
 ### mcp-chrome
 
-- fix: Restore managed pages across Extension reloads using document identity, and serialize initialization with later state changes
-- fix: Dispatch ordinary background Extension element clicks through the existing atomic click path, including iframe targets, without a preparatory mouse move or action replay
+- fix: Restore managed pages across Extension reloads using document identity, and serialize initialization with later
+  state changes
+- fix: Dispatch ordinary background Extension element clicks through the existing atomic click path, including iframe
+  targets, without a preparatory mouse move or action replay
 - fix: Preserve iframe identity, valid script arguments and request deadlines across page operations
 - fix: Distinguish unavailable native contexts from verification-script errors and preserve the completed action state
 - fix: Return actual locator match counts and bounded candidates without unrelated window-focus suggestions
-- fix: Detect visible English and Chinese challenge content, preserve passive title waiting and native system-mouse handling, and retain existing debugger sessions on ordinary pages
-- fix: Read genuine older Extension group summaries without extra topology requests, keeping missing and malformed data distinct
-- fix: Preserve input-value redaction, native error details and document-scoped logs across successful and failed operations
+- fix: Detect visible English and Chinese challenge content, preserve passive title waiting and native system-mouse
+  handling, and retain existing debugger sessions on ordinary pages
+- fix: Read genuine older Extension group summaries without extra topology requests, keeping missing and malformed data
+  distinct
+- fix: Preserve input-value redaction, native error details and document-scoped logs across successful and failed
+  operations
 - chore: Update the Extension's Vite build dependency to 8.1.6
 
 ### mcp-ssh
 
-- feat: Add an opt-in OpenSSH backend that reuses an existing ControlMaster without opening a new authenticated connection
+- feat: Add an opt-in OpenSSH backend that reuses an existing ControlMaster without opening a new authenticated
+  connection
 - feat: Add name/time filters, entry limits, offsets and UTF-8 response-byte budgets to SFTP directory listing
 - feat: Add explicit bounded verification for individual files and directory synchronization
-- fix: Preserve transport capabilities, remote-operation state and visible errors when a requested operation is unsupported or fails
+- fix: Preserve transport capabilities, remote-operation state and visible errors when a requested operation is
+  unsupported or fails
 
 ### Publishing
 
-- ci: Add GitHub Actions Trusted Publishing with exact-commit checks, isolated OIDC permissions and validation of the selected tarballs against npm registry metadata
+- ci: Add GitHub Actions Trusted Publishing with exact-commit checks, isolated OIDC permissions and validation of the
+  selected tarballs against npm registry metadata
 - ci: Run Windows export-transaction tests before building the Rust release artifacts
 
 ---
@@ -193,32 +369,41 @@
 
 ### mcp-claude-history
 
-- feat: Add paged source catalogs, exact `sources` selection and grouped scans through MCP and CLI, with explicit catalog release
+- feat: Add paged source catalogs, exact `sources` selection and grouped scans through MCP and CLI, with explicit
+  catalog release
 - fix: Search oversized records in normal and aggregate modes while preserving filters, redaction and match counts
 - fix: Export full content independently of response previews and preserve mixed text, thinking and tool blocks
 
 ### mcp-chrome
 
-- fix: Restore managed pages across Extension reloads using document identity, and serialize initialization with later state changes
-- fix: Dispatch ordinary background Extension element clicks through the existing atomic click path, including iframe targets, without a preparatory mouse move or action replay
+- fix: Restore managed pages across Extension reloads using document identity, and serialize initialization with later
+  state changes
+- fix: Dispatch ordinary background Extension element clicks through the existing atomic click path, including iframe
+  targets, without a preparatory mouse move or action replay
 - fix: Preserve iframe identity, valid script arguments and request deadlines across page operations
 - fix: Distinguish unavailable native contexts from verification-script errors and preserve the completed action state
 - fix: Return actual locator match counts and bounded candidates without unrelated window-focus suggestions
-- fix: Detect visible English and Chinese challenge content, preserve passive title waiting and native system-mouse handling, and retain existing debugger sessions on ordinary pages
-- fix: Read genuine older Extension group summaries without extra topology requests, keeping missing and malformed data distinct
-- fix: Preserve input-value redaction, native error details and document-scoped logs across successful and failed operations
+- fix: Detect visible English and Chinese challenge content, preserve passive title waiting and native system-mouse
+  handling, and retain existing debugger sessions on ordinary pages
+- fix: Read genuine older Extension group summaries without extra topology requests, keeping missing and malformed data
+  distinct
+- fix: Preserve input-value redaction, native error details and document-scoped logs across successful and failed
+  operations
 - chore: Update the Extension's Vite build dependency to 8.1.6
 
 ### mcp-ssh
 
-- feat: Add an opt-in OpenSSH backend that reuses an existing ControlMaster without opening a new authenticated connection
+- feat: Add an opt-in OpenSSH backend that reuses an existing ControlMaster without opening a new authenticated
+  connection
 - feat: Add name/time filters, entry limits, offsets and UTF-8 response-byte budgets to SFTP directory listing
 - feat: Add explicit bounded verification for individual files and directory synchronization
-- fix: Preserve transport capabilities, remote-operation state and visible errors when a requested operation is unsupported or fails
+- fix: Preserve transport capabilities, remote-operation state and visible errors when a requested operation is
+  unsupported or fails
 
 ### Publishing
 
-- ci: Add GitHub Actions Trusted Publishing with exact-commit checks, isolated OIDC permissions and validation of the selected tarballs against npm registry metadata
+- ci: Add GitHub Actions Trusted Publishing with exact-commit checks, isolated OIDC permissions and validation of the
+  selected tarballs against npm registry metadata
 - ci: Run Windows export-transaction tests before building the Rust release artifacts
 
 ---
@@ -280,7 +465,7 @@
 - breaking: Create a unique bundle for each export and use manifest v2; consumers must use the returned output paths
 - breaking: Apply `max_total` to the final compact JSON response in UTF-8 bytes and report `serialized_bytes`
 - feat: Add process-bound incremental scan and paged `history_scan_metadata`; retain physical sources beyond normal
-  collection limits, replay the latest page, and release cancelled or completed scan state
+  collection limits, replay the latest page, and release canceled or completed scan state
 - feat: Read known nested Workflow agent sources and expose exact `source` across search, get, context, trace, and CLI
 - feat: Index oversized records for scan, Unicode ranges, tool input/result views, and local context/trace windows;
   structured previews carry exact get pointers and explicit full requests retain their contract
@@ -328,8 +513,8 @@
   incomplete window observation without replaying updates
 - fix: Return group members and native tab properties in both flat and window-grouped list views; group membership and
   cached MCP window IDs no longer confer page authority
-- fix: Reject unsupported inactive-tab updates and popup multi-page creation before changes, preserve known preflight
-  rejection state and valid revisions, and keep new groups in their members' window unless explicitly moved
+- fix: Reject unsupported inactive-tab updates and popup creation with multiple pages before changes, preserve known
+  preflight rejection state and valid revisions, and keep new groups in their members' window unless explicitly moved
 - feat: Add `expectedUrl` and `expectedRevision` checks to page actions and return `pageContext` with the affected
   target and before/after state
 - fix: Preserve created-page IDs and actual managed state after partial creation failures; report unknown outcomes
@@ -473,13 +658,14 @@
 - breaking: `closePage` 必须显式传 `targetId`，选择目标不授予已有用户页面的访问权限
 - fix: 显式 adopt 后恢复完整受控能力，release 保留分组并撤销权限，浏览器阻止采集/debugger 清理时明确返回提示
 - fix: Service Worker 重启后恢复本 Extension 已有的 debugger 连接，不接管其他调试器，保留并发附加与清理状态
-- fix: 旧 Extension 缺少页面快照时保留无条件页面操作，返回实时 URL 和 revision 不可用提示，不支持的原子页面条件在派发前拒绝，evaluate 和 input 的顶层状态与错误上下文保持未开始状态
+- fix: 旧 Extension 缺少页面快照时保留无条件页面操作，返回实时 URL 和 revision 不可用提示，不支持的原子页面条件在派发前拒绝，evaluate
+  和 input 的顶层状态与错误上下文保持未开始状态
 - fix: 无 Server 扫描和重连消息使用 debug，已识别的认证、协议错误仍输出去重 warning
 - fix: 忽略只有尺寸相似的无关元素，Linux 原生点击使用 client 窗口几何与 GTK frame extents，工具缺失或视口不符时拒绝点击
 - feat: 公开原生页面更新、分组成员/名称/颜色/折叠/移动和窗口更新，支持原生创建参数、同时移入已有页并新建 URL 页面，分别记录创建来源
 - fix: normal 状态恢复完成后再应用窗口几何，返回稳定的浏览器观测值，观察未完成时明确报告，不重放更新动作
 - fix: 平铺目标与窗口列表回显分组成员和原生 tab 属性，分组归属及缓存的 MCP window ID 不赋予页面权限
-- fix: 不支持的活动页停用与 popup 多页面创建在变更前拒绝，保留明确未执行状态及有效 revision，新组默认保留成员原窗口，显式指定时才跨窗移动
+- fix: 在变更前拒绝停用活动页、在 popup 中创建多个页面等不支持的操作，保留明确未执行状态及有效 revision，新组默认保留成员原窗口，显式指定时才跨窗移动
 - feat: 页面动作支持 `expectedUrl` 和 `expectedRevision`，`pageContext` 返回实际目标及动作前后状态
 - fix: 创建部分失败后保留新页面 ID 和实际受控状态，未知结果不指向旧默认页，不自动重复创建
 - feat: 通过 MCP 授予和撤销普通读取权限，限定服务器实例、文档、URL 和 revision；页面管理或导航被权限拒绝时保留有效只读授权
@@ -1223,7 +1409,7 @@
 
 ### mcp-claude-history
 
-- fix: `history_get --output` 对齐同样的受控临时目录策略和显式 `cwd:` 前缀行为
+- fix: `history_get --output` 使用相同的受控临时目录策略和显式 `cwd:` 前缀规则
 - docs: 同步更新 README 和 TESTING 中的 temp-first 导出说明
 
 ### mcp-ssh
@@ -1505,7 +1691,7 @@
 - fix: RegExp safety — detect catastrophic backtracking patterns + limit input length
 - fix: Replace selection polling with state confirmation before setRangeText
 - fix: Text traversal limits for select/replace (10K nodes / 500KB)
-- fix(CVE-2026-25536): Upgrade @anthropic-ai/sdk to 1.27.1
+- fix (CVE-2026-25536): Upgrade @anthropic-ai/sdk to 1.27.1
 - docs: Fix README_zh.md table formatting and code block syntax
 - test: Add select/replace test coverage
 
@@ -1517,7 +1703,7 @@
 
 ### mcp-ssh
 
-- fix(CVE-2026-25536): Upgrade @anthropic-ai/sdk to 1.27.1
+- fix (CVE-2026-25536): Upgrade @anthropic-ai/sdk to 1.27.1
 
 ### Other
 
@@ -1543,7 +1729,7 @@
 - fix: RegExp 安全——检测灾难性回溯模式 + 限制输入长度
 - fix: replace 选区轮询确认后再执行替换
 - fix: select/replace 文本遍历加上限（10K 节点 / 500KB）
-- fix(CVE-2026-25536): 升级 @anthropic-ai/sdk 到 1.27.1
+- fix (CVE-2026-25536): 升级 @anthropic-ai/sdk 到 1.27.1
 - docs: 修复中文 README 表格格式和代码块语法
 - test: 补充 select/replace 测试覆盖
 
@@ -1555,7 +1741,7 @@
 
 ### mcp-ssh
 
-- fix(CVE-2026-25536): 升级 @anthropic-ai/sdk 到 1.27.1
+- fix (CVE-2026-25536): 升级 @anthropic-ai/sdk 到 1.27.1
 
 ### 其他
 
@@ -1580,7 +1766,7 @@
 ### mcp-chrome
 
 - feat: Add select/replace input events for text selection and replacement via mouse simulation
-- feat: Add find() CDP fallback when Extension is not connected
+- feat: Add find () CDP fallback when Extension is not connected
 - feat: Add keyboard combo example (Ctrl+A) in input tool description
 - fix: Filter quality param for png format in Page.captureScreenshot (GPT review P0)
 - fix: Remove unsafe SSRF-prone URL fetch in extract tool (GPT review P0)
@@ -1615,7 +1801,7 @@
 ### mcp-chrome
 
 - feat: 新增 select/replace 输入事件，通过鼠标模拟实现文本选中和替换
-- feat: Extension 未连接时 find() 自动回退到 CDP 模式
+- feat: Extension 未连接时 find () 自动回退到 CDP 模式
 - feat: input 工具描述新增组合键示例（Ctrl+A）
 - fix: 修复 png 格式截图错误传递 quality 参数的问题（GPT 评审 P0）
 - fix: 移除 extract 工具中存在 SSRF 风险的 URL 抓取逻辑（GPT 评审 P0）
@@ -1686,20 +1872,20 @@
 ### mcp-chrome
 
 - feat: Add select/replace event types for text selection and replacement via mouse simulation
-- feat: Add find() CDP fallback when Extension is not connected
+- feat: Add find () CDP fallback when Extension is not connected
 - feat: Add combo key example (Ctrl+A) to input tool description
 
 ### mcp-claude-history
 
 - fix: Search agent sessions in subagents/ directory
 - fix: Add sessions filter to subagents branch
-- refactor: Extract Config::list_project_dirs() to deduplicate directory traversal
+- refactor: Extract Config::list_project_dirs () to deduplicate directory traversal
 
 ### mcp-ssh
 
 - refactor: Split SessionManager into PtyManager + ForwardManager (975 → 645+211+257 lines)
 - fix: Reconnect storm caused by close event triggering recursive auto-reconnect
-- fix: disconnect() now cleans up PTY sessions and port forwards
+- fix: disconnect () now cleans up PTY sessions and port forwards
 - fix: Add connection diagnostics with actionable suggestions
 - fix: Add client identity check in error/close events
 
@@ -1716,20 +1902,20 @@
 ### mcp-chrome
 
 - feat: 新增 select/replace 事件类型，通过鼠标模拟实现文本选中和替换
-- feat: 新增 find() CDP fallback（Extension 未连接时可用）
+- feat: 新增 find () CDP fallback（Extension 未连接时可用）
 - feat: input 工具描述新增组合键示例（Ctrl+A）
 
 ### mcp-claude-history
 
 - fix: 搜索 subagents/ 目录下的 agent session 文件
 - fix: subagents 分支补齐 sessions 过滤
-- refactor: 提取 Config::list_project_dirs() 消除重复代码
+- refactor: 提取 Config::list_project_dirs () 消除重复代码
 
 ### mcp-ssh
 
 - refactor: SessionManager 拆分为 PtyManager + ForwardManager（975 → 645+211+257 行）
 - fix: 修复 reconnect 导致 close 事件递归重连风暴
-- fix: disconnect() 现在清理关联的 PTY 会话和端口转发
+- fix: disconnect () 现在清理关联的 PTY 会话和端口转发
 - fix: 连接失败增加诊断信息和排查建议
 - fix: error/close 事件增加 client 身份校验
 
@@ -2035,7 +2221,7 @@ npm install -g @pyrokine/mcp-chrome
 
 - fix: Tighten roots/list response check to exact request ID
 - fix: Ensure project ID always starts with dash
-- fix: Sync serverInfo.version with Cargo.toml
+- fix: Sync `serverInfo.version` with `Cargo.toml`
 - fix: Treat datetime without timezone as local time
 - docs: Document datetime timezone behavior
 

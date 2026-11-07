@@ -6,13 +6,19 @@ MCP servers and skills for Claude Code.
 
 ## Tools
 
-| Tool                                           | Type       | Description                                                                   |
-| ---------------------------------------------- | ---------- | ----------------------------------------------------------------------------- |
-| [mcp-claude-history](./mcp-claude-history)     | MCP Server | Search, inspect, and export conversation history                              |
-| [mcp-chrome](./mcp-chrome)                     | MCP Server | Chrome browser automation through Extension or CDP                            |
-| [mcp-ssh](./mcp-ssh)                           | MCP Server | SSH connections, command execution, and file transfers                        |
-| [skill-cc-session-fix](./skill-cc-session-fix) | Skill      | Diagnose and repair session JSONL files for resume failures and wrong anchors |
-| [skill-elenchus](./skill-elenchus)             | Skill      | Multi-perspective dialectical analysis for code review and reasoning          |
+| Tool                   | Type       | Description                                                                   |
+| ---------------------- | ---------- | ----------------------------------------------------------------------------- |
+| [mcp-claude-history]   | MCP Server | Search, inspect, and export conversation history                              |
+| [mcp-chrome]           | MCP Server | Chrome browser automation through Extension or CDP                            |
+| [mcp-ssh]              | MCP Server | SSH connections, command execution, and file transfers                        |
+| [skill-cc-session-fix] | Skill      | Diagnose and repair session JSONL files for resume failures and wrong anchors |
+| [skill-elenchus]       | Skill      | Evidence-led diff, snapshot and design review; bounded independent analysis   |
+
+[mcp-claude-history]: ./mcp-claude-history
+[mcp-chrome]: ./mcp-chrome
+[mcp-ssh]: ./mcp-ssh
+[skill-cc-session-fix]: ./skill-cc-session-fix
+[skill-elenchus]: ./skill-elenchus
 
 ## Installation
 
@@ -50,13 +56,34 @@ Each subdirectory README includes source build instructions and client-specific 
 
 ## Module versions
 
-| Module             | Version | Changes                                                                                                                                                                                |
-| ------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| mcp-claude-history | 2.1.1   | Indexed large-record search, paged source catalogs, full-content exports, precise source recovery, and Windows history-path/private-export fixes                                                                                  |
-| mcp-chrome         | 3.0.1   | Hidden-field value protection, middle-button events, focus-only editing commands, target/frame/deadline corrections, action-scoped window/group controls, and backend capability fixes |
-| mcp-ssh            | 3.1.0   | Existing OpenSSH master reuse, explicit file verification, filtered directory pages, and SFTP/output corrections                                                                       |
+- mcp-claude-history 2.2.0: Session titles, exact large-history search, paged source catalogs, full-content exports,
+  precise source recovery, and private output bundles
 
-OpenSSH reuse is opt-in with `ssh_connect(backend="openssh", configHost="myserver")`; default ssh2 behavior remains.
+- mcp-chrome 3.1.0: Local file uploads, hidden-field value protection, middle-button events, focus-only editing
+  commands, task page controls, Cloudflare completion checks, open Shadow DOM and nested frames, browser dialogs,
+  original response/download capture, request routing, scoped HTTP authentication, and WebSocket/SSE observation
+
+- mcp-ssh 3.2.0: Interpreter arguments and transfer progress, with OpenSSH master reuse, explicit file verification,
+  filtered directory pages, and SFTP/output corrections
+
+- skill-elenchus 1.2.0: Diff, snapshot and design scopes, evidence levels, and shared review budgets
+
+Use `taskHint` and `note` when creating a Chrome task page. Extension task groups retain their names and creation
+records across reloads; list existing pages before creating another. Default page creation uses an existing window in
+the background. At task end, close only pages created for that task and explicitly intended to be temporary; retain
+user pages and reusable output.
+
+Use `input` with `{type:"upload", target:{css:"input[type=file]"}, files:["./review.zip"]}` to select local files in
+Extension or CDP mode. Paths belong to the MCP Server machine; `files:[]` clears the selection. The combined file
+size must be below 50 MiB. See the [upload examples](./mcp-chrome/README.md#upload-local-files) for site verification.
+
+Use `manage` to prepare dialog, download or network observation, then use the references returned by `logs` to handle
+that dialog, save the original attachment, or read the same request's body. Request routing and HTTP authentication
+stay scoped to the controlled page. See [browser events](./mcp-chrome/README.md#browser-events-and-original-files).
+
+OpenSSH reuse is opt-in with `ssh_connect(backend="openssh", configHost="myserver")`. The default ssh2 backend uses
+known-host records: an unknown host is recorded before authentication, while a changed or revoked key is rejected.
+Pre-provision a trusted record when the first connection requires an independently verified identity.
 `ssh_sync(verify={sha256: true})` verifies a regular file as well as a directory, with separate transfer and
 verification results. `ssh_list_dir` supports name/time filters and explicit item/byte budgets, without truncating
 internal synchronization listings. Use `history_search(mode="sources")` to page source groups before scanning, and
@@ -67,8 +94,9 @@ behavior.
 
 Module versions are independent of the repository release tag.
 
-- **mcp-chrome 3.0**: `manage(action="closePage")` requires `targetId`. Adopt existing browser tabs before operating on
-  them; explicit adopt grants full managed access, while `targetId` alone does not. Native page/window/group
+- **mcp-chrome 3.0**: `manage(action="closePage")` requires `targetId`. Use `grantReadAccess` for ordinary reads of user
+  pages, or `adoptPage` for authorized changes; explicit adopt grants full managed access, while `targetId` alone does
+  not. Native page/window/group
   configuration and group membership/state are available through `manage` and `browse list`. Relative output paths use
   session-owned `tmp:` storage; use `cwd:` for persistent output.
 - **mcp-ssh 3.0**: `maxOutputSize` and PTY `bufferSize` measure raw UTF-8 bytes. Apply byte budgets when consuming
@@ -81,6 +109,17 @@ Module versions are independent of the repository release tag.
   explicitly report incomplete coverage.
 
 See the module READMEs for parameter contracts and migration examples.
+
+## Review and validation
+
+`/elenchus mode=full .` reviews the repository snapshot even when there is no diff; `mode=diff` retains change review,
+and `mode=design` assesses a proposal. Reports distinguish runtime evidence, source support and conditions needing
+validation. See [Elenchus](./skill-elenchus) for coverage records and shared review budgets.
+
+The [cross-platform workflow](./.github/workflows/windows-tests.yml) checks Ubuntu, Windows and macOS, including Node.js
+20.19.0, Rust 1.88 and the Python session-repair fixtures. Release and npm authentication jobs require these checks for
+the same workflow commit. This automated gate complements the module regression guides and current release
+authorization.
 
 ## npm publishing for maintainers
 

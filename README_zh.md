@@ -6,13 +6,19 @@ Claude Code 的 MCP Server 和 Skill 工具集
 
 ## 工具列表
 
-| 工具                                           | 类型       | 功能                                              |
-| ---------------------------------------------- | ---------- | ------------------------------------------------- |
-| [mcp-claude-history](./mcp-claude-history)     | MCP Server | 搜索、查看和导出对话历史                          |
-| [mcp-chrome](./mcp-chrome)                     | MCP Server | 通过 Extension 或 CDP 操作 Chrome 浏览器          |
-| [mcp-ssh](./mcp-ssh)                           | MCP Server | SSH 连接、命令执行和文件传输                      |
-| [skill-cc-session-fix](./skill-cc-session-fix) | Skill      | 诊断并修复 session JSONL 的 resume 失败与恢复错位 |
-| [skill-elenchus](./skill-elenchus)             | Skill      | 用于代码评审和推理的多视角辩证分析                |
+| 工具                   | 类型       | 功能                                               |
+| ---------------------- | ---------- | -------------------------------------------------- |
+| [mcp-claude-history]   | MCP Server | 搜索、查看和导出对话历史                           |
+| [mcp-chrome]           | MCP Server | 通过 Extension 或 CDP 操作 Chrome 浏览器           |
+| [mcp-ssh]              | MCP Server | SSH 连接、命令执行和文件传输                       |
+| [skill-cc-session-fix] | Skill      | 诊断并修复 session JSONL 的 resume 失败与恢复错位  |
+| [skill-elenchus]       | Skill      | 按证据评审差异、完整快照和方案，独立分析有明确预算 |
+
+[mcp-claude-history]: ./mcp-claude-history
+[mcp-chrome]: ./mcp-chrome
+[mcp-ssh]: ./mcp-ssh
+[skill-cc-session-fix]: ./skill-cc-session-fix
+[skill-elenchus]: ./skill-elenchus
 
 ## 安装
 
@@ -50,13 +56,26 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ## 子模块版本
 
-| 模块               | 版本  | 功能变化                                                                                                  |
-| ------------------ | ----- | --------------------------------------------------------------------------------------------------------- |
-| mcp-claude-history | 2.1.1 | 大记录索引搜索、来源目录分页、全文导出、精确来源恢复与 Windows 历史路径／私有导出修复                                                      |
-| mcp-chrome         | 3.0.1 | 隐藏字段值保护、中键事件、编辑命令仅聚焦、目标／frame／期限修正、按操作对象管理窗口／分组与双后端能力修正 |
-| mcp-ssh            | 3.1.0 | 复用已有 OpenSSH master、显式文件校验、目录筛选分页与 SFTP/输出修正                                       |
+- mcp-claude-history 2.2.0：会话名称、大规模历史精确检索、来源目录分页、全文导出、精确来源恢复与私有导出目录
 
-通过 `ssh_connect(backend="openssh", configHost="myserver")` 显式选择已有主连接复用，默认 ssh2 行为保留
+- mcp-chrome 3.1.0：本地文件上传、字段值保护、任务页面管理、Cloudflare 完成状态、open Shadow DOM 与嵌套 frame、对话框、原响应与下载收件、请求控制、限定范围的 HTTP 认证及 WebSocket/SSE 观察
+
+- mcp-ssh 3.2.0：解释器独立参数、传输进度、已有 OpenSSH master 复用、显式文件校验、目录筛选分页与 SFTP/输出修正
+
+- skill-elenchus 1.2.0：差异、完整快照和设计范围，证据分级与共享评审预算
+
+创建 Chrome 任务页面时使用 `taskHint` 和 `note`，Extension 任务分组跨重载保留名称和创建来源，新建前查看并复用已有页
+默认在已有窗口后台创建页面，任务结束后仅关闭明确为本任务创建的临时页，保留用户页面和可复用产物
+
+使用 `input` 的 `{type:"upload", target:{css:"input[type=file]"}, files:["./review.zip"]}` 在 Extension 或 CDP 模式选择本地文件
+路径属于 MCP Server 所在机器，`files:[]` 清空选择，文件总大小须低于 50 MiB，站点收件验证见[上传示例](./mcp-chrome/README_zh.md#上传本地文件)
+
+用 `manage` 准备对话框、下载或网络观察，再按 `logs` 返回的引用处理对应弹窗、保存原附件或读取同一次请求的正文
+请求控制与 HTTP 认证限定在受控页面，见[浏览器事件与原文件](./mcp-chrome/README_zh.md#浏览器事件与原文件)
+
+通过 `ssh_connect(backend="openssh", configHost="myserver")`
+显式选择已有主连接复用，默认 ssh2 后端使用 known-host 信任记录：未知主机在认证前记录，变化或撤销的 key
+明确拒绝；首次连接需要独立身份保证时，预置信任记录
 `ssh_sync(verify={sha256: true})` 支持普通文件和目录，传输结果与校验结果分开报告
 
 `ssh_list_dir` 支持名称／时间筛选与显式条数／字节预算，内部同步目录清单保持完整；使用 `history_search(mode="sources")`
@@ -66,8 +85,8 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 子模块版本独立于仓库的 Release tag
 
-- **mcp-chrome 3.0**：`manage(action="closePage")` 必须指定 `targetId`，操作已有浏览器页面前需 adopt；仅指定 `targetId`
-  不授予权限，显式 adopt 后获得完整受控能力，`manage` 和 `browse list`
+- **mcp-chrome 3.0**：`manage(action="closePage")` 必须指定 `targetId`，用户页面的普通读取使用 `grantReadAccess`，
+  已授权修改使用 `adoptPage`；仅指定 `targetId` 不授予权限，显式 adopt 后获得完整受控能力，`manage` 和 `browse list`
   支持原生页面、窗口、分组配置与成员状态，相对输出路径使用本会话所有的 `tmp:` 目录，持久输出使用 `cwd:`
 - **mcp-ssh 3.0**：`maxOutputSize` 和 PTY `bufferSize`
   按原始 UTF-8 字节计量，消费输出时按字节设置预算并检查截断信息；PTY raw 读取返回清理前的计数
@@ -79,20 +98,30 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 参数合同和迁移示例见各模块 README
 
+## 评审与验证
+
+`/elenchus mode=full .` 在没有 diff 时仍评审仓库快照，`mode=diff` 保留改动评审，`mode=design`
+用于方案判断，报告区分实际运行、源码支持与需要验证的条件，覆盖记录和共享审查预算见 [Elenchus](./skill-elenchus)
+
+[跨平台工作流](./.github/workflows/windows-tests.yml) 覆盖 Ubuntu、Windows 和 macOS，包含 Node.js 20.19.0、Rust
+1.88 及 Python 会话修复夹具，Release 和 npm 认证任务依赖同一次工作流提交的这些检查，自动门禁与各模块回归指导及当次发布授权共同使用
+
 ## 维护者 npm 发布
 
 默认 npm 发版入口为 GitHub Actions 的
-[npm Trusted Publishing 工作流](./.github/workflows/npm-publish.yml)，GitHub 每次通过 OIDC 自动取得短期 npm 凭证，无需手动创建、续期或粘贴 npm
+[npm Trusted Publishing 工作流](./.github/workflows/npm-publish.yml)，GitHub 每次通过 OIDC 自动取得短期 npm
+凭证，无需手动创建、续期或粘贴 npm
 token，本机 token 到期不影响这条发布路径
 
 `@pyrokine/mcp-chrome` 和 `@pyrokine/mcp-ssh` 已分别配置 Trusted Publisher：GitHub owner 为 `Pyrokine`，仓库为
-`claude-tools`，workflow 文件名为 `npm-publish.yml`，环境为 `npm-publish` Trusted
-Publisher 和环境绑定属于一次性配置，仅在配置变化时维护，不列为每次发版步骤允许直接发布，无需另行授予 dist-tag 管理权限，GitHub 环境的部署分支必须仅允许
-`main`
+`claude-tools`，workflow 文件名为 `npm-publish.yml`，环境为 `npm-publish`
+
+Trusted Publisher 和环境绑定属于一次性配置，仅在配置变化时维护，不列为每次发版步骤；
+权限设置允许直接发布，无需另行授予 dist-tag 管理权限；GitHub 环境的部署分支必须仅允许 `main`
 
 从 `main` 手动运行工作流，将 `expected_commit` 设置为已经批准的完整 commit SHA，`publish_chrome` 和 `publish_ssh`
 默认均为 `false`，此时只构建、检查两个包并验证 GitHub 到 npm 的真实 OIDC token 交换，不发布版本，也不需要配置
-`NPM_TOKEN` secret 构建 job 没有 OIDC 发布权限，认证 job 核对打包制品，不执行包的生命周期脚本
+`NPM_TOKEN` secret；构建 job 没有 OIDC 发布权限，认证 job 核对打包制品，不执行包的生命周期脚本
 
 将 `APPROVED_FULL_SHA` 替换为当次批准的完整 SHA，执行以下命令只验证、不发布：
 
@@ -107,6 +136,8 @@ gh workflow run npm-publish.yml \
 
 本机直接执行 `npm publish` 属于单独明确授权的操作，仍需本机 npm 鉴权
 
-正式发版前，完成各模块回归指导、包内容检查和当次发版授权，再仅开启已经批准发布的模块开关工作流发布已核对的 tarball，并验证 registry 的
-`gitHead`、integrity 和 `latest`，不会创建仓库 tag 或 GitHub Release npm 发布及验证完成后再创建仓库 release
-tag，发布或 registry 验证失败时，先检查 registry 中的实际版本，再决定重试，工作流失败不代表版本尚未发布
+正式发版前，完成各模块回归指导、包内容检查和当次发版授权，再仅开启已经批准发布的模块开关；
+工作流发布已核对的 tarball，并验证 registry 的 `gitHead`、integrity 和 `latest`，不会创建仓库 tag 或 GitHub Release
+
+npm 发布及验证完成后再创建仓库 release tag；发布或 registry 验证失败时，先检查 registry 中的实际版本，再决定重试，
+失败工作流的实际发布状态以 registry 查询结果为准
