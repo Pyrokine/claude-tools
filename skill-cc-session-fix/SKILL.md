@@ -1,95 +1,88 @@
 ---
 name: cc-session-fix
-description: 修复 Claude Code session jsonl 问题 — /resume 失败、resume 后上下文错位、jsonl 过大、resume cancelled、/compact 报 Invalid signature in thinking block，诊断 uuid 链、compact_boundary、resume leaf 选择，安全截断并补 custom-title，当用户说 resume 失败、resume 恢复错位、jsonl 太大、resume 卡住、compact 失败、thinking block 签名错误时使用
+description: >-
+  修复 Claude Code session jsonl 问题 — /resume 失败、resume 后上下文错位、jsonl 过大、resume cancelled、/compact 报 Invalid signature in
+  thinking block，诊断 uuid 链、compact_boundary、resume leaf 选择，安全截断并补 custom-title，当用户说 resume 失败、resume 恢复错位、jsonl
+  太大、resume 卡住、compact 失败、thinking block 签名错误时使用
 argument-hint: "[session-id or path]"
 ---
 
-Claude Code session jsonl 诊断与修复工具，处理 /resume 失败、上下文错位、文件过大等问题
+Claude Code session JSONL 诊断与修复工具，处理 `/resume` 失败、上下文错位、文件过大和 thinking 签名错误
 
 ## 脚本
 
-- **[scripts/diagnose.py](scripts/diagnose.py)** — 诊断 jsonl:文件大小、行数、uuid 链完整性、compact_boundary 位置、resume
-  leaf 推断、截断建议
-- **[scripts/truncate.py](scripts/truncate.py)** — 安全截断:自动备份、截到 N 行、补 custom-title、验证 uuid 链;支持
-  `--new-session` 生成新 UUID 保留原文件
+- **[scripts/diagnose.py](scripts/diagnose.py)**：文件大小、物理行数、uuid 链、compact_boundary、resume
+  leaf 推断和截断建议
+- **[scripts/truncate.py](scripts/truncate.py)**：截到 N 行、删除 thinking
+  block、追加 custom-title、验证最终 JSONL 和 uuid 链；`--new-session` 生成新 UUID，保留原文件
+- `scripts/session_io.py` 为两个入口共享的标准库实现，无需安装依赖
 
 ## 典型流程
 
 ```bash
-# 1. 诊断，target 可以是完整路径或 session-id 前缀(自动在 ~/.claude/projects/ 下找)
-scripts/diagnose.py <session-id-or-path>
+# 1. target 可以是文件路径、完整 session id 或前缀
+python3 scripts/diagnose.py <session-id-or-path>
 
-# 2. 如输出 "Recommend: truncate to L<N>",先 dry-run 预览
-scripts/truncate.py <target> --line <N> --title "..." --dry-run
+# 指定 project 后，完整 id 和前缀查询都只在该项目中进行
+python3 scripts/diagnose.py <session-id-prefix> --project <project-hash>
 
-# 3. 确认无误后正式执行(会自动备份 .bak.<时间戳>)
-scripts/truncate.py <target> --line <N> --title "..."
+# 2. 如输出 Recommend: truncate to L<N>，预览保留与删除范围
+python3 scripts/truncate.py <target> --line <N> --title "..." --dry-run
 
-# 可选:保留原文件(例如用于 MCP 历史检索),生成新 UUID 到新文件
-scripts/truncate.py <target> --line <N> --new-session --title "..."
+# 3. 停止所有向该会话写入的 Claude Code 进程后，原地修复
+python3 scripts/truncate.py <target> --line <N> --title "..."
+
+# 活跃会话或需要保留原文件用于 MCP 历史检索时，生成新 UUID 文件
+python3 scripts/truncate.py <target> --line <N> --new-session --title "..."
 ```
+
+显式文件路径优先于 id 查询；多个候选会报错，请改用完整 id 或路径
 
 ## 使用场景
 
-1. **/resume 失败 / Cancelled** — diagnose 看文件大小和 uuid 链，>100MB 可能就是大小问题;dangling parentUuid >0 是链断裂问题
-2. **resume 恢复到错的历史点** — diagnose 看 `Resume leaf` 是否比 `Dialog tail` 晚但是 system 类型，是 → 截断到 dialog
-   tail
-3. **session 列表里消失** — 可能是 [Issue #25920](https://github.com/anthropics/claude-code/issues/25920) 首条 user >
-   15KB 触发 head-read bug，truncate 会自动补 custom-title 绕过
-4. **文件太大打开慢** — 截断到最近 1 万行以内 (经验上限,更多会再触发 /compact)
-5. **/compact 报 `Invalid signature in thinking block`** — 两种情况：
-    - 签名为空字符串：CPA 等代理将 GPT 接入 CC，GPT 返回的 thinking block 没有有效签名
-    - 签名存在但无效：oneapi/Bedrock 代理的 API key 和生成 thinking 时的 key 不一致，签名校验失败
+1. **`/resume` 失败或 Cancelled**：查看文件大小和 uuid 链，>100MB 时检查大小问题，dangling
+   parentUuid >0 表示链存在外部引用
+2. **resume 恢复到错误历史点**：比较 `Resume leaf` 和 `Dialog tail`；链有效且无分支歧义、截断范围保留完整父链和后写入对话时，非对话
+   leaf 晚超过 5 分钟才建议截到 dialog tail
+   对话按实际时刻比较，同刻选择物理位置较后的记录，UUID 环、重复 UUID、混合时区或时间回退会提示复核
+   候选检查覆盖所有有效物理行：后写入的对话缺少时间戳时停止建议，没有 UUID 的保留行也检查父引用，报告实际相关行号；普通无时间戳
+   system 元数据仍合法
+3. **session 从列表消失**：[Issue #25920](https://github.com/anthropics/claude-code/issues/25920) 的首条 user >15KB
+   head-read 问题可通过末尾 custom-title 处理
+4. **文件太大或打开慢**：约 1 万行是经验参考，保留范围仍由诊断和实际需要决定
+5. **`/compact` 报
+   `Invalid signature in thinking block`**：CPA 等代理将 GPT 接入 CC 时会出现空签名；oneapi/Bedrock 代理在生成与校验使用不同
+   API
+   key 时会出现无效签名
 
-   修复：删除所有 thinking block（不只是空签名的），thinking 内容是内部推理，删除不影响对话继续
+    删除所有 thinking block，保留 text、tool_use、tool_result 和其他记录字段，仅清理 thinking 时保留已有标题，显式
+    `--title` 才会追加新标题，使用同一 CLI 预览和写入
 
-   ```python
-   import json
-   import os
-   import shutil
-   import sys
-   import time
+    ```bash
+    python3 scripts/truncate.py <target> --strip-thinking --dry-run
+    # 停止所有写者后原地修复，或加 --new-session 保留原文件
+    python3 scripts/truncate.py <target> --strip-thinking
+    python3 scripts/truncate.py <target> --strip-thinking --new-session
+    ```
 
+## 安全与恢复
 
-   def strip_thinking_blocks(path):
-       out = path + '.fixed'
-       removed = 0
-       with open(path) as fin, open(out, 'w') as fout:
-           for line in fin:
-               if not line.strip():
-                   fout.write(line)
-                   continue
-               try:
-                   obj = json.loads(line)
-                   content = obj.get('message', {}).get('content', [])
-                   if isinstance(content, list):
-                       new_content = [
-                           block for block in content
-                           if not (isinstance(block, dict) and block.get('type') == 'thinking')
-                       ]
-                       removed += len(content) - len(new_content)
-                       obj['message']['content'] = new_content
-                       fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
-                       continue
-               except Exception as exc:
-                   print(f'warn: {exc}', flush=True)
-               fout.write(line)
-       os.replace(out, path)
-       return removed
+- 原地修复保留唯一的 `.bak.<随机标识>` 备份；POSIX 备份是原 inode 的独占硬链接，Windows 使用
+  `ReplaceFileW`，备份位于同名私有目录内
+- 读取及提交前检查源文件身份和变化，检测到变化就拒绝覆盖；停止写者仍是原地修复的前提，最后检查窗口内向旧 inode 的追加可在备份中恢复
+- 缺少安全原地发布原语时会报错，改用
+  `--new-session`；该入口独占创建新目标，写入失败时原文件保留，错误和私有失败文件位置会明确输出
+- 原地操作后按输出的 `Backup` 路径检查原记录；恢复前停止所有写者，确认备份内容后恢复目标路径
+- 新文件、暂存文件和失败文件按私有权限创建，POSIX 为 `0600`，Windows 使用受保护的当前账户/SYSTEM
+  DACL；备份保留原文件的访问控制
+- 显式读取和写入 UTF-8，坏字节带物理行号报错，原文件保留；诊断继续检查后续行
+- 诊断报告坏 JSON、非对象记录和错误字段类型；修复会列出 retained/removed 范围，保留范围内包含这些无效记录时拒绝写入，选中删除的异常尾行会明确提示
+- UUID 环和重复记录令 health=needs_review，显式 --line 写入前提示保留范围的链异常；最终输出逐物理行验证并保留 LF 分隔
+- 缺少 leaf 或 dialog anchor 且未发现其他异常时显示 unknown，无截断建议不等于健康
+- `--dry-run` 不创建会话、备份或暂存文件
 
+## 参考与回归
 
-   path = sys.argv[1]
-   shutil.copy2(path, f"{path}.bak.{time.strftime('%Y%m%d%H%M%S')}")
-   print(f'removed {strip_thinking_blocks(path)} thinking blocks')
-   ```
-
-## 细节参考
-
-- [references/mechanism.md](references/mechanism.md) — jsonl 结构、/compact 行为、CC resume 选 leaf 的实际逻辑
-- [references/known-issues.md](references/known-issues.md) — 相关 GitHub issue 清单
-
-## 安全
-
-- truncate.py 默认原地覆盖前会写 `.bak.<YYYYMMDDHHMMSS>` 备份
-- `--dry-run` 先预览,不写任何文件
-- 所有操作前都会验证 uuid 链,报告 dangling 数量
+- [references/mechanism.md](references/mechanism.md)：JSONL 结构、`/compact` 行为与 leaf 推断
+- [references/known-issues.md](references/known-issues.md)：相关 GitHub issue
+- [TESTING.md](TESTING.md)：仅使用隔离 HOME 和合成会话的回归用例

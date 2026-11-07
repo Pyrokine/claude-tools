@@ -6,8 +6,9 @@ Session jsonl 和 /resume 的相关 issue,按场景分组，修复前先查是�
 
 ### [Issue #22566 — Session JSONL 截断恢复标准做法](https://github.com/anthropics/claude-code/issues/22566)
 
-在 `cd` 之后 assistant 响应停止持久化,但用户消息继续写入，`--resume` 从 cd 之后任何点都加载失败,只有截断到 cd 之前最后完整
-turn 才能恢复 **Workaround**:`head -n <LAST_GOOD_LINE>`,即 `scripts/truncate.py` 核心逻辑
+在 `cd` 之后 assistant 响应停止持久化,但用户消息继续写入，`--resume`
+从 cd 之后任何点都加载失败,只有截断到 cd 之前最后完整 turn 才能恢复 **Workaround**:`head -n <LAST_GOOD_LINE>`,即
+`scripts/truncate.py` 核心逻辑
 
 ### [Issue #22526 — parentUuid 链包含 phantom 引用](https://github.com/anthropics/claude-code/issues/22526)
 
@@ -20,8 +21,8 @@ resume 写入的 `file-history-snapshot` 条目 messageId 复用原 message 的 
 
 ### [Issue #33651 — SubAgent progress chain 覆盖主对话](https://github.com/anthropics/claude-code/issues/33651)
 
-SubAgent 的 progress 消息 flush 晚于主对话,时间戳反而更新，resume 只保留 progress chain,主对话消息"静默消失"(报告中 28 条
-assistant 消息丢失)
+SubAgent 的 progress 消息 flush 晚于主对话,时间戳反而更新，resume 只保留 progress
+chain,主对话消息"静默消失"(报告中 28 条 assistant 消息丢失)
 
 ## Resume 卡死 / 超时
 
@@ -42,15 +43,16 @@ assistant 消息丢失)
 
 ### [Issue #30302 — 多天 session + 207 subagent 文件让 resume 崩溃](https://github.com/anthropics/claude-code/issues/30302)
 
-主 transcript 仅 12MB,但 207 个 subagent 文件累计 107MB，Resume 可能 eagerly stat + parse 全部 subagent,含 base64 图片的
-subagent 直接爆内存
+主 transcript 仅 12MB,但 207 个 subagent 文件累计 107MB，Resume 可能 eagerly stat +
+parse 全部 subagent,含 base64 图片的 subagent 直接爆内存
 
 ## Session 列表里消失
 
 ### [Issue #25920 — 首条 user > 15KB 让 session "找不到"](https://github.com/anthropics/claude-code/issues/25920)
 
-Session metadata 解析器硬编码只读文件前 16KB，首条非 system user message >15KB 时 firstPrompt 取不到,session 过滤器返回
-null,session picker 和 `--resume <uuid>` 都找不到 **Workaround**:在 jsonl 尾部注入 custom-title:
+Session metadata 解析器硬编码只读文件前 16KB，首条非 system user
+message >15KB 时 firstPrompt 取不到,session 过滤器返回 null,session picker 和 `--resume <uuid>` 都找不到 **Workaround**:
+在 jsonl 尾部注入 custom-title:
 
 ```json
 {"type":"custom-title","customTitle":"My Title","sessionId":"<uuid>"}
@@ -58,7 +60,9 @@ null,session picker 和 `--resume <uuid>` 都找不到 **Workaround**:在 jsonl 
 
 CC 从文件尾部回读,绕过 head-read bug，`scripts/truncate.py` 每次截断都会自动追加这条
 
-### [Issue #39667 — session jsonl 被静默删除 + sessions-index.json 不更新](https://github.com/anthropics/claude-code/issues/39667)
+### Issue #39667 — session jsonl 被静默删除 + sessions-index.json 不更新
+
+[GitHub issue](https://github.com/anthropics/claude-code/issues/39667)
 
 ## Context 相关
 
@@ -68,7 +72,9 @@ Session 大到超模型上下文,resume 立即 "Prompt is too long" 失败,无�
 
 ### [Issue #50732 — /context 显示矛盾:header 76% 但 Messages 138%](https://github.com/anthropics/claude-code/issues/50732)
 
-### [Issue #22178 — saved_hook_context 条目 UUID 重复破坏 session graph](https://github.com/anthropics/claude-code/issues/22178)
+### Issue #22178 — saved_hook_context 条目 UUID 重复破坏 session graph
+
+[GitHub issue](https://github.com/anthropics/claude-code/issues/22178)
 
 ### [Issue #50223 — Advisor tool result 无法处理](https://github.com/anthropics/claude-code/issues/50223)
 
