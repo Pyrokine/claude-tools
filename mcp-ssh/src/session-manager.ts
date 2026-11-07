@@ -14,31 +14,31 @@ import * as os from 'os'
 import * as path from 'path'
 import { Client, ClientChannel, ConnectConfig, ExecOptions as Ssh2ExecOptions, SFTPWrapper } from 'ssh2'
 import { StringDecoder } from 'string_decoder'
-import { isUtf8ContinuationByte, retainUtf8Suffix } from './utf8.js'
 import { clearRsyncCache } from './file-ops.js'
 import { ForwardManager } from './forward-manager.js'
-import { OperationManager } from './operation-manager.js'
+import { HostKeyError, type HostKeyTrust, KnownHosts } from './known-hosts.js'
 import { OpenSshConnection, OpenSshError } from './openssh.js'
+import { OperationManager } from './operation-manager.js'
 import { PtyManager } from './pty-manager.js'
 import { buildRemoteCommand, encodedPowershell, quotePowershell, remotePathStyle } from './remote-platform.js'
 import { sanitizeKeyError, validateKeyFile } from './security.js'
 import { escapeShellArg, expandTilde } from './tools/utils.js'
-import { checkWindowsAcl } from './windows-acl.js'
 import {
     CommandChannel,
     ConnectionFailureDetails,
     DEFAULT_EXEC_MAX_OUTPUT_SIZE,
+    DEFAULT_EXEC_TIMEOUT_MS,
     ExecOptions,
     ExecResult,
     ExternalTransferCapability,
     ForwardCloseOptions,
     ForwardCloseResult,
     HARD_EXEC_MAX_OUTPUT_SIZE,
+    OpenSshMasterInfo,
     OperationCancelResult,
     OperationInfo,
     OperationReadResult,
     OperationStartOptions,
-    OpenSshMasterInfo,
     PersistedSession,
     PortForwardInfo,
     PtyCloseResult,
@@ -50,6 +50,8 @@ import {
     SSHSessionBrief,
     SSHSessionDetail,
 } from './types.js'
+import { isUtf8ContinuationByte, retainUtf8Suffix } from './utf8.js'
+import { checkWindowsAcl } from './windows-acl.js'
 
 interface SessionState {
     config: SSHConnectionConfig
@@ -58,6 +60,9 @@ interface SessionState {
     reconnectAttempts: number
     connected: boolean // 通过事件监听维护的连接状态
     authAgent?: string
+    hostKey?: HostKeyTrust
+    hostKeys?: (HostKeyTrust & { host: string; port: number })[]
+    connectionError?: ConnectionError
     manualClose: boolean // 标记主动关闭，阻止 close 事件触发自动重连
     /** 当前正在等待的重连定时器,disconnect 时需要清除以防 zombie 重连 */
     reconnectTimer?: NodeJS.Timeout
@@ -66,6 +71,7 @@ interface SessionState {
 interface Ssh2Session extends SessionState {
     backend?: 'ssh2'
     client: Client
+    jumpClient?: Client
 }
 
 type SSHSession = Ssh2Session | (SessionState & { backend: 'openssh'; transport: OpenSshConnection })
@@ -103,6 +109,8 @@ interface SessionConnectionInfo {
     commandShell: 'posix' | 'cmd' | 'powershell'
     remotePathStyle: 'posix' | 'win32' | 'sftp-posix'
     keyAclStatus?: 'key_path_usable' | 'key_acl_insecure' | 'key_acl_unverified'
+    hostKey?: HostKeyTrust
+    hostKeys?: (HostKeyTrust & { host: string; port: number })[]
 }
 
 interface CommandContext {
@@ -152,6 +160,7 @@ export class SessionManager {
     private connectInFlight: Map<string, InFlightConnection> = new Map()
     private pendingConnections: Map<string, PendingConnection> = new Map()
     private connectionGenerations: Map<string, number> = new Map()
+    private readonly knownHosts = new KnownHosts()
     private readonly ptyManager = new PtyManager()
     private readonly forwardManager = new ForwardManager()
     private readonly operationManager: OperationManager
@@ -159,7 +168,7 @@ export class SessionManager {
     private persistQueue: Promise<void> = Promise.resolve()
     private defaultKeepaliveInterval = 30000 // 30秒
     private defaultKeepaliveCountMax = 3
-    private defaultTimeout = 30000 // 30秒
+    private defaultTimeout = DEFAULT_EXEC_TIMEOUT_MS // 30秒
     private maxReconnectAttempts = 3
     private defaultMaxOutputSize = DEFAULT_EXEC_MAX_OUTPUT_SIZE
     private reconnectDelay = 5000 // 5秒
@@ -268,8 +277,11 @@ export class SessionManager {
         this.invalidateAliasResources(alias)
 
         try {
-            if (session.backend === 'openssh') session.transport.close()
-            else session.client.end()
+            if (session.backend === 'openssh') {
+                session.transport.close()
+            } else {
+                session.client.end()
+            }
         } catch {
             /* 忽略已关闭的连接 */
         }
@@ -292,8 +304,11 @@ export class SessionManager {
             }
             this.invalidateAliasResources(alias)
             try {
-                if (session.backend === 'openssh') session.transport.close()
-                else session.client.end()
+                if (session.backend === 'openssh') {
+                    session.transport.close()
+                } else {
+                    session.client.end()
+                }
             } catch {
                 /* 忽略已关闭的连接 */
             }
@@ -320,16 +335,22 @@ export class SessionManager {
         if (!session) {
             throw new Error(`Session '${alias}' not found. Use ssh_connect first.`)
         }
-        if (session.backend === 'openssh') session.transport.assertCurrent()
+        if (session.backend === 'openssh') {
+            session.transport.assertCurrent()
+        }
         if (!this.isAlive(session)) {
-            if (session.backend === 'openssh')
+            if (session.backend === 'openssh') {
                 throw new OpenSshError('The bound OpenSSH master is no longer available', {
                     code: 'master_unavailable',
                     backend: 'openssh',
                     alias,
                     retryable: false,
                 })
-            throw new Error(`Session '${alias}' is disconnected. Use ssh_connect to reconnect.`)
+            }
+            throw (
+                session.connectionError ??
+                new Error(`Session '${alias}' is disconnected. Use ssh_connect to reconnect.`)
+            )
         }
         session.lastUsedAt = Date.now()
         return session
@@ -337,7 +358,9 @@ export class SessionManager {
 
     getOpenSshConnection(alias: string): OpenSshConnection | undefined {
         const session = this.sessions.get(alias)
-        if (session?.backend !== 'openssh') return undefined
+        if (session?.backend !== 'openssh') {
+            return undefined
+        }
         this.getSession(alias)
         return session.transport
     }
@@ -391,6 +414,8 @@ export class SessionManager {
         return {
             backend: session.backend ?? 'ssh2',
             ...(session.backend === 'openssh' ? session.transport.info : {}),
+            hostKey: session.hostKey,
+            hostKeys: session.hostKeys,
             alias,
             identity: this.sessionIdentity(session),
             loginUser: config.username,
@@ -1019,6 +1044,8 @@ export class SessionManager {
         )
     }
 
+
+
     private emptyOutputFailureMetadata(exitCode: number, preview: OutputPreview): Partial<ExecResult> {
         if (exitCode === 0 || preview.stdoutBytes > 0 || preview.stderrBytes > 0) {
             return {}
@@ -1434,10 +1461,15 @@ export class SessionManager {
 
         if (existing) {
             existing.manualClose = true
-            if (existing.reconnectTimer) clearTimeout(existing.reconnectTimer)
+            if (existing.reconnectTimer) {
+                clearTimeout(existing.reconnectTimer)
+            }
             this.invalidateAliasResources(alias)
-            if (existing.backend === 'openssh') existing.transport.close()
-            else existing.client.end()
+            if (existing.backend === 'openssh') {
+                existing.transport.close()
+            } else {
+                existing.client.end()
+            }
         }
         if (config.backend === 'openssh') {
             const transport = await OpenSshConnection.connect(config, pendingConnection.signal)
@@ -1461,6 +1493,13 @@ export class SessionManager {
         const client = new Client()
         pendingConnection.client = client
         const readyTimeout = config.readyTimeout ?? this.defaultTimeout
+        const verificationController = new AbortController()
+        const verificationSignal = AbortSignal.any([pendingConnection.signal, verificationController.signal])
+        let verificationDeadline: number | undefined
+        let hostKey: HostKeyTrust | undefined
+        let hostKeyError: unknown
+        let hostKeyAlgorithm: string | undefined
+        const generation = pendingConnection.generation
         const connectConfig: ConnectConfig = {
             host: config.host,
             port: config.port ?? 22,
@@ -1468,6 +1507,57 @@ export class SessionManager {
             readyTimeout,
             keepaliveInterval: config.keepaliveInterval ?? this.defaultKeepaliveInterval,
             keepaliveCountMax: config.keepaliveCountMax ?? this.defaultKeepaliveCountMax,
+            debug: (message: string): void => {
+                const algorithm = /^Handshake: Host key format: ([\w@.-]+)$/.exec(message)
+                if (algorithm) {
+                    hostKeyAlgorithm = algorithm[1]
+                }
+            },
+            hostVerifier: (key: Buffer, callback: (verified: boolean) => void): void => {
+                void this.knownHosts
+                    .verify(
+                        config.host,
+                        config.port ?? 22,
+                        key,
+                        verificationSignal,
+                        verificationDeadline ?? Date.now() + readyTimeout
+                    )
+                    .then(
+                        (trust) => {
+                            if (verificationSignal.aborted || this.getConnectionGeneration(alias) !== generation) {
+                                return
+                            } else {
+                                hostKey = trust
+                                callback(true)
+                            }
+                        },
+                        (error: unknown) => {
+                            if (verificationSignal.aborted || this.getConnectionGeneration(alias) !== generation) {
+                                return
+                            }
+                            if (!verificationSignal.aborted) {
+                                if (error instanceof HostKeyError && error.hostKey) {
+                                    error.hostKey.algorithm = hostKeyAlgorithm
+                                }
+                                hostKeyError = error
+                                const session = this.sessions.get(alias)
+                                if (
+                                    session?.backend !== 'openssh' &&
+                                    session?.client === client &&
+                                    !session.manualClose &&
+                                    this.getConnectionGeneration(alias) === generation
+                                ) {
+                                    this.stopUntrustedConnection(
+                                        alias,
+                                        session,
+                                        this.createConnectionError(error, config, readyTimeout, 'target_connect')
+                                    )
+                                }
+                            }
+                            callback(false)
+                        }
+                    )
+            },
         }
 
         try {
@@ -1510,10 +1600,24 @@ export class SessionManager {
             throw this.createConnectionError(error, config, readyTimeout, 'key_read')
         }
 
+        let jumpHostKeys: (HostKeyTrust & { host: string; port: number })[] = []
+        let jumpSession: Ssh2Session | undefined
         if (config.jumpHost) {
             const jumpConfig: SSHConnectionConfig = {
                 ...config.jumpHost,
                 readyTimeout: config.jumpHost.readyTimeout ?? readyTimeout,
+            }
+            if (!jumpConfig.alias) {
+                const defaultAlias = this.generateAlias(jumpConfig)
+                const existing = this.sessions.get(defaultAlias)
+                const inFlight = this.connectInFlight.get(defaultAlias)
+                const requested = existing || inFlight ? this.connectionFingerprint(jumpConfig) : undefined
+                if (
+                    (existing && this.isAlive(existing) && this.connectionFingerprint(existing.config) !== requested) ||
+                    (inFlight && inFlight.fingerprint !== requested)
+                ) {
+                    jumpConfig.alias = `${alias}:jump:${defaultAlias}`
+                }
             }
             let jumpAlias: string
             try {
@@ -1527,8 +1631,8 @@ export class SessionManager {
                 }
                 throw this.createConnectionError(error, jumpConfig, jumpConfig.readyTimeout!, 'jump_connect')
             }
-            const jumpSession = this.sessions.get(jumpAlias)
-            if (!jumpSession || jumpSession.backend === 'openssh' || !this.isAlive(jumpSession)) {
+            const candidate = this.sessions.get(jumpAlias)
+            if (!candidate || candidate.backend === 'openssh' || !this.isAlive(candidate)) {
                 throw new ConnectionError(`Jump host session '${jumpAlias}' is unavailable`, {
                     failureStage: 'transport_or_handshake',
                     connectionStep: 'jump_connect',
@@ -1536,6 +1640,8 @@ export class SessionManager {
                     suggestion: '重新连接跳板机，或检查 jumpHost 配置和网络路径',
                 })
             }
+            jumpSession = candidate
+            jumpHostKeys = jumpSession.hostKeys ?? []
             connectConfig.sock = await this.forwardConnection(
                 jumpSession.client,
                 config.host,
@@ -1563,10 +1669,29 @@ export class SessionManager {
                 }
                 settled = true
                 clearPendingConnection()
-                reject(this.createConnectionError(error, config, readyTimeout, 'target_connect'))
+                verificationController.abort(error)
+                this.closeClientChannel(connectConfig.sock as ClientChannel | undefined)
+                reject(
+                    this.createConnectionError(
+                        hostKeyError ?? jumpSession?.connectionError ?? error,
+                        config,
+                        readyTimeout,
+                        'target_connect'
+                    )
+                )
             }
 
             client.on('ready', () => {
+                if (jumpSession?.connectionError) {
+                    rejectConnection(jumpSession.connectionError)
+                    client.end()
+                    return
+                }
+                if (!hostKey) {
+                    rejectConnection(new HostKeyError('SSH ready arrived before host key verification completed'))
+                    client.end()
+                    return
+                }
                 if (settled || !this.isCurrentPendingConnection(alias, pendingConnection)) {
                     clearPendingConnection()
                     client.end()
@@ -1587,8 +1712,11 @@ export class SessionManager {
                 clearPendingConnection()
                 const session: SSHSession = {
                     client,
+                    jumpClient: jumpSession?.client,
                     config,
                     authAgent: typeof connectConfig.agent === 'string' ? connectConfig.agent : undefined,
+                    hostKey,
+                    hostKeys: [...jumpHostKeys, { ...hostKey, host: config.host, port: config.port ?? 22 }],
                     connectedAt: Date.now(),
                     lastUsedAt: Date.now(),
                     reconnectAttempts: 0,
@@ -1596,6 +1724,7 @@ export class SessionManager {
                     manualClose: false,
                 }
                 this.sessions.set(alias, session)
+                verificationDeadline = undefined
                 this.persistSessions()
                 resolve(alias)
             })
@@ -1609,11 +1738,12 @@ export class SessionManager {
             })
 
             client.on('close', () => {
+                verificationController.abort(new Error('SSH connection closed'))
                 const session = this.sessions.get(alias)
                 if (session && session.backend !== 'openssh' && session.client === client) {
                     session.connected = false
                     this.invalidateAliasResources(alias)
-                    if (!session.manualClose) {
+                    if (!session.manualClose && !session.connectionError) {
                         this.scheduleReconnect(alias)
                     }
                 } else if (!settled) {
@@ -1622,6 +1752,14 @@ export class SessionManager {
             })
 
             try {
+                verificationDeadline = Date.now() + readyTimeout
+                const algorithms = this.knownHosts.getHostKeyAlgorithms(config.host, config.port ?? 22)
+                if (algorithms.length > 0) {
+                    // ssh2 的 prepend 跳过已有项，先 remove 才能调整默认顺序
+                    connectConfig.algorithms = {
+                        serverHostKey: { remove: algorithms, prepend: algorithms, append: [] },
+                    }
+                }
                 client.connect(connectConfig)
                 client.setNoDelay(true)
             } catch (error) {
@@ -1764,11 +1902,47 @@ export class SessionManager {
         clearRsyncCache(alias)
     }
 
+    private stopUntrustedConnection(alias: string, session: Ssh2Session, error: ConnectionError): void {
+        if (this.sessions.get(alias) !== session) {
+            return
+        }
+        session.connectionError = error
+        session.connected = false
+        if (session.reconnectTimer) {
+            clearTimeout(session.reconnectTimer)
+            session.reconnectTimer = undefined
+        }
+        this.invalidateAliasResources(alias)
+        for (const [targetAlias, target] of this.sessions) {
+            if (target.backend !== 'openssh' && target.jumpClient === session.client && !target.manualClose) {
+                this.stopUntrustedConnection(
+                    targetAlias,
+                    target,
+                    new ConnectionError(error.message, { ...error.details, connectionStep: 'jump_connect' })
+                )
+                target.client.end()
+            }
+        }
+    }
+
     /**
      * 检查连接是否存活
      */
     private isAlive(session: SSHSession): boolean {
-        return session.connected && (session.backend !== 'openssh' || session.transport.isAlive())
+        if (!session.connected) {
+            return false
+        }
+        if (session.backend === 'openssh') {
+            return session.transport.isAlive()
+        }
+        const client = session.client as Client & {
+            _sock?: { writable?: boolean; destroyed?: boolean; _readableState?: { ended?: boolean } }
+        }
+        // ssh2 在 close 事件更新 connected 前就会按 socket 状态拒绝命令
+        return (
+            !('_sock' in client) ||
+            Boolean(client._sock?.writable && !client._sock.destroyed && client._sock._readableState?.ended === false)
+        )
     }
 
     private isCurrentSession(alias: string, session: SSHSession): boolean {
@@ -1801,7 +1975,12 @@ export class SessionManager {
      */
     private scheduleReconnect(alias: string): void {
         const session = this.sessions.get(alias)
-        if (!session || session.backend === 'openssh' || session.reconnectAttempts >= this.maxReconnectAttempts) {
+        if (
+            !session ||
+            session.backend === 'openssh' ||
+            session.connectionError ||
+            session.reconnectAttempts >= this.maxReconnectAttempts
+        ) {
             return
         }
 
@@ -1815,17 +1994,27 @@ export class SessionManager {
 
         session.reconnectTimer = setTimeout(async () => {
             const current = this.sessions.get(alias)
-            if (current !== session) {
+            session.reconnectTimer = undefined
+            if (current !== session || session.connectionError) {
                 return
             }
-            session.reconnectTimer = undefined
             try {
                 await this.reconnect(alias)
             } catch (err) {
                 console.error(
-                    `Auto-reconnect failed for ${alias} (${attempt}/${this.maxReconnectAttempts}): ${(err as Error).message}`
+                    'Auto-reconnect failed for ' +
+                        `${alias}` +
+                        ' (' +
+                        `${attempt}` +
+                        '/' +
+                        `${this.maxReconnectAttempts}` +
+                        '): ' +
+                        `${(err as Error).message}`
                 )
-                if (this.sessions.get(alias) === session) {
+                if (
+                    this.sessions.get(alias) === session &&
+                    !(err instanceof ConnectionError && err.details.failureStage === 'host_key')
+                ) {
                     this.scheduleReconnect(alias)
                 }
             }
@@ -1872,6 +2061,14 @@ export class SessionManager {
         readyTimeout: number,
         connectionStep: ConnectionFailureDetails['connectionStep']
     ): ConnectionError {
+        if (error instanceof HostKeyError) {
+            return new ConnectionError(error.message, {
+                failureStage: 'host_key',
+                connectionStep,
+                retryable: false,
+                hostKey: error.hostKey,
+            })
+        }
         if (error instanceof ConnectionError) {
             return new ConnectionError(error.message, {
                 ...error.details,

@@ -7,16 +7,22 @@ import path from 'node:path'
 import test from 'node:test'
 import { clearTimeout } from 'node:timers'
 import { fileURLToPath } from 'node:url'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { Client } from '@modelcontextprotocol/sdk/client'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-openssh-test-'))
 process.env.HOME = root
 process.env.SSH_MCP_ALLOWED_KEY_DIRS = root
+// 会话模块在导入时建立持久化目录，必须先设置隔离 HOME
+// noinspection ES6TopLevelAwaitExpression
 const { SessionManager, sessionManager } = await import('../dist/session-manager.js')
+// noinspection ES6TopLevelAwaitExpression
 const { resolveOpenSshConfig } = await import('../dist/openssh.js')
+// noinspection ES6TopLevelAwaitExpression
 const { registerConnectionTools } = await import('../dist/tools/connection.js')
+// noinspection ES6TopLevelAwaitExpression
 const { registerFileTools } = await import('../dist/tools/file.js')
+// noinspection ES6TopLevelAwaitExpression
 const { registerExecTools } = await import('../dist/tools/exec.js')
 
 function run(command, args) {
@@ -29,13 +35,17 @@ function run(command, args) {
 async function waitFor(predicate, description) {
     const end = Date.now() + 10_000
     while (!predicate()) {
-        if (Date.now() > end) throw new Error(`Timed out waiting for ${description}`)
+        if (Date.now() > end) {
+            throw new Error(`Timed out waiting for ${description}`)
+        }
         await new Promise((resolve) => setTimeout(resolve, 20))
     }
 }
 
 async function stop(child) {
-    if (child.exitCode !== null || child.signalCode !== null) return
+    if (child.exitCode !== null || child.signalCode !== null) {
+        return
+    }
     const exited = once(child, 'exit')
     child.kill('SIGTERM')
     const timer = setTimeout(() => child.kill('SIGKILL'), 1000)
@@ -86,7 +96,9 @@ async function fixture(t) {
     await waitFor(() => serverLog.includes('Server listening') || server.exitCode !== null, 'loopback sshd')
     assert.equal(server.exitCode, null, serverLog)
     const configPath = path.join(directory, 'ssh_config')
-    const controlPath = path.join(directory, 'master')
+    const socketDirectory = fs.mkdtempSync(path.join(process.env.SSH_MCP_TEST_SOCKET_DIR ?? os.tmpdir(), 's-'))
+    const controlPath = path.join(socketDirectory, 'm')
+    t.after(() => fs.rmSync(socketDirectory, { recursive: true, force: true }))
     fs.writeFileSync(
         configPath,
         [
@@ -99,6 +111,7 @@ async function fixture(t) {
             '  IdentityAgent none',
             '  StrictHostKeyChecking no',
             `  UserKnownHostsFile ${directory}/known_hosts`,
+            '  GlobalKnownHostsFile /dev/null',
             `  ControlPath ${controlPath}`,
             '  ControlMaster auto',
             '  ControlPersist no',
@@ -119,7 +132,7 @@ async function fixture(t) {
 }
 
 test(
-    'OpenSSH master reuses commands, preserves bytes and remote exit 255, and owns only alias channels',
+    'OpenSSH master reuses commands, preserves bytes and remote exit 255, and ' + 'owns only alias channels',
     { skip: process.platform !== 'linux' },
     async (t) => {
         const f = await fixture(t)
@@ -199,7 +212,63 @@ test(
 )
 
 test(
-    'OpenSSH runs two commands and verified directory sync concurrently, and cancels only one operation',
+    'OpenSSH public sync keeps preflight error details without changing the selected backend',
+    { skip: process.platform !== 'linux' },
+    async (t) => {
+        const f = await fixture(t)
+        t.after(() => sessionManager.disconnectAll())
+        await sessionManager.connect({ backend: 'openssh', ...f.resolved, alias: 'missing-rsync' })
+        const directory = path.join(f.directory, 'local-bin')
+        fs.mkdirSync(directory)
+        for (const command of ['ssh', 'which']) {
+            fs.symlinkSync(run('which', [command]).trim(), path.join(directory, command))
+        }
+        const originalPath = process.env.PATH
+        t.after(() => {
+            process.env.PATH = originalPath
+        })
+        process.env.PATH = directory
+        const source = path.join(f.directory, 'source')
+        const target = path.join(f.directory, 'must-not-create')
+        fs.writeFileSync(source, 'fixture')
+        const handlers = new Map()
+        registerFileTools({ registerTool: (name, _definition, handler) => handlers.set(name, handler) })
+        const response = await handlers.get('ssh_sync')({
+            alias: 'missing-rsync',
+            localPath: source,
+            remotePath: target,
+            direction: 'upload',
+        })
+        const result = JSON.parse(response.content[0].text)
+        assert.equal(response.isError, true)
+        assert.equal(result.success, false)
+        assert.deepEqual(result.details, {
+            code: 'openssh_sync_preflight',
+            backend: 'openssh',
+            reason: 'local_rsync_unavailable',
+            retryable: false,
+        })
+        assert.ok(result.diagnostics.localBefore)
+        assert.equal(fs.existsSync(target), false)
+        for (const [name, args] of [
+            ['ssh_upload', { localPath: source, remotePath: target }],
+            ['ssh_upload', { localPath: source, remotePath: source, atomic: true }],
+            ['ssh_download', { localPath: target, remotePath: source }],
+        ]) {
+            const failure = await handlers.get(name)({ alias: 'missing-rsync', ...args })
+            const data = JSON.parse(failure.content[0].text)
+            assert.equal(failure.isError, true, JSON.stringify(data))
+            assert.equal(data.details.code, 'unsupported_backend', JSON.stringify(data))
+            assert.equal(data.details.backend, 'openssh')
+            assert.equal(fs.existsSync(target), false)
+            assert.equal(fs.readFileSync(source, 'utf8'), 'fixture')
+        }
+        assert.equal((f.log().match(/Accepted publickey/g) ?? []).length, 1)
+    }
+)
+
+test(
+    'OpenSSH runs two commands and verified directory sync concurrently, and ' + 'cancels only one operation',
     { skip: process.platform !== 'linux' },
     async (t) => {
         const f = await fixture(t)
@@ -255,7 +324,7 @@ test(
 )
 
 test(
-    'OpenSSH explicit single-file verification handles file and directory destinations in both directions',
+    'OpenSSH explicit single-file verification handles file and directory ' + 'destinations in both directions',
     { skip: process.platform !== 'linux' },
     async (t) => {
         const f = await fixture(t)
@@ -270,7 +339,9 @@ test(
                     const source = path.join(f.directory, `source-${direction}-${directoryTarget}-${content.length}`)
                     const destination = `${source}-target`
                     fs.writeFileSync(source, content, { mode: 0o640 })
-                    if (directoryTarget) fs.mkdirSync(destination)
+                    if (directoryTarget) {
+                        fs.mkdirSync(destination)
+                    }
                     const args = {
                         alias: 'files',
                         localPath: direction === 'upload' ? source : destination,
@@ -319,15 +390,27 @@ test(
     async (t) => {
         const f = await fixture(t)
         const moduleUrl = new URL('../dist/session-manager.js', import.meta.url).href
-        const script = `import fs from 'node:fs'; import assert from 'node:assert/strict'; import {SessionManager} from ${JSON.stringify(moduleUrl)};
-        const manager = new SessionManager(${JSON.stringify(path.join(f.directory, 'race-sessions.json'))});
-        await manager.connect(${JSON.stringify({ backend: 'openssh', ...f.resolved, alias: 'race' })});
-        const connection = manager.getOpenSshConnection('race');
-        const original = connection.arguments.bind(connection);
-        connection.arguments = () => { const args = original(); fs.unlinkSync(${JSON.stringify(f.controlPath)}); return args; };
-        await assert.rejects(connection.consume('printf must-not-execute', () => {}, 3000), /without a remote exit status/);
-        await manager.disconnectAll();
-        process.stdout.write('race-failed-without-new-connection');`
+        const script =
+            "import fs from 'node:fs'; import assert from 'node:assert/strict'; " +
+            'import {SessionManager} from ' +
+            `${JSON.stringify(moduleUrl)}` +
+            ';\n' +
+            '        const manager = new SessionManager(' +
+            `${JSON.stringify(path.join(f.directory, 'race-sessions.json'))}` +
+            ');\n' +
+            '        await manager.connect(' +
+            `${JSON.stringify({ backend: 'openssh', ...f.resolved, alias: 'race' })}` +
+            ');\n' +
+            "        const connection = manager.getOpenSshConnection('race');\n" +
+            '        const original = connection.arguments.bind(connection);\n' +
+            '        connection.arguments = () => { const args = original(); ' +
+            'fs.unlinkSync(' +
+            `${JSON.stringify(f.controlPath)}` +
+            '); return args; };\n' +
+            "        await assert.rejects(connection.consume('printf " +
+            "must-not-execute', () => {}, 3000), /without a remote exit status/);\n" +
+            '        await manager.disconnectAll();\n' +
+            "        process.stdout.write('race-failed-without-new-connection');"
         const result = spawnSync(
             'strace',
             ['-f', '-e', 'trace=connect,execve', process.execPath, '--input-type=module', '-e', script],
@@ -448,7 +531,7 @@ test(
 )
 
 test(
-    'public stdio SFTP directory filters and pages preserve full verified downloads and OpenSSH limits',
+    'public stdio SFTP directory filters and pages preserve full verified ' + 'downloads and OpenSSH limits',
     { skip: process.platform !== 'linux' },
     async (t) => {
         const f = await fixture(t)

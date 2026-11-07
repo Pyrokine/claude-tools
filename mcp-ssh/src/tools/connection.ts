@@ -9,8 +9,8 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import { z } from 'zod'
-import { sessionManager } from '../session-manager.js'
 import { OpenSshError, resolveOpenSshConfig } from '../openssh.js'
+import { sessionManager } from '../session-manager.js'
 import { parseProxyJump, parseSSHConfig } from '../ssh-config.js'
 import { sshPortSchema } from './schema.js'
 import { expandTilde, formatError, formatResult } from './utils.js'
@@ -74,7 +74,20 @@ function loadTemplates(): Record<string, unknown> {
         return {}
     }
 
-    const parsed: unknown = JSON.parse(source)
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(source)
+    } catch (error) {
+        const message = error instanceof Error ? error.message : ''
+        const location = /(?:at position \d+(?: \(line \d+ column \d+\))?|\(line \d+ column \d+\))$/.exec(message)?.[0]
+        // JSON parser errors can contain credentials, including through Error.cause.
+        // eslint-disable-next-line preserve-caught-error
+        throw new Error(
+            'Invalid JSON in ' +
+                `${fromEnv !== undefined ? 'SSH_MCP_TEMPLATES' : '~/.mcp-ssh/templates.json'}` +
+                `${location ? ` (${location})` : ''}`
+        )
+    }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('SSH templates must be an object keyed by template name')
     }
@@ -332,7 +345,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             }
 
             // 解析 ProxyJump（支持 user@host:port 格式）
-            if (hostConfig.proxyJump) {
+            if (hostConfig.proxyJump && !(args.jumpHost ?? template.jumpHost)) {
                 const parsed = parseProxyJump(hostConfig.proxyJump)
                 if (parsed) {
                     // 先尝试在 config 中查找对应的 Host
@@ -448,6 +461,8 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
             commandShell: connected.commandShell,
             remotePathStyle: connected.remotePathStyle,
             keyAclStatus: connected.keyAclStatus,
+            hostKey: connected.hostKey,
+            hostKeys: connected.hostKeys,
             host: connected.host,
             port: connected.port,
             defaultEnvKeys: connected.defaultEnvKeys,

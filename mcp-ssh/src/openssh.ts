@@ -71,13 +71,15 @@ async function captureSsh(
         })
         child.once('close', (status) => {
             clearTimeout(timer)
-            if (failure) reject(failure)
-            else
+            if (failure) {
+                reject(failure)
+            } else {
                 resolve({
                     stdout: Buffer.concat(stdout).toString('utf8'),
                     stderr: Buffer.concat(stderr).toString('utf8'),
                     status,
                 })
+            }
         })
     })
 }
@@ -109,13 +111,23 @@ export async function resolveOpenSshConfig(input: {
         validateConfigFile(configPath)
         args.push('-F', configPath)
     }
-    if (input.configHost && input.host) args.push('-o', `HostName=${input.host}`)
-    if (input.username) args.push('-l', input.username)
-    if (input.port !== undefined) args.push('-p', String(input.port))
-    if (input.controlPath) args.push('-S', path.resolve(expandTilde(input.controlPath)))
+    if (input.configHost && input.host) {
+        args.push('-o', `HostName=${input.host}`)
+    }
+    if (input.username) {
+        args.push('-l', input.username)
+    }
+    if (input.port !== undefined) {
+        args.push('-p', String(input.port))
+    }
+    if (input.controlPath) {
+        args.push('-S', path.resolve(expandTilde(input.controlPath)))
+    }
     args.push('--', destination)
     const result = await captureSsh(args, input.readyTimeout ?? 30_000, CONFIG_OUTPUT_LIMIT)
-    if (result.status !== 0) invalidConfig(`OpenSSH configuration could not be resolved: ${result.stderr.trim()}`)
+    if (result.status !== 0) {
+        invalidConfig(`OpenSSH configuration could not be resolved: ${result.stderr.trim()}`)
+    }
     const config = new Map<string, string>()
     for (const line of result.stdout.split('\n')) {
         const separator = line.indexOf(' ')
@@ -130,7 +142,9 @@ export async function resolveOpenSshConfig(input: {
     if (!host || host.startsWith('-') || /[\s\0]/.test(host) || !username || /[\s:@\0]/.test(username)) {
         invalidConfig('OpenSSH returned an invalid host or user')
     }
-    if (!Number.isInteger(port) || port < 1 || port > 65535) invalidConfig('OpenSSH returned an invalid port')
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        invalidConfig('OpenSSH returned an invalid port')
+    }
     if (!controlPath || controlPath === 'none' || /[\0\r\n]/.test(controlPath)) {
         invalidConfig('OpenSSH requires an existing ControlPath; configure it or pass controlPath')
     }
@@ -140,7 +154,7 @@ export async function resolveOpenSshConfig(input: {
 class OpenSshChannel extends PassThrough implements CommandChannel {
     readonly stderr = new PassThrough()
     readonly ready: Promise<void>
-    private child: ChildProcess
+    private readonly child: ChildProcess
     private resolveReady!: () => void
     private rejectReady!: (error: Error) => void
 
@@ -174,8 +188,9 @@ class OpenSshChannel extends PassThrough implements CommandChannel {
                         while (
                             retained > 0 &&
                             !pending.subarray(pending.length - retained).equals(prefix.subarray(0, retained))
-                        )
+                        ) {
                             --retained
+                        }
                         const count = pending.length - retained
                         this.push(pending.subarray(0, count))
                         pending = pending.subarray(count)
@@ -186,7 +201,9 @@ class OpenSshChannel extends PassThrough implements CommandChannel {
                         pending = pending.subarray(index)
                     }
                     const end = pending.indexOf(0x1f, prefix.length)
-                    if (end < 0 && pending.length <= prefix.length + 16) break
+                    if (end < 0 && pending.length <= prefix.length + 16) {
+                        break
+                    }
                     if (end < 0 || end > prefix.length + 16) {
                         this.push(pending.subarray(0, 1))
                         pending = pending.subarray(1)
@@ -215,7 +232,9 @@ class OpenSshChannel extends PassThrough implements CommandChannel {
         this.child.stderr!.pipe(markers).pipe(this.stderr)
         this.child.once('error', (error) => {
             this.rejectReady(error)
-            if (!this.destroyed) this.emit('error', error)
+            if (!this.destroyed) {
+                this.emit('error', error)
+            }
         })
         this.child.once('close', (code, signal) => {
             if (remoteExitCode === undefined) {
@@ -231,7 +250,9 @@ class OpenSshChannel extends PassThrough implements CommandChannel {
                     }
                 )
                 this.rejectReady(error)
-                if (!this.destroyed) this.emit('error', error)
+                if (!this.destroyed) {
+                    this.emit('error', error)
+                }
             }
             this.end()
             this.emit('close', remoteExitCode ?? null, signal)
@@ -279,7 +300,9 @@ export class OpenSshConnection {
                 retryable: false,
             })
         }
-        if (!config.controlPath) invalidConfig('OpenSSH requires a resolved controlPath')
+        if (!config.controlPath) {
+            invalidConfig('OpenSSH requires a resolved controlPath')
+        }
         const socket = this.socket(config.controlPath)
         const args = this.arguments(config)
         const timeout = config.readyTimeout ?? 30_000
@@ -289,7 +312,7 @@ export class OpenSshConnection {
             CONTROL_OUTPUT_LIMIT,
             signal
         )
-        const pid = Number(/Master running \(pid=(\d+)\)/.exec(checked.stderr)?.[1])
+        const pid = Number(/Master running \(pid=(?<pid>\d+)\)/.exec(checked.stderr)?.[1])
         if (checked.status !== 0 || !Number.isSafeInteger(pid) || pid <= 0) {
             throw new OpenSshError(`OpenSSH master is unavailable: ${checked.stderr.trim()}`, {
                 code: 'master_unavailable',
@@ -301,7 +324,9 @@ export class OpenSshConnection {
         const abort = () => connection.close()
         signal?.addEventListener('abort', abort, { once: true })
         try {
-            if (signal?.aborted) throw signal.reason
+            if (signal?.aborted) {
+                throw signal.reason
+            }
             const marker = randomBytes(32).toString('hex')
             const command = `printf ${escapeShellArg(`${marker}\\n`)}; id -u; id -un; printf '%s\\n' "$SSH_CONNECTION"`
             const observed = await captureSsh(
@@ -421,7 +446,9 @@ export class OpenSshConnection {
     readonly trackProcess = (child: ChildProcess, processGroup: boolean = false): void => {
         this.processes.set(child, processGroup)
         child.once('close', () => this.processes.delete(child))
-        if (this.closed) this.close()
+        if (this.closed) {
+            this.close()
+        }
     }
 
     open(command: string): CommandChannel & { ready: Promise<void> } {
@@ -434,13 +461,17 @@ export class OpenSshConnection {
             let settled = false
             let stderr = Buffer.alloc(0)
             const finish = (error?: Error): void => {
-                if (settled) return
+                if (settled) {
+                    return
+                }
                 settled = true
                 clearTimeout(timer)
                 if (error) {
                     stream.destroy()
                     reject(error)
-                } else resolve()
+                } else {
+                    resolve()
+                }
             }
             const timer = setTimeout(
                 () =>
@@ -456,7 +487,9 @@ export class OpenSshConnection {
                 timeout
             )
             stream.on('data', (chunk: Buffer) => {
-                if (settled) return
+                if (settled) {
+                    return
+                }
                 try {
                     consume(chunk)
                 } catch (error) {
@@ -493,13 +526,14 @@ export class OpenSshConnection {
             command,
             (chunk) => {
                 size += chunk.length
-                if (size > maxBytes)
+                if (size > maxBytes) {
                     throw new OpenSshError('OpenSSH command exceeded its output budget', {
                         code: 'openssh_output_limit',
                         backend: 'openssh',
                         maxBytes,
                         retryable: false,
                     })
+                }
                 chunks.push(chunk)
             },
             timeout
@@ -544,17 +578,20 @@ export class OpenSshConnection {
         const deadline = Date.now() + timeout
         const remaining = (): number => {
             const value = deadline - Date.now()
-            if (value <= 0)
+            if (value <= 0) {
                 throw new OpenSshError('OpenSSH file verification exhausted its timeout', {
                     code: 'openssh_timeout',
                     backend: 'openssh',
                     operationStatus: 'unknown',
                     retryable: false,
                 })
+            }
             return value
         }
         const before = await this.stat(remotePath, remaining())
-        if ((before.mode & 0o170000) !== 0o100000) throw new Error('File hashing requires a regular remote file')
+        if ((before.mode & 0o170000) !== 0o100000) {
+            throw new Error('File hashing requires a regular remote file')
+        }
         if (
             (maxBytes !== undefined && before.size > maxBytes) ||
             (expectedSize !== undefined && before.size !== expectedSize)
@@ -567,14 +604,17 @@ export class OpenSshConnection {
             `head -c ${before.size + 1} -- ${escapeShellArg(remotePath)}`,
             (chunk) => {
                 size += chunk.length
-                if (size > before.size) throw new Error('Remote file grew during verification')
+                if (size > before.size) {
+                    throw new Error('Remote file grew during verification')
+                }
                 hash.update(chunk)
             },
             remaining()
         )
         const after = await this.stat(remotePath, remaining())
-        if (size !== before.size || before.stamp !== after.stamp)
+        if (size !== before.size || before.stamp !== after.stamp) {
             throw new Error('Remote file changed during verification')
+        }
         return hash.digest('hex')
     }
 
@@ -585,10 +625,13 @@ export class OpenSshConnection {
                 try {
                     process.kill(-child.pid, 'SIGKILL')
                 } catch (error) {
-                    if ((error as NodeJS.ErrnoException).code !== 'ESRCH')
+                    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
                         console.error('OpenSSH process cleanup failed:', error)
+                    }
                 }
-            } else child.kill('SIGKILL')
+            } else {
+                child.kill('SIGKILL')
+            }
         }
     }
 }

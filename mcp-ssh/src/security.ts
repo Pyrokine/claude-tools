@@ -91,6 +91,43 @@ export function validateConfigFile(p: string): void {
     }
 }
 
+/** known_hosts protects write integrity; public read access is permitted. */
+export function validateKnownHostsPath(filePath: string, system: boolean = false): string {
+    const resolveRealPath = (candidate: string): string => {
+        let ancestor = candidate
+        const suffix: string[] = []
+        while (!fs.existsSync(ancestor)) {
+            const parent = path.dirname(ancestor)
+            if (parent === ancestor) {
+                throw new Error('known_hosts path has no existing ancestor')
+            }
+            suffix.unshift(path.basename(ancestor))
+            ancestor = parent
+        }
+        return path.join(fs.realpathSync(ancestor), ...suffix)
+    }
+    const allowed = getAllowedDirs()
+    if (system && process.platform === 'win32') {
+        allowed.push(path.resolve(process.env.ProgramData ?? 'C:\\ProgramData', 'ssh'))
+    }
+    // Resolve trusted roots as well as files: system ancestors such as /etc can be aliases.
+    const realAllowed = allowed.map(resolveRealPath)
+    const under = (candidate: string, directories: string[]): boolean =>
+        directories.some((dir) => {
+            const relative = path.relative(dir, candidate)
+            return (
+                relative === '' ||
+                (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+            )
+        })
+    const resolved = path.resolve(filePath)
+    const real = resolveRealPath(resolved)
+    if (!under(resolved, [...allowed, ...realAllowed]) || !under(real, realAllowed)) {
+        throw new Error('known_hosts path is outside the allowed SSH directories')
+    }
+    return real
+}
+
 /**
  * 脱敏 ssh2 keyParser 错误，避免 PEM 文件 cipher/kdf 字段被泄露
  */

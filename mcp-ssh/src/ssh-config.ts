@@ -101,7 +101,7 @@ function parseHostPort(s: string): { host: string; port?: number } {
  * 注意：只解析第一跳，不支持逗号分隔的多跳链路
  */
 export function parseProxyJump(proxyJump: string): ParsedProxyJump | null {
-    if (!proxyJump) {
+    if (!proxyJump || proxyJump.trim().toLowerCase() === 'none') {
         return null
     }
 

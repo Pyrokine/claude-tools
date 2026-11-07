@@ -18,6 +18,7 @@ export interface OpenSshMasterInfo {
     observedLogin?: { uid: number; username: string; sshConnection?: string }
 }
 
+export const DEFAULT_EXEC_TIMEOUT_MS = 30_000
 export const DEFAULT_EXEC_MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 export const HARD_EXEC_MAX_OUTPUT_SIZE = 50 * 1024 * 1024
 
@@ -103,7 +104,7 @@ export interface ExternalTransferCapability {
 }
 
 export type ConnectionFailureStage =
-    'preflight' | 'authentication' | 'ready_timeout' | 'transport_or_handshake' | 'unknown'
+    'preflight' | 'authentication' | 'ready_timeout' | 'transport_or_handshake' | 'host_key' | 'unknown'
 
 export type ConnectionStep = 'key_read' | 'jump_connect' | 'jump_forward' | 'target_connect'
 
@@ -113,6 +114,12 @@ export interface ConnectionFailureDetails {
     retryable: boolean
     suggestion?: string
     keyAclStatus?: 'key_path_usable' | 'key_acl_insecure' | 'key_acl_unverified'
+    hostKey?: {
+        algorithm?: string
+        keyType: string
+        fingerprint: string
+        knownKeys: { keyType: string; fingerprint: string; file: string; line: number; revoked: boolean }[]
+    }
 }
 
 export interface ExecOptions {
