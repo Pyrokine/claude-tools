@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { getUnifiedSession } from '../dist/core/index.js';
+import { ExtensionBridge } from '../dist/extension/bridge.js';
+import { registerInputTool } from '../dist/tools/input.js';

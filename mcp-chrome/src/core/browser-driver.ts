@@ -9,6 +9,33 @@
  */
 
 import type { ConsoleLogEntry, NetworkRequestEntry } from './types.js'
+import type { BrowserEventAction, EventCommand } from './browser-events.js'
+import type { SemanticTarget } from './dom-helpers.js'
+
+export type { SemanticTarget } from './dom-helpers.js'
+
+export type UserActionKind = 'evaluate' | 'input'
+
+export interface BrowserRequestContext {
+    signal?: AbortSignal
+    deadline?: number
+    budgetError?: Error
+    keyboardFocus?: { id: string; targetId: string; warning?: string }
+    pendingPageCondition?: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null
+    userAction?: {
+        kind: UserActionKind
+        dispatched: boolean
+        phase: 'preparation' | 'precondition'
+    }
+}
+
+export type FrameSelection = string | number | Array<string | number>
+export interface CookieScope {
+    targetId?: string
+    storeId?: string
+    browserContextId?: string
+    partitionKey?: { topLevelSite?: string; hasCrossSiteAncestor?: boolean }
+}
 
 // ==================== 共享类型 ====================
 
@@ -50,7 +77,7 @@ export interface NetworkRequestOptions {
     clear?: boolean
 }
 
-export interface CookieFilter {
+export interface CookieFilter extends CookieScope {
     url?: string
     name?: string
     domain?: string
@@ -59,7 +86,7 @@ export interface CookieFilter {
     session?: boolean
 }
 
-export interface SetCookieParams {
+export interface SetCookieParams extends CookieScope {
     name: string
     value: string
     url?: string
@@ -99,6 +126,8 @@ export interface InteractiveElementInfo {
     refId: string
     role: string
     name: string
+    type?: string
+    value?: string
     selector: string
     visible: boolean
     disabled: boolean
@@ -130,6 +159,7 @@ export interface ActionabilityDiagnosticCandidate {
 
 export interface ActionableClickResult {
     success: boolean
+    warning?: string
     error?: string
     reason?: string
     coveringElement?: string
@@ -199,7 +229,21 @@ export interface DriverState {
     managed?: boolean
 }
 
+export interface PageMetadata {
+    origin: 'created' | 'adopted' | 'unknown'
+    createdBy: 'mcp-chrome' | 'unknown'
+    createdAt: string | null
+    lastUsedAt: string | null
+    taskHint?: string
+    note?: string
+}
+
+export interface TargetListOptions {
+    preserveDefaultTarget?: boolean
+}
+
 export interface ListedTarget {
+    metadata?: PageMetadata
     id: number | string
     targetId?: string
     url: string
@@ -286,6 +330,8 @@ export interface GroupPagesOptions {
 export type UpdateGroupOptions = Pick<GroupPagesOptions, 'title' | 'color' | 'collapsed'>
 
 export interface NewPageOptions {
+    taskHint?: string | null
+    note?: string | null
     windowId?: number
     index?: number
     groupId?: number
@@ -365,7 +411,7 @@ export interface NewTabResult extends Omit<ListedTarget, 'id'> {
  * 消费者：UnifiedSessionManager（unified-session.ts）
  *
  * 设计约定：
- * - Extension 独有的能力（refId 操作、stealth、iframe、actionable、dispatch、drag/drop）
+ * - Extension 独有的能力（refId 操作、stealth、actionable、dispatch、drag/drop）
  *   在 CDP 实现里 throw（保持业务语义而非伪造结果）
  * - precise 输入接口（inputKey/inputMouse/inputTouch/inputType）两侧实现一致语义
  * - modifiers 由调用方维护并通过 options 传入，driver 不持有键盘修饰键状态
@@ -389,12 +435,24 @@ export interface IBrowserDriver {
     getFrames?(): Promise<Record<string, unknown>>
 
     // ---- 元素查找 ----
-    find(selector?: string, text?: string, xpath?: string, timeout?: number): Promise<FindResult[]>
+    find(
+        selector?: string,
+        text?: string,
+        xpath?: string,
+        timeout?: number,
+        semanticOrMatchIndex?: SemanticTarget | number,
+        matchIndex?: number
+    ): Promise<FindResult[]>
 
     // ---- 元素操作（refId 类，仅 Extension 真实支持，CDP 实现 throw） ----
     /** Extension 真做；CDP throw（CDP 模式应通过 input 工具坐标点击） */
-    click(refId: string): Promise<void>
-    actionableClick(refId: string, force?: boolean): Promise<ActionableClickResult>
+    click(refId: string, timeout?: number, modifiers?: number): Promise<void>
+    actionableClick(
+        refId: string,
+        force?: boolean,
+        timeout?: number,
+        modifiers?: number
+    ): Promise<ActionableClickResult>
     checkActionability(refId: string): Promise<ActionableClickResult>
     dispatchInput(refId: string, text: string): Promise<DispatchInputResult>
     dragAndDrop(srcRefId: string, dstRefId: string): Promise<DragAndDropResult>
@@ -417,9 +475,17 @@ export interface IBrowserDriver {
         button?: string,
         clickCount?: number,
         refId?: string,
-        timeout?: number
+        timeout?: number,
+        modifiers?: number
     ): Promise<void>
-    stealthMouse(type: string, x: number, y: number, button?: string, timeout?: number): Promise<void>
+    stealthMouse(
+        type: string,
+        x: number,
+        y: number,
+        button?: string,
+        timeout?: number,
+        modifiers?: number
+    ): Promise<void>
     stealthType(text: string, delay?: number, timeout?: number): Promise<void>
     stealthInject(): Promise<void>
 
@@ -438,7 +504,7 @@ export interface IBrowserDriver {
         }>
     >
     setCookie(params: SetCookieParams): Promise<void>
-    deleteCookie(url: string, name: string): Promise<void>
+    deleteCookie(url: string, name: string, scope?: CookieScope): Promise<void>
     /**
      * 清除 cookies，合同条款：filter 必须含 url 或 domain，name 只能进一步缩小范围,
      * 实现层应拒绝无站点范围的清除（防止跨站误清同名登录态）
@@ -453,8 +519,8 @@ export interface IBrowserDriver {
     getChallengeState(): Promise<boolean>
 
     // ---- Tab / 状态 ----
-    listTargets(timeout?: number): Promise<ListedTarget[]>
-    listWindows?(timeout?: number): Promise<BrowserTopology>
+    listTargets(timeout?: number, options?: TargetListOptions): Promise<ListedTarget[]>
+    listWindows?(timeout?: number, options?: TargetListOptions): Promise<BrowserTopology>
     setReadAccess?(targetId: string, allow: boolean): Promise<Record<string, unknown>>
     adoptPage?(targetId: string): Promise<ManagedPageResult>
     releasePage?(targetId: string): Promise<ManagedPageResult>
@@ -472,6 +538,10 @@ export interface IBrowserDriver {
     updateGroup?(groupId: number, options: UpdateGroupOptions): Promise<GroupManagementResult>
     moveGroup?(groupId: number, options: Pick<MovePageOptions, 'windowId' | 'index'>): Promise<GroupManagementResult>
     newPage(url?: string, timeout?: number, options?: NewPageOptions): Promise<NewTabResult>
+    setPageMetadata?(
+        targetId: string,
+        updates: { taskHint?: string | null; note?: string | null }
+    ): Promise<PageMetadata>
     closePage(targetId: string): Promise<void | PageManagementResult>
     activatePage(targetId: string): Promise<void>
     activatePageWithAffected?(targetId: string): Promise<PageManagementResult>
@@ -485,14 +555,13 @@ export interface IBrowserDriver {
     setPageCondition(condition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null): void
     getState(): DriverState | null
 
-    // ---- iframe（仅 Extension） ----
-    /** 仅 Extension 模式支持；CDP throw */
-    resolveFrame(frame: string | number, timeout?: number): Promise<FrameResolveResult>
+    // ---- frame scope ----
+    /** Extension 使用原生 frame/document 身份；CDP 使用 frame tree、执行上下文和所属 target session */
+    resolveFrame(frame: FrameSelection, timeout?: number): Promise<FrameResolveResult>
     getCurrentFrameId(): number
     setCurrentFrameId(frameId: number): void
     /**
-     * 在指定 iframe 中执行 JS（precise 模式，Extension 通过 contextId 绕过 CSP），
-     * CDP 实现 throw 'iframe 穿透需要 Extension 模式'
+     * 在已解析的 frame scope 中执行 JS，保留原生异常与 stale-context 状态
      */
     evaluateInFrame(
         frameId: number,
@@ -507,6 +576,15 @@ export interface IBrowserDriver {
         staleContextRetry?: StaleContextRetryPolicy
         frameContext?: Record<string, unknown>
     }>
+
+    browserEvents(
+        action: BrowserEventAction,
+        command: EventCommand,
+        targetId?: string,
+        timeout?: number
+    ): Promise<Record<string, unknown>>
+    browserFetchCommand?(method: string, params?: Record<string, unknown>, targetId?: string): Promise<unknown>
+    suspendBrowserEventsForChallenge?(): Promise<Record<string, unknown>>
 
     // ---- CDP 命令直通 ----
     /**

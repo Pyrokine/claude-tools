@@ -9,9 +9,12 @@ import { readFile } from 'fs/promises'
 import { z } from 'zod'
 import type { StaleContextRetryPolicy } from '../core/browser-driver.js'
 import {
+    BrowserError,
     CWD_PATH_PREFIX,
     formatErrorResponse,
     formatResponse,
+    getErrorPageContext,
+    getErrorSource,
     getUnifiedSession,
     isNativeExecutionResultUnknown,
     resolveScopedInputPath,
@@ -20,13 +23,13 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
-import { EvaluateResultTooLargeError, NonSerializableEvaluateResultError } from '../core/types.js'
+import { DEFAULT_TIMEOUT, EvaluateResultTooLargeError, NonSerializableEvaluateResultError } from '../core/types.js'
 import type { InputMode } from '../core/unified-session.js'
-import { challengeResultFields, ChallengeDeniedError, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
+import { ChallengeDeniedError, challengeResultFields, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
 import { appendDiagnostics, finishDiagnostics, startDiagnostics } from './diagnostics.js'
 import { withPageContext } from './page-context.js'
 import { postConditionSchema, waitForPostCondition } from './post-condition.js'
-import { pageConditionSchema, pageTargetIdSchema, resolvePageTargetId } from './schema.js'
+import { frameZodSchema, pageConditionSchema, pageTargetIdSchema, resolvePageTargetId } from './schema.js'
 
 /**
  * evaluate 参数 schema
@@ -50,7 +53,10 @@ const evaluateSchema = z.object({
         .string()
         .optional()
         .describe(
-            `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，持久化到仓库请显式写 ${CWD_PATH_PREFIX}，字符串结果直接写原始文本，其他类型写 JSON；Extension precise 主 frame 的对象结果字符预算为 16 Mi，深度 8、节点 2000 上限不变，临时输出仍受配额约束`
+            `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，` +
+                `持久化到仓库请显式写 ${CWD_PATH_PREFIX}，字符串结果直接写原始文本，其他类型写 JSON；` +
+                '绝对路径仅限当前工作目录或本次 Server 会话的受控临时目录，实际允许根见 error.context.allowedRoots；' +
+                'Extension precise 主 frame 的对象结果字符预算为 16 Mi，深度 8、节点 2000 上限不变，临时输出仍受配额约束'
         ),
     timeout: z
         .number()
@@ -68,7 +74,7 @@ const evaluateSchema = z.object({
         .enum(['never', 'readOnly'])
         .optional()
         .describe(
-            'iframe precise 执行遇到 stale execution context 时的重试契约；默认 never 不重放，readOnly 表示脚本无副作用并允许重新解析 context 后重放一次'
+            'iframe precise 的 context 重试策略；默认 never 不重放，readOnly 仅适用于 Extension，表示脚本无副作用并允许重新解析后重放一次；CDP iframe 请求 readOnly 时在派发前返回能力错误'
         ),
     diagnostics: z
         .boolean()
@@ -81,12 +87,7 @@ const evaluateSchema = z.object({
         .describe('脚本执行后要验证的页面状态；不传时 success 只表示脚本已执行并返回，不表示业务结果已达成'),
     targetId: pageTargetIdSchema.describe('目标页面 ID（Extension 或 CDP），优先于默认操作目标'),
     tabId: pageTargetIdSchema.describe('旧版目标 Tab ID，与 targetId 相同语义，保留兼容'),
-    frame: z
-        .union([z.string(), z.number()])
-        .optional()
-        .describe(
-            'iframe 定位（可选，仅 Extension 模式），CSS 选择器（如 "iframe#main"）或索引（如 0），不指定则在主框架执行'
-        ),
+    frame: frameZodSchema.describe('iframe selector／索引或逐层路径（如 ["iframe#outer", 0]），省略时使用主文档'),
 })
 
 /**
@@ -116,33 +117,6 @@ function invalidEvaluateInputResponse(message: string): ToolResponse {
     }
 }
 
-function cspErrorResponse(): ToolResponse {
-    return {
-        content: [
-            {
-                type: 'text',
-                text: JSON.stringify({
-                    error: {
-                        code: 'CSP_BLOCKED',
-                        message: 'CSP 限制：此页面禁止动态代码执行',
-                        suggestion: '请添加 mode="precise" 参数使用 debugger API 绕过 CSP（会显示调试提示）',
-                    },
-                }),
-            },
-        ],
-        isError: true,
-    }
-}
-
-function formatEvaluateErrorResponse(error: unknown): ToolResponse {
-    const errorMessage = error instanceof Error ? error.message : String(error)
-    return errorMessage.includes('CSP') ||
-        errorMessage.includes('Content Security Policy') ||
-        errorMessage.includes('unsafe-eval')
-        ? cspErrorResponse()
-        : formatErrorResponse(error)
-}
-
 export function resolveEvaluateMode(mode: InputMode | undefined): InputMode {
     return mode ?? 'precise'
 }
@@ -152,10 +126,43 @@ export function resolveStaleContextRetryPolicy(policy: StaleContextRetryPolicy |
 }
 
 export function classifyEvaluateActionError(error: unknown): {
-    actionExecuted: boolean
-    actionStatus: 'failed' | 'unknown'
+    actionExecuted: boolean | 'unknown'
+    actionStatus: 'completed' | 'not_started' | 'failed' | 'unknown'
+    failureStage?: string
     retryable: boolean
 } {
+    const contextPhase = getErrorPageContext(error)?.contextPhase
+    if (contextPhase === 'before' || contextPhase === 'precondition' || contextPhase === 'preparation') {
+        return {
+            actionExecuted: false,
+            actionStatus: 'not_started',
+            failureStage: contextPhase === 'precondition' ? 'precondition' : 'context',
+            retryable: false,
+        }
+    }
+    if (getErrorSource(error) === 'page') {
+        return { actionExecuted: true, actionStatus: 'failed', retryable: false }
+    }
+    const context = error instanceof StructuredToolError || error instanceof BrowserError ? error.context : undefined
+    if (
+        context &&
+        (context.actionExecuted === false || context.actionExecuted === true || context.actionExecuted === 'unknown')
+    ) {
+        return {
+            actionExecuted: context.actionExecuted,
+            actionStatus:
+                context.actionStatus === 'completed' ||
+                context.actionStatus === 'not_started' ||
+                context.actionStatus === 'failed' ||
+                context.actionStatus === 'unknown'
+                    ? context.actionStatus
+                    : context.actionExecuted === 'unknown'
+                      ? 'unknown'
+                      : 'failed',
+            ...(typeof context.failureStage === 'string' ? { failureStage: context.failureStage } : {}),
+            retryable: context.retryable === true,
+        }
+    }
     const message = error instanceof Error ? error.message : String(error)
     const preActionTimeout = /(?:timeout|timed out) before/i.test(message)
     const timedOut = !preActionTimeout && /Request timeout|timed out|timeout|超时/i.test(message)
@@ -167,8 +174,9 @@ export function classifyEvaluateActionError(error: unknown): {
         isNativeExecutionResultUnknown(error) ||
         timedOut ||
         /FRAME_STALE_CONTEXT|FRAME_EVALUATION_FAILED|Execution context became stale/i.test(message)
+    const explicitExecution = (error as { context?: { actionExecuted?: unknown } } | null)?.context?.actionExecuted
     return {
-        actionExecuted: executionStatusUnknown || pageEvaluationStarted,
+        actionExecuted: explicitExecution === 'unknown' ? 'unknown' : executionStatusUnknown || pageEvaluationStarted,
         actionStatus: executionStatusUnknown ? 'unknown' : 'failed',
         retryable:
             !executionStatusUnknown &&
@@ -178,12 +186,18 @@ export function classifyEvaluateActionError(error: unknown): {
 }
 
 export function classifyEvaluateFailure(error: unknown): {
-    actionExecuted: boolean
-    actionStatus: 'completed' | 'failed' | 'unknown'
-    failureStage: 'action' | 'output'
+    actionExecuted: boolean | 'unknown'
+    actionStatus: 'completed' | 'not_started' | 'failed' | 'unknown'
+    failureStage: string
     retryable: boolean
 } {
-    if (error instanceof NonSerializableEvaluateResultError || error instanceof EvaluateResultTooLargeError) {
+    const contextPhase = getErrorPageContext(error)?.contextPhase
+    if (
+        contextPhase !== 'before' &&
+        contextPhase !== 'precondition' &&
+        contextPhase !== 'preparation' &&
+        (error instanceof NonSerializableEvaluateResultError || error instanceof EvaluateResultTooLargeError)
+    ) {
         return {
             actionExecuted: true,
             actionStatus: 'completed',
@@ -192,8 +206,8 @@ export function classifyEvaluateFailure(error: unknown): {
         }
     }
     return {
-        ...classifyEvaluateActionError(error),
         failureStage: 'action',
+        ...classifyEvaluateActionError(error),
     }
 }
 
@@ -215,7 +229,9 @@ function appendEvaluateFailureMetadata(
             error.context.actionExecuted === false &&
             error.context.actionStatus === 'not_started' &&
             error.context.failureStage === 'precondition'
+        const conditionReadFailed = getErrorPageContext(error)?.contextPhase === 'precondition'
         const preconditionFailed =
+            conditionReadFailed ||
             unavailableCondition ||
             (error !== null &&
                 typeof error === 'object' &&
@@ -225,7 +241,7 @@ function appendEvaluateFailureMetadata(
             ? {
                   actionExecuted: false,
                   actionStatus: 'not_started',
-                  failureStage: unavailableCondition ? 'precondition' : 'action',
+                  failureStage: conditionReadFailed || unavailableCondition ? 'precondition' : 'action',
                   retryable: false,
                   verificationStatus: 'unavailable',
               }
@@ -260,7 +276,10 @@ function appendEvaluateFailureMetadata(
     }
 }
 
-async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
+async function handleEvaluate(
+    args: z.infer<typeof evaluateSchema>,
+    signal?: AbortSignal
+): Promise<{
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
 }> {
@@ -270,6 +289,7 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
     if (hasScript === hasScriptFile) {
         return invalidEvaluateInputResponse('script 与 scriptFile 必须且只能提供一个')
     }
+    const deadline = Date.now() + (args.timeout ?? DEFAULT_TIMEOUT)
     let script = args.script
     let outputPath: string | undefined
     if (args.scriptFile) {
@@ -292,127 +312,192 @@ async function handleEvaluate(args: z.infer<typeof evaluateSchema>): Promise<{
     }
 
     let challengeFields: Record<string, unknown> = {}
+    let evaluationCompleted = false
+    let failureStage = 'action'
     try {
         const unifiedSession = getUnifiedSession()
 
-        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
-            return unifiedSession.withPageCondition(args, () =>
-                unifiedSession.withFrame(args.frame, async () => {
-                    const startedAt = Date.now()
-                    if (args.expectedUrl === undefined && args.expectedRevision === undefined) {
-                        challengeFields = challengeResultFields(
-                            await resolveChallenge(unifiedSession, 'evaluate', 'not_started', args.timeout)
-                        )
-                    }
-                    const remainingTimeout =
-                        args.timeout === undefined ? undefined : Math.max(0, args.timeout - (Date.now() - startedAt))
-                    const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
-                    const evaluationMode = resolveEvaluateMode(args.mode)
-                    const staleContextRetry = resolveStaleContextRetryPolicy(args.staleContextRetry)
-                    let result: unknown
-                    let evaluationMetadata: ReturnType<typeof unifiedSession.consumeLastEvaluationMetadata>
-                    try {
-                        result = await unifiedSession.evaluate(
-                            script,
-                            evaluationMode,
-                            remainingTimeout,
-                            args.args as unknown[],
-                            {
-                                staleContextRetry,
-                                fileOutput: outputPath !== undefined,
-                            }
-                        )
-                        evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
-                    } catch (error) {
-                        evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
-                        const response = formatEvaluateErrorResponse(error)
-                        const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition), {
-                            ...challengeFields,
-                            staleContextRetry,
-                            ...(evaluationMetadata ?? {}),
-                        })
-                        if (payload) {
-                            appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
-                            response.content[0].text = JSON.stringify(payload, null, 2)
+        return await withPageContext(
+            unifiedSession,
+            resolvePageTargetId(args),
+            async () => {
+                return unifiedSession.withPageCondition(args, () =>
+                    unifiedSession.withFrame(args.frame, async () => {
+                        const startedAt = Date.now()
+                        if (args.expectedUrl === undefined && args.expectedRevision === undefined) {
+                            challengeFields = challengeResultFields(
+                                await resolveChallenge(unifiedSession, 'evaluate', 'not_started', args.timeout)
+                            )
                         }
-                        return response
-                    }
+                        const remainingTimeout =
+                            args.timeout === undefined
+                                ? undefined
+                                : Math.max(0, args.timeout - (Date.now() - startedAt))
+                        const diagnostics = await startDiagnostics(unifiedSession, args.diagnostics)
+                        const evaluationMode = resolveEvaluateMode(args.mode)
+                        const staleContextRetry = resolveStaleContextRetryPolicy(args.staleContextRetry)
+                        let result: unknown
+                        let evaluationMetadata: ReturnType<typeof unifiedSession.consumeLastEvaluationMetadata>
+                        try {
+                            result = await unifiedSession.evaluate(
+                                script,
+                                evaluationMode,
+                                remainingTimeout,
+                                args.args as unknown[],
+                                {
+                                    staleContextRetry,
+                                    fileOutput: outputPath !== undefined,
+                                    userAction: 'evaluate',
+                                }
+                            )
+                            evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
+                        } catch (error) {
+                            unifiedSession.annotateUserActionError(error)
+                            evaluationMetadata = unifiedSession.consumeLastEvaluationMetadata()
+                            const response = formatErrorResponse(error)
+                            const payload = appendEvaluateFailureMetadata(
+                                response,
+                                error,
+                                Boolean(args.postCondition),
+                                {
+                                    ...challengeFields,
+                                    staleContextRetry,
+                                    ...(evaluationMetadata ?? {}),
+                                }
+                            )
+                            if (payload) {
+                                appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                                response.content[0].text = JSON.stringify(payload, null, 2)
+                            }
+                            return response
+                        }
 
-                    const normalizedResult = result === undefined ? null : result
-                    const postCondition = args.postCondition
-                        ? await waitForPostCondition(unifiedSession, args.postCondition, 'evaluate', evaluationMode)
-                        : undefined
-                    const payload: Record<string, unknown> = {
-                        ...challengeFields,
-                        success: postCondition ? postCondition.verificationStatus === 'matched' : true,
-                        mode: unifiedSession.getMode(),
-                        actionExecuted: true,
-                        actionStatus: 'completed',
-                        verificationRequested: Boolean(postCondition),
-                        verificationStatus: postCondition?.verificationStatus ?? 'unavailable',
-                        failureStage:
-                            postCondition && postCondition.verificationStatus !== 'matched'
-                                ? 'verification'
-                                : undefined,
-                        retryable: postCondition?.retryable ?? false,
-                        ...(args.frame !== undefined ? { staleContextRetry } : {}),
-                        ...(evaluationMetadata ?? {}),
-                        ...(postCondition ? { postCondition } : {}),
-                    }
-
-                    try {
-                        if (outputPath) {
-                            const content =
-                                typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
-                            await writePrivateFile(outputPath, content, 'utf-8')
-                            payload.output = outputPath
-                        } else {
-                            const serialized = JSON.stringify(normalizedResult, null, 2)
-                            if (serialized.length > 100_000) {
-                                const suffix = typeof result === 'string' ? 'txt' : 'json'
-                                const autoSavedPath = (
-                                    await resolveScopedOutputPath(
-                                        `${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`,
-                                        'mcp-chrome'
+                        evaluationCompleted = true
+                        failureStage = 'verification'
+                        if (Date.now() < deadline) {
+                            Object.assign(
+                                challengeFields,
+                                challengeResultFields(
+                                    await resolveChallenge(
+                                        unifiedSession,
+                                        'evaluate',
+                                        'completed',
+                                        deadline - Date.now()
                                     )
-                                ).absolutePath
-                                const fileContent = typeof result === 'string' ? result : serialized
-                                await writePrivateFile(autoSavedPath, fileContent, 'utf-8')
-                                Object.assign(payload, {
-                                    autoSaved: true,
-                                    path: autoSavedPath,
-                                    size: fileContent.length,
-                                    hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
-                                })
-                            } else {
-                                payload.result = normalizedResult
-                            }
+                                )
+                            )
+                        } else {
+                            Object.assign(challengeFields, {
+                                challengeVerificationStatus: 'unavailable',
+                                challengeVerificationError: '脚本已确认返回，剩余 timeout 已用尽',
+                            })
                         }
-                    } catch (error) {
-                        const response = formatEvaluateErrorResponse(error)
-                        const failurePayload = appendEvaluateFailureMetadata(response, error, Boolean(postCondition), {
+                        const normalizedResult = result === undefined ? null : result
+                        const postCondition = args.postCondition
+                            ? await waitForPostCondition(
+                                  unifiedSession,
+                                  args.postCondition,
+                                  'evaluate',
+                                  evaluationMode,
+                                  deadline,
+                                  signal
+                              )
+                            : undefined
+                        const payload: Record<string, unknown> = {
                             ...challengeFields,
+                            success: postCondition ? postCondition.verificationStatus === 'matched' : true,
+                            mode: unifiedSession.getMode(),
                             actionExecuted: true,
                             actionStatus: 'completed',
+                            verificationRequested: Boolean(postCondition),
                             verificationStatus: postCondition?.verificationStatus ?? 'unavailable',
-                            failureStage: 'output',
+                            failureStage:
+                                postCondition && postCondition.verificationStatus !== 'matched'
+                                    ? 'verification'
+                                    : undefined,
                             retryable: false,
+                            ...(args.frame !== undefined ? { staleContextRetry } : {}),
+                            ...(evaluationMetadata ?? {}),
                             ...(postCondition ? { postCondition } : {}),
-                        })
-                        if (failurePayload) {
-                            appendDiagnostics(failurePayload, await finishDiagnostics(unifiedSession, diagnostics))
-                            response.content[0].text = JSON.stringify(failurePayload, null, 2)
                         }
-                        return response
-                    }
-                    appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
-                    return formatResponse(payload)
-                })
-            )
-        }) // withTabId
+
+                        try {
+                            if (outputPath) {
+                                const content =
+                                    typeof result === 'string' ? result : JSON.stringify(normalizedResult, null, 2)
+                                await writePrivateFile(outputPath, content, 'utf-8', () =>
+                                    unifiedSession.assertRequestActive()
+                                )
+                                payload.output = outputPath
+                            } else {
+                                const serialized = JSON.stringify(normalizedResult, null, 2)
+                                if (serialized.length > 100_000) {
+                                    const suffix = typeof result === 'string' ? 'txt' : 'json'
+                                    const autoSavedPath = (
+                                        await resolveScopedOutputPath(
+                                            `${TMP_PATH_PREFIX}evaluate/auto-${Date.now()}.${suffix}`,
+                                            'mcp-chrome'
+                                        )
+                                    ).absolutePath
+                                    const fileContent = typeof result === 'string' ? result : serialized
+                                    await writePrivateFile(autoSavedPath, fileContent, 'utf-8', () =>
+                                        unifiedSession.assertRequestActive()
+                                    )
+                                    Object.assign(payload, {
+                                        autoSaved: true,
+                                        path: autoSavedPath,
+                                        size: fileContent.length,
+                                        hint: '结果过大已自动保存到受控临时目录，请使用 Read 工具读取',
+                                    })
+                                } else {
+                                    payload.result = normalizedResult
+                                }
+                            }
+                        } catch (error) {
+                            const response = formatErrorResponse(error)
+                            const failurePayload = appendEvaluateFailureMetadata(
+                                response,
+                                error,
+                                Boolean(postCondition),
+                                {
+                                    ...challengeFields,
+                                    actionExecuted: true,
+                                    actionStatus: 'completed',
+                                    verificationStatus: postCondition?.verificationStatus ?? 'unavailable',
+                                    failureStage: 'output',
+                                    retryable: false,
+                                    ...(postCondition ? { postCondition } : {}),
+                                }
+                            )
+                            if (failurePayload) {
+                                appendDiagnostics(failurePayload, await finishDiagnostics(unifiedSession, diagnostics))
+                                response.content[0].text = JSON.stringify(failurePayload, null, 2)
+                            }
+                            return response
+                        }
+                        failureStage = 'context'
+                        appendDiagnostics(payload, await finishDiagnostics(unifiedSession, diagnostics))
+                        return formatResponse(payload)
+                    })
+                )
+            },
+            deadline,
+            signal,
+            'evaluate'
+        ) // withTabId
     } catch (error) {
-        const response = formatEvaluateErrorResponse(error)
-        const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition), challengeFields)
+        const response = formatErrorResponse(error)
+        const payload = appendEvaluateFailureMetadata(response, error, Boolean(args.postCondition), {
+            ...challengeFields,
+            ...(evaluationCompleted
+                ? {
+                      actionExecuted: true,
+                      actionStatus: 'completed',
+                      failureStage,
+                      retryable: false,
+                  }
+                : {}),
+        })
         if (payload) {
             payload.diagnosticsStatus = args.diagnostics ? 'unavailable' : 'disabled'
             if (args.diagnostics) {
@@ -443,6 +528,6 @@ export function registerEvaluateTool(server: McpServer): void {
             ].join(''),
             inputSchema: evaluateSchema,
         },
-        (args) => handleEvaluate(args)
+        (args, extra) => handleEvaluate(args, extra?.signal)
     )
 }

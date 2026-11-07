@@ -6,11 +6,12 @@
 
 import { ExpectedOperationError } from '../types/expected-errors'
 import type { TabInfo } from '../types'
-import { assertManagedTab, getTargetTabId, type ActionContext } from './action-utils'
+import { assertActionActive, assertManagedTab, getTargetTabId, type ActionContext } from './action-utils'
 import { ContentHandler } from './content-handler'
 import { CookieHandler } from './cookie-handler'
 import { DebuggerHandler } from './debugger-handler'
 import { DebuggerManager } from './debugger-manager'
+import { BrowserEventHandler } from './browser-event-handler'
 import { FrameResolver } from './frame-resolver'
 import { InputEventHandler } from './input-event-handler'
 import { LogEventHandler } from './log-event-handler'
@@ -27,7 +28,7 @@ import { NavigationHandler, remainingNavigationTimeout } from './navigation-hand
 import { StealthHandler } from './stealth-handler'
 import { TabHandler } from './tab-handler'
 import { hasReadGrant, setReadGrant } from './read-grants'
-import { isManagedTab } from './tab-state'
+import { getManagedTabMetadata, isManagedTab, refreshManagedTabRelations } from './tab-state'
 import { TabsReadAccessSchema } from '../types/schemas'
 
 type ActionFunction = (params: unknown, context: ActionContext) => Promise<unknown>
@@ -86,6 +87,7 @@ const MANAGED_PAGE_ONLY = new Set([
     'debugger_attach',
     'debugger_detach',
     'debugger_send',
+    'keyboard_focus',
     'input_key',
     'input_mouse',
     'input_touch',
@@ -112,6 +114,7 @@ const MANAGED_PAGE_ONLY = new Set([
 ])
 
 const PAGE_READS = new Set([
+    'tabs_metadata',
     'tabs_read_access',
     'read_page',
     'find',
@@ -130,6 +133,7 @@ export class ActionHandler {
     private actionLocks = new Map<number, Promise<void>>()
     private logManager = new LogManager()
     private debuggerManager = new DebuggerManager(this.logManager)
+    private browserEventHandler = new BrowserEventHandler(this.debuggerManager)
     private navigationHandler = new NavigationHandler(this.logManager, (tabId) =>
         this.logEventHandler.enableNetworkObservation(tabId)
     )
@@ -144,27 +148,67 @@ export class ActionHandler {
     private stealthHandler = new StealthHandler()
 
     constructor() {
+        this.debuggerHandler.browserEvents = this.browserEventHandler
         this.registerActions()
         this.debuggerManager.setupListeners()
     }
 
     async execute(action: string, params: unknown, context: ActionContext): Promise<unknown> {
+        const deadline = (params as { deadline?: unknown } | null)?.deadline
+        if (deadline !== undefined && (typeof deadline !== 'number' || !Number.isFinite(deadline))) {
+            throw new ExpectedOperationError('Action deadline must be a finite number', false)
+        }
+        context = { ...context, deadline: deadline as number | undefined }
+        assertActionActive(context)
         const handler = this.actions.get(action)
+        if (action === 'browser_events_raw') {
+            const p = params as { tabId?: number; method?: string; params?: Record<string, unknown> }
+            if (
+                !Number.isSafeInteger(p.tabId) ||
+                ![
+                    'Fetch.continueRequest',
+                    'Fetch.continueResponse',
+                    'Fetch.fulfillRequest',
+                    'Fetch.failRequest',
+                    'Fetch.continueWithAuth',
+                    'Fetch.getResponseBody',
+                    'Fetch.disable',
+                ].includes(p.method ?? '')
+            ) {
+                throw new ExpectedOperationError('Unsupported ref-directed Fetch command', false)
+            }
+            await assertManagedTab(p.tabId!, context, action)
+            assertActionActive(context)
+            return this.browserEventHandler.rawFetch(p.tabId!, p.method!, p.params, context)
+        }
+        if (action === 'browser_events') {
+            return this.browserEventHandler.execute(params, context)
+        }
+        if (action === 'keyboard_focus' && (params as { operation?: string } | null)?.operation === 'release') {
+            return this.debuggerHandler.keyboardFocus(params, context)
+        }
+        if (action === 'browser_events_suspend') {
+            const tabId = (params as { tabId?: number })?.tabId
+            if (!Number.isSafeInteger(tabId)) {
+                throw new ExpectedOperationError('Explicit tabId required', false)
+            }
+            await assertManagedTab(tabId!, context, action)
+            return this.browserEventHandler.suspendTab(tabId!, 'Cloudflare challenge', context.serverInstanceId)
+        }
         if (!handler) {
             throw new ExpectedOperationError(
-                JSON.stringify({
-                    error: {
-                        code: 'UNKNOWN_ACTION',
-                        message: `Unknown action: ${action}`,
-                    },
-                })
+                JSON.stringify({ error: { code: 'UNKNOWN_ACTION', message: `Unknown action: ${action}` } })
             )
+        }
+        if (action === 'tabs_create') {
+            return this.withActionLocks([-1], () => handler(params, context), context)
         }
         if (action.startsWith('tabgroup_')) {
             const snapshot = await this.tabHandler.getGroupLockSnapshot(action, params, context)
             return this.withActionLocks(
-                snapshot.map((tab) => tab.id!),
+                [-1, ...snapshot.map((tab) => tab.id!)],
                 async () => {
+                    assertActionActive(context)
                     const current = await this.tabHandler.getGroupLockSnapshot(action, params, context)
                     const request = params as { tabId?: number; tabIds?: number[] }
                     const targets = (tabs: chrome.tabs.Tab[]) =>
@@ -179,8 +223,10 @@ export class ActionHandler {
                         throw new ExpectedOperationError('分组成员或窗口已变化，未执行分组操作')
                     }
                     await Promise.all(targets(current).map((tab) => assertManagedTab(tab.id!, context, action)))
+                    assertActionActive(context)
                     return handler(params, context)
-                }
+                },
+                context
             )
         }
         const mutating = PAGE_MUTATIONS.has(action)
@@ -192,78 +238,144 @@ export class ActionHandler {
                 deadline?: number
             } | null
             const tabId = await getTargetTabId(request?.tabId)
-            return this.withActionLocks([tabId], async () => {
-                if (request?.deadline !== undefined) {
-                    const deadline = (params as { deadline?: unknown } | null)?.deadline
-                    if (deadline !== undefined && (typeof deadline !== 'number' || !Number.isFinite(deadline))) {
-                        throw new ExpectedOperationError(
-                            JSON.stringify({
-                                error: {
-                                    code: 'INVALID_ARGUMENT',
-                                    message: 'Action deadline must be a finite number',
-                                    context: { actionExecuted: false },
-                                },
-                            })
-                        )
+            return this.withActionLocks(
+                action.startsWith('tabs_') ? [-1, tabId] : [tabId],
+                async () => {
+                    if (request?.deadline !== undefined) {
+                        const deadline = (params as { deadline?: unknown } | null)?.deadline
+                        if (deadline !== undefined && (typeof deadline !== 'number' || !Number.isFinite(deadline))) {
+                            throw new ExpectedOperationError(
+                                JSON.stringify({
+                                    error: {
+                                        code: 'INVALID_ARGUMENT',
+                                        message: 'Action deadline must be a finite number',
+                                        context: { actionExecuted: false },
+                                    },
+                                })
+                            )
+                        }
+                        if (typeof deadline === 'number') {
+                            remainingNavigationTimeout(deadline)
+                        }
                     }
-                    if (typeof deadline === 'number') {
-                        remainingNavigationTimeout(deadline)
+                    await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
+                    if (MANAGED_PAGE_ONLY.has(action)) {
+                        await assertManagedTab(tabId, context, action)
                     }
-                }
-                await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
-                if (MANAGED_PAGE_ONLY.has(action)) {
-                    await assertManagedTab(tabId, context, action)
-                }
-                if (request?.deadline !== undefined) {
-                    remainingNavigationTimeout(request.deadline)
-                }
-                const warnings: string[] = []
-                if (action === 'tabs_release' && this.debuggerManager.isAttached(tabId)) {
+                    if (request?.deadline !== undefined) {
+                        remainingNavigationTimeout(request.deadline)
+                    }
+                    const warnings: string[] = []
+                    if (action === 'tabs_release' && this.debuggerManager.isAttached(tabId)) {
+                        try {
+                            await this.debuggerHandler.debuggerDetach({ tabId }, context)
+                        } catch (error) {
+                            warnings.push(
+                                `debugger 清理失败：${error instanceof Error ? error.message : String(error)}`
+                            )
+                        }
+                    }
+                    assertActionActive(context)
+                    const nativeType =
+                        (params as { type?: string; params?: { type?: string } })?.type ??
+                        (params as { params?: { type?: string } })?.params?.type
+                    const cleanupInput = ['mouseReleased', 'keyUp', 'touchEnd', 'touchCancel'].includes(
+                        nativeType ?? ''
+                    )
+                    const dialogHandling =
+                        action === 'debugger_send' &&
+                        (params as { method?: string })?.method === 'Page.handleJavaScriptDialog'
+                    if (mutating && !action.startsWith('tabs_') && !cleanupInput && !dialogHandling) {
+                        try {
+                            this.browserEventHandler.controller(tabId, context).assertNativeReady()
+                        } catch (error) {
+                            if ((error as { code?: string }).code !== 'DIALOG_OPEN') {
+                                throw error
+                            }
+                            throw new ExpectedOperationError(
+                                JSON.stringify((error as { toJSON: () => unknown }).toJSON()),
+                                false
+                            )
+                        }
+                    }
+                    let result: unknown
+                    let actionExecuted = true
                     try {
-                        await this.debuggerHandler.debuggerDetach({ tabId }, context)
+                        if (!action.startsWith('tabs_')) {
+                            this.browserEventHandler.controller(tabId, context)
+                        }
+                        const native = handler(params, context)
+                        result =
+                            PAGE_MUTATIONS.has(action) && !action.startsWith('tabs_')
+                                ? await this.browserEventHandler
+                                      .controller(tabId, context)
+                                      .race(native)
+                                      .catch((error) => {
+                                          if ((error as { code?: string }).code === 'DIALOG_OPEN') {
+                                              throw new ExpectedOperationError(
+                                                  JSON.stringify({
+                                                      error: {
+                                                          code: 'DIALOG_OPEN',
+                                                          message: (error as Error).message,
+                                                          context: (error as { context?: unknown }).context,
+                                                      },
+                                                  })
+                                              )
+                                          }
+                                          throw error
+                                      })
+                                : await native
+                        if (action === 'tabs_close') {
+                            forgetPageRevision(tabId)
+                        }
+                        if (action === 'tabs_release') {
+                            if (
+                                (result as { managedBefore: boolean }).managedBefore &&
+                                !(await this.logEventHandler.flushAndUninstallConsoleHook(tabId))
+                            ) {
+                                warnings.push('console 监听清理失败，请检查 Extension 日志')
+                            }
+                            this.cleanupTab(tabId)
+                            if (warnings.length) {
+                                return { ...(result as object), warnings }
+                            }
+                        }
+                        return result
                     } catch (error) {
-                        warnings.push(`debugger 清理失败：${error instanceof Error ? error.message : String(error)}`)
-                    }
-                }
-                let result: unknown
-                let actionExecuted = true
-                try {
-                    result = await handler(params, context)
-                    if (action === 'tabs_close') {
-                        forgetPageRevision(tabId)
-                    }
-                    if (action === 'tabs_release') {
-                        if (
-                            (result as { managedBefore: boolean }).managedBefore &&
-                            !(await this.logEventHandler.flushAndUninstallConsoleHook(tabId))
-                        ) {
-                            warnings.push('console 监听清理失败，请检查 Extension 日志')
-                        }
-                        this.cleanupTab(tabId)
-                        if (warnings.length) {
-                            return { ...(result as object), warnings }
-                        }
-                    }
-                    return result
-                } catch (error) {
-                    actionExecuted = !(error instanceof ExpectedOperationError && error.actionExecuted === false)
-                    throw error
-                } finally {
-                    if (mutating && actionExecuted && action !== 'tabs_close') {
-                        advancePageRevision(tabId)
-                        if (action.startsWith('tabs_') || action === 'navigate') {
-                            const info = result as
-                                { id?: number; revision?: string; tab?: TabInfo; after?: TabInfo | null } | undefined
-                            const after = info?.tab ?? info?.after ?? info
-                            if (after?.id === tabId) {
-                                after.revision = pageRevision(tabId)
+                        actionExecuted = !(error instanceof ExpectedOperationError && error.actionExecuted === false)
+                        throw error
+                    } finally {
+                        if (mutating && actionExecuted && action !== 'tabs_close') {
+                            advancePageRevision(tabId)
+                            if (action.startsWith('tabs_') || action === 'navigate') {
+                                const info = result as
+                                    | { id?: number; revision?: string; tab?: TabInfo; after?: TabInfo | null }
+                                    | undefined
+                                const after = info?.tab ?? info?.after ?? info
+                                if (after?.id === tabId) {
+                                    after.revision = pageRevision(tabId)
+                                }
                             }
                         }
                     }
-                }
-            })
+                },
+                context
+            )
         }
+        assertActionActive(context)
         return handler(params, context)
+    }
+
+    async releaseBrowserEventOwner(owner: string): Promise<void> {
+        await this.browserEventHandler.releaseOwner(owner)
+    }
+
+    async releaseKeyboardFocusOwner(owner: string): Promise<void> {
+        await this.debuggerManager.releaseKeyboardFocusOwner(owner)
+    }
+
+    async refreshNativeRelations(): Promise<void> {
+        await this.withActionLocks([-1], refreshManagedTabRelations)
     }
 
     /**
@@ -275,10 +387,17 @@ export class ActionHandler {
         this.inputEventHandler.cleanupTab(tabId)
     }
 
-    private async withActionLocks<T>(tabIds: number[], action: () => Promise<T>): Promise<T> {
+    private async withActionLocks<T>(tabIds: number[], action: () => Promise<T>, context?: ActionContext): Promise<T> {
         const ids = [...new Set(tabIds)].sort((a, b) => a - b)
         const previous = Promise.all(ids.map((id) => this.actionLocks.get(id)))
-        const operation = previous.then(action)
+        let started = false
+        const operation = previous.then(() => {
+            if (context) {
+                assertActionActive(context)
+            }
+            started = true
+            return action()
+        })
         const settled = operation.then(
             () => {},
             () => {}
@@ -286,13 +405,39 @@ export class ActionHandler {
         for (const id of ids) {
             this.actionLocks.set(id, settled)
         }
-        try {
-            return await operation
-        } finally {
+        void settled.then(() => {
             for (const id of ids) {
                 if (this.actionLocks.get(id) === settled) {
                     this.actionLocks.delete(id)
                 }
+            }
+        })
+        const signal = context?.signal
+        if (!signal) {
+            return operation
+        }
+        let onAbort: (() => void) | undefined
+        try {
+            return await new Promise<T>((resolve, reject) => {
+                onAbort = () => {
+                    if (started) {
+                        return
+                    }
+                    try {
+                        assertActionActive(context!)
+                    } catch (error) {
+                        reject(error)
+                    }
+                }
+                signal.addEventListener('abort', onAbort, { once: true })
+                if (signal.aborted) {
+                    onAbort()
+                }
+                operation.then(resolve, reject)
+            })
+        } finally {
+            if (onAbort) {
+                signal.removeEventListener('abort', onAbort)
             }
         }
     }
@@ -304,10 +449,11 @@ export class ActionHandler {
             if (!Number.isSafeInteger(tabId) || tabId! < 0) {
                 throw new ExpectedOperationError('page_snapshot 需要有效 tabId')
             }
-            return pageSnapshot(tabId!)
+            return { ...(await pageSnapshot(tabId!)), metadata: getManagedTabMetadata(tabId!) }
         })
         this.actions.set('tabs_list', this.tabHandler.tabsList.bind(this.tabHandler))
         this.actions.set('tabs_topology', this.tabHandler.tabsTopology.bind(this.tabHandler))
+        this.actions.set('tabs_metadata', this.tabHandler.tabsMetadata.bind(this.tabHandler))
         this.actions.set('tabs_create', this.tabHandler.tabsCreate.bind(this.tabHandler))
         this.actions.set('tabs_close', this.tabHandler.tabsClose.bind(this.tabHandler))
         this.actions.set('tabs_activate', this.tabHandler.tabsActivate.bind(this.tabHandler))
@@ -320,8 +466,10 @@ export class ActionHandler {
                 throw new ExpectedOperationError('缺少服务器实例身份，未修改只读权限')
             }
             const before = await pageSnapshot(tabId)
-            await setReadGrant(context.serverInstanceId, tabId, allow, before)
-            const allowed = await hasReadGrant(context.serverInstanceId, tabId)
+            await setReadGrant(context.serverInstanceId, tabId, allow, before, () => assertActionActive(context))
+            const allowed = await hasReadGrant(context.serverInstanceId, tabId, () =>
+                assertActionActive(context, { action: 'tabs_read_access', targetId: String(tabId) })
+            )
             if (allowed !== allow) {
                 throw new ExpectedOperationError('页面身份已变化，未授予只读权限')
             }
@@ -394,6 +542,7 @@ export class ActionHandler {
         this.actions.set('debugger_attach', this.debuggerHandler.debuggerAttach.bind(this.debuggerHandler))
         this.actions.set('debugger_detach', this.debuggerHandler.debuggerDetach.bind(this.debuggerHandler))
         this.actions.set('debugger_send', this.debuggerHandler.debuggerSend.bind(this.debuggerHandler))
+        this.actions.set('keyboard_focus', this.debuggerHandler.keyboardFocus.bind(this.debuggerHandler))
 
         // 输入事件（通过 CDP）- precise 模式
         this.actions.set('input_key', this.inputEventHandler.inputKey.bind(this.inputEventHandler))

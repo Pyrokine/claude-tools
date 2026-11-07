@@ -20,6 +20,7 @@ import {
     TabsCreateSchema,
     TabsListSchema,
     TabsMoveSchema,
+    TabsMetadataSchema,
     TabsPinSchema,
     TabsReleaseSchema,
     TabsReorderSchema,
@@ -29,10 +30,21 @@ import {
     WindowFocusSchema,
     WindowUpdateSchema,
 } from '../types/schemas'
-import { ActionContext, assertManagedTab, tabToInfo } from './action-utils'
+import { ActionContext, assertActionActive, assertManagedTab, tabToInfo } from './action-utils'
 import { NavigationHandler } from './navigation-handler'
 import { getExistingTab } from './page-revision'
-import { isManagedTab, markManagedTab, setMcpTabGroupId, setMcpWindowId, unmarkManagedTab } from './tab-state'
+import {
+    getManagedTabRecord,
+    getManagedTabMetadata,
+    isManagedTab,
+    markManagedTab,
+    refreshManagedTabRelations,
+    setManagedTabGroup,
+    updateManagedTabMetadata,
+    setMcpTabGroupId,
+    setMcpWindowId,
+    unmarkManagedTab,
+} from './tab-state'
 
 function windowToInfo(window: chrome.windows.Window): WindowInfo {
     const tabs = (window.tabs ?? [])
@@ -237,7 +249,6 @@ export class TabHandler {
             pinned: p.pinned,
             openerTabId: p.openerTabId,
         }
-        let initialTabIdToCleanup: number | undefined
         let effectiveGroupId: number | null = null
         const autoGroup =
             p.groupId === undefined &&
@@ -245,45 +256,59 @@ export class TabHandler {
             p.openerTabId === undefined &&
             p.index === undefined &&
             p.pinned !== true
+        await refreshManagedTabRelations(() => assertActionActive(context))
         if (windowId !== undefined) {
             createProps.windowId = windowId
         } else {
-            // 未指定窗口时复用缓存的 MCP 窗口，窗口关闭后重新创建
-            let targetWindowId: number | null = context.mcpWindowId
-            if (targetWindowId !== null) {
-                try {
-                    await chrome.windows.get(targetWindowId)
-                } catch (error) {
-                    const message = error instanceof Error ? error.message : String(error)
-                    if (!/^No window with id: -?\d+\.?$/.test(message)) {
-                        throw error
-                    }
-                    console.warn('[MCP] 原受控窗口已关闭，将创建新窗口:', error)
-                    targetWindowId = null
-                }
-            }
-            if (targetWindowId === null) {
-                // 新建 MCP 专属 window 时必须同步重置 mcpTabGroupId
-                setMcpTabGroupId(null)
-                const newWindow = await chrome.windows.create({
-                    type: 'normal',
-                    focused: false,
-                    url: 'about:blank',
+            const windows = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] })
+            const normal = windows.filter((window) => window.type === 'normal' && window.id !== undefined)
+            const owned = normal.find((window) =>
+                window.tabs?.some((tab) => {
+                    const record = tab.id === undefined ? undefined : getManagedTabRecord(tab.id)
+                    return record?.managed && record.origin === 'created'
                 })
-                if (newWindow?.id === undefined) {
-                    throw new ExpectedOperationError('创建窗口失败，Chrome 未返回 windowId')
-                }
-                targetWindowId = newWindow.id
-                setMcpWindowId(newWindow.id)
-                initialTabIdToCleanup = newWindow.tabs?.[0]?.id
-            } else if (autoGroup && context.mcpTabGroupId !== null) {
-                const groups = await chrome.tabGroups.query({ windowId: targetWindowId })
-                if (groups.some((group) => group.id === context.mcpTabGroupId)) {
-                    effectiveGroupId = context.mcpTabGroupId
-                }
+            )
+            const taskWindow = normal.find((window) =>
+                window.tabs?.some((tab) => {
+                    const record = tab.id === undefined ? undefined : getManagedTabRecord(tab.id)
+                    return (
+                        record?.managed &&
+                        record.origin === 'created' &&
+                        record.trustedGroupId === tab.groupId &&
+                        record.trustedWindowId === window.id &&
+                        record.metadata.taskHint === (p.taskHint ?? undefined)
+                    )
+                })
+            )
+            const selected = taskWindow ?? owned ?? normal[0]
+            if (!selected) {
+                throw new ExpectedOperationError('没有可用的普通 Chrome 窗口，未创建页面', false)
             }
-            createProps.windowId = targetWindowId
+            createProps.windowId = selected.id
+            setMcpWindowId(selected.id!)
+            if (autoGroup) {
+                const groups = await chrome.tabGroups.query({ windowId: selected.id })
+                const tabs = await chrome.tabs.query({ windowId: selected.id })
+                effectiveGroupId =
+                    groups.find((group) => {
+                        const members = tabs.filter((tab) => tab.groupId === group.id)
+                        return (
+                            members.length > 0 &&
+                            members.every((tab) => {
+                                const record = tab.id === undefined ? undefined : getManagedTabRecord(tab.id)
+                                return (
+                                    record?.managed &&
+                                    record.origin === 'created' &&
+                                    record.trustedGroupId === group.id &&
+                                    record.trustedWindowId === selected.id &&
+                                    record.metadata.taskHint === (p.taskHint ?? undefined)
+                                )
+                            })
+                        )
+                    })?.id ?? null
+            }
         }
+        assertActionActive(context)
         const tab = await chrome.tabs.create(createProps).catch((error: unknown) => {
             throw structuredOperationError(
                 'CREATE_RESULT_UNKNOWN',
@@ -293,7 +318,7 @@ export class TabHandler {
                     action: 'tabs_create',
                     createdTargetId: null,
                     windowId: createProps.windowId,
-                    createdTargetIds: initialTabIdToCleanup !== undefined ? [String(initialTabIdToCleanup)] : [],
+                    createdTargetIds: [],
                     managed: null,
                     actionExecuted: 'unknown',
                     actionStatus: 'unknown',
@@ -319,26 +344,24 @@ export class TabHandler {
         }
         let failureStage = 'storage'
         try {
-            await markManagedTab(tab.id)
-            // 清理新建 MCP window 自带的初始 about:blank tab
-            if (initialTabIdToCleanup !== undefined && initialTabIdToCleanup !== tab.id) {
-                try {
-                    await chrome.tabs.remove(initialTabIdToCleanup)
-                } catch (error) {
-                    console.warn('[MCP] 初始空白页面未能关闭:', error)
-                }
-            }
+            await markManagedTab(tab.id, 'created', { taskHint: p.taskHint, note: p.note })
+            const progress = { action: 'tabs_create', targetId: String(tab.id), windowId: tab.windowId }
+            assertActionActive(context, progress)
             const warnings: string[] = []
+            // noinspection JSUnusedAssignment -- Read by catch after the awaited operation fails
             failureStage = 'group'
             if (explicitGroup) {
                 await chrome.tabs.group({ tabIds: [tab.id], groupId: explicitGroup.id })
                 if (p.index !== undefined) {
+                    // noinspection JSUnusedAssignment -- Read by catch after the awaited operation fails
                     failureStage = 'placement'
+                    assertActionActive(context, progress)
                     await chrome.tabs.move(tab.id, { index: p.index })
                 }
             } else if (p.groupId === -1 && tab.groupId >= 0) {
                 await chrome.tabs.ungroup(tab.id)
             } else if (autoGroup) {
+                let assignedGroupId: number | undefined
                 // 默认分组仅用于显示，失败时页面仍受控，返回实际状态与提示
                 try {
                     const groupId = await chrome.tabs.group({
@@ -348,20 +371,34 @@ export class TabHandler {
                             : { createProperties: { windowId: tab.windowId } }),
                     })
                     if (effectiveGroupId === null) {
-                        await chrome.tabGroups.update(groupId, { title: 'MCP Chrome', color: 'cyan' })
+                        assertActionActive(context, { ...progress, groupId })
+                        await chrome.tabGroups.update(groupId, {
+                            title: p.taskHint ? `MCP · ${p.taskHint}` : 'MCP Chrome',
+                            color: 'cyan',
+                        })
                     }
+                    assignedGroupId = groupId
                     setMcpTabGroupId(groupId)
                 } catch (error) {
+                    assertActionActive(context, progress)
                     const message = `默认分组未完成：${error instanceof Error ? error.message : String(error)}`
                     warnings.push(message)
                     console.warn('[MCP]', message)
                 }
+                if (assignedGroupId !== undefined) {
+                    // noinspection JSUnusedAssignment -- Read by catch after the awaited operation fails
+                    failureStage = 'storage'
+                    await setManagedTabGroup(tab.id, assignedGroupId, tab.windowId)
+                }
             }
             // 等待页面加载
+            // noinspection JSUnusedAssignment -- Read by catch after the awaited operation fails
             failureStage = 'navigation'
+            assertActionActive(context, progress)
             if (p.waitUntil) {
                 await this.navigationHandler.waitForNavigation(tab.id, p.waitUntil, p.timeout)
             }
+            // noinspection JSUnusedAssignment -- Read by catch after the awaited operation fails
             failureStage = 'snapshot'
             return { ...tabToInfo(await getExistingTab(tab.id)), ...(warnings.length ? { warnings } : {}) }
         } catch (error) {
@@ -381,6 +418,31 @@ export class TabHandler {
                 }
             )
         }
+    }
+
+    async tabsMetadata(params: unknown, context?: ActionContext): Promise<ReturnType<typeof getManagedTabMetadata>> {
+        const { tabId, ...updates } = TabsMetadataSchema.parse(params)
+        const tab = await getExistingTab(tabId)
+        await refreshManagedTabRelations(() => assertActionActive(context))
+        assertActionActive(context)
+        const metadata = await updateManagedTabMetadata(tabId, updates, () => assertActionActive(context))
+        const record = getManagedTabRecord(tabId)
+        if (updates.taskHint !== undefined && record?.trustedGroupId === tab.groupId) {
+            const members = await chrome.tabs.query({ groupId: tab.groupId })
+            if (
+                members.length &&
+                members.every((member) => {
+                    const owner = member.id === undefined ? undefined : getManagedTabRecord(member.id)
+                    return owner?.trustedGroupId === tab.groupId && owner.metadata.taskHint === metadata.taskHint
+                })
+            ) {
+                assertActionActive(context, { action: 'tabs_metadata', targetId: String(tabId), groupId: tab.groupId })
+                await chrome.tabGroups.update(tab.groupId, {
+                    title: metadata.taskHint ? `MCP · ${metadata.taskHint}` : 'MCP Chrome',
+                })
+            }
+        }
+        return metadata
     }
 
     async tabsUpdate(params: unknown, context: ActionContext): Promise<ManagedTabChangeResult> {
@@ -404,6 +466,7 @@ export class TabHandler {
             return { tabId, properties, tab }
         })
         const before = tabToInfo(tab)
+        assertActionActive(context)
         await chrome.tabs.update(tabId, properties)
         const after = tabToInfo(await getExistingTab(tabId))
         return { success: true, targetId: String(tabId), windowId: after.windowId, before, after }
@@ -413,6 +476,7 @@ export class TabHandler {
         const p = TabsCloseSchema.parse(params)
         const tab = await assertManagedTab(p.tabId, context, 'tabs_close')
         const before = tabToInfo(tab)
+        assertActionActive(context)
         await chrome.tabs.remove(p.tabId)
         await unmarkManagedTab(p.tabId)
         return { success: true, targetId: String(p.tabId), windowId: before.windowId, before, after: null }
@@ -421,6 +485,7 @@ export class TabHandler {
     async tabsActivate(params: unknown, context: ActionContext): Promise<TabInfo> {
         const p = TabsActivateSchema.parse(params)
         await assertManagedTab(p.tabId, context, 'tabs_activate')
+        assertActionActive(context)
 
         const tab = await chrome.tabs.update(p.tabId, { active: true })
         if (!tab) {
@@ -429,6 +494,7 @@ export class TabHandler {
 
         // 聚焦窗口
         if (tab.windowId !== undefined) {
+            assertActionActive(context, { action: 'tabs_activate', targetId: String(p.tabId) })
             await chrome.windows.update(tab.windowId, { focused: true })
         }
 
@@ -439,11 +505,13 @@ export class TabHandler {
         const p = TabsActivateSchema.parse(params)
         const tab = await assertManagedTab(p.tabId, context, 'tabs_activate')
         const before = tabToInfo(tab)
+        assertActionActive(context)
         const updatedTab = await chrome.tabs.update(p.tabId, { active: true })
         if (!updatedTab) {
             throw new ExpectedOperationError('激活 tab 失败，Chrome 未返回 tab')
         }
         if (updatedTab.windowId !== undefined) {
+            assertActionActive(context, { action: 'tabs_activate_managed', targetId: String(p.tabId) })
             await chrome.windows.update(updatedTab.windowId, { focused: true })
         }
         const after = tabToInfo(await getExistingTab(p.tabId))
@@ -451,12 +519,14 @@ export class TabHandler {
     }
 
     async tabsAdopt(
-        params: unknown
+        params: unknown,
+        context?: ActionContext
     ): Promise<{ success: boolean; tab: TabInfo; managedBefore: boolean; managedAfter: boolean }> {
         const p = TabsAdoptSchema.parse(params)
         const tab = await getExistingTab(p.tabId)
         const managedBefore = isManagedTab(tab)
-        await markManagedTab(p.tabId)
+        assertActionActive(context)
+        await markManagedTab(p.tabId, 'adopted', {}, () => assertActionActive(context))
         const updatedTab = await getExistingTab(p.tabId)
         return {
             success: true,
@@ -467,12 +537,14 @@ export class TabHandler {
     }
 
     async tabsRelease(
-        params: unknown
+        params: unknown,
+        context?: ActionContext
     ): Promise<{ success: boolean; tab: TabInfo; managedBefore: boolean; managedAfter: boolean }> {
         const p = TabsReleaseSchema.parse(params)
         const tab = await getExistingTab(p.tabId)
         const managedBefore = isManagedTab(tab)
-        await unmarkManagedTab(p.tabId)
+        assertActionActive(context)
+        await unmarkManagedTab(p.tabId, () => assertActionActive(context))
         const updatedTab = await getExistingTab(p.tabId)
         return {
             success: true,
@@ -486,11 +558,13 @@ export class TabHandler {
         const p = TabsMoveSchema.parse(params)
         const tab = await assertManagedTab(p.tabId, context, 'tabs_move')
         const before = tabToInfo(tab)
+        assertActionActive(context)
         await chrome.tabs.move(p.tabId, {
             index: p.index ?? -1,
             ...(p.windowId !== undefined ? { windowId: p.windowId } : {}),
         })
         if (p.active !== undefined) {
+            assertActionActive(context, { action: 'tabs_move', targetId: String(p.tabId) })
             await chrome.tabs.update(p.tabId, { active: p.active })
         }
         const after = tabToInfo(await getExistingTab(p.tabId))
@@ -501,6 +575,7 @@ export class TabHandler {
         const p = TabsReorderSchema.parse(params)
         const tab = await assertManagedTab(p.tabId, context, 'tabs_reorder')
         const before = tabToInfo(tab)
+        assertActionActive(context)
         await chrome.tabs.move(p.tabId, { index: p.index })
         const after = tabToInfo(await getExistingTab(p.tabId))
         return { success: true, targetId: String(p.tabId), windowId: after.windowId, before, after }
@@ -510,14 +585,16 @@ export class TabHandler {
         const p = TabsPinSchema.parse(params)
         const tab = await assertManagedTab(p.tabId, context, 'tabs_pin')
         const before = tabToInfo(tab)
+        assertActionActive(context)
         await chrome.tabs.update(p.tabId, { pinned: p.pinned })
         const after = tabToInfo(await getExistingTab(p.tabId))
         return { success: true, targetId: String(p.tabId), windowId: after.windowId, before, after }
     }
 
-    async windowFocus(params: unknown): Promise<ManagedWindowChangeResult> {
+    async windowFocus(params: unknown, context?: ActionContext): Promise<ManagedWindowChangeResult> {
         const p = WindowFocusSchema.parse(params)
         const before = await getWindowInfo(p.windowId)
+        assertActionActive(context)
         await chrome.windows.update(p.windowId, { focused: true })
         const after = await waitForWindowFocus(p.windowId)
         if (!after.focused) {
@@ -536,11 +613,11 @@ export class TabHandler {
         return { success: true, windowId: p.windowId, before, after }
     }
 
-    async windowResize(params: unknown): Promise<ManagedWindowChangeResult> {
-        return this.windowUpdate(params)
+    async windowResize(params: unknown, context?: ActionContext): Promise<ManagedWindowChangeResult> {
+        return this.windowUpdate(params, context)
     }
 
-    async windowUpdate(params: unknown): Promise<ManagedWindowChangeResult> {
+    async windowUpdate(params: unknown, context?: ActionContext): Promise<ManagedWindowChangeResult> {
         const { windowId, ...properties } = WindowUpdateSchema.parse(params)
         assertWindowOptions(properties)
         if (Object.values(properties).every((value) => value === undefined)) {
@@ -552,9 +629,11 @@ export class TabHandler {
         const hasBounds = [properties.left, properties.top, properties.width, properties.height].some(
             (value) => value !== undefined
         )
+        assertActionActive(context)
         if (hasBounds && requestedState === 'normal' && before.state !== 'normal') {
             await chrome.windows.update(windowId, { state: 'normal' })
             await waitForWindowGeometry(windowId, requestedState, deadline)
+            assertActionActive(context, { action: 'window_update', windowId })
             delete properties.state
         }
         await chrome.windows.update(windowId, properties)
@@ -592,6 +671,7 @@ export class TabHandler {
             }
             return p
         })
+        assertActionActive(context)
         const window = await chrome.windows
             .create({
                 url: p.url ?? (p.tabId === undefined ? 'about:blank' : undefined),
@@ -644,13 +724,16 @@ export class TabHandler {
         try {
             tabs = window.tabs ?? (await chrome.windows.get(window.id, { populate: true })).tabs ?? []
             const tabId = p.tabId ?? tabs[0]?.id
+            // noinspection JSUnusedAssignment -- Read by catch after the awaited operation fails
             failureStage = 'storage'
             for (const tab of tabs) {
                 if (tab.id !== undefined) {
-                    await markManagedTab(tab.id)
+                    await markManagedTab(tab.id, tab.id === p.tabId ? 'adopted' : 'created')
                 }
             }
+            // noinspection JSUnusedAssignment -- Read by catch after the awaited operation fails
             failureStage = 'snapshot'
+            assertActionActive(context, { action: 'window_create', windowId: window.id })
             const after = p.focused ? await waitForWindowFocus(window.id) : await getWindowInfo(window.id)
             return {
                 success: true,
@@ -699,6 +782,7 @@ export class TabHandler {
                 }
             )
         }
+        assertActionActive(context)
         await chrome.windows.remove(p.windowId)
         for (const tab of before.tabs) {
             await unmarkManagedTab(tab.id)
@@ -758,6 +842,7 @@ export class TabHandler {
                 tabIds: p.tabIds as [number, ...number[]],
                 createProperties: { windowId },
             })
+            assertActionActive(context, { action: 'tabgroup_create', groupId, windowId })
             await chrome.tabGroups.update(groupId, {
                 title: p.title ?? 'MCP Chrome',
                 color: p.color ?? 'cyan',
@@ -799,13 +884,14 @@ export class TabHandler {
         })
     }
 
-    async tabGroupUpdate(params: unknown): Promise<ManagedGroupChangeResult> {
+    async tabGroupUpdate(params: unknown, context?: ActionContext): Promise<ManagedGroupChangeResult> {
         const { groupId, ...properties } = TabGroupUpdateSchema.parse(params)
         if (Object.values(properties).every((value) => value === undefined)) {
             throw new ExpectedOperationError('updateGroup 需要 title、color 或 collapsed，未执行')
         }
         const before = await chrome.tabGroups.get(groupId)
         const tabsBefore = await chrome.tabs.query({ groupId })
+        assertActionActive(context)
         await chrome.tabGroups.update(groupId, properties)
         const after = await chrome.tabGroups.get(groupId)
         const tabsAfter = await chrome.tabs.query({ groupId })
@@ -859,6 +945,7 @@ export class TabHandler {
         ) {
             throw new ExpectedOperationError('分组成员或窗口已变化，未执行分组操作')
         }
+        assertActionActive(context)
         const groupId = await operation(tabs)
         if (groupId !== undefined) {
             groupIds.add(groupId)

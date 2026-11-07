@@ -10,9 +10,10 @@
  */
 
 import type { CDPClient } from '../cdp/client.js'
+import { installDomHelpers } from './dom-helpers.js'
 import { StructuredToolError } from './errors.js'
 import { withRetry } from './retry.js'
-import { DEFAULT_TIMEOUT, type Box } from './types.js'
+import { type Box, DEFAULT_TIMEOUT } from './types.js'
 
 /**
  * AutoWait 选项
@@ -51,19 +52,25 @@ export class AutoWait {
                     object: { objectId: string }
                 }
 
-                const { result } = (await this.send('Runtime.callFunctionOn', {
-                    objectId: object.objectId,
-                    functionDeclaration: `function() {
+                try {
+                    const { result } = (await this.send('Runtime.callFunctionOn', {
+                        objectId: object.objectId,
+                        functionDeclaration: `function() {
             if (!(this instanceof HTMLElement)) return true;
             const formControls = ['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'];
             if (!formControls.includes(this.nodeName)) return true;
             return !this.hasAttribute('disabled');
           }`,
-                    returnByValue: true,
-                })) as { result: { value: boolean } }
+                        returnByValue: true,
+                    })) as { result: { value: boolean } }
 
-                if (!result.value) {
-                    throw new Error('元素处于禁用状态')
+                    if (!result.value) {
+                        throw new Error('元素处于禁用状态')
+                    }
+                } finally {
+                    await this.cdp
+                        .send('Runtime.releaseObject', { objectId: object.objectId }, this.sessionId)
+                        .catch(() => {})
                 }
             },
             { timeout: this.remaining() }
@@ -82,28 +89,34 @@ export class AutoWait {
                 const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
                     object: { objectId: string }
                 }
-                const params = {
-                    objectId: object.objectId,
-                    functionDeclaration: `function() {
+                try {
+                    const params = {
+                        objectId: object.objectId,
+                        functionDeclaration: `function() {
                         const { x, y, width, height } = this.getBoundingClientRect();
                         return { x, y, width, height };
                     }`,
-                    returnByValue: true,
-                }
-                const { result: first } = (await this.send('Runtime.callFunctionOn', params)) as {
-                    result: { value: Box }
-                }
-                await new Promise((resolve) => setTimeout(resolve, Math.min(32, this.remaining())))
-                const { result: second } = (await this.send('Runtime.callFunctionOn', params)) as {
-                    result: { value: Box }
-                }
-                if (
-                    first.value.x !== second.value.x ||
-                    first.value.y !== second.value.y ||
-                    first.value.width !== second.value.width ||
-                    first.value.height !== second.value.height
-                ) {
-                    throw new Error('元素位置不稳定')
+                        returnByValue: true,
+                    }
+                    const { result: first } = (await this.send('Runtime.callFunctionOn', params)) as {
+                        result: { value: Box }
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, Math.min(32, this.remaining())))
+                    const { result: second } = (await this.send('Runtime.callFunctionOn', params)) as {
+                        result: { value: Box }
+                    }
+                    if (
+                        first.value.x !== second.value.x ||
+                        first.value.y !== second.value.y ||
+                        first.value.width !== second.value.width ||
+                        first.value.height !== second.value.height
+                    ) {
+                        throw new Error('元素位置不稳定')
+                    }
+                } finally {
+                    await this.cdp
+                        .send('Runtime.releaseObject', { objectId: object.objectId }, this.sessionId)
+                        .catch(() => {})
                 }
             },
             { timeout: this.remaining() }
@@ -121,29 +134,33 @@ export class AutoWait {
             object: { objectId: string }
         }
 
-        // 检查是否在视口内
-        const { result: isInViewport } = (await this.send('Runtime.callFunctionOn', {
-            objectId: object.objectId,
-            functionDeclaration: `function() {
+        try {
+            // 检查是否在视口内
+            const { result: isInViewport } = (await this.send('Runtime.callFunctionOn', {
+                objectId: object.objectId,
+                functionDeclaration: `function() {
         const rect = this.getBoundingClientRect();
         return rect.top >= 0 && rect.left >= 0 &&
                rect.bottom <= window.innerHeight &&
                rect.right <= window.innerWidth;
       }`,
-            returnByValue: true,
-        })) as { result: { value: boolean } }
+                returnByValue: true,
+            })) as { result: { value: boolean } }
 
-        // 如果不在视口内，滚动到视口中
-        if (!isInViewport.value) {
-            await this.send('Runtime.callFunctionOn', {
-                objectId: object.objectId,
-                functionDeclaration: `function() {
+            // 如果不在视口内，滚动到视口中
+            if (!isInViewport.value) {
+                await this.send('Runtime.callFunctionOn', {
+                    objectId: object.objectId,
+                    functionDeclaration: `function() {
           this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
         }`,
-            })
+                })
 
-            // 等待滚动完成
-            await new Promise((resolve) => setTimeout(resolve, 100))
+                // 等待滚动完成
+                await new Promise((resolve) => setTimeout(resolve, 100))
+            }
+        } finally {
+            await this.cdp.send('Runtime.releaseObject', { objectId: object.objectId }, this.sessionId).catch(() => {})
         }
     }
 
@@ -159,20 +176,26 @@ export class AutoWait {
                     object: { objectId: string }
                 }
 
-                const { result } = (await this.send('Runtime.callFunctionOn', {
-                    objectId: object.objectId,
-                    functionDeclaration: `function() {
+                try {
+                    const { result } = (await this.send('Runtime.callFunctionOn', {
+                        objectId: object.objectId,
+                        functionDeclaration: `function() {
             const style = window.getComputedStyle(this);
-            if (style.visibility === 'hidden') return false;
+            if (style.visibility === 'hidden' || style.visibility === 'collapse') return false;
             if (style.display === 'none') return false;
             const rect = this.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0;
           }`,
-                    returnByValue: true,
-                })) as { result: { value: boolean } }
+                        returnByValue: true,
+                    })) as { result: { value: boolean } }
 
-                if (!result.value) {
-                    throw new Error('元素不可见')
+                    if (!result.value) {
+                        throw new Error('元素不可见')
+                    }
+                } finally {
+                    await this.cdp
+                        .send('Runtime.releaseObject', { objectId: object.objectId }, this.sessionId)
+                        .catch(() => {})
                 }
             },
             { timeout: this.remaining() }
@@ -194,15 +217,17 @@ export class AutoWait {
                 const { object } = (await this.send('DOM.resolveNode', { nodeId })) as {
                     object: { objectId: string }
                 }
-                const { result } = (await this.send('Runtime.callFunctionOn', {
-                    objectId: object.objectId,
-                    functionDeclaration: `function() {
+                try {
+                    const { result } = (await this.send('Runtime.callFunctionOn', {
+                        objectId: object.objectId,
+                        functionDeclaration: `function() {
+                    (${installDomHelpers.toString()})();
                     const rect = this.getBoundingClientRect();
                     const clickPoint = {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
-                    const top = document.elementFromPoint(clickPoint.x, clickPoint.y);
+                    const top = globalThis.__mcpDomHelpers.deepElementFromPoint(clickPoint.x, clickPoint.y);
                     const describe = el => el.tagName.toLowerCase() + (el.id ? '#' + CSS.escape(el.id) : '');
                     const plainRect = r => ({x: r.x, y: r.y, width: r.width, height: r.height});
-                    const covered = top !== this && !(top && this.contains(top));
+                    const covered = !globalThis.__mcpDomHelpers.containsComposed(this, top);
                     return {
                         actionable: this.isConnected && !covered,
                         reason: !this.isConnected ? 'not-connected' : !top ? 'not-in-viewport' : 'covered',
@@ -210,19 +235,25 @@ export class AutoWait {
                         coveringElement: covered && top ? describe(top).slice(0, 500) : undefined,
                         candidates: document.elementsFromPoint(clickPoint.x, clickPoint.y).slice(0, 10).map(el => ({
                             tag: el.tagName.toLowerCase(), selector: describe(el).slice(0, 500),
-                            text: (el.textContent || '').trim().slice(0, 160), rect: plainRect(el.getBoundingClientRect())
+                            text: (el.textContent || '').trim().slice(0, 160),
+                            rect: plainRect(el.getBoundingClientRect())
                         }))
                     };
                 }`,
-                    returnByValue: true,
-                })) as { result: { value: Record<string, unknown> & { actionable: boolean } } }
-                if (!result.value.actionable) {
-                    throw new StructuredToolError(
-                        'ACTIONABILITY_FAILED',
-                        '点击目标无法接收鼠标事件，未执行点击',
-                        '请根据 rect、clickPoint 和 coveringElement 关闭遮罩或调整 target；直接触发目标事件需明确使用 force',
-                        result.value
-                    )
+                        returnByValue: true,
+                    })) as { result: { value: Record<string, unknown> & { actionable: boolean } } }
+                    if (!result.value.actionable) {
+                        throw new StructuredToolError(
+                            'ACTIONABILITY_FAILED',
+                            '点击目标无法接收鼠标事件，未执行点击',
+                            '请根据 rect、clickPoint 和 coveringElement 关闭遮罩或调整 target；直接触发目标事件需明确使用 force',
+                            result.value
+                        )
+                    }
+                } finally {
+                    await this.cdp
+                        .send('Runtime.releaseObject', { objectId: object.objectId }, this.sessionId)
+                        .catch(() => {})
                 }
             },
             { timeout: this.remaining() }

@@ -14,7 +14,8 @@
  */
 
 import type { CDPClient } from '../cdp/client.js'
-import { ElementNotFoundError } from './errors.js'
+import { installDomHelpers, type DomQuery } from './dom-helpers.js'
+import { ElementNotFoundError, StructuredToolError } from './errors.js'
 import { withRetry } from './retry.js'
 import {
     type Box,
@@ -33,7 +34,7 @@ import {
     type Point,
     type Target,
 } from './types.js'
-import { escapeXPathString } from './utils.js'
+import { sanitizeErrorMessage } from './error-sanitizer.js'
 
 /**
  * CDP DOM 节点 ID
@@ -49,25 +50,16 @@ type RemoteObjectId = string
  * Locator 选项
  */
 export interface LocatorOptions {
+    contextId?: number
+    localPoint?: (timeout: number) => Promise<boolean>
+    mapPoint?: (point: Point, timeout: number) => Promise<Point>
+    mapViewportPoint?: (point: Point, timeout: number) => Promise<Point>
     /** 超时时间（毫秒），默认 30000 */
     timeout?: number
     /** 第 N 个匹配元素（从 0 开始，默认 0 即第一个） */
     nth?: number
     /** 获取当前 URL 的回调（用于错误上下文） */
     getUrl?: () => string | undefined
-}
-
-/**
- * 转义 JavaScript 字符串
- */
-function escapeJSString(str: string): string {
-    return str
-        .replace(/\\/g, '\\\\')
-        .replace(/'/g, "\\'")
-        .replace(/"/g, '\\"')
-        .replace(/\n/g, '\\n')
-        .replace(/\r/g, '\\r')
-        .replace(/\t/g, '\\t')
 }
 
 /**
@@ -92,17 +84,19 @@ export class Locator {
     private readonly deadline: number
     private readonly nth: number
     private readonly getUrl?: () => string | undefined
+    private readonly contextId?: number
 
     constructor(
         private cdp: CDPClient,
         private target: Target,
         private sessionId?: string,
-        options: LocatorOptions = {}
+        private options: LocatorOptions = {}
     ) {
         this.timeout = options.timeout ?? DEFAULT_TIMEOUT
         this.deadline = Date.now() + this.timeout
         this.nth = options.nth ?? 0
         this.getUrl = options.getUrl
+        this.contextId = options.contextId
     }
 
     get lastObservation(): Readonly<{ matchCount: number | null; lastLocatorState: string }> {
@@ -112,7 +106,7 @@ export class Locator {
     /**
      * 查找元素，返回节点 ID（带重试）
      */
-    async find(): Promise<NodeId> {
+    async find(retry = true): Promise<NodeId> {
         this.logs = []
         this.log(`定位元素: ${JSON.stringify(this.target)}`)
 
@@ -121,7 +115,7 @@ export class Locator {
             throw new Error('坐标定位不支持 find()，请使用 getClickablePoint()')
         }
 
-        return withRetry(() => this.findInternal(), { timeout: this.remaining() })
+        return retry ? withRetry(() => this.findInternal(), { timeout: this.remaining() }) : this.findInternal()
     }
 
     /**
@@ -129,16 +123,22 @@ export class Locator {
      */
     async getClickablePoint(): Promise<Point> {
         if (isCoordinateTarget(this.target)) {
-            return { x: this.target.x, y: this.target.y }
+            const point = { x: this.target.x, y: this.target.y }
+            return this.options.mapPoint ? this.options.mapPoint(point, this.remaining()) : point
         }
 
+        if (await this.options.localPoint?.(this.remaining())) {
+            // Chrome omits inherited iframe CSS zoom from same-session selector quads.
+            const point = await this.evaluateOn<Point>(
+                `function(){const r=this.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}}`
+            )
+            return this.options.mapPoint!(point, this.remaining())
+        }
         const nodeId = await this.find()
-        const box = await this.getBoxModel(nodeId)
-
-        return {
-            x: box.x + box.width / 2,
-            y: box.y + box.height / 2,
-        }
+        const { model } = await this.send<{ model: { content: number[] } }>('DOM.getBoxModel', { nodeId })
+        const quad = model.content
+        const point = { x: (quad[0] + quad[4]) / 2, y: (quad[1] + quad[5]) / 2 }
+        return this.options.mapViewportPoint ? this.options.mapViewportPoint(point, this.remaining()) : point
     }
 
     /**
@@ -157,10 +157,11 @@ export class Locator {
      * 在找到的元素上执行函数
      *
      * @param fn 要执行的函数字符串，元素作为第一个参数
+     * @param retry 是否在定位失败时按当前预算重试
      * @returns 函数返回值
      */
-    async evaluateOn<T>(fn: string): Promise<T> {
-        const nodeId = await this.find()
+    async evaluateOn<T>(fn: string, retry = true): Promise<T> {
+        const nodeId = await this.find(retry)
 
         // 将 nodeId 转换为 RemoteObjectId
         const { object } = (await this.send('DOM.resolveNode', {
@@ -172,21 +173,29 @@ export class Locator {
             throw this.notFound()
         }
 
-        // 在元素上执行函数
-        const { result, exceptionDetails } = (await this.send('Runtime.callFunctionOn', {
-            objectId: object.objectId,
-            functionDeclaration: fn,
-            returnByValue: true,
-        })) as {
-            result: { value: T }
-            exceptionDetails?: { text: string }
-        }
+        try {
+            // 在元素上执行函数
+            const { result, exceptionDetails } = (await this.send('Runtime.callFunctionOn', {
+                objectId: object.objectId,
+                functionDeclaration: fn,
+                returnByValue: true,
+            })) as {
+                result: { value: T }
+                exceptionDetails?: { text: string }
+            }
 
-        if (exceptionDetails) {
-            throw new Error(`执行失败: ${exceptionDetails.text}`)
-        }
+            if (exceptionDetails) {
+                throw new Error(`执行失败: ${exceptionDetails.text}`)
+            }
 
-        return result.value
+            return result.value
+        } finally {
+            await this.cdp
+                .send('Runtime.releaseObject', { objectId: object.objectId }, this.sessionId)
+                .catch((error: unknown) => {
+                    console.warn('[MCP] Locator object cleanup failed:', sanitizeErrorMessage(error))
+                })
+        }
     }
 
     /**
@@ -232,7 +241,12 @@ export class Locator {
      * 通过可访问性树定位
      */
     private async findByAccessibility(): Promise<NodeId> {
-        const { role, name, exact = false } = this.target as { role: string; name?: string; exact?: boolean }
+        const {
+            role: requestedRole,
+            name,
+            exact = false,
+        } = this.target as { role: string; name?: string; exact?: boolean }
+        const role = requestedRole.toLowerCase() === 'img' ? 'image' : requestedRole.toLowerCase()
         this.log(
             `使用可访问性树定位: role=${role}, name=${name ?? '(any)'}, exact=${exact}${
                 this.nth > 0 ? `, nth=${this.nth}` : ''
@@ -243,7 +257,10 @@ export class Locator {
         await this.send('Accessibility.enable')
 
         // queryAXTree 必须指定根节点，accessibleName 仅用于精确匹配
-        const { root } = (await this.send('DOM.getDocument')) as { root: { nodeId: number } }
+        const root =
+            this.contextId === undefined
+                ? ((await this.send('DOM.getDocument')) as { root: { nodeId: number } }).root
+                : { nodeId: await this.queryDom({ selector: ':root' }, 0) }
         const queryParams: Record<string, unknown> = { nodeId: root.nodeId, role }
         if (exact && name !== undefined) {
             queryParams.accessibleName = name
@@ -285,91 +302,19 @@ export class Locator {
      * 通过文本内容定位
      */
     private async findByText(): Promise<NodeId> {
-        const { text, exact = false } = this.target as {
-            text: string
-            exact?: boolean
-        }
-        this.log(`使用文本内容定位: text=${text}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
-
-        // 使用 XPath 查找包含文本的元素（正确转义引号）
-        // 用 . 而非 text()：text() 只匹配直接子文本节点，. 匹配完整 textContent
-        const escapedText = escapeXPathString(text)
-        const xpath = exact ? `//*[normalize-space(.)=${escapedText}]` : `//*[contains(.,${escapedText})]`
-
-        return this.findByXPathInternal(xpath)
+        const { text, exact = false } = this.target as { text: string; exact?: boolean }
+        return this.queryDom({ text, exact })
     }
 
     /**
      * 通过 label 定位
      */
     private async findByLabel(): Promise<NodeId> {
-        const { label, exact = false } = this.target as {
-            label: string
-            exact?: boolean
-        }
-        this.log(`使用 label 定位: label=${label}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`)
-
-        // 转义 JS 字符串
-        const escapedLabel = escapeJSString(label)
-
-        // 使用 Runtime.evaluate 执行复杂查询
-        const { result } = (await this.send('Runtime.evaluate', {
-            expression: `
-        (function() {
-          const targetLabel = "${escapedLabel}";
-          const isExact = ${exact};
-          const nth = ${this.nth};
-          const labels = document.querySelectorAll('label');
-          let matchCount = 0;
-          for (const label of labels) {
-            const text = label.textContent?.trim() ?? '';
-            const match = isExact ? text === targetLabel : text.includes(targetLabel);
-            if (match) {
-              let found = null;
-              // 1. 通过 for 属性找关联元素
-              if (label.htmlFor) {
-                const input = document.getElementById(label.htmlFor);
-                if (input) found = input;
-              }
-              // 2. 找 label 内部的 input
-              if (!found) {
-                const inner = label.querySelector('input, select, textarea');
-                if (inner) found = inner;
-              }
-              // 3. 通过 label.id 推断（如 userName-label → #userName）
-              if (!found && label.id && label.id.endsWith('-label')) {
-                const inputId = label.id.slice(0, -6);
-                const input = document.getElementById(inputId);
-                if (input) found = input;
-              }
-              // 4. 在父元素的相邻兄弟中查找 input
-              if (!found) {
-                const parent = label.parentElement;
-                if (parent) {
-                  for (const sibling of parent.parentElement?.children ?? []) {
-                    if (sibling === parent) continue;
-                    const input = sibling.querySelector('input, select, textarea');
-                    if (input) { found = input; break; }
-                  }
-                }
-              }
-              if (found) {
-                if (matchCount < nth) { ++matchCount; continue; }
-                return found;
-              }
-            }
-          }
-          return null;
-        })()
-      `,
-            returnByValue: false,
-        })) as { result: { objectId?: string } }
-
-        if (!result.objectId) {
-            throw this.notFound()
-        }
-
-        return this.objectIdToNodeId(result.objectId)
+        const { label, exact = false } = this.target as { label: string; exact?: boolean }
+        return this.queryDom({
+            selector: 'input,select,textarea,button,meter,output,progress,[aria-label],[aria-labelledby]',
+            semantic: { label, exact },
+        })
     }
 
     /**
@@ -449,40 +394,8 @@ export class Locator {
      * 通过 CSS + 文本组合定位
      */
     private async findByCSSAndText(): Promise<NodeId> {
-        const { css, text, exact = false } = this.target as { css: string; text: string; exact?: boolean }
-        this.log(
-            `使用 CSS+text 组合定位: css=${css}, text=${text}, exact=${exact}${this.nth > 0 ? `, nth=${this.nth}` : ''}`
-        )
-
-        const escapedCSS = escapeJSString(css)
-        const escapedText = escapeJSString(text)
-
-        const { result } = (await this.send('Runtime.evaluate', {
-            expression: `
-        (function() {
-          const elements = document.querySelectorAll("${escapedCSS}");
-          const target = "${escapedText}";
-          const isExact = ${exact};
-          const nth = ${this.nth};
-          let matchCount = 0;
-          for (const el of elements) {
-            const content = (el.textContent ?? '').trim();
-            if (isExact ? content === target : content.includes(target)) {
-              if (matchCount < nth) { ++matchCount; continue; }
-              return el;
-            }
-          }
-          return null;
-        })()
-      `,
-            returnByValue: false,
-        })) as { result: { objectId?: string } }
-
-        if (!result.objectId) {
-            throw this.notFound()
-        }
-
-        return this.objectIdToNodeId(result.objectId)
+        const target = this.target as { css: string; text: string; exact?: boolean }
+        return this.queryDom({ selector: target.css, text: target.text, exact: target.exact })
     }
 
     /**
@@ -499,107 +412,93 @@ export class Locator {
      * CSS 选择器定位内部实现
      */
     private async findByCSSInternal(css: string): Promise<NodeId> {
-        // 确保 DOM 已启用
-        const { root } = (await this.send('DOM.getDocument')) as {
-            root: { nodeId: number }
-        }
-
-        if (this.nth > 0) {
-            // nth > 0：用 querySelectorAll 取第 nth 个
-            const { nodeIds } = (await this.send('DOM.querySelectorAll', {
-                nodeId: root.nodeId,
-                selector: css,
-            })) as { nodeIds: number[] }
-
-            this.observeMatches(nodeIds.length)
-            if (this.nth >= nodeIds.length) {
-                this.log(`第 ${this.nth} 个匹配元素不存在（共 ${nodeIds.length} 个）: ${css}`)
-                throw this.notFound()
-            }
-
-            this.log(`找到元素: nodeId=${nodeIds[this.nth]}（第 ${this.nth} 个）`)
-            return nodeIds[this.nth]
-        }
-
-        const { nodeId } = (await this.send('DOM.querySelector', {
-            nodeId: root.nodeId,
-            selector: css,
-        })) as { nodeId: number }
-
-        this.observation = {
-            matchCount: nodeId === 0 ? 0 : null,
-            lastLocatorState: nodeId === 0 ? 'not_found' : 'found',
-        }
-        if (nodeId === 0) {
-            this.log(`元素未找到: ${css}`)
-            throw this.notFound()
-        }
-
-        this.log(`找到元素: nodeId=${nodeId}`)
-        return nodeId
+        return this.queryDom({ selector: css })
     }
 
     /**
      * XPath 定位内部实现
      */
     private async findByXPathInternal(xpath: string): Promise<NodeId> {
-        const escapedXPath = escapeJSString(xpath)
+        return this.queryDom({ xpath })
+    }
 
-        if (this.nth > 0) {
-            // nth > 0：用 ORDERED_NODE_SNAPSHOT_TYPE 取第 nth 个
-            const nthExpr =
-                `(function() { var r = document.evaluate('${escapedXPath}', document, null, ` +
-                `XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); ` +
-                `return r.snapshotLength > ${this.nth} ? r.snapshotItem(${this.nth}) : null })()`
-            const { result } = (await this.send('Runtime.evaluate', {
-                expression: nthExpr,
-                returnByValue: false,
-            })) as { result: { objectId?: string; subtype?: string } }
-
-            if (!result.objectId || result.subtype === 'null') {
-                this.log(`第 ${this.nth} 个匹配元素不存在: ${xpath}`)
-                throw this.notFound()
+    private async queryDom(query: DomQuery, index = this.nth): Promise<NodeId> {
+        const expression =
+            '(function(){(' +
+            installDomHelpers.toString() +
+            ')();const matches=globalThis.__mcpDomHelpers.query(' +
+            JSON.stringify(query) +
+            ');return {node:matches[' +
+            index +
+            ']??null,count:matches.length};})()'
+        const { result, exceptionDetails } = await this.send<{
+            result: { objectId?: string }
+            exceptionDetails?: { text?: string; exception?: { className?: string; description?: string } }
+        }>('Runtime.evaluate', { expression, returnByValue: false })
+        if (exceptionDetails) {
+            const exception = exceptionDetails.exception
+            const message = exception?.description ?? exceptionDetails.text ?? 'DOM query failed'
+            if (
+                (query.selector || query.xpath) &&
+                (exception?.className === 'SyntaxError' ||
+                    (exception?.className === 'DOMException' && /^SyntaxError:/.test(message)))
+            ) {
+                throw new StructuredToolError('INVALID_SELECTOR', message, '请检查 target 的 CSS 或 XPath 表达式', {
+                    phase: 'script_result',
+                    actionExecuted: false,
+                    actionStatus: 'not_started',
+                    retryable: false,
+                })
             }
-
-            return this.objectIdToNodeId(result.objectId)
+            throw new Error(message)
         }
-
-        // 使用 Runtime.evaluate 执行 XPath
-        const xpathExpr =
-            `document.evaluate('${escapedXPath}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)` +
-            `.singleNodeValue`
-        const { result } = (await this.send('Runtime.evaluate', {
-            expression: xpathExpr,
-            returnByValue: false,
-        })) as { result: { objectId?: string } }
-
         if (!result.objectId) {
-            this.log(`元素未找到: ${xpath}`)
             throw this.notFound()
         }
-
-        return this.objectIdToNodeId(result.objectId)
+        try {
+            const { result: properties } = await this.send<{
+                result: Array<{ name: string; value?: { value?: number; objectId?: string; subtype?: string } }>
+            }>('Runtime.getProperties', { objectId: result.objectId, ownProperties: true })
+            this.observeMatches(properties.find((item) => item.name === 'count')?.value?.value ?? 0)
+            const node = properties.find((item) => item.name === 'node')?.value
+            if (!node?.objectId || node.subtype === 'null') {
+                throw this.notFound()
+            }
+            return await this.objectIdToNodeId(node.objectId)
+        } finally {
+            await this.cdp
+                .send('Runtime.releaseObject', { objectId: result.objectId }, this.sessionId)
+                .catch((error: unknown) => {
+                    console.warn('[MCP] DOM query object cleanup failed:', sanitizeErrorMessage(error))
+                })
+        }
     }
 
     /**
      * 将 RemoteObject ID 转换为 NodeId
      */
     private async objectIdToNodeId(objectId: RemoteObjectId): Promise<NodeId> {
-        // DOM.requestNode 需要 DOM 树已初始化（通过 DOM.getDocument）
-        await this.send('DOM.getDocument')
+        try {
+            // DOM.requestNode 需要 DOM 树已初始化（通过 DOM.getDocument）
+            await this.send('DOM.getDocument')
 
-        const { nodeId } = (await this.send('DOM.requestNode', {
-            objectId,
-        })) as { nodeId: number }
+            const { nodeId } = (await this.send('DOM.requestNode', {
+                objectId,
+            })) as { nodeId: number }
 
-        if (nodeId === 0) {
-            this.observation.lastLocatorState = 'node_resolution_failed'
-            throw this.notFound()
+            if (nodeId === 0) {
+                this.observation.lastLocatorState = 'node_resolution_failed'
+                throw this.notFound()
+            }
+
+            this.observation.lastLocatorState = 'found'
+            this.log(`找到元素: nodeId=${nodeId}`)
+            return nodeId
+        } finally {
+            await this.cdp.send('Runtime.releaseObject', { objectId }, this.sessionId).catch((error: unknown) => {
+                console.warn('[MCP] Locator object cleanup failed:', sanitizeErrorMessage(error))
+            })
         }
-
-        this.observation.lastLocatorState = 'found'
-        this.log(`找到元素: nodeId=${nodeId}`)
-        return nodeId
     }
 
     /**
@@ -611,14 +510,11 @@ export class Locator {
         }
 
         // content 是 [x1,y1, x2,y2, x3,y3, x4,y4] 格式的四个角坐标
-        const [x1, y1, x2, , , , , y4] = model.content
-
-        return {
-            x: x1,
-            y: y1,
-            width: x2 - x1,
-            height: y4 - y1,
-        }
+        const xs = model.content.filter((_, index) => index % 2 === 0)
+        const ys = model.content.filter((_, index) => index % 2 === 1)
+        const x = Math.min(...xs)
+        const y = Math.min(...ys)
+        return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y }
     }
 
     /**
@@ -628,7 +524,11 @@ export class Locator {
      * withRetry() 在重试间隙检查 deadline，此处保证单命令在当前 tick 内也受预算约束
      */
     private send<T>(method: string, params?: object): Promise<T> {
-        return this.cdp.send(method, params, this.sessionId, this.remaining())
+        const scoped =
+            method === 'Runtime.evaluate' && this.contextId !== undefined
+                ? { ...params, contextId: this.contextId }
+                : params
+        return this.cdp.send(method, scoped, this.sessionId, this.remaining())
     }
 
     /**

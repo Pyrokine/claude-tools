@@ -26,8 +26,16 @@ export const TabsListSchema = z
     .partial()
     .optional()
 
+const pageMetadata = {
+    taskHint: z.string().max(120).nullable().optional(),
+    note: z.string().max(1000).nullable().optional(),
+}
+
+export const TabsMetadataSchema = z.object({ tabId: z.number().int().nonnegative(), ...pageMetadata })
+
 export const TabsCreateSchema = z
     .object({
+        ...pageMetadata,
         url: z.string().optional(),
         active: z.boolean().optional(),
         windowId: z.number().int().optional(),
@@ -166,7 +174,7 @@ export const NavigateSchema = z.object({
     url: z.string().min(1),
     waitUntil,
     timeout: z.number().nonnegative().optional(),
-    deadline: z.number().finite().nonnegative().optional(),
+    deadline: z.number().nonnegative().optional(),
 })
 
 export const GoBackSchema = z
@@ -174,7 +182,7 @@ export const GoBackSchema = z
         tabId: tabIdOpt,
         waitUntil,
         timeout: z.number().nonnegative().optional(),
-        deadline: z.number().finite().nonnegative().optional(),
+        deadline: z.number().nonnegative().optional(),
     })
     .partial()
     .optional()
@@ -187,7 +195,7 @@ export const ReloadSchema = z
         ignoreCache: z.boolean().optional(),
         waitUntil,
         timeout: z.number().nonnegative().optional(),
-        deadline: z.number().finite().nonnegative().optional(),
+        deadline: z.number().nonnegative().optional(),
     })
     .partial()
     .optional()
@@ -234,6 +242,7 @@ export const ClickSchema = z.object({
     tabId: tabIdOpt,
     frameId: frameIdOpt,
     refId: refIdReq,
+    modifiers: z.number().int().min(0).max(15).optional(),
 })
 
 export const ActionableClickSchema = z.object({
@@ -241,6 +250,7 @@ export const ActionableClickSchema = z.object({
     frameId: frameIdOpt,
     refId: refIdReq,
     force: z.boolean().optional(),
+    modifiers: z.number().int().min(0).max(15).optional(),
 })
 
 export const CheckActionabilitySchema = z.object({
@@ -304,7 +314,7 @@ export const ViewportMetricsSchema = z.object({
 export const ChallengeInspectSchema = z.object({
     tabId: tabIdOpt,
     frameId: frameIdOpt,
-    deadline: z.number().finite().nonnegative().optional(),
+    deadline: z.number().nonnegative().optional(),
     challengeSelectors: z.array(z.string()),
     deniedSelectors: z.array(z.string()),
     widgetSelectors: z.array(z.string()),
@@ -322,7 +332,16 @@ export const FindSchema = z
         selector: z.string().optional(),
         text: z.string().optional(),
         xpath: z.string().optional(),
-        point: z.object({ x: z.number().finite(), y: z.number().finite() }).optional(),
+        semantic: z
+            .object({
+                role: z.string().optional(),
+                name: z.string().optional(),
+                label: z.string().optional(),
+                exact: z.boolean().optional(),
+            })
+            .strict()
+            .optional(),
+        point: z.object({ x: z.number(), y: z.number() }).optional(),
         matchIndex: z.number().int().nonnegative().optional(),
     })
     .partial()
@@ -373,6 +392,14 @@ export const GetMetadataSchema = z
 
 export const CookiesGetSchema = z
     .object({
+        targetId: z.string().optional(),
+        storeId: z.string().optional(),
+        browserContextId: z.string().optional(),
+        partitionKey: z
+            .object({ topLevelSite: z.string().optional(), hasCrossSiteAncestor: z.boolean().optional() })
+            .strict()
+            .optional(),
+
         url: z.string().optional(),
         name: z.string().optional(),
         domain: z.string().optional(),
@@ -384,6 +411,14 @@ export const CookiesGetSchema = z
     .optional()
 
 export const CookiesSetSchema = z.object({
+    targetId: z.string().optional(),
+    storeId: z.string().optional(),
+    browserContextId: z.string().optional(),
+    partitionKey: z
+        .object({ topLevelSite: z.string().optional(), hasCrossSiteAncestor: z.boolean().optional() })
+        .strict()
+        .optional(),
+
     url: z.string().min(1),
     name: z.string().min(1),
     value: z.string().optional(),
@@ -396,12 +431,28 @@ export const CookiesSetSchema = z.object({
 })
 
 export const CookiesDeleteSchema = z.object({
+    targetId: z.string().optional(),
+    storeId: z.string().optional(),
+    browserContextId: z.string().optional(),
+    partitionKey: z
+        .object({ topLevelSite: z.string().optional(), hasCrossSiteAncestor: z.boolean().optional() })
+        .strict()
+        .optional(),
+
     url: z.string().min(1),
     name: z.string().min(1),
 })
 
 export const CookiesClearSchema = z
     .object({
+        targetId: z.string().optional(),
+        storeId: z.string().optional(),
+        browserContextId: z.string().optional(),
+        partitionKey: z
+            .object({ topLevelSite: z.string().optional(), hasCrossSiteAncestor: z.boolean().optional() })
+            .strict()
+            .optional(),
+
         url: z.string().optional(),
         domain: z.string().optional(),
         name: z.string().optional(),
@@ -430,7 +481,7 @@ export const DebuggerAttachSchema = z
 export const DebuggerDetachSchema = z
     .object({
         tabId: tabIdOpt,
-        deadline: z.number().finite().nonnegative().optional(),
+        deadline: z.number().nonnegative().optional(),
     })
     .partial()
     .optional()
@@ -441,11 +492,22 @@ export const DebuggerSendSchema = z.object({
     params: z.record(z.string(), z.unknown()).optional(),
 })
 
+export const KeyboardFocusSchema = z.object({
+    tabId: z.number().int().nonnegative(),
+    operation: z.enum(['acquire', 'release']),
+    id: z.string().min(1),
+    frameId: frameIdOpt,
+    documentId: z.string().min(1).optional(),
+    releaseKeys: z.boolean().optional(),
+    deadline: z.number().nonnegative().optional(),
+})
+
 // ==================== Input events ====================
 
 export const InputKeySchema = z.object({
     tabId: tabIdOpt,
-    deadline: z.number().finite().nonnegative().optional(),
+    keyboardFocusId: z.string().min(1).optional(),
+    deadline: z.number().nonnegative().optional(),
     type: z.enum(['keyDown', 'keyUp', 'rawKeyDown', 'char']),
     key: z.string().optional(),
     code: z.string().optional(),
@@ -463,7 +525,8 @@ export const InputKeySchema = z.object({
 export const InputMouseSchema = z.object({
     tabId: tabIdOpt,
     frameId: frameIdOpt,
-    deadline: z.number().finite().nonnegative().optional(),
+    documentId: z.string().min(1).optional(),
+    deadline: z.number().nonnegative().optional(),
     type: z.enum(['mousePressed', 'mouseReleased', 'mouseMoved', 'mouseWheel']),
     x: z.number(),
     y: z.number(),
@@ -472,12 +535,14 @@ export const InputMouseSchema = z.object({
     deltaX: z.number().optional(),
     deltaY: z.number().optional(),
     modifiers: z.number().optional(),
+    coordinateSpace: z.literal('frame').optional(),
 })
 
 export const InputTouchSchema = z
     .object({
         tabId: tabIdOpt,
         frameId: frameIdOpt,
+        documentId: z.string().min(1).optional(),
         type: z.enum(['touchStart', 'touchMove', 'touchEnd', 'touchCancel']),
         touchPoints: z.array(
             z.object({
@@ -504,9 +569,10 @@ export const InputTouchSchema = z
 
 export const InputTypeSchema = z.object({
     tabId: tabIdOpt,
+    keyboardFocusId: z.string().min(1).optional(),
     text: z.string(),
     delay: z.number().nonnegative().optional(),
-    deadline: z.number().finite().nonnegative().optional(),
+    deadline: z.number().nonnegative().optional(),
 })
 
 // ==================== Console / Network ====================
@@ -543,12 +609,13 @@ export const NetworkGetSchema = z
 export const StealthClickSchema = z.object({
     tabId: tabIdOpt,
     frameId: frameIdOpt,
-    deadline: z.number().finite().nonnegative().optional(),
+    deadline: z.number().nonnegative().optional(),
     x: z.number(),
     y: z.number(),
     button: z.string().optional(),
     clickCount: z.number().int().positive().optional(),
     refId: z.string().optional(),
+    modifiers: z.number().int().min(0).max(15).optional(),
 })
 
 export const StealthTypeSchema = z.object({
@@ -556,12 +623,12 @@ export const StealthTypeSchema = z.object({
     frameId: frameIdOpt,
     text: z.string(),
     delay: z.number().nonnegative().optional(),
-    deadline: z.number().finite().nonnegative().optional(),
+    deadline: z.number().nonnegative().optional(),
 })
 
 export const StealthKeySchema = z.object({
     tabId: tabIdOpt,
-    deadline: z.number().finite().nonnegative().optional(),
+    deadline: z.number().nonnegative().optional(),
     frameId: frameIdOpt,
     key: z.string().min(1),
     type: z.enum(['down', 'up', 'press']).optional(),
@@ -571,11 +638,12 @@ export const StealthKeySchema = z.object({
 export const StealthMouseSchema = z.object({
     tabId: tabIdOpt,
     frameId: frameIdOpt,
-    deadline: z.number().finite().nonnegative().optional(),
+    deadline: z.number().nonnegative().optional(),
     type: z.string(),
     x: z.number(),
     y: z.number(),
     button: z.string().optional(),
+    modifiers: z.number().int().min(0).max(15).optional(),
 })
 
 export const StealthInjectSchema = z
@@ -590,7 +658,11 @@ export const StealthInjectSchema = z
 
 export const ResolveFrameSchema = z.object({
     tabId: tabIdOpt,
-    frame: z.union([z.string().min(1), z.number().int().nonnegative()]),
+    frame: z.union([
+        z.string().min(1),
+        z.number().int().nonnegative(),
+        z.array(z.union([z.string().min(1), z.number().int().nonnegative()])).min(1),
+    ]),
 })
 
 export const GetAllFramesSchema = TabIdOnly

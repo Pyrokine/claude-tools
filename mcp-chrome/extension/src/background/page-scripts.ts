@@ -1,4 +1,8 @@
+import type { SemanticTarget } from '../../../src/core/dom-helpers.js'
+
 // ==================== 注入到页面的函数 ====================
+
+
 
 export function installFrameProbeListener(): void {
     const probeWindow = window as Window & { __mcpFrameProbeListenerV2?: (event: MessageEvent) => Promise<void> }
@@ -21,6 +25,7 @@ export function installFrameProbeListener(): void {
         try {
             const runtime = typeof chrome === 'undefined' ? undefined : chrome.runtime
             if (typeof runtime?.sendMessage !== 'function') {
+                // noinspection ExceptionCaughtLocallyJS -- Report failure
                 throw new Error('Extension context invalidated: runtime messaging is unavailable')
             }
             const response = (await runtime.sendMessage({
@@ -61,6 +66,7 @@ export function generateAccessibilityTree(
         refId: string
         role: string
         name: string
+        value?: string
         selector: string
         visible: boolean
         disabled: boolean
@@ -86,144 +92,25 @@ export function generateAccessibilityTree(
     const lines: string[] = []
 
     function getRole(element: Element): string {
-        const role = element.getAttribute('role')
-        if (role) {
-            return role
-        }
-
-        const tag = element.tagName.toLowerCase()
-        const type = element.getAttribute('type')
-
-        const roleMap: Record<string, string> = {
-            a: 'link',
-            button: 'button',
-            input:
-                type === 'submit' || type === 'button'
-                    ? 'button'
-                    : type === 'checkbox'
-                      ? 'checkbox'
-                      : type === 'radio'
-                        ? 'radio'
-                        : type === 'file'
-                          ? 'button'
-                          : 'textbox',
-            select: 'combobox',
-            textarea: 'textbox',
-            h1: 'heading',
-            h2: 'heading',
-            h3: 'heading',
-            h4: 'heading',
-            h5: 'heading',
-            h6: 'heading',
-            img: 'image',
-            nav: 'navigation',
-            main: 'main',
-            header: 'banner',
-            footer: 'contentinfo',
-            section: 'region',
-            article: 'article',
-            aside: 'complementary',
-            form: 'form',
-            table: 'table',
-            ul: 'list',
-            ol: 'list',
-            li: 'listitem',
-            label: 'label',
-        }
-
-        return roleMap[tag] || 'generic'
+        return globalThis.__mcpDomHelpers!.role(element)
     }
 
     function getName(element: Element): string {
-        const tag = element.tagName.toLowerCase()
+        return globalThis.__mcpDomHelpers!.accessibleName(element, filter === 'all')
+    }
 
-        // Select 元素
-        if (tag === 'select') {
-            const select = element as HTMLSelectElement
-            const selected = select.querySelector('option[selected]') || select.options[select.selectedIndex]
-            if (selected?.textContent) {
-                return selected.textContent.trim()
-            }
+    function currentValue(element: Element, name: string): string | undefined {
+        if (element.tagName.toLowerCase() !== 'input') {
+            return undefined
         }
-
-        // ARIA label
-        const ariaLabel = element.getAttribute('aria-label')
-        if (ariaLabel?.trim()) {
-            return ariaLabel.trim()
+        const input = element as HTMLInputElement
+        if (
+            ['hidden', 'password', 'file'].includes(input.type) ||
+            (name && ['button', 'submit', 'reset'].includes(input.type))
+        ) {
+            return undefined
         }
-
-        // Placeholder
-        const placeholder = element.getAttribute('placeholder')
-        if (placeholder?.trim()) {
-            return placeholder.trim()
-        }
-
-        // Title
-        const title = element.getAttribute('title')
-        if (title?.trim()) {
-            return title.trim()
-        }
-
-        // Alt
-        const alt = element.getAttribute('alt')
-        if (alt?.trim()) {
-            return alt.trim()
-        }
-
-        // Label for
-        if (element.id) {
-            const label = document.querySelector(`label[for="${CSS.escape(element.id)}"]`)
-            if (label?.textContent?.trim()) {
-                return label.textContent.trim()
-            }
-        }
-
-        // Input value
-        if (tag === 'input') {
-            const input = element as HTMLInputElement
-            const inputType = input.type || ''
-            if (inputType !== 'hidden' && inputType !== 'password') {
-                const value = input.value
-                if (value && (inputType === 'submit' || value.length < 50)) {
-                    return value.trim()
-                }
-            }
-        }
-
-        // Button/Link text
-        if (['button', 'a', 'summary'].includes(tag)) {
-            let text = ''
-            for (const child of element.childNodes) {
-                if (child.nodeType === Node.TEXT_NODE) {
-                    text += child.textContent
-                }
-            }
-            if (text.trim()) {
-                return text.trim()
-            }
-        }
-
-        // Heading text
-        if (tag.match(/^h[1-6]$/)) {
-            const text = element.textContent
-            if (text?.trim()) {
-                return text.trim().substring(0, 100)
-            }
-        }
-
-        // Generic text content
-        let textContent = ''
-        for (const child of element.childNodes) {
-            if (child.nodeType === Node.TEXT_NODE) {
-                textContent += child.textContent
-            }
-        }
-        if (textContent.trim().length >= 3) {
-            const trimmed = textContent.trim()
-            return trimmed.length > 100 ? trimmed.substring(0, 100) + '...' : trimmed
-        }
-
-        return ''
+        return input.value
     }
 
     function isVisible(element: Element): boolean {
@@ -359,14 +246,15 @@ export function generateAccessibilityTree(
         if (rect.width <= 0 || rect.height <= 0) {
             return false
         }
-        const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
-        return Boolean(hit && hit !== element && !element.contains(hit) && !hit.contains(element))
+        const hit = globalThis.__mcpDomHelpers!.deepElementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+        return Boolean(hit && !globalThis.__mcpDomHelpers!.containsComposed(element, hit))
     }
 
     const interactiveElements: Array<{
         refId: string
         role: string
         name: string
+        value?: string
         selector: string
         visible: boolean
         disabled: boolean
@@ -374,7 +262,7 @@ export function generateAccessibilityTree(
         covered: boolean
     }> = []
 
-    function rememberInteractive(element: Element, elementRefId: string, role: string, name: string) {
+    function rememberInteractive(element: Element, elementRefId: string, role: string, name: string, value?: string) {
         if (!isInteractive(element) || interactiveElements.length >= 100) {
             return
         }
@@ -383,6 +271,7 @@ export function generateAccessibilityTree(
             refId: elementRefId,
             role,
             name,
+            ...(value !== undefined ? { value } : {}),
             selector: cssSelector(element),
             visible: isVisible(element),
             disabled: isDisabled(element),
@@ -391,61 +280,73 @@ export function generateAccessibilityTree(
         })
     }
 
-    function traverse(element: Element, level: number, checkRefId: boolean) {
-        if (level > maxDepth || !element || !element.tagName) {
-            return
-        }
-
-        const include = shouldInclude(element, checkRefId) || (checkRefId && level === 0)
-
-        if (include) {
-            const role = getRole(element)
-            const name = getName(element)
-            const elementRefId = getOrCreateRef(element)
-
-            let line = '  '.repeat(level) + role
-            if (name) {
-                line += ` "${name.replace(/\s+/g, ' ').replace(/"/g, '\\"')}"`
-            }
-            line += ` [${elementRefId}]`
-
-            const href = element.getAttribute('href')
-            if (href) {
-                line += ` href="${href}"`
+    function traverse(root: Element, rootLevel: number, checkRefId: boolean) {
+        const pending = [{ element: root, level: rootLevel }]
+        while (pending.length) {
+            const { element, level } = pending.pop()!
+            if (level > maxDepth || !element || !element.tagName) {
+                continue
             }
 
-            const type = element.getAttribute('type')
-            if (type) {
-                line += ` type="${type}"`
-            }
+            const include = shouldInclude(element, checkRefId) || (checkRefId && level === 0)
 
-            lines.push(line)
-            rememberInteractive(element, elementRefId, role, name)
+            if (include) {
+                const role = getRole(element)
+                const name = getName(element)
+                const elementRefId = getOrCreateRef(element)
 
-            // 处理 select 的 options
-            if (element.tagName.toLowerCase() === 'select') {
-                const select = element as HTMLSelectElement
-                for (const option of select.options) {
-                    let optLine = '  '.repeat(level + 1) + 'option'
-                    const optText = option.textContent?.trim() || ''
-                    if (optText) {
-                        optLine += ` "${optText.replace(/\s+/g, ' ').substring(0, 100).replace(/"/g, '\\"')}"`
+                let line = '  '.repeat(level) + role
+                if (name) {
+                    line += ` "${name.replace(/\s+/g, ' ').replace(/"/g, '\\"')}"`
+                }
+                line += ` [${elementRefId}]`
+
+                const href = element.getAttribute('href')
+                if (href) {
+                    line += ` href="${href}"`
+                }
+
+                const type = element.getAttribute('type')
+                if (type) {
+                    line += ` type="${type}"`
+                }
+
+                const value = currentValue(element, name)
+                if (value !== undefined) {
+                    line += ` value=${JSON.stringify(value)}`
+                }
+                lines.push(line)
+                rememberInteractive(element, elementRefId, role, name, value)
+
+                // 处理 select 的 options
+                if (element.tagName.toLowerCase() === 'select') {
+                    const select = element as HTMLSelectElement
+                    for (const option of select.options) {
+                        let optLine = '  '.repeat(level + 1) + 'option'
+                        const optText = option.textContent?.trim() || ''
+                        if (optText) {
+                            optLine += ` "${optText.replace(/\s+/g, ' ').substring(0, 100).replace(/"/g, '\\"')}"`
+                        }
+                        if (option.selected) {
+                            optLine += ' (selected)'
+                        }
+                        if (option.value && option.value !== optText) {
+                            optLine += ` value="${option.value.replace(/"/g, '\\"')}"`
+                        }
+                        lines.push(optLine)
                     }
-                    if (option.selected) {
-                        optLine += ' (selected)'
-                    }
-                    if (option.value && option.value !== optText) {
-                        optLine += ` value="${option.value.replace(/"/g, '\\"')}"`
-                    }
-                    lines.push(optLine)
                 }
             }
-        }
 
-        // 递归子元素
-        if (element.children && level < maxDepth) {
-            for (const child of element.children) {
-                traverse(child, include ? level + 1 : level, checkRefId)
+            // 按 Shadow 子树在前的顺序遍历
+            if (element.children && level < maxDepth) {
+                const children = [
+                    ...(element.shadowRoot ? Array.from(element.shadowRoot.children) : []),
+                    ...Array.from(element.children),
+                ]
+                for (let index = children.length - 1; index >= 0; --index) {
+                    pending.push({ element: children[index]!, level: include ? level + 1 : level })
+                }
             }
         }
     }
@@ -504,7 +405,7 @@ export function generateAccessibilityTree(
 }
 
 // 点击操作（高效模式）
-export function performClick(refId: string): { success: boolean; error?: string } {
+export function performClick(refId: string, modifiers?: MouseEventInit): { success: boolean; error?: string } {
     const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
     const ref = win.__mcpElementMap?.[refId]
 
@@ -523,7 +424,7 @@ export function performClick(refId: string): { success: boolean; error?: string 
     // 高效点击：直接调用 click()
     const el = element as HTMLElement
     el.focus()
-    el.click()
+    globalThis.__mcpDomHelpers!.click(el, modifiers)
 
     return { success: true }
 }
@@ -548,7 +449,7 @@ export function performType(refId: string, text: string, clear: boolean): { succ
     // 高效输入：直接设置 value
     if ('value' in el) {
         el.value = clear ? text : el.value + text
-        el.dispatchEvent(new Event('input', { bubbles: true }))
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }))
         el.dispatchEvent(new Event('change', { bubbles: true }))
     } else if ((element as HTMLElement).contentEditable === 'true') {
         if (clear) {
@@ -556,7 +457,7 @@ export function performType(refId: string, text: string, clear: boolean): { succ
         } else {
             element.textContent = (element.textContent || '') + text
         }
-        element.dispatchEvent(new Event('input', { bubbles: true }))
+        element.dispatchEvent(new Event('input', { bubbles: true, composed: true }))
     }
 
     return { success: true }
@@ -599,61 +500,114 @@ export function performScroll(
 export async function executeCode(
     code: string,
     timeout?: number
-): Promise<{ success: boolean; result?: string; error?: string }> {
-    function evaluateSerializationError(message: string, suggestion: string, context: Record<string, unknown>): string {
-        return JSON.stringify({
-            error: {
-                code: 'NON_SERIALIZABLE_EVALUATE_RESULT',
-                message,
-                suggestion,
-                context,
-            },
-        })
+): Promise<{
+    success: boolean
+    result?: string
+    error?: string
+    errorMessage?: string
+    errorSource?: 'page' | 'context' | 'output'
+    errorCode?: 'CSP_BLOCKED' | 'NON_SERIALIZABLE_EVALUATE_RESULT'
+    actionExecuted?: false
+}> {
+    const errorText = (error: unknown): string => {
+        try {
+            return error instanceof Error ? String(error.message) : String(error)
+        } catch {
+            return 'Unprintable page exception'
+        }
+    }
+    function evaluateSerializationError(
+        message: string,
+        suggestion: string,
+        context: Record<string, unknown>
+    ): { error: string; errorMessage: string } {
+        return {
+            error: JSON.stringify({
+                error: {
+                    code: 'NON_SERIALIZABLE_EVALUATE_RESULT',
+                    message,
+                    suggestion,
+                    context,
+                },
+            }),
+            errorMessage: message,
+        }
     }
 
-    function serializeEvaluateResult(result: unknown): { success: boolean; result?: string; error?: string } {
-        if (result instanceof Node) {
-            const element = result instanceof Element ? result : result.parentElement
-            return {
-                success: false,
-                error: evaluateSerializationError(
-                    `返回值是 DOM 节点 ${result.nodeName}，不能直接 JSON 序列化`,
-                    '请返回 textContent、outerHTML、getAttribute(...) 等简单字段，或改用 extract type="text"/"html"',
-                    {
-                        nodeType: result.nodeType,
-                        nodeName: result.nodeName,
-                        selector: element?.id ? `#${CSS.escape(element.id)}` : element?.tagName.toLowerCase(),
-                    }
-                ),
-            }
-        }
-        if (result instanceof NodeList || result instanceof HTMLCollection) {
-            return {
-                success: false,
-                error: evaluateSerializationError(
-                    `返回值是 ${result.constructor.name}，不能直接 JSON 序列化`,
-                    '请用 Array.from(value).map(...) 提取需要的字段，例如 textContent、href、outerHTML',
-                    { className: result.constructor.name, length: result.length }
-                ),
-            }
-        }
+    function serializeEvaluateResult(result: unknown): {
+        success: boolean
+        result?: string
+        error?: string
+        errorMessage?: string
+        errorSource?: 'output'
+        errorCode?: 'NON_SERIALIZABLE_EVALUATE_RESULT'
+    } {
         try {
+            if (result instanceof Node) {
+                const element = result instanceof Element ? result : result.parentElement
+                return {
+                    success: false,
+                    errorSource: 'output',
+                    ...evaluateSerializationError(
+                        `返回值是 DOM 节点 ${result.nodeName}，不能直接 JSON 序列化`,
+                        '请返回 textContent、outerHTML、getAttribute(...) 等简单字段，或改用 extract type="text"/"html"',
+                        {
+                            nodeType: result.nodeType,
+                            nodeName: result.nodeName,
+                            selector: element?.id ? `#${CSS.escape(element.id)}` : element?.tagName.toLowerCase(),
+                        }
+                    ),
+                }
+            }
+            if (result instanceof NodeList || result instanceof HTMLCollection) {
+                return {
+                    success: false,
+                    errorSource: 'output',
+                    ...evaluateSerializationError(
+                        `返回值是 ${result.constructor.name}，不能直接 JSON 序列化`,
+                        '请用 Array.from(value).map(...) 提取需要的字段，例如 textContent、href、outerHTML',
+                        { className: result.constructor.name, length: result.length }
+                    ),
+                }
+            }
             return { success: true, result: JSON.stringify(result) }
         } catch (error) {
-            const errorMsg = error instanceof Error ? error.message : String(error)
-            return {
-                success: false,
-                error: evaluateSerializationError(
-                    `evaluate 返回值无法 JSON 序列化: ${errorMsg}`,
-                    '请返回字符串、数字、布尔值、数组或普通对象，避免返回循环引用、BigInt、DOM 对象',
-                    { error: errorMsg }
-                ),
+            const errorMsg = errorText(error)
+            try {
+                return {
+                    success: false,
+                    errorSource: 'output',
+                    ...evaluateSerializationError(
+                        `evaluate 返回值检查或序列化失败: ${errorMsg}`,
+                        '请返回可 JSON 序列化的简单数据，并检查自定义原型或 getter 是否抛错',
+                        { error: errorMsg }
+                    ),
+                }
+            } catch (detailError) {
+                return {
+                    success: false,
+                    errorSource: 'output',
+                    errorCode: 'NON_SERIALIZABLE_EVALUATE_RESULT',
+                    error: `evaluate 返回值检查或序列化失败: ${errorMsg}；输出错误详情生成失败: ${errorText(detailError)}`,
+                }
             }
+        }
+    }
+
+    let fn: () => unknown
+    try {
+        fn = new Function(`return (${code})`) as () => unknown
+    } catch (error) {
+        return {
+            success: false,
+            error: errorText(error),
+            errorSource: 'context',
+            actionExecuted: false,
+            ...(error instanceof EvalError ? { errorCode: 'CSP_BLOCKED' } : {}),
         }
     }
 
     try {
-        const fn = new Function(`return (${code})`)
         const result = fn()
         if (timeout === undefined) {
             return serializeEvaluateResult(await result)
@@ -676,14 +630,7 @@ export async function executeCode(
             }
         }
     } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : 'Unknown error'
-        if (errorMsg.includes('Content Security Policy') || errorMsg.includes("'unsafe-eval'")) {
-            return {
-                success: false,
-                error: `CSP 限制：此页面禁止动态代码执行，建议使用 extract 工具获取页面内容或使用 CDP 模式，原始错误: ${errorMsg}`,
-            }
-        }
-        return { success: false, error: errorMsg }
+        return { success: false, error: errorText(error), errorSource: 'page' }
     }
 }
 
@@ -943,141 +890,68 @@ export function findElements(
     xpath: string | null,
     expectedUrl?: string | null,
     point?: { x: number; y: number } | null,
-    matchIndex?: number
+    matchIndex?: number | null,
+    semantic?: SemanticTarget | null
 ):
-    | Array<{
-          refId: string
-          tag: string
-          text: string
-          rect: { x: number; y: number; width: number; height: number }
-      }>
+    | Array<{ refId: string; tag: string; text: string; rect: { x: number; y: number; width: number; height: number } }>
     | { error: string } {
     if (expectedUrl != null && location.href !== expectedUrl) {
         throw new Error('页面 URL 已变化，未读取')
+    }
+    const helpers = globalThis.__mcpDomHelpers
+    if (!helpers) {
+        throw new Error('DOM query helpers are not installed')
+    }
+    if (!point && !selector && !text && !xpath && !semantic) {
+        return { error: 'find requires at least one of: selector, xpath, text, semantic' }
     }
     const win = window as Window & {
         __mcpElementMap?: Record<string, WeakRef<Element>>
         __mcpElementToRefId?: WeakMap<Element, string>
         __mcpRefCounter?: number
+        __mcpSweepCounter?: number
     }
-    win.__mcpElementMap = win.__mcpElementMap || {}
-    win.__mcpElementToRefId = win.__mcpElementToRefId || new WeakMap()
-    win.__mcpRefCounter = win.__mcpRefCounter || 0
-
-    const results: Array<{
-        refId: string
-        tag: string
-        text: string
-        rect: { x: number; y: number; width: number; height: number }
-    }> = []
-
+    win.__mcpElementMap ??= {}
+    win.__mcpElementToRefId ??= new WeakMap()
+    win.__mcpRefCounter ??= 0
     let elements: Element[]
-
-    if (point) {
-        const element = document.elementFromPoint(point.x, point.y)
-        elements = element ? [element] : []
-    } else if (xpath) {
-        // XPath 查询
-        elements = []
-        const xpathResult = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null)
-        for (let i = 0; i < xpathResult.snapshotLength; i++) {
-            const node = xpathResult.snapshotItem(i)
-            if (node instanceof Element) {
-                elements.push(node)
-            }
+    try {
+        const hit = point ? helpers.deepElementFromPoint(point.x, point.y) : null
+        elements = point ? (hit ? [hit] : []) : helpers.query({ selector, text, xpath, semantic })
+    } catch (error) {
+        if ((error as { name?: string }).name === 'SyntaxError') {
+            return { error: 'Invalid CSS selector: ' + selector }
         }
-    } else if (selector) {
-        // CSS 选择器查询；非法 selector 转为 {error} 返回（Chrome 会吞掉同步 throw，故用结构化返回）
-        try {
-            elements = Array.from(document.querySelectorAll(selector))
-        } catch (e) {
-            // 跨 realm instanceof 失效，用 name 判断
-            const err = e as { name?: string; message?: string }
-            if (err?.name === 'SyntaxError') {
-                return { error: `Invalid CSS selector: "${selector}" (${err.message})` }
-            }
-            throw e
-        }
-    } else if (text) {
-        // 无 selector / xpath 但有 text：用 TreeWalker 走文本节点，避开 querySelectorAll('*')
-        // 大型 SPA 中后者会触发 O(N) 全树扫描 + N 次 getBoundingClientRect
-        elements = []
-        const seen = new Set<Element>()
-        const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT, {
-            acceptNode: (node) =>
-                (node as Text).data?.includes(text) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT,
-        })
-        let n: Node | null = walker.nextNode()
-        let textMatchIndex = 0
-        while (n && (matchIndex !== undefined || elements.length < 200)) {
-            const parent = (n as Text).parentElement
-            if (parent && !seen.has(parent)) {
-                seen.add(parent)
-                if (matchIndex === undefined || textMatchIndex++ === matchIndex) {
-                    elements.push(parent)
-                    if (matchIndex !== undefined) {
-                        break
-                    }
-                }
-            }
-            n = walker.nextNode()
-        }
-    } else {
-        // selector / xpath / text 全空：拒绝全树扫描，要求调用方至少传一个
-        return { error: 'find requires at least one of: selector, xpath, text' }
+        throw error
     }
-
-    let matched = 0
-    for (const element of elements) {
-        if (text) {
-            const elementText = element.textContent || ''
-            if (!elementText.includes(text)) {
-                continue
-            }
-        }
-        if (matchIndex !== undefined && (selector || xpath || point) && matched++ !== matchIndex) {
-            continue
-        }
-
-        // 查找或创建 refId（用 WeakMap 反向索引避免 O(N×M)）
-        let refId = win.__mcpElementToRefId!.get(element) ?? null
+    const selected = matchIndex == null ? elements.slice(0, 50) : elements.slice(matchIndex, matchIndex + 1)
+    const results = selected.map((element) => {
+        let refId = win.__mcpElementToRefId!.get(element)
         if (refId && win.__mcpElementMap![refId]?.deref() !== element) {
-            refId = null
+            refId = undefined
         }
-
         if (!refId) {
-            refId = `ref_${++win.__mcpRefCounter!}`
+            refId = 'ref_' + ++win.__mcpRefCounter!
             win.__mcpElementMap![refId] = new WeakRef(element)
             win.__mcpElementToRefId!.set(element, refId)
         }
-
         const rect = element.getBoundingClientRect()
-        results.push({
+        return {
             refId,
             tag: element.tagName.toLowerCase(),
-            text: (element.textContent || '').trim().substring(0, 100),
+            text: (element.textContent ?? '').trim().substring(0, 100),
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-        })
-
-        if (matchIndex !== undefined || results.length >= 50) {
-            break
         }
-    }
-
-    // 清理失效引用，防止 key 泄漏（懒执行：每 10 次调用一次,或 Map 大于 500 时强制执行）
-    {
-        const w = window as Window & { __mcpSweepCounter?: number }
-        const counter = (w.__mcpSweepCounter ?? 0) + 1
-        w.__mcpSweepCounter = counter
-        if (counter % 10 === 0 || Object.keys(win.__mcpElementMap!).length > 500) {
-            for (const id of Object.keys(win.__mcpElementMap!)) {
-                if (!win.__mcpElementMap![id].deref()) {
-                    delete win.__mcpElementMap![id]
-                }
+    })
+    const counter = (win.__mcpSweepCounter ?? 0) + 1
+    win.__mcpSweepCounter = counter
+    if (counter % 10 === 0 || Object.keys(win.__mcpElementMap).length > 500) {
+        for (const [key, ref] of Object.entries(win.__mcpElementMap)) {
+            if (!ref.deref()?.isConnected) {
+                delete win.__mcpElementMap[key]
             }
         }
     }
-
     return results
 }
 
@@ -1089,7 +963,8 @@ export function simulateMouseClick(
     y: number,
     button: string,
     clickCount = 1,
-    refId?: string
+    refId?: string | null,
+    modifiers?: MouseEventInit
 ): { success: boolean } {
     // refId 优先：用 __mcpElementMap 直接解析目标元素，避开 elementFromPoint 在嵌套 iframe overlay
     // 下命中外层 IFRAME 的问题；解析失败 fallback 到 elementFromPoint
@@ -1106,7 +981,7 @@ export function simulateMouseClick(
         }
     }
     if (!element) {
-        element = document.elementFromPoint(x, y)
+        element = globalThis.__mcpDomHelpers!.deepElementFromPoint(x, y)
     }
     if (!element) {
         return { success: false }
@@ -1117,6 +992,7 @@ export function simulateMouseClick(
     const buttonsMask = button === 'right' ? 2 : button === 'middle' ? 4 : 1
     const baseOptions = {
         bubbles: true,
+        composed: true,
         cancelable: true,
         view: window,
         clientX: x,
@@ -1124,12 +1000,15 @@ export function simulateMouseClick(
         screenX: x + window.screenX,
         screenY: y + window.screenY,
         button: buttonCode,
+        ...modifiers,
     }
     const pressed = { ...baseOptions, buttons: buttonsMask }
     const released = { ...baseOptions, buttons: 0 }
 
     element.dispatchEvent(new MouseEvent('mouseover', released))
-    element.dispatchEvent(new MouseEvent('mouseenter', { ...released, bubbles: false }))
+    element.dispatchEvent(
+        new MouseEvent('mouseenter', { ...released, bubbles: false, composed: false, cancelable: false })
+    )
     element.dispatchEvent(new MouseEvent('mousemove', released))
     const clickType = button === 'right' ? 'contextmenu' : button === 'middle' ? 'auxclick' : 'click'
     for (let detail = 1; detail <= clickCount; ++detail) {
@@ -1154,7 +1033,7 @@ export async function simulateKeyboardType(
     deadline?: number
 ): Promise<{ success: boolean; error?: string }> {
     const expired = () => deadline !== undefined && Date.now() >= deadline
-    const activeElement = document.activeElement as HTMLElement | null
+    const activeElement = globalThis.__mcpDomHelpers!.activeElement() as HTMLElement | null
 
     if (!activeElement) {
         return { success: false, error: 'No active element' }
@@ -1200,6 +1079,7 @@ export async function simulateKeyboardType(
 
         const keyEventOptions = {
             bubbles: true,
+            composed: true,
             cancelable: true,
             key: char,
             code:
@@ -1230,7 +1110,7 @@ export async function simulateKeyboardType(
         activeElement.dispatchEvent(
             new InputEvent('input', {
                 bubbles: true,
-                cancelable: true,
+                composed: true,
                 inputType: 'insertText',
                 data: char,
             })
@@ -1258,10 +1138,11 @@ export function simulateKeyEvent(
     if (deadline !== undefined && Date.now() >= deadline) {
         throw new Error('input timeout before event dispatch')
     }
-    const activeElement = document.activeElement || document.body
+    const activeElement = globalThis.__mcpDomHelpers!.activeElement() || document.body
 
     const keyEventOptions: KeyboardEventInit = {
         bubbles: true,
+        composed: true,
         cancelable: true,
         key,
         code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
@@ -1291,18 +1172,20 @@ export function simulateMouseEvent(
     x: number,
     y: number,
     button: string,
-    deadline?: number
+    deadline?: number | null,
+    modifiers?: MouseEventInit
 ): { success: boolean } {
-    if (deadline !== undefined && Date.now() >= deadline) {
+    if (deadline != null && Date.now() >= deadline) {
         throw new Error('input timeout before mouse event dispatch')
     }
-    const element = document.elementFromPoint(x, y) || document.body
+    const element = globalThis.__mcpDomHelpers!.deepElementFromPoint(x, y) || document.body
     // W3C 标准：button 字段 left=0/middle=1/right=2；buttons 位掩码 left=1/middle=4/right=2
     const buttonCode = button === 'right' ? 2 : button === 'middle' ? 1 : 0
     const buttonsMask = button === 'right' ? 2 : button === 'middle' ? 4 : 1
 
     const eventOptions = {
         bubbles: true,
+        composed: type !== 'mouseenter' && type !== 'mouseleave',
         cancelable: true,
         view: window,
         clientX: x,
@@ -1310,6 +1193,7 @@ export function simulateMouseEvent(
         screenX: x + window.screenX,
         screenY: y + window.screenY,
         button: buttonCode,
+        ...modifiers,
         buttons: type === 'mousedown' ? buttonsMask : 0,
     }
 
@@ -1602,8 +1486,8 @@ export function installActionabilityHelpers(): void {
         if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
             return failure('not-in-viewport')
         }
-        const hitEl = document.elementFromPoint(clickPoint.x, clickPoint.y)
-        if (hitEl && hitEl !== element && !element.contains(hitEl) && !hitEl.contains(element)) {
+        const hitEl = globalThis.__mcpDomHelpers!.deepElementFromPoint(clickPoint.x, clickPoint.y)
+        if (hitEl && !globalThis.__mcpDomHelpers!.containsComposed(element, hitEl)) {
             return failure('covered', {
                 coveringElement: describeElement(hitEl),
                 coveringRect: plainRect(hitEl.getBoundingClientRect()),
@@ -1665,7 +1549,8 @@ export function checkActionability(refId: string): ActionabilityResult {
  */
 export function performActionableClick(
     refId: string,
-    force: boolean
+    force: boolean,
+    modifiers?: MouseEventInit
 ): Partial<ActionabilityResult> & {
     success: boolean
     error?: string
@@ -1686,9 +1571,11 @@ export function performActionableClick(
         const cy = Math.round(rect.y + rect.height / 2)
         const opts = {
             bubbles: true,
+            composed: true,
             cancelable: true,
             button: 0,
             buttons: 1,
+            ...modifiers,
             clientX: cx,
             clientY: cy,
             view: window,
@@ -1696,7 +1583,7 @@ export function performActionableClick(
         el.dispatchEvent(new MouseEvent('mousedown', opts))
         el.focus()
         el.dispatchEvent(new MouseEvent('mouseup', { ...opts, buttons: 0 }))
-        el.dispatchEvent(new MouseEvent('click', { ...opts, buttons: 0 }))
+        globalThis.__mcpDomHelpers!.click(el, modifiers, { ...opts, buttons: 0 })
     }
 
     // force 模式：跳过所有检查，直接点击
@@ -1794,22 +1681,39 @@ export function performDragAndDrop(
 export function dispatchInputToElement(refId: string, val: string): { success: boolean; error?: string } {
     const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
     const ref = win.__mcpElementMap?.[refId]
-    const el = ref?.deref() as HTMLInputElement | HTMLTextAreaElement | undefined
+    const el = ref?.deref() as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | undefined
     if (!el) {
         return { success: false, error: `Element ${refId} not found` }
     }
-    el.focus()
-    const proto = Object.getPrototypeOf(el)
-    const setter =
-        Object.getOwnPropertyDescriptor(proto, 'value') ??
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value') ??
-        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
-    if (setter?.set) {
-        setter.set.call(el, val)
-    } else {
-        el.value = val
+    const tag = el.namespaceURI === 'http://www.w3.org/1999/xhtml' ? el.localName : undefined
+    const prototype =
+        tag === 'input'
+            ? HTMLInputElement.prototype
+            : tag === 'textarea'
+              ? HTMLTextAreaElement.prototype
+              : tag === 'select'
+                ? HTMLSelectElement.prototype
+                : undefined
+    if (!prototype && !el.isContentEditable) {
+        return { success: false, error: 'controlled 输入需要 input、textarea、select 或 contenteditable 目标' }
     }
-    el.dispatchEvent(new Event('input', { bubbles: true }))
+    if (el.matches(':disabled') || ('readOnly' in el && el.readOnly)) {
+        return { success: false, error: 'controlled 输入目标处于 disabled 或 readonly 状态' }
+    }
+    if (tag === 'input' && el.type === 'file') {
+        return { success: false, error: '文件控件请使用 upload 事件' }
+    }
+    const setter = prototype ? Object.getOwnPropertyDescriptor(prototype, 'value')?.set : undefined
+    if (prototype && !setter) {
+        return { success: false, error: 'controlled 输入目标的原生 value setter 不可用' }
+    }
+    el.focus()
+    if (setter) {
+        setter.call(el, val)
+    } else {
+        el.textContent = val
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }))
     el.dispatchEvent(new Event('change', { bubbles: true }))
     return { success: true }
 }

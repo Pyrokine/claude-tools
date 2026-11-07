@@ -14,12 +14,13 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import { StructuredToolError, TargetNotFoundError } from '../core/errors.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
-import { StructuredToolError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT, type WaitUntil } from '../core/types.js'
-import { remainingNavigationTimeout } from '../core/utils.js'
+import { remainingNavigationTimeout, withNavigationBudget, withNavigationMetadata } from '../core/utils.js'
 import { challengeResultFields, resolveChallenge } from './challenge.js'
 import { withDiagnosticsResponse } from './diagnostics.js'
+import { sanitizePageUrls, sanitizeUrlRecord } from './network-sanitizer.js'
 import { withPageContext, withPageResponse } from './page-context.js'
 import { pageConditionSchema } from './schema.js'
 
@@ -48,7 +49,7 @@ const browseSchema = z.object({
         .number()
         .optional()
         .describe(
-            'CDP 调试端口。只在 browse(action="connect") 中显式指定时选择 CDP；其他场景优先使用已连接的 Extension'
+            'CDP 调试端口。connect 或 launch 显式指定时选择 CDP；launch 的显式进程参数在创建页面前确定执行路径，未指定时优先使用已连接的 Extension'
         ),
     host: z.string().optional().describe('调试主机（connect）'),
     targetId: z
@@ -83,21 +84,43 @@ const browseSchema = z.object({
 /**
  * browse 工具处理器
  */
-function pageStateMetadata(unifiedSession: ReturnType<typeof getUnifiedSession>): Record<string, unknown> {
-    const state = unifiedSession.getState()
-    return {
+async function pageStateMetadata(
+    unifiedSession: ReturnType<typeof getUnifiedSession>,
+    navigationDeadline?: number,
+    signal?: AbortSignal
+): Promise<Record<string, unknown>> {
+    let state = unifiedSession.getState()
+    if (navigationDeadline !== undefined) {
+        const targetId = unifiedSession.getCurrentTargetId()
+        state = await withNavigationMetadata(async () => {
+            const live = await withNavigationBudget(
+                () => unifiedSession.getLiveState(remainingNavigationTimeout(navigationDeadline)),
+                navigationDeadline,
+                signal
+            )
+            if (live === null) {
+                throw new TargetNotFoundError(targetId ?? '当前页面')
+            }
+            return live
+        })
+    }
+    return sanitizeUrlRecord({
         url: state?.url,
         title: state?.title,
         managed: state?.managed ?? false,
-    }
+    })
 }
 
-async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
+async function handleBrowse(
+    args: z.infer<typeof browseSchema>,
+    deadline: number,
+    signal?: AbortSignal
+): Promise<{
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
 }> {
     try {
-        const deadline = Date.now() + (args.timeout ?? DEFAULT_TIMEOUT)
+        signal?.throwIfAborted()
         const unifiedSession = getUnifiedSession()
         const cdpSession = getSession()
 
@@ -105,6 +128,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
         const useExtension = unifiedSession.isExtensionModeEnabled()
         const conditional = args.expectedUrl !== undefined || args.expectedRevision !== undefined
         if (conditional && !['open', 'back', 'forward', 'refresh', 'close'].includes(args.action)) {
+            // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new StructuredToolError(
                 'INVALID_ARGUMENT',
                 `${args.action} 不支持页面动作条件，未执行`,
@@ -137,8 +161,16 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                 note:
                                     target.mode === 'extension'
                                         ? 'Extension 模式：使用用户浏览器，共享登录状态'
-                                        : '已启动新浏览器（Extension 未连接，fallback 到 CDP 模式）',
-                                target,
+                                        : [
+                                                args.port,
+                                                args.executablePath,
+                                                args.headless,
+                                                args.userDataDir,
+                                                args.incognito,
+                                            ].some((value) => value !== undefined)
+                                          ? '显式启动参数已应用于独立 CDP 浏览器'
+                                          : '已启动新浏览器（Extension 未连接，fallback 到 CDP 模式）',
+                                target: sanitizePageUrls(target),
                                 createdTargetId:
                                     target.mode === 'extension' || target.targetCreated === true || !target.reused
                                         ? target.targetId
@@ -166,7 +198,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                             note: reused
                                 ? '已复用运行中的浏览器，保留登录状态'
                                 : '已启动新浏览器，登录状态保存在 ~/.mcp-chrome/profile',
-                            target,
+                            target: sanitizePageUrls(target),
                             createdTargetId: (target.targetCreated ?? !reused) ? target.targetId : null,
                         })
                     },
@@ -227,7 +259,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                             action: 'connect',
                             mode: 'cdp',
                             port: args.port,
-                            target,
+                            target: sanitizePageUrls(target),
                             createdTargetId: null,
                         })
                     },
@@ -265,7 +297,9 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         : favIconUrl !== undefined
                           ? { favIconUrl }
                           : {}
-                    if (detail === 'full') return { ...native, ...favicon }
+                    if (detail === 'full') {
+                        return { ...native, ...favicon }
+                    }
                     return {
                         targetId: tab.targetId,
                         type: tab.type,
@@ -325,7 +359,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                     details: detail,
                     targetCount: targets.length,
                     totalTargetCount: allTargets.length,
-                    targets,
+                    targets: sanitizePageUrls(targets),
                     defaultTargetId: unifiedSession.getCurrentTargetId(),
                     ...(topology
                         ? {
@@ -384,7 +418,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                         mode: unifiedSession.getMode(),
                         targetId: args.targetId,
                         activated: args.activate ?? false,
-                        ...pageStateMetadata(unifiedSession),
+                        ...(await pageStateMetadata(unifiedSession)),
                     })
                 })
             }
@@ -429,11 +463,11 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                                     suggestion:
                                                         '请从 browse(action="list") 选择 managed=true 的 tab，' +
                                                         '或用 manage(action="newPage") 创建受控页面',
-                                                    context: {
+                                                    context: sanitizeUrlRecord({
                                                         managed: currentState.managed ?? false,
                                                         url: currentState.url,
                                                         title: currentState.title,
-                                                    },
+                                                    }),
                                                 },
                                             },
                                             null,
@@ -471,7 +505,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                             success: true,
                                             action: 'open',
                                             mode: unifiedSession.getMode(),
-                                            ...pageStateMetadata(unifiedSession),
+                                            ...(await pageStateMetadata(unifiedSession, deadline, signal)),
                                             ...challengeResultFields(challenge),
                                         }
                                     },
@@ -510,7 +544,11 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                             action: 'back',
                                             mode: unifiedSession.getMode(),
                                             navigated: result.navigated,
-                                            ...pageStateMetadata(unifiedSession),
+                                            ...(await pageStateMetadata(
+                                                unifiedSession,
+                                                result.navigated ? deadline : undefined,
+                                                signal
+                                            )),
                                             ...(result.navigated ? {} : { note: '无后退历史' }),
                                             ...(challenge ? challengeResultFields(challenge) : {}),
                                         }
@@ -551,7 +589,11 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                             action: 'forward',
                                             mode: unifiedSession.getMode(),
                                             navigated: result.navigated,
-                                            ...pageStateMetadata(unifiedSession),
+                                            ...(await pageStateMetadata(
+                                                unifiedSession,
+                                                result.navigated ? deadline : undefined,
+                                                signal
+                                            )),
                                             ...(result.navigated ? {} : { note: '无前进历史' }),
                                             ...(challenge ? challengeResultFields(challenge) : {}),
                                         }
@@ -591,7 +633,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                                             success: true,
                                             action: 'refresh',
                                             mode: unifiedSession.getMode(),
-                                            ...pageStateMetadata(unifiedSession),
+                                            ...(await pageStateMetadata(unifiedSession, deadline, signal)),
                                             ...challengeResultFields(challenge),
                                         }
                                     },
@@ -631,7 +673,7 @@ async function handleBrowse(args: z.infer<typeof browseSchema>): Promise<{
                             action: 'close',
                             mode: unifiedSession.getMode(),
                             targetId: args.targetId,
-                            ...(affected ? { affected } : {}),
+                            ...(affected ? { affected: sanitizePageUrls(affected) } : {}),
                         })
                     })
                 )
@@ -666,6 +708,8 @@ export function registerBrowseTool(server: McpServer): void {
         'browse',
         {
             description: [
+                '先 list，按任务 metadata 后台 attach 复用；无合适页面才 manage newPage 并设置 taskHint/note。',
+                '任务完成用 close/release 处理明确临时页，保留 adopted/unknown、产物和可复用测试页。',
                 '浏览器管理与导航。默认优先使用已连接的 Chrome Extension 和用户真实 Chrome；',
                 'Extension 不可用时才回退 CDP。仅 browse(action="connect", port=…) 会显式选择 CDP。',
                 '过 Cloudflare 时，Extension 先被动等待真实 tab 标题恢复，避免先附加 debugger；',
@@ -677,6 +721,11 @@ export function registerBrowseTool(server: McpServer): void {
             ].join(''),
             inputSchema: browseSchema,
         },
-        (args) => handleBrowse(args)
+        (args, extra) => {
+            const deadline = Date.now() + (args.timeout ?? DEFAULT_TIMEOUT)
+            return getUnifiedSession()
+                .withTabLock(() => handleBrowse(args, deadline, extra?.signal), deadline, extra?.signal)
+                .catch(formatErrorResponse)
+        }
     )
 }

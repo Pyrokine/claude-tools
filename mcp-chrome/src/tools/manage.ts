@@ -17,6 +17,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import {
     devices,
+    DEFAULT_TIMEOUT,
     formatErrorResponse,
     formatResponse,
     getSession,
@@ -24,8 +25,18 @@ import {
     isNativeExecutionResultUnknown,
 } from '../core/index.js'
 import type { CacheType } from '../core/types.js'
+import { sanitizePageUrls } from './network-sanitizer.js'
 import { withPageResponse } from './page-context.js'
 import { pageConditionSchema } from './schema.js'
+import {
+    dialogCommandSchema,
+    captureCommandSchema,
+    routeCommandSchema,
+    authCommandSchema,
+    downloadCommandSchema,
+} from '../core/browser-event-schema.js'
+import { browserEventResponse } from './browser-event-output.js'
+import type { BrowserEventAction, EventCommand } from '../core/browser-events.js'
 
 function invalidArgument(
     message: string,
@@ -62,7 +73,7 @@ function formatAffectedResponse(
         success: true,
         action,
         mode,
-        affected,
+        affected: sanitizePageUrls(affected),
     })
 }
 
@@ -100,6 +111,11 @@ const manageSchema = z
                 'inputMode',
                 'stealth',
                 'cdp',
+                'dialog',
+                'networkCapture',
+                'route',
+                'httpAuth',
+                'download',
             ])
             .describe('管理操作'),
         inputMode: z
@@ -108,6 +124,11 @@ const manageSchema = z
             .describe(
                 '输入模式（inputMode），precise=debugger API（默认，可绕过 CSP 但显示调试提示）；stealth=JS 事件模拟（不触发调试提示但受 CSP 限制，适用于反检测场景）'
             ),
+        dialog: dialogCommandSchema.optional(),
+        capture: captureCommandSchema.optional(),
+        route: routeCommandSchema.optional(),
+        auth: authCommandSchema.optional(),
+        download: downloadCommandSchema.optional(),
         cdpMethod: z.string().optional().describe('CDP 方法名（cdp），如 Runtime.evaluate、Page.captureScreenshot'),
         cdpParams: z.record(z.string(), z.unknown()).optional().describe('CDP 方法参数（cdp）'),
         targetId: z.string().optional().describe('目标页面 ID；newWindow 时将此受控页面移入新窗口'),
@@ -184,12 +205,22 @@ const manageSchema = z
         height: z.number().optional().describe('视口高度（viewport）'),
         userAgent: z.string().optional().describe('User-Agent 字符串（userAgent）'),
         device: z.string().optional().describe('设备名称（emulate），如 iPhone 13, iPad Pro'),
-        taskHint: z.string().max(120).nullable().optional().describe('pageMetadata：任务提示，null 清除'),
-        note: z.string().max(1000).nullable().optional().describe('pageMetadata：页面备注，null 清除'),
+        taskHint: z.string().max(120).nullable().optional().describe('newPage/pageMetadata：任务名称，null 清除'),
+        note: z
+            .string()
+            .max(1000)
+            .nullable()
+            .optional()
+            .describe('newPage/pageMetadata：页面用途与保留要求，null 清除'),
     })
     .strict()
     .superRefine((args, context) => {
         const scopes: Record<string, string[]> = {
+            dialog: ['dialog'],
+            capture: ['networkCapture'],
+            route: ['route'],
+            auth: ['httpAuth'],
+            download: ['download'],
             activate: ['movePage'],
             targetIds: ['groupPages', 'ungroupPages'],
             groupId: ['newPage', 'groupPages', 'updateGroup', 'moveGroup'],
@@ -231,6 +262,17 @@ const manageSchema = z
             if (args[field as keyof typeof args] !== undefined && !actions.includes(args.action)) {
                 context.addIssue({ code: 'custom', path: [field], message: `${args.action} 不支持 ${field}，未执行` })
             }
+        }
+        const eventFields = {
+            dialog: 'dialog',
+            networkCapture: 'capture',
+            route: 'route',
+            httpAuth: 'auth',
+            download: 'download',
+        } as const
+        const eventField = eventFields[args.action as keyof typeof eventFields]
+        if (eventField && args[eventField] === undefined) {
+            context.addIssue({ code: 'custom', path: [eventField], message: `${args.action} requires ${eventField}` })
         }
         if (args.action === 'newPage') {
             if (args.index !== undefined && args.index < 0) {
@@ -312,10 +354,67 @@ interface ManageContext {
 
 type ManageHandler = (context: ManageContext, args: ManageArgs) => Promise<ManageResponse> | ManageResponse
 
-async function handleManage(args: ManageArgs): Promise<ManageResponse> {
+async function handleManage(args: ManageArgs, signal?: AbortSignal): Promise<ManageResponse> {
     try {
+        signal?.throwIfAborted()
         const unifiedSession = getUnifiedSession()
         const mode = unifiedSession.getMode()
+        const deadline = Date.now() + (args.timeout ?? DEFAULT_TIMEOUT)
+        const eventField = (
+            {
+                dialog: 'dialog',
+                networkCapture: 'capture',
+                route: 'route',
+                httpAuth: 'auth',
+                download: 'download',
+            } as const
+        )[args.action as 'dialog' | 'networkCapture' | 'route' | 'httpAuth' | 'download']
+        if (eventField) {
+            if (args.expectedUrl !== undefined || args.expectedRevision !== undefined) {
+                return invalidArgument('Event controls use their observed ref and do not accept document preconditions')
+            }
+            const command = args[eventField] as EventCommand
+            const timeout = Number(command.timeout ?? 30_000)
+            const deadline = Date.now() + timeout
+            const result = await unifiedSession.browserEvents(
+                args.action as BrowserEventAction,
+                command,
+                args.targetId,
+                timeout,
+                signal,
+                deadline
+            )
+            return await browserEventResponse(
+                result,
+                typeof command.output === 'string' ? command.output : undefined,
+                () => unifiedSession.assertRequestActive({ signal, deadline })
+            )
+        }
+        if (
+            args.action === 'cdp' &&
+            [
+                'Fetch.continueRequest',
+                'Fetch.continueResponse',
+                'Fetch.fulfillRequest',
+                'Fetch.failRequest',
+                'Fetch.continueWithAuth',
+                'Fetch.getResponseBody',
+                'Fetch.disable',
+            ].includes(args.cdpMethod ?? '')
+        ) {
+            if (args.expectedUrl !== undefined || args.expectedRevision !== undefined) {
+                return invalidArgument(
+                    'Paused Fetch controls use native request identity and do not accept document preconditions'
+                )
+            }
+            const result = await unifiedSession.browserFetchCommand(
+                args.cdpMethod!,
+                args.cdpParams,
+                args.targetId,
+                signal
+            )
+            return formatResponse({ success: true, action: 'cdp', method: args.cdpMethod, result, mode })
+        }
         const handler = async () => manageHandlers[args.action]({ unifiedSession, mode }, args)
         const pageActions: ManageArgs['action'][] = [
             'pageMetadata',
@@ -352,7 +451,7 @@ async function handleManage(args: ManageArgs): Promise<ManageResponse> {
         if (
             conditional &&
             args.action === 'cdp' &&
-            (!args.cdpMethod || /^(Target|Browser|SystemInfo|DeviceAccess|IO)\./.test(args.cdpMethod))
+            (!args.cdpMethod || /^(?:Target|Browser|SystemInfo|DeviceAccess|IO)\./.test(args.cdpMethod))
         ) {
             return invalidArgument('browser-level CDP 命令不支持页面条件，未执行操作')
         }
@@ -371,10 +470,13 @@ async function handleManage(args: ManageArgs): Promise<ManageResponse> {
                 unifiedSession,
                 args.targetId,
                 run,
-                args.action === 'newPage' || (args.action === 'newWindow' && args.targetId === undefined)
+                args.action === 'newPage' || (args.action === 'newWindow' && args.targetId === undefined),
+                deadline,
+                signal,
+                args.action === 'pageMetadata' && !conditional
             )
         }
-        return await run()
+        return await unifiedSession.withTabLock(run, deadline, signal)
     } catch (error) {
         return formatErrorResponse(error)
     }
@@ -390,13 +492,15 @@ async function handleNewPage({ unifiedSession }: ManageContext, args: ManageArgs
             active: args.active,
             pinned: args.pinned,
             openerTabId: args.openerTabId,
+            ...(args.taskHint !== undefined ? { taskHint: args.taskHint } : {}),
+            ...(args.note !== undefined ? { note: args.note } : {}),
         },
         args.timeout
     )
     return formatResponse({
         success: true,
         action: 'newPage',
-        target,
+        target: sanitizePageUrls(target),
         createdTargetId: target.targetId,
         metadata: unifiedSession.getPageMetadata(target.targetId),
         mode: unifiedSession.getMode(),
@@ -425,7 +529,7 @@ async function handleClosePage({ unifiedSession, mode }: ManageContext, args: Ma
         action: 'closePage',
         targetId: args.targetId ?? 'current',
         mode,
-        ...(affected ? { affected } : {}),
+        ...(affected ? { affected: sanitizePageUrls(affected) } : {}),
     })
 }
 
@@ -437,7 +541,13 @@ async function handleAdoptPage({ unifiedSession, mode }: ManageContext, args: Ma
         )
     }
     const result = await unifiedSession.adoptPage(args.targetId)
-    return formatResponse({ success: true, action: 'adoptPage', mode, targetId: args.targetId, ...result })
+    return formatResponse({
+        success: true,
+        action: 'adoptPage',
+        mode,
+        targetId: args.targetId,
+        ...sanitizePageUrls(result),
+    })
 }
 
 async function handleReleasePage({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
@@ -448,7 +558,13 @@ async function handleReleasePage({ unifiedSession, mode }: ManageContext, args: 
         )
     }
     const result = await unifiedSession.releasePage(args.targetId)
-    return formatResponse({ success: true, action: 'releasePage', mode, targetId: args.targetId, ...result })
+    return formatResponse({
+        success: true,
+        action: 'releasePage',
+        mode,
+        targetId: args.targetId,
+        ...sanitizePageUrls(result),
+    })
 }
 
 async function handleReadAccess({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
@@ -456,7 +572,7 @@ async function handleReadAccess({ unifiedSession, mode }: ManageContext, args: M
         return invalidArgument(`${args.action} 需要 targetId，未修改权限`)
     }
     const result = await unifiedSession.setReadAccess(args.targetId, args.action === 'grantReadAccess')
-    return formatResponse({ ...result, action: args.action, mode })
+    return formatResponse({ ...sanitizePageUrls(result), action: args.action, mode })
 }
 
 async function handleUpdatePage({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
@@ -630,7 +746,7 @@ async function handleNewWindow({ unifiedSession, mode }: ManageContext, args: Ma
         success: true,
         action: 'newWindow',
         mode,
-        affected,
+        affected: sanitizePageUrls(affected),
         ...(args.targetId === undefined
             ? { createdTargetId: affected.targetId ?? null }
             : { targetId: affected.targetId }),
@@ -790,6 +906,11 @@ async function handleCdp({ unifiedSession, mode }: ManageContext, args: ManageAr
 }
 
 const manageHandlers: Record<ManageArgs['action'], ManageHandler> = {
+    dialog: () => invalidArgument('Event command missing'),
+    networkCapture: () => invalidArgument('Event command missing'),
+    route: () => invalidArgument('Event command missing'),
+    httpAuth: () => invalidArgument('Event command missing'),
+    download: () => invalidArgument('Event command missing'),
     newPage: handleNewPage,
     pageMetadata: handlePageMetadata,
     closePage: handleClosePage,
@@ -825,10 +946,16 @@ export function registerManageTool(server: McpServer): void {
     server.registerTool(
         'manage',
         {
-            description:
-                '页面、窗口与分组管理：创建、更新、移动、关闭，受控页 adopt/release，分组成员、名称、颜色和折叠；缓存、视口、UA、设备模拟',
+            description: [
+                '页面、窗口与原生分组管理。先 browse list，再后台 attach 复用；确无合适页才 newPage，',
+                '设置 taskHint/note 说明任务和临时、产物或可复用用途。newPage 始终新建，默认复用现有普通窗口。',
+                '任务完成通过已有 closePage/releasePage 处理明确页面集合；默认只关闭本任务 created 临时页，',
+                '保留 adopted/unknown、产物、可复用页及混合用户组。原生分组仅 Extension；显式授权关闭保持原合同。',
+                '支持缓存、视口、UA、设备模拟；dialog、networkCapture、route、httpAuth、download 准备浏览器事件观察，',
+                '再按 logs 返回的 ref 处理弹窗、暂停请求或保存原下载文件，读取日志不会接受弹窗或继续请求',
+            ].join(''),
             inputSchema: manageSchema,
         },
-        (args) => handleManage(args)
+        (args, extra) => handleManage(args, extra?.signal)
     )
 }

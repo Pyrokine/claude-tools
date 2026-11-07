@@ -20,19 +20,32 @@ const ALLOW_INSECURE_NO_TOKEN_STORAGE_KEY = 'mcp_allow_insecure_no_token_v2'
 interface ServerConnection {
     ws: WebSocket
     heartbeatTimer: ReturnType<typeof setTimeout> | null
+    ready: boolean
+    instanceId: string | null
+    auth?: VerifiedAuth
+    sent: number
+    received: number
+    sendChain: Promise<void>
+    receiveChain: Promise<void>
+    requests: Map<string, AbortController>
 }
 
 interface VerifiedAuth {
     clientNonce: string
     serverNonce: string
     clientProof: string
+    session: string
+    sendKey: string
+    receiveKey: string
 }
 
 interface HealthResponse {
     status?: string
+    port?: number
     instanceId?: string
     authRequired?: boolean
     auth?: {
+        protocol?: number
         clientNonce?: string
         serverNonce?: string
         serverProof?: string
@@ -47,7 +60,13 @@ interface PortCheckResult {
     reason?: string
 }
 
-type MessageHandler = (message: { id: string; action: string; params: unknown }, port: number) => void
+type Reply = (success: boolean, data?: unknown, error?: string) => void
+type MessageHandler = (
+    message: { id: string; action: string; params: unknown },
+    port: number,
+    signal: AbortSignal,
+    reply: Reply
+) => void | Promise<void>
 type StatusHandler = (status: 'connected' | 'disconnected' | 'connecting', connectedCount: number) => void
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -131,12 +150,12 @@ export class HttpClient {
     getConnectedServers(): Array<{ port: number; instanceId: string | null }> {
         return this.getConnectedPorts().map((port) => ({
             port,
-            instanceId: this.verifiedInstanceIds.get(port) ?? null,
+            instanceId: this.connections.get(port)?.instanceId ?? null,
         }))
     }
 
     getServerInstanceId(port: number): string | null {
-        return this.connections.has(port) ? (this.verifiedInstanceIds.get(port) ?? null) : null
+        return this.connections.get(port)?.instanceId ?? null
     }
 
     async setPairingToken(token: string): Promise<void> {
@@ -259,9 +278,12 @@ export class HttpClient {
 
         for (const [port, conn] of this.connections) {
             this.stopHeartbeat(port)
-            const instanceId = this.verifiedInstanceIds.get(port)
+            const instanceId = conn.instanceId
             if (instanceId) {
                 this.connectionClosedHandler?.(instanceId)
+            }
+            for (const controller of conn.requests.values()) {
+                controller.abort()
             }
             conn.ws.close()
         }
@@ -272,11 +294,14 @@ export class HttpClient {
     }
 
     isConnected(): boolean {
-        return this.connections.size > 0
+        return this.getConnectedPorts().length > 0
     }
 
     getConnectedPorts(): number[] {
-        return Array.from(this.connections.keys()).sort((a, b) => a - b)
+        return Array.from(this.connections)
+            .filter(([, conn]) => conn.ready)
+            .map(([port]) => port)
+            .sort((a, b) => a - b)
     }
 
     sendResponse(id: string, success: boolean, data?: unknown, error?: string, port?: number): void {
@@ -291,7 +316,10 @@ export class HttpClient {
             return
         }
 
-        conn.ws.send(JSON.stringify({ id, success, data, error }))
+        void this.sendMessage(conn, { id, success, data, error }).catch((error) => {
+            console.warn('[HTTP] Response delivery failed:', error)
+            conn.ws.close()
+        })
     }
 
     private async getPairingToken(): Promise<string> {
@@ -331,96 +359,111 @@ export class HttpClient {
         }
 
         return new Promise((resolve) => {
-            try {
-                const auth = this.verifiedAuth.get(port)
-                const authQuery = auth
-                    ? `?clientNonce=${encodeURIComponent(auth.clientNonce)}&serverNonce=${encodeURIComponent(
-                          auth.serverNonce
-                      )}&clientProof=${encodeURIComponent(auth.clientProof)}`
-                    : ''
-                const url = `ws://127.0.0.1:${port}/${authQuery}`
-                const ws = new WebSocket(url)
-                this.pendingSockets.add(ws)
-                let opened = false
-                let resolved = false
-
-                const finishCandidate = (result: boolean): void => {
-                    if (resolved) {
-                        return
-                    }
-                    resolved = true
-                    clearTimeout(connectionTimeout)
-                    this.pendingSockets.delete(ws)
-                    resolve(result)
+            const auth = this.verifiedAuth.get(port)
+            const authQuery = auth
+                ? `?protocol=2&clientNonce=${encodeURIComponent(auth.clientNonce)}` +
+                  `&serverNonce=${encodeURIComponent(auth.serverNonce)}` +
+                  `&clientProof=${encodeURIComponent(auth.clientProof)}`
+                : ''
+            const ws = new WebSocket(`ws://127.0.0.1:${port}/${authQuery}`)
+            const conn: ServerConnection = {
+                ws,
+                auth,
+                heartbeatTimer: null,
+                ready: false,
+                instanceId: this.verifiedInstanceIds.get(port) ?? null,
+                sent: 0,
+                received: 0,
+                sendChain: Promise.resolve(),
+                receiveChain: Promise.resolve(),
+                requests: new Map(),
+            }
+            this.pendingSockets.add(ws)
+            let resolved = false
+            const finishCandidate = (result: boolean) => {
+                if (resolved) {
+                    return
                 }
-
-                const connectionTimeout = setTimeout(() => {
-                    if (ws.readyState !== WebSocket.OPEN) {
-                        finishCandidate(false)
+                resolved = true
+                clearTimeout(connectionTimeout)
+                this.pendingSockets.delete(ws)
+                resolve(result)
+            }
+            const connectionTimeout = setTimeout(() => {
+                finishCandidate(false)
+                console.warn(`[HTTP] Authentication protocol v2 readiness timeout at port ${port}`)
+                ws.close()
+            }, 5000)
+            const markReady = () => {
+                if (!this.isGenerationActive(generation) || this.connections.get(port) !== conn) {
+                    return
+                }
+                conn.ready = true
+                this.resetHeartbeat(port)
+                this.statusHandler?.('connected', this.getConnectedPorts().length)
+                finishCandidate(true)
+            }
+            const hello = async () => {
+                const backgroundBundleHash = await getBackgroundBundleHash()
+                if (!this.isGenerationActive(generation) || this.connections.get(port) !== conn) {
+                    return
+                }
+                await this.sendMessage(conn, {
+                    type: 'hello',
+                    version: chrome.runtime.getManifest().version,
+                    ...(backgroundBundleHash ? { backgroundBundleHash } : {}),
+                })
+            }
+            ws.onopen = () => {
+                if (!this.isGenerationActive(generation) || resolved) {
+                    finishCandidate(false)
+                    ws.close()
+                    return
+                }
+                this.connections.set(port, conn)
+                if (!auth) {
+                    markReady()
+                    void hello().catch((error) => {
+                        console.warn('[HTTP] Hello failed:', error)
                         ws.close()
-                    }
-                }, 5000)
-
-                ws.onopen = () => {
-                    if (!this.isGenerationActive(generation) || resolved) {
-                        finishCandidate(false)
-                        ws.close()
-                        return
-                    }
-                    opened = true
-
-                    const conn: ServerConnection = {
-                        ws,
-                        heartbeatTimer: null,
-                    }
-                    this.connections.set(port, conn)
-                    this.resetHeartbeat(port)
-
-                    // 版本与活动后台 bundle 握手；hash 读取失败时保持旧版 version-only 协议
-                    void getBackgroundBundleHash().then((backgroundBundleHash) => {
-                        if (!this.isGenerationActive(generation) || ws.readyState !== WebSocket.OPEN) {
+                    })
+                }
+            }
+            ws.onmessage = (event) => {
+                conn.receiveChain = conn.receiveChain
+                    .then(async () => {
+                        if (!this.isGenerationActive(generation) || this.connections.get(port) !== conn) {
                             return
                         }
-                        ws.send(
-                            JSON.stringify({
-                                type: 'hello',
-                                version: chrome.runtime.getManifest().version,
-                                ...(backgroundBundleHash ? { backgroundBundleHash } : {}),
-                            })
-                        )
+                        const payload = await this.receiveMessage(conn, event.data)
+                        if (!this.isGenerationActive(generation) || this.connections.get(port) !== conn) {
+                            return
+                        }
+                        if (auth && !conn.ready) {
+                            if (JSON.parse(payload).type !== 'ready') {
+                                throw new Error('Authenticated ready required')
+                            }
+                            await hello()
+                            markReady()
+                            return
+                        }
+                        this.handleMessage(payload, port, conn)
                     })
-
-                    console.log(`[HTTP] Connected to MCP Server at port ${port} (total: ${this.connections.size})`)
-                    this.statusHandler?.('connected', this.connections.size)
-                    finishCandidate(true)
-                }
-
-                ws.onmessage = (event) => {
-                    if (this.isGenerationActive(generation)) {
-                        this.handleMessage(event.data, port)
-                    }
-                }
-
-                ws.onclose = () => {
-                    this.pendingSockets.delete(ws)
-                    if (!opened) {
+                    .catch((error) => {
+                        console.warn(`[HTTP] Authentication protocol v2 rejected at port ${port}:`, error)
                         finishCandidate(false)
-                        return
-                    }
-                    console.log(`[HTTP] WebSocket closed for port ${port}`)
-                    this.removeConnection(port, ws)
-                }
-
-                ws.onerror = (error) => {
-                    if (opened) {
-                        console.error(`[HTTP] Established WebSocket error for port ${port}:`, error)
-                        this.removeConnection(port, ws)
-                        return
-                    }
-                    finishCandidate(false)
-                }
-            } catch {
-                resolve(false)
+                        ws.close(1008, 'Authentication protocol v2 required')
+                    })
+            }
+            ws.onclose = () => {
+                this.pendingSockets.delete(ws)
+                finishCandidate(false)
+                this.removeConnection(port, ws)
+            }
+            ws.onerror = () => {
+                finishCandidate(false)
+                ws.close()
+                this.removeConnection(port, ws)
             }
         })
     }
@@ -435,9 +478,13 @@ export class HttpClient {
         }
 
         this.stopHeartbeat(port)
+        for (const controller of conn.requests.values()) {
+            controller.abort()
+        }
+        conn.requests.clear()
         this.connections.delete(port)
         this.verifiedAuth.delete(port)
-        const instanceId = this.verifiedInstanceIds.get(port)
+        const instanceId = conn.instanceId
         this.verifiedInstanceIds.delete(port)
         if (instanceId) {
             this.connectionClosedHandler?.(instanceId)
@@ -447,9 +494,9 @@ export class HttpClient {
             this.statusHandler?.('connected', this.connections.size)
         } else {
             this.statusHandler?.('disconnected', 0)
-            if (this.shouldReconnect) {
-                this.scheduleReconnect()
-            }
+        }
+        if (this.shouldReconnect) {
+            this.scheduleReconnect()
         }
     }
 
@@ -535,14 +582,51 @@ export class HttpClient {
                 if (!token) {
                     return { healthy: false, failureKind: 'authentication', reason: 'pairing token missing' }
                 }
-                if (!health.auth?.serverNonce || !health.auth.serverProof) {
-                    return { healthy: false, failureKind: 'protocol', reason: 'authentication challenge incomplete' }
+                if (
+                    health.auth?.protocol !== 2 ||
+                    health.port !== port ||
+                    !health.instanceId ||
+                    !/^[0-9a-f]{32}$/.test(health.instanceId) ||
+                    health.auth.clientNonce !== clientNonce ||
+                    !health.auth.serverNonce ||
+                    !health.auth.serverProof
+                ) {
+                    return {
+                        healthy: false,
+                        failureKind: 'protocol',
+                        reason: 'authentication protocol v2 required or endpoint mismatch',
+                    }
                 }
-                const expected = await hmacHex(token, `server:${clientNonce}:${health.auth.serverNonce}`)
+                const expected = await hmacHex(
+                    token,
+                    JSON.stringify([
+                        'mcp-chrome',
+                        2,
+                        'server-proof',
+                        clientNonce,
+                        health.auth.serverNonce,
+                        health.instanceId,
+                        port,
+                    ])
+                )
                 if (expected !== health.auth.serverProof) {
                     return { healthy: false, failureKind: 'authentication', reason: 'server proof mismatch' }
                 }
-                const clientProof = await hmacHex(token, `client:${clientNonce}:${health.auth.serverNonce}`)
+                const clientProof = await hmacHex(
+                    token,
+                    JSON.stringify([
+                        'mcp-chrome',
+                        2,
+                        'client-proof',
+                        clientNonce,
+                        health.auth.serverNonce,
+                        health.instanceId,
+                        port,
+                    ])
+                )
+                const session = JSON.stringify([clientNonce, health.auth.serverNonce, health.instanceId, port])
+                const sendKey = await hmacHex(token, JSON.stringify(['mcp-chrome', 2, 'key', 'extension', session]))
+                const receiveKey = await hmacHex(token, JSON.stringify(['mcp-chrome', 2, 'key', 'server', session]))
                 if (!this.isGenerationActive(generation)) {
                     return { healthy: false }
                 }
@@ -550,6 +634,9 @@ export class HttpClient {
                     clientNonce,
                     serverNonce: health.auth.serverNonce,
                     clientProof,
+                    session,
+                    sendKey,
+                    receiveKey,
                 })
                 return { healthy: true }
             }
@@ -583,25 +670,104 @@ export class HttpClient {
         return generation === this.generation && this.shouldReconnect
     }
 
-    private handleMessage(data: string, port: number): void {
+    private handleMessage(data: string, port: number, source = this.connections.get(port)): void {
         try {
             const message = JSON.parse(data)
+            const conn = source
+            if (!conn || this.connections.get(port) !== conn) {
+                return
+            }
 
             // 心跳：收到 ping 说明连接存活，重置心跳计时器
             if (message.type === 'ping') {
-                const conn = this.connections.get(port)
-                conn?.ws.send(JSON.stringify({ type: 'pong' }))
+                void this.sendMessage(conn, { type: 'pong' }).catch((error) => {
+                    console.warn('[HTTP] Pong failed:', error)
+                    conn.ws.close()
+                })
                 this.resetHeartbeat(port)
+                return
+            }
+
+            if (message.type === 'cancel' && typeof message.id === 'string') {
+                conn.requests.get(message.id)?.abort()
                 return
             }
 
             // 命令请求
             if (message.action && message.id && this.messageHandler) {
-                this.messageHandler(message, port)
+                if (conn.requests.has(message.id)) {
+                    // noinspection ExceptionCaughtLocallyJS -- Report failure
+                    throw new Error('Duplicate request id')
+                }
+                const controller = new AbortController()
+                conn.requests.set(message.id, controller)
+                const reply: Reply = (success, data, error) => {
+                    if (this.connections.get(port) !== conn || conn.ws.readyState !== WebSocket.OPEN) {
+                        return
+                    }
+                    void this.sendMessage(conn, { id: message.id, success, data, error }).catch((error) => {
+                        console.warn('[HTTP] Response delivery failed:', error)
+                        conn.ws.close()
+                    })
+                }
+                void Promise.resolve()
+                    .then(() => this.messageHandler?.(message, port, controller.signal, reply))
+                    .catch((error) => reply(false, undefined, String(error)))
+                    .finally(() => conn.requests.delete(message.id))
             }
         } catch (error) {
             console.error(`[HTTP] Error parsing message from port ${port}:`, error)
         }
+    }
+
+    private sendMessage(conn: ServerConnection, message: unknown): Promise<void> {
+        const payload = JSON.stringify(message)
+        const operation = conn.sendChain.then(async () => {
+            if (conn.ws.readyState !== WebSocket.OPEN) {
+                throw new Error('Connection closed')
+            }
+            if (!conn.auth) {
+                conn.ws.send(payload)
+                return
+            }
+            const seq = ++conn.sent
+            const mac = await hmacHex(
+                conn.auth.sendKey,
+                JSON.stringify([2, conn.auth.session, 'extension', seq, payload])
+            )
+            if (conn.ws.readyState !== WebSocket.OPEN) {
+                throw new Error('Connection closed')
+            }
+            conn.ws.send(JSON.stringify({ v: 2, session: conn.auth.session, seq, payload, mac }))
+        })
+        conn.sendChain = operation
+        return operation
+    }
+
+    private async receiveMessage(conn: ServerConnection, data: string): Promise<string> {
+        if (!conn.auth) {
+            return data
+        }
+        const envelope = JSON.parse(data) as { v: number; session: string; seq: number; payload: string; mac: string }
+        if (
+            envelope.v !== 2 ||
+            envelope.session !== conn.auth.session ||
+            !Number.isSafeInteger(envelope.seq) ||
+            envelope.seq !== conn.received + 1 ||
+            typeof envelope.payload !== 'string' ||
+            typeof envelope.mac !== 'string'
+        ) {
+            throw new Error('Invalid authenticated message or sequence')
+        }
+        const expected = await hmacHex(
+            conn.auth.receiveKey,
+            JSON.stringify([2, conn.auth.session, 'server', envelope.seq, envelope.payload])
+        )
+        if (expected !== envelope.mac) {
+            throw new Error('Message authentication failed')
+        }
+        conn.received = envelope.seq
+        return envelope.payload
     }
 
     /**

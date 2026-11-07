@@ -1,3 +1,4 @@
+import { installDomHelpers } from '../../../src/core/dom-helpers.js'
 import type { ElementInfo, ReadPageResult, ScreenshotResult } from '../types'
 import { ExpectedOperationError } from '../types/expected-errors'
 import {
@@ -24,6 +25,7 @@ import {
 } from '../types/schemas'
 import {
     type ActionContext,
+    assertActionActive,
     assertManagedTab,
     assertReadableTab,
     assertScriptable,
@@ -201,42 +203,28 @@ export class ContentHandler {
             const sizeExpr =
                 'JSON.stringify({' +
                 'width: document.documentElement.scrollWidth, ' +
-                'height: document.documentElement.scrollHeight})'
+                'height: document.documentElement.scrollHeight, devicePixelRatio: window.devicePixelRatio})'
             const { result: sizeResult } = (await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
                 expression: sizeExpr,
                 returnByValue: true,
             })) as { result: { value: string } }
-            let width: number, height: number
+            let width: number, height: number, devicePixelRatio: number
             try {
-                ;({ width, height } = JSON.parse(sizeResult.value))
+                ;({ width, height, devicePixelRatio } = JSON.parse(sizeResult.value))
             } catch {
                 throw new Error('无法获取页面尺寸，document.documentElement 可能不可用')
             }
 
-            assertScreenshotBudget(width, height, p.scale ?? 1)
-            // 临时设置视口为页面完整尺寸
-            await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
-                width,
-                height,
-                deviceScaleFactor: p.scale ?? 1,
-                mobile: false,
-            })
-
-            try {
-                const effectiveFormat = p.format || 'png'
-                const result = (await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
-                    format: effectiveFormat,
-                    ...(p.quality !== undefined && effectiveFormat !== 'png' ? { quality: p.quality } : {}),
-                })) as { data: string }
-                assertScreenshotBase64Budget(result.data)
-                return { data: result.data, format: effectiveFormat }
-            } finally {
-                try {
-                    await chrome.debugger.sendCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride')
-                } catch {
-                    // cleanup 失败不覆盖原始错误
-                }
-            }
+            assertScreenshotBudget(width, height, (p.scale ?? 1) * devicePixelRatio)
+            const effectiveFormat = p.format || 'png'
+            const result = (await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
+                format: effectiveFormat,
+                ...(p.quality !== undefined && effectiveFormat !== 'png' ? { quality: p.quality } : {}),
+                clip: { x: 0, y: 0, width, height, scale: p.scale ?? 1 },
+                captureBeyondViewport: true,
+            })) as { data: string }
+            assertScreenshotBase64Budget(result.data)
+            return { data: result.data, format: effectiveFormat }
         }
 
         const effectiveFormat = p.format || 'png'
@@ -256,7 +244,16 @@ export class ContentHandler {
     async click(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = ClickSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'click')
-        return this.injectScript<{ success: boolean }>(tabId, p.frameId, performClick, [p.refId])
+        assertActionActive(context)
+        return this.injectScript<{ success: boolean }>(tabId, p.frameId, performClick, [
+            p.refId,
+            {
+                altKey: Boolean((p.modifiers ?? 0) & 1),
+                ctrlKey: Boolean((p.modifiers ?? 0) & 2),
+                metaKey: Boolean((p.modifiers ?? 0) & 4),
+                shiftKey: Boolean((p.modifiers ?? 0) & 8),
+            },
+        ])
     }
 
     async actionableClick(
@@ -275,12 +272,23 @@ export class ContentHandler {
                 await new Promise((resolve) => setTimeout(resolve, delays[attempt - 1]))
             }
 
+            assertActionActive(context)
             await this.injectScript<void>(tabId, p.frameId, installActionabilityHelpers, [])
+            assertActionActive(context)
             lastResult = await this.injectScript<Partial<ActionabilityResult> & { success: boolean; error?: string }>(
                 tabId,
                 p.frameId,
                 performActionableClick,
-                [p.refId, p.force ?? false]
+                [
+                    p.refId,
+                    p.force ?? false,
+                    {
+                        altKey: Boolean((p.modifiers ?? 0) & 1),
+                        ctrlKey: Boolean((p.modifiers ?? 0) & 2),
+                        metaKey: Boolean((p.modifiers ?? 0) & 4),
+                        shiftKey: Boolean((p.modifiers ?? 0) & 8),
+                    },
+                ]
             )
 
             if (lastResult.success) {
@@ -322,10 +330,15 @@ export class ContentHandler {
     async dispatchInputAction(params: unknown, context: ActionContext): Promise<{ success: boolean; error?: string }> {
         const p = DispatchInputSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'dispatch_input')
-        return this.injectScript<{ success: boolean; error?: string }>(tabId, p.frameId, dispatchInputToElement, [
-            p.refId,
-            p.text ?? '',
-        ])
+        assertActionActive(context)
+        return this.injectScript<{ success: boolean; error?: string }>(
+            tabId,
+            p.frameId,
+            dispatchInputToElement,
+            [p.refId, p.text ?? ''],
+            undefined,
+            'action'
+        )
     }
 
     async dragAndDropAction(
@@ -334,6 +347,7 @@ export class ContentHandler {
     ): Promise<{ success: boolean; error?: string; code?: string }> {
         const p = DragAndDropSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'drag_and_drop')
+        assertActionActive(context)
         return this.injectScript<{ success: boolean; error?: string; code?: string }>(
             tabId,
             p.frameId,
@@ -371,6 +385,7 @@ export class ContentHandler {
     async type(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = TypeSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'type')
+        assertActionActive(context)
         return this.injectScript<{ success: boolean }>(tabId, p.frameId, performType, [
             p.refId,
             p.text,
@@ -384,6 +399,7 @@ export class ContentHandler {
     ): Promise<{ success: boolean; scrollX: number; scrollY: number }> {
         const p = ScrollSchema.parse(params) ?? {}
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'scroll')
+        assertActionActive(context)
         return this.injectScript<{ success: boolean; scrollX: number; scrollY: number }>(
             tabId,
             p.frameId,
@@ -395,13 +411,34 @@ export class ContentHandler {
     async evaluate(
         params: unknown,
         context: ActionContext
-    ): Promise<{ success: boolean; result?: string; error?: string }> {
+    ): Promise<{
+        success: boolean
+        result?: string
+        error?: string
+        errorMessage?: string
+        errorSource?: 'page' | 'context' | 'output'
+        errorCode?: 'CSP_BLOCKED' | 'NON_SERIALIZABLE_EVALUATE_RESULT'
+        actionExecuted?: false
+    }> {
         const p = EvaluateSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'evaluate')
+        assertActionActive(context)
         // world: 'MAIN' 在页面上下文中执行（绕过 Extension CSP，但页面 CSP 仍可拦截）
-        return this.injectScript<{ success: boolean; result?: string; error?: string }>(tabId, p.frameId, executeCode, [
+        return this.injectScript<{
+            success: boolean
+            result?: string
+            error?: string
+            errorMessage?: string
+            errorSource?: 'page' | 'context' | 'output'
+            errorCode?: 'CSP_BLOCKED' | 'NON_SERIALIZABLE_EVALUATE_RESULT'
+            actionExecuted?: false
+        }>(tabId, p.frameId, executeCode, [
             p.code,
-            ...(p.timeout !== undefined ? [p.timeout] : []),
+            ...(context.deadline !== undefined
+                ? [Math.max(0, context.deadline - Date.now())]
+                : p.timeout !== undefined
+                  ? [p.timeout]
+                  : []),
         ])
     }
 
@@ -530,7 +567,8 @@ export class ContentHandler {
                 p.xpath ?? null,
                 documentId ? (expectedUrl ?? null) : null,
                 p.point ?? null,
-                ...(p.matchIndex !== undefined ? [p.matchIndex] : []),
+                p.matchIndex ?? null,
+                p.semantic ?? null,
             ],
             documentId,
             true
@@ -539,7 +577,7 @@ export class ContentHandler {
 
         // iframe 坐标修正：将 iframe 内相对坐标转为页面绝对坐标
         if (frameId !== 0 && elements.length > 0) {
-            const offset = await getFrameOffset(tabId, frameId)
+            const offset = await getFrameOffset(tabId, frameId, context)
             if (offset) {
                 elements = elements.map((el) => ({
                     ...el,
@@ -722,7 +760,8 @@ export class ContentHandler {
         const frame = await chrome.webNavigation.getFrame({ tabId: resolvedTabId, frameId })
         if (
             !frame?.documentId ||
-            (await readGrantDocumentId(context.serverInstanceId, resolvedTabId)) !== readable.documentId
+            (await readGrantDocumentId(context.serverInstanceId, resolvedTabId, () => assertActionActive(context))) !==
+                readable.documentId
         ) {
             throw new ExpectedOperationError(`${operation} 页面或 iframe 已变化，未读取`)
         }
@@ -770,12 +809,23 @@ export class ContentHandler {
         func: InjectableFunc<R>,
         args: unknown[],
         documentId?: string,
-        requireResult = false
+        requireResult: boolean | 'action' = false
     ): Promise<R> {
         const context = { tabId, frameId: frameId ?? 0, documentId, phase: 'injection' }
+        const target = documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [frameId ?? 0] }
+        const world = documentId ? 'ISOLATED' : 'MAIN'
+        const setup = await chrome.scripting
+            .executeScript({ target, world, func: installDomHelpers })
+            .catch((error: unknown) => {
+                throw wrapInjectionError(error, context)
+            })
+        const setupError = (setup[0] as { error?: { message?: string } })?.error
+        if (!setup[0] || setupError) {
+            throw wrapInjectionError(setupError?.message ?? 'DOM helper installation returned no result', context)
+        }
         const results = await chrome.scripting
             .executeScript({
-                target: documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [frameId ?? 0] },
+                target,
                 func: func as (...a: unknown[]) => R,
                 args: args as never[],
                 world: documentId ? 'ISOLATED' : 'MAIN',
@@ -792,11 +842,41 @@ export class ContentHandler {
                 'FRAME_SCRIPT_NO_RESULT',
                 '脚本注入未返回可读取的结果',
                 '重新读取 iframe 元素与页面状态；无结果不能证明 selector 非法，工具不会重放脚本',
-                { ...context, phase: 'script_result', resultCount: results.length }
+                {
+                    ...context,
+                    phase: 'script_result',
+                    resultCount: results.length,
+                    ...(requireResult === 'action'
+                        ? { actionExecuted: 'unknown', actionStatus: 'unknown', retryable: false }
+                        : {}),
+                }
             )
         }
         const data = results[0].result
-        if (requireResult && data && typeof data === 'object' && 'error' in data && typeof data.error === 'string') {
+        if (
+            requireResult === 'action' &&
+            (!data || typeof data !== 'object' || !('success' in data) || typeof data.success !== 'boolean')
+        ) {
+            throw structuredOperationError(
+                'ACTION_RESULT_INVALID',
+                '脚本已派发，但未返回有效的动作结果',
+                '独立读取目标实际文本后再决定下一步，工具不会重放输入',
+                {
+                    ...context,
+                    phase: 'script_result',
+                    actionExecuted: 'unknown',
+                    actionStatus: 'unknown',
+                    retryable: false,
+                }
+            )
+        }
+        if (
+            requireResult === true &&
+            data &&
+            typeof data === 'object' &&
+            'error' in data &&
+            typeof data.error === 'string'
+        ) {
             throw wrapInjectionError(data.error, { ...context, phase: 'script_result' })
         }
         return data as R
@@ -804,62 +884,84 @@ export class ContentHandler {
 
     /** debugger 被占用时通过 captureVisibleTab 截图（仅可视区域） */
     private async screenshotFallback(tabId: number, p: ScreenshotInput): Promise<ScreenshotResult> {
-        const tab = await getExistingTab(tabId)
-        if (!tab.active) {
-            throw structuredOperationError(
-                'DEBUGGER_BLOCKED_SCREENSHOT_UNAVAILABLE',
-                'debugger 被占用，且当前 tab 不是窗口内 active tab，无法通过 captureVisibleTab 截图',
-                '请关闭占用 debugger 的扩展，或只在 managed 测试页上显式 activatePage 后重试；不要激活用户工作 tab',
-                { tabId, fallback: 'captureVisibleTab', active: tab.active }
-            )
+        let changed = false
+        let windowId: number | undefined
+        const onActivated = (info: chrome.tabs.OnActivatedInfo) => {
+            if (windowId === undefined || info.windowId === windowId) {
+                changed = true
+            }
         }
-        // captureVisibleTab 只能截可视区域、只支持 png/jpeg；遇到 fullPage/clip/scale/webp
-        // 应明确报错而非静默降级，避免上层拿到「viewport-only 但 success=true」或「PNG 字节贴 webp mimeType」
-        if (p?.fullPage) {
-            throw structuredOperationError(
-                'SCREENSHOT_FALLBACK_UNSUPPORTED',
-                'debugger 被占用时的 screenshot fallback 不支持 fullPage',
-                '请关闭占用 debugger 的扩展后重试；fallback 只能截取当前可视区域',
-                { tabId, fallback: 'captureVisibleTab', unsupported: 'fullPage' }
-            )
-        }
-        if (p?.clip) {
-            throw structuredOperationError(
-                'SCREENSHOT_FALLBACK_UNSUPPORTED',
-                'debugger 被占用时的 screenshot fallback 不支持 clip',
-                '请关闭占用 debugger 的扩展后重试；fallback 不支持区域裁剪',
-                { tabId, fallback: 'captureVisibleTab', unsupported: 'clip' }
-            )
-        }
-        if (p?.scale !== undefined && p.scale !== 1) {
-            throw structuredOperationError(
-                'SCREENSHOT_FALLBACK_UNSUPPORTED',
-                'debugger 被占用时的 screenshot fallback 不支持 scale',
-                '请关闭占用 debugger 的扩展后重试；fallback 不支持缩放截图',
-                { tabId, fallback: 'captureVisibleTab', unsupported: 'scale', scale: p.scale }
-            )
-        }
-        if (p?.format && p.format !== 'jpeg' && p.format !== 'png') {
-            throw structuredOperationError(
-                'SCREENSHOT_FALLBACK_UNSUPPORTED',
-                `debugger 被占用时的 screenshot fallback 不支持 format="${p.format}"`,
-                '请关闭占用 debugger 的扩展后重试；fallback 仅支持 png/jpeg',
-                { tabId, fallback: 'captureVisibleTab', unsupported: 'format', format: p.format }
-            )
-        }
-        const format = p?.format === 'jpeg' ? 'jpeg' : 'png'
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-            format,
-            quality: p?.quality,
-        })
-        const data = dataUrl.split(',')[1]
-        assertScreenshotBase64Budget(data)
-        return {
-            data,
-            format,
-            degraded: true,
-            fallback: 'captureVisibleTab',
-            limitations: ['viewport-only'],
+        chrome.tabs.onActivated.addListener(onActivated)
+        try {
+            const tab = await getExistingTab(tabId)
+            windowId = tab.windowId
+            if (!tab.active) {
+                throw structuredOperationError(
+                    'DEBUGGER_BLOCKED_SCREENSHOT_UNAVAILABLE',
+                    'debugger 被占用，且当前 tab 不是窗口内 active tab，无法通过 captureVisibleTab 截图',
+                    '请关闭占用 debugger 的扩展，或只在 managed 测试页上显式 activatePage 后重试；不要激活用户工作 tab',
+                    { tabId, fallback: 'captureVisibleTab', active: tab.active }
+                )
+            }
+            // captureVisibleTab 只能截可视区域、只支持 png/jpeg；遇到 fullPage/clip/scale/webp
+            // 应明确报错而非静默降级，避免上层拿到「viewport-only 但 success=true」或「PNG 字节贴 webp mimeType」
+            if (p?.fullPage) {
+                throw structuredOperationError(
+                    'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                    'debugger 被占用时的 screenshot fallback 不支持 fullPage',
+                    '请关闭占用 debugger 的扩展后重试；fallback 只能截取当前可视区域',
+                    { tabId, fallback: 'captureVisibleTab', unsupported: 'fullPage' }
+                )
+            }
+            if (p?.clip) {
+                throw structuredOperationError(
+                    'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                    'debugger 被占用时的 screenshot fallback 不支持 clip',
+                    '请关闭占用 debugger 的扩展后重试；fallback 不支持区域裁剪',
+                    { tabId, fallback: 'captureVisibleTab', unsupported: 'clip' }
+                )
+            }
+            if (p?.scale !== undefined && p.scale !== 1) {
+                throw structuredOperationError(
+                    'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                    'debugger 被占用时的 screenshot fallback 不支持 scale',
+                    '请关闭占用 debugger 的扩展后重试；fallback 不支持缩放截图',
+                    { tabId, fallback: 'captureVisibleTab', unsupported: 'scale', scale: p.scale }
+                )
+            }
+            if (p?.format && p.format !== 'jpeg' && p.format !== 'png') {
+                throw structuredOperationError(
+                    'SCREENSHOT_FALLBACK_UNSUPPORTED',
+                    `debugger 被占用时的 screenshot fallback 不支持 format="${p.format}"`,
+                    '请关闭占用 debugger 的扩展后重试；fallback 仅支持 png/jpeg',
+                    { tabId, fallback: 'captureVisibleTab', unsupported: 'format', format: p.format }
+                )
+            }
+            const format = p?.format === 'jpeg' ? 'jpeg' : 'png'
+            const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+                format,
+                quality: p?.quality,
+            })
+            const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId })
+            if (changed || active?.id !== tabId || (await getExistingTab(tabId)).windowId !== tab.windowId) {
+                throw structuredOperationError(
+                    'SCREENSHOT_TARGET_CHANGED',
+                    '活动页面在截图期间发生变化，已丢弃图像',
+                    '保持目标受控页面为活动页后重新截图',
+                    { tabId, fallback: 'captureVisibleTab' }
+                )
+            }
+            const data = dataUrl.split(',')[1]
+            assertScreenshotBase64Budget(data)
+            return {
+                data,
+                format,
+                degraded: true,
+                fallback: 'captureVisibleTab',
+                limitations: ['viewport-only'],
+            }
+        } finally {
+            chrome.tabs.onActivated.removeListener(onActivated)
         }
     }
 }

@@ -6,9 +6,11 @@
 
 import { z } from 'zod'
 import type { Target } from '../core/types.js'
-import { escapeXPathString } from '../core/utils.js'
+import type { SemanticTarget } from '../core/dom-helpers.js'
 
 export const pageTargetIdSchema = z.string().min(1).optional()
+const frameStepSchema = z.union([z.string().min(1), z.number().int().nonnegative()])
+export const frameZodSchema = z.union([frameStepSchema, z.array(frameStepSchema).min(1)]).optional()
 export const pageConditionSchema = {
     expectedUrl: z.string().optional().describe('动作执行前要求页面 URL 与此值一致；不一致时不执行'),
     expectedRevision: z
@@ -144,10 +146,12 @@ const IMPLICIT_ROLE_SELECTORS: Record<string, string[]> = {
     ],
     checkbox: ['input[type="checkbox"]'],
     radio: ['input[type="radio"]'],
-    combobox: ['select'],
+    combobox: ['select', 'input[list]'],
+    listbox: ['select'],
+    searchbox: ['input[type="search"]'],
     heading: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
-    image: ['img[alt]'],
-    img: ['img[alt]'],
+    image: ['img'],
+    img: ['img'],
     navigation: ['nav'],
     main: ['main'],
     banner: ['header'],
@@ -162,40 +166,6 @@ const IMPLICIT_ROLE_SELECTORS: Record<string, string[]> = {
 }
 
 /**
- * 隐式 ARIA role → XPath self:: 条件映射
- *
- * 用于 role+name 组合定位：需要 xpath 表达多来源可访问名称过滤，
- * 与 IMPLICIT_ROLE_SELECTORS 内容对应，只是语法不同
- */
-const IMPLICIT_ROLE_XPATH: Record<string, string> = {
-    button:
-        'self::button or self::input[@type="submit"] or self::input[@type="button"] or ' +
-        'self::input[@type="reset"] or self::summary',
-    link: 'self::a[@href] or self::area[@href]',
-    textbox:
-        'self::input[not(@type)] or self::input[@type="text"] or self::input[@type="email"] or ' +
-        'self::input[@type="url"] or self::input[@type="tel"] or self::input[@type="search"] or ' +
-        'self::input[@type="password"] or self::textarea or self::*[@contenteditable="true"]',
-    checkbox: 'self::input[@type="checkbox"]',
-    radio: 'self::input[@type="radio"]',
-    combobox: 'self::select',
-    heading: 'self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::h6',
-    image: 'self::img[@alt]',
-    img: 'self::img[@alt]',
-    navigation: 'self::nav',
-    main: 'self::main',
-    banner: 'self::header',
-    contentinfo: 'self::footer',
-    region: 'self::section[@aria-label or @aria-labelledby]',
-    article: 'self::article',
-    complementary: 'self::aside',
-    form: 'self::form[@aria-label or @aria-labelledby]',
-    table: 'self::table',
-    list: 'self::ul or self::ol or self::menu',
-    listitem: 'self::li',
-}
-
-/**
  * 将 Target 对象解析为 find() 所需的查询参数
  *
  * 统一处理各种定位方式到 {selector, text, xpath} 的映射，
@@ -203,9 +173,9 @@ const IMPLICIT_ROLE_XPATH: Record<string, string> = {
  *
  * exact 语义（默认 false）：
  * - CSS 属性（placeholder/title/alt）：false → *= 子串匹配，true → = 精确匹配
- * - text：false → Extension find 的 includes 子串匹配，true → xpath 精确匹配
- * - label：xpath 同时匹配 aria-label、<label for> 关联、<label> 内嵌控件
- * - role：无 name 时 CSS 匹配隐式+显式 role；有 name 时 xpath 匹配多来源可访问名称
+ * - text：false → Extension find 的 includes 子串匹配，true → DOM 精确匹配
+ * - label：按控件的标签和 aria-labelledby 引用计算名称
+ * - role：CSS 筛选候选，再按实际 role 和可访问名称过滤
  * - testId/css/xpath：exact 不影响
  * - role 值自动 lowercase（ARIA role 不区分大小写）
  */
@@ -214,100 +184,39 @@ export function targetToFindParams(target: Target & { nth?: number }): {
     text?: string
     xpath?: string
     nth?: number
+    semantic?: SemanticTarget
 } {
     let selector: string | undefined
     let text: string | undefined
     let xpath: string | undefined
-
+    let semantic: SemanticTarget | undefined
     if ('css' in target && target.css) {
         selector = target.css
-        // CSS + 文本组合定位：先 CSS 筛选，再按 text 过滤
-        if ('text' in target && (target as { text?: string }).text) {
-            text = (target as { text: string }).text
+        if ('text' in target) {
+            text = target.text
+            semantic = { exact: getExact(target) }
         }
     } else if ('xpath' in target && target.xpath) {
         xpath = target.xpath
-    } else if ('text' in target && target.text) {
-        if (getExact(target)) {
-            // 精确匹配：通过 xpath 匹配 textContent 完全相等的元素
-            xpath = `//*[normalize-space(.)=${escapeXPathString(target.text)}]`
-        } else {
-            text = target.text
-        }
+    } else if ('text' in target) {
+        text = target.text
+        semantic = { exact: getExact(target) }
     } else if ('role' in target && target.role) {
-        const roleLower = target.role.toLowerCase()
-
-        if ('name' in target && target.name) {
-            // role + name：xpath 同时匹配隐式/显式 role 和多来源可访问名称
-            const roleConditions = [`@role=${escapeXPathString(roleLower)}`]
-            const implicitXPath = IMPLICIT_ROLE_XPATH[roleLower]
-            if (implicitXPath) {
-                roleConditions.push(implicitXPath)
-            }
-            const nameStr = escapeXPathString(target.name)
-            const nameConditions = getExact(target)
-                ? [
-                      `normalize-space(.)=${nameStr}`,
-                      `@aria-label=${nameStr}`,
-                      `@title=${nameStr}`,
-                      `@placeholder=${nameStr}`,
-                      `@alt=${nameStr}`,
-                      `@value=${nameStr}`,
-                      `@id=//label[normalize-space(.)=${nameStr}]/@for`,
-                  ]
-                : [
-                      `contains(.,${nameStr})`,
-                      `contains(@aria-label,${nameStr})`,
-                      `contains(@title,${nameStr})`,
-                      `contains(@placeholder,${nameStr})`,
-                      `contains(@alt,${nameStr})`,
-                      `contains(@value,${nameStr})`,
-                      `@id=//label[contains(.,${nameStr})]/@for`,
-                  ]
-            xpath = `//*[(${roleConditions.join(' or ')}) and (${nameConditions.join(' or ')})]`
-        } else {
-            // role only：CSS 选择器匹配隐式标签 + 显式 role
-            const escapedRole = escapeAttrValue(roleLower)
-            const selectors = [`[role="${escapedRole}"]`]
-            const implicit = IMPLICIT_ROLE_SELECTORS[roleLower]
-            if (implicit) {
-                selectors.push(...implicit)
-            }
-            selector = selectors.join(',')
-        }
-    } else if ('label' in target && target.label) {
-        // xpath 同时匹配 aria-label、<label for="id"> 关联、<label> 内嵌控件
-        const xpathStr = escapeXPathString(target.label)
-        const formControls = 'self::input or self::select or self::textarea'
-        if (getExact(target)) {
-            const labelMatch = `normalize-space(.)=${xpathStr}`
-            xpath =
-                `//*[@aria-label=${xpathStr}]` +
-                ` | //*[@id=//label[${labelMatch}]/@for]` +
-                ` | //label[${labelMatch}]/descendant::*[${formControls}]` +
-                ` | //label[${labelMatch}]/following-sibling::*[${formControls}][1]` +
-                ` | //label[${labelMatch}]/parent::*/following-sibling::*[1]/descendant::*[${formControls}]`
-        } else {
-            const labelMatch = `contains(.,${xpathStr})`
-            xpath =
-                `//*[contains(@aria-label,${xpathStr})]` +
-                ` | //*[@id=//label[${labelMatch}]/@for]` +
-                ` | //label[${labelMatch}]/descendant::*[${formControls}]` +
-                ` | //label[${labelMatch}]/following-sibling::*[${formControls}][1]` +
-                ` | //label[${labelMatch}]/parent::*/following-sibling::*[1]/descendant::*[${formControls}]`
-        }
-    } else if ('placeholder' in target && target.placeholder) {
-        const escaped = escapeAttrValue(target.placeholder)
-        selector = getExact(target) ? `[placeholder="${escaped}"]` : `[placeholder*="${escaped}"]`
-    } else if ('title' in target && target.title) {
-        const escaped = escapeAttrValue(target.title)
-        selector = getExact(target) ? `[title="${escaped}"]` : `[title*="${escaped}"]`
-    } else if ('alt' in target && target.alt) {
-        const escaped = escapeAttrValue(target.alt)
-        selector = getExact(target) ? `[alt="${escaped}"]` : `[alt*="${escaped}"]`
-    } else if ('testId' in target && target.testId) {
-        selector = `[data-testid="${escapeAttrValue(target.testId)}"]`
+        const role = target.role.toLowerCase()
+        const implicit = IMPLICIT_ROLE_SELECTORS[role] ?? []
+        selector = ['[role="' + escapeAttrValue(role) + '"]', ...implicit].join(',')
+        semantic = { role, ...('name' in target ? { name: target.name } : {}), exact: getExact(target) }
+    } else if ('label' in target) {
+        selector = 'input,select,textarea,button,meter,output,progress,[aria-label],[aria-labelledby]'
+        semantic = { label: target.label, exact: getExact(target) }
+    } else if ('placeholder' in target) {
+        selector = '[placeholder' + (getExact(target) ? '=' : '*=') + '"' + escapeAttrValue(target.placeholder) + '"]'
+    } else if ('title' in target) {
+        selector = '[title' + (getExact(target) ? '=' : '*=') + '"' + escapeAttrValue(target.title) + '"]'
+    } else if ('alt' in target) {
+        selector = '[alt' + (getExact(target) ? '=' : '*=') + '"' + escapeAttrValue(target.alt) + '"]'
+    } else if ('testId' in target) {
+        selector = '[data-testid="' + escapeAttrValue(target.testId) + '"]'
     }
-
-    return { selector, text, xpath, nth: (target as { nth?: number }).nth }
+    return { selector, text, xpath, nth: target.nth, ...(semantic ? { semantic } : {}) }
 }

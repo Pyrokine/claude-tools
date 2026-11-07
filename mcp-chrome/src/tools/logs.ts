@@ -11,6 +11,7 @@ import { stat } from 'fs/promises'
 import { z } from 'zod'
 import {
     CWD_PATH_PREFIX,
+    DEFAULT_TIMEOUT,
     formatErrorResponse,
     formatResponse,
     getSession,
@@ -22,12 +23,15 @@ import {
 import { sanitizeUrlRecord, sanitizeUrlRecords } from './network-sanitizer.js'
 import { withPageContext } from './page-context.js'
 import { pageTargetIdSchema, resolvePageTargetId } from './schema.js'
+import { browserEventResponse } from './browser-event-output.js'
 
 /**
  * logs 参数 schema
  */
 const logsSchema = z.object({
-    type: z.enum(['console', 'network']).describe('日志类型'),
+    type: z.enum(['console', 'network', 'dialog', 'download']).describe('日志类型'),
+    view: z.enum(['summary', 'details', 'requestBody', 'responseBody', 'stream', 'paused', 'auth']).optional(),
+    ref: z.string().min(1).optional(),
     level: z.enum(['all', 'error', 'warning', 'info', 'debug']).optional().describe('日志级别过滤（console）'),
     urlPattern: z.string().optional().describe('URL 模式过滤（network），支持通配符'),
     limit: z.number().int().positive().max(1000).optional().describe('最大返回条数，1 至 1000'),
@@ -103,10 +107,12 @@ async function writeLogsOutput(
     output: string,
     type: 'console' | 'network',
     logs: unknown[],
-    metadata: Record<string, unknown>
+    metadata: Record<string, unknown>,
+    assertActive: () => void
 ): Promise<{ output: string; manifest: string; bytes: number }> {
+    assertActive()
     const outputPath = (await resolveScopedOutputPath(output, 'mcp-chrome')).absolutePath
-    await writePrivateFile(outputPath, JSON.stringify(logs, null, 2), 'utf-8')
+    await writePrivateFile(outputPath, JSON.stringify(logs, null, 2), 'utf-8', assertActive)
     const manifestPath = outputPath.replace(/\.[^/\\.]+$/, '') + '_manifest.json'
     const bytes = (await stat(outputPath)).size
     await writePrivateFile(
@@ -124,7 +130,8 @@ async function writeLogsOutput(
             null,
             2
         ),
-        'utf-8'
+        'utf-8',
+        assertActive
     )
     return { output: outputPath, manifest: manifestPath, bytes }
 }
@@ -132,159 +139,222 @@ async function writeLogsOutput(
 /**
  * logs 工具处理器
  */
-async function handleLogs(args: z.infer<typeof logsSchema>): Promise<{
+async function handleLogs(
+    args: z.infer<typeof logsSchema>,
+    signal?: AbortSignal
+): Promise<{
     content: Array<{ type: 'text'; text: string }>
     isError?: boolean
 }> {
     try {
+        signal?.throwIfAborted()
         const unifiedSession = getUnifiedSession()
+        const deadline = Date.now() + DEFAULT_TIMEOUT
+        const assertActive = () => unifiedSession.assertRequestActive({ signal, deadline })
         const responseLimit = args.limit ?? DEFAULT_LOG_LIMIT
+        if (args.type === 'dialog' || args.type === 'download' || args.view !== undefined || args.ref !== undefined) {
+            if (args.type === 'console') {
+                return formatErrorResponse(new Error('Console logs do not accept event view/ref'))
+            }
+            if (args.type !== 'network' && args.view !== undefined) {
+                return formatErrorResponse(new Error('Network view is only valid for network logs'))
+            }
+            if (args.level !== undefined) {
+                return formatErrorResponse(new Error('Event logs do not accept console level'))
+            }
+            const result = await unifiedSession.browserEvents(
+                'read',
+                {
+                    type: args.type,
+                    view: args.view,
+                    ref: args.ref,
+                    limit: args.limit,
+                    clear: args.clear,
+                    urlPattern: args.urlPattern,
+                },
+                resolvePageTargetId(args),
+                DEFAULT_TIMEOUT,
+                signal,
+                deadline
+            )
+            return await browserEventResponse(result, args.output, assertActive)
+        }
 
-        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
-            const mode = unifiedSession.getMode()
-            switch (args.type) {
-                case 'console': {
-                    let logs: Array<{
-                        source?: string
-                        level: string
-                        text: string
-                        timestamp?: number
-                        url?: string
-                        lineNumber?: number
-                    }>
+        return await withPageContext(
+            unifiedSession,
+            resolvePageTargetId(args),
+            async () => {
+                const mode = unifiedSession.getMode()
+                switch (args.type) {
+                    case 'console': {
+                        let logs: Array<{
+                            source?: string
+                            level: string
+                            text: string
+                            timestamp?: number
+                            url?: string
+                            lineNumber?: number
+                        }>
 
-                    await unifiedSession.enableConsole()
-                    if (mode === 'extension') {
-                        // Extension 模式：使用 debugger API 获取控制台日志
-                        logs = await unifiedSession.getConsoleLogs({ clear: args.clear })
-                    } else {
-                        // CDP 模式
-                        const session = getSession()
-                        logs = await session.getConsoleLogs({ clear: args.clear })
-                    }
+                        await unifiedSession.enableConsole()
+                        if (mode === 'extension') {
+                            // Extension 模式：使用 debugger API 获取控制台日志
+                            logs = await unifiedSession.getConsoleLogs({ clear: args.clear })
+                        } else {
+                            // CDP 模式
+                            const session = getSession()
+                            logs = await session.getConsoleLogs({ clear: args.clear })
+                        }
 
-                    logs = sanitizeUrlRecords(logs.map(normalizeConsoleLog))
-                    if (args.level && args.level !== 'all') {
-                        logs = logs.filter((log) => log.level === args.level)
-                    }
+                        logs = sanitizeUrlRecords(logs.map(normalizeConsoleLog))
+                        if (args.level && args.level !== 'all') {
+                            logs = logs.filter((log) => log.level === args.level)
+                        }
 
-                    const hasExplicitLimit = args.limit !== undefined
-                    const selectedLogs = args.output && !hasExplicitLimit ? logs : latestItems(logs, responseLimit)
-                    const kind = sampleKind(Boolean(args.output), hasExplicitLimit)
-                    if (args.output) {
-                        const written = await writeLogsOutput(args.output, 'console', selectedLogs, {
-                            sample_kind: kind,
-                            limit_applied: hasExplicitLimit ? responseLimit : null,
-                            total_buffered: logs.length,
-                            level: args.level ?? 'all',
-                            mode,
-                        })
+                        const hasExplicitLimit = args.limit !== undefined
+                        const selectedLogs = args.output && !hasExplicitLimit ? logs : latestItems(logs, responseLimit)
+                        const kind = sampleKind(Boolean(args.output), hasExplicitLimit)
+                        if (args.output) {
+                            const written = await writeLogsOutput(
+                                args.output,
+                                'console',
+                                selectedLogs,
+                                {
+                                    sample_kind: kind,
+                                    limit_applied: hasExplicitLimit ? responseLimit : null,
+                                    total_buffered: logs.length,
+                                    level: args.level ?? 'all',
+                                    mode,
+                                },
+                                assertActive
+                            )
+                            return formatResponse({
+                                success: true,
+                                type: 'console',
+                                output: written.output,
+                                manifest: written.manifest,
+                                count: selectedLogs.length,
+                                totalBuffered: logs.length,
+                                sample_kind: kind,
+                                bytes: written.bytes,
+                                mode,
+                            })
+                        }
+
                         return formatResponse({
                             success: true,
                             type: 'console',
-                            output: written.output,
-                            manifest: written.manifest,
+                            logs: selectedLogs,
                             count: selectedLogs.length,
                             totalBuffered: logs.length,
                             sample_kind: kind,
-                            bytes: written.bytes,
+                            limit: responseLimit,
                             mode,
                         })
                     }
 
-                    return formatResponse({
-                        success: true,
-                        type: 'console',
-                        logs: selectedLogs,
-                        count: selectedLogs.length,
-                        totalBuffered: logs.length,
-                        sample_kind: kind,
-                        limit: responseLimit,
-                        mode,
-                    })
-                }
+                    case 'network': {
+                        let requests: Array<{
+                            url: string
+                            method: string
+                            status?: number
+                            type: string
+                            timestamp: number
+                            duration?: number
+                        }>
 
-                case 'network': {
-                    let requests: Array<{
-                        url: string
-                        method: string
-                        status?: number
-                        type: string
-                        timestamp: number
-                        duration?: number
-                    }>
+                        if (mode === 'extension') {
+                            // Extension 模式：使用 debugger API 获取网络日志
+                            await unifiedSession.enableNetwork()
+                            requests = await unifiedSession.getNetworkRequests({
+                                urlPattern: args.urlPattern,
+                                clear: args.clear,
+                            })
+                        } else {
+                            // CDP 模式
+                            const session = getSession()
+                            requests = await session.getNetworkRequests({
+                                urlPattern: args.urlPattern,
+                                clear: args.clear,
+                            })
+                        }
 
-                    if (mode === 'extension') {
-                        // Extension 模式：使用 debugger API 获取网络日志
-                        await unifiedSession.enableNetwork()
-                        requests = await unifiedSession.getNetworkRequests({
-                            urlPattern: args.urlPattern,
-                            clear: args.clear,
-                        })
-                    } else {
-                        // CDP 模式
-                        const session = getSession()
-                        requests = await session.getNetworkRequests({
-                            urlPattern: args.urlPattern,
-                            clear: args.clear,
-                        })
-                    }
+                        requests = sanitizeUrlRecords(requests)
+                        const events = unifiedSession.hasBrowserEventObservation()
+                            ? await unifiedSession.browserEvents('read', {
+                                  type: 'network',
+                                  view: 'summary',
+                                  limit: args.limit,
+                                  urlPattern: args.urlPattern,
+                                  clear: args.clear,
+                              })
+                            : { logs: [], dropped: 0, evicted: 0 }
+                        const hasExplicitLimit = args.limit !== undefined
+                        const selectedRequests =
+                            args.output && !hasExplicitLimit ? requests : latestItems(requests, responseLimit)
+                        const kind = sampleKind(Boolean(args.output), hasExplicitLimit)
+                        if (args.output) {
+                            const written = await writeLogsOutput(
+                                args.output,
+                                'network',
+                                selectedRequests,
+                                {
+                                    sample_kind: kind,
+                                    limit_applied: hasExplicitLimit ? responseLimit : null,
+                                    total_buffered: requests.length,
+                                    urlPattern: args.urlPattern,
+                                    mode,
+                                },
+                                assertActive
+                            )
+                            return formatResponse({
+                                success: true,
+                                type: 'network',
+                                output: written.output,
+                                manifest: written.manifest,
+                                count: selectedRequests.length,
+                                totalBuffered: requests.length,
+                                sample_kind: kind,
+                                bytes: written.bytes,
+                                mode,
+                            })
+                        }
 
-                    requests = sanitizeUrlRecords(requests)
-                    const hasExplicitLimit = args.limit !== undefined
-                    const selectedRequests =
-                        args.output && !hasExplicitLimit ? requests : latestItems(requests, responseLimit)
-                    const kind = sampleKind(Boolean(args.output), hasExplicitLimit)
-                    if (args.output) {
-                        const written = await writeLogsOutput(args.output, 'network', selectedRequests, {
-                            sample_kind: kind,
-                            limit_applied: hasExplicitLimit ? responseLimit : null,
-                            total_buffered: requests.length,
-                            urlPattern: args.urlPattern,
-                            mode,
-                        })
                         return formatResponse({
                             success: true,
                             type: 'network',
-                            output: written.output,
-                            manifest: written.manifest,
+                            requests: selectedRequests.map(boundInlineNetworkRequest),
+                            eventReferences: events.logs,
+                            dropped: events.dropped,
+                            evicted: events.evicted,
                             count: selectedRequests.length,
                             totalBuffered: requests.length,
                             sample_kind: kind,
-                            bytes: written.bytes,
+                            limit: responseLimit,
                             mode,
                         })
                     }
 
-                    return formatResponse({
-                        success: true,
-                        type: 'network',
-                        requests: selectedRequests.map(boundInlineNetworkRequest),
-                        count: selectedRequests.length,
-                        totalBuffered: requests.length,
-                        sample_kind: kind,
-                        limit: responseLimit,
-                        mode,
-                    })
+                    default:
+                        return {
+                            content: [
+                                {
+                                    type: 'text',
+                                    text: JSON.stringify({
+                                        error: {
+                                            code: 'INVALID_ARGUMENT',
+                                            message: `未知日志类型: ${args.type}`,
+                                        },
+                                    }),
+                                },
+                            ],
+                            isError: true,
+                        }
                 }
-
-                default:
-                    return {
-                        content: [
-                            {
-                                type: 'text',
-                                text: JSON.stringify({
-                                    error: {
-                                        code: 'INVALID_ARGUMENT',
-                                        message: `未知日志类型: ${args.type}`,
-                                    },
-                                }),
-                            },
-                        ],
-                        isError: true,
-                    }
-            }
-        }) // withTabId
+            },
+            deadline,
+            signal
+        ) // withTabId
     } catch (error) {
         return formatErrorResponse(error)
     }
@@ -297,9 +367,10 @@ export function registerLogsTool(server: McpServer): void {
     server.registerTool(
         'logs',
         {
-            description: '浏览器日志：控制台日志、网络请求',
+            description:
+                '读取控制台、网络、对话框和下载状态；network view 可按 ref 读取原请求详情、正文、WebSocket/SSE 消息、暂停请求或认证状态；正文 output 保存原始字节',
             inputSchema: logsSchema,
         },
-        (args) => handleLogs(args)
+        (args, extra) => handleLogs(args, extra?.signal)
     )
 }

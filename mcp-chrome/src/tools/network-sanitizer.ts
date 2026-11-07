@@ -2,7 +2,7 @@ const REDACTED_VALUE = '[REDACTED]'
 
 // noinspection LongLine — 拆分该完整匹配正则会降低参数名审查的可读性
 const SENSITIVE_QUERY_PARAMETER =
-    /^(?:access[_-]?token|api[_-]?key|apikey|auth|authorization|code|credential|id[_-]?token|key|password|passwd|proxy[_-]?authorization|refresh[_-]?token|secret|sig|signature|token|x-amz-credential|x-amz-security-token|x-amz-signature|x-goog-credential|x-goog-signature)$/i
+    /^(?:access[_-]?token|api[_-]?key|apikey|auth|authorization|code|credential|id[_-]?token|key|password|passwd|proxy[_-]?authorization|refresh[_-]?token|secret|sig|signature|ticket|token|x-amz-credential|x-amz-security-token|x-amz-signature|x-goog-credential|x-goog-signature)$/i
 
 export interface SanitizedUrl {
     url: string
@@ -75,4 +75,34 @@ export function sanitizeUrlRecord<T extends { url?: string; urlRedacted?: true }
 
 export function sanitizeUrlRecords<T extends { url?: string }>(records: T[]): Array<T & Omit<SanitizedUrl, 'url'>> {
     return records.map(sanitizeUrlRecord)
+}
+
+export function sanitizePageUrls<T>(value: T): T {
+    if (Array.isArray(value)) {
+        return value.map(sanitizePageUrls) as T
+    }
+    if (!value || typeof value !== 'object') {
+        return value
+    }
+    const record = value as Record<string, unknown> & { url?: string; urlRedacted?: true }
+    const result: Record<string, unknown> = { ...sanitizeUrlRecord(record) }
+    for (const field of ['pendingUrl', 'favIconUrl', 'currentUrl', 'expectedUrl', 'actualUrl']) {
+        const url = result[field]
+        if (typeof url === 'string' && !result[`${field}Redacted`]) {
+            const sanitized = sanitizeUrl(url)
+            if (sanitized.urlRedacted) {
+                result[field] = sanitized.url
+                result[`${field}Redacted`] = true
+                result[`${field}OriginalLength`] = sanitized.urlOriginalLength
+                result[`${field}RedactedQueryParameters`] = sanitized.redactedQueryParameters
+            }
+        }
+    }
+    // 只遍历页面与窗口响应字段，保留正文、元标签和用户脚本结果
+    for (const field of ['target', 'tabs', 'before', 'after', 'tabsBefore', 'tabsAfter', 'frames', 'frameContext']) {
+        if (Object.hasOwn(result, field)) {
+            result[field] = sanitizePageUrls(result[field])
+        }
+    }
+    return result as T
 }

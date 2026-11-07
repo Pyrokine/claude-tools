@@ -4,7 +4,17 @@
 
 // ==================== Tab 相关 ====================
 
+export interface PageMetadata {
+    origin: 'created' | 'adopted' | 'unknown'
+    createdBy: 'mcp-chrome' | 'unknown'
+    createdAt: string | null
+    lastUsedAt: string | null
+    taskHint?: string
+    note?: string
+}
+
 export interface TabInfo {
+    metadata?: PageMetadata
     id: number
     url: string
     title: string

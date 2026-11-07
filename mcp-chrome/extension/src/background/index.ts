@@ -30,8 +30,16 @@ import {
 const httpClient = new HttpClient()
 const actionHandler = new ActionHandler()
 let connectionGeneration = 0
+
+
 httpClient.onConnectionClosed((instanceId) => {
     void revokeReadGrants(instanceId).catch((error) => console.error('[MCP] Read grant cleanup failed:', error))
+    void actionHandler
+        .releaseBrowserEventOwner(instanceId)
+        .catch((error: unknown) => console.error('[MCP] Browser event cleanup failed:', error))
+    void actionHandler
+        .releaseKeyboardFocusOwner(instanceId)
+        .catch((error: unknown) => console.error('[MCP] Keyboard focus cleanup failed:', error))
 })
 
 function sanitizeErrorMessage(message: string): string {
@@ -52,8 +60,8 @@ function structuredErrorPayload(error: unknown): string | null {
 
 // ==================== WebSocket 消息处理 ====================
 
-httpClient.onMessage(async (message, port) => {
-    const { id, action, params } = message
+httpClient.onMessage(async (message, port, signal, reply) => {
+    const { action, params } = message
 
     try {
         await restoreManagedTabs()
@@ -61,8 +69,9 @@ httpClient.onMessage(async (message, port) => {
             mcpTabGroupId: getMcpTabGroupId(),
             mcpWindowId: getMcpWindowId(),
             serverInstanceId: httpClient.getServerInstanceId(port),
+            signal,
         })
-        httpClient.sendResponse(id, true, result, undefined, port)
+        reply(true, result)
     } catch (error) {
         const rawMsg = error instanceof Error ? error.message : 'Unknown error'
         const msg = structuredErrorPayload(error) ?? sanitizeErrorMessage(rawMsg)
@@ -72,7 +81,7 @@ httpClient.onMessage(async (message, port) => {
         } else {
             console.error(`[MCP] Error executing ${action}:`, error)
         }
-        httpClient.sendResponse(id, false, null, msg, port)
+        reply(false, null, msg)
     }
 })
 
@@ -239,19 +248,20 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     }
 })
 
-// 感知用户拖动 tab 到 MCP Chrome 分组
-// Chrome 88+ 的 onUpdated 事件会在 tab 的 groupId 变化时触发
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    const groupId = getMcpTabGroupId()
-    if (groupId === null) {
-        return
-    }
-    // changeInfo 包含 groupId（Chrome 88+），TypeScript 类型可能未声明
-    const info = changeInfo as chrome.tabs.OnUpdatedInfo & { groupId?: number }
-    if (info.groupId === groupId) {
-        console.log(`[MCP] Tab ${tabId} joined MCP Chrome group`)
+// 原生分组、移动和关闭只更新可信关系，不改变受控权限
+function refreshNativeRelations(): void {
+    void actionHandler
+        .refreshNativeRelations()
+        .catch((error) => console.warn('[MCP] Native page relationship update failed:', error))
+}
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+    if ((changeInfo as chrome.tabs.OnUpdatedInfo & { groupId?: number }).groupId !== undefined) {
+        refreshNativeRelations()
     }
 })
+chrome.tabs.onMoved.addListener(refreshNativeRelations)
+chrome.tabs.onAttached.addListener(refreshNativeRelations)
+chrome.tabGroups.onRemoved.addListener(refreshNativeRelations)
 
 // revision 仅追踪导航事件与 MCP 发起的动作，不观察页面自主的 DOM 变更
 chrome.webNavigation.onCommitted.addListener((details) => {

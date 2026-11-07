@@ -1,4 +1,5 @@
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
+import { getErrorSource } from '../core/errors.js'
 import { formatErrorResponse, formatResponse, getUnifiedSession } from '../core/index.js'
 import { withNavigationBudget } from '../core/utils.js'
 import { sanitizeUrlRecords } from './network-sanitizer.js'
@@ -48,9 +49,13 @@ export async function startDiagnostics(
         return { result: { diagnosticsStatus: 'disabled' } }
     }
     try {
+        unifiedSession.assertRequestActive?.()
         await withNavigationBudget(() => unifiedSession.enableConsole(), deadline)
+        unifiedSession.assertRequestActive?.()
         await withNavigationBudget(() => unifiedSession.enableNetwork(), deadline)
+        unifiedSession.assertRequestActive?.()
         const consoleLogs = await withNavigationBudget(() => unifiedSession.getConsoleLogs(), deadline)
+        unifiedSession.assertRequestActive?.()
         const network = await withNavigationBudget(() => unifiedSession.getNetworkRequests(), deadline)
         return {
             start: {
@@ -60,6 +65,10 @@ export async function startDiagnostics(
             result: { diagnosticsStatus: 'collected' },
         }
     } catch (error) {
+        if (getErrorSource(error) === 'budget') {
+            unifiedSession.annotateUserActionError?.(error)
+            throw error
+        }
         return {
             result: {
                 diagnosticsStatus: 'unavailable',
@@ -78,7 +87,9 @@ export async function finishDiagnostics(
         return started.result
     }
     try {
+        unifiedSession.assertRequestActive?.()
         const consoleLogs = await withNavigationBudget(() => unifiedSession.getConsoleLogs(), deadline)
+        unifiedSession.assertRequestActive?.()
         const network = await withNavigationBudget(() => unifiedSession.getNetworkRequests(), deadline)
         const consoleDelta = entriesSince(consoleLogs, started.start.consoleLastEntry)
         const networkDelta = entriesSince(network, started.start.networkLastEntry)
@@ -97,6 +108,9 @@ export async function finishDiagnostics(
             },
         }
     } catch (error) {
+        if (getErrorSource(error) === 'budget') {
+            unifiedSession.annotateUserActionError?.(error)
+        }
         return {
             diagnosticsStatus: 'error',
             diagnosticsError: errorSummary(error),

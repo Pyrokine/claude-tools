@@ -15,6 +15,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { readFile, stat } from 'fs/promises'
 import { basename, extname, join } from 'path'
 import { z } from 'zod'
+import { installDomHelpers } from '../core/dom-helpers.js'
+import { ElementNotFoundError } from '../core/errors.js'
 import {
     CWD_PATH_PREFIX,
     formatErrorResponse,
@@ -26,9 +28,9 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
-import { ElementNotFoundError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT, type Target } from '../core/types.js'
-import { sanitizeUrlRecords } from './network-sanitizer.js'
+import { remainingNavigationTimeout } from '../core/utils.js'
+import { sanitizePageUrls, sanitizeUrlRecord, sanitizeUrlRecords } from './network-sanitizer.js'
 import { withPageContext } from './page-context.js'
 import {
     assertPngFileBudget,
@@ -39,7 +41,13 @@ import {
     MAX_COMPARE_PNG_BYTES,
     readPngHeader,
 } from './png.js'
-import { pageTargetIdSchema, resolvePageTargetId, targetToFindParams, targetZodSchema } from './schema.js'
+import {
+    frameZodSchema,
+    pageTargetIdSchema,
+    resolvePageTargetId,
+    targetToFindParams,
+    targetZodSchema,
+} from './schema.js'
 import {
     buildTargetDiagnostics,
     enrichTargetError,
@@ -64,10 +72,13 @@ interface ImageInfo {
 interface ImageData {
     base64: string | null
     mimeType: string
+    omitted?: 'appendix-limit' | 'image-byte-limit' | 'request-byte-limit' | 'unavailable'
 }
 
 /** 无 output 时附录返回的最大图片数 */
 const MAX_APPENDIX_IMAGES = 20
+const MAX_IMAGE_BYTES = 2 * 1024 * 1024
+const MAX_IMAGE_REQUEST_BYTES = 8 * 1024 * 1024
 
 /**
  * extract 参数 schema
@@ -135,13 +146,13 @@ const extractSchema = z
                 '页面状态提取模式（state 类型有效），accessibility=可访问性树（默认，与原 read_page 一致），' +
                     'domsnapshot=DOMSnapshot 全量快照（CDP 或受控 Extension 页面，不支持 target/frame/depth 限定）'
             ),
-        timeout: z.number().optional().describe('等待目标元素超时'),
-        frame: z
-            .union([z.string(), z.number()])
+        timeout: z
+            .number()
             .optional()
             .describe(
-                'iframe 定位（可选，仅 Extension 模式），CSS 选择器（如 "iframe#main"）或索引（如 0），不指定则在主框架操作'
+                '浏览器操作总预算（毫秒，默认 30000），包含排队、页面/frame 准备、目标等待、内容读取和页面元信息读取'
             ),
+        frame: frameZodSchema.describe('iframe selector／索引或逐层路径（如 ["iframe#outer", 0]），省略时使用主文档'),
     })
     .superRefine((args, context) => {
         if (args.diffOutput && !args.compareWith) {
@@ -169,7 +180,7 @@ interface ExtractContext {
     useExtension: boolean
 }
 
-async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
+async function handleExtract(args: ExtractArgs, signal?: AbortSignal): Promise<ExtractToolResponse> {
     const timeout = args.timeout ?? DEFAULT_TIMEOUT
     const deadline = Date.now() + timeout
     try {
@@ -190,38 +201,53 @@ async function handleExtract(args: ExtractArgs): Promise<ExtractToolResponse> {
         const unifiedSession = getUnifiedSession()
 
         // 多 tab 并行：临时切换到指定 tab
-        return await withPageContext(unifiedSession, resolvePageTargetId(args), async () => {
-            return await unifiedSession.withFrame(args.frame, async () => {
-                const useExtension = unifiedSession.getMode() === 'extension'
-                const frameHtmlError = validateFrameHtmlArgs(args, useExtension)
-                if (frameHtmlError) {
-                    return frameHtmlError
-                }
-                const session = getSession()
+        return await withPageContext(
+            unifiedSession,
+            resolvePageTargetId(args),
+            async () => {
+                return await unifiedSession.withFrame(
+                    args.frame,
+                    async () => {
+                        const useExtension = unifiedSession.getMode() === 'extension'
+                        const frameHtmlError = validateFrameHtmlArgs(args, useExtension)
+                        if (frameHtmlError) {
+                            return frameHtmlError
+                        }
+                        const session = getSession()
 
-                // Extension 路径：等待目标元素出现（如果指定了 target + timeout）
-                if (useExtension && args.target && args.timeout !== undefined) {
-                    await waitForTargetExtension(unifiedSession, args.target, args.timeout, args.frame)
-                }
+                        // Extension 路径：等待目标元素出现（如果指定了 target + timeout）
+                        if (useExtension && args.target && args.timeout !== undefined) {
+                            await waitForTargetExtension(
+                                unifiedSession,
+                                args.target,
+                                remainingNavigationTimeout(deadline),
+                                args.frame
+                            )
+                        }
 
-                try {
-                    const scopedArgs =
-                        !useExtension && args.target
-                            ? { ...args, timeout: targetLookupTimeout(Math.max(1, deadline - Date.now())) }
-                            : args
-                    return await handleExtractInFrame({ unifiedSession, session, useExtension }, scopedArgs)
-                } catch (error) {
-                    if (!useExtension && args.target && error instanceof ElementNotFoundError) {
-                        await enrichTargetError(error, unifiedSession, args.target, {
-                            timeout,
-                            deadline,
-                            frame: args.frame,
-                        })
-                    }
-                    throw error
-                }
-            }) // withFrame
-        }) // withTabId
+                        try {
+                            const scopedArgs =
+                                !useExtension && args.target
+                                    ? { ...args, timeout: targetLookupTimeout(Math.max(1, deadline - Date.now())) }
+                                    : args
+                            return await handleExtractInFrame({ unifiedSession, session, useExtension }, scopedArgs)
+                        } catch (error) {
+                            if (!useExtension && args.target && error instanceof ElementNotFoundError) {
+                                await enrichTargetError(error, unifiedSession, args.target, {
+                                    timeout,
+                                    deadline,
+                                    frame: args.frame,
+                                })
+                            }
+                            throw error
+                        }
+                    },
+                    deadline
+                ) // withFrame
+            },
+            deadline,
+            signal
+        ) // withTabId
     } catch (error) {
         return formatErrorResponse(error)
     }
@@ -348,7 +374,13 @@ async function handleScreenshotExtract(
 ): Promise<ExtractToolResponse> {
     let clip: { x: number; y: number; width: number; height: number } | undefined
     if (args.target && !args.clip) {
-        const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
+        const {
+            selector,
+            text,
+            xpath,
+            nth: nthParam,
+            semantic,
+        } = targetToFindParams(args.target as Target & { nth?: number })
         const nth = nthParam ?? 0
         const pointTarget = 'x' in args.target && 'y' in args.target ? args.target : null
         const found = pointTarget
@@ -357,7 +389,10 @@ async function handleScreenshotExtract(
                 : await unifiedSession
                       .evaluate<Awaited<ReturnType<typeof unifiedSession.find>>[number] | null>(
                           `(() => {
-                          const element = document.elementFromPoint(${pointTarget.x}, ${pointTarget.y});
+                          (${installDomHelpers.toString()})();
+                          const element = globalThis.__mcpDomHelpers.deepElementFromPoint(
+                              ${pointTarget.x}, ${pointTarget.y}
+                          );
                           if (!element) return null;
                           const rect = element.getBoundingClientRect();
                           return {
@@ -369,15 +404,15 @@ async function handleScreenshotExtract(
                           args.timeout
                       )
                       .then((element) => (element && nth === 0 ? [element] : []))
-            : await unifiedSession.find(selector, text, xpath, args.timeout)
-        const target = found[pointTarget ? 0 : nth]
+            : await unifiedSession.find(selector, text, xpath, args.timeout, semantic, nth)
+        const target = found[0]
         if (!target || target.rect.width <= 0 || target.rect.height <= 0) {
             throw new TargetNotFoundError(
                 await buildTargetDiagnostics(unifiedSession, args.target, {
                     nth,
                     timeout: args.timeout,
                     frame: args.frame,
-                    matchCount: found.length,
+                    matchCount: null,
                     lastState: target ? 'zero-size' : 'not-found',
                     candidates: found,
                 })
@@ -416,6 +451,9 @@ async function handleScreenshotExtract(
     const dimensions = encodedDimensions ?? fallbackDimensions
     const metadata: Record<string, unknown> = {
         format: screenshot.format,
+        ...(screenshot.degraded !== undefined ? { degraded: screenshot.degraded } : {}),
+        ...(screenshot.fallback !== undefined ? { fallback: screenshot.fallback } : {}),
+        ...(screenshot.limitations !== undefined ? { limitations: screenshot.limitations } : {}),
         width: dimensions?.width,
         height: dimensions?.height,
         dimensionSource: dimensions?.source,
@@ -464,7 +502,7 @@ async function handleScreenshotExtract(
 }
 
 async function handleStateExtract(
-    { unifiedSession, useExtension }: ExtractContext,
+    { unifiedSession, session, useExtension }: ExtractContext,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
     if (args.mode === 'domsnapshot') {
@@ -480,17 +518,18 @@ async function handleStateExtract(
                 text,
                 xpath,
                 nth: nthParam,
+                semantic,
             } = targetToFindParams(args.target as Target & { nth?: number })
             const candidates =
                 'x' in args.target && 'y' in args.target
                     ? await unifiedSession.findAtPoint(args.target.x, args.target.y)
-                    : await unifiedSession.find(selector, text, xpath, args.timeout)
+                    : await unifiedSession.find(selector, text, xpath, args.timeout, semantic)
             throw new TargetNotFoundError(
                 await buildTargetDiagnostics(unifiedSession, args.target, {
                     nth: nthParam ?? 0,
                     timeout: args.timeout,
                     frame: args.frame,
-                    matchCount: candidates.length,
+                    matchCount: candidates.length < 50 ? candidates.length : null,
                     lastState: 'not-found',
                     candidates,
                 })
@@ -506,7 +545,11 @@ async function handleStateExtract(
         readPageOptions.depth = args.depth
     }
 
-    const state = await unifiedSession.readPage(Object.keys(readPageOptions).length > 0 ? readPageOptions : undefined)
+    const state = sanitizePageUrls(
+        useExtension
+            ? await unifiedSession.readPage(Object.keys(readPageOptions).length > 0 ? readPageOptions : undefined)
+            : await session.readPage({ target: args.target, depth: args.depth, timeout: args.timeout })
+    )
     if (args.output) {
         const outputPath = await writeOutputFile(args.output, JSON.stringify(state, null, 2), 'utf-8')
         return formatResponse({ success: true, type: 'state', output: outputPath })
@@ -535,15 +578,15 @@ async function handleDiagnosticBundleExtract(
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
     const state = await unifiedSession.getLiveState().catch(() => null)
-    const metadata = await unifiedSession.getMetadata()
-    const frames = await unifiedSession.getFrames()
+    const metadata = sanitizePageUrls(await unifiedSession.getMetadata())
+    const frames = sanitizePageUrls(await unifiedSession.getFrames())
     await unifiedSession.enableConsole()
     await unifiedSession.enableNetwork()
     const consoleLogs = sanitizeUrlRecords(await unifiedSession.getConsoleLogs())
     const networkRequests = sanitizeUrlRecords(await unifiedSession.getNetworkRequests())
     const bundle = {
         schema: 'mcp-chrome.diagnosticBundle.v1',
-        url: state?.url,
+        ...sanitizeUrlRecord({ url: state?.url }),
         title: state?.title,
         managed: state?.managed ?? false,
         mode: unifiedSession.getMode(),
@@ -566,12 +609,12 @@ async function handleDiagnosticBundleExtract(
         },
     }
     const summary = {
-        url: bundle.url,
+        ...sanitizeUrlRecord({ url: state?.url }),
         title: bundle.title,
         managed: bundle.managed,
         mode: bundle.mode,
         frameCount: Array.isArray(frames.frames) ? frames.frames.length : 0,
-        consoleErrors: bundle.consoleSummary.recentErrors.length,
+        consoleErrors: bundle.consoleSummary.recentErrors.filter((item) => item.level === 'error').length,
         networkFailures: bundle.networkSummary.recentFailures.length,
     }
     if (args.output) {
@@ -592,8 +635,8 @@ async function handleMetadataExtract(
     { unifiedSession }: ExtractContext,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
-    const metadata = await unifiedSession.getMetadata()
-    const frames = await unifiedSession.getFrames()
+    const metadata = sanitizePageUrls(await unifiedSession.getMetadata())
+    const frames = sanitizePageUrls(await unifiedSession.getFrames())
     if (args.output) {
         const outputPath = await writeOutputFile(
             args.output,
@@ -623,8 +666,10 @@ function invalidExtractTypeResponse(args: ExtractArgs): ExtractToolResponse {
 
 /** 写入文件前自动创建父目录，并收敛到受控范围 */
 async function writeOutputFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<string> {
+    const session = getUnifiedSession()
+    session.assertRequestActive()
     const resolvedPath = await resolveScopedOutputPath(path, 'mcp-chrome')
-    await writePrivateFile(resolvedPath.absolutePath, data, encoding)
+    await writePrivateFile(resolvedPath.absolutePath, data, encoding, () => session.assertRequestActive())
     return resolvedPath.absolutePath
 }
 
@@ -813,7 +858,13 @@ async function handleHtmlWithImages(
     let result: { html: string; images: ImageInfo[] }
 
     if (args.target) {
-        const { selector, text, xpath, nth: nthParam } = targetToFindParams(args.target as Target & { nth?: number })
+        const {
+            selector,
+            text,
+            xpath,
+            nth: nthParam,
+            semantic,
+        } = targetToFindParams(args.target as Target & { nth?: number })
         const nth = nthParam ?? 0
         if (useExtension) {
             const refId = await findTargetRefExtension(unifiedSession, args.target, args.timeout)
@@ -821,12 +872,12 @@ async function handleHtmlWithImages(
                 const matches =
                     'x' in args.target && 'y' in args.target
                         ? await unifiedSession.findAtPoint(args.target.x, args.target.y)
-                        : await unifiedSession.find(selector, text, xpath, args.timeout)
+                        : await unifiedSession.find(selector, text, xpath, args.timeout, semantic)
                 throw new TargetNotFoundError(
                     await buildTargetDiagnostics(unifiedSession, args.target, {
                         nth,
                         timeout: args.timeout,
-                        matchCount: matches.length,
+                        matchCount: matches.length < 50 ? matches.length : null,
                         lastState: 'not-found',
                         candidates: matches,
                     })
@@ -834,13 +885,13 @@ async function handleHtmlWithImages(
             }
             result = await unifiedSession.getHtmlWithImagesByRef(refId)
         } else {
-            const matches = await unifiedSession.find(selector, text, xpath, args.timeout)
-            if (matches.length <= nth) {
+            const matches = await unifiedSession.find(selector, text, xpath, args.timeout, semantic, nth)
+            if (matches.length === 0) {
                 throw new TargetNotFoundError(
                     await buildTargetDiagnostics(unifiedSession, args.target, {
                         nth,
                         timeout: args.timeout,
-                        matchCount: matches.length,
+                        matchCount: null,
                         lastState: 'not-found',
                         candidates: matches,
                     })
@@ -874,26 +925,32 @@ async function handleHtmlWithImages(
 
     // data 模式：获取图片数据
     const appendixMode = !args.output
-    const imageDataList = await fetchImageData(
+    const imageData = fetchImageData(
         unifiedSession,
         result.images,
-        appendixMode ? MAX_APPENDIX_IMAGES : undefined
+        appendixMode ? MAX_APPENDIX_IMAGES : undefined,
+        !appendixMode
     )
-
     if (args.output) {
         const outputDir = (await resolveScopedOutputPath(args.output, 'mcp-chrome')).absolutePath
-        // 写入目录
-        await writeImageDirectory(outputDir, result.html, result.images, imageDataList)
+        const omittedImages = await writeImageDirectory(outputDir, result.html, result.images, imageData, () =>
+            unifiedSession.assertRequestActive()
+        )
         return formatResponse({
             success: true,
             type: 'html',
             output: outputDir,
             imageCount: result.images.length,
             index: join(outputDir, 'index.json'),
+            omittedImages,
+            imageByteLimit: MAX_IMAGE_BYTES,
+            imageRequestByteLimit: MAX_IMAGE_REQUEST_BYTES,
         })
     }
-
-    // 无 output：MCP 附录方式返回
+    const imageDataList: ImageData[] = []
+    for await (const data of imageData) {
+        imageDataList.push(data)
+    }
     return buildImageAppendixResponse(result.html, result.images, imageDataList)
 }
 
@@ -1002,85 +1059,78 @@ async function extractHtmlWithImagesCdp(
  *
  * 策略：
  * 1. data: URL → 直接解码
- * 2. CDP Page.getResourceContent（批量） → 从浏览器缓存读取（零网络请求）
+ * 2. CDP Page.getResourceContent → 逐图读取浏览器缓存（零网络请求）
  *
  * @param unifiedSession 会话管理器，用于 CDP 资源获取
  * @param images 图片元信息列表
- * @param limit 最多获取前 N 张图片数据（附录模式限流），超出的返回 null
+ * @param limit 最多获取前 N 张图片数据（附录模式限流），超出的图片 base64 为 null
+ * @param skipDuplicates 是否跳过重复图片来源
  */
-async function fetchImageData(
+async function* fetchImageData(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     images: ImageInfo[],
-    limit?: number
-): Promise<ImageData[]> {
-    const effectiveLimit = limit ?? images.length
-
-    // 第一趟：解析 data: URL + 收集需要 CDP 获取的 URL（去重）
-    const preResolved: (ImageData | null)[] = []
-    const cdpUrlSet = new Set<string>()
-    for (let i = 0; i < images.length; i++) {
+    limit = images.length,
+    skipDuplicates = false
+): AsyncGenerator<ImageData> {
+    let usedBytes = 0
+    const sources = new Set<string>()
+    for (let i = 0; i < images.length; ++i) {
+        unifiedSession.assertRequestActive()
         const img = images[i]
-        const effectiveSrc = img.src || img.dataSrc
-
-        if (i >= effectiveLimit || !effectiveSrc) {
-            preResolved.push({ base64: null, mimeType: 'image/png' })
+        const src = img.src || img.dataSrc
+        const mimeType = guessMimeType(src)
+        if (skipDuplicates && sources.has(src)) {
+            yield { base64: null, mimeType }
             continue
         }
-
-        if (effectiveSrc.startsWith('data:')) {
-            const match = effectiveSrc.match(/^data:(?<mime>[^;]+);base64,(?<data>.+)$/)
-            preResolved.push(
-                match
-                    ? { base64: match.groups!.data, mimeType: match.groups!.mime }
-                    : { base64: null, mimeType: 'image/png' }
-            )
+        if (i >= limit) {
+            yield { base64: null, mimeType, omitted: 'appendix-limit' }
             continue
         }
-
-        if (!effectiveSrc.startsWith('http')) {
-            preResolved.push({ base64: null, mimeType: guessMimeType(effectiveSrc) })
+        if (usedBytes >= MAX_IMAGE_REQUEST_BYTES) {
+            yield { base64: null, mimeType, omitted: 'request-byte-limit' }
             continue
         }
-
-        // 只有 src 非空（浏览器实际请求过的）才走 CDP 缓存
-        if (img.src) {
-            cdpUrlSet.add(img.src)
-        }
-        preResolved.push(null) // 需要进一步获取
-    }
-
-    // 第二趟：批量 CDP 获取
-    const cdpResults = await unifiedSession.getResourceContentBatch([...cdpUrlSet])
-
-    // 第三趟：组装结果，CDP 未命中的返回 null
-    const results: ImageData[] = []
-
-    for (let i = 0; i < images.length; i++) {
-        if (preResolved[i] !== null) {
-            results.push(preResolved[i]!)
-            continue
-        }
-
-        const img = images[i]
-        const effectiveSrc = img.src || img.dataSrc
-        const mimeType = guessMimeType(effectiveSrc)
-
-        // 尝试 CDP 缓存
-        if (img.src && cdpResults.has(img.src)) {
-            const resource = cdpResults.get(img.src)!
-            if (resource.base64Encoded) {
-                results.push({ base64: resource.content, mimeType })
-            } else {
-                results.push({ base64: Buffer.from(resource.content).toString('base64'), mimeType })
+        let base64: string | undefined
+        let resolvedMime = mimeType
+        if (src.startsWith('data:')) {
+            const match = /^data:(?<mimeType>[^;]+);base64,/.exec(src)
+            if (match) {
+                resolvedMime = match[1]
+                base64 = src.slice(match[0].length)
             }
+        } else if (img.src && /^https?:/.test(src)) {
+            const resource = (await unifiedSession.getResourceContentBatch([img.src], 1)).get(img.src)
+            unifiedSession.assertRequestActive()
+            if (resource) {
+                if (!resource.base64Encoded && Buffer.byteLength(resource.content) > MAX_IMAGE_BYTES) {
+                    yield { base64: null, mimeType, omitted: 'image-byte-limit' }
+                    continue
+                }
+                base64 = resource.base64Encoded ? resource.content : Buffer.from(resource.content).toString('base64')
+            }
+        }
+        if (base64 === undefined) {
+            yield { base64: null, mimeType: resolvedMime, omitted: 'unavailable' }
             continue
         }
-
-        // CDP 缓存未命中，不使用 Node.js fetch（避免绕过浏览器同源策略）
-        results.push({ base64: null, mimeType })
+        const bytes = Buffer.byteLength(base64, 'base64')
+        const omitted =
+            bytes > MAX_IMAGE_BYTES
+                ? 'image-byte-limit'
+                : usedBytes + bytes > MAX_IMAGE_REQUEST_BYTES
+                  ? 'request-byte-limit'
+                  : undefined
+        if (omitted) {
+            yield { base64: null, mimeType: resolvedMime, omitted }
+            continue
+        }
+        usedBytes += bytes
+        if (skipDuplicates) {
+            sources.add(src)
+        }
+        yield { base64, mimeType: resolvedMime }
     }
-
-    return results
 }
 
 /**
@@ -1098,12 +1148,13 @@ async function writeImageDirectory(
     outputDir: string,
     html: string,
     images: ImageInfo[],
-    imageDataList: ImageData[]
-): Promise<void> {
+    imageDataList: AsyncIterable<ImageData>,
+    assertActive?: () => void
+): Promise<number> {
     const imagesDir = join(outputDir, 'images')
 
     // 写入 HTML
-    await writePrivateFile(join(outputDir, 'content.html'), html, 'utf-8')
+    await writePrivateFile(join(outputDir, 'content.html'), html, 'utf-8', assertActive)
 
     // 写入图片文件 + 构建索引（相同 src 去重）
     const indexEntries: Array<{
@@ -1113,14 +1164,17 @@ async function writeImageDirectory(
         width: number
         height: number
         file: string | null
+        omitted?: ImageData['omitted']
     }> = []
     const writtenFiles = new Map<string, string>() // src → file path
 
-    for (let i = 0; i < images.length; i++) {
+    let i = 0
+    let omittedImages = 0
+    for await (const data of imageDataList) {
+        assertActive?.()
         const img = images[i]
-        const data = imageDataList[i]
         const src = img.src || img.dataSrc
-        let file: string | null = null
+        let file: string | null = writtenFiles.get(src) ?? null
 
         if (data.base64) {
             // 相同 src 复用已写入的文件
@@ -1132,7 +1186,12 @@ async function writeImageDirectory(
                 const safeName = sanitizeFilename(src)
                 const filename = `${i}-${safeName}${ext}`
                 file = `images/${filename}`
-                await writePrivateFile(join(imagesDir, filename), Buffer.from(data.base64, 'base64'))
+                await writePrivateFile(
+                    join(imagesDir, filename),
+                    Buffer.from(data.base64, 'base64'),
+                    undefined,
+                    assertActive
+                )
                 writtenFiles.set(src, file)
             }
         }
@@ -1144,7 +1203,12 @@ async function writeImageDirectory(
             width: img.width,
             height: img.height,
             file,
+            ...(data.omitted ? { omitted: data.omitted } : {}),
         })
+        if (data.omitted) {
+            ++omittedImages
+        }
+        ++i
     }
 
     // 写入索引
@@ -1158,8 +1222,10 @@ async function writeImageDirectory(
             null,
             2
         ),
-        'utf-8'
+        'utf-8',
+        assertActive
     )
+    return omittedImages
 }
 
 /**
@@ -1189,6 +1255,9 @@ function buildImageAppendixResponse(
             type: 'html',
             content: html,
             imageCount: images.length,
+            imageByteLimit: MAX_IMAGE_BYTES,
+            imageRequestByteLimit: MAX_IMAGE_REQUEST_BYTES,
+            omittedImages: imageDataList.filter((image) => image.omitted).length,
         }),
     })
 
@@ -1210,7 +1279,12 @@ function buildImageAppendixResponse(
         // 图片标注
         const sizeStr = img.naturalWidth ? `${img.naturalWidth}×${img.naturalHeight}` : `${img.width}×${img.height}`
         const altStr = img.alt ? `  alt="${img.alt}"` : ''
-        content.push({ type: 'text', text: `\n[${img.index}] ${effectiveSrc}${altStr}  ${sizeStr}` })
+        content.push({
+            type: 'text',
+            text:
+                `\n[${img.index}] ${effectiveSrc}${altStr}  ${sizeStr}` +
+                (data.omitted ? `  omitted=${data.omitted}` : ''),
+        })
 
         // 在限制内且有数据时附带图片（SVG 等不支持的格式跳过 image block）
         if (i < limit && data.base64 && SUPPORTED_IMAGE_MIMES.has(data.mimeType)) {
@@ -1221,7 +1295,7 @@ function buildImageAppendixResponse(
     if (images.length > MAX_APPENDIX_IMAGES) {
         content.push({
             type: 'text',
-            text: `\n（共 ${images.length} 张图片，仅前 ${MAX_APPENDIX_IMAGES} 张附带数据，使用 output 参数导出全部图片）`,
+            text: `\n（共 ${images.length} 张图片，仅前 ${MAX_APPENDIX_IMAGES} 张附带数据，使用 output 参数导出图片，字节预算仍适用）`,
         })
     }
 
@@ -1348,11 +1422,11 @@ async function findTargetRefExtension(
     target: Target,
     timeout?: number
 ): Promise<string | undefined> {
-    const { selector, text, xpath, nth } = targetToFindParams(target as Target & { nth?: number })
+    const { selector, text, xpath, nth, semantic } = targetToFindParams(target as Target & { nth?: number })
     const matches =
         'x' in target && 'y' in target
             ? await unifiedSession.findAtPoint(target.x, target.y, nth ?? 0, timeout)
-            : await unifiedSession.find(selector, text, xpath, timeout, nth ?? 0)
+            : await unifiedSession.find(selector, text, xpath, timeout, semantic, nth ?? 0)
     return matches[0]?.refId
 }
 
@@ -1418,18 +1492,19 @@ async function waitForTargetExtension(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
     timeout: number,
-    frame?: string | number
+    frame?: import('../core/browser-driver.js').FrameSelection
 ): Promise<void> {
     if ('x' in target && 'y' in target) {
         return
     }
 
+    unifiedSession.preserveTargetAfterLookup()
     const startTime = Date.now()
     const retryDelay = 100
-    const { selector, text, xpath, nth: nthParam } = targetToFindParams(target as Target & { nth?: number })
+    const { selector, text, xpath, nth: nthParam, semantic } = targetToFindParams(target as Target & { nth?: number })
     const nth = nthParam ?? 0
     let lastError: Error | null = null
-    let matchCount = 0
+    let matchCount: number | null = null
     let candidates: Array<{
         tag: string
         text: string
@@ -1443,6 +1518,7 @@ async function waitForTargetExtension(
                 await buildTargetDiagnostics(unifiedSession, target, {
                     nth,
                     timeout,
+                    deadline: startTime + timeout,
                     frame,
                     matchCount,
                     lastState: 'attached',
@@ -1460,15 +1536,30 @@ async function waitForTargetExtension(
         }
 
         try {
-            const indexed = nth >= 50
-            const elements = await unifiedSession.find(selector, text, xpath, remaining, indexed ? nth : undefined)
-            matchCount = elements.length
+            const elements = await unifiedSession.find(selector, text, xpath, remaining, semantic)
+            matchCount = elements.length < 50 ? elements.length : null
             candidates = elements
-            if (indexed ? elements.length > 0 : elements.length > nth) {
+            const selected =
+                nth < 50
+                    ? elements[nth]
+                    : (
+                          await unifiedSession.find(
+                              selector,
+                              text,
+                              xpath,
+                              Math.max(1, timeout - (Date.now() - startTime)),
+                              semantic,
+                              nth
+                          )
+                      )[0]
+            if (selected) {
                 return
             }
         } catch (err) {
-            // 暂时性错误（RPC 超时、发送失败、连接断开）可重试，其他确定性错误立即抛出
+            if (err instanceof StructuredToolError && err.context.actionStatus === 'unknown') {
+                throw err
+            }
+            // 仅重试尚未派发成功的暂时性错误
             if (
                 err instanceof Error &&
                 /Request timeout|Failed to send|disconnect|未连接|stopped|replaced/i.test(err.message)
@@ -1500,6 +1591,6 @@ export function registerExtractTool(server: McpServer): void {
             description: `提取页面内容：文本、HTML（可附带图片）、iframe HTML、属性、截图、状态、页面元信息`,
             inputSchema: extractSchema,
         },
-        (args) => handleExtract(args)
+        (args, extra) => handleExtract(args, extra?.signal)
     )
 }

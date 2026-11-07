@@ -8,6 +8,7 @@
  * - 参考《代码整洁之道》§7.4：给出异常发生的环境说明
  */
 
+import { sanitizePageUrls, sanitizeUrl } from '../tools/network-sanitizer.js'
 import type { Target } from './types.js'
 
 /**
@@ -19,14 +20,33 @@ export interface ErrorContext {
 
 const errorPageContexts = new WeakMap<object, ErrorContext>()
 
+export type ErrorSource = 'page' | 'transport' | 'protocol' | 'context' | 'budget' | 'cancelled'
+const errorSources = new WeakMap<object, ErrorSource>()
+
+export function setErrorSource<T extends Error>(error: T, source: ErrorSource): T {
+    errorSources.set(error, source)
+    return error
+}
+
+export function getErrorSource(error: unknown): ErrorSource | undefined {
+    return error !== null && typeof error === 'object' ? errorSources.get(error) : undefined
+}
+
 export function isNativeExecutionResultUnknown(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error)
     if (
+        ((error instanceof StructuredToolError || error instanceof CDPError) &&
+            error.context.actionStatus === 'unknown') ||
         message === 'Execution was terminated' ||
         (error instanceof CDPError &&
-            /^Runtime\.(?:evaluate|callFunctionOn|runScript): (?:Execution was terminated|Internal error|Object couldn't be returned by value\.?|Object reference chain is too long\.?)$/.test(
-                message
-            ))
+            getErrorSource(error) === 'context' &&
+            /^Runtime\.(?:evaluate|callFunctionOn|runScript)$/.test(String(error.context.method))) ||
+        (error instanceof CDPError &&
+            new RegExp(
+                String.raw`^Runtime\.(?:evaluate|callFunctionOn|runScript): ` +
+                    String.raw`(?:Execution was terminated|Internal error|Object couldn't be returned by value\.?|` +
+                    String.raw`Object reference chain is too long\.?)$`
+            ).test(message))
     ) {
         return true
     }
@@ -36,6 +56,10 @@ export function isNativeExecutionResultUnknown(error: unknown): boolean {
     } catch {
         return false
     }
+}
+
+export function getErrorPageContext(error: unknown): ErrorContext | undefined {
+    return error !== null && typeof error === 'object' ? errorPageContexts.get(error) : undefined
 }
 
 export function setErrorPageContext(error: unknown, pageContext: ErrorContext): unknown {
@@ -252,7 +276,7 @@ export class NavigationTimeoutError extends BrowserError {
     override readonly context: ErrorContext
 
     constructor(url: string, timeout: number) {
-        super(`导航超时: ${url} (${timeout}ms)`)
+        super(`导航超时: ${sanitizeUrl(url).url} (${timeout}ms)`)
         this.context = { url, timeout }
     }
 }
@@ -266,7 +290,7 @@ export class NavigationError extends BrowserError {
     override readonly context: ErrorContext
 
     constructor(url: string, errorText: string) {
-        super(`导航失败: ${url} (${errorText})`)
+        super(`导航失败: ${sanitizeUrl(url).url} (${errorText})`)
         this.context = { url, errorText }
     }
 }
@@ -283,6 +307,7 @@ export class TimeoutError extends BrowserError {
     constructor(message: string, context: ErrorContext = {}) {
         super(message)
         this.context = { ...context }
+        setErrorSource(this, 'budget')
     }
 }
 
@@ -298,6 +323,15 @@ export class CDPError extends BrowserError {
         super(message)
         this.suggestion = suggestion
         this.context = { ...context }
+        setErrorSource(
+            this,
+            context.errorSource === 'transport' ||
+                context.errorSource === 'context' ||
+                context.errorSource === 'budget' ||
+                context.errorSource === 'cancelled'
+                ? context.errorSource
+                : 'protocol'
+        )
     }
 }
 
@@ -350,6 +384,9 @@ function isZodError(error: unknown): error is Error & { issues: ZodIssue[] } {
  */
 function detectVisibilityHint(errorMessage: string): string | null {
     const msg = errorMessage.toLowerCase()
+    if (msg.includes('bounds') && msg.includes('visible screen space')) {
+        return null
+    }
     const keywords = [
         'hidden',
         'visible',
@@ -390,7 +427,7 @@ export function formatErrorResponse(error: unknown): {
     content: Array<{ type: 'text'; text: string }>
     isError: boolean
 } {
-    const pageContext = error !== null && typeof error === 'object' ? errorPageContexts.get(error) : undefined
+    const pageContext = sanitizePageUrls(getErrorPageContext(error))
 
     // 处理 ZodError
     if (isZodError(error)) {
@@ -424,8 +461,9 @@ export function formatErrorResponse(error: unknown): {
     // 处理 BrowserError（带 toJSON 方法）
     const err = error as Error & { toJSON?: () => object }
     const errorMessage = err.message ?? String(error)
+    const pageError = getErrorSource(error) === 'page'
     const errorJson = err.toJSON?.() ??
-        parseStructuredErrorMessage(errorMessage) ?? {
+        (pageError ? null : parseStructuredErrorMessage(errorMessage)) ?? {
             error: {
                 code: 'UNKNOWN_ERROR',
                 message: errorMessage,
@@ -434,7 +472,22 @@ export function formatErrorResponse(error: unknown): {
 
     // 定位上下文中的 visible/hidden 描述元素状态，不代表窗口焦点要求
     const context = (errorJson as { error?: { context?: ErrorContext } }).error?.context
-    const hint = context?.locator || context?.target ? null : detectVisibilityHint(errorMessage)
+    if (context) {
+        const body = errorJson as { error: { context: ErrorContext } }
+        body.error = { ...body.error, context: sanitizePageUrls(context) }
+    }
+    const elementState = [
+        'not-connected',
+        'not-visible',
+        'not-enabled',
+        'covered',
+        'pointer-events-none',
+        'not-in-viewport',
+    ]
+    const hint =
+        pageError || context?.locator || context?.target || elementState.includes(String(context?.reason))
+            ? null
+            : detectVisibilityHint(errorMessage)
     if (hint) {
         ;(errorJson as Record<string, unknown>).hint = hint
     }

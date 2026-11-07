@@ -1,8 +1,10 @@
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
-import { getSession, getUnifiedSession } from '../core/index.js'
 import { ElementNotFoundError, TimeoutError } from '../core/errors.js'
-import { withNavigationBudget } from '../core/utils.js'
+import { getSession, getUnifiedSession } from '../core/index.js'
 import type { Target } from '../core/types.js'
+import { withNavigationBudget } from '../core/utils.js'
+import { sanitizePageUrls } from './network-sanitizer.js'
+import { targetToFindParams } from './schema.js'
 
 const MAX_CANDIDATES = 10
 const MAX_LOCATOR_TEXT = 500
@@ -69,12 +71,22 @@ export function summarizeTargetCandidates(candidates: TargetCandidate[]): Array<
 
 async function collectPageCandidates(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
-    timeout: number | undefined
-): Promise<{ candidates: unknown[]; activeElement: Record<string, unknown> | null; diagnosticError?: string }> {
+    timeout: number | undefined,
+    target: Target
+): Promise<{
+    candidates: unknown[]
+    activeElement: Record<string, unknown> | null
+    matchCount?: number | null
+    diagnosticError?: string
+}> {
     try {
+        const { selector, text, xpath, semantic } = targetToFindParams(target)
+        const query = JSON.stringify({ selector, text, xpath, semantic })
         const script = `(() => {
+                const matchCount = ${'x' in target ? 'null' : `globalThis.__mcpDomHelpers?.query(${query}).length ?? null`};
                 const active = document.activeElement;
                 return {
+                    matchCount,
                     activeElement: active ? {
                         tag: active.tagName.toLowerCase().slice(0, 40),
                         id: active.id ? active.id.slice(0, ${MAX_CANDIDATE_TEXT}) : undefined,
@@ -92,8 +104,10 @@ async function collectPageCandidates(
                                 tag: el.tagName.toLowerCase(),
                                 id: el.id || undefined,
                                 role: el.getAttribute('role') || undefined,
-                                label: (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').slice(0, 80),
-                                text: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, ${MAX_CANDIDATE_TEXT}),
+                                label: (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '')
+                                    .slice(0, 80),
+                                text: (el.textContent || '').replace(/\\s+/g, ' ').trim()
+                                    .slice(0, ${MAX_CANDIDATE_TEXT}),
                                 visible: rect.width > 0 && rect.height > 0,
                                 disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
                                 bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
@@ -123,7 +137,7 @@ export async function enrichTargetError(
     error: ElementNotFoundError | TimeoutError,
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
-    options: { timeout: number; deadline: number; frame?: string | number }
+    options: { timeout: number; deadline: number; frame?: import('../core/browser-driver.js').FrameSelection }
 ): Promise<void> {
     try {
         Object.assign(
@@ -148,7 +162,7 @@ export async function buildTargetDiagnostics(
         nth: number
         timeout?: number
         deadline?: number
-        frame?: string | number
+        frame?: import('../core/browser-driver.js').FrameSelection
         matchCount: number | null
         lastState: string
         lastError?: unknown
@@ -176,10 +190,10 @@ export async function buildTargetDiagnostics(
         candidates: knownCandidates,
         activeElement: null,
     }
-    if (knownCandidates.length === 0 && remaining() > 0) {
+    if ((knownCandidates.length === 0 || options.matchCount === null) && remaining() > 0) {
         try {
             pageCandidates = await withNavigationBudget(
-                () => collectPageCandidates(unifiedSession, remaining()),
+                () => collectPageCandidates(unifiedSession, remaining(), target),
                 deadline
             )
         } catch (error) {
@@ -187,15 +201,17 @@ export async function buildTargetDiagnostics(
         }
     }
 
+    const pageUrl = sanitizePageUrls({ currentUrl: state?.url ?? null })
     return {
+        ...pageUrl,
         locator: boundedTarget(target),
         targetType: targetType(target),
         nth: options.nth,
-        currentUrl: state?.url?.slice(0, 500) ?? null,
+        currentUrl: pageUrl.currentUrl?.slice(0, 500) ?? null,
         tabId,
         managed: state?.managed ?? null,
         frame: options.frame,
-        matchCount: options.matchCount,
+        matchCount: options.matchCount ?? pageCandidates.matchCount ?? null,
         candidates: pageCandidates.candidates.slice(0, MAX_CANDIDATES),
         activeElement: pageCandidates.activeElement,
         lastLocatorState: options.lastState,

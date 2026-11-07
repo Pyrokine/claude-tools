@@ -4,12 +4,12 @@ import { chmod, lstat, mkdir, open, opendir, readFile, realpath, rename, rm } fr
 import { tmpdir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 import { promisify } from 'util'
-import { StructuredToolError, TimeoutError } from './errors.js'
+import { formatErrorResponse, setErrorSource, StructuredToolError, TimeoutError } from './errors.js'
 
 function navigationBudgetExpired(): TimeoutError {
     const error = new TimeoutError('navigation timeout: request budget exhausted')
     Object.assign(error.context, { actionExecuted: 'unknown', actionStatus: 'unknown', retryable: false })
-    return error
+    return setErrorSource(error, 'budget')
 }
 
 export function remainingNavigationTimeout(deadline: number): number {
@@ -20,28 +20,69 @@ export function remainingNavigationTimeout(deadline: number): number {
     return remaining
 }
 
-export async function withNavigationBudget<T>(operation: () => Promise<T>, deadline?: number): Promise<T> {
-    if (deadline === undefined) {
+export async function withNavigationBudget<T>(
+    operation: () => Promise<T>,
+    deadline?: number,
+    signal?: AbortSignal
+): Promise<T> {
+    signal?.throwIfAborted()
+    if (deadline === undefined && signal === undefined) {
         return operation()
     }
-    const remaining = remainingNavigationTimeout(deadline)
+    const remaining = deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
     let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
     try {
         const result = await Promise.race([
             new Promise<never>((_resolve, reject) => {
-                timer = setTimeout(() => reject(navigationBudgetExpired()), remaining)
+                if (remaining !== undefined) {
+                    timer = setTimeout(() => reject(navigationBudgetExpired()), remaining)
+                }
+                onAbort = () => reject(signal?.reason ?? new Error('Request cancelled'))
+                signal?.addEventListener('abort', onAbort, { once: true })
+                if (signal?.aborted) {
+                    onAbort()
+                }
             }),
             operation(),
         ])
-        remainingNavigationTimeout(deadline)
+        signal?.throwIfAborted()
+        if (deadline !== undefined) {
+            remainingNavigationTimeout(deadline)
+        }
         return result
     } finally {
         clearTimeout(timer)
+        if (onAbort) {
+            signal?.removeEventListener('abort', onAbort)
+        }
     }
 }
 
-export async function waitForNavigationQueue(previous: Promise<void>, deadline?: number): Promise<void> {
-    if (deadline === undefined) {
+export async function withNavigationMetadata<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+        return await operation()
+    } catch (error) {
+        const { error: detail } = JSON.parse(formatErrorResponse(error).content[0]!.text) as {
+            error: { code: string; message: string; context?: Record<string, unknown> }
+        }
+        throw new StructuredToolError(detail.code, detail.message, '导航已完成，请读取当前页面核验结果，勿重复导航', {
+            ...detail.context,
+            actionExecuted: true,
+            actionStatus: 'completed',
+            failureStage: 'metadata',
+            retryable: false,
+        })
+    }
+}
+
+export async function waitForNavigationQueue(
+    previous: Promise<void>,
+    deadline?: number,
+    signal?: AbortSignal
+): Promise<void> {
+    signal?.throwIfAborted()
+    if (deadline === undefined && signal === undefined) {
         return previous
     }
     const expired = () =>
@@ -51,21 +92,33 @@ export async function waitForNavigationQueue(previous: Promise<void>, deadline?:
             failureStage: 'queue',
             retryable: false,
         })
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) {
+    const remaining = deadline === undefined ? undefined : deadline - Date.now()
+    if (remaining !== undefined && remaining <= 0) {
         throw expired()
     }
     let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
     try {
         await new Promise<void>((resolve, reject) => {
-            timer = setTimeout(() => reject(expired()), remaining)
+            if (remaining !== undefined) {
+                timer = setTimeout(() => reject(expired()), remaining)
+            }
+            onAbort = () => reject(signal?.reason ?? new Error('Request cancelled'))
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+            }
             previous.then(resolve, reject)
         })
-        if (Date.now() >= deadline) {
+        signal?.throwIfAborted()
+        if (deadline !== undefined && Date.now() >= deadline) {
             throw expired()
         }
     } finally {
         clearTimeout(timer)
+        if (onAbort) {
+            signal?.removeEventListener('abort', onAbort)
+        }
     }
 }
 
@@ -94,7 +147,7 @@ const execFileAsync = promisify(execFile)
 /**
  * 转义 XPath 字符串字面量（处理包含引号的值）
  *
- * 例如: "It's a \"test\"" => concat('It', "'", 's a "test"')
+ * 例如：`"It's a \"test\"" => concat('It', "'", 's a "test"')`
  */
 export function escapeXPathString(str: string): string {
     if (!str.includes("'")) {
@@ -149,13 +202,16 @@ $inherit = if (${directory ? '$true' : '$false'}) {
 foreach ($sid in @($current, $system, $admins)) {
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
         $sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inherit,
-        [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow)
     [void]$acl.AddAccessRule($rule)
 }
 Set-Acl -LiteralPath $p -AclObject $acl
 $actual = Get-Acl -LiteralPath $p
 if (-not $actual.AreAccessRulesProtected -or
-    $actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $current.Value) { throw 'private ACL not applied' }
+    $actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $current.Value) {
+    throw 'private ACL not applied'
+}
 $ownerAllowed = $false
 foreach ($rule in $actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
     if ($rule.IsInherited -or $rule.AccessControlType -ne 'Allow' -or
@@ -358,6 +414,7 @@ async function countMissingDirectories(root: string, parent: string): Promise<nu
         try {
             const info = await lstat(current)
             if (!info.isDirectory() || info.isSymbolicLink()) {
+                // noinspection ExceptionCaughtLocallyJS -- Report failure
                 throw new Error(`输出父路径不是普通目录: ${current}`)
             }
         } catch (error) {
@@ -434,6 +491,7 @@ async function checkTempQuota(root: string, path: string, dataSize: number, addi
     try {
         const existing = await lstat(path)
         if (!existing.isFile() || existing.isSymbolicLink()) {
+            // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new Error(`不能覆盖非普通文件: ${path}`)
         }
         previousSize = existing.size
@@ -455,9 +513,15 @@ export function isControlledTempOutput(path: string): boolean {
     return [...activeTempRoots].some((root) => isWithinRoot(resolve(path), root))
 }
 
-export async function writePrivateFile(path: string, data: string | Buffer, encoding?: BufferEncoding): Promise<void> {
+export async function writePrivateFile(
+    path: string,
+    data: string | Buffer,
+    encoding?: BufferEncoding,
+    assertActive?: () => void
+): Promise<void> {
     const root = [...activeTempRoots].find((item) => isWithinRoot(resolve(path), item))
     const write = async (): Promise<void> => {
+        assertActive?.()
         if (root) {
             const missing = await countMissingDirectories(root, dirname(path))
             await checkTempQuota(
@@ -467,15 +531,19 @@ export async function writePrivateFile(path: string, data: string | Buffer, enco
                 missing
             )
         }
+        assertActive?.()
         await ensureParentDir(path)
+        assertActive?.()
         const tempPath = join(dirname(path), `.${basename(path)}.tmp-${randomUUID()}`)
         const handle = await open(tempPath, 'wx', 0o600)
         let closed = false
         try {
             await restrictPrivatePath(tempPath, false)
+            assertActive?.()
             await handle.writeFile(data, encoding)
             await handle.close()
             closed = true
+            assertActive?.()
             await rename(tempPath, path)
         } catch (error) {
             if (!closed) {
@@ -488,6 +556,8 @@ export async function writePrivateFile(path: string, data: string | Buffer, enco
     if (!root) {
         return write()
     }
+    // 先同步登记写入队列，再由 next 等待前序请求
+    // noinspection ES6MissingAwait
     const previous = writeLocks.get(root) ?? Promise.resolve()
     const next = previous.catch(() => undefined).then(write)
     writeLocks.set(root, next)
@@ -534,7 +604,7 @@ function validatePortableOutputPath(rawPath: string): void {
             throw pathArgumentError(rawPath, `路径包含 Windows 不支持的组件: ${part}`)
         }
         const base = part.split('.')[0].toUpperCase()
-        if (/^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$)$/.test(base) || /^(?:COM|LPT)(?:[1-9¹²³])$/.test(base)) {
+        if (/^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$)$/.test(base) || /^(?:COM|LPT)[1-9¹²³]$/.test(base)) {
             throw pathArgumentError(rawPath, `路径包含 Windows 保留设备名: ${part}`)
         }
     }

@@ -3,12 +3,14 @@ import { EvaluateInFrameSchema, GetAllFramesSchema, ResolveFrameSchema } from '.
 import {
     type ActionContext,
     type DomFrameSnapshot,
+    assertActionActive,
     assertManagedTab,
     assertReadableTab,
     assertScriptable,
     getDomFrameSnapshot,
     getTargetTabId,
     probeCdpFrameOwner,
+    resolveCdpFramePath,
 } from './action-utils.js'
 import type { DebuggerManager } from './debugger-manager.js'
 import { readGrantDocumentId } from './read-grants.js'
@@ -21,69 +23,85 @@ export class FrameResolver {
         context: ActionContext
     ): Promise<{ frameId: number; offset: { x: number; y: number } | null; frameContext?: Record<string, unknown> }> {
         const p = ResolveFrameSchema.parse(params)
-
         const tabId = await getTargetTabId(p.tabId)
         const readable = await assertReadableTab(tabId, context, 'resolve_frame')
         await assertScriptable(tabId)
-
-        const snapshot = await getDomFrameSnapshot(tabId, 0, p.frame, readable.documentId, readable.tab.url)
-        if (
-            readable.documentId &&
-            (await readGrantDocumentId(context.serverInstanceId, tabId)) !== readable.documentId
-        ) {
-            throw new ExpectedOperationError('resolve_frame 页面已变化，未读取')
+        const root = await this.getExtensionFrameIdentity(tabId, 0)
+        if (readable.documentId && readable.documentId !== root.documentId) {
+            throw new ExpectedOperationError('resolve_frame 授权文档已变化，未读取')
         }
-        if (snapshot.selectionStatus !== 'found' || snapshot.selectedIndex === null) {
-            const desc = typeof p.frame === 'number' ? `index ${p.frame}` : `selector "${p.frame}"`
-            const detail = snapshot.selectionError ? `: ${snapshot.selectionError}` : ''
-            throw this.frameEvaluationError(
-                snapshot.selectionStatus === 'invalid-selector'
-                    ? 'INVALID_FRAME_SELECTOR'
-                    : snapshot.selectionStatus === 'not-frame'
-                      ? 'FRAME_NOT_IFRAME'
-                      : 'FRAME_NOT_FOUND',
-                `iframe not found: ${desc} (${snapshot.selectionStatus})${detail}`,
-                {
-                    tabId,
-                    phase: 'frame_resolution',
-                    selection: p.frame,
-                    selectionStatus: snapshot.selectionStatus,
-                    domFrameCount: snapshot.frames.length,
-                }
-            )
-        }
-
-        const selected = snapshot.frames.find((frame) => frame.index === snapshot.selectedIndex)
-        if (!selected || selected.frameId === null) {
-            throw new ExpectedOperationError(
-                JSON.stringify({
-                    error: {
-                        code: 'FRAME_IDENTITY_UNAVAILABLE',
-                        message: 'Cannot map the selected DOM iframe to one Chrome frameId',
-                        suggestion: '请等待 iframe 完成加载后重试；工具不会按 webNavigation 列表顺序选择其他 frame',
-                        context: {
-                            tabId,
-                            selection: p.frame,
-                            domIndex: snapshot.selectedIndex,
-                            candidateFrameIds: selected?.candidateFrameIds ?? [],
-                            domFrameCount: snapshot.frames.length,
-                            ...(snapshot.unavailableFrames ? { unavailableFrames: snapshot.unavailableFrames } : {}),
-                        },
-                    },
-                })
-            )
-        }
-
-        const identity = await this.getExtensionFrameIdentity(tabId, selected.frameId)
-        return {
-            frameId: selected.frameId,
-            offset: selected.contentOffset,
-            frameContext: {
+        const selections = Array.isArray(p.frame) ? p.frame : [p.frame]
+        let parentFrameId = 0
+        let offset = { x: 0, y: 0 }
+        const path: Array<Record<string, unknown>> = []
+        let identity = root
+        for (const selection of selections) {
+            assertActionActive(context)
+            const parent = await this.getExtensionFrameIdentity(tabId, parentFrameId)
+            const snapshot = await getDomFrameSnapshot(
                 tabId,
-                ...this.frameIdentitySummary(identity),
-                domIndex: selected.index,
-                ...(snapshot.unavailableFrames ? { unavailableFrames: snapshot.unavailableFrames } : {}),
-            },
+                parentFrameId,
+                selection,
+                parent.documentId,
+                parent.url,
+                context
+            )
+            const currentRoot = await this.getExtensionFrameIdentity(tabId, 0)
+            if (
+                currentRoot.documentId !== root.documentId ||
+                (readable.documentId &&
+                    (await readGrantDocumentId(context.serverInstanceId, tabId, () => assertActionActive(context))) !==
+                        readable.documentId)
+            ) {
+                throw new ExpectedOperationError('resolve_frame 页面或授权已变化，未读取')
+            }
+            if (snapshot.selectionStatus !== 'found' || snapshot.selectedIndex === null) {
+                throw this.frameEvaluationError(
+                    snapshot.selectionStatus === 'invalid-selector'
+                        ? 'INVALID_FRAME_SELECTOR'
+                        : snapshot.selectionStatus === 'not-frame'
+                          ? 'FRAME_NOT_IFRAME'
+                          : 'FRAME_NOT_FOUND',
+                    'iframe not found: ' + String(selection) + ' (' + snapshot.selectionStatus + ')',
+                    {
+                        tabId,
+                        phase: 'frame_resolution',
+                        selection,
+                        path,
+                        selectionStatus: snapshot.selectionStatus,
+                        domFrameCount: snapshot.frames.length,
+                    }
+                )
+            }
+            const selected = snapshot.frames.find((frame) => frame.index === snapshot.selectedIndex)
+            if (!selected || selected.frameId === null) {
+                throw this.frameEvaluationError(
+                    'FRAME_IDENTITY_UNAVAILABLE',
+                    'Cannot map selected DOM iframe to one Chrome frameId',
+                    { tabId, selection, path, candidateFrameIds: selected?.candidateFrameIds ?? [] }
+                )
+            }
+            identity = await this.getExtensionFrameIdentity(tabId, selected.frameId)
+            const currentParent = await this.getExtensionFrameIdentity(tabId, parentFrameId)
+            if (
+                identity.parentFrameId !== parentFrameId ||
+                currentParent.documentId !== parent.documentId ||
+                (identity.parentDocumentId && identity.parentDocumentId !== parent.documentId)
+            ) {
+                throw this.frameEvaluationError(
+                    'FRAME_IDENTITY_CHANGED',
+                    'Frame parent document changed during resolution',
+                    { tabId, path, selection, actionExecuted: false }
+                )
+            }
+            offset = { x: offset.x + selected.contentOffset.x, y: offset.y + selected.contentOffset.y }
+            path.push({ selection, domIndex: selected.index, ...this.frameIdentitySummary(identity) })
+            parentFrameId = identity.frameId
+        }
+        return {
+            frameId: identity.frameId,
+            offset,
+            frameContext: { tabId, ...this.frameIdentitySummary(identity), domIndex: path.at(-1)?.domIndex, path },
         }
     }
 
@@ -114,10 +132,11 @@ export class FrameResolver {
             throw new Error('Failed to get frames')
         }
 
-        const snapshot = await getDomFrameSnapshot(tabId, 0, undefined, readable.documentId, readable.tab.url)
+        const snapshot = await getDomFrameSnapshot(tabId, 0, undefined, readable.documentId, readable.tab.url, context)
         if (
             readable.documentId &&
-            (await readGrantDocumentId(context.serverInstanceId, tabId)) !== readable.documentId
+            (await readGrantDocumentId(context.serverInstanceId, tabId, () => assertActionActive(context))) !==
+                readable.documentId
         ) {
             throw new ExpectedOperationError('get_all_frames 页面已变化，未读取')
         }
@@ -162,12 +181,14 @@ export class FrameResolver {
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'evaluate_in_frame')
         await this.debuggerManager.ensureAttached(tabId)
         const startedAt = Date.now()
+        assertActionActive(context)
         const originalFrame = await this.getExtensionFrameIdentity(tabId, p.frameId)
         let retryAttempted = false
         let retryReason: string | undefined
         const maxAttempts = p.staleContextRetry === 'readOnly' ? 2 : 1
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            assertActionActive(context)
             const remaining = p.timeout === undefined ? undefined : p.timeout - (Date.now() - startedAt)
             if (remaining !== undefined && remaining <= 0) {
                 throw this.frameEvaluationError(
@@ -183,7 +204,7 @@ export class FrameResolver {
                 )
             }
             let identity = originalFrame
-            let resolved: { cdpFrameId: string }
+            let resolved: { cdpFrameId: string; querySessionId?: string; ownerSessionId?: string }
             try {
                 identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
                 const resolutionDeadline = startedAt + (p.timeout ?? 2000)
@@ -192,6 +213,7 @@ export class FrameResolver {
                         identity.parentFrameId !== originalFrame.parentFrameId ||
                         identity.frameId !== originalFrame.frameId
                     ) {
+                        // noinspection ExceptionCaughtLocallyJS -- Report failure
                         throw this.frameEvaluationError(
                             'FRAME_IDENTITY_CHANGED',
                             'Frame identity changed before stale-context retry; refusing to guess target',
@@ -205,7 +227,7 @@ export class FrameResolver {
                         )
                     }
                     try {
-                        resolved = await this.resolveCdpFrame(tabId, identity)
+                        resolved = await this.resolveCdpFrame(tabId, identity, context)
                         break
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error)
@@ -213,10 +235,12 @@ export class FrameResolver {
                             !retryAttempted ||
                             message !== `No document with id ${identity.documentId} in tab with id ${tabId}`
                         ) {
+                            // noinspection ExceptionCaughtLocallyJS -- Report failure
                             throw error
                         }
                         const remainingResolution = resolutionDeadline - Date.now()
                         if (remainingResolution <= 0) {
+                            // noinspection ExceptionCaughtLocallyJS -- Report failure
                             throw new Error('Frame document resolution timed out after stale execution context', {
                                 cause: error,
                             })
@@ -241,15 +265,20 @@ export class FrameResolver {
                     }
                 )
             }
-            let contexts = this.debuggerManager.getExecutionContexts(tabId)
+            const queryTarget = { tabId, ...(resolved.querySessionId ? { sessionId: resolved.querySessionId } : {}) }
+            let contexts = this.debuggerManager
+                .getExecutionContexts(tabId)
+                .filter((item) => item.sessionId === resolved.querySessionId)
             if (contexts.length === 0 || attempt > 0) {
-                await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable')
+                await chrome.debugger.sendCommand(queryTarget, 'Runtime.enable')
             }
             let targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
             const deadline = p.timeout === undefined ? Date.now() + 2000 : startedAt + p.timeout
             while (!targetCtx && Date.now() < deadline) {
                 await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
-                contexts = this.debuggerManager.getExecutionContexts(tabId)
+                contexts = this.debuggerManager
+                    .getExecutionContexts(tabId)
+                    .filter((item) => item.sessionId === resolved.querySessionId)
                 targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
             }
             if (!targetCtx) {
@@ -262,7 +291,50 @@ export class FrameResolver {
                     retryReason,
                 })
             }
-            const evaluationTimeout = p.timeout === undefined ? undefined : p.timeout - (Date.now() - startedAt)
+            const owner =
+                identity.frameId === 0
+                    ? 0
+                    : identity.documentId
+                      ? await probeCdpFrameOwner(
+                            tabId,
+                            identity.documentId,
+                            resolved.cdpFrameId,
+                            resolved.ownerSessionId,
+                            context
+                        )
+                      : null
+            const current = await this.getExtensionFrameIdentity(tabId, p.frameId)
+            if (
+                owner !== identity.frameId ||
+                current.documentId !== identity.documentId ||
+                current.url !== identity.url ||
+                current.parentFrameId !== identity.parentFrameId ||
+                !this.debuggerManager
+                    .getExecutionContexts(tabId)
+                    .some(
+                        (item) =>
+                            item.id === targetCtx!.id &&
+                            item.frameId === resolved.cdpFrameId &&
+                            item.isDefault &&
+                            item.sessionId === resolved.querySessionId
+                    )
+            ) {
+                throw this.frameEvaluationError('FRAME_IDENTITY_CHANGED', 'Frame identity changed before dispatch', {
+                    tabId,
+                    actionExecuted: false,
+                    originalFrame: this.frameIdentitySummary(identity),
+                    currentFrame: this.frameIdentitySummary(current),
+                })
+            }
+            // 请求期限和脚本期限可分别缺省，任一缺省时仍需使用另一个预算
+            // noinspection PointlessBooleanExpressionJS
+            const evaluationTimeout =
+                context.deadline === undefined && p.timeout === undefined
+                    ? undefined
+                    : Math.min(
+                          context.deadline === undefined ? Infinity : context.deadline - Date.now(),
+                          p.timeout === undefined ? Infinity : p.timeout - (Date.now() - startedAt)
+                      )
             if (evaluationTimeout !== undefined && evaluationTimeout <= 0) {
                 throw this.frameEvaluationError(
                     'FRAME_EVALUATION_TIMEOUT',
@@ -278,6 +350,7 @@ export class FrameResolver {
                     }
                 )
             }
+            assertActionActive(context)
             const evalParams: Record<string, unknown> = {
                 contextId: targetCtx.id,
                 expression: p.expression,
@@ -286,10 +359,11 @@ export class FrameResolver {
                 ...(evaluationTimeout !== undefined ? { timeout: evaluationTimeout } : {}),
             }
             try {
-                const result = (await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', evalParams)) as Record<
-                    string,
-                    unknown
-                >
+                const result = (await chrome.debugger.sendCommand(
+                    queryTarget,
+                    'Runtime.evaluate',
+                    evalParams
+                )) as Record<string, unknown>
                 return {
                     ...result,
                     retryAttempted,
@@ -351,7 +425,7 @@ export class FrameResolver {
                 }
                 retryAttempted = true
                 retryReason = message.slice(0, 500)
-                this.debuggerManager.invalidateExecutionContext(tabId, targetCtx.id)
+                this.debuggerManager.invalidateExecutionContext(tabId, targetCtx.id, resolved.querySessionId)
                 if (p.timeout !== undefined && Date.now() - startedAt >= p.timeout) {
                     throw this.frameEvaluationError('FRAME_EVALUATION_TIMEOUT', message.slice(0, 500), {
                         tabId,
@@ -429,53 +503,45 @@ export class FrameResolver {
 
     private async resolveCdpFrame(
         tabId: number,
-        frame: chrome.webNavigation.GetAllFrameResultDetails
-    ): Promise<{ cdpFrameId: string }> {
-        const targetUrl = frame.url
-        const treeResult = (await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree')) as {
-            frameTree: { frame: { id: string; url: string; urlFragment?: string }; childFrames?: Array<unknown> }
-        }
-        const candidates = this.findCdpFrameIds(treeResult.frameTree, targetUrl)
-        if (candidates.length === 0) {
-            throw this.frameEvaluationError('FRAME_CDP_UNAVAILABLE', 'Cannot resolve CDP frame for URL', {
-                tabId,
-                ...this.frameUrlSummary(targetUrl),
-                candidateCount: 0,
-            })
-        }
-        if (candidates.length > 1) {
-            if (frame.documentId) {
-                for (const candidate of candidates) {
-                    const matched = await probeCdpFrameOwner(tabId, frame.documentId, candidate)
-                    if (matched === frame.frameId) {
-                        const current = await this.getExtensionFrameIdentity(tabId, frame.frameId)
-                        if (current.documentId !== frame.documentId || current.parentFrameId !== frame.parentFrameId) {
-                            throw this.frameEvaluationError(
-                                'FRAME_IDENTITY_CHANGED',
-                                'Frame document changed during owner probe',
-                                {
-                                    tabId,
-                                    originalFrame: this.frameIdentitySummary(frame),
-                                    currentFrame: this.frameIdentitySummary(current),
-                                }
-                            )
-                        }
-                        return { cdpFrameId: candidate }
-                    }
-                }
-            }
+        frame: chrome.webNavigation.GetAllFrameResultDetails,
+        context: ActionContext
+    ): Promise<{ cdpFrameId: string; querySessionId?: string; ownerSessionId?: string }> {
+        if (!frame.documentId) {
             throw this.frameEvaluationError(
-                'FRAME_AMBIGUOUS',
-                'Multiple CDP frames match the same URL; refusing to guess target',
+                'FRAME_CDP_UNAVAILABLE',
+                'Cannot verify a frame without document identity',
                 {
                     tabId,
-                    ...this.frameUrlSummary(targetUrl),
-                    candidateCount: candidates.length,
-                    candidates: candidates.slice(0, 10),
+                    ...this.frameUrlSummary(frame.url),
+                    candidateCount: 0,
                 }
             )
         }
-        return { cdpFrameId: candidates[0] }
+        const path = await resolveCdpFramePath(
+            tabId,
+            frame,
+            await this.debuggerManager.getFrameSessions(tabId),
+            context
+        )
+        const selected = path.at(-1)!
+        const current = await this.getExtensionFrameIdentity(tabId, frame.frameId)
+        if (
+            current.documentId !== frame.documentId ||
+            current.parentFrameId !== frame.parentFrameId ||
+            current.url !== frame.url
+        ) {
+            throw this.frameEvaluationError('FRAME_IDENTITY_CHANGED', 'Frame document changed during owner probe', {
+                tabId,
+                actionExecuted: false,
+                originalFrame: this.frameIdentitySummary(frame),
+                currentFrame: this.frameIdentitySummary(current),
+            })
+        }
+        return {
+            cdpFrameId: selected.cdpFrameId,
+            ...(selected.queryTarget.sessionId ? { querySessionId: selected.queryTarget.sessionId } : {}),
+            ...(selected.ownerTarget.sessionId ? { ownerSessionId: selected.ownerTarget.sessionId } : {}),
+        }
     }
 
     private async getManagedScriptableTabId(
@@ -487,20 +553,5 @@ export class FrameResolver {
         await assertManagedTab(resolvedTabId, context, operation)
         await assertScriptable(resolvedTabId)
         return resolvedTabId
-    }
-
-    /** 在 CDP frame tree 中递归收集所有匹配 URL 的 frameId */
-    private findCdpFrameIds(
-        node: { frame: { id: string; url: string; urlFragment?: string }; childFrames?: Array<unknown> },
-        targetUrl: string
-    ): string[] {
-        const results: string[] = []
-        if (node.frame.url + (node.frame.urlFragment ?? '') === targetUrl) {
-            results.push(node.frame.id)
-        }
-        for (const child of (node.childFrames || []) as Array<typeof node>) {
-            results.push(...this.findCdpFrameIds(child, targetUrl))
-        }
-        return results
     }
 }

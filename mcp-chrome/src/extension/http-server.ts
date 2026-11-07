@@ -14,9 +14,10 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { readFileSync } from 'node:fs'
 import { WebSocket, WebSocketServer } from 'ws'
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
-import { CDPError } from '../core/errors.js'
+import { CDPError, setErrorSource, StructuredToolError } from '../core/errors.js'
 import { ExtensionDisconnectedError } from '../core/extension-errors.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
+import type { BrowserRequestContext, UserActionKind } from '../core/browser-driver.js'
 
 const SERVER_VERSION = (
     JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as { version: string }
@@ -57,6 +58,7 @@ export interface HttpServerOptions {
     port?: number
     autoPort?: boolean
     expectedExtensionBackgroundBundleHash?: string | null
+    requestContext?: () => BrowserRequestContext | undefined
 }
 
 export function resolveExtensionBundleStatus(
@@ -80,6 +82,16 @@ interface MessageHandler {
     resolve: (value: unknown) => void
     reject: (error: Error) => void
     timeout: NodeJS.Timeout
+    sent: boolean
+    cleanup: () => void
+}
+
+interface AuthSession {
+    id: string
+    sendKey: string
+    receiveKey: string
+    sent: number
+    received: number
 }
 
 interface AuthChallenge {
@@ -97,21 +109,26 @@ function timingSafeEqualHex(left: string, right: string): boolean {
     return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'))
 }
 
-class ExtensionStructuredError extends Error {
-    readonly code: string | undefined
-
+class ExtensionStructuredError extends StructuredToolError {
     constructor(
         private readonly body: object,
         message: string
     ) {
-        super(message)
+        const detail = (body as { error: { code: string; suggestion?: unknown; context?: Record<string, unknown> } })
+            .error
+        super(
+            detail.code,
+            message,
+            typeof detail.suggestion === 'string' ? detail.suggestion : '请读取当前页面核验操作结果',
+            detail.context !== null && typeof detail.context === 'object' && !Array.isArray(detail.context)
+                ? { ...detail.context }
+                : {}
+        )
         this.name = 'ExtensionStructuredError'
-        const code = (body as { error?: { code?: unknown } }).error?.code
-        this.code = typeof code === 'string' ? code : undefined
     }
 
     // noinspection JSUnusedGlobalSymbols — formatErrorResponse 通过结构化 toJSON 调用
-    toJSON(): object {
+    override toJSON(): object {
         return this.body
     }
 }
@@ -149,6 +166,7 @@ export class ExtensionHttpServer extends EventEmitter {
     private server: Server | null = null
     private wss: WebSocketServer | null = null
     private clientSocket: WebSocket | null = null
+    private readonly authSessions = new WeakMap<WebSocket, AuthSession>()
     private port = 0
     private messageHandlers = new Map<string, MessageHandler>()
     private extensionVersion: string | null = null
@@ -196,76 +214,147 @@ export class ExtensionHttpServer extends EventEmitter {
      *                       不传则使用 REQUEST_TIMEOUT (30s)，
      *                       ≤0 直接失败
      */
-    async sendCommand(action: string, params: unknown = {}, requestTimeout?: number): Promise<unknown> {
-        const budget = requestTimeout ?? REQUEST_TIMEOUT
+    async sendCommand(
+        action: string,
+        params: unknown = {},
+        requestTimeout?: number,
+        dispatchedAction?: UserActionKind
+    ): Promise<unknown> {
+        const method = (params as { method?: string } | null)?.method
+        const cleanup =
+            action === 'debugger_send' &&
+            (method === 'Runtime.releaseObject' || method === 'Runtime.releaseObjectGroup')
+        const requestScope = this.options.requestContext?.()
+        const userAction = requestScope?.userAction
+        const scope = cleanup ? undefined : requestScope
+        const signal = scope?.signal
+        signal?.throwIfAborted()
+        const suppliedDeadline = (params as { deadline?: number } | null)?.deadline
+        const deadline = Math.min(
+            Date.now() + (requestTimeout ?? REQUEST_TIMEOUT),
+            scope?.deadline ?? Infinity,
+            suppliedDeadline ?? Infinity
+        )
+        const budget = deadline - Date.now()
         if (budget <= 0) {
-            throw new Error(`Request timeout for action: ${action} (budget ${budget}ms)`)
+            throw new Error(`Request timeout before dispatch for action: ${action}`)
         }
-
-        const startTime = Date.now()
-        let connectWait = 0
-
         if (!this.isConnected()) {
-            const connectStart = Date.now()
-            const connected = await this.waitForConnection(budget)
-            connectWait = Date.now() - connectStart
+            const connected = await this.waitForConnection(budget, signal)
+            signal?.throwIfAborted()
             if (!connected) {
                 throw new Error('Extension 未连接，请确保 Chrome 已打开并安装了 MCP Chrome Extension')
             }
         }
-
-        // 端到端预算：函数入口至今的总耗时从预算中扣除
-        const remaining = budget - (Date.now() - startTime)
+        signal?.throwIfAborted()
+        const remaining = deadline - Date.now()
         if (remaining <= 0) {
-            const detail =
-                connectWait > 0 ? `budget ${budget}ms, connection wait ${connectWait}ms` : `budget ${budget}ms`
-            throw new Error(`Request timeout for action: ${action} (${detail})`)
+            throw new Error(`Request timeout before dispatch for action: ${action}`)
         }
-
+        const socket = this.clientSocket!
         return new Promise((resolve, reject) => {
             const messageId = this.generateId()
             const condition = this.actionConditionProvider?.(action, params)
-            const message = {
-                id: messageId,
-                action,
-                params: condition ? { ...(params as object), ...condition } : params,
-            }
-
-            const timeout = setTimeout(() => {
+            const message = { id: messageId, action, params: { ...(params as object), ...condition, deadline } }
+            const finishError = (reason: string, source: 'budget' | 'cancelled') => {
+                const handler = this.messageHandlers.get(messageId)
+                if (!handler) {
+                    return
+                }
                 this.messageHandlers.delete(messageId)
-                // 明确剩余预算 = 总预算 - 连接等待,提示当前等待是 ws 响应阶段
-                const detail =
-                    connectWait > 0
-                        ? `remaining ${remaining}ms after connection wait ${connectWait}ms (total budget ${budget}ms)`
-                        : `${remaining}ms`
-                reject(new Error(`Request timeout for action: ${action} (${detail})`))
-            }, remaining)
-
-            this.messageHandlers.set(messageId, { resolve, reject, timeout })
-
-            try {
-                this.clientSocket!.send(JSON.stringify(message))
-            } catch (err) {
-                clearTimeout(timeout)
-                this.messageHandlers.delete(messageId)
-                reject(
-                    new Error(
-                        `Failed to send command ${action}: ${err instanceof Error ? err.message : 'Unknown error'}`
-                    )
+                handler.cleanup()
+                if (handler.sent && socket.readyState === WebSocket.OPEN) {
+                    try {
+                        this.sendMessage(socket, { type: 'cancel', id: messageId })
+                    } catch (error) {
+                        console.warn('[HTTP] Cancellation delivery failed:', error)
+                    }
+                }
+                const error = setErrorSource(
+                    handler.sent
+                        ? new StructuredToolError(
+                              'EXECUTION_RESULT_UNKNOWN',
+                              reason,
+                              '请回读实际页面，勿自动重放操作',
+                              {
+                                  actionExecuted: 'unknown',
+                                  actionStatus: 'unknown',
+                                  retryable: false,
+                                  failureStage: 'rpc',
+                              }
+                          )
+                        : new Error(reason),
+                    source
                 )
+                if (scope && source === 'budget') {
+                    scope.budgetError ??= error
+                }
+                reject(error)
+            }
+            const onAbort = () => finishError('Request cancelled before confirmation', 'cancelled')
+            const timeout = setTimeout(
+                () => finishError(`Request timeout for action: ${action} (${remaining}ms)`, 'budget'),
+                remaining
+            )
+            const handler: MessageHandler = {
+                resolve,
+                reject,
+                timeout,
+                sent: false,
+                cleanup: () => {
+                    clearTimeout(timeout)
+                    signal?.removeEventListener('abort', onAbort)
+                },
+            }
+            this.messageHandlers.set(messageId, handler)
+            signal?.addEventListener('abort', onAbort, { once: true })
+            try {
+                signal?.throwIfAborted()
+                this.sendMessage(socket, message)
+                handler.sent = true
+                if (
+                    userAction &&
+                    (userAction.kind === dispatchedAction ||
+                        (userAction.kind === 'input' &&
+                            (action.startsWith('input_') ||
+                                (action.startsWith('stealth_') && action !== 'stealth_inject') ||
+                                [
+                                    'click',
+                                    'actionable_click',
+                                    'dispatch_input',
+                                    'drag_and_drop',
+                                    'type',
+                                    'scroll',
+                                ].includes(action))))
+                ) {
+                    userAction.dispatched = true
+                }
+            } catch (error) {
+                this.messageHandlers.delete(messageId)
+                handler.cleanup()
+                reject(error)
             }
         })
     }
 
-    async waitForConnection(timeout = 0): Promise<boolean> {
+    async waitForConnection(timeout = 0, signal?: AbortSignal): Promise<boolean> {
         if (this.isConnected()) {
             return true
         }
 
-        return new Promise<boolean>((resolve) => {
+        signal?.throwIfAborted()
+        return new Promise<boolean>((resolve, reject) => {
             let timer: NodeJS.Timeout | undefined
 
+            const onAbort = () => {
+                if (timer) {
+                    clearTimeout(timer)
+                }
+                this.removeListener('connected', onConnected)
+                reject(signal?.reason ?? new Error('Request cancelled'))
+            }
             const onConnected = () => {
+                signal?.removeEventListener('abort', onAbort)
                 if (timer) {
                     clearTimeout(timer)
                 }
@@ -275,16 +364,21 @@ export class ExtensionHttpServer extends EventEmitter {
             if (timeout > 0) {
                 timer = setTimeout(() => {
                     this.removeListener('connected', onConnected)
+                    signal?.removeEventListener('abort', onAbort)
                     resolve(false)
                 }, timeout)
             }
 
             this.once('connected', onConnected)
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+            }
         })
     }
 
     isConnected(): boolean {
-        return this.clientSocket?.readyState === WebSocket.OPEN
+        return this.clientSocket?.readyState === WebSocket.OPEN && (!this.pairingToken || this.helloReceived)
     }
 
     getPort(): number {
@@ -354,7 +448,7 @@ export class ExtensionHttpServer extends EventEmitter {
             })
         })
 
-        this.wss.on('connection', (ws) => {
+        this.wss.on('connection', (ws, req) => {
             console.error('[HTTP] Extension connected')
 
             // 只允许一个客户端连接，关闭旧的
@@ -368,14 +462,47 @@ export class ExtensionHttpServer extends EventEmitter {
             this.extensionVersion = null
             this.extensionBackgroundBundleHash = null
             this.helloReceived = false
-            this.startHeartbeat()
-            this.emit('connected')
+            if (this.pairingToken) {
+                const query = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams
+                const id = JSON.stringify([
+                    query.get('clientNonce'),
+                    query.get('serverNonce'),
+                    this.instanceId,
+                    this.port,
+                ])
+                this.authSessions.set(ws, {
+                    id,
+                    sent: 0,
+                    received: 0,
+                    sendKey: hmacHex(this.pairingToken, JSON.stringify(['mcp-chrome', 2, 'key', 'server', id])),
+                    receiveKey: hmacHex(this.pairingToken, JSON.stringify(['mcp-chrome', 2, 'key', 'extension', id])),
+                })
+                this.sendMessage(ws, { type: 'ready' })
+                const readyTimer = setTimeout(() => {
+                    if (this.clientSocket === ws && !this.helloReceived) {
+                        ws.close(1008, 'Authenticated hello required')
+                    }
+                }, 5000)
+                ws.once('close', () => clearTimeout(readyTimer))
+            } else {
+                this.startHeartbeat()
+                this.emit('connected')
+            }
 
             ws.on('message', (data) => {
-                this.handleMessage(data.toString())
+                if (this.clientSocket !== ws) {
+                    return
+                }
+                try {
+                    this.handleMessage(this.receiveMessage(ws, data.toString()))
+                } catch (error) {
+                    console.warn('[HTTP] Authenticated channel rejected:', error)
+                    ws.close(1008, 'Authentication protocol v2 required')
+                }
             })
 
             ws.on('close', () => {
+                this.authSessions.delete(ws)
                 console.error('[HTTP] Extension disconnected')
                 if (this.clientSocket === ws) {
                     this.clientSocket = null
@@ -396,6 +523,7 @@ export class ExtensionHttpServer extends EventEmitter {
     }
 
     private createAuthChallenge(clientNonce: string): {
+        protocol: number
         clientNonce: string
         serverNonce: string
         serverProof: string
@@ -404,9 +532,13 @@ export class ExtensionHttpServer extends EventEmitter {
         const serverNonce = randomBytes(16).toString('hex')
         this.authChallenges.set(`${clientNonce}:${serverNonce}`, { expiresAt: Date.now() + AUTH_CHALLENGE_TTL_MS })
         return {
+            protocol: 2,
             clientNonce,
             serverNonce,
-            serverProof: hmacHex(this.pairingToken, `server:${clientNonce}:${serverNonce}`),
+            serverProof: hmacHex(
+                this.pairingToken,
+                JSON.stringify(['mcp-chrome', 2, 'server-proof', clientNonce, serverNonce, this.instanceId, this.port])
+            ),
         }
     }
 
@@ -419,11 +551,17 @@ export class ExtensionHttpServer extends EventEmitter {
         const clientNonce = url.searchParams.get('clientNonce') ?? ''
         const serverNonce = url.searchParams.get('serverNonce') ?? ''
         const clientProof = url.searchParams.get('clientProof') ?? ''
+        if (url.searchParams.get('protocol') !== '2') {
+            return false
+        }
         const challengeKey = `${clientNonce}:${serverNonce}`
         if (!clientNonce || !serverNonce || !clientProof || !this.authChallenges.has(challengeKey)) {
             return false
         }
-        const expected = hmacHex(this.pairingToken, `client:${clientNonce}:${serverNonce}`)
+        const expected = hmacHex(
+            this.pairingToken,
+            JSON.stringify(['mcp-chrome', 2, 'client-proof', clientNonce, serverNonce, this.instanceId, this.port])
+        )
         const valid = timingSafeEqualHex(clientProof, expected)
         this.authChallenges.delete(challengeKey)
         return valid
@@ -453,7 +591,8 @@ export class ExtensionHttpServer extends EventEmitter {
         const server = this.server!
         const onListening = () => {
             server.off('error', onError)
-            this.port = port
+            const address = server.address()
+            this.port = address && typeof address === 'object' ? address.port : port
             this.setupWebSocket()
             console.error(`[HTTP] Server listening on http://127.0.0.1:${port}`)
             resolve()
@@ -572,6 +711,7 @@ export class ExtensionHttpServer extends EventEmitter {
 
             // 版本与活动后台 bundle 握手
             if (message.type === 'hello') {
+                const wasReady = this.helloReceived
                 this.helloReceived = true
                 this.extensionVersion = message.version ?? null
                 this.extensionBackgroundBundleHash =
@@ -603,13 +743,22 @@ export class ExtensionHttpServer extends EventEmitter {
                         '[HTTP] Extension did not report a background bundle hash; build identity is unavailable'
                     )
                 }
+                if (this.pairingToken && !wasReady) {
+                    this.startHeartbeat()
+                    this.emit('connected')
+                }
                 return
+            }
+
+            if (this.pairingToken && !this.helloReceived) {
+                // noinspection ExceptionCaughtLocallyJS -- Report failure
+                throw new Error('Authenticated hello required')
             }
 
             // 响应消息
             if (message.id && this.messageHandlers.has(message.id)) {
                 const handler = this.messageHandlers.get(message.id)!
-                clearTimeout(handler.timeout)
+                handler.cleanup()
                 this.messageHandlers.delete(message.id)
 
                 if (message.success) {
@@ -648,7 +797,7 @@ export class ExtensionHttpServer extends EventEmitter {
             // 发送新的 ping
             this.pongReceived = false
             try {
-                this.clientSocket.send(JSON.stringify({ type: 'ping' }))
+                this.sendMessage(this.clientSocket, { type: 'ping' })
             } catch {
                 console.error('[HTTP] Failed to send heartbeat ping')
             }
@@ -673,11 +822,62 @@ export class ExtensionHttpServer extends EventEmitter {
             reason.includes('Connection replaced') ||
             reason.includes('Server stopped')
         for (const [, handler] of this.messageHandlers) {
-            clearTimeout(handler.timeout)
-            const err = isDisconnect ? new ExtensionDisconnectedError(reason) : new Error(reason)
+            handler.cleanup()
+            const err = handler.sent
+                ? new StructuredToolError('EXECUTION_RESULT_UNKNOWN', reason, '请回读实际页面，勿自动重放操作', {
+                      actionExecuted: 'unknown',
+                      actionStatus: 'unknown',
+                      retryable: false,
+                      failureStage: 'rpc',
+                  })
+                : isDisconnect
+                  ? new ExtensionDisconnectedError(reason)
+                  : new Error(reason)
             handler.reject(err)
         }
         this.messageHandlers.clear()
+    }
+
+    private sendMessage(socket: WebSocket, message: unknown): void {
+        const auth = this.authSessions.get(socket)
+        const payload = JSON.stringify(message)
+        if (!auth) {
+            if (this.pairingToken) {
+                throw new Error('Authentication protocol v2 required')
+            }
+            socket.send(payload)
+            return
+        }
+        const seq = ++auth.sent
+        const mac = hmacHex(auth.sendKey, JSON.stringify([2, auth.id, 'server', seq, payload]))
+        socket.send(JSON.stringify({ v: 2, session: auth.id, seq, payload, mac }))
+    }
+
+    private receiveMessage(socket: WebSocket, data: string): string {
+        const auth = this.authSessions.get(socket)
+        if (!auth) {
+            if (this.pairingToken) {
+                throw new Error('Authentication protocol v2 required')
+            }
+            return data
+        }
+        const envelope = JSON.parse(data) as { v: number; session: string; seq: number; payload: string; mac: string }
+        if (
+            envelope.v !== 2 ||
+            envelope.session !== auth.id ||
+            !Number.isSafeInteger(envelope.seq) ||
+            envelope.seq !== auth.received + 1 ||
+            typeof envelope.payload !== 'string' ||
+            typeof envelope.mac !== 'string' ||
+            !timingSafeEqualHex(
+                envelope.mac,
+                hmacHex(auth.receiveKey, JSON.stringify([2, auth.id, 'extension', envelope.seq, envelope.payload]))
+            )
+        ) {
+            throw new Error('Invalid authenticated message or sequence')
+        }
+        auth.received = envelope.seq
+        return envelope.payload
     }
 
     private generateId(): string {

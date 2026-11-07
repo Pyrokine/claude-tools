@@ -7,8 +7,8 @@
 
 import {
     type ActionableClickResult,
-    type BrowserTopology,
     type BrowserTabGroupInfo,
+    type BrowserTopology,
     type CookieFilter,
     DriverCapabilityError,
     type GroupManagementResult,
@@ -17,25 +17,42 @@ import {
     type ListedTarget,
     type ManagedPageResult,
     type MovePageOptions,
-    type NewTabResult,
     type NewPageOptions,
+    type NewTabResult,
     type NewWindowOptions,
     type PageManagementResult,
+    type PageMetadata,
     type ResizeWindowOptions,
     type ScreenshotResult,
     type SetCookieParams,
     type StaleContextRetryPolicy,
+    type TargetListOptions,
     type UpdateGroupOptions,
     type UpdatePageOptions,
 } from '../core/browser-driver.js'
-import { creationError, StructuredToolError, TargetNotFoundError } from '../core/errors.js'
-import { remainingNavigationTimeout } from '../core/utils.js'
+import {
+    creationError,
+    setErrorPageContext,
+    setErrorSource,
+    StructuredToolError,
+    TargetNotFoundError,
+} from '../core/errors.js'
 import { type ConsoleLogEntry, DEFAULT_TIMEOUT, type NetworkRequestEntry } from '../core/types.js'
+import { remainingNavigationTimeout } from '../core/utils.js'
+import { eventRefTarget, type BrowserEventAction, type EventCommand } from '../core/browser-events.js'
+import type {
+    BrowserRequestContext,
+    FrameSelection,
+    SemanticTarget,
+    CookieScope,
+    UserActionKind,
+} from '../core/browser-driver.js'
 import { type ExtensionConnectionInfo, ExtensionHttpServer } from './http-server.js'
 
 /** RPC 传输余量（毫秒）：给网络往返和 Extension 处理留出的额外时间 */
 const RPC_MARGIN = 5000
 const CONDITIONAL_ACTIONS = new Set([
+    'tabs_metadata',
     'tabs_close',
     'tabs_activate',
     'tabs_activate_managed',
@@ -59,6 +76,7 @@ const CONDITIONAL_ACTIONS = new Set([
     'evaluate',
     'evaluate_in_frame',
     'debugger_send',
+    'keyboard_focus',
     'input_key',
     'input_mouse',
     'input_touch',
@@ -104,22 +122,27 @@ interface ExtensionPageChangeResult {
 export interface ExtensionBridgeOptions {
     port?: number
     timeout?: number
+    requestContext?: () => BrowserRequestContext | undefined
 }
 
 export class ExtensionBridge implements IBrowserDriver {
     private httpServer: ExtensionHttpServer
     private currentTabId: number | null = null
+    private browserEventTargets = new Set<string>()
     private currentFrameId: number = 0
+    private currentFrameDocumentId: string | undefined
     private state: SimplePageState | null = null
     private pendingPageCondition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null = null
 
-    constructor(options: ExtensionBridgeOptions = {}) {
+    constructor(private readonly options: ExtensionBridgeOptions = {}) {
         this.httpServer = new ExtensionHttpServer({
             port: options.port,
             autoPort: true,
+            requestContext: options.requestContext,
         })
         this.httpServer.setActionConditionProvider((action, params) => {
-            const condition = this.pendingPageCondition
+            const context = this.options.requestContext?.()
+            const condition = context ? context.pendingPageCondition : this.pendingPageCondition
             if (!condition || !CONDITIONAL_ACTIONS.has(action)) {
                 return undefined
             }
@@ -127,7 +150,11 @@ export class ExtensionBridge implements IBrowserDriver {
             if (tabId === undefined || String(tabId) !== condition.targetId) {
                 throw new DriverCapabilityError('条件动作的目标与请求目标不一致，未执行动作')
             }
-            this.pendingPageCondition = null
+            if (context) {
+                context.pendingPageCondition = null
+            } else {
+                this.pendingPageCondition = null
+            }
             return {
                 ...(condition.expectedUrl !== undefined ? { expectedUrl: condition.expectedUrl } : {}),
                 ...(condition.expectedRevision !== undefined ? { expectedRevision: condition.expectedRevision } : {}),
@@ -152,7 +179,7 @@ export class ExtensionBridge implements IBrowserDriver {
      * @param timeout 超时时间（毫秒），0 表示无限等待（默认）
      */
     async waitForConnection(timeout = 0): Promise<boolean> {
-        return this.httpServer.waitForConnection(timeout)
+        return this.httpServer.waitForConnection(timeout, this.options.requestContext?.()?.signal)
     }
 
     getPort(): number {
@@ -165,12 +192,23 @@ export class ExtensionBridge implements IBrowserDriver {
 
     // ==================== Tab 操作 ====================
 
-    async listTabs(timeout?: number): Promise<ExtensionTabSummary[]> {
+    async listTabs(timeout?: number, options?: TargetListOptions): Promise<ExtensionTabSummary[]> {
+        const currentTabId = this.currentTabId
         const result = await this.httpServer.sendCommand('tabs_list', {}, timeout)
-        return result as ExtensionTabSummary[]
+        const tabs = result as ExtensionTabSummary[]
+        if (
+            options?.preserveDefaultTarget !== true &&
+            currentTabId !== null &&
+            this.currentTabId === currentTabId &&
+            !tabs.some((tab) => tab.id === currentTabId)
+        ) {
+            this.setCurrentTargetId(null)
+        }
+        return tabs
     }
 
-    async listWindows(timeout?: number): Promise<BrowserTopology> {
+    async listWindows(timeout?: number, options?: TargetListOptions): Promise<BrowserTopology> {
+        const currentTabId = this.currentTabId
         const result = await this.httpServer.sendCommand('tabs_topology', {}, timeout)
         const topology = result as BrowserTopology
         const windows = topology.windows.map((window) => ({
@@ -212,12 +250,20 @@ export class ExtensionBridge implements IBrowserDriver {
             }
             return group
         })
+        if (
+            options?.preserveDefaultTarget !== true &&
+            currentTabId !== null &&
+            this.currentTabId === currentTabId &&
+            !windows.some((window) => window.tabs.some((tab) => tab.id === currentTabId))
+        ) {
+            this.setCurrentTargetId(null)
+        }
         return { ...topology, windows, ...(groups === undefined ? {} : { groups }) }
     }
 
     /** IBrowserDriver 接口：列出所有 tab，统一为 ListedTarget 形式（id 字符串化以保持跨 driver 兼容） */
-    async listTargets(timeout?: number): Promise<ListedTarget[]> {
-        const tabs = await this.listTabs(timeout)
+    async listTargets(timeout?: number, options?: TargetListOptions): Promise<ListedTarget[]> {
+        const tabs = await this.listTabs(timeout, options)
         return tabs.map((tab) => this.tabToTarget(tab))
     }
 
@@ -280,6 +326,16 @@ export class ExtensionBridge implements IBrowserDriver {
             throw new DriverCapabilityError('closePage 需要显式 targetId，未关闭页面')
         }
         return this.closeTab(this.parseTargetId(targetId))
+    }
+
+    async setPageMetadata(
+        targetId: string,
+        updates: { taskHint?: string | null; note?: string | null }
+    ): Promise<PageMetadata> {
+        return (await this.httpServer.sendCommand('tabs_metadata', {
+            tabId: this.parseTargetId(targetId),
+            ...updates,
+        })) as PageMetadata
     }
 
     async setReadAccess(targetId: string, allow: boolean): Promise<Record<string, unknown>> {
@@ -514,7 +570,8 @@ export class ExtensionBridge implements IBrowserDriver {
         } catch (error) {
             if (error instanceof Error && error.message === 'Unknown action: page_snapshot') {
                 const tabs = await this.listTabs(
-                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline),
+                    { preserveDefaultTarget: true }
                 )
                 if (deadline !== undefined) {
                     remainingNavigationTimeout(deadline)
@@ -543,7 +600,12 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     setPageCondition(condition: { targetId: string; expectedUrl?: string; expectedRevision?: string } | null): void {
-        this.pendingPageCondition = condition
+        const context = this.options.requestContext?.()
+        if (context) {
+            context.pendingPageCondition = condition
+        } else {
+            this.pendingPageCondition = condition
+        }
     }
 
     /** IBrowserDriver 接口：设置当前操作目标 ID */
@@ -625,12 +687,17 @@ export class ExtensionBridge implements IBrowserDriver {
 
     // ==================== 页面内容 ====================
 
-    async click(refId: string): Promise<void> {
-        const result = (await this.httpServer.sendCommand('click', {
-            tabId: this.requireCurrentTabId(),
-            frameId: this.currentFrameId || undefined,
-            refId,
-        })) as { success: boolean; error?: string }
+    async click(refId: string, timeout?: number, modifiers = 0): Promise<void> {
+        const result = (await this.httpServer.sendCommand(
+            'click',
+            {
+                tabId: this.requireCurrentTabId(),
+                frameId: this.currentFrameId || undefined,
+                refId,
+                modifiers,
+            },
+            timeout
+        )) as { success: boolean; error?: string }
 
         if (!result.success) {
             throw new Error(result.error || 'Click failed')
@@ -639,13 +706,23 @@ export class ExtensionBridge implements IBrowserDriver {
 
     // ==================== DOM 操作 ====================
 
-    async actionableClick(refId: string, force?: boolean): Promise<ActionableClickResult> {
-        return (await this.httpServer.sendCommand('actionable_click', {
-            tabId: this.requireCurrentTabId(),
-            frameId: this.currentFrameId || undefined,
-            refId,
-            force: force ?? false,
-        })) as ActionableClickResult
+    async actionableClick(
+        refId: string,
+        force?: boolean,
+        timeout?: number,
+        modifiers = 0
+    ): Promise<ActionableClickResult> {
+        return (await this.httpServer.sendCommand(
+            'actionable_click',
+            {
+                tabId: this.requireCurrentTabId(),
+                frameId: this.currentFrameId || undefined,
+                refId,
+                force: force ?? false,
+                modifiers,
+            },
+            timeout
+        )) as ActionableClickResult
     }
 
     async checkActionability(refId: string): Promise<ActionableClickResult> {
@@ -658,12 +735,21 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     async dispatchInput(refId: string, text: string): Promise<{ success: boolean; error?: string }> {
-        return (await this.httpServer.sendCommand('dispatch_input', {
+        const result = await this.httpServer.sendCommand('dispatch_input', {
             tabId: this.requireCurrentTabId(),
             frameId: this.currentFrameId || undefined,
             refId,
             text,
-        })) as { success: boolean; error?: string }
+        })
+        if (!result || typeof result !== 'object' || !('success' in result) || typeof result.success !== 'boolean') {
+            throw new StructuredToolError(
+                'ACTION_RESULT_INVALID',
+                'controlled 输入已派发，但未返回有效的动作结果',
+                '独立读取目标实际文本后再决定下一步，工具不会重放输入',
+                { actionExecuted: 'unknown', actionStatus: 'unknown', retryable: false, failureStage: 'script_result' }
+            )
+        }
+        return result as { success: boolean; error?: string }
     }
 
     async dragAndDrop(
@@ -721,7 +807,7 @@ export class ExtensionBridge implements IBrowserDriver {
         return this.scroll(x, y, refId)
     }
 
-    async evaluate(code: string, _args?: unknown[], timeout?: number): Promise<unknown> {
+    async evaluate(code: string, _args?: unknown[], timeout?: number, userAction?: UserActionKind): Promise<unknown> {
         // _args 参数仅满足 IBrowserDriver 接口签名；ExtensionBridge 不消费 args（stealth 路径上层已字符串拼接）
         const rpcTimeout = timeout !== undefined ? timeout + RPC_MARGIN : undefined
         const result = (await this.httpServer.sendCommand(
@@ -731,21 +817,124 @@ export class ExtensionBridge implements IBrowserDriver {
                 frameId: this.currentFrameId || undefined,
                 code,
                 timeout,
+                deadline: Date.now() + (timeout ?? DEFAULT_TIMEOUT),
             },
-            rpcTimeout
-        )) as { success: boolean; result?: string; error?: string }
-
-        if (!result.success) {
-            throw new Error(result.error || 'Evaluate failed')
+            rpcTimeout,
+            userAction
+        )) as {
+            success: boolean
+            result?: string
+            error?: string
+            errorMessage?: string
+            errorSource?: 'page' | 'context' | 'output'
+            errorCode?: 'CSP_BLOCKED' | 'NON_SERIALIZABLE_EVALUATE_RESULT'
+            actionExecuted?: false
+        }
+        const outputError = (
+            message: string,
+            suggestion: string,
+            context: Record<string, unknown>,
+            cause?: unknown
+        ): StructuredToolError => {
+            const error = new StructuredToolError('NON_SERIALIZABLE_EVALUATE_RESULT', message, suggestion, {
+                ...context,
+                ...(result.errorMessage !== undefined ? { originalOutputError: result.errorMessage } : {}),
+                actionExecuted: true,
+                actionStatus: 'completed',
+                failureStage: 'output',
+                retryable: false,
+            })
+            if (cause !== undefined) {
+                Object.defineProperty(error, 'cause', { value: cause, configurable: true, writable: true })
+            }
+            if (userAction === undefined) {
+                setErrorPageContext(error, { contextPhase: 'preparation' })
+            }
+            return error
         }
 
-        if (!result.result) {
+        if (!result.success) {
+            if (result.errorSource === 'context' && result.actionExecuted === false) {
+                throw setErrorSource(
+                    new StructuredToolError(
+                        result.errorCode ?? 'UNKNOWN_ERROR',
+                        result.error ?? 'Script compilation failed',
+                        result.errorCode === 'CSP_BLOCKED'
+                            ? '可使用 evaluate 的 mode="precise" 执行脚本；当前脚本未执行'
+                            : '请检查脚本语法，当前脚本未执行',
+                        {
+                            actionExecuted: false,
+                            actionStatus: 'not_started',
+                            failureStage: 'context',
+                            retryable: false,
+                            phase: 'compile',
+                        }
+                    ),
+                    'context'
+                )
+            }
+            if (result.errorSource === 'output') {
+                if (result.errorCode === 'NON_SERIALIZABLE_EVALUATE_RESULT') {
+                    throw outputError(result.error ?? 'evaluate 输出处理失败', '请检查返回值及页面的 JSON 序列化行为', {
+                        error: result.error,
+                        detailSerializationFailed: true,
+                    })
+                }
+                let detail: { message: string; suggestion: string; context: Record<string, unknown> }
+                try {
+                    const value = JSON.parse(result.error!)?.error as
+                        | {
+                              message?: unknown
+                              suggestion?: unknown
+                              context?: unknown
+                          }
+                        | undefined
+                    if (
+                        typeof value?.message !== 'string' ||
+                        typeof value.suggestion !== 'string' ||
+                        !value.context ||
+                        typeof value.context !== 'object' ||
+                        Array.isArray(value.context)
+                    ) {
+                        throw new TypeError('浏览器返回的 evaluate 输出错误详情格式无效')
+                    }
+                    detail = {
+                        message: value.message,
+                        suggestion: value.suggestion,
+                        context: value.context as Record<string, unknown>,
+                    }
+                } catch (error) {
+                    throw outputError(
+                        `evaluate 输出错误详情解析失败: ${error}`,
+                        '请检查页面的 JSON 序列化行为',
+                        {
+                            error: result.error,
+                            detailParsingError: String(error),
+                        },
+                        error
+                    )
+                }
+                throw outputError(detail.message, detail.suggestion, detail.context)
+            }
+            const error = new Error(result.error ?? 'Evaluate failed')
+            throw result.errorSource === 'page' ? setErrorSource(error, 'page') : error
+        }
+
+        if (result.result === undefined) {
             return undefined
         }
         try {
+            if (typeof result.result !== 'string') {
+                throw new TypeError('浏览器返回的 evaluate 结果不是 JSON 字符串')
+            }
             return JSON.parse(result.result)
         } catch (err) {
-            throw new Error(`evaluate 结果 JSON 解析失败: ${err}`, { cause: err })
+            throw outputError(
+                `evaluate 结果 JSON 解析失败: ${err}`,
+                '请返回可 JSON 序列化的简单数据，并检查页面的 JSON 序列化行为',
+                { error: String(err) },
+                err
+            )
         }
     }
 
@@ -754,7 +943,7 @@ export class ExtensionBridge implements IBrowserDriver {
         text?: string,
         xpath?: string,
         timeout?: number,
-        point?: { x: number; y: number },
+        semanticOrPointOrMatchIndex?: SemanticTarget | { x: number; y: number } | number,
         matchIndex?: number
     ): Promise<
         Array<{
@@ -764,6 +953,15 @@ export class ExtensionBridge implements IBrowserDriver {
             rect: { x: number; y: number; width: number; height: number }
         }>
     > {
+        const point =
+            typeof semanticOrPointOrMatchIndex === 'object' && 'x' in semanticOrPointOrMatchIndex
+                ? semanticOrPointOrMatchIndex
+                : undefined
+        const semantic =
+            typeof semanticOrPointOrMatchIndex === 'object' && !('x' in semanticOrPointOrMatchIndex)
+                ? semanticOrPointOrMatchIndex
+                : undefined
+        matchIndex = typeof semanticOrPointOrMatchIndex === 'number' ? semanticOrPointOrMatchIndex : matchIndex
         return (await this.httpServer.sendCommand(
             'find',
             {
@@ -773,6 +971,7 @@ export class ExtensionBridge implements IBrowserDriver {
                 text,
                 xpath,
                 point,
+                semantic,
                 matchIndex,
             },
             timeout
@@ -950,20 +1149,80 @@ export class ExtensionBridge implements IBrowserDriver {
         })
     }
 
-    async deleteCookie(url: string, name: string): Promise<void> {
-        await this.httpServer.sendCommand('cookies_delete', { url, name })
+    async deleteCookie(url: string, name: string, scope?: CookieScope): Promise<void> {
+        await this.httpServer.sendCommand('cookies_delete', { url, name, ...scope })
     }
 
     async clearCookies(filter?: CookieFilter): Promise<{ count: number }> {
         return (await this.httpServer.sendCommand('cookies_clear', filter ?? {})) as { count: number }
     }
 
+    async browserEvents(
+        action: BrowserEventAction,
+        command: EventCommand,
+        targetId?: string,
+        timeout?: number
+    ): Promise<Record<string, unknown>> {
+        const refTarget = command.ref ? eventRefTarget(command.ref) : undefined
+        if (refTarget && (refTarget.backend !== 'extension' || (targetId && refTarget.targetId !== targetId))) {
+            throw new DriverCapabilityError('Browser event ref target mismatch')
+        }
+        const id = refTarget?.targetId ?? targetId ?? this.getCurrentTargetId()
+        if (!id || !/^\d+$/.test(id)) {
+            throw new DriverCapabilityError('Browser events require an explicit target or observed ref')
+        }
+        const result = (await this.httpServer.sendCommand(
+            'browser_events',
+            { tabId: Number(id), action, command },
+            timeout
+        )) as Record<string, unknown>
+        this.browserEventTargets.add(id)
+        return result
+    }
+
+    hasBrowserEventObservation(targetId?: string): boolean {
+        const id = targetId ?? this.getCurrentTargetId()
+        return id !== null && id !== undefined && this.browserEventTargets.has(id)
+    }
+
+    async browserFetchCommand(method: string, params?: Record<string, unknown>, targetId?: string): Promise<unknown> {
+        const id = targetId ?? this.getCurrentTargetId()
+        if (!id || !/^\d+$/.test(id)) {
+            throw new DriverCapabilityError('Explicit targetId required for Fetch control')
+        }
+        return this.httpServer.sendCommand('browser_events_raw', { tabId: Number(id), method, params })
+    }
+
+    async suspendBrowserEventsForChallenge(): Promise<Record<string, unknown>> {
+        const id = String(this.requireCurrentTabId())
+        if (!this.browserEventTargets.has(id)) {
+            return { targetId: id, suspended: true, observations: [], cleanupFailures: [], fetchEnabled: false }
+        }
+        const result = (await this.httpServer.sendCommand('browser_events_suspend', { tabId: Number(id) })) as Record<
+            string,
+            unknown
+        >
+        if (result.suspended === true) {
+            this.browserEventTargets.delete(id)
+        }
+        return result
+    }
+
     async debuggerSend(
         method: string,
         params?: Record<string, unknown>,
         tabId?: number,
-        timeout?: number
+        timeout?: number,
+        userAction?: UserActionKind
     ): Promise<unknown> {
+        if (method === 'Fetch.enable') {
+            await this.browserEvents(
+                'read',
+                { type: 'network', view: 'summary' },
+                String(tabId ?? this.requireCurrentTabId()),
+                timeout
+            )
+        }
         return await this.httpServer.sendCommand(
             'debugger_send',
             {
@@ -971,7 +1230,8 @@ export class ExtensionBridge implements IBrowserDriver {
                 method,
                 params,
             },
-            timeout
+            timeout,
+            userAction
         )
     }
 
@@ -983,6 +1243,7 @@ export class ExtensionBridge implements IBrowserDriver {
             },
             timeout
         )
+        this.browserEventTargets.delete(String(tabId ?? this.requireCurrentTabId()))
     }
 
     async getViewportMetrics(frameId?: number): Promise<unknown> {
@@ -1019,6 +1280,36 @@ export class ExtensionBridge implements IBrowserDriver {
 
     // ==================== Debugger (CDP via Extension) ====================
 
+    async acquireKeyboardFocus(id: string, timeout?: number): Promise<{ changed: boolean }> {
+        return (await this.sendBudgetedCommand(
+            'keyboard_focus',
+            {
+                operation: 'acquire',
+                id,
+                tabId: this.requireCurrentTabId(),
+                frameId: this.currentFrameId,
+                documentId: this.currentFrameDocumentId,
+            },
+            timeout
+        )) as { changed: boolean }
+    }
+
+    async releaseKeyboardFocus(
+        focus: NonNullable<BrowserRequestContext['keyboardFocus']>,
+        releaseKeys: boolean
+    ): Promise<{ restored: boolean; errors: string[] }> {
+        return (await this.sendBudgetedCommand(
+            'keyboard_focus',
+            {
+                operation: 'release',
+                id: focus.id,
+                tabId: this.parseTargetId(focus.targetId),
+                releaseKeys,
+            },
+            4000
+        )) as { restored: boolean; errors: string[] }
+    }
+
     async inputKey(
         type: 'keyDown' | 'keyUp' | 'rawKeyDown' | 'char',
         options: {
@@ -1039,6 +1330,7 @@ export class ExtensionBridge implements IBrowserDriver {
             'input_key',
             {
                 tabId: this.requireCurrentTabId(),
+                keyboardFocusId: this.options.requestContext?.()?.keyboardFocus?.id,
                 type,
                 ...options,
             },
@@ -1061,7 +1353,16 @@ export class ExtensionBridge implements IBrowserDriver {
         } = {},
         timeout?: number
     ): Promise<void> {
-        const params = { tabId: this.requireCurrentTabId(), type, x, y, ...options }
+        const params = {
+            tabId: this.requireCurrentTabId(),
+            frameId: this.currentFrameId,
+            documentId: this.currentFrameDocumentId,
+            ...(type !== 'mouseWheel' && this.currentFrameId ? { coordinateSpace: 'frame' } : {}),
+            type,
+            x,
+            y,
+            ...options,
+        }
         if (timeout === undefined) {
             await this.httpServer.sendCommand('input_mouse', params)
         } else {
@@ -1082,6 +1383,8 @@ export class ExtensionBridge implements IBrowserDriver {
     ): Promise<void> {
         await this.httpServer.sendCommand('input_touch', {
             tabId: this.requireCurrentTabId(),
+            frameId: this.currentFrameId,
+            documentId: this.currentFrameDocumentId,
             type,
             touchPoints,
         })
@@ -1090,7 +1393,13 @@ export class ExtensionBridge implements IBrowserDriver {
     async inputType(text: string, delay = 0, timeout = DEFAULT_TIMEOUT): Promise<void> {
         await this.httpServer.sendCommand(
             'input_type',
-            { tabId: this.requireCurrentTabId(), text, delay, deadline: Date.now() + timeout },
+            {
+                tabId: this.requireCurrentTabId(),
+                keyboardFocusId: this.options.requestContext?.()?.keyboardFocus?.id,
+                text,
+                delay,
+                deadline: Date.now() + timeout,
+            },
             timeout
         )
     }
@@ -1221,7 +1530,8 @@ export class ExtensionBridge implements IBrowserDriver {
         button = 'left',
         clickCount = 1,
         refId?: string,
-        timeout = DEFAULT_TIMEOUT
+        timeout = DEFAULT_TIMEOUT,
+        modifiers = 0
     ): Promise<void> {
         if (this.currentTabId === null) {
             throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
@@ -1234,6 +1544,7 @@ export class ExtensionBridge implements IBrowserDriver {
             button: string
             clickCount: number
             refId?: string
+            modifiers: number
         } = {
             tabId: this.requireCurrentTabId(),
             frameId: this.currentFrameId !== null ? this.currentFrameId : undefined,
@@ -1241,6 +1552,7 @@ export class ExtensionBridge implements IBrowserDriver {
             y,
             button,
             clickCount,
+            modifiers,
         }
         if (typeof refId === 'string') {
             params.refId = refId
@@ -1248,7 +1560,14 @@ export class ExtensionBridge implements IBrowserDriver {
         await this.sendBudgetedCommand('stealth_click', params, timeout)
     }
 
-    async stealthMouse(type: string, x: number, y: number, button = 'left', timeout?: number): Promise<void> {
+    async stealthMouse(
+        type: string,
+        x: number,
+        y: number,
+        button = 'left',
+        timeout?: number,
+        modifiers = 0
+    ): Promise<void> {
         if (this.currentTabId === null) {
             throw new DriverCapabilityError('没有当前页面，请先 browse attach 或先 browse open 创建受控页面')
         }
@@ -1259,6 +1578,7 @@ export class ExtensionBridge implements IBrowserDriver {
             x,
             y,
             button,
+            modifiers,
         }
         if (timeout === undefined) {
             await this.httpServer.sendCommand('stealth_mouse', params)
@@ -1288,8 +1608,13 @@ export class ExtensionBridge implements IBrowserDriver {
         return this.currentFrameId
     }
 
-    setCurrentFrameId(frameId: number): void {
+    getCurrentFrameDocumentId(): string | undefined {
+        return this.currentFrameDocumentId
+    }
+
+    setCurrentFrameId(frameId: number, documentId?: string): void {
         this.currentFrameId = frameId
+        this.currentFrameDocumentId = documentId
     }
 
     /**
@@ -1299,7 +1624,8 @@ export class ExtensionBridge implements IBrowserDriver {
         frameId: number,
         expression: string,
         timeout?: number,
-        staleContextRetry: StaleContextRetryPolicy = 'never'
+        staleContextRetry: StaleContextRetryPolicy = 'never',
+        userAction?: UserActionKind
     ): Promise<{
         result?: { value?: unknown }
         exceptionDetails?: { text: string }
@@ -1319,7 +1645,8 @@ export class ExtensionBridge implements IBrowserDriver {
                 timeout,
                 staleContextRetry,
             },
-            timeout
+            timeout,
+            userAction
         )) as {
             result?: { value?: unknown }
             exceptionDetails?: { text: string }
@@ -1334,7 +1661,7 @@ export class ExtensionBridge implements IBrowserDriver {
      * 解析 iframe 选择器/索引 → frameId
      */
     async resolveFrame(
-        frame: string | number,
+        frame: FrameSelection,
         timeout?: number
     ): Promise<{
         frameId: number
@@ -1360,11 +1687,13 @@ export class ExtensionBridge implements IBrowserDriver {
             | 'stealth_click'
             | 'input_mouse'
             | 'input_key'
+            | 'keyboard_focus'
             | 'stealth_key'
             | 'resolve_frame'
             | 'stealth_mouse'
             | 'debugger_detach'
-            | 'challenge_inspect',
+            | 'challenge_inspect'
+            | 'viewport_metrics',
         params: Record<string, unknown>,
         timeout = DEFAULT_TIMEOUT
     ): Promise<unknown> {
@@ -1433,7 +1762,7 @@ export class ExtensionBridge implements IBrowserDriver {
     }
 
     private parseTargetId(targetId: string): number {
-        if (!/^(0|[1-9]\d*)$/.test(targetId)) {
+        if (!/^(?:0|[1-9]\d*)$/.test(targetId)) {
             throw new DriverCapabilityError(`无效的 Tab ID: ${targetId}`)
         }
         const parsed = Number(targetId)

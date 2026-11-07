@@ -17,20 +17,32 @@ import {
     getUnifiedSession,
     resolveScopedOutputPath,
     TMP_PATH_PREFIX,
+    StructuredToolError,
     writePrivateFile,
 } from '../core/index.js'
 import { TEMP_OUTPUT_RETENTION } from '../core/utils.js'
+import type { CookieFilter, CookieScope } from '../core/browser-driver.js'
 
 /**
  * cookies 参数 schema
  */
 const cookiesSchema = z.object({
     action: z.enum(['get', 'set', 'delete', 'clear']).describe('操作类型'),
+    targetId: z.string().min(1).optional().describe('显式页面对应的 Cookie 存储上下文'),
+    storeId: z.string().min(1).optional().describe('Extension CookieStore ID；与 targetId 同时提供时必须一致'),
+    browserContextId: z.string().min(1).optional().describe('CDP BrowserContext ID'),
+    partitionKey: z
+        .object({
+            topLevelSite: z.string().min(1).optional(),
+            hasCrossSiteAncestor: z.boolean().optional(),
+        })
+        .optional()
+        .describe('Cookie 分区；保留未分区 Cookie 的既有默认行为'),
     url: z.string().optional().describe('URL 过滤（get/clear/set/delete）'),
     name: z
         .string()
         .optional()
-        .describe('Cookie 名称（get/set/delete 必填；clear 时只能作为 url/domain 范围内的附加过滤）'),
+        .describe('Cookie 名称（get 至少带 name/domain/url 之一，set/delete 必填；clear 仅缩小 url/domain 范围）'),
     domain: z.string().optional().describe('域名过滤（get/clear）'),
     path: z.string().optional().describe('路径过滤（get）或设置路径（set）'),
     secure: z.boolean().optional().describe('只返回 secure cookies（get）或设置 secure 属性（set）'),
@@ -54,18 +66,27 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
 }> {
     try {
         const unifiedSession = getUnifiedSession()
+        const scope: CookieScope = {
+            targetId: args.targetId,
+            storeId: args.storeId,
+            partitionKey: args.partitionKey,
+            browserContextId: args.browserContextId,
+        }
 
         switch (args.action) {
             case 'get': {
+                if (
+                    ![args.name, args.domain, args.url].some((value) => value !== undefined && value.trim().length > 0)
+                ) {
+                    throw new StructuredToolError(
+                        'INVALID_ARGUMENT',
+                        'cookies action=get 必须带非空 name、domain 或 url 过滤参数',
+                        '用 name、domain 或 url 指定读取范围，targetId 和其他条件仅用于选择存储上下文或进一步过滤',
+                        { actionExecuted: false, actionStatus: 'not_started', retryable: false }
+                    )
+                }
                 // 构建过滤条件
-                const filter: {
-                    url?: string
-                    name?: string
-                    domain?: string
-                    path?: string
-                    secure?: boolean
-                    session?: boolean
-                } = {}
+                const filter: CookieFilter = { ...scope }
                 if (args.url) {
                     filter.url = args.url
                 }
@@ -99,7 +120,10 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
 
                 if (args.output) {
                     const output = await resolveScopedOutputPath(args.output, 'mcp-chrome')
-                    await writePrivateFile(output.absolutePath, JSON.stringify(cookies, null, 2), 'utf-8')
+                    unifiedSession.assertRequestActive()
+                    await writePrivateFile(output.absolutePath, JSON.stringify(cookies, null, 2), 'utf-8', () =>
+                        unifiedSession.assertRequestActive()
+                    )
                     return formatResponse({
                         success: true,
                         action: 'get',
@@ -168,6 +192,7 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                 }
 
                 await unifiedSession.setCookie({
+                    ...scope,
                     name: args.name,
                     value: args.value,
                     url: args.url,
@@ -221,7 +246,7 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                     }
                 }
 
-                await unifiedSession.deleteCookie(args.url, args.name)
+                await unifiedSession.deleteCookie(args.url, args.name, scope)
 
                 return formatResponse({
                     success: true,
@@ -253,7 +278,7 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                 }
 
                 // 构建过滤条件
-                const filter: { url?: string; domain?: string; name?: string } = {}
+                const filter: CookieFilter = { ...scope }
                 if (args.url) {
                     filter.url = args.url
                 }
@@ -270,7 +295,7 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                     success: true,
                     action: 'clear',
                     filter,
-                    count: result.count,
+                    ...result,
                 })
             }
 
@@ -305,6 +330,20 @@ export function registerCookiesTool(server: McpServer): void {
             description: 'Cookie 管理：获取、设置、删除、清空',
             inputSchema: cookiesSchema,
         },
-        (args) => handleCookies(args)
+        (args, extra) =>
+            getUnifiedSession()
+                .withTabLock(() => handleCookies(args), undefined, extra?.signal)
+                .catch((error: unknown) =>
+                    formatErrorResponse(
+                        extra?.signal?.aborted
+                            ? new StructuredToolError(
+                                  'CANCELLED',
+                                  'Cookie 请求在开始前已取消',
+                                  '读取实际 Cookie 状态后再提交操作',
+                                  { actionExecuted: false, actionStatus: 'not_started', retryable: false }
+                              )
+                            : error
+                    )
+                )
     )
 }

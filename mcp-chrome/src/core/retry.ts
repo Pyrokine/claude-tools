@@ -5,7 +5,7 @@
  * RETRY_DELAY = 100ms
  */
 
-import { TimeoutError } from './errors.js'
+import { StructuredToolError, TimeoutError } from './errors.js'
 import { DEFAULT_TIMEOUT } from './types.js'
 
 /**
@@ -41,6 +41,9 @@ export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions =
         try {
             return await fn()
         } catch (error) {
+            if (error instanceof StructuredToolError && error.context.retryable === false) {
+                throw error
+            }
             lastError = error as Error
 
             // 如果剩余时间不足以进行下一次重试，直接抛出错误

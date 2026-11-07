@@ -57,6 +57,7 @@ export function wrapDebuggerError(
 
     let reason: string
     let suggestion: string
+    let expected = true
     if (/^Debugger agent is not enabled\.?$/i.test(message)) {
         reason = 'domain_not_enabled'
         suggestion = '在当前调试会话显式启用 Debugger 域后，再请求该方法'
@@ -79,25 +80,35 @@ export function wrapDebuggerError(
         reason = 'target_unavailable'
         suggestion = '重新读取目标页面和调试上下文，再提交操作'
     } else {
-        return error instanceof Error ? error : new Error(raw)
+        if (
+            nativeCode === undefined &&
+            !(
+                /^Runtime\.(?:evaluate|callFunctionOn|runScript)$/.test(context.method ?? '') &&
+                /^(?:Execution was terminated|Internal error)$/.test(message)
+            )
+        ) {
+            return error instanceof Error ? error : new Error(raw)
+        }
+        reason = 'command_failed'
+        suggestion = '请检查原生命令错误，并读取实际页面核验操作状态'
+        expected = false
     }
-    return new ExpectedOperationError(
-        JSON.stringify({
-            error: {
-                code: 'CDP_ERROR',
-                message: `${context.method ?? `chrome.debugger.${context.phase}`}: ${message}`,
-                suggestion,
-                context: {
-                    nativeSource: 'chrome.debugger',
-                    targetId: String(context.tabId),
-                    method: context.method,
-                    phase: context.phase,
-                    nativeMessage: message,
-                    ...(nativeCode !== undefined ? { nativeCode } : {}),
-                    reason,
-                    ...(context.frameContext ? { frameContext: context.frameContext } : {}),
-                },
+    const serialized = JSON.stringify({
+        error: {
+            code: 'CDP_ERROR',
+            message: `${context.method ?? `chrome.debugger.${context.phase}`}: ${message}`,
+            suggestion,
+            context: {
+                nativeSource: 'chrome.debugger',
+                targetId: String(context.tabId),
+                method: context.method,
+                phase: context.phase,
+                nativeMessage: message,
+                ...(nativeCode !== undefined ? { nativeCode } : {}),
+                reason,
+                ...(context.frameContext ? { frameContext: context.frameContext } : {}),
             },
-        })
-    )
+        },
+    })
+    return expected ? new ExpectedOperationError(serialized) : new Error(serialized, { cause: error })
 }

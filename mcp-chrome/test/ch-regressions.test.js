@@ -21,10 +21,10 @@ import {
     resolveStaleContextRetryPolicy,
 } from '../dist/tools/evaluate.js';
 import { boundInlineNetworkRequest, normalizeConsoleLog } from '../dist/tools/logs.js';
-import { sanitizeUrl, sanitizeUrlRecord } from '../dist/tools/network-sanitizer.js';
+import { sanitizePageUrls, sanitizeUrl, sanitizeUrlRecord } from '../dist/tools/network-sanitizer.js';
 import { EvaluateResultTooLargeError, NonSerializableEvaluateResultError } from '../dist/core/types.js';
 import { resolveExtensionBundleStatus } from '../dist/extension/http-server.js';
-import { summarizeTargetCandidates } from '../dist/tools/target-diagnostics.js';
+import { buildTargetDiagnostics, summarizeTargetCandidates } from '../dist/tools/target-diagnostics.js';
 import {
     CHALLENGE_INSPECT_SCRIPT,
     ChallengeDeniedError,
@@ -34,7 +34,7 @@ import {
     readChallengeSnapshot,
     waitForChallenge,
 } from '../dist/tools/challenge.js';
-import { OsMouseError } from '../dist/core/errors.js';
+import { ElementNotFoundError, OsMouseError, StructuredToolError } from '../dist/core/errors.js';
 import { CDPClient } from '../dist/cdp/client.js';
 import {
     buildOsMovePath,
@@ -362,228 +362,412 @@ test('CH-01 redacts input find and replacement sentinels from nested failure dat
     const serialized = JSON.stringify(redacted);
     assert.equal(serialized.includes(findSentinel), false);
     assert.equal(serialized.includes(replacementSentinel), false);
-    assert.match(serialized, /\[REDACTED\]/);
+    assert.match(serialized, /\[REDACTED]/);
 });
 
-test('CH-01 registered input protects password diagnostics in both backends without hiding ordinary input', async (t) => {
+test('C-R11 mouse cleanup distinguishes a rejected press from an unknown result', async (t) => {
+    for (const outcome of ['not_started', 'unknown', 'completed']) {
+        await t.test(outcome, async () => {
+            const unified = getUnifiedSession();
+            const native = [];
+            let synthetic = 0;
+            const failure =
+                outcome === 'not_started'
+                    ? new StructuredToolError('NATIVE_INPUT_UNAVAILABLE', 'owned refusal', 'owned', {
+                          actionExecuted: false,
+                      })
+                    : new Error('owned unknown mouse result');
+            const driver = {
+                checkActionability: async () => ({ success: true }),
+                inputMouse: async (type) => {
+                    native.push(type);
+                },
+                actionableClick: async () => {
+                    ++synthetic;
+                    return { success: true };
+                },
+            };
+            const overrides = {
+                inputMode: 'precise',
+                getDriver: async () => driver,
+                isExtensionConnected: () => true,
+                withMouseFrame: async (action) => action(),
+                mouseDown: async () => {
+                    if (outcome !== 'completed') {
+                        throw failure;
+                    }
+                },
+            };
+            const original = new Map(
+                Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(unified, key)])
+            );
+            Object.assign(unified, overrides);
+            try {
+                if (outcome === 'unknown') {
+                    await assert.rejects(
+                        () => unified.actionableClick('owned-target'),
+                        (error) => error === failure
+                    );
+                } else {
+                    const response = await unified.actionableClick('owned-target');
+                    assert.equal(response.success, true);
+                    if (outcome === 'not_started') {
+                        assert.match(response.warning, /合成/);
+                    }
+                }
+                assert.deepEqual(native, outcome === 'not_started' ? [] : ['mouseReleased']);
+                assert.equal(synthetic, outcome === 'not_started' ? 1 : 0);
+            } finally {
+                for (const [key, descriptor] of original) {
+                    if (descriptor) {
+                        Object.defineProperty(unified, key, descriptor);
+                    } else {
+                        delete unified[key];
+                    }
+                }
+            }
+        });
+    }
+});
+
+test('CH-01 registered input redacts locator logs while retaining error identity', async (t) => {
     for (const mode of ['extension', 'cdp']) {
-        for (const inputType of ['password', 'text']) {
-            for (const type of ['select', 'replace']) {
-                for (const fails of [false, true]) {
-                    await t.test(`${mode} ${inputType} ${type} ${fails ? 'failure' : 'success'}`, async () => {
-                        const find = fails ? 'missing-find-sentinel' : 'find-sentinel';
-                        const replacement = 'replacement-sentinel';
-                        const originalValue = 'password-value-sentinel find-sentinel find-sentinel';
-                        const logs = [];
-                        const requests = [];
-                        const diagnosticsText = `password-value-sentinel|${find}|${replacement}`;
-                        class Input {
-                            constructor(value, id) {
-                                Object.assign(this, {
-                                    value,
-                                    id,
-                                    type: inputType,
-                                    tagName: 'INPUT',
-                                    selectionStart: 0,
-                                    selectionEnd: 0,
-                                });
-                            }
+        await t.test(mode, async () => {
+            const find = 'owned-find-sentinel';
+            const replacement = 'owned-replacement-sentinel';
+            const target = { css: `#missing-${find}` };
+            const unified = getUnifiedSession();
+            let attempts = 0;
+            const overrides = {
+                getMode: () => mode,
+                getCurrentTargetId: () => '101',
+                getTargetRestoration: () => undefined,
+                getPageSnapshot: async (targetId) => ({ targetId, url: 'https://example.com/input', revision: 'r1' }),
+                listTargets: async () => [{ targetId: '101' }],
+                listTopology: async () => ({ activeTargetId: '101' }),
+                withTabId: async (_id, action) => action(),
+                withPageCondition: async (_args, action) => action(),
+                withFrame: async () => {
+                    ++attempts;
+                    throw new ElementNotFoundError(target, 100, [
+                        `lookup ${find}`,
+                        `replacement ${replacement}`,
+                        'ordinary locator detail',
+                    ]);
+                },
+            };
+            const original = new Map(
+                Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(unified, key)])
+            );
+            Object.assign(unified, overrides);
+            try {
+                let handler;
+                registerInputTool({
+                    registerTool(_name, _options, callback) {
+                        handler = callback;
+                    },
+                });
+                const response = await handler({
+                    targetId: '101',
+                    events: [{ type: 'replace', target, find, text: replacement }],
+                });
+                const payload = JSON.parse(response.content[0].text);
+                assert.equal(response.isError, true);
+                assert.equal(payload.error.code, 'ELEMENT_NOT_FOUND');
+                assert.equal(payload.actionExecuted, false);
+                assert.equal(payload.eventsExecuted, 0);
+                assert.equal(attempts, 1);
+                assert.equal(response.content[0].text.includes(find), false);
+                assert.equal(response.content[0].text.includes(replacement), false);
+                assert.deepEqual(payload.error.logs, [
+                    'lookup [REDACTED]',
+                    'replacement [REDACTED]',
+                    'ordinary locator detail',
+                ]);
+            } finally {
+                for (const [key, descriptor] of original) {
+                    if (descriptor) {
+                        Object.defineProperty(unified, key, descriptor);
+                    } else {
+                        delete unified[key];
+                    }
+                }
+            }
+        });
+    }
+});
 
-                            focus() {
-                                document.activeElement = this;
-                                logs.push({ level: 'error', text: diagnosticsText, timestamp: logs.length });
-                                requests.push({
-                                    url: 'https://example.com/input',
-                                    status: 500,
-                                    errorText: diagnosticsText,
-                                    sequence: requests.length,
-                                });
-                            }
-
-                            setSelectionRange(start, end) {
-                                this.selectionStart = start;
-                                this.selectionEnd = end;
-                            }
-
-                            setRangeText(text, start, end) {
-                                this.value = this.value.slice(0, start) + text + this.value.slice(end);
-                                this.selectionStart = this.selectionEnd = start + text.length;
-                            }
-
-                            dispatchEvent() {
-                                return true;
-                            }
-
-                            getBoundingClientRect() {
-                                return { x: 10, y: 20, width: 100, height: 25 };
-                            }
-
-                            querySelectorAll() {
-                                return [];
-                            }
-                        }
-                        const control = new Input('control-unchanged', 'control');
-                        const subject = new Input(originalValue, 'subject');
-                        const document = {
-                            activeElement: control,
-                            body: subject,
-                            querySelectorAll: () => [control, subject],
-                        };
-                        const globals = {
-                            document,
-                            HTMLInputElement: Input,
-                            Element: Input,
-                            Event: globalThis.Event,
-                            CSS: { escape: (value) => value },
-                            window: { getSelection: () => null },
-                        };
-                        const unified = getUnifiedSession();
-                        const session = getSession();
-                        const overrides = {
-                            getMode: () => mode,
-                            getCurrentTargetId: () => '101',
-                            getTargetRestoration: () => undefined,
-                            getPageSnapshot: async (targetId) => ({
-                                targetId,
-                                url: 'https://example.com/input',
-                                revision: 'r1',
-                            }),
-                            listTargets: async () => [{ targetId: '101' }],
-                            listTopology: async () => ({ activeTargetId: '101' }),
-                            withTabLock: async (action) => action(),
-                            withTabId: async (_id, action) => action(),
-                            withPageCondition: async (_args, action) => action(),
-                            withFrame: async (_frame, action) => action(),
-                            enableConsole: async () => {},
-                            enableNetwork: async () => {},
-                            getConsoleLogs: async () => [...logs],
-                            getNetworkRequests: async () => [...requests],
-                            find: async () => [{ refId: 'control' }, { refId: 'subject' }],
-                            actionableClick: async (refId) => {
-                                (refId === 'subject' ? subject : control).focus();
-                                return { success: true };
-                            },
-                            evaluate: async (script, _mode, _timeout, args) => {
-                                const result = vm.runInNewContext(`(${script})`, globals);
-                                const value =
-                                    typeof result === 'function' ? await result(...(args ?? [])) : await result;
-                                if (
-                                    inputType === 'password' &&
-                                    value &&
-                                    value.inputType === 'password' &&
-                                    value.tag === 'input'
-                                ) {
-                                    assert.equal(
-                                        value.value,
-                                        undefined,
-                                        'password capability probe must not return its value'
-                                    );
+test(
+    'CH-01 registered input protects password diagnostics in both backends ' + 'without hiding ordinary input',
+    async (t) => {
+        for (const mode of ['extension', 'cdp']) {
+            for (const inputType of ['password', 'text']) {
+                for (const type of ['select', 'replace']) {
+                    for (const fails of [false, true]) {
+                        await t.test(`${mode} ${inputType} ${type} ${fails ? 'failure' : 'success'}`, async () => {
+                            const find = fails ? 'missing-find-sentinel' : 'find-sentinel';
+                            const replacement = 'replacement-sentinel';
+                            const originalValue = 'password-value-sentinel find-sentinel find-sentinel';
+                            const logs = [];
+                            const requests = [];
+                            const diagnosticsText = `password-value-sentinel|${find}|${replacement}`;
+                            class Input {
+                                constructor(value, id) {
+                                    Object.assign(this, {
+                                        value,
+                                        id,
+                                        type: inputType,
+                                        tagName: 'INPUT',
+                                        nodeType: 1,
+                                        childNodes: [],
+                                        selectionStart: 0,
+                                        selectionEnd: 0,
+                                    });
                                 }
-                                return value;
-                            },
-                        };
-                        const original = new Map(
-                            Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(unified, key)])
-                        );
-                        const originalLocator = Object.getOwnPropertyDescriptor(session, 'createLocator');
-                        Object.assign(unified, overrides);
-                        session.createLocator = () => ({
-                            evaluateOn: async () => {
-                                subject.focus();
-                                return true;
-                            },
-                        });
-                        try {
-                            let handler;
-                            registerInputTool({
-                                registerTool(_name, _options, callback) {
-                                    handler = callback;
+
+                                focus() {
+                                    document.activeElement = this;
+                                    logs.push({ level: 'error', text: diagnosticsText, timestamp: logs.length });
+                                    requests.push({
+                                        url: 'https://example.com/input',
+                                        status: 500,
+                                        errorText: diagnosticsText,
+                                        sequence: requests.length,
+                                    });
+                                }
+
+                                setSelectionRange(start, end) {
+                                    this.selectionStart = start;
+                                    this.selectionEnd = end;
+                                }
+
+                                setRangeText(text, start, end) {
+                                    this.value = this.value.slice(0, start) + text + this.value.slice(end);
+                                    this.selectionStart = this.selectionEnd = start + text.length;
+                                }
+
+                                dispatchEvent() {
+                                    return true;
+                                }
+
+                                getBoundingClientRect() {
+                                    return { x: 10, y: 20, width: 100, height: 25 };
+                                }
+
+                                querySelector() {
+                                    return null;
+                                }
+
+                                querySelectorAll() {
+                                    return [];
+                                }
+
+                                matches(selector) {
+                                    return selector === '.fixture-input' || selector.includes('input');
+                                }
+
+                                getAttribute() {
+                                    return null;
+                                }
+
+                                hasAttribute() {
+                                    return false;
+                                }
+
+                                getRootNode() {
+                                    return document;
+                                }
+                            }
+                            const control = new Input('control-unchanged', 'control');
+                            const subject = new Input(originalValue, 'subject');
+                            const document = {
+                                nodeType: 9,
+                                childNodes: [control, subject],
+                                activeElement: control,
+                                body: subject,
+                                querySelector: () => control,
+                                querySelectorAll: () => [control, subject],
+                            };
+                            const globals = {
+                                document,
+                                HTMLInputElement: Input,
+                                Element: Input,
+                                Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 },
+                                Event: globalThis.Event,
+                                CSS: { escape: (value) => value },
+                                window: { getSelection: () => null },
+                            };
+                            const unified = getUnifiedSession();
+                            const session = getSession();
+                            const overrides = {
+                                getMode: () => mode,
+                                getCurrentTargetId: () => '101',
+                                getTargetRestoration: () => undefined,
+                                getPageSnapshot: async (targetId) => ({
+                                    targetId,
+                                    url: 'https://example.com/input',
+                                    revision: 'r1',
+                                }),
+                                listTargets: async () => [{ targetId: '101' }],
+                                listTopology: async () => ({ activeTargetId: '101' }),
+                                withTabId: async (_id, action) => action(),
+                                withPageCondition: async (_args, action) => action(),
+                                withFrame: async (_frame, action) => action(),
+                                enableConsole: async () => {},
+                                enableNetwork: async () => {},
+                                getConsoleLogs: async () => [...logs],
+                                getNetworkRequests: async () => [...requests],
+                                hasBrowserEventObservation: () => false,
+                                getState: () => ({ title: 'Owned input', url: 'https://example.com/input' }),
+                                getChallengeState: async () => null,
+                                getLiveState: async () => ({ title: 'Owned input', url: 'https://example.com/input' }),
+                                inspectChallenge: async () => ({ title: 'Owned input', inspected: true }),
+                                find: async (_selector, _text, _xpath, _timeout, _semantic, matchIndex) => {
+                                    const matches = [{ refId: 'control' }, { refId: 'subject' }];
+                                    return matchIndex === undefined
+                                        ? matches
+                                        : matches.slice(matchIndex, matchIndex + 1);
+                                },
+                                actionableClick: async (refId) => {
+                                    (refId === 'subject' ? subject : control).focus();
+                                    return { success: true };
+                                },
+                                evaluate: async (script, _mode, _timeout, args) => {
+                                    if (script === CHALLENGE_INSPECT_SCRIPT) {
+                                        return { title: 'Owned input', inspected: true };
+                                    }
+                                    const result = vm.runInNewContext(`(${script})`, globals);
+                                    const value =
+                                        typeof result === 'function' ? await result(...(args ?? [])) : await result;
+                                    if (
+                                        inputType === 'password' &&
+                                        value &&
+                                        value.inputType === 'password' &&
+                                        value.tag === 'input'
+                                    ) {
+                                        assert.equal(
+                                            value.value,
+                                            undefined,
+                                            'password capability probe must not return its value'
+                                        );
+                                    }
+                                    return value;
+                                },
+                            };
+                            const original = new Map(
+                                Object.keys(overrides).map((key) => [
+                                    key,
+                                    Object.getOwnPropertyDescriptor(unified, key),
+                                ])
+                            );
+                            const originalLocator = Object.getOwnPropertyDescriptor(session, 'createLocator');
+                            Object.assign(unified, overrides);
+                            session.createLocator = () => ({
+                                evaluateOn: async () => {
+                                    subject.focus();
+                                    return true;
                                 },
                             });
-                            const response = await handler({
-                                targetId: '101',
-                                expectedUrl: 'https://example.com/input',
-                                diagnostics: true,
-                                events: [
-                                    {
-                                        type,
-                                        target: { css: '.fixture-input', nth: 1 },
-                                        find,
-                                        text: replacement,
-                                        nth: 1,
+                            try {
+                                let handler;
+                                registerInputTool({
+                                    registerTool(_name, _options, callback) {
+                                        handler = callback;
                                     },
-                                ],
-                                postCondition: { script: 'true' },
-                                timeout: 2000,
-                            });
-                            const payload = JSON.parse(response.content[0].text);
-                            assert.equal(Boolean(response.isError), fails);
-                            assert.equal(payload.actionStatus, fails ? 'failed' : 'completed');
-                            assert.equal(payload.diagnosticsStatus, 'collected');
-                            assert.equal(payload.pageContext.targetId, '101');
-                            if (inputType === 'password') {
-                                assert.equal(payload.diagnostics.redacted, true);
-                                for (const secret of ['password-value-sentinel', find, replacement]) {
-                                    assert.equal(response.content[0].text.includes(secret), false);
-                                }
-                            } else {
-                                assert.equal(
-                                    payload.diagnostics.console[0].text.includes('password-value-sentinel'),
-                                    true
-                                );
-                                assert.equal(
-                                    payload.diagnostics.failedRequests[0].errorText.includes('password-value-sentinel'),
-                                    true
-                                );
-                            }
-                            if (fails) {
-                                assert.equal(payload.error.code, 'TEXT_NOT_FOUND');
-                                assert.equal(subject.value, originalValue);
-                            } else {
-                                assert.equal(payload.verificationStatus, 'matched');
-                                assert.equal(payload.postCondition.checks[0].actual, true);
-                                assert.equal(
-                                    subject.value,
-                                    type === 'replace'
-                                        ? 'password-value-sentinel find-sentinel replacement-sentinel'
-                                        : originalValue
-                                );
-                            }
-                            assert.equal(control.value, 'control-unchanged');
-                            if (inputType === 'password') {
-                                subject.type = 'text';
-                                const ordinary = await handler({
+                                });
+                                const response = await handler({
                                     targetId: '101',
                                     expectedUrl: 'https://example.com/input',
                                     diagnostics: true,
                                     events: [
                                         {
-                                            type: 'select',
+                                            type,
                                             target: { css: '.fixture-input', nth: 1 },
-                                            find: 'find-sentinel',
+                                            find,
+                                            text: replacement,
+                                            nth: 1,
                                         },
                                     ],
+                                    postCondition: { script: 'true' },
                                     timeout: 2000,
                                 });
-                                const ordinaryPayload = JSON.parse(ordinary.content[0].text);
-                                assert.equal(ordinaryPayload.success, true);
-                                assert.equal(ordinaryPayload.diagnostics.redacted, undefined);
-                                assert.equal(ordinaryPayload.diagnostics.console[0].text, diagnosticsText);
+                                const payload = JSON.parse(response.content[0].text);
+                                assert.equal(Boolean(response.isError), fails, response.content[0].text);
+                                assert.equal(payload.actionStatus, fails ? 'failed' : 'completed');
+                                assert.equal(payload.diagnosticsStatus, 'collected');
+                                assert.equal(payload.pageContext.targetId, '101');
+                                if (inputType === 'password') {
+                                    assert.equal(payload.diagnostics.redacted, true);
+                                    for (const secret of ['password-value-sentinel', find, replacement]) {
+                                        assert.equal(response.content[0].text.includes(secret), false);
+                                    }
+                                } else {
+                                    assert.equal(
+                                        payload.diagnostics.console[0].text.includes('password-value-sentinel'),
+                                        true
+                                    );
+                                    assert.equal(
+                                        payload.diagnostics.failedRequests[0].errorText.includes(
+                                            'password-value-sentinel'
+                                        ),
+                                        true
+                                    );
+                                }
+                                if (fails) {
+                                    assert.equal(payload.error.code, 'TEXT_NOT_FOUND');
+                                    assert.equal(subject.value, originalValue);
+                                } else {
+                                    assert.equal(payload.verificationStatus, 'matched');
+                                    assert.equal(payload.postCondition.checks[0].actual, true);
+                                    assert.equal(
+                                        subject.value,
+                                        type === 'replace'
+                                            ? 'password-value-sentinel find-sentinel replacement-sentinel'
+                                            : originalValue
+                                    );
+                                }
+                                assert.equal(control.value, 'control-unchanged');
+                                if (inputType === 'password') {
+                                    subject.type = 'text';
+                                    const ordinary = await handler({
+                                        targetId: '101',
+                                        expectedUrl: 'https://example.com/input',
+                                        diagnostics: true,
+                                        events: [
+                                            {
+                                                type: 'select',
+                                                target: { css: '.fixture-input', nth: 1 },
+                                                find: 'find-sentinel',
+                                            },
+                                        ],
+                                        timeout: 2000,
+                                    });
+                                    const ordinaryPayload = JSON.parse(ordinary.content[0].text);
+                                    assert.equal(ordinaryPayload.success, true);
+                                    assert.equal(ordinaryPayload.diagnostics.redacted, undefined);
+                                    assert.equal(ordinaryPayload.diagnostics.console[0].text, diagnosticsText);
+                                }
+                            } finally {
+                                for (const [key, descriptor] of original) {
+                                    if (descriptor) {
+                                        Object.defineProperty(unified, key, descriptor);
+                                    } else {
+                                        delete unified[key];
+                                    }
+                                }
+                                if (originalLocator) {
+                                    Object.defineProperty(session, 'createLocator', originalLocator);
+                                } else {
+                                    delete session.createLocator;
+                                }
                             }
-                        } finally {
-                            for (const [key, descriptor] of original) {
-                                if (descriptor) Object.defineProperty(unified, key, descriptor);
-                                else delete unified[key];
-                            }
-                            if (originalLocator) Object.defineProperty(session, 'createLocator', originalLocator);
-                            else delete session.createLocator;
-                        }
-                    });
+                        });
+                    }
                 }
             }
         }
     }
-});
+);
 
 test('input empty event arrays reach structured handler validation', async () => {
     let handler;
@@ -812,7 +996,7 @@ test('C21 CDPClient script errors retain unknown execution state', () => {
                 classifyEvaluateActionError(error),
                 {
                     actionExecuted: unknown,
-                    actionStatus: unknown ? 'unknown' : 'failed',
+                    actionStatus: unknown ? 'unknown' : message === 'Invalid parameters' ? 'not_started' : 'failed',
                     retryable: false,
                 },
                 `${method}: ${message}`
@@ -869,7 +1053,7 @@ test('CDP console reads enable the Runtime domain before collecting events', asy
     ]);
     assert.match(logsSource, /await unifiedSession\.enableConsole\(\)\s*if \(mode === 'extension'\)/);
     assert.match(sessionSource, /async consoleEnable\(\): Promise<void> \{\s*await this\.ensureRuntimeEnabled\(\)/);
-    assert.match(sessionSource, /if \(!this\.isCurrentSessionEvent\(eventSessionId\)\) \{\s*return\s*\}/);
+    assert.match(sessionSource, /if \(!this\.isCurrentSessionEvent\(eventSessionId\)\) \{\s*return\s*}/);
 });
 
 test('inline network logs bound long URLs and retain original length', () => {
@@ -888,8 +1072,8 @@ test('network and console URL fields redact credential query parameters', () => 
     const sanitized = sanitizeUrl(rawUrl);
     assert.equal(sanitized.url.includes('test-sentinel'), false);
     assert.equal(sanitized.url.includes('token-sentinel'), false);
-    assert.match(sanitized.url, /authorization=\[REDACTED\]/);
-    assert.match(sanitized.url, /access_token=\[REDACTED\]/);
+    assert.match(sanitized.url, /authorization=\[REDACTED]/);
+    assert.match(sanitized.url, /access_token=\[REDACTED]/);
     assert.equal(sanitized.urlRedacted, true);
     assert.equal(sanitized.urlOriginalLength, rawUrl.length);
     assert.deepEqual(sanitized.redactedQueryParameters, ['authorization', 'access_token']);
@@ -901,6 +1085,77 @@ test('network and console URL fields redact credential query parameters', () => 
     const sanitizedAgain = sanitizeUrlRecord(record);
     assert.equal(sanitizedAgain, record);
     assert.equal(sanitizedAgain.urlOriginalLength, rawUrl.length);
+});
+
+test('page URL redaction preserves ordinary queries, encoded names, snapshots and opaque content', () => {
+    const url = 'https://example.com/page?name=report&ticket=ticket-sentinel&%54ICKET=encoded-sentinel#section';
+    const page = { url, pendingUrl: url, favIconUrl: url, title: 'Page', revision: 'epoch:1' };
+    const original = {
+        before: page,
+        after: { tabs: [page] },
+        target: page,
+        tabsBefore: [page],
+        tabsAfter: [page],
+        frames: [page],
+        result: { url },
+        metadata: { url },
+        content: url,
+    };
+    const sanitized = sanitizePageUrls(original);
+    for (const record of [
+        sanitized.before,
+        sanitized.after.tabs[0],
+        sanitized.target,
+        sanitized.tabsBefore[0],
+        sanitized.tabsAfter[0],
+        sanitized.frames[0],
+    ]) {
+        for (const field of ['url', 'pendingUrl', 'favIconUrl']) {
+            assert.equal(
+                record[field],
+                'https://example.com/page?name=report&ticket=[REDACTED]&%54ICKET=[REDACTED]#section'
+            );
+            assert.equal(record[`${field}Redacted`], true);
+            assert.equal(record[`${field}OriginalLength`], url.length);
+        }
+        assert.deepEqual(record.redactedQueryParameters, ['ticket', 'TICKET']);
+        assert.equal(record.revision, 'epoch:1');
+    }
+    assert.deepEqual(sanitizePageUrls(sanitized), sanitized);
+    assert.equal(page.url, url);
+    assert.equal(sanitized.result, original.result);
+    assert.equal(sanitized.metadata, original.metadata);
+    assert.equal(sanitized.content, url);
+    for (const ordinary of ['about:blank', 'https://example.com/page?name=report#section']) {
+        const record = { url: ordinary };
+        assert.equal(sanitizeUrlRecord(record), record);
+    }
+});
+
+test('target diagnostics redact the live URL before applying the display limit', async () => {
+    const url = `https://example.com/page?ticket=${'x'.repeat(600)}&name=report`;
+    const state = { url, managed: true };
+    const session = {
+        getCurrentTargetId: () => '101',
+        getMode: () => 'cdp',
+        getState: () => state,
+        getLiveState: async () => state,
+    };
+    const result = await buildTargetDiagnostics(
+        session,
+        { css: '#missing' },
+        {
+            nth: 0,
+            timeout: 1000,
+            matchCount: 0,
+            lastState: 'not-found',
+            candidates: [{ tag: 'button' }],
+        }
+    );
+    assert.equal(result.currentUrl, 'https://example.com/page?ticket=[REDACTED]&name=report');
+    assert.equal(result.currentUrlOriginalLength, url.length);
+    assert.equal(result.currentUrlRedacted, true);
+    assert.equal(state.url, url);
 });
 
 test('CH-04 target candidate summaries are bounded and omit page values', () => {
@@ -943,8 +1198,9 @@ test('CH-04 target diagnostics read live tab state instead of cached attach meta
         readFile(new URL('../src/tools/target-diagnostics.ts', import.meta.url), 'utf8'),
         readFile(new URL('../src/tools/extract.ts', import.meta.url), 'utf8'),
     ]);
-    assert.match(sessionSource, /async getLiveState\(\)/);
-    assert.match(sessionSource, /await this\.extensionBridge!\.listTargets\(\)/);
+    assert.match(sessionSource, /async getLiveState\(timeout\?: number\)/);
+    assert.match(sessionSource, /await this\.extensionBridge!\.listTargets\(timeout\)/);
+    assert.match(sessionSource, /return getCdpSession\(\)\.getLiveState\(timeout\)/);
     assert.match(diagnosticsSource, /withNavigationBudget\(\(\) => unifiedSession\.getLiveState\(\), deadline\)/);
     assert.match(extractSource, /await unifiedSession\.getLiveState\(\)/);
 });
@@ -989,7 +1245,7 @@ test('CH-06 Extension only replays stale iframe contexts for read-only scripts',
     ]);
     assert.match(resolverSource, /p\.staleContextRetry === 'readOnly' \? 2 : 1/);
     assert.match(resolverSource, /script was not replayed because staleContextRetry is never/);
-    assert.match(schemaSource, /staleContextRetry: z\.enum\(\['never', 'readOnly'\]\)\.default\('never'\)/);
+    assert.match(schemaSource, /staleContextRetry: z\.enum\(\['never', 'readOnly']\)\.default\('never'\)/);
 });
 
 test('CH-06 DOM iframe identity does not depend on webNavigation frame ordering', async () => {
@@ -1000,34 +1256,46 @@ test('CH-06 DOM iframe identity does not depend on webNavigation frame ordering'
         readFile(new URL('../extension/src/background/page-scripts.ts', import.meta.url), 'utf8'),
     ]);
 
-    assert.match(resolverSource, /getDomFrameSnapshot\(tabId, 0, p\.frame, readable\.documentId, readable\.tab\.url\)/);
-    assert.doesNotMatch(resolverSource, /directChildFrames\[info\.index\]/);
+    assert.match(
+        resolverSource,
+        /getDomFrameSnapshot\(\s*tabId,\s*parentFrameId,\s*selection,\s*parent\.documentId,\s*parent\.url,\s*context\s*\)/
+    );
+    assert.match(resolverSource, /currentRoot\.documentId !== root\.documentId/);
+    assert.match(resolverSource, /identity\.parentDocumentId !== parent\.documentId/);
+    assert.doesNotMatch(resolverSource, /directChildFrames\[info\.index]/);
     assert.match(actionUtilsSource, /mcp-frame-probe/);
     assert.match(actionUtilsSource, /recordDomFrameProbe/);
     assert.match(actionUtilsSource, /candidateFrameIds\.length === 1/);
-    assert.match(contentSource, /import \{ installFrameProbeListener \} from '\.\.\/background\/page-scripts'/);
+    assert.match(contentSource, /import \{ installFrameProbeListener } from '\.\.\/background\/page-scripts'/);
     assert.match(contentSource, /installFrameProbeListener\(\)/);
-    assert.match(actionUtilsSource, /documentIds: \[frame\.documentId\]/);
+    assert.match(actionUtilsSource, /documentIds: \[frame\.documentId]/);
     assert.match(actionUtilsSource, /verifiedFrameIds\.has/);
     assert.match(actionUtilsSource, /func: installFrameProbeListener/);
     assert.match(pageScriptsSource, /MCP_FRAME_PROBE/);
-    assert.match(resolverSource, /不会按 webNavigation 列表顺序选择其他 frame/);
+    assert.match(resolverSource, /selected\.frameId === null/);
+    assert.match(resolverSource, /FRAME_IDENTITY_UNAVAILABLE/);
 });
 
 // noinspection LongLine — 回归测试标题完整描述兼容场景
-test('CH-06 Extension bundle identity distinguishes active and stale builds without blocking legacy clients', async () => {
-    const expected = `sha256:${'a'.repeat(64)}`;
-    const active = `sha256:${'b'.repeat(64)}`;
-    assert.equal(resolveExtensionBundleStatus(expected, expected, true), 'match');
-    assert.equal(resolveExtensionBundleStatus(expected, active, true), 'stale');
-    assert.equal(resolveExtensionBundleStatus(expected, null, true), 'legacy');
-    assert.equal(resolveExtensionBundleStatus(null, active, true), 'unknown');
-    assert.equal(resolveExtensionBundleStatus(expected, null, false), 'pending');
+test(
+    'CH-06 Extension bundle identity distinguishes active and stale builds ' + 'without blocking legacy clients',
+    async () => {
+        const expected = `sha256:${'a'.repeat(64)}`;
+        const active = `sha256:${'b'.repeat(64)}`;
+        assert.equal(resolveExtensionBundleStatus(expected, expected, true), 'match');
+        assert.equal(resolveExtensionBundleStatus(expected, active, true), 'stale');
+        assert.equal(resolveExtensionBundleStatus(expected, null, true), 'legacy');
+        assert.equal(resolveExtensionBundleStatus(null, active, true), 'unknown');
+        assert.equal(resolveExtensionBundleStatus(expected, null, false), 'pending');
 
-    const clientSource = await readFile(new URL('../extension/src/background/http-client.ts', import.meta.url), 'utf8');
-    assert.match(clientSource, /chrome\.runtime\.getURL\('service-worker-loader\.js'\)/);
-    assert.match(clientSource, /backgroundBundleHash/);
-});
+        const clientSource = await readFile(
+            new URL('../extension/src/background/http-client.ts', import.meta.url),
+            'utf8'
+        );
+        assert.match(clientSource, /chrome\.runtime\.getURL\('service-worker-loader\.js'\)/);
+        assert.match(clientSource, /backgroundBundleHash/);
+    }
+);
 
 test('CH-07 diagnostics initialization and collection are best effort', async () => {
     const unavailable = await startDiagnostics(
@@ -2291,6 +2559,117 @@ test('CH-08 OS mouse converts CSS points and clicks linux/darwin/win32 via execF
     );
 });
 
+test('C32 OS mouse refreshes its endpoint after hover and presses only once', async (t) => {
+    for (const platform of ['linux', 'darwin', 'win32']) {
+        await t.test(platform, async () => {
+            const calls = [];
+            let refreshes = 0;
+            await osLeftClick(280, 326, {
+                platform,
+                deadline: Date.now() + 2000,
+                signal: new AbortController().signal,
+                path: [{ x: 280, y: 326 }],
+                sleep: async () => {},
+                refreshPoint: async () => {
+                    calls.push({ refresh: ++refreshes });
+                    return { x: 300, y: 270 };
+                },
+                execFile: async (file, args) => {
+                    calls.push({ file, args: [...args] });
+                    return { stdout: '', stderr: '' };
+                },
+            });
+            assert.equal(refreshes, 2);
+            const commands = calls.filter((call) => call.args).map((call) => call.args.join(' '));
+            const presses = commands.filter((command) => /mousedown|dd:\.|mouse_event\(2/.test(command));
+            const releases = commands.filter((command) => /mouseup|du:\.|mouse_event\(4/.test(command));
+            assert.equal(presses.length, 1);
+            assert.equal(releases.length, 1);
+            if (platform === 'linux') {
+                assert.equal(commands.filter((command) => command.startsWith('mousemove')).at(-1), 'mousemove 300 270');
+            } else {
+                assert.ok(commands.some((command) => /m:300,270|SetCursorPos\(300, 270\)/.test(command)));
+            }
+            assert.equal(calls.at(-3).refresh, 2);
+        });
+    }
+});
+
+test('C32 OS mouse revalidation failure, cancellation and deadline exhaustion dispatch no press', async () => {
+    for (const failure of ['unavailable', 'cancelled', 'timeout']) {
+        const calls = [];
+        const abort = new AbortController();
+        const originalNow = Date.now;
+        const deadline = Date.now() + 2000;
+        try {
+            await assert.rejects(
+                osLeftClick(280, 326, {
+                    platform: 'linux',
+                    deadline,
+                    signal: abort.signal,
+                    path: [{ x: 280, y: 326 }],
+                    sleep: async () => {},
+                    refreshPoint: async () => {
+                        if (failure === 'unavailable') {
+                            throw new OsMouseError(
+                                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                                'Owned target changed',
+                                'Inspect again'
+                            );
+                        }
+                        if (failure === 'timeout') {
+                            Date.now = () => deadline + 1;
+                        } else {
+                            abort.abort(new Error('Owned cancelled'));
+                        }
+                        return { x: 280, y: 270 };
+                    },
+                    execFile: async (_file, args, options) => {
+                        calls.push([...args]);
+                        assert.ok(options.timeout > 0 && options.timeout <= deadline - Date.now());
+                        return { stdout: '', stderr: '' };
+                    },
+                }),
+                (error) =>
+                    failure === 'timeout'
+                        ? error.code === 'TIMEOUT'
+                        : /Owned (?:target changed|cancelled)/.test(error.message)
+            );
+            assert.deepEqual(calls, [['mousemove', '280', '326']]);
+        } finally {
+            Date.now = originalNow;
+        }
+    }
+});
+
+test('C32 macOS fallback refreshes coordinates before its single System Events click', async () => {
+    const calls = [];
+    let refreshes = 0;
+    await osLeftClick(280, 326, {
+        platform: 'darwin',
+        deadline: Date.now() + 2000,
+        path: [{ x: 280, y: 326 }],
+        sleep: async () => {},
+        warn() {},
+        refreshPoint: async () => {
+            ++refreshes;
+            return { x: 280, y: 270 };
+        },
+        execFile: async (file, args) => {
+            calls.push({ file, args: [...args] });
+            if (file === 'cliclick') {
+                throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+            }
+            return { stdout: '', stderr: '' };
+        },
+    });
+    assert.equal(refreshes, 2);
+    assert.deepEqual(
+        calls.filter((call) => call.file === 'osascript'),
+        [{ file: 'osascript', args: ['-e', 'tell application "System Events" to click at {280, 270}'] }]
+    );
+});
+
 test('C-P6 OS mouse stops before a later process or fallback after deadline exhaustion', async () => {
     const NativeDate = Date;
     let now = 1000;
@@ -2355,6 +2734,6 @@ test('CH-08 cookie clearing requires a URL or domain at every boundary', async (
         readFile(new URL('../extension/src/types/schemas.ts', import.meta.url), 'utf8'),
     ]);
     for (const source of [toolSource, sessionSource, cookieHandlerSource, schemaSource]) {
-        assert.match(source, /url 或 domain/);
+        assert.match(source, /url (?:或|or) domain/);
     }
 });

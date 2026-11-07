@@ -1,3 +1,4 @@
+import { installDomHelpers } from '../../../src/core/dom-helpers.js'
 import { ExpectedOperationError } from '../types/expected-errors'
 import {
     StealthClickSchema,
@@ -6,7 +7,13 @@ import {
     StealthMouseSchema,
     StealthTypeSchema,
 } from '../types/schemas'
-import { type ActionContext, assertManagedTab, assertScriptable, getTargetTabId } from './action-utils'
+import {
+    type ActionContext,
+    assertActionActive,
+    assertManagedTab,
+    assertScriptable,
+    getTargetTabId,
+} from './action-utils'
 import { remainingNavigationTimeout } from './navigation-handler'
 import {
     injectStealthScripts,
@@ -19,16 +26,26 @@ import {
 export class StealthHandler {
     async stealthClick(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthClickSchema.parse(params)
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_click')
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_click', p.frameId)
         if (p.deadline !== undefined) {
             remainingNavigationTimeout(p.deadline)
         }
 
-        const args: [number, number, string, number?, string?] =
-            typeof p.refId === 'string'
-                ? [p.x, p.y, p.button || 'left', p.clickCount ?? 1, p.refId]
-                : [p.x, p.y, p.button || 'left', p.clickCount ?? 1]
+        const args: Parameters<typeof simulateMouseClick> = [
+            p.x,
+            p.y,
+            p.button || 'left',
+            p.clickCount ?? 1,
+            p.refId ?? null,
+            {
+                altKey: Boolean((p.modifiers ?? 0) & 1),
+                ctrlKey: Boolean((p.modifiers ?? 0) & 2),
+                metaKey: Boolean((p.modifiers ?? 0) & 4),
+                shiftKey: Boolean((p.modifiers ?? 0) & 8),
+            },
+        ]
 
+        assertActionActive(context)
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
@@ -41,8 +58,9 @@ export class StealthHandler {
 
     async stealthType(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthTypeSchema.parse(params)
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_type')
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_type', p.frameId)
 
+        assertActionActive(context)
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
@@ -59,11 +77,12 @@ export class StealthHandler {
 
     async stealthKey(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthKeySchema.parse(params)
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_key')
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_key', p.frameId)
         if (p.deadline !== undefined) {
             remainingNavigationTimeout(p.deadline)
         }
 
+        assertActionActive(context)
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
@@ -74,28 +93,34 @@ export class StealthHandler {
                     : [p.key, p.type || 'press', p.modifiers || [], p.deadline],
         })
 
-        if (p.deadline !== undefined) {
-            remainingNavigationTimeout(p.deadline, true)
-        }
-
         return results[0].result as { success: boolean }
     }
 
     async stealthMouse(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthMouseSchema.parse(params)
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_mouse')
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_mouse', p.frameId)
         if (p.deadline !== undefined) {
             remainingNavigationTimeout(p.deadline)
         }
 
+        assertActionActive(context)
         const results = await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             world: 'MAIN',
             func: simulateMouseEvent,
-            args:
-                p.deadline === undefined
-                    ? [p.type, p.x, p.y, p.button || 'left']
-                    : [p.type, p.x, p.y, p.button || 'left', p.deadline],
+            args: [
+                p.type,
+                p.x,
+                p.y,
+                p.button || 'left',
+                p.deadline ?? null,
+                {
+                    altKey: Boolean((p.modifiers ?? 0) & 1),
+                    ctrlKey: Boolean((p.modifiers ?? 0) & 2),
+                    metaKey: Boolean((p.modifiers ?? 0) & 4),
+                    shiftKey: Boolean((p.modifiers ?? 0) & 8),
+                },
+            ],
         })
 
         return results[0].result as { success: boolean }
@@ -103,8 +128,9 @@ export class StealthHandler {
 
     async stealthInject(params: unknown, context: ActionContext): Promise<{ success: boolean }> {
         const p = StealthInjectSchema.parse(params) ?? {}
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_inject')
+        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'stealth_inject', p.frameId)
 
+        assertActionActive(context)
         await chrome.scripting.executeScript({
             target: { tabId, frameIds: [p.frameId ?? 0] },
             func: injectStealthScripts,
@@ -117,11 +143,21 @@ export class StealthHandler {
     private async getManagedScriptableTabId(
         tabId: number | undefined,
         context: ActionContext,
-        operation: string
+        operation: string,
+        frameId = 0
     ): Promise<number> {
         const resolvedTabId = await getTargetTabId(tabId)
         await assertManagedTab(resolvedTabId, context, operation)
         await assertScriptable(resolvedTabId)
+        assertActionActive(context)
+        const setup = await chrome.scripting.executeScript({
+            target: { tabId: resolvedTabId, frameIds: [frameId] },
+            world: 'MAIN',
+            func: installDomHelpers,
+        })
+        if (!setup[0] || (setup[0] as { error?: unknown }).error) {
+            throw new ExpectedOperationError('DOM helper installation failed before stealth input', false)
+        }
         return resolvedTabId
     }
 }

@@ -7,6 +7,18 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
+import { eventRefTarget, type BrowserEventAction, type EventCommand } from './browser-events.js'
+import type {
+    BrowserRequestContext,
+    CookieFilter,
+    CookieScope,
+    FrameSelection,
+    SemanticTarget,
+    UserActionKind,
+} from './browser-driver.js'
+import { setTimeout as delay } from 'node:timers/promises'
+import { Script } from 'node:vm'
 import { ExtensionBridge, type ExtensionConnectionInfo } from '../extension/index.js'
 import {
     type ActionableClickResult,
@@ -18,20 +30,26 @@ import {
     type ListedTarget,
     type ManagedPageResult,
     type MovePageOptions,
-    type NewWindowOptions,
     type NewPageOptions,
     type NewTabResult,
+    type NewWindowOptions,
     type PageManagementResult,
+    type PageMetadata,
     type ResizeWindowOptions,
     type SetCookieParams,
     type StaleContextRetryPolicy,
+    type TargetListOptions,
     type UpdateGroupOptions,
     type UpdatePageOptions,
 } from './browser-driver.js'
 import {
+    isNativeExecutionResultUnknown,
+    getErrorSource,
+    getErrorPageContext,
     OsMouseError,
     PagePreconditionError,
     setErrorPageContext,
+    setErrorSource,
     StructuredToolError,
     TargetNotFoundError,
     TimeoutError,
@@ -45,16 +63,20 @@ import {
     type ViewportMetrics,
 } from './os-mouse.js'
 import { getKeyDefinition, getSession as getCdpSession } from './session.js'
-import { DEFAULT_TIMEOUT, type CdpResultObject, type ChallengeState, type TargetInfo, type WaitUntil } from './types.js'
-import { remainingNavigationTimeout, waitForNavigationQueue, withNavigationBudget } from './utils.js'
 import {
+    type CdpResultObject,
+    type ChallengeState,
+    DEFAULT_TIMEOUT,
     EvaluateResultTooLargeError,
     extractCdpValue,
     formatCdpException,
     isKnownNonSerializableRemoteObject,
     MODIFIER_KEYS,
     NonSerializableEvaluateResultError,
+    type TargetInfo,
+    type WaitUntil,
 } from './types.js'
+import { remainingNavigationTimeout, waitForNavigationQueue, withNavigationBudget } from './utils.js'
 
 export type ConnectionMode = 'extension' | 'cdp' | 'none'
 type ActiveConnectionMode = Exclude<ConnectionMode, 'none'>
@@ -63,6 +85,7 @@ export type InputMode = 'stealth' | 'precise' // stealth=JS模拟, precise=debug
 export interface EvaluateOptions {
     staleContextRetry?: StaleContextRetryPolicy
     fileOutput?: boolean
+    userAction?: UserActionKind
 }
 
 export interface EvaluationMetadata {
@@ -92,14 +115,6 @@ interface UnifiedSessionState {
     managed?: boolean
 }
 
-interface PageMetadata {
-    createdBy: 'mcp-chrome' | 'unknown'
-    createdAt: string | null
-    lastUsedAt: string | null
-    taskHint?: string
-    note?: string
-}
-
 interface TargetRestoration {
     status: 'restored' | 'cleared' | 'previous_target_closed' | 'failed'
     previousTargetId: string | null
@@ -119,6 +134,7 @@ class UnifiedSessionManager {
     private extensionBridge: ExtensionBridge | null = null
     private inputMode: InputMode = 'precise' // 默认使用 precise 模式，可绕过 CSP 限制
     private currentMousePosition: { x: number; y: number } = { x: 0, y: 0 } // 跟踪鼠标位置
+    private mouseFrameContext: { targetId: string; frameId: number; documentId?: string } | undefined
     /** 当前按下的修饰键位掩码 */
     private modifiers = 0
     /** 当前按下的所有键（用于 Puppeteer 风格的 rawKeyDown/autoRepeat 长按重复） */
@@ -129,18 +145,26 @@ class UnifiedSessionManager {
     private extensionChallengeStateUnsupported = false
     private unsupportedChallengeStateBundleHash: string | null = null
     private tabSwitchLock: Promise<void> = Promise.resolve() // 串行化 tab 切换，防止并发竞态
-    private readonly tabLockContext = new AsyncLocalStorage<{
-        session: UnifiedSessionManager
-        mode?: ActiveConnectionMode
-        targetRestoration?: TargetRestoration
-    }>()
+    private readonly tabLockContext = new AsyncLocalStorage<
+        BrowserRequestContext & {
+            session: UnifiedSessionManager
+            inputKeys?: Set<string>
+            inputCleanup?: () => Promise<void>
+            restoreTargetAfterPreparationFailure?: boolean
+            restoreTargetAfterLookup?: boolean
+            mode?: ActiveConnectionMode
+            targetRestoration?: TargetRestoration
+        }
+    >()
 
     private requireExtension = false // 指定 tabId 或 frame 时为 true，禁止 CDP 回退
     private currentFrameOffset: { x: number; y: number } | null = null // iframe 在主页面的偏移量（withFrame 期间有效）
     private lastEvaluationMetadata: EvaluationMetadata | undefined
     private readonly pageMetadata = new Map<string, PageMetadata>()
 
-    private constructor() {}
+    private constructor() {
+        getCdpSession().requestContext = () => this.tabLockContext.getStore()
+    }
 
     static getInstance(): UnifiedSessionManager {
         if (!UnifiedSessionManager.instance) {
@@ -157,7 +181,7 @@ class UnifiedSessionManager {
             return // 已经启动
         }
 
-        this.extensionBridge = new ExtensionBridge()
+        this.extensionBridge = new ExtensionBridge({ requestContext: () => this.tabLockContext.getStore() })
 
         try {
             await this.extensionBridge.start()
@@ -223,6 +247,7 @@ class UnifiedSessionManager {
     getPageMetadata(targetId: string): PageMetadata {
         return (
             this.pageMetadata.get(this.metadataKey(targetId)) ?? {
+                origin: 'unknown',
                 createdBy: 'unknown',
                 createdAt: null,
                 lastUsedAt: null,
@@ -235,6 +260,15 @@ class UnifiedSessionManager {
         updates: { taskHint?: string | null; note?: string | null }
     ): Promise<PageMetadata> {
         await this.getPageSnapshot(targetId)
+        if (this.getMode() === 'extension') {
+            const driver = await this.getDriver()
+            if (!driver.setPageMetadata) {
+                throw new DriverCapabilityError('Extension 不支持持久页面备注，请成套更新 Server 和 Extension')
+            }
+            const metadata = await driver.setPageMetadata(targetId, updates)
+            this.pageMetadata.set(this.metadataKey(targetId), metadata)
+            return metadata
+        }
         const metadata = { ...this.getPageMetadata(targetId) }
         if (updates.taskHint !== undefined) {
             if (updates.taskHint === null) {
@@ -355,7 +389,10 @@ class UnifiedSessionManager {
     /**
      * 列出所有页面
      */
-    async listTargets(timeout?: number): Promise<
+    async listTargets(
+        timeout?: number,
+        options?: TargetListOptions
+    ): Promise<
         Array<
             TargetInfo &
                 Omit<ListedTarget, 'id'> & {
@@ -379,12 +416,18 @@ class UnifiedSessionManager {
         const deadline = timeout === undefined ? undefined : Date.now() + timeout
         const driver = await this.getDriver(timeout)
         const targets = await driver.listTargets(
-            deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+            deadline === undefined ? undefined : remainingNavigationTimeout(deadline),
+            options
         )
         const liveKeys = new Set(targets.map((t) => `${mode}:${t.targetId ?? String(t.id)}`))
         for (const key of this.pageMetadata.keys()) {
             if (key.startsWith(`${mode}:`) && !liveKeys.has(key)) {
                 this.pageMetadata.delete(key)
+            }
+        }
+        for (const target of targets) {
+            if (target.metadata) {
+                this.rememberPageMetadata(target.targetId ?? String(target.id), target.metadata)
             }
         }
         return targets.map(({ id, ...target }) => ({
@@ -397,7 +440,7 @@ class UnifiedSessionManager {
         }))
     }
 
-    async listTopology(timeout?: number): Promise<BrowserTopology | null> {
+    async listTopology(timeout?: number, options?: TargetListOptions): Promise<BrowserTopology | null> {
         const mode = this.getMode()
         if (mode === 'none') {
             return null
@@ -407,7 +450,16 @@ class UnifiedSessionManager {
         if (!driver.listWindows) {
             return null
         }
-        return driver.listWindows(deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
+        const topology = await driver.listWindows(
+            deadline === undefined ? undefined : remainingNavigationTimeout(deadline),
+            options
+        )
+        for (const tab of topology.windows.flatMap((window) => window.tabs)) {
+            if (tab.metadata) {
+                this.rememberPageMetadata(tab.targetId ?? String(tab.id), tab.metadata)
+            }
+        }
+        return topology
     }
 
     async setReadAccess(targetId: string, allow: boolean): Promise<Record<string, unknown>> {
@@ -624,7 +676,7 @@ class UnifiedSessionManager {
         fullPage?: boolean
         scale?: number
         clip?: { x: number; y: number; width: number; height: number }
-    }): Promise<{ data: string; format: string }> {
+    }): Promise<import('./browser-driver.js').ScreenshotResult> {
         return (await this.getDriver()).screenshot(options)
     }
 
@@ -633,7 +685,7 @@ class UnifiedSessionManager {
      */
     async click(refId: string): Promise<void> {
         const driver = await this.getDriver()
-        await driver.click(refId)
+        await driver.click(refId, undefined, this.modifiers)
     }
 
     /**
@@ -651,19 +703,43 @@ class UnifiedSessionManager {
         const driver = await this.getDriver()
         if (point) {
             this.currentMousePosition = { x: point.x, y: point.y }
+            this.rememberMouseFrame()
         }
-        if (button === 'left' && clickCount === 1) {
-            return driver.actionableClick(refId, force)
+        if (this.inputMode === 'stealth' || force) {
+            if (button === 'left' && clickCount === 1) {
+                return driver.actionableClick(refId, force, undefined, this.modifiers)
+            }
         }
         if (!force) {
             const result = await driver.checkActionability(refId)
-            if (!result.success) return result
+            if (!result.success) {
+                return result
+            }
+            if (result.clickPoint) {
+                this.currentMousePosition = { ...result.clickPoint }
+                this.rememberMouseFrame()
+            }
         }
         if (force) {
             const { x, y } = this.currentMousePosition
-            await driver.stealthClick(x, y, button, clickCount, refId)
+            await driver.stealthClick(x, y, button, clickCount, refId, undefined, this.modifiers)
         } else {
-            await this.mouseClick(button, clickCount, refId)
+            try {
+                await this.mouseClick(button, clickCount, refId)
+            } catch (error) {
+                const code = (error as { code?: string } | null)?.code
+                if (
+                    code !== 'NATIVE_INPUT_UNAVAILABLE' ||
+                    !this.isExtensionConnected() ||
+                    button !== 'left' ||
+                    clickCount !== 1 ||
+                    this.modifiers !== 0
+                ) {
+                    throw error
+                }
+                const result = await driver.actionableClick(refId, false, undefined, this.modifiers)
+                return { ...result, warning: '后台元素单击使用合成事件，isTrusted=false，未激活标签页' }
+            }
         }
         return { success: true }
     }
@@ -738,7 +814,7 @@ class UnifiedSessionManager {
         options: EvaluateOptions = {},
         _retried = false
     ): Promise<T> {
-        const entryStart = Date.now()
+        this.assertRequestActive()
         this.lastEvaluationMetadata = undefined
         const effectiveMode = mode ?? this.inputMode
         const hasArgs = args !== undefined
@@ -752,53 +828,33 @@ class UnifiedSessionManager {
 
         const cdpScript = hasArgs ? code : expression
 
-        try {
-            if (timeout !== undefined) {
-                // 轮询上下文：快速失败，端到端预算受控
-                if (!this.isExtensionConnected()) {
-                    this.assertCdpFallbackAllowed()
-                    return this.evaluateViaCdp<T>(cdpScript, args, timeout)
-                }
-            } else {
-                // 非轮询上下文：允许等待重连；连接失败时回退 CDP
-                if (!(await this.ensureExtensionConnected())) {
-                    return this.evaluateViaCdp<T>(cdpScript, args, timeout)
+        if (!_retried && !hasArgs && /\breturn\b/.test(code)) {
+            try {
+                new Script(code)
+            } catch (error) {
+                if (error instanceof SyntaxError && /Illegal return statement/.test(error.message)) {
+                    return this.evaluate<T>(`(() => { ${code} })()`, mode, timeout, undefined, options, true)
                 }
             }
-
-            // Extension 路径
-            if (effectiveMode === 'precise') {
-                return this.evaluateViaExtensionPrecise<T>(code, expression, args, timeout, options)
-            }
-            return this.evaluateViaExtensionStealth<T>(expression, timeout)
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err)
-            // 计算重试时剩余预算（避免重试用满预算导致总耗时超额）
-            const remainingTimeout =
-                timeout !== undefined ? Math.max(0, timeout - (Date.now() - entryStart)) : undefined
-            // Extension 断连时等待重连后重试一次
-            if (!_retried && (isExtensionDisconnected(err) || msg.includes('not connected'))) {
-                if (remainingTimeout !== undefined && remainingTimeout <= 0) {
-                    throw err
-                }
-                await new Promise((r) => setTimeout(r, 2000))
-                if (this.isExtensionConnected()) {
-                    return this.evaluate<T>(code, mode, remainingTimeout, args, options, true)
-                }
-                // Extension 重连失败，尝试 CDP fallback
-                if (!this.requireExtension) {
-                    return this.evaluateViaCdp<T>(cdpScript, args, remainingTimeout)
-                }
-            }
-            // 裸 return 语句导致语法错误时，自动包裹 IIFE 重试（仅一次）
-            if (!_retried && !hasArgs) {
-                if (/Illegal return statement|'return' not inside function|Unexpected token 'return'/.test(msg)) {
-                    const wrapped = `(() => { ${code} })()`
-                    return this.evaluate<T>(wrapped, mode, timeout, undefined, options, true)
-                }
-            }
-            throw err
         }
+        if (timeout !== undefined) {
+            // 轮询上下文：快速失败，端到端预算受控
+            if (!this.isExtensionConnected()) {
+                this.assertCdpFallbackAllowed()
+                return await this.evaluateViaCdp<T>(cdpScript, args, timeout, options)
+            }
+        } else {
+            // 非轮询上下文：允许等待重连；连接失败时回退 CDP
+            if (!(await this.ensureExtensionConnected())) {
+                return await this.evaluateViaCdp<T>(cdpScript, args, timeout, options)
+            }
+        }
+
+        // Extension 路径
+        if (effectiveMode === 'precise') {
+            return await this.evaluateViaExtensionPrecise<T>(code, expression, args, timeout, options)
+        }
+        return await this.evaluateViaExtensionStealth<T>(expression, timeout, options.userAction)
     }
 
     /**
@@ -938,12 +994,15 @@ class UnifiedSessionManager {
      * @param text 文本内容
      * @param xpath XPath 表达式
      * @param timeout 端到端预算（毫秒），包含连接等待和请求超时，传给 bridge.find → sendCommand
+     * @param semanticOrMatchIndex 语义名称条件，或兼容旧调用的匹配序号
+     * @param matchIndex 匹配序号，从 0 开始，指定时只返回该位置
      */
     async find(
         selector?: string,
         text?: string,
         xpath?: string,
         timeout?: number,
+        semanticOrMatchIndex?: SemanticTarget | number,
         matchIndex?: number
     ): Promise<
         Array<{
@@ -953,23 +1012,26 @@ class UnifiedSessionManager {
             rect: { x: number; y: number; width: number; height: number }
         }>
     > {
-        if (matchIndex !== undefined) {
-            return this.extensionReadBridge().find(selector, text, xpath, timeout, undefined, matchIndex)
-        }
+        const semantic = typeof semanticOrMatchIndex === 'object' ? semanticOrMatchIndex : undefined
+        matchIndex = typeof semanticOrMatchIndex === 'number' ? semanticOrMatchIndex : matchIndex
+        this.assertRequestActive()
         if (timeout !== undefined) {
             // 轮询上下文：快速失败，端到端预算受控
             if (this.isExtensionConnected()) {
-                return this.extensionBridge!.find(selector, text, xpath, timeout)
+                return this.extensionBridge!.find(selector, text, xpath, timeout, semantic, matchIndex)
             }
             this.assertCdpFallbackAllowed()
-            return getCdpSession().find(selector, text, xpath, timeout)
+            return getCdpSession().find(selector, text, xpath, timeout, semantic, matchIndex)
         }
 
         // 非轮询上下文：允许等待重连，断连时 fallback CDP
         const driver = await this.getDriver()
         return this.withExtensionRetry(
-            () => driver.find(selector, text, xpath),
-            () => getCdpSession().find(selector, text, xpath)
+            () =>
+                driver === this.extensionBridge
+                    ? this.extensionBridge.find(selector, text, xpath, undefined, semantic, matchIndex)
+                    : getCdpSession().find(selector, text, xpath, undefined, semantic, matchIndex),
+            () => getCdpSession().find(selector, text, xpath, undefined, semantic, matchIndex)
         )
     }
 
@@ -996,14 +1058,7 @@ class UnifiedSessionManager {
     /**
      * 获取 Cookies
      */
-    async getCookies(filter?: {
-        url?: string
-        name?: string
-        domain?: string
-        path?: string
-        secure?: boolean
-        session?: boolean
-    }): Promise<unknown> {
+    async getCookies(filter?: CookieFilter): Promise<unknown> {
         return (await this.getDriver()).getCookies(filter)
     }
 
@@ -1012,11 +1067,11 @@ class UnifiedSessionManager {
         await driver.setCookie(params)
     }
 
-    async deleteCookie(url: string, name: string): Promise<void> {
-        return (await this.getDriver()).deleteCookie(url, name)
+    async deleteCookie(url: string, name: string, scope?: CookieScope): Promise<void> {
+        return (await this.getDriver()).deleteCookie(url, name, scope)
     }
 
-    async clearCookies(filter?: { url?: string; domain?: string; name?: string }): Promise<{ count: number }> {
+    async clearCookies(filter?: CookieFilter): Promise<{ count: number }> {
         if (!filter || (!filter.url && !filter.domain)) {
             throw new Error(
                 'clearCookies 必须带 url 或 domain 过滤参数，name 只能在该范围内进一步过滤（防止跨站误清同名 cookie）'
@@ -1034,6 +1089,11 @@ class UnifiedSessionManager {
         const op = async (): Promise<TargetInfo & NewTabResult> => {
             const result = await driver.newPage(url, timeout, options)
             this.recordPageUse(result.targetId, true)
+            if (result.metadata) {
+                this.rememberPageMetadata(result.targetId, result.metadata)
+            } else if (!isExt && (options?.taskHint !== undefined || options?.note !== undefined)) {
+                await this.setPageMetadata(result.targetId, options)
+            }
             return {
                 ...result,
                 targetId: result.targetId,
@@ -1102,8 +1162,282 @@ class UnifiedSessionManager {
      *
      * 同一请求内的嵌套调用可重入，恢复状态只保存在当前请求的 AsyncLocalStorage 中
      */
-    async withTabLock<T>(fn: () => Promise<T>, deadline?: number): Promise<T> {
+    assertRequestActive(scope: BrowserRequestContext | undefined = this.tabLockContext.getStore()): void {
+        if (scope?.budgetError) {
+            throw scope.budgetError
+        }
+        scope?.signal?.throwIfAborted()
+        if (scope?.deadline !== undefined && Date.now() >= scope.deadline) {
+            throw setErrorSource(
+                new StructuredToolError('TIMEOUT', 'Request timeout before dispatch', '请检查页面状态后再提交操作', {
+                    actionExecuted: false,
+                    actionStatus: 'not_started',
+                    retryable: false,
+                }),
+                'budget'
+            )
+        }
+    }
+
+    async withUserAction<T>(
+        kind: UserActionKind,
+        fn: () => Promise<T>,
+        restoreTargetAfterPreparationFailure = false
+    ): Promise<T> {
+        return this.withTabLock(async () => {
+            const scope = this.tabLockContext.getStore()!
+            const previous = scope.userAction
+            const action: NonNullable<BrowserRequestContext['userAction']> = {
+                kind,
+                dispatched: false,
+                phase: 'preparation',
+            }
+            scope.userAction = action
+            try {
+                return await fn()
+            } catch (error) {
+                if (restoreTargetAfterPreparationFailure && !action.dispatched && action.phase === 'preparation') {
+                    scope.restoreTargetAfterPreparationFailure = true
+                }
+                throw this.annotateUserActionError(error)
+            } finally {
+                if (previous?.kind === kind && action.dispatched) {
+                    previous.dispatched = true
+                }
+                scope.userAction = previous
+            }
+        })
+    }
+
+    annotateUserActionError(error: unknown): unknown {
+        const scope = this.tabLockContext.getStore()
+        if (scope && error instanceof Error && getErrorSource(error) === 'budget') {
+            scope.budgetError ??= error
+        }
+        const action = scope?.userAction
+        const uncertain = getErrorSource(error) !== 'page' && isNativeExecutionResultUnknown(error)
+        const outputFailure =
+            getErrorSource(error) !== 'page' &&
+            error instanceof StructuredToolError &&
+            error.code === 'NON_SERIALIZABLE_EVALUATE_RESULT' &&
+            getErrorPageContext(error)?.contextPhase === 'preparation'
+        const preparing =
+            action &&
+            !action.dispatched &&
+            (uncertain ||
+                outputFailure ||
+                getErrorPageContext(error)?.keyboardFocusPreparation === true ||
+                getErrorPageContext(error)?.frameResolutionPreparation === true ||
+                action.phase === 'precondition' ||
+                error instanceof PagePreconditionError)
+        return setErrorPageContext(error, {
+            contextPhase: preparing
+                ? error instanceof PagePreconditionError
+                    ? 'precondition'
+                    : action.phase
+                : 'action',
+        })
+    }
+
+    async prepareKeyboardFocus(timeout?: number): Promise<string | undefined> {
+        if (this.getMode() !== 'extension' || this.inputMode !== 'precise') {
+            return undefined
+        }
+        const scope = this.tabLockContext.getStore()!
+        if (scope.keyboardFocus) {
+            return undefined
+        }
+        const bridge = this.extensionBridge!
+        const targetId = bridge.getCurrentTargetId()
+        if (!targetId) {
+            throw new TargetNotFoundError('没有当前原生按键目标')
+        }
+        const focus: NonNullable<BrowserRequestContext['keyboardFocus']> = { id: randomUUID(), targetId }
+        scope.keyboardFocus = focus
+        try {
+            this.assertRequestActive()
+            const result = await bridge.acquireKeyboardFocus(focus.id, timeout)
+            if (result.changed) {
+                focus.warning = '原生按键期间文档临时报告 visible；操作结束后恢复原设置，实际标签页与窗口焦点保持'
+            }
+            this.assertRequestActive()
+            return focus.warning
+        } catch (error) {
+            throw setErrorPageContext(error, { keyboardFocusPreparation: true })
+        }
+    }
+
+    async withInputCleanup<T>(fn: () => Promise<T>): Promise<T> {
+        const scope = this.tabLockContext.getStore()!
+        const keysBefore = new Set(this.pressedKeys)
+        const driver = this.getMode() === 'extension' ? this.extensionBridge : getCdpSession()
+        const targetId = driver?.getCurrentTargetId()
+        const frameId = driver?.getCurrentFrameId?.()
+        const documentId =
+            this.extensionBridge === driver ? this.extensionBridge?.getCurrentFrameDocumentId?.() : undefined
+        const keys = new Set<string>()
+        scope.inputKeys = keys
+        const cleanup = async (releaseUnknown = false) => {
+            if (
+                !releaseUnknown &&
+                !scope.signal?.aborted &&
+                !scope.budgetError &&
+                (scope.deadline === undefined || Date.now() < scope.deadline)
+            ) {
+                return
+            }
+            scope.inputCleanup = undefined
+            if (![...keys].some((key) => !keysBefore.has(key))) {
+                return
+            }
+            const cleanupDeadline = Date.now() + 1000
+            try {
+                await this.tabLockContext.run(
+                    {
+                        ...scope,
+                        signal: undefined,
+                        deadline: cleanupDeadline,
+                        inputCleanup: undefined,
+                        userAction: undefined,
+                        budgetError: undefined,
+                        pendingPageCondition: null,
+                    },
+                    async () => {
+                        const bridge = driver === this.extensionBridge ? this.extensionBridge : null
+                        const previousTarget = driver?.getCurrentTargetId()
+                        const previousFrame = driver?.getCurrentFrameId?.()
+                        const previousDocument = bridge?.getCurrentFrameDocumentId?.()
+                        const inputContext =
+                            !bridge && targetId && (targetId !== previousTarget || frameId !== previousFrame)
+                                ? { targetId, frameId }
+                                : undefined
+                        try {
+                            if (bridge && targetId) {
+                                bridge.setCurrentTargetId(targetId)
+                                if (frameId !== undefined) {
+                                    bridge.setCurrentFrameId(frameId, documentId)
+                                }
+                            }
+                            for (const key of keys) {
+                                if (keysBefore.has(key)) {
+                                    continue
+                                }
+                                try {
+                                    await this.keyUp(key, remainingNavigationTimeout(cleanupDeadline), inputContext)
+                                } catch (error) {
+                                    console.warn('[MCP] Cancelled input key release failed:', key, error)
+                                }
+                            }
+                        } finally {
+                            if (bridge && previousTarget !== undefined) {
+                                bridge.setCurrentTargetId(previousTarget)
+                                if (previousFrame !== undefined) {
+                                    bridge.setCurrentFrameId(previousFrame, previousDocument)
+                                }
+                            }
+                        }
+                    }
+                )
+            } catch (error) {
+                console.warn('[MCP] Cancelled input scope cleanup failed:', error)
+            }
+        }
+        scope.inputCleanup = cleanup
+        let failed = false
+        let primaryError: unknown
+        let cleanupError: StructuredToolError | undefined
+        let value: T
+        try {
+            value = await fn()
+        } catch (error) {
+            failed = true
+            primaryError = error
+            if (scope.keyboardFocus?.warning) {
+                setErrorPageContext(error, { keyboardFocusWarning: scope.keyboardFocus.warning })
+            }
+            throw error
+        } finally {
+            await cleanup(failed && isNativeExecutionResultUnknown(primaryError))
+            const focus = scope.keyboardFocus
+            if (focus && driver === this.extensionBridge) {
+                scope.inputCleanup = undefined
+                const releaseKeys =
+                    failed ||
+                    Boolean(scope.signal?.aborted || scope.budgetError) ||
+                    (scope.deadline !== undefined && Date.now() >= scope.deadline)
+                let result: { restored: boolean; errors: string[] }
+                try {
+                    result = await this.tabLockContext.run(
+                        {
+                            ...scope,
+                            signal: undefined,
+                            deadline: Date.now() + 4000,
+                            budgetError: undefined,
+                            userAction: undefined,
+                            pendingPageCondition: null,
+                            keyboardFocus: undefined,
+                            inputCleanup: undefined,
+                        },
+                        () => this.extensionBridge!.releaseKeyboardFocus(focus, releaseKeys)
+                    )
+                    if (releaseKeys && result.restored) {
+                        for (const key of keys) {
+                            if (!keysBefore.has(key)) {
+                                this.pressedKeys.delete(key)
+                                this.modifiers &= ~(MODIFIER_KEYS[key] ?? 0)
+                            }
+                        }
+                    }
+                } catch (error) {
+                    result = { restored: false, errors: [error instanceof Error ? error.message : String(error)] }
+                } finally {
+                    scope.keyboardFocus = undefined
+                }
+                if (!result.restored) {
+                    if (failed) {
+                        setErrorPageContext(primaryError, { keyboardFocusCleanup: result })
+                    } else {
+                        cleanupError = new StructuredToolError(
+                            'KEYBOARD_FOCUS_CLEANUP_FAILED',
+                            '原生按键已执行，焦点状态恢复未完成',
+                            '请读取当前页面与 Extension 日志',
+                            {
+                                failureStage: 'cleanup',
+                                retryable: false,
+                                keyboardFocusCleanup: result,
+                            }
+                        )
+                    }
+                }
+            }
+        }
+        if (cleanupError) {
+            throw cleanupError
+        }
+        return value
+    }
+
+    async wait(ms: number): Promise<void> {
+        this.assertRequestActive()
+        await delay(ms, undefined, { signal: this.tabLockContext.getStore()?.signal })
+        this.assertRequestActive()
+    }
+
+    async withMetadataContext<T>(fn: () => Promise<T>, deadline?: number, signal?: AbortSignal): Promise<T> {
+        const mode = this.getMode()
+        return this.tabLockContext.run(
+            { session: this, deadline, signal, mode: mode === 'none' ? undefined : mode },
+            async () => {
+                this.assertRequestActive()
+                return fn()
+            }
+        )
+    }
+
+    async withTabLock<T>(fn: () => Promise<T>, deadline?: number, signal?: AbortSignal): Promise<T> {
+        signal?.throwIfAborted()
         if (this.tabLockContext.getStore()?.session === this) {
+            this.assertRequestActive()
             if (deadline !== undefined) {
                 remainingNavigationTimeout(deadline)
             }
@@ -1116,9 +1450,28 @@ class UnifiedSessionManager {
         })
         let acquired = false
         try {
-            await waitForNavigationQueue(previousLock, deadline)
+            await waitForNavigationQueue(previousLock, deadline, signal)
             acquired = true
-            return await this.tabLockContext.run({ session: this }, fn)
+            signal?.throwIfAborted()
+            return await this.tabLockContext.run({ session: this, deadline, signal }, async () => {
+                const scope = this.tabLockContext.getStore()!
+                try {
+                    return await fn()
+                } finally {
+                    try {
+                        if (
+                            scope.signal?.aborted ||
+                            scope.budgetError ||
+                            (scope.deadline !== undefined && Date.now() >= scope.deadline)
+                        ) {
+                            await scope.inputCleanup?.()
+                        }
+                    } finally {
+                        scope.inputKeys = undefined
+                        scope.inputCleanup = undefined
+                    }
+                }
+            })
         } finally {
             if (acquired) {
                 releaseLock!()
@@ -1199,45 +1552,83 @@ class UnifiedSessionManager {
                         temporaryTargetId: targetId,
                         currentTargetId: null,
                     }
-                    let clearTarget = true
-                    try {
-                        if (previousId) {
-                            const targets = await driver.listTargets(remaining())
-                            if (targets.some((target) => (target.targetId ?? String(target.id)) === previousId)) {
-                                await driver.selectPage(previousId, remaining())
-                                clearTarget = false
-                            } else {
-                                restoration.status = 'previous_target_closed'
-                            }
-                        }
-                    } catch (error) {
-                        restoration.status = 'failed'
-                        restoration.error = error instanceof Error ? error.message : String(error)
-                    }
-                    if (clearTarget) {
-                        try {
-                            if (mode === 'extension') {
-                                driver.setCurrentTargetId(null)
-                            } else {
-                                await getCdpSession().deselectPage(
-                                    deadline === undefined ? undefined : Math.max(0, deadline - Date.now())
-                                )
-                            }
-                        } catch (error) {
-                            const message = error instanceof Error ? error.message : String(error)
-                            if (restoration.error) {
-                                restoration.cleanupError = message
-                            } else {
+                    const independentCleanup =
+                        (scope.restoreTargetAfterPreparationFailure === true ||
+                            scope.restoreTargetAfterLookup === true) &&
+                        (scope.signal?.aborted === true ||
+                            scope.budgetError !== undefined ||
+                            (scope.deadline !== undefined && Date.now() >= scope.deadline))
+                    scope.restoreTargetAfterPreparationFailure = undefined
+                    scope.restoreTargetAfterLookup = undefined
+                    const cleanupDeadline = independentCleanup ? Date.now() + 1000 : deadline
+                    const cleanupRemaining = () =>
+                        cleanupDeadline === undefined ? undefined : remainingNavigationTimeout(cleanupDeadline)
+                    await this.tabLockContext.run(
+                        independentCleanup
+                            ? {
+                                  ...scope,
+                                  signal: undefined,
+                                  deadline: cleanupDeadline,
+                                  budgetError: undefined,
+                                  userAction: undefined,
+                                  pendingPageCondition: null,
+                                  keyboardFocus: undefined,
+                                  inputCleanup: undefined,
+                              }
+                            : scope,
+                        async () => {
+                            let clearTarget = true
+                            try {
+                                if (previousId) {
+                                    const targets = await driver.listTargets(cleanupRemaining())
+                                    if (
+                                        targets.some((target) => (target.targetId ?? String(target.id)) === previousId)
+                                    ) {
+                                        await driver.selectPage(previousId, cleanupRemaining())
+                                        clearTarget = false
+                                    } else {
+                                        restoration.status = 'previous_target_closed'
+                                    }
+                                }
+                            } catch (error) {
                                 restoration.status = 'failed'
-                                restoration.error = message
+                                restoration.error = error instanceof Error ? error.message : String(error)
+                            }
+                            if (clearTarget) {
+                                try {
+                                    if (mode === 'extension') {
+                                        driver.setCurrentTargetId(null)
+                                    } else {
+                                        await getCdpSession().deselectPage(
+                                            cleanupDeadline === undefined
+                                                ? undefined
+                                                : Math.max(0, cleanupDeadline - Date.now())
+                                        )
+                                    }
+                                } catch (error) {
+                                    const message = error instanceof Error ? error.message : String(error)
+                                    if (restoration.error) {
+                                        restoration.cleanupError = message
+                                    } else {
+                                        restoration.status = 'failed'
+                                        restoration.error = message
+                                    }
+                                }
                             }
                         }
-                    }
+                    )
                     restoration.currentTargetId = driver.getCurrentTargetId()
-                    this.tabLockContext.getStore()!.targetRestoration = restoration
+                    scope.targetRestoration = restoration
                 }
             }
         }, deadline)
+    }
+
+    preserveTargetAfterLookup(): void {
+        const scope = this.tabLockContext.getStore()
+        if (scope) {
+            scope.restoreTargetAfterLookup = true
+        }
     }
 
     getTargetRestoration(): TargetRestoration | undefined {
@@ -1261,6 +1652,10 @@ class UnifiedSessionManager {
                 ? await this.extensionBridge!.getPageSnapshot(id, timeout)
                 : await getCdpSession().getPageSnapshot(id, timeout)
         this.recordPageUse(id)
+        const nativeMetadata = (snapshot as typeof snapshot & { metadata?: PageMetadata }).metadata
+        if (nativeMetadata) {
+            this.rememberPageMetadata(id, nativeMetadata)
+        }
         return snapshot
     }
 
@@ -1269,62 +1664,81 @@ class UnifiedSessionManager {
         fn: () => Promise<T>,
         deadline?: number
     ): Promise<T> {
-        if (condition.expectedUrl === undefined && condition.expectedRevision === undefined) {
-            return fn()
-        }
-        return this.withTabLock(async () => {
-            const mode = this.getMode()
-            const targetId = condition.targetId ?? this.getCurrentTargetId()
-            if (mode === 'none' || !targetId) {
-                throw new DriverCapabilityError('没有操作目标，请先选择页面')
-            }
-            const driver = mode === 'extension' ? this.extensionBridge! : getCdpSession()
-            const previousRequireExtension = this.requireExtension
-            const previousCdpSelection = this.cdpExplicitlySelected
-            const previousMode = this.activeMode
-            if (mode === 'extension') {
-                this.requireExtension = true
-            } else {
-                this.cdpExplicitlySelected = true
-            }
-            try {
-                const snapshot = await driver.getPageSnapshot(
-                    targetId,
-                    deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
-                )
-                if (snapshot.revision === null) {
-                    throw new StructuredToolError(
-                        'DRIVER_CAPABILITY_ERROR',
-                        '当前 Extension 不支持原子页面条件，未执行操作',
-                        '更新 Extension 后再使用 expectedUrl 或 expectedRevision',
-                        { targetId, actionExecuted: false, actionStatus: 'not_started', failureStage: 'precondition' }
-                    )
-                }
-                if (
-                    (condition.expectedUrl !== undefined && snapshot.url !== condition.expectedUrl) ||
-                    (condition.expectedRevision !== undefined && snapshot.revision !== condition.expectedRevision)
-                ) {
-                    throw new PagePreconditionError({
-                        targetId,
-                        expectedUrl: condition.expectedUrl ?? null,
-                        expectedRevision: condition.expectedRevision ?? null,
-                        actualUrl: snapshot.url,
-                        actualRevision: snapshot.revision,
-                    })
-                }
-                driver.setPageCondition({
-                    targetId,
-                    expectedUrl: condition.expectedUrl,
-                    expectedRevision: condition.expectedRevision,
-                })
+        let contextPhase: 'action' | 'precondition' = 'action'
+        try {
+            if (condition.expectedUrl === undefined && condition.expectedRevision === undefined) {
                 return await fn()
-            } finally {
-                driver.setPageCondition(null)
-                this.requireExtension = previousRequireExtension
-                this.cdpExplicitlySelected = previousCdpSelection
-                this.activeMode = previousMode
             }
-        }, deadline)
+            return await this.withTabLock(async () => {
+                contextPhase = 'precondition'
+                const userAction = this.tabLockContext.getStore()?.userAction
+                if (userAction) {
+                    userAction.phase = 'precondition'
+                }
+                const mode = this.getMode()
+                const targetId = condition.targetId ?? this.getCurrentTargetId()
+                if (mode === 'none' || !targetId) {
+                    throw new DriverCapabilityError('没有操作目标，请先选择页面')
+                }
+                const driver = mode === 'extension' ? this.extensionBridge! : getCdpSession()
+                const previousRequireExtension = this.requireExtension
+                const previousCdpSelection = this.cdpExplicitlySelected
+                const previousMode = this.activeMode
+                if (mode === 'extension') {
+                    this.requireExtension = true
+                } else {
+                    this.cdpExplicitlySelected = true
+                }
+                try {
+                    const snapshot = await driver.getPageSnapshot(
+                        targetId,
+                        deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
+                    )
+                    if (snapshot.revision === null) {
+                        throw new StructuredToolError(
+                            'DRIVER_CAPABILITY_ERROR',
+                            '当前 Extension 不支持原子页面条件，未执行操作',
+                            '更新 Extension 后再使用 expectedUrl 或 expectedRevision',
+                            {
+                                targetId,
+                                actionExecuted: false,
+                                actionStatus: 'not_started',
+                                failureStage: 'precondition',
+                            }
+                        )
+                    }
+                    if (
+                        (condition.expectedUrl !== undefined && snapshot.url !== condition.expectedUrl) ||
+                        (condition.expectedRevision !== undefined && snapshot.revision !== condition.expectedRevision)
+                    ) {
+                        throw new PagePreconditionError({
+                            targetId,
+                            expectedUrl: condition.expectedUrl ?? null,
+                            expectedRevision: condition.expectedRevision ?? null,
+                            actualUrl: snapshot.url,
+                            actualRevision: snapshot.revision,
+                        })
+                    }
+                    driver.setPageCondition({
+                        targetId,
+                        expectedUrl: condition.expectedUrl,
+                        expectedRevision: condition.expectedRevision,
+                    })
+                    contextPhase = 'action'
+                    if (userAction) {
+                        userAction.phase = 'preparation'
+                    }
+                    return await fn()
+                } finally {
+                    driver.setPageCondition(null)
+                    this.requireExtension = previousRequireExtension
+                    this.cdpExplicitlySelected = previousCdpSelection
+                    this.activeMode = previousMode
+                }
+            }, deadline)
+        } catch (error) {
+            throw setErrorPageContext(error, { contextPhase })
+        }
     }
 
     /**
@@ -1336,41 +1750,112 @@ class UnifiedSessionManager {
      * 与 withTabId 配合使用时，应嵌套在 withTabId 内部：
      * withTabId(tabId, () => withFrame(frame, () => { ... }))
      */
-    async withFrame<T>(frame: string | number | undefined, fn: () => Promise<T>, deadline?: number): Promise<T> {
+    async withFrame<T>(frame: FrameSelection | undefined, fn: () => Promise<T>, deadline?: number): Promise<T> {
         if (frame === undefined) {
             return fn()
         }
-
-        if (this.getMode() !== 'extension' || !this.extensionBridge?.isConnected()) {
-            throw new DriverCapabilityError('iframe 穿透需要 Extension 模式，当前连接未执行 frame 解析或操作')
-        }
-
-        const driver = this.extensionBridge!
-        const { frameId, offset, frameContext } = await driver.resolveFrame(
-            frame,
-            deadline === undefined ? undefined : remainingNavigationTimeout(deadline)
-        )
+        const scope = this.tabLockContext.getStore()
+        deadline = deadline === undefined ? scope?.deadline : Math.min(deadline, scope?.deadline ?? deadline)
+        const driver = await this.getDriver(deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
+        const { frameId, offset, frameContext } = await driver
+            .resolveFrame(frame, deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
+            .catch((error: unknown) => {
+                if (!scope?.userAction?.dispatched) {
+                    if (scope) {
+                        scope.restoreTargetAfterPreparationFailure = true
+                    }
+                    throw setErrorPageContext(error, { contextPhase: 'preparation', frameResolutionPreparation: true })
+                }
+                throw error
+            })
         const previousFrameId = driver.getCurrentFrameId()
-        const previousFrameOffset = this.currentFrameOffset
-        const previousRequireExtension = this.requireExtension
-        const previousActiveMode = this.activeMode
-        driver.setCurrentFrameId(frameId)
+        const extension = driver === this.extensionBridge ? this.extensionBridge : undefined
+        const previousDocument = extension?.getCurrentFrameDocumentId?.()
+        const previousOffset = this.currentFrameOffset
+        if (extension) {
+            extension.setCurrentFrameId(
+                frameId,
+                typeof frameContext?.documentId === 'string' ? frameContext.documentId : undefined
+            )
+        } else {
+            driver.setCurrentFrameId(frameId)
+        }
         this.currentFrameOffset = offset
-        this.requireExtension = true
-        this.activeMode = 'extension'
         try {
             return await fn()
         } catch (error) {
-            throw setErrorPageContext(error, {
-                frameContext: { selection: frame, frameId, ...frameContext },
-            })
+            throw setErrorPageContext(error, { frameContext: { selection: frame, frameId, ...frameContext } })
         } finally {
-            // 字段赋值不会 throw,driver.setCurrentFrameId 是同步函数也不会 throw,无需嵌套 try
-            this.requireExtension = previousRequireExtension
-            this.activeMode = previousActiveMode
-            this.currentFrameOffset = previousFrameOffset
-            driver.setCurrentFrameId(previousFrameId)
+            this.currentFrameOffset = previousOffset
+            if (extension) {
+                extension.setCurrentFrameId(previousFrameId, previousDocument)
+            } else {
+                driver.setCurrentFrameId(previousFrameId)
+            }
         }
+    }
+
+    hasBrowserEventObservation(targetId?: string): boolean {
+        return this.getMode() === 'cdp' || this.extensionBridge?.hasBrowserEventObservation(targetId) === true
+    }
+
+    async browserEvents(
+        action: BrowserEventAction,
+        command: EventCommand,
+        targetId?: string,
+        timeout = DEFAULT_TIMEOUT,
+        signal?: AbortSignal,
+        deadline = Date.now() + timeout
+    ): Promise<Record<string, unknown>> {
+        const refTarget = command.ref ? eventRefTarget(command.ref) : undefined
+        const mode = refTarget?.backend ?? this.getMode()
+        if (targetId && refTarget && targetId !== refTarget.targetId) {
+            throw new DriverCapabilityError('Browser event ref target mismatch')
+        }
+        const driver = mode === 'extension' ? this.extensionBridge : mode === 'cdp' ? getCdpSession() : null
+        if (!driver) {
+            throw new DriverCapabilityError('Browser event backend is not connected')
+        }
+        const id = refTarget?.targetId ?? targetId ?? driver.getCurrentTargetId() ?? undefined
+        const scope = this.tabLockContext.getStore()
+        return this.tabLockContext.run(
+            {
+                session: this,
+                signal: signal ?? scope?.signal,
+                deadline: Math.min(scope?.deadline ?? Infinity, deadline),
+            },
+            () => driver.browserEvents(action, command, id, timeout)
+        )
+    }
+
+    async browserFetchCommand(
+        method: string,
+        params?: Record<string, unknown>,
+        targetId?: string,
+        signal?: AbortSignal
+    ): Promise<unknown> {
+        const mode = this.getMode()
+        const driver = mode === 'extension' ? this.extensionBridge : mode === 'cdp' ? getCdpSession() : null
+        if (!driver?.browserFetchCommand) {
+            throw new DriverCapabilityError('Fetch control backend unavailable')
+        }
+        const scope = this.tabLockContext.getStore()
+        return this.tabLockContext.run(
+            {
+                ...scope,
+                session: this,
+                signal: signal ?? scope?.signal,
+                deadline: Math.min(scope?.deadline ?? Infinity, Date.now() + DEFAULT_TIMEOUT),
+            },
+            () => driver.browserFetchCommand!(method, params, targetId)
+        )
+    }
+
+    async suspendBrowserEventsForChallenge(): Promise<Record<string, unknown>> {
+        const driver = await this.getDriver()
+        return driver.suspendBrowserEventsForChallenge
+            ? driver.suspendBrowserEventsForChallenge()
+            : { suspended: false, reason: 'backend capability unavailable' }
     }
 
     /**
@@ -1384,15 +1869,15 @@ class UnifiedSessionManager {
         return getCdpSession().getState()
     }
 
-    async getLiveState(): Promise<UnifiedSessionState | null> {
+    async getLiveState(timeout?: number): Promise<UnifiedSessionState | null> {
         if (this.getMode() !== 'extension') {
-            return getCdpSession().getLiveState()
+            return getCdpSession().getLiveState(timeout)
         }
         const targetId = this.extensionBridge!.getCurrentTargetId()
         if (!targetId) {
             return null
         }
-        const targets = await this.extensionBridge!.listTargets()
+        const targets = await this.extensionBridge!.listTargets(timeout)
         const target = targets.find((item) => item.targetId === targetId)
         if (!target) {
             return null
@@ -1433,6 +1918,7 @@ class UnifiedSessionManager {
         }
 
         // Puppeteer 风格：连续 keyDown 同 key → rawKeyDown + autoRepeat（长按重复）
+        this.tabLockContext.getStore()?.inputKeys?.add(key)
         const isRepeat = this.pressedKeys.has(key)
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers | MODIFIER_KEYS[key] : this.modifiers
 
@@ -1471,7 +1957,7 @@ class UnifiedSessionManager {
     /**
      * 释放键盘按键
      */
-    async keyUp(key: string, timeout?: number): Promise<void> {
+    async keyUp(key: string, timeout?: number, inputContext?: { targetId: string; frameId?: number }): Promise<void> {
         const deadline = timeout === undefined ? undefined : Date.now() + timeout
         const driver = await this.getDriver(timeout)
         const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
@@ -1479,7 +1965,11 @@ class UnifiedSessionManager {
         const nextModifiers = MODIFIER_KEYS[key] ? this.modifiers & ~MODIFIER_KEYS[key] : this.modifiers
 
         if (!isExt) {
-            await getCdpSession().keyUp(key, remaining())
+            if (inputContext) {
+                await getCdpSession().keyUp(key, remaining(), { ...inputContext, modifiers: nextModifiers })
+            } else {
+                await getCdpSession().keyUp(key, remaining())
+            }
         } else if (this.inputMode === 'stealth') {
             await driver.stealthKey(key, 'up', this.getModifierNames(nextModifiers), remaining())
         } else {
@@ -1497,6 +1987,7 @@ class UnifiedSessionManager {
         }
         this.modifiers = nextModifiers
         this.pressedKeys.delete(key)
+        this.tabLockContext.getStore()?.inputKeys?.delete(key)
     }
 
     /**
@@ -1524,49 +2015,57 @@ class UnifiedSessionManager {
         if (remaining !== undefined && remaining <= 0) {
             throw new TimeoutError('input timeout before mouse movement')
         }
-        this.currentMousePosition = { x, y } // 更新位置
         const isExt = this.isExtensionConnected()
+        if (!isExt) {
+            ;({ x, y } = await getCdpSession().mapFramePoint({ x, y }, remaining))
+        }
         if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthMouse('mousemove', x, y, undefined, remaining)
+            await driver.stealthMouse('mousemove', x, y, undefined, remaining, this.modifiers)
         } else {
             await driver.inputMouse('mouseMoved', x, y, { modifiers: this.modifiers }, remaining)
         }
+        this.currentMousePosition = { x, y }
+        this.rememberMouseFrame()
     }
 
     /**
      * 鼠标按下
      */
     async mouseDown(button: 'left' | 'middle' | 'right' | 'back' | 'forward' = 'left', clickCount = 1): Promise<void> {
-        const { x, y } = this.currentMousePosition
-        const driver = await this.getDriver()
-        const isExt = this.isExtensionConnected()
-        if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthMouse('mousedown', x, y, button)
-        } else {
-            await driver.inputMouse('mousePressed', x, y, {
-                button,
-                clickCount,
-                modifiers: this.modifiers,
-            })
-        }
+        return this.withMouseFrame(async () => {
+            const { x, y } = this.currentMousePosition
+            const driver = await this.getDriver()
+            const isExt = this.isExtensionConnected()
+            if (isExt && this.inputMode === 'stealth') {
+                await driver.stealthMouse('mousedown', x, y, button, undefined, this.modifiers)
+            } else {
+                await driver.inputMouse('mousePressed', x, y, {
+                    button,
+                    clickCount,
+                    modifiers: this.modifiers,
+                })
+            }
+        })
     }
 
     /**
      * 鼠标释放
      */
     async mouseUp(button: 'left' | 'middle' | 'right' | 'back' | 'forward' = 'left', clickCount = 1): Promise<void> {
-        const { x, y } = this.currentMousePosition
-        const driver = await this.getDriver()
-        const isExt = this.isExtensionConnected()
-        if (isExt && this.inputMode === 'stealth') {
-            await driver.stealthMouse('mouseup', x, y, button)
-        } else {
-            await driver.inputMouse('mouseReleased', x, y, {
-                button,
-                clickCount,
-                modifiers: this.modifiers,
-            })
-        }
+        return this.withMouseFrame(async () => {
+            const { x, y } = this.currentMousePosition
+            const driver = await this.getDriver()
+            const isExt = this.isExtensionConnected()
+            if (isExt && this.inputMode === 'stealth') {
+                await driver.stealthMouse('mouseup', x, y, button, undefined, this.modifiers)
+            } else {
+                await driver.inputMouse('mouseReleased', x, y, {
+                    button,
+                    clickCount,
+                    modifiers: this.modifiers,
+                })
+            }
+        })
     }
 
     /**
@@ -1580,20 +2079,36 @@ class UnifiedSessionManager {
         clickCount = 1,
         refId?: string
     ): Promise<void> {
-        const driver = await this.getDriver()
-        const isExt = this.isExtensionConnected()
-        if (isExt && (this.inputMode === 'stealth' || button === 'right')) {
-            const { x, y } = this.currentMousePosition
-            // stealth 通过单次脚本注入完成所有 mouse/click/dblclick/contextmenu 事件
-            // refId 透传：嵌套 iframe overlay 场景下绕过 elementFromPoint 命中外层 IFRAME 的问题
-            await driver.stealthClick(x, y, button, clickCount, refId)
-            return
-        }
-        // CDP 每次 mousePressed/mouseReleased 递增 clickCount，让浏览器合成 dblclick/tripleclick
-        for (let i = 1; i <= clickCount; i++) {
-            await this.mouseDown(button, i)
-            await this.mouseUp(button, i)
-        }
+        return this.withMouseFrame(async () => {
+            const driver = await this.getDriver()
+            const isExt = this.isExtensionConnected()
+            if (isExt && (this.inputMode === 'stealth' || button === 'right')) {
+                const { x, y } = this.currentMousePosition
+                // stealth 通过单次脚本注入完成所有 mouse/click/dblclick/contextmenu 事件
+                // refId 透传：嵌套 iframe overlay 场景下绕过 elementFromPoint 命中外层 IFRAME 的问题
+                await driver.stealthClick(x, y, button, clickCount, refId, undefined, this.modifiers)
+                return
+            }
+            // CDP 每次 mousePressed/mouseReleased 递增 clickCount，让浏览器合成 dblclick/tripleclick
+            for (let i = 1; i <= clickCount; i++) {
+                let pressRejected = false
+                try {
+                    await this.mouseDown(button, i)
+                } catch (error) {
+                    pressRejected = error instanceof StructuredToolError && error.context.actionExecuted === false
+                    throw error
+                } finally {
+                    if (!pressRejected) {
+                        const { x, y } = this.currentMousePosition
+                        await driver.inputMouse('mouseReleased', x, y, {
+                            button,
+                            clickCount: i,
+                            modifiers: this.modifiers,
+                        })
+                    }
+                }
+            }
+        })
     }
 
     /**
@@ -1799,10 +2314,25 @@ class UnifiedSessionManager {
     /**
      * 鼠标滚轮
      */
-    async mouseWheel(deltaX: number, deltaY: number): Promise<void> {
-        const { x, y } = this.currentMousePosition
-        const driver = await this.getDriver()
-        await driver.inputMouse('mouseWheel', x, y, { deltaX, deltaY, modifiers: this.modifiers })
+    async mouseWheel(
+        deltaX: number,
+        deltaY: number,
+        timeout?: number,
+        point?: { x: number; y: number }
+    ): Promise<void> {
+        this.assertRequestActive()
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
+        const driver = await this.getDriver(remaining())
+        this.assertRequestActive()
+        const { x, y } = point ?? this.currentMousePosition
+        const dispatch = () =>
+            driver.inputMouse('mouseWheel', x, y, { deltaX, deltaY, modifiers: this.modifiers }, remaining())
+        if (point) {
+            await dispatch()
+        } else {
+            await this.withMouseFrame(dispatch)
+        }
     }
 
     /**
@@ -1936,18 +2466,43 @@ class UnifiedSessionManager {
         return `${this.getMode()}:${targetId}`
     }
 
+    private rememberPageMetadata(targetId: string, metadata: PageMetadata): void {
+        const lastUsedAt = this.getPageMetadata(targetId).lastUsedAt
+        this.pageMetadata.set(this.metadataKey(targetId), {
+            ...metadata,
+            lastUsedAt: lastUsedAt && lastUsedAt > (metadata.lastUsedAt ?? '') ? lastUsedAt : metadata.lastUsedAt,
+        })
+    }
+
     private recordPageUse(targetId: string, created = false): void {
         const metadata = this.getPageMetadata(targetId)
         this.pageMetadata.set(this.metadataKey(targetId), {
             ...metadata,
+            origin: created ? 'created' : metadata.origin,
             createdBy: created ? 'mcp-chrome' : metadata.createdBy,
             createdAt: created ? new Date().toISOString() : metadata.createdAt,
             lastUsedAt: new Date().toISOString(),
         })
     }
 
-    private evaluateViaCdp<T>(script: string, args: unknown[] | undefined, timeout?: number): Promise<T> {
-        return getCdpSession().evaluate<T>(script, args, timeout)
+    private evaluateViaCdp<T>(
+        script: string,
+        args: unknown[] | undefined,
+        timeout: number | undefined,
+        options: EvaluateOptions
+    ): Promise<T> {
+        const session = getCdpSession()
+        if (session.getCurrentFrameId() !== 0 && options.staleContextRetry === 'readOnly') {
+            return Promise.reject(
+                new StructuredToolError(
+                    'DRIVER_CAPABILITY_ERROR',
+                    'CDP iframe 暂不支持 readOnly context 重试，脚本未执行',
+                    '使用 Extension precise 执行无副作用脚本，或显式使用 never 并独立核对结果',
+                    { actionExecuted: false, actionStatus: 'not_started', failureStage: 'context', retryable: false }
+                )
+            )
+        }
+        return session.evaluate<T>(script, args, timeout, options.userAction)
     }
 
     private async evaluateViaExtensionPrecise<T>(
@@ -1977,7 +2532,8 @@ class UnifiedSessionManager {
                 currentFrameId,
                 iframeExpression,
                 timeout,
-                staleContextRetry
+                staleContextRetry,
+                options.userAction
             )) as {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
@@ -2005,18 +2561,28 @@ class UnifiedSessionManager {
         if (timeout !== undefined) {
             params.timeout = timeout
         }
-        const result = (await this.extensionBridge!.debuggerSend('Runtime.evaluate', params, undefined, timeout)) as {
+        const result = (await this.extensionBridge!.debuggerSend(
+            'Runtime.evaluate',
+            params,
+            undefined,
+            timeout,
+            options.userAction
+        )) as {
             result?: CdpResultObject<T>
             exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
         }
         if (result.exceptionDetails) {
-            throw new Error(formatCdpException(result.exceptionDetails))
+            throw setErrorSource(new Error(formatCdpException(result.exceptionDetails)), 'page')
         }
         return this.materializeCdpResult<T>(result.result, timeout, options.fileOutput)
     }
 
-    private async evaluateViaExtensionStealth<T>(expression: string, timeout?: number): Promise<T> {
-        return (await this.extensionBridge!.evaluate(expression, undefined, timeout)) as T
+    private async evaluateViaExtensionStealth<T>(
+        expression: string,
+        timeout?: number,
+        userAction?: UserActionKind
+    ): Promise<T> {
+        return (await this.extensionBridge!.evaluate(expression, undefined, timeout, userAction)) as T
     }
 
     private async readViewportMetrics(frameId?: number): Promise<ViewportMetrics> {
@@ -2053,7 +2619,10 @@ class UnifiedSessionManager {
             return await operation()
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err)
-            if (isExtensionDisconnected(err) || msg.includes('not connected')) {
+            if (
+                !isNativeExecutionResultUnknown(err) &&
+                (isExtensionDisconnected(err) || msg.includes('not connected'))
+            ) {
                 // 等待 Extension 重连
                 await new Promise((r) => setTimeout(r, 2000))
                 if (this.isExtensionConnected()) {
@@ -2096,7 +2665,7 @@ class UnifiedSessionManager {
         exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
     }): T {
         if (result.exceptionDetails) {
-            throw new Error(formatCdpException(result.exceptionDetails))
+            throw setErrorSource(new Error(formatCdpException(result.exceptionDetails)), 'page')
         }
         return extractCdpValue<T>(result.result)
     }
@@ -2159,7 +2728,7 @@ class UnifiedSessionManager {
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
             }
             if (properties.exceptionDetails) {
-                throw new Error(formatCdpException(properties.exceptionDetails))
+                throw setErrorSource(new Error(formatCdpException(properties.exceptionDetails)), 'page')
             }
 
             const descriptors = properties.result ?? []
@@ -2167,7 +2736,26 @@ class UnifiedSessionManager {
             this.assertMaterializeBudget(state, depth, result)
 
             if (result.subtype === 'array') {
-                const array: unknown[] = []
+                const length = descriptors.find((descriptor) => descriptor.name === 'length')?.value?.value
+                if (
+                    typeof length !== 'number' ||
+                    !Number.isInteger(length) ||
+                    length < 0 ||
+                    length > UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES
+                ) {
+                    this.throwMaterializeLimit(state, depth, result)
+                }
+                const populated = descriptors.filter(
+                    (descriptor) =>
+                        /^\d+$/.test(descriptor.name) &&
+                        Number(descriptor.name) < (length as number) &&
+                        descriptor.value
+                ).length
+                const holes = (length as number) - populated
+                state.nodes += holes
+                state.chars += holes * 5
+                this.assertMaterializeBudget(state, depth, result)
+                const array: unknown[] = new Array(length as number)
                 for (const descriptor of descriptors) {
                     if (!descriptor.value || !/^\d+$/.test(descriptor.name)) {
                         continue
@@ -2188,12 +2776,12 @@ class UnifiedSessionManager {
                     continue
                 }
                 this.trackMaterializedPropertyName(descriptor.name, state, depth, result)
-                object[descriptor.name] = await this.materializePropertyValue(
-                    descriptor.value,
-                    timeout,
-                    state,
-                    depth + 1
-                )
+                Object.defineProperty(object, descriptor.name, {
+                    value: await this.materializePropertyValue(descriptor.value, timeout, state, depth + 1),
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                })
             }
             return object as T
         } finally {
@@ -2313,6 +2901,7 @@ class UnifiedSessionManager {
      *               避免工具 timeout 被连接等待吞掉，不传则使用默认 30s
      */
     private async getDriver(timeout?: number): Promise<IBrowserDriver> {
+        this.assertRequestActive()
         const scopedMode = this.tabLockContext.getStore()?.mode
         if (scopedMode === 'extension') {
             if (!this.extensionBridge?.isConnected()) {
@@ -2341,6 +2930,7 @@ class UnifiedSessionManager {
     }
 
     private async ensureExtensionConnected(maxWait?: number): Promise<boolean> {
+        this.assertRequestActive()
         if (!this.extensionBridge) {
             return this.assertCdpFallbackAllowed()
         }
@@ -2369,7 +2959,13 @@ class UnifiedSessionManager {
         }
         console.error(`[MCP] Waiting for Chrome Extension connection (${waitTimeout}ms timeout)...`)
         console.error('[MCP] Please ensure Chrome is running with MCP Chrome extension installed.')
-        const connected = await this.extensionBridge.waitForConnection(waitTimeout)
+        const scope = this.tabLockContext.getStore()
+        const connected = await withNavigationBudget(
+            () => this.extensionBridge!.waitForConnection(waitTimeout),
+            scope?.deadline,
+            scope?.signal
+        )
+        this.assertRequestActive()
         if (connected) {
             console.error('[MCP] Chrome Extension connected successfully')
             this.lastConnectionFailure = 0
@@ -2433,14 +3029,15 @@ class UnifiedSessionManager {
                 'Runtime.callFunctionOn',
                 params,
                 undefined,
-                timeout
+                timeout,
+                options.userAction
             )) as {
                 result?: CdpResultObject<T>
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
             }
 
             if (result.exceptionDetails) {
-                throw new Error(formatCdpException(result.exceptionDetails))
+                throw setErrorSource(new Error(formatCdpException(result.exceptionDetails)), 'page')
             }
             return await this.materializeCdpResult<T>(result.result, timeout, options.fileOutput)
         } finally {
@@ -2448,6 +3045,36 @@ class UnifiedSessionManager {
                 objectId: globalObjectId,
             }).catch(() => {})
         }
+    }
+
+    private async withMouseFrame<T>(fn: () => Promise<T>): Promise<T> {
+        const bridge = this.isExtensionConnected() ? this.extensionBridge : null
+        const original =
+            this.mouseFrameContext?.targetId === this.getCurrentTargetId() ? this.mouseFrameContext : undefined
+        if (!bridge || !original) {
+            return fn()
+        }
+        const frameId = bridge.getCurrentFrameId()
+        const documentId = bridge.getCurrentFrameDocumentId()
+        bridge.setCurrentFrameId(original.frameId, original.documentId)
+        try {
+            return await fn()
+        } finally {
+            bridge.setCurrentFrameId(frameId, documentId)
+        }
+    }
+
+    private rememberMouseFrame(): void {
+        const bridge = this.isExtensionConnected() ? this.extensionBridge : null
+        const targetId = bridge?.getCurrentTargetId()
+        this.mouseFrameContext =
+            bridge && targetId
+                ? {
+                      targetId,
+                      frameId: bridge.getCurrentFrameId(),
+                      documentId: bridge.getCurrentFrameDocumentId(),
+                  }
+                : undefined
     }
 
     // ==================== Debugger 直接访问 ====================

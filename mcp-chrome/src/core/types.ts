@@ -22,7 +22,13 @@ export const MODIFIER_KEYS: Record<string, number> = {
 /** CDP Runtime.evaluate / callFunctionOn 响应中的异常详情 */
 export interface CdpExceptionDetails {
     text: string
-    exception?: { className?: string; description?: string }
+    exception?: {
+        type?: string
+        className?: string
+        description?: string
+        value?: unknown
+        unserializableValue?: string
+    }
 }
 
 /** CDP Runtime.evaluate / callFunctionOn 响应中的结果对象 */
@@ -37,7 +43,24 @@ export interface CdpResultObject<T = unknown> {
 
 /** 从 CDP exceptionDetails 提取有用的错误信息（含完整堆栈） */
 export function formatCdpException(details: CdpExceptionDetails): string {
-    return details.exception?.description ?? details.text ?? 'Unknown error'
+    const exception = details.exception
+    if (exception?.description !== undefined) {
+        return exception.description
+    }
+    if (exception?.unserializableValue !== undefined) {
+        return exception.unserializableValue
+    }
+    if (
+        exception &&
+        Object.hasOwn(exception, 'value') &&
+        (exception.value === null || typeof exception.value !== 'object')
+    ) {
+        return String(exception.value)
+    }
+    if (exception?.type === 'undefined') {
+        return 'undefined'
+    }
+    return details.text ?? 'Unknown error'
 }
 
 function buildSerializationHint(result?: CdpResultObject): { message: string; suggestion: string } {
@@ -223,6 +246,7 @@ export type InputEventType =
     | 'touchmove'
     | 'touchend'
     | 'type'
+    | 'upload'
     | 'wait'
     | 'select'
     | 'replace'
@@ -253,6 +277,8 @@ export interface InputEvent {
     // 输入文本参数
     text?: string
     delay?: number
+    // Server 本地文件路径（upload 事件），空数组清空选择
+    files?: string[]
     // 等待参数
     ms?: number
     // 查找文本参数（select/replace 事件）

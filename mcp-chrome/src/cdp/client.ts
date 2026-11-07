@@ -6,9 +6,12 @@
  */
 
 import { EventEmitter } from 'events'
+import { AsyncLocalStorage } from 'async_hooks'
 import WebSocket from 'ws'
-import { CDPError, ConnectionRefusedError, TimeoutError } from '../core/errors.js'
+import { CDPError, ConnectionRefusedError, getErrorSource, TimeoutError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
+import type { BrowserRequestContext, UserActionKind } from '../core/browser-driver.js'
+import { remainingNavigationTimeout, withNavigationBudget } from '../core/utils.js'
 
 /**
  * CDP 消息回调
@@ -17,6 +20,9 @@ interface PendingCallback {
     resolve: (result: unknown) => void
     reject: (error: Error) => void
     method: string
+    retainOnCancel?: boolean
+    abandoned?: boolean
+    cleanup?: { result: unknown; error?: unknown }
 }
 
 /**
@@ -45,6 +51,11 @@ export class CDPClient extends EventEmitter {
     private nextId = 1
     private eventListeners = new Map<string, Set<CDPEventListener>>()
     private activeEventWaiters = new Set<EventWaiter>()
+    private readonly nativeEventContext = new AsyncLocalStorage<boolean>()
+
+    constructor(private readonly requestContext?: () => BrowserRequestContext | undefined) {
+        super()
+    }
 
     get isConnected(): boolean {
         return this.ws !== null && this.ws.readyState === WebSocket.OPEN
@@ -54,48 +65,82 @@ export class CDPClient extends EventEmitter {
      * 连接到 CDP 端点
      */
     async connect(endpoint: string, timeout = DEFAULT_TIMEOUT): Promise<void> {
+        const scope = this.requestContext?.()
+        const signal = scope?.signal
+        signal?.throwIfAborted()
+        const deadline = Math.min(Date.now() + timeout, scope?.deadline ?? Infinity)
+        timeout = remainingNavigationTimeout(deadline)
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                reject(new TimeoutError(`连接超时: ${endpoint} (${timeout}ms)`))
-            }, timeout)
-
+            let socket: WebSocket
             try {
-                this.ws = new WebSocket(endpoint)
+                socket = new WebSocket(endpoint, { perMessageDeflate: false })
             } catch {
-                clearTimeout(timer)
-                // 解析 host 和 port
                 const match = endpoint.match(/ws:\/\/(?<host>[^:]+):(?<port>\d+)/)
-                if (match) {
-                    reject(new ConnectionRefusedError(match.groups!.host, parseInt(match.groups!.port, 10)))
-                } else {
-                    reject(new CDPError(`无法连接到 ${endpoint}`))
-                }
+                reject(
+                    match
+                        ? new ConnectionRefusedError(match.groups!.host, parseInt(match.groups!.port, 10))
+                        : new CDPError(`无法连接到 ${endpoint}`)
+                )
                 return
             }
-
-            this.ws.on('open', () => {
+            this.ws = socket
+            let settled = false
+            const cleanup = () => {
                 clearTimeout(timer)
+                signal?.removeEventListener('abort', onAbort)
+                socket.removeListener('open', onOpen)
+            }
+            const fail = (error: unknown) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                cleanup()
+                if (scope && error instanceof Error && getErrorSource(error) === 'budget') {
+                    scope.budgetError ??= error
+                }
+                if (this.ws === socket) {
+                    this.ws = null
+                }
+                socket.terminate()
+                reject(error)
+            }
+            const onAbort = () => fail(signal?.reason ?? new Error('Request cancelled'))
+            const timer = setTimeout(() => fail(new TimeoutError(`连接超时: ${endpoint} (${timeout}ms)`)), timeout)
+            const onOpen = () => {
+                try {
+                    signal?.throwIfAborted()
+                    remainingNavigationTimeout(deadline)
+                } catch (error) {
+                    fail(error)
+                    return
+                }
+                settled = true
+                cleanup()
                 resolve()
-            })
-
-            this.ws.on('error', (error: Error) => {
-                clearTimeout(timer)
-                // 解析 host 和 port
+            }
+            socket.on('open', onOpen)
+            socket.on('error', (error: Error) => {
                 const match = endpoint.match(/ws:\/\/(?<host>[^:]+):(?<port>\d+)/)
-                if (match && error.message.includes('ECONNREFUSED')) {
-                    reject(new ConnectionRefusedError(match.groups!.host, parseInt(match.groups!.port, 10)))
-                } else {
-                    reject(new CDPError(error.message))
+                fail(
+                    match && error.message.includes('ECONNREFUSED')
+                        ? new ConnectionRefusedError(match.groups!.host, parseInt(match.groups!.port, 10))
+                        : new CDPError(error.message)
+                )
+            })
+            socket.on('message', (data: WebSocket.Data) => this.handleMessage(data))
+            socket.on('close', () => {
+                if (!settled) {
+                    fail(new CDPError('CDP 连接在握手完成前关闭'))
+                }
+                if (this.ws === socket) {
+                    this.handleClose()
                 }
             })
-
-            this.ws.on('message', (data: WebSocket.Data) => {
-                this.handleMessage(data)
-            })
-
-            this.ws.on('close', () => {
-                this.handleClose()
-            })
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+            }
         })
     }
 
@@ -106,10 +151,56 @@ export class CDPClient extends EventEmitter {
         method: string,
         params?: object,
         sessionId?: string,
-        timeout: number = CDPClient.DEFAULT_COMMAND_TIMEOUT
+        timeout: number = CDPClient.DEFAULT_COMMAND_TIMEOUT,
+        cleanup = false,
+        dispatchedAction?: UserActionKind
     ): Promise<T> {
+        const type = (params as { type?: string } | undefined)?.type
+        const resourceCleanup =
+            cleanup ||
+            (method === 'Fetch.failRequest' && (params as { errorReason?: string })?.errorReason === 'Aborted') ||
+            (method === 'Fetch.continueWithAuth' &&
+                (params as { authChallengeResponse?: { response?: string } })?.authChallengeResponse?.response ===
+                    'CancelAuth') ||
+            method === 'Fetch.disable' ||
+            method === 'Runtime.releaseObject' ||
+            method === 'Runtime.releaseObjectGroup' ||
+            (method === 'Input.dispatchKeyEvent' && type === 'keyUp') ||
+            (method === 'Input.dispatchMouseEvent' && type === 'mouseReleased') ||
+            (method === 'Input.dispatchTouchEvent' && (type === 'touchEnd' || type === 'touchCancel')) ||
+            (method === 'Emulation.setTouchEmulationEnabled' && (params as { enabled?: boolean })?.enabled === false)
+        const requestScope = this.nativeEventContext.getStore() ? undefined : this.requestContext?.()
+        const userAction = requestScope?.userAction
+        const scope = resourceCleanup ? undefined : requestScope
+        if (scope?.signal?.aborted) {
+            throw new CDPError(`CDP request cancelled before dispatch: ${method}`, {
+                method,
+                errorSource: 'cancelled',
+                actionExecuted: false,
+                actionStatus: 'not_started',
+                retryable: false,
+            })
+        }
+        if (scope?.deadline !== undefined) {
+            const remaining = scope.deadline - Date.now()
+            if (remaining <= 0) {
+                throw new TimeoutError('CDP timeout before dispatch', {
+                    method,
+                    actionExecuted: false,
+                    actionStatus: 'not_started',
+                    retryable: false,
+                })
+            }
+            timeout = Math.min(timeout, remaining)
+        }
         if (!this.isConnected) {
-            throw new CDPError('CDP 客户端未连接')
+            throw new CDPError('CDP 客户端未连接', {
+                method,
+                errorSource: 'transport',
+                actionExecuted: false,
+                actionStatus: 'not_started',
+                retryable: false,
+            })
         }
 
         const id = this.nextId++
@@ -122,32 +213,108 @@ export class CDPClient extends EventEmitter {
             message.sessionId = sessionId
         }
 
+        const onAbandonedResult =
+            method === 'Target.attachToTarget'
+                ? async (result: unknown) => {
+                      const { sessionId } = result as { sessionId: string }
+                      await this.send('Target.detachFromTarget', { sessionId }, undefined, 1000, true)
+                  }
+                : undefined
         return new Promise((resolve, reject) => {
+            const abandon = (error: Error) => {
+                clearTimeout(timeoutId)
+                signalCleanup()
+                if (scope && this.callbacks.has(id) && getErrorSource(error) === 'budget') {
+                    scope.budgetError ??= error
+                }
+                if (onAbandonedResult) {
+                    // 业务等待结束后，资源响应仍由原命令负责，直到回收或连接关闭
+                    callback.abandoned = true
+                } else {
+                    this.callbacks.delete(id)
+                }
+                reject(error)
+            }
+            const onAbort = () =>
+                abandon(
+                    new CDPError(`CDP request cancelled after dispatch: ${method}`, {
+                        method,
+                        errorSource: 'cancelled',
+                        actionExecuted: 'unknown',
+                        actionStatus: 'unknown',
+                        retryable: false,
+                    })
+                )
+            const signalCleanup = () => scope?.signal?.removeEventListener('abort', onAbort)
             const timeoutId = setTimeout(() => {
-                this.callbacks.delete(id)
-                reject(new CDPError(`CDP 命令超时: ${method} (${timeout}ms)`))
+                abandon(
+                    new CDPError(`CDP 命令超时: ${method} (${timeout}ms)`, {
+                        method,
+                        errorSource: 'budget',
+                        actionExecuted: 'unknown',
+                        actionStatus: 'unknown',
+                        retryable: false,
+                    })
+                )
             }, timeout)
 
-            this.callbacks.set(id, {
+            const callback: PendingCallback = {
                 resolve: (result: unknown) => {
                     clearTimeout(timeoutId)
-                    resolve(result as T)
+                    signalCleanup()
+                    if (callback.abandoned && onAbandonedResult) {
+                        callback.cleanup = { result }
+                        void Promise.resolve()
+                            .then(() => onAbandonedResult(result))
+                            .then(
+                                () => this.callbacks.delete(id),
+                                (error: unknown) => {
+                                    callback.cleanup!.error = error
+                                    console.warn('[MCP] CDP resource cleanup outcome unknown:', {
+                                        id,
+                                        method,
+                                        result,
+                                        error,
+                                    })
+                                }
+                            )
+                    } else {
+                        this.callbacks.delete(id)
+                        resolve(result as T)
+                    }
                 },
                 reject: (error: Error) => {
                     clearTimeout(timeoutId)
+                    signalCleanup()
+                    this.callbacks.delete(id)
                     reject(error)
                 },
                 method,
-            })
+                retainOnCancel: onAbandonedResult !== undefined,
+            }
+            this.callbacks.set(id, callback)
 
             try {
                 this.ws!.send(JSON.stringify(message))
+                if (
+                    userAction &&
+                    (userAction.kind === dispatchedAction ||
+                        (userAction.kind === 'input' &&
+                            (method.startsWith('Input.dispatch') || method === 'Input.insertText')))
+                ) {
+                    userAction.dispatched = true
+                }
+                scope?.signal?.addEventListener('abort', onAbort, { once: true })
+                if (scope?.signal?.aborted) {
+                    onAbort()
+                }
             } catch (err) {
                 clearTimeout(timeoutId)
                 this.callbacks.delete(id)
                 reject(
                     new CDPError(
-                        `Failed to send CDP command ${method}: ${err instanceof Error ? err.message : 'Unknown error'}`
+                        `Failed to send CDP command ${method}: ${err instanceof Error ? err.message : 'Unknown error'}`,
+                        { method, errorSource: 'transport' }
                     )
                 )
             }
@@ -269,9 +436,29 @@ export class CDPClient extends EventEmitter {
         if (message.id !== undefined) {
             const callback = this.callbacks.get(message.id)
             if (callback) {
-                this.callbacks.delete(message.id)
+                if (!callback.retainOnCancel) {
+                    this.callbacks.delete(message.id)
+                }
                 if (message.error) {
-                    callback.reject(new CDPError(`${callback.method}: ${message.error.message}`))
+                    const contextLost =
+                        message.error.code === -32000 &&
+                        new RegExp(
+                            '^(?:Cannot find (?:context with specified id|default execution context|object with given id)|' +
+                                'Could not find object with given id|Execution context was destroyed|' +
+                                'No frame with given id found|Inspected target navigated or closed|' +
+                                String.raw`Session with given id not found)\.?$`
+                        ).test(message.error.message)
+                    callback.reject(
+                        new CDPError(`${callback.method}: ${message.error.message}`, {
+                            method: callback.method,
+                            protocolError: true,
+                            errorSource: contextLost ? 'context' : 'protocol',
+                            nativeCode: message.error.code,
+                            ...([-32601, -32602].includes(message.error.code ?? 0)
+                                ? { actionExecuted: false, actionStatus: 'not_started', retryable: false }
+                                : {}),
+                        })
+                    )
                 } else {
                     callback.resolve(message.result)
                 }
@@ -279,20 +466,23 @@ export class CDPClient extends EventEmitter {
             return
         }
 
-        // 事件消息
+        // 原生事件及其异步后续处理独立于建立连接时的请求期限和取消
         if (message.method) {
-            const listeners = this.eventListeners.get(message.method)
-            if (listeners) {
-                for (const listener of listeners) {
-                    try {
-                        listener(message.params, message.sessionId)
-                    } catch (error) {
-                        console.error(`CDP 事件处理错误 (${message.method}):`, error)
+            const { method, params, sessionId } = message
+            this.nativeEventContext.run(true, () => {
+                const listeners = this.eventListeners.get(method)
+                if (listeners) {
+                    for (const listener of listeners) {
+                        try {
+                            listener(params, sessionId)
+                        } catch (error) {
+                            console.error(`CDP 事件处理错误 (${method}):`, error)
+                        }
                     }
                 }
-            }
-            // 也触发通用事件
-            this.emit(message.method, message.params, message.sessionId)
+                // 也触发通用事件
+                this.emit(method, params, sessionId)
+            })
         }
     }
 
@@ -301,14 +491,22 @@ export class CDPClient extends EventEmitter {
      */
     private rejectAllPending(reason: string): void {
         for (const [, callback] of this.callbacks) {
-            callback.reject(new CDPError(reason))
+            callback.reject(
+                new CDPError(reason, {
+                    method: callback.method,
+                    errorSource: 'transport',
+                    actionExecuted: 'unknown',
+                    actionStatus: 'unknown',
+                    retryable: false,
+                })
+            )
         }
         this.callbacks.clear()
 
         for (const waiter of this.activeEventWaiters) {
             clearTimeout(waiter.timer)
             this.offEvent(waiter.event, waiter.listener)
-            waiter.reject(new CDPError(reason))
+            waiter.reject(new CDPError(reason, { errorSource: 'transport' }))
         }
         this.activeEventWaiters.clear()
     }
@@ -333,20 +531,41 @@ const DEFAULT_HTTP_TIMEOUT = 10000
 /**
  * 请求 CDP HTTP 接口（公共逻辑）
  */
-async function cdpHttpFetch<T>(host: string, port: number, path: string, timeout: number): Promise<T> {
+async function cdpHttpFetch<T>(
+    host: string,
+    port: number,
+    path: string,
+    timeout: number,
+    signal?: AbortSignal
+): Promise<T> {
+    signal?.throwIfAborted()
     // noinspection HttpUrlsUsage — CDP 调试协议只支持 HTTP
     const url = `http://${host}:${port}${path}`
     const controller = new AbortController()
+    const onAbort = () => controller.abort(signal?.reason)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) {
+        onAbort()
+    }
+    const deadline = Date.now() + timeout
     const timeoutId = setTimeout(() => controller.abort(), timeout)
-
     try {
-        const response = await fetch(url, { signal: controller.signal })
-        if (!response.ok) {
-            throw new ConnectionRefusedError(host, port)
-        }
-        return (await response.json()) as T
+        return await withNavigationBudget(
+            async () => {
+                const response = await fetch(url, { signal: controller.signal })
+                signal?.throwIfAborted()
+                remainingNavigationTimeout(deadline)
+                if (!response.ok) {
+                    throw new ConnectionRefusedError(host, port)
+                }
+                return (await response.json()) as T
+            },
+            deadline,
+            signal
+        )
     } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') {
+        signal?.throwIfAborted()
+        if (error instanceof TimeoutError || (error instanceof Error && error.name === 'AbortError')) {
             throw new TimeoutError(`连接超时: ${host}:${port} (${timeout}ms)`)
         }
         if (error instanceof ConnectionRefusedError || error instanceof SyntaxError) {
@@ -355,6 +574,8 @@ async function cdpHttpFetch<T>(host: string, port: number, path: string, timeout
         throw new ConnectionRefusedError(host, port)
     } finally {
         clearTimeout(timeoutId)
+        signal?.removeEventListener('abort', onAbort)
+        controller.abort()
     }
 }
 
@@ -364,9 +585,10 @@ async function cdpHttpFetch<T>(host: string, port: number, path: string, timeout
 export async function getBrowserWSEndpoint(
     host: string,
     port: number,
-    timeout: number = DEFAULT_HTTP_TIMEOUT
+    timeout: number = DEFAULT_HTTP_TIMEOUT,
+    signal?: AbortSignal
 ): Promise<string> {
-    const data = await cdpHttpFetch<{ webSocketDebuggerUrl: string }>(host, port, '/json/version', timeout)
+    const data = await cdpHttpFetch<{ webSocketDebuggerUrl: string }>(host, port, '/json/version', timeout, signal)
     return data.webSocketDebuggerUrl
 }
 
@@ -376,7 +598,8 @@ export async function getBrowserWSEndpoint(
 export async function getTargets(
     host: string,
     port: number,
-    timeout: number = DEFAULT_HTTP_TIMEOUT
+    timeout: number = DEFAULT_HTTP_TIMEOUT,
+    signal?: AbortSignal
 ): Promise<Array<{ id: string; type: string; url: string; title: string; webSocketDebuggerUrl: string }>> {
-    return cdpHttpFetch(host, port, '/json/list', timeout)
+    return cdpHttpFetch(host, port, '/json/list', timeout, signal)
 }
