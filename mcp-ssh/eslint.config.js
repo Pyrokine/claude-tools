@@ -2,10 +2,12 @@ import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
+    { ignores: ['dist/'] },
     {
         extends: [eslint.configs.recommended, ...tseslint.configs.recommended],
-        ignores: ['dist/'],
         rules: {
+            curly: ['error', 'all'],
+
             // 允许 while (true) 等有意为之的无限循环
             'no-constant-condition': ['warn', { checkLoops: false }],
 
@@ -53,9 +55,20 @@ export default tseslint.config(
         },
     },
     {
+        files: ['src/**/*.ts'],
+        languageOptions: {
+            parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+        },
+        rules: {
+            '@typescript-eslint/no-floating-promises': 'error',
+            '@typescript-eslint/return-await': ['error', 'in-try-catch'],
+        },
+    },
+    {
         files: ['test/**/*.{js,mjs}'],
         languageOptions: {
             globals: {
+                AbortController: 'readonly',
                 Buffer: 'readonly',
                 console: 'readonly',
                 process: 'readonly',

@@ -141,9 +141,15 @@ jobs:
                   overwrite: true
                   retention-days: 7
 
+    verify:
+        needs: build
+        uses: ./.github/workflows/windows-tests.yml
+        permissions:
+            contents: read
+
     authenticate:
         name: 验证或发布 ${{ matrix.module }}
-        needs: build
+        needs: [build, verify]
         runs-on: ubuntu-latest
         timeout-minutes: 15
         environment: npm-publish
@@ -279,7 +285,9 @@ jobs:
                   NODE
 
             - name: 发布已批准的模块并核对 registry
-              if: (matrix.module == 'mcp-chrome' && inputs.publish_chrome) || (matrix.module == 'mcp-ssh' && inputs.publish_ssh)
+              if:
+                  (matrix.module == 'mcp-chrome' && inputs.publish_chrome) || (matrix.module == 'mcp-ssh' &&
+                  inputs.publish_ssh)
               env:
                   ARTIFACT_DIR: ${{ runner.temp }}/npm-release-${{ matrix.module }}
               run: |

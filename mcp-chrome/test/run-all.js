@@ -132,8 +132,8 @@ async function run() {
     // 2.2 screenshot
     try {
         const rawResult = await client.callTool('extract', { type: 'screenshot' });
-        const content = rawResult?.content?.[0];
-        if (content?.type === 'image' && content.data?.length > 100) {
+        const content = rawResult?.content?.find((item) => item.type === 'image');
+        if (!rawResult?.isError && content?.data?.length > 100) {
             reporter.pass('extract screenshot');
         } else {
             reporter.fail('extract screenshot', 'No image data');

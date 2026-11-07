@@ -9,6 +9,11 @@ permissions:
     contents: read
 
 jobs:
+    verify:
+        uses: ./.github/workflows/windows-tests.yml
+        permissions:
+            contents: read
+
     build:
         strategy:
             matrix:
@@ -61,7 +66,7 @@ jobs:
 
             - name: Build
               working-directory: mcp-claude-history
-              run: cargo build --release --target ${{ matrix.target }}
+              run: cargo build --release --locked --target ${{ matrix.target }}
 
             - name: Prepare artifact
               shell: bash
@@ -86,7 +91,7 @@ jobs:
                       mcp-claude-history-${{ matrix.platform }}.*
 
     release:
-        needs: build
+        needs: [build, verify]
         runs-on: ubuntu-latest
         permissions:
             contents: write

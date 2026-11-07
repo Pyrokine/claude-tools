@@ -2,10 +2,12 @@ import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
+    { ignores: ['dist/', 'extension/dist/', 'test-output/'] },
     {
         extends: [eslint.configs.recommended, ...tseslint.configs.recommended],
-        ignores: ['dist/', 'extension/dist/', 'test-output/'],
         rules: {
+            curly: ['error', 'all'],
+
             // 空行控制
             'no-multiple-empty-lines': ['warn', { max: 1, maxEOF: 0, maxBOF: 0 }],
             'lines-between-class-members': ['warn', 'always', { exceptAfterSingleLine: true }],
@@ -53,15 +55,30 @@ export default tseslint.config(
         },
     },
     {
-        files: ['test/**/*.js'],
+        files: ['src/**/*.ts', 'extension/src/**/*.ts'],
+        languageOptions: {
+            parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+        },
+        rules: {
+            '@typescript-eslint/no-floating-promises': 'error',
+            '@typescript-eslint/return-await': ['error', 'error-handling-correctness-only'],
+        },
+    },
+    {
+        files: ['test/**/*.{js,mjs}', 'extension/test/**/*.{js,mjs}'],
         languageOptions: {
             globals: {
+                AbortController: 'readonly',
+                AbortSignal: 'readonly',
+                clearTimeout: 'readonly',
+                clearImmediate: 'readonly',
                 Buffer: 'readonly',
                 console: 'readonly',
                 process: 'readonly',
                 setImmediate: 'readonly',
                 setTimeout: 'readonly',
                 URL: 'readonly',
+                WeakRef: 'readonly',
             },
         },
     }

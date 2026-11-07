@@ -10,6 +10,8 @@
   "endOfLine": "lf",
   "quoteProps": "as-needed",
   "bracketSameLine": false,
+  "proseWrap": "preserve",
+  "embeddedLanguageFormatting": "off",
   "overrides": [
     {
       "files": "*.js",

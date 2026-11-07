@@ -4,7 +4,8 @@
  * 封装与 mcp-chrome 的 JSON-RPC 通信
  */
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { Client } from '@modelcontextprotocol/sdk/client';
+// noinspection JSFileReferences,NpmUsedModulesInstalled -- Resolved by the SDK package export map in stdio tests
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -16,7 +17,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 export class McpClient {
     constructor() {
+        /** @type {Client | null} */
         this.client = null;
+        /** @type {StdioClientTransport | null} */
         this.transport = null;
     }
 
@@ -68,6 +71,8 @@ export class McpClient {
 
     /**
      * 调用 MCP 工具
+     * @param {string} name
+     * @param {Record<string, unknown>} [args]
      */
     async callTool(name, args = {}) {
         if (!this.client) {

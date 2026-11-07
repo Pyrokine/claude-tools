@@ -12,10 +12,10 @@
         "dev": "node node_modules/typescript7/bin/tsc -w",
         "prepare": "npm run build",
         "prepack": "npm run build && npm run build:extension",
-        "lint": "eslint \"{src,extension/src}/**/*.ts\" \"{test,extension/test}/**/*.js\" \"extension/vite*.ts\"",
+        "lint": "eslint \"{src,extension/src}/**/*.ts\" \"{test,extension/test}/**/*.{js,mjs}\" \"extension/vite*.ts\"",
         "lint:fix": "npm run lint -- --fix",
-        "format": "prettier -w --prose-wrap=always src test \"extension/{src/**,test/**,vite*.ts}\" \"*.md\"",
-        "format:check": "prettier -c --prose-wrap=always src test \"extension/{src/**,test/**,vite*.ts}\" \"*.md\"",
+        "format": "prettier -w src test \"extension/{src/**,test/**,vite*.ts}\" \"*.md\"",
+        "format:check": "prettier -c src test \"extension/{src/**,test/**,vite*.ts}\" \"*.md\"",
         "test": "npm run build && node --test test/*.test.js",
         "test:extension": "npm --prefix extension test"
     },
