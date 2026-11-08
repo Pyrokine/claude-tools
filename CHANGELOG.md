@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.19.0 - Unreleased / 未发布
+## v1.19.0 - 2026-11-07
 
 ## Versions
 
@@ -21,6 +21,8 @@
 - fix: Preserve source selection, scan metadata, tool attribution and byte budgets across search, context, trace and
   export paths
 - fix: Keep complete JSON bodies parseable after redaction in normal records, streamed records and exports, while preserving original character ranges
+- fix: Set and verify Windows private DACLs through native APIs, preserving trusted owners and full export coverage without per-file PowerShell startup
+- fix: Accept returned canonical Windows drive paths as export destinations
 
 ### mcp-chrome
 
@@ -63,6 +65,8 @@
 - fix: Preserve completed transfers, partial byte counts and failure stages across timeouts, cancellation and lost SFTP
   replies
 - fix: Validate read targets, synchronization parents, Windows filenames and ACLs before the affected file operations
+- fix: Wait for a failed download's local stream to close before removing temporary files, preserving the existing target
+- fix: Resolve trusted SSH key and configuration root aliases while rejecting links outside allowed roots
 - fix: Update Zod to 4.6.7 and compatible locked dependencies for upstream validation, HTTP parsing, URI and address security fixes
 
 ### skill-cc-session-fix
@@ -102,6 +106,8 @@
 - fix: 修复大规模跨项目及子会话检索超时，保留精确计数、排序、UUID 去重、筛选条件和分页
 - fix: 搜索、上下文、调用追踪与导出保留来源选择、扫描元数据、工具归属及字节预算
 - fix: 普通、流式记录及导出的完整 JSON 正文脱敏后保持可解析，range 保留原字符坐标
+- fix: 通过原生 API 设置和验证 Windows 私有 DACL，保留可信 owner 与完整导出覆盖，每个文件均无需启动 PowerShell
+- fix: 返回的 Windows canonical 盘符路径可再次用作导出目标
 
 ### mcp-chrome
 
@@ -139,6 +145,8 @@
 - fix: 认证前验证 SSH 主机密钥，保留各跳身份诊断与已有信任记录
 - fix: 超时、取消或 SFTP 应答丢失时，保留已完成传输、部分字节数与失败阶段
 - fix: 文件操作前验证读取目标、同步父目录、Windows 文件名与 ACL
+- fix: 下载失败时等待本地写流关闭后删除临时文件，保留原目标
+- fix: SSH 私钥与配置支持受信任根目录别名，继续拒绝允许范围外的链接
 - fix: 将 Zod 更新至 4.6.7，同步兼容依赖的上游安全修复，覆盖验证、HTTP 解析、URI 与地址处理
 
 ### skill-cc-session-fix

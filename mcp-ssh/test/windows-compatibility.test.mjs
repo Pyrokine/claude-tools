@@ -31,6 +31,7 @@ import {
     remotePathModule,
     remoteShellPath,
     sftpPath,
+    windowsCaseSemanticsScript,
 } from '../dist/remote-platform.js'
 import { SessionManager, sessionManager } from '../dist/session-manager.js'
 import { parseConfigValue, parseSSHConfig } from '../dist/ssh-config.js'
@@ -45,7 +46,7 @@ const fixtureHostKey = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed255
 const fixtureTrustFile = path.join(os.homedir(), '.ssh', `known_hosts-fixture-${process.pid}`)
 
 function fixture(t, getManager) {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-windows-'))
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-windows-')))
     t.after(async () => {
         const manager = getManager?.()
         if (manager) {
@@ -70,6 +71,15 @@ function prepareCaseSensitiveDirectory(t, directory) {
             t.skip(`NTFS case-sensitive source directory unavailable: ${reason}`)
             return false
         }
+    }
+    const probe = fs.mkdtempSync(path.join(directory, '.case-sensitive-'))
+    try {
+        if (fs.existsSync(path.join(directory, path.basename(probe).toUpperCase()))) {
+            t.skip('Source filesystem does not support distinct case-sensitive names')
+            return false
+        }
+    } finally {
+        fs.rmdirSync(probe)
     }
     return true
 }
@@ -1585,17 +1595,44 @@ test(
             sessionManager.getSftp = originalSftp
             sessionManager.sessions.delete(alias)
         })
-        names = ['å', 'å']
-        const unicodeTarget = path.join(directory, 'unicode')
-        const unicode = await syncFiles(alias, unicodeTarget, '/source', 'download')
-        assert.equal(unicode.success, true, unicode.output)
-        assert.deepEqual(fs.readdirSync(unicodeTarget).sort(), [...names].sort())
-        names = ['σ', 'ς']
-        const sigmaTarget = path.join(directory, 'sigma')
-        const sigma = await syncFiles(alias, sigmaTarget, '/source', 'download')
-        assert.equal(sigma.success, false)
-        assert.match(sigma.output, /Windows local filename collision/)
-        assert.equal(fs.existsSync(sigmaTarget), false)
+        for (const [folder, entries] of [
+            ['unicode', ['å', 'å']],
+            ['sigma', ['σ', 'ς']],
+        ]) {
+            names = entries
+            const target = path.join(directory, folder)
+            const result = await syncFiles(alias, target, '/source', 'download')
+            assert.equal(result.success, true, result.output)
+            assert.deepEqual(fs.readdirSync(target).sort(), [...names].sort())
+        }
+        names = ['a.txt', 'A.txt']
+        const collisionTarget = path.join(directory, 'collision')
+        const collision = await syncFiles(alias, collisionTarget, '/source', 'download')
+        const nativeCollision = path.join(directory, 'native-collision')
+        for (const name of names) {
+            fs.mkdirSync(path.join(nativeCollision, name), { recursive: true })
+        }
+        const query = encodedPowershell(windowsCaseSemanticsScript(directory, names)).split(' ').at(-1)
+        const nativeQuery = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', query], {
+            encoding: 'utf8',
+            timeout: 10000,
+        })
+        assert.equal(
+            collision.success,
+            false,
+            JSON.stringify({
+                collision,
+                nativeEntries: fs.readdirSync(nativeCollision),
+                downloadedEntries: fs.existsSync(collisionTarget) ? fs.readdirSync(collisionTarget) : [],
+                nativeQuery: { status: nativeQuery.status, stdout: nativeQuery.stdout, stderr: nativeQuery.stderr },
+            })
+        )
+        assert.match(collision.output, /Windows local filename collision/)
+        assert.equal(fs.existsSync(collisionTarget), false)
+        assert.equal(nativeQuery.status, 0, nativeQuery.stderr)
+        const semantics = JSON.parse(nativeQuery.stdout)
+        assert.equal(semantics.caseSensitive, false)
+        assert.deepEqual(new Set(semantics.collision), new Set(names))
         names = ['Exact']
         const exactTarget = path.join(directory, 'exact')
         fs.mkdirSync(path.join(exactTarget, 'Exact'), { recursive: true })
@@ -1813,7 +1850,7 @@ test(
             { names: ['a.txt', 'A.txt'], loop: true, followSymlinks: true, writes: 1, queries: 0 },
             { names: ['a', 'A'], directory: true, collision: ['A', 'a'] },
             { names: ['a.txt', 'A.txt'], nested: true, collision: ['A.txt', 'a.txt'] },
-            { names: ['σ.txt', 'ς.txt'], collision: ['σ.txt', 'ς.txt'] },
+            { names: ['å.txt', 'Å.txt'], collision: ['å.txt', 'Å.txt'] },
             { names: ['中.txt', 'other.txt'], writes: 2 },
             {
                 names: ['a.txt', 'A.txt'],
@@ -2387,7 +2424,8 @@ test(
         fs.mkdirSync(bin)
         fs.mkdirSync(source)
         fs.writeFileSync(path.join(source, 'a.txt'), 'one')
-        fs.writeFileSync(path.join(source, 'A.txt'), 'two')
+        fs.writeFileSync(path.join(source, '中.txt'), 'two')
+        assert.deepEqual(fs.readdirSync(source).sort(), ['a.txt', '中.txt'])
         const keyPath = path.join(root, 'key')
         fs.writeFileSync(keyPath, 'fixture-key', { mode: 0o600 })
         const record = path.join(root, 'calls')

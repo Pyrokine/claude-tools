@@ -1106,6 +1106,8 @@ Linux/macOS or `;` on Windows:
 export SSH_MCP_ALLOWED_KEY_DIRS=/opt/secrets:/var/lib/keys
 ```
 
+Trusted root directories are resolved through filesystem aliases, including macOS system paths. Both the requested
+path and its resolved file must remain under an allowed root; descendant links outside allowed roots are rejected.
 Files outside the whitelist are rejected with `Invalid private key path: ...` or `Invalid config path: ...`.
 
 ### Optional File-Ops Path Whitelist

@@ -86,7 +86,8 @@ scripts/truncate.py <target> --line <N> --title "..." --new-session # fork to fr
 
 Stop every process writing the session before repairing in place. For an active session, use `--new-session`; it leaves
 the source path untouched. A change detected during reading or preparation refuses publication, so retry from a fresh
-diagnosis.
+diagnosis. Windows checks descriptor ctime independently from path metadata, so differing creation-time and change-time
+values do not reject a stable file; file identity, size, modification time and mode remain checked.
 
 - Each in-place repair preserves a unique `.bak.<random-id>` backup, printed as `Backup`
 - POSIX creates an exclusive hard link to the original inode before atomic replacement; appends to an old open file

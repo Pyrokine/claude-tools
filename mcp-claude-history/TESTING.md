@@ -969,9 +969,11 @@ UNC 路径查询同一项目，对大小写别名和多个项目匹配同一路�
 DACL 并检查该 ACE 已删除；对不存在的路径设置
 DACL 并检查报错创建目录、含空格正文文件和 manifest 后检查 DACL
 
-**预期**：路径别名指向同一项目；歧义明确返回
-`project_ambiguous`非法输出路径被拒绝且不产生文件；私有 DACL 限定当前用户和系统必需主体，无法创建或验证时返回
-`privacy_not_enforced_on_windows`，不把 POSIX mode 当作验证证据
+**预期**：路径别名指向同一项目，歧义明确返回 `project_ambiguous`；非法输出路径被拒绝且不产生文件
+返回的 canonical 盘符路径（包含 `\\?\C:\...`）可再次作为 `output` 并覆盖同一个带归属标记的目录
+私有 DACL 仅授予当前用户 FullControl Allow，目录规则由子文件和子目录继承；权限通过原生 Windows API 设置后回读验证，无法创建或验证时返回 `privacy_not_enforced_on_windows`
+完整授权语料矩阵仍逐项验证全部视图、脱敏模式、原字符 range、真实导出正文与 manifest，文件权限检查与导出次数保持
+Windows 临时配额扫描遇到目录消失或 Access Denied 时，按现有上限重新检查完整会话；持续不可访问返回实际错误，配额计数和字节上限保持
 
 通过 Bash 和原生 PowerShell 分别执行 `cargo test --locked utils::tests::windows_private -- --nocapture` 与
 `cargo test --locked get::tests::`，每条命令均须成功
@@ -979,11 +981,14 @@ DACL 并检查报错创建目录、含空格正文文件和 manifest 后检查 D
 使用独立临时 fixture，对目录和文件分别设置当前用户、SYSTEM、Administrators 和内置 Users 组 owner，读取实际 owner 后调用权限函数
 
 **预期**：当前用户、SYSTEM 和 Administrators
-owner 均可设置私有 DACL，owner 保持原值，DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，显式 Everyone
+owner 在当前进程具有 WRITE_DAC 权限时可设置私有 DACL，owner 保持原值，DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，显式 Everyone
 ACE 被删除；Users 组 owner 返回
 `privacy_not_enforced_on_windows`，错误包含该 SID，owner、DACL 和正文保持原样，可信 owner 集合不作为 DACL 授权集合
 
-测试仅修改自建临时对象，原生 owner 设置失败须报告 fixture 失败，不能记为通过或以模拟值替代
+另对 Users 组 owner 分别保留 FullControl 和只读 DACL，确认两种对象均返回包含 owner SID 的拒绝结果；只读用例在当前 SID、禁用特权的线程 token 下调用权限函数，使 FILE_FLAG_BACKUP_SEMANTICS 的备份／还原特权保持关闭，函数返回或异常退出时恢复原线程身份
+SYSTEM owner 仅授予当前用户读取权限且调用者缺少 WRITE_DAC 时，返回明确的写入 DACL 权限错误；三种失败对象的原 owner、DACL 和正文均保持
+只读目录的 Read 规则继承到 sentinel 文件；限制权限前保留该自建对象的 READ_CONTROL／WRITE_DAC 句柄与原 DACL，全部不变断言完成后经原句柄恢复 DACL 并完成清理，测试清理保持被测 owner
+测试仅修改自建临时对象，原生 owner 设置或清理失败须报告 fixture 失败，不能记为通过或以模拟值替代
 
 ### history-output-03：CLI 与 MCP 参数
 

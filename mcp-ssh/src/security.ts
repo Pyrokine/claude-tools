@@ -25,11 +25,14 @@ function getAllowedDirs(): string[] {
 function isUnderAllowedDir(resolved: string): { ok: boolean; allowed: string[] } {
     const allowed = getAllowedDirs()
     const ok = allowed.some((dir) => {
-        const relative = path.relative(dir, resolved)
-        return (
-            relative === '' ||
-            (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
-        )
+        const roots = fs.existsSync(dir) ? [dir, fs.realpathSync(dir)] : [dir]
+        return roots.some((root) => {
+            const relative = path.relative(root, resolved)
+            return (
+                relative === '' ||
+                (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+            )
+        })
     })
     return { ok, allowed }
 }

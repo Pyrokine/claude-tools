@@ -34,7 +34,14 @@ replaces the validator or publication algorithm with a substitute.
 
 - **SF-02 changes**
     - Inputs and operation: Append immediately before backup creation, or change the source between read and commit
+      using the real platform publication primitive while the original descriptor remains open
     - Acceptance: Refuse overwrite, retain the modified source and report recovery/staging paths
+
+- **SF-02 platform timestamps**
+    - Inputs and operation: Give Windows path stat a creation-time ctime different from the descriptor's change-time
+      ctime; alter each path identity/content field and the descriptor ctime independently
+    - Acceptance: A stable Windows source passes; device, file ID, size, mtime, mode or descriptor ctime changes refuse
+      repair; POSIX still compares path ctime
 
 - **SF-02 final window**
     - Inputs and operation: Append through an already open original file descriptor immediately after the actual POSIX

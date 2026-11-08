@@ -28,6 +28,9 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"]
 schemars = "1.2.1"
 anyhow = "1.0.103"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading"] }
+
 [profile.release]
 opt-level = 3
 lto = true

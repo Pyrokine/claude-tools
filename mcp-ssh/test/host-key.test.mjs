@@ -51,7 +51,7 @@ const ecdsaRaw = ssh2.utils.parseKey(ecdsa.private).getPublicSSH()
 const rsaRaw = ssh2.utils.parseKey(rsa.private).getPublicSSH()
 
 function fixture(t) {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-host-key-'))
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-host-key-')))
     if (process.platform === 'win32') {
         assert.equal(checkWindowsAcl(directory, true), 'key_path_usable')
     }
@@ -76,7 +76,7 @@ function fixture(t) {
 }
 
 function systemAliasFixture(t) {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-system-alias-'))
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-system-alias-')))
     const home = path.join(directory, 'home')
     const system = path.join(directory, 'private', 'etc', 'ssh')
     fs.mkdirSync(home, { mode: 0o700 })
@@ -257,7 +257,7 @@ async function server(t, hostKey = key, algorithms) {
 }
 
 function connection(port, alias = 'fixture') {
-    return { host: '127.0.0.1', port, username: 'fixture', password: 'synthetic', alias, readyTimeout: 3000 }
+    return { host: '127.0.0.1', port, username: 'fixture', password: 'synthetic', alias }
 }
 
 test('SSH-01: existing pins select trusted algorithms without changing trust files', async (t) => {
@@ -467,7 +467,7 @@ test('R-01: real rekey after the initial deadline accepts the same key and rejec
     const peer = [...remote.clients][0]
     const original = fs.readFileSync(file, 'utf8')
     const clock = Date.now
-    t.mock.method(Date, 'now', () => clock() + 4000)
+    t.mock.method(Date, 'now', () => clock() + 31000)
     const handshakes = Promise.all([
         once(client, 'handshake', { signal: globalThis.AbortSignal.timeout(5000) }),
         once(peer, 'handshake', { signal: globalThis.AbortSignal.timeout(5000) }),
@@ -563,8 +563,17 @@ test('R29-SSH-01: ordinary disconnect still automatically reconnects', async (t)
     const remote = await server(t)
     await manager.connect(connection(remote.port))
     const first = manager.getSession('fixture').client
+    const reconnect = manager.reconnect.bind(manager)
+    const reconnected = new Promise((resolve, reject) => {
+        t.mock.method(manager, 'reconnect', (...args) => {
+            const pending = reconnect(...args)
+            pending.then(resolve, reject)
+            return pending
+        })
+    })
     ;[...remote.clients][0].end()
     await new Promise((resolve) => setTimeout(resolve, 5500))
+    await reconnected
     assert.notEqual(manager.getSession('fixture').client, first)
     assert.equal(remote.connections(), 2)
     assert.equal(remote.authentication(), 2)
@@ -581,7 +590,7 @@ test(
             t.mock.method(Date, 'now', () => clock() + 4000)
             return verify(...args)
         })
-        await assert.rejects(manager.connect(connection(remote.port)), (error) => {
+        await assert.rejects(manager.connect({ ...connection(remote.port), readyTimeout: 3000 }), (error) => {
             assert.equal(error.details.failureStage, 'host_key')
             assert.match(error.message, /verification deadline exhausted/)
             return true
@@ -694,6 +703,8 @@ test('SSH-01: known_hosts supports hashes, patterns, negation, IPv6, multiple ke
 
 test('SSH-01: competing first keys serialize; cancelled waits leave no owned lock', async (t) => {
     const { file, trust } = fixture(t)
+    const now = Date.now()
+    t.mock.method(Date, 'now', () => now)
     const results = await Promise.allSettled([
         trust.verify('race.example.com', 22, raw),
         trust.verify('race.example.com', 22, other),
@@ -1136,6 +1147,16 @@ test('QL-SSH-01: legacy empty lock files are retained with a bounded explanatory
     const { directory, file, trust } = fixture(t)
     const lock = `${file}.mcp-lock`
     fs.writeFileSync(lock, '', { mode: 0o600 })
+    let now = Date.now()
+    t.mock.method(Date, 'now', () => now)
+    const lstat = fs.promises.lstat.bind(fs.promises)
+    t.mock.method(fs.promises, 'lstat', async (...args) => {
+        const stat = await lstat(...args)
+        if (args[0] === lock) {
+            now += 100
+        }
+        return stat
+    })
     await assert.rejects(
         trust.verify('legacy.example.com', 22, raw, undefined, Date.now() + 100),
         /locked.*legacy.*retained/
@@ -1292,7 +1313,7 @@ for (const failure of ['sync', 'cancel', 'deadline', 'close']) {
                 fs.writeFileSync(file, original, { mode: 0o644 })
                 const access = accessState(file)
                 const open = fs.promises.open.bind(fs.promises)
-                const clock = Date.now
+                let verificationDeadline
                 const controller = new AbortController()
                 t.mock.method(fs.promises, 'open', async (...args) => {
                     const handle = await open(...args)
@@ -1308,7 +1329,7 @@ for (const failure of ['sync', 'cancel', 'deadline', 'close']) {
                                 controller.abort(new Error('fixture verification cancellation'))
                             }
                             if (failure === 'deadline') {
-                                t.mock.method(Date, 'now', () => clock() + 10000)
+                                t.mock.method(Date, 'now', () => verificationDeadline)
                             }
                         }
                         if (failure === 'close') {
@@ -1324,6 +1345,7 @@ for (const failure of ['sync', 'cancel', 'deadline', 'close']) {
                 let observed
                 t.mock.method(manager.knownHosts, 'verify', async (...args) => {
                     try {
+                        verificationDeadline = args[4]
                         args[3] = globalThis.AbortSignal.any([args[3], controller.signal])
                         return await KnownHosts.prototype.verify.call(manager.knownHosts, ...args)
                     } catch (error) {
@@ -1344,7 +1366,6 @@ for (const failure of ['sync', 'cancel', 'deadline', 'close']) {
                     user: 'fixture',
                     password: 'synthetic',
                     alias: 'fixture',
-                    readyTimeout: 3000,
                 })
                 const result = JSON.parse(response.content[0].text)
                 assert.equal(response.isError, true)

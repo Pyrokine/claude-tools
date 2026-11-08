@@ -2651,8 +2651,11 @@ test('C32 OS mouse revalidation failure, cancellation and deadline exhaustion di
         const calls = [];
         const abort = new AbortController();
         const originalNow = Date.now;
-        const deadline = Date.now() + 2000;
+        let now = Date.now();
+        const deadline = now + 2000;
         try {
+            // 超时计算和断言使用同一时钟读数
+            Date.now = () => now;
             await assert.rejects(
                 osLeftClick(280, 326, {
                     platform: 'linux',
@@ -2669,7 +2672,7 @@ test('C32 OS mouse revalidation failure, cancellation and deadline exhaustion di
                             );
                         }
                         if (failure === 'timeout') {
-                            Date.now = () => deadline + 1;
+                            now = deadline + 1;
                         } else {
                             abort.abort(new Error('Owned cancelled'));
                         }

@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setImmediate as tick, setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -27,7 +27,7 @@ await build({
         outDir: bundle,
         minify: false,
         lib: {
-            entry: new URL('./review-c31f4-extension.ts', import.meta.url).pathname,
+            entry: fileURLToPath(new URL('./review-c31f4-extension.ts', import.meta.url)),
             formats: ['es'],
             fileName: () => 'boundary.mjs',
         },

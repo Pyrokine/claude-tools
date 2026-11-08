@@ -302,9 +302,9 @@ MiB 绝对 output 路径须解析到当前工作目录或受控临时会话内�
 发布前同步已存在的正文与 manifest，保留文件内容并要求文件已经存在，Windows 文件同步使用可写句柄，同步失败时返回错误，清理未发布的暂存目录并保留原
 bundle
 
-Windows 导出路径接受当前用户、SYSTEM 或 Administrators 作为 owner，owner 保持原值；DACL 禁止继承，仅保留当前用户的
-FullControl
-Allow，其他 owner 在修改 DACL 前被拒绝，错误中包含 owner SID
+Windows 导出路径接受当前用户、SYSTEM 或 Administrators 作为 owner，owner 保持原值；DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，其他 owner 在修改 DACL 前被拒绝，错误中包含 owner SID
+权限通过 Windows 原生 API 设置并回读验证，每个文件均无需启动 PowerShell，目录规则由子文件和子目录继承
+返回的 Windows canonical 盘符路径可再次作为 `output`，包含 `\\?\C:\...` 路径
 
 normal 搜索导出与内联结果使用相同过滤、时间排序和去重，导出最多 20,000 条、16 MiB；v2
 manifest 记录实际条数、字节数、`complete` 和 `incomplete_reasons`

@@ -245,6 +245,48 @@ class SessionFixTests(unittest.TestCase):
         for path in self.project.iterdir():
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_sf02_source_timestamp_meanings_are_platform_specific(self):
+        self.write([record()])
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")
+        with self.source.open("rb") as stream:
+            original = os.fstat(stream.fileno())
+            expected = session_io.file_stamp(original)
+            values = {field: getattr(original, field) for field in fields}
+            values["st_ctime_ns"] += 1
+            path = mock.Mock()
+            path.stat.return_value = mock.Mock(**values)
+            for platform in ("nt", "posix"):
+                with self.subTest(platform=platform), mock.patch.object(session_io.os, "name", platform):
+                    if platform == "nt":
+                        session_io.check_source(path, stream, expected)
+                    else:
+                        with self.assertRaisesRegex(session_io.SessionError, "Source changed"):
+                            session_io.check_source(path, stream, expected)
+
+    def test_sf02_windows_source_changes_still_refuse_repair(self):
+        self.write([record()])
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")
+        with self.source.open("rb") as stream:
+            original = os.fstat(stream.fileno())
+            expected = session_io.file_stamp(original)
+            values = {field: getattr(original, field) for field in fields}
+            path = mock.Mock()
+            with mock.patch.object(session_io.os, "name", "nt"):
+                for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_mode"):
+                    changed = dict(values)
+                    changed[field] += 0o100 if field == "st_mode" else 1
+                    changed["st_ctime_ns"] += 1
+                    path.stat.return_value = mock.Mock(**changed)
+                    with self.subTest(field=field), \
+                            self.assertRaisesRegex(session_io.SessionError, "Source changed"):
+                        session_io.check_source(path, stream, expected)
+                changed = dict(values)
+                changed["st_ctime_ns"] += 1
+                path.stat.return_value = mock.Mock(**values)
+                with mock.patch.object(session_io.os, "fstat", return_value=mock.Mock(**changed)), \
+                        self.assertRaisesRegex(session_io.SessionError, "Source changed"):
+                    session_io.check_source(path, stream, expected)
+
     def test_sf02_source_identity_change_before_commit_refuses_overwrite(self):
         self.write([record(), record("b", "a")])
         replacement = self.write([record("replacement")], self.project / "replacement.jsonl")
@@ -252,7 +294,9 @@ class SessionFixTests(unittest.TestCase):
         publish = session_io.publish
 
         def replace_source_then_publish(*args, **kwargs):
-            os.replace(replacement, self.source)
+            source, stream, expected = args[2:5]
+            # 使用实际发布原语替换，保留 Windows 打开句柄的共享语义
+            publish(replacement, source, source, stream, expected)
             return publish(*args, **kwargs)
 
         with mock.patch.object(truncate, "publish", side_effect=replace_source_then_publish):

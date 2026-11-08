@@ -11,6 +11,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { createContext, runInContext, runInNewContext } from 'node:vm';
 import { AutoWait } from '../dist/core/auto-wait.js';
 import { Locator } from '../dist/core/locator.js';
@@ -11575,7 +11576,7 @@ test(
             for (const script of ['start-chrome.sh', 'start-chrome-headless.sh']) {
                 await execFileAsync(
                     '/bin/bash',
-                    [new URL(`../scripts/${script}`, import.meta.url).pathname, '9333', '--flag'],
+                    [fileURLToPath(new URL(`../scripts/${script}`, import.meta.url)), '9333', '--flag'],
                     {
                         env: environment,
                     }

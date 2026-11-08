@@ -324,7 +324,9 @@ bundle and removes the unpublished staging directory.
 
 On Windows, export paths may be owned by the current user, SYSTEM, or Administrators. The owner remains unchanged; the
 protected DACL grants only the current user FullControl Allow, with no inherited entries. Other owners are rejected
-before changing the DACL, and the error includes the owner SID.
+before changing the DACL, and the error includes the owner SID. Permissions are set and verified through native Windows
+APIs, without starting PowerShell for each file. Directory rules apply to child files and directories. Returned canonical
+Windows drive paths can be passed back as `output`, including `\\?\C:\...` paths.
 
 Exported search rows use the same filtering, timestamp ordering, and de-duplication as inline results, subject to a
 20,000-row / 16 MiB export ceiling. The v2 manifest records actual rows and bytes, `complete`, and `incomplete_reasons`,

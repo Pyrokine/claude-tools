@@ -1202,9 +1202,10 @@ fn enforce_session_quota_with_extra(
     }
     let mut retries = 0;
     loop {
-        let mut disappeared = false;
+        let mut retry_scan = false;
         let mut io_error = |error: std::io::Error| {
-            disappeared = error.kind() == std::io::ErrorKind::NotFound;
+            retry_scan = error.kind() == std::io::ErrorKind::NotFound
+                || (cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied);
             ErrorResponse {
                 error: "io_error".to_string(),
                 message: format!("无法检查临时导出配额: {error}"),
@@ -1245,11 +1246,11 @@ fn enforce_session_quota_with_extra(
             }
             Ok(())
         })();
-        if result.is_ok() || !disappeared || retries == 7 {
+        if result.is_ok() || !retry_scan || retries == 7 {
             return result;
         }
         if retries == 0 {
-            eprintln!("[mcp-claude-history] 导出目录在配额扫描期间发生变化，重新计算完整配额");
+            eprintln!("[mcp-claude-history] 配额扫描目录暂时不可访问，重新检查完整配额");
         }
         std::thread::sleep(Duration::from_millis(1 << retries));
         retries += 1;
@@ -1476,6 +1477,11 @@ fn validate_output_path(raw: &str) -> Result<(), ErrorResponse> {
         .strip_prefix(TMP_PATH_PREFIX)
         .or_else(|| raw.strip_prefix(CWD_PATH_PREFIX))
         .unwrap_or(raw);
+    #[cfg(windows)]
+    let path = match Path::new(path).components().next() {
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)) => &path[4..],
+        _ => path,
+    };
     let path = if !prefixed
         && Path::new(path).is_absolute()
         && path.len() >= 3

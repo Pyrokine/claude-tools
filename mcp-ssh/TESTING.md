@@ -162,7 +162,7 @@ DACL；真实握手在认证前失败，公开错误说明结果未知且未回�
 
 自动入口：`test/windows-compatibility.test.mjs` 原生 NTFS 用例
 
-验收：NFC/NFD 名称保留区别；sigma/final-sigma 按 ordinal 冲突；大小写敏感目录允许 A/a；精确同名更新保留原内容，查询失败明确报错
+验收：NFC/NFD 与 σ/ς 名称分别保留；大小写不敏感目录中的 a.txt/A.txt 在写入前拒绝，记录原生目录标志和碰撞名称；大小写敏感目录允许 A/a；精确同名更新保留原内容，查询失败明确报错
 
 ### SSH-REQUEST-BUDGET
 
@@ -200,9 +200,11 @@ owner 或返回真实错误
 旧格式空锁文件无法区分活跃旧 writer 与退出遗留，测试须断言文件保持原样且有明确错误，旧空文件保持手动清理合同
 准备目录缺少完整 owner 时保留，但不阻塞固定锁；只有身份可核实且进程明确退出的准备目录才自动回收
 
-原生 Windows 用例在非 Windows 主机按前置条件跳过，Linux 平台替身不替代 DACL、NTFS 或 ordinal 验收大小写敏感目录用例要求自有
-NTFS 目录支持
-`fsutil file setCaseSensitiveInfo`，缺少该能力时说明条件限制
+原生 Windows 用例在非 Windows 主机按前置条件跳过，Linux 平台替身不替代 DACL、NTFS 或 ordinal 验收
+临时 fixture 创建后解析真实根路径，故障注入匹配与生产校验相同的路径，覆盖 macOS 系统临时目录别名
+私钥和配置校验另用真实根目录链接验证允许根别名、普通文件、目录外链接与目录前缀相似路径，Windows 使用自有 junction
+大小写敏感源目录在各平台实际检查名称能否同时存在，Windows 另要求自有 NTFS 目录支持
+`fsutil file setCaseSensitiveInfo`，缺少前置时仅跳过依赖不同大小写源名称的子用例，并保留具体原因
 
 ### I005 解释器参数
 
@@ -1280,10 +1282,9 @@ fallback 原因；模拟 rsync 传输开始后失败，不应再启动 SFTP 重�
 
 ### win-upload-case-preflight-01
 
-**前置**：Windows 本地源目录使用支持大小写敏感标志的 NTFS，并具备执行
+**前置**：本地源目录须允许同名不同大小写的名称同时存在，各平台使用自有临时名称实际检查；Windows 使用支持大小写敏感标志的 NTFS，并具备执行
 `fsutil.exe file setCaseSensitiveInfo <空目录> enable`
-的权限；创建名称后核对目录项确实同时存在无法启用时，仅将依赖同名不同大小写源文件的子用例标为条件 SKIP，保留 fsutil
-的错误原因；不同名称的用例继续执行
+的权限；创建名称后核对目录项确实同时存在，文件系统不支持或标志无法启用时，仅将依赖该前置的子用例标为条件 SKIP，保留具体原因；不同名称的用例继续执行
 
 **步骤**：在区分大小写的本地文件系统建立 `a.txt` 和
 `A.txt`，分别上传到已存在的 Windows 大小写敏感和不敏感目录；使用密码 SFTP 和密钥 rsync 两条路径；覆盖

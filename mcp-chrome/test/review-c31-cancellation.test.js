@@ -209,7 +209,10 @@ test(
     }
 );
 
-test('native pointer observer cleanup retains its own budget after the request expires', async () => {
+test('native pointer observer cleanup retains its own budget after the request expires', async (context) => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+    context.after(() => Object.defineProperty(process, 'platform', platform));
+    Object.defineProperty(process, 'platform', { value: 'linux' });
     await extensionFixture(async ({ unified, requests }) => {
         const scope = { session: unified, deadline: Date.now() + 1000 };
         const failure = new Error('owned coordinate timeout');

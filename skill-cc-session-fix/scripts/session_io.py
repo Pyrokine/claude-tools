@@ -153,7 +153,14 @@ def file_stamp(value):
 
 
 def check_source(source, stream, expected):
-    if file_stamp(os.fstat(stream.fileno())) != expected or file_stamp(source.stat()) != expected:
+    current = file_stamp(os.fstat(stream.fileno()))
+    by_path = file_stamp(source.stat())
+    if os.name == "nt":
+        # Windows 的路径 ctime 与描述符 ctime 存在创建／变更时间差异
+        same_path = by_path[:4] == expected[:4] and by_path[5:] == expected[5:]
+    else:
+        same_path = by_path == expected
+    if current != expected or not same_path:
         raise SessionError("Source changed while reading or preparing the repair; "
                            "original retained, retry from a fresh diagnosis")
 

@@ -981,6 +981,7 @@ forward，避免 ssh2 pending channel 继续累积，此时断开 alias 才能�
 export SSH_MCP_ALLOWED_KEY_DIRS=/opt/secrets:/var/lib/keys
 ```
 
+受信任根目录会解析文件系统别名，包含 macOS 系统路径，原请求路径和解析后的文件都须处于允许的根目录内，指向允许范围外的链接会被拒绝
 白名单外的文件会被拒绝，错误信息为 `Invalid private key path: ...` 或 `Invalid config path: ...`
 
 ### 可选：文件操作路径白名单

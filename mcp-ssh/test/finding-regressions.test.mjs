@@ -18,7 +18,7 @@ import { registerConnectionTools } from '../dist/tools/connection.js'
 import { parseProxyJump } from '../dist/ssh-config.js'
 
 function temporary(t) {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-findings-'))
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-findings-')))
     t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
     return directory
 }
@@ -619,6 +619,7 @@ test('SSH-15: completed download publication is counted before verification', as
 test('SSH-16: public sync probe consumes the request deadline before acquiring SFTP', async (t) => {
     const source = path.join(temporary(t), 'source')
     fs.writeFileSync(source, 'DATA')
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
     let stats = 0
     let ended = 0
     sftpSession(
@@ -640,18 +641,20 @@ test('SSH-16: public sync probe consumes the request deadline before acquiring S
                 )
             )
     )
-    const result = content(
-        await handlers(registerFileTools).get('ssh_sync')({
-            alias: 'fixture',
-            direction: 'upload',
-            localPath: source,
-            remotePath: '/target',
-            operationTimeout: 5,
-        })
-    )
+    const pending = handlers(registerFileTools).get('ssh_sync')({
+        alias: 'fixture',
+        direction: 'upload',
+        localPath: source,
+        remotePath: '/target',
+        operationTimeout: 5,
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+    t.mock.timers.tick(5)
+    const result = content(await pending)
     assert.equal(result.success, false)
     assert.match(result.error, /timeout/)
-    await new Promise((resolve) => setTimeout(resolve, 40))
+    t.mock.timers.tick(40)
+    await new Promise((resolve) => setImmediate(resolve))
     assert.equal(stats, 0)
     assert.equal(ended, 1)
 })

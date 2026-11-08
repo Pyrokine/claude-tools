@@ -3207,13 +3207,16 @@ mod tests {
     }
     impl Fixture {
         fn new(line: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
             let owner = format!(
-                "{}-{}",
+                "{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
             );
             let root = std::env::temp_dir().join(format!("history-record-reader-{owner}"));
             std::fs::create_dir(&root).unwrap();
@@ -3236,6 +3239,22 @@ mod tests {
                 std::fs::remove_dir_all(&self.root).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn record_fixtures_remain_distinct_and_clean_up_independently() {
+        let first = Fixture::new("first");
+        let second = Fixture::new("second");
+        let first_root = first.root.clone();
+        let second_root = second.root.clone();
+        assert_ne!(first.root, second.root);
+        assert_ne!(first.owner, second.owner);
+        assert_eq!(std::fs::read_to_string(&first.path).unwrap(), "first");
+        drop(first);
+        assert!(!first_root.exists());
+        assert_eq!(std::fs::read_to_string(&second.path).unwrap(), "second");
+        drop(second);
+        assert!(!second_root.exists());
     }
 
     #[test]

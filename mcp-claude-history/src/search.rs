@@ -3227,7 +3227,7 @@ mod tests {
             )
             .unwrap();
         }
-        path
+        path.canonicalize().unwrap()
     }
 
     #[test]
@@ -4059,6 +4059,7 @@ mod tests {
         let tmp = env::temp_dir().join(format!("mcp-search-pending-{}-{nonce}", process::id()));
         let project = tmp.join("project");
         fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
         let path = project.join("session-pending.jsonl");
         let mut file = File::create(&path).unwrap();
         for (index, letter) in ['x', 'y'].into_iter().enumerate() {
@@ -4177,6 +4178,7 @@ mod tests {
 
         let tmp = env::temp_dir().join(format!("mcp-search-metadata-test-{}", process::id()));
         fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmp.canonicalize().unwrap();
         let path = tmp.join("session-metadata.jsonl");
         let mut file = File::create(&path).unwrap();
         writeln!(
@@ -5553,6 +5555,7 @@ mod tests {
     fn coverage_attempts_include_empty_and_failed_files_in_every_mode() {
         let root = env::temp_dir().join(format!("mcp-search-attempted-coverage-{}", process::id()));
         fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let empty = root.join("empty.jsonl");
         fs::write(&empty, "").unwrap();
         let missing = root.join("missing.jsonl");

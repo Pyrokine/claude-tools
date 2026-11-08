@@ -277,6 +277,8 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("history-canonical-{}-{nonce}", std::process::id()));
         fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        let root = root.canonicalize().unwrap();
         let path = root.join("session.jsonl");
         let expected = b"{\"type\":\"user\",\"message\":{\"content\":\"fixture\"}}\n";
         fs::write(&path, expected).unwrap();
@@ -290,6 +292,36 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert!(open_session_file(&fs::canonicalize(&root).unwrap()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_canonicalizes_root_aliases_but_open_rejects_linked_sources() {
+        let root = std::env::temp_dir().join(format!("history-root-alias-{}", std::process::id()));
+        fs::create_dir_all(root.join("real/project")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("real/project/session.jsonl");
+        fs::write(&source, b"{}\n").unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(root.join("real"), &alias).unwrap();
+        let config = crate::config::Config { projects_dir: alias };
+        let linked_source = config.projects_dir.join("project/session.jsonl");
+        assert!(open_session_file(&linked_source).is_err());
+        let files = collect_session_files(&config.list_project_dirs().unwrap(), &[], false).unwrap();
+        assert_eq!(files, [("project".to_string(), "session".to_string(), source.clone())]);
+        let resolved = resolve_exact_source(&config, linked_source.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, files[0]);
+        let mut body = String::new();
+        open_session_file(&resolved.2)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        assert_eq!(body, "{}\n");
+        let linked_file = root.join("real/project/linked.jsonl");
+        std::os::unix::fs::symlink(&source, &linked_file).unwrap();
+        assert!(open_session_file(&linked_file).is_err());
+        assert!(resolve_exact_source(&config, linked_file.to_str().unwrap()).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

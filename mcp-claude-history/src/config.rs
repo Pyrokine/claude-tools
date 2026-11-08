@@ -407,13 +407,16 @@ mod tests {
             "--Server-Share-Repo"
         );
 
-        #[cfg(not(windows))]
-        {
-            fs::create_dir_all(root.join("c--work-repo")).unwrap();
-            assert_eq!(
+        match fs::create_dir(root.join("c--work-repo")) {
+            Ok(()) => assert_eq!(
                 config.normalize_project_id(r"c:\work\repo").unwrap_err().error,
                 "project_ambiguous"
-            );
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                assert_eq!(config.list_project_dirs().unwrap().len(), 2);
+                assert_eq!(config.normalize_project_id(r"c:\work\repo").unwrap(), "C--Work-Repo");
+            }
+            Err(error) => panic!("failed to create case-variant project: {error}"),
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -435,6 +438,14 @@ mod tests {
                 .unwrap(),
             id
         );
+        let alias_id = project_path_to_id(&root.join("alias").to_string_lossy());
+        assert_ne!(alias_id, id);
+        fs::create_dir(config.projects_dir.join(&alias_id)).unwrap();
+        let error = config
+            .normalize_project_id(&root.join("real").to_string_lossy())
+            .unwrap_err();
+        assert_eq!(error.error, "project_ambiguous");
+        assert_eq!(error.available.unwrap()["candidates"].as_array().unwrap().len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 }

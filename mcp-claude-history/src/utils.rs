@@ -159,77 +159,195 @@ pub fn set_private_permissions(path: &Path, mode: u32) -> Result<(), ErrorRespon
 
 #[cfg(windows)]
 pub fn set_private_permissions(path: &Path, _mode: u32) -> Result<(), ErrorResponse> {
-    // Pass the path as an environment variable; it must never be interpreted as PowerShell code.
-    let script = concat!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$p = $env:MCP_HISTORY_PRIVATE_PATH
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$item = Get-Item -LiteralPath $p -Force
-if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'private path is a reparse point' }
-$acl = Get-Acl -LiteralPath $p
-$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-$trustedOwners = @($sid.Value, 'S-1-5-18', 'S-1-5-32-544')
-if ($trustedOwners -notcontains $owner) { throw "private path owner mismatch: $owner" }
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
-$inherit = if (Test-Path -LiteralPath $p -PathType Container) { 'ContainerInherit,ObjectInherit' } else { 'None' }
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', $inherit, 'None', 'Allow')
-$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $p -AclObject $acl
-$actual = Get-Acl -LiteralPath $p
-$entries = @($actual.Access)
-if (-not $actual.AreAccessRulesProtected -or $entries.Count -ne 1 -or $entries[0].IsInherited -or
-    $entries[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or
-    $entries[0].AccessControlType -ne 'Allow' -or
-    ($entries[0].FileSystemRights -band "#,
-        r#"[System.Security.AccessControl.FileSystemRights]::FullControl) -ne "#,
-        r#"[System.Security.AccessControl.FileSystemRights]::FullControl) {
-    throw 'private DACL verification failed'
-}
-"#
-    );
-    let result = (|| -> io::Result<std::process::Output> {
-        let mut child = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .env_remove("PSModulePath")
-            .env("MCP_HISTORY_PRIVATE_PATH", path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        let started = std::time::Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return child.wait_with_output(),
-                Ok(None) if started.elapsed() < std::time::Duration::from_secs(10) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Ok(None) => {
-                    let termination = child.kill();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("Windows DACL 验证超过 10 秒；终止进程结果: {termination:?}"),
-                    ));
-                }
-                Err(error) => {
-                    let _ = child.kill();
-                    return Err(error);
-                }
-            }
+    use std::ffi::c_void;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::{addr_of, null_mut};
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+        EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl,
+        IsWellKnownSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+        SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct LocalMemory(*mut c_void);
+    impl Drop for LocalMemory {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
         }
-    })();
-    if result.as_ref().is_ok_and(|output| output.status.success()) {
-        return Ok(());
     }
-    Err(ErrorResponse {
-        error: "privacy_not_enforced_on_windows".to_string(),
-        message: format!(
-            "无法设置并验证私有 DACL: {}",
-            result.map_or_else(
-                |e| e.to_string(),
-                |out| String::from_utf8_lossy(&out.stderr).into_owned()
+
+    fn security(file: &File) -> io::Result<(LocalMemory, PSID, *mut ACL)> {
+        let mut descriptor = LocalMemory(null_mut());
+        let mut owner = null_mut();
+        let mut dacl = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor.0,
             )
-        ),
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::other(format!(
+                "读取 owner 和 DACL 失败: {}",
+                io::Error::from_raw_os_error(status as i32)
+            )));
+        }
+        Ok((descriptor, owner, dacl))
+    }
+
+    fn sid_text(sid: PSID) -> io::Result<String> {
+        let mut text = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _allocation = LocalMemory(text.cast());
+        let mut length = 0;
+        unsafe {
+            while *text.add(length) != 0 {
+                length += 1;
+            }
+            Ok(String::from_utf16_lossy(std::slice::from_raw_parts(text, length)))
+        }
+    }
+
+    let result = (|| -> io::Result<()> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let (file, write_error) = match options.open(path) {
+            Ok(file) => (file, None),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                // 只读句柄只用于报告 owner，写权限被拒绝后仍结束本次设置
+                let file = options.access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES).open(path)?;
+                (file, Some(error))
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| io::Error::other(format!("读取输出路径属性失败: {error}")))?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other("private path is a reparse point"));
+        }
+        let mut token = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut required = 0;
+        unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut required) };
+        if io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(io::Error::last_os_error());
+        }
+        // Token 缓冲区保持指针对齐，生命周期覆盖其中的 user SID
+        let mut user = vec![0usize; (required as usize).div_ceil(size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                user.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let (_original, owner, _) = security(&file)?;
+        if unsafe {
+            EqualSid(owner, sid) == 0
+                && IsWellKnownSid(owner, WinLocalSystemSid) == 0
+                && IsWellKnownSid(owner, WinBuiltinAdministratorsSid) == 0
+        } {
+            return Err(io::Error::other(format!(
+                "private path owner mismatch: {}",
+                sid_text(owner)?
+            )));
+        }
+        if let Some(error) = write_error {
+            return Err(io::Error::other(format!("取得写入 DACL 权限失败: {error}")));
+        }
+        let flags = if metadata.is_dir() {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        };
+        let length = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
+            + unsafe { GetLengthSid(sid) } as usize;
+        let mut buffer = vec![0u32; length.div_ceil(size_of::<u32>())];
+        let dacl = buffer.as_mut_ptr().cast::<ACL>();
+        if unsafe { InitializeAcl(dacl, (buffer.len() * size_of::<u32>()) as u32, ACL_REVISION) } == 0
+            || unsafe { AddAccessAllowedAceEx(dacl, ACL_REVISION, flags, FILE_ALL_ACCESS, sid) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::other(format!(
+                "设置私有 DACL 失败: {}",
+                io::Error::from_raw_os_error(status as i32)
+            )));
+        }
+        let (actual, actual_owner, actual_dacl) = security(&file)?;
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(actual.0, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if control & SE_DACL_PROTECTED == 0
+            || actual_dacl.is_null()
+            || unsafe { (*actual_dacl).AceCount } != 1
+            || unsafe { EqualSid(owner, actual_owner) } == 0
+        {
+            return Err(io::Error::other("private DACL verification failed"));
+        }
+        let mut entry = null_mut();
+        if unsafe { GetAce(actual_dacl, 0, &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let entry = unsafe { &*entry.cast::<ACCESS_ALLOWED_ACE>() };
+        if entry.Header.AceType != ACCESS_ALLOWED_ACE_TYPE as u8
+            || u32::from(entry.Header.AceFlags) != flags
+            || entry.Mask != FILE_ALL_ACCESS
+            || unsafe { EqualSid(addr_of!(entry.SidStart).cast_mut().cast(), sid) } == 0
+        {
+            return Err(io::Error::other("private DACL verification failed"));
+        }
+        Ok(())
+    })();
+    result.map_err(|error| ErrorResponse {
+        error: "privacy_not_enforced_on_windows".to_string(),
+        message: format!("无法设置并验证私有 DACL: {error}"),
         available: None,
     })
 }
@@ -3114,7 +3232,7 @@ mod tests {
             writeln!(file, "{line}").unwrap();
         }
         file.flush().unwrap();
-        path
+        path.canonicalize().unwrap()
     }
 
     #[test]
@@ -3747,18 +3865,45 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_private_acl_checks_trusted_owners_without_transferring_ownership() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser,
+            RevertToSelf, TOKEN_DUPLICATE, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        struct RestrictedCaller;
+        impl Drop for RestrictedCaller {
+            fn drop(&mut self) {
+                assert_ne!(
+                    unsafe { RevertToSelf() },
+                    0,
+                    "restore fixture caller: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!("mcp-history-owner-test-{}-{nonce}", std::process::id()));
         fs::create_dir(&root).unwrap();
-        let run = |script: &str, path: &Path, owner: &str| -> serde_json::Value {
+        let run = |script: &str, path: &Path, owner: &str, read_only: bool| -> serde_json::Value {
             let output = std::process::Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", script])
                 .env_remove("PSModulePath")
                 .env("MCP_HISTORY_PRIVATE_PATH", path)
                 .env("MCP_HISTORY_TEST_OWNER", owner)
+                .env("MCP_HISTORY_TEST_READ_ONLY", read_only.to_string())
                 .output()
                 .unwrap();
             assert!(
@@ -3792,10 +3937,38 @@ if ($private) {
 } | ConvertTo-Json -Compress
 "#
         );
-        let initial = run(query, &root, "");
+        let initial = run(query, &root, "", false);
         eprintln!("Windows private-output fixture initial owner: {}", initial["owner"]);
         let user = initial["user"].as_str().unwrap();
         set_private_permissions(&root, 0o700).unwrap();
+        let mut token = null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token) },
+            0,
+            "fixture process token: {}",
+            io::Error::last_os_error()
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut restricted = null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE,
+                    0,
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    &mut restricted,
+                )
+            },
+            0,
+            "fixture restricted token: {}",
+            io::Error::last_os_error()
+        );
+        let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
         let assign = format!(
             r#"
 $ErrorActionPreference = 'Stop'
@@ -3806,6 +3979,19 @@ $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($ev
 Set-Acl -LiteralPath $p -AclObject $acl
 & "$env:SystemRoot\System32\icacls.exe" $p /setowner "*$env:MCP_HISTORY_TEST_OWNER" /Q | Out-Null
 if ($LASTEXITCODE -ne 0) {{ throw "owner fixture failed: exit $LASTEXITCODE" }}
+if ($env:MCP_HISTORY_TEST_READ_ONLY -eq 'true') {{
+    $acl = Get-Acl -LiteralPath $p
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ((Get-Item -LiteralPath $p).PSIsContainer) {{
+        $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, 'Read', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }} else {{
+        $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'Read', 'Allow'))
+    }}
+    Set-Acl -LiteralPath $p -AclObject $acl
+}}
 {query}
 "#
         );
@@ -3814,6 +4000,8 @@ if ($LASTEXITCODE -ne 0) {{ throw "owner fixture failed: exit $LASTEXITCODE" }}
             ("system", "S-1-5-18", true),
             ("administrators", "S-1-5-32-544", true),
             ("users", "S-1-5-32-545", false),
+            ("users-read-only", "S-1-5-32-545", false),
+            ("system-read-only", "S-1-5-18", true),
         ] {
             for (kind, directory) in [("directory", true), ("file", false)] {
                 let path = root.join(format!("{name}-{kind}"));
@@ -3824,24 +4012,89 @@ if ($LASTEXITCODE -ne 0) {{ throw "owner fixture failed: exit $LASTEXITCODE" }}
                     path.clone()
                 };
                 fs::write(&content, b"owner fixture content").unwrap();
-                let before = run(&assign, &path, owner);
+                let read_only = name.ends_with("-read-only");
+                let cleanup = read_only.then(|| {
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .access_mode(READ_CONTROL | WRITE_DAC)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(&path)
+                        .unwrap();
+                    let mut descriptor = null_mut();
+                    let mut dacl = null_mut();
+                    assert_eq!(
+                        unsafe {
+                            GetSecurityInfo(
+                                file.as_raw_handle(),
+                                SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION,
+                                null_mut(),
+                                null_mut(),
+                                &mut dacl,
+                                null_mut(),
+                                &mut descriptor,
+                            )
+                        },
+                        ERROR_SUCCESS,
+                        "fixture DACL snapshot: {name}-{kind}"
+                    );
+                    let length = unsafe { (*dacl).AclSize } as usize;
+                    let mut original = vec![0u32; length.div_ceil(size_of::<u32>())];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(dacl.cast::<u8>(), original.as_mut_ptr().cast::<u8>(), length);
+                        LocalFree(descriptor);
+                    }
+                    (file, original)
+                });
+                let before = run(&assign, &path, owner, read_only);
                 assert_eq!(before["owner"], owner, "{name}-{kind}");
                 assert_eq!(before["private"], false, "{name}-{kind}");
+                let caller = read_only.then(|| {
+                    assert_ne!(
+                        unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+                        0,
+                        "restricted fixture caller: {name}-{kind}: {}",
+                        io::Error::last_os_error()
+                    );
+                    RestrictedCaller
+                });
                 let result = set_private_permissions(&path, if directory { 0o700 } else { 0o600 });
-                if trusted {
+                drop(caller);
+                if trusted && !read_only {
                     result.unwrap();
                 } else {
-                    let error = result.unwrap_err();
+                    let error = result.expect_err(&format!("owner fixture {name}-{kind}"));
                     assert_eq!(error.error, "privacy_not_enforced_on_windows");
-                    assert!(error.message.contains(owner));
+                    if trusted {
+                        assert!(error.message.contains("取得写入 DACL 权限失败"));
+                    } else {
+                        assert!(error.message.contains(owner));
+                    }
                 }
-                let after = run(query, &path, owner);
+                let after = run(query, &path, owner, false);
                 assert_eq!(after["owner"], owner, "{name}-{kind}");
-                assert_eq!(after["private"], trusted, "{name}-{kind}");
-                if !trusted {
+                assert_eq!(after["private"], trusted && !read_only, "{name}-{kind}");
+                if !trusted || read_only {
                     assert_eq!(after["sddl"], before["sddl"], "{name}-{kind}");
                 }
                 assert_eq!(fs::read(&content).unwrap(), b"owner fixture content", "{name}-{kind}");
+                if let Some((file, mut original)) = cleanup {
+                    assert_eq!(
+                        unsafe {
+                            SetSecurityInfo(
+                                file.as_raw_handle(),
+                                SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION,
+                                null_mut(),
+                                null_mut(),
+                                original.as_mut_ptr().cast(),
+                                null_mut(),
+                            )
+                        },
+                        ERROR_SUCCESS,
+                        "fixture DACL cleanup: {name}-{kind}"
+                    );
+                }
             }
         }
         fs::remove_dir_all(root).unwrap();

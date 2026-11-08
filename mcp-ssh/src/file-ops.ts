@@ -1043,6 +1043,7 @@ export async function downloadFile(
         `.${path.basename(localPath)}.mcp-tmp-${process.pid}-${randomBytes(8).toString('hex')}`
     )
     let failureStage = 'download'
+    let localWriteStream: Writable | undefined
     try {
         const { totalSize, readStream, writeStream } = await prepareDownloadTransfer(
             sftp,
@@ -1053,6 +1054,7 @@ export async function downloadFile(
             deadline,
             signal
         )
+        localWriteStream = writeStream
         const result = await withSftpDeadline(
             sftp,
             pipeWithProgress(readStream, writeStream, sftp, totalSize, onProgress, !sharedSftp, signal),
@@ -1081,6 +1083,14 @@ export async function downloadFile(
             },
         })
         try {
+            const writeStream = localWriteStream
+            if (writeStream && !writeStream.closed) {
+                // 尚未完成的 open 会在 unlink 返回 ENOENT 后创建文件
+                await new Promise<void>((resolve) => {
+                    writeStream.once('close', resolve)
+                    writeStream.destroy()
+                })
+            }
             await fs.promises.unlink(temporaryPath)
         } catch (cleanupError) {
             if (!isLocalMissingError(cleanupError)) {

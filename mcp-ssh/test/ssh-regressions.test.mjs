@@ -36,6 +36,7 @@ import {
 } from '../dist/file-ops.js'
 import { formatFileMode, formatFilePermissions, parseExpectedFileMode } from '../dist/file-mode.js'
 import { sessionManager, SessionManager } from '../dist/session-manager.js'
+import { validateKeyFile, validateConfigFile } from '../dist/security.js'
 import { registerExecTools } from '../dist/tools/exec.js'
 import { createAtomicUploadPath, registerFileTools } from '../dist/tools/file.js'
 import { dynamicSshPortSchema, sshPortSchema } from '../dist/tools/schema.js'
@@ -51,7 +52,7 @@ sessionManager.getRemotePathStyle = (alias) => (sessionManager.sessions.has(alia
 sessionManager.getRemotePlatform = (alias) => (sessionManager.sessions.has(alias) ? originalPlatform(alias) : 'posix')
 
 function makeTempDir(t) {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-ssh-test-'))
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-ssh-test-')))
     t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
     return directory
 }
@@ -538,6 +539,35 @@ test('SSH key and config validators reject nonregular inputs before synchronous 
     assert.ifError(result.error)
     assert.equal(result.status, 0, result.stderr)
     assert.equal(result.stdout.trim(), 'nonregular-inputs-rejected')
+})
+
+test('SSH key and config validators resolve trusted root aliases and reject descendant escapes', (t) => {
+    const directory = makeTempDir(t)
+    const trusted = path.join(directory, 'trusted')
+    const alias = path.join(directory, 'trusted-alias')
+    const outside = path.join(directory, 'trusted-other')
+    fs.mkdirSync(trusted)
+    fs.mkdirSync(outside)
+    fs.writeFileSync(path.join(trusted, 'regular'), 'Host fixture\n  HostName example.com\n')
+    fs.writeFileSync(path.join(outside, 'regular'), 'outside fixture')
+    const linkType = process.platform === 'win32' ? 'junction' : 'dir'
+    fs.symlinkSync(trusted, alias, linkType)
+    fs.symlinkSync(outside, path.join(trusted, 'escape'), linkType)
+    const previous = process.env.SSH_MCP_ALLOWED_KEY_DIRS
+    process.env.SSH_MCP_ALLOWED_KEY_DIRS = alias
+    t.after(() => {
+        if (previous === undefined) {
+            delete process.env.SSH_MCP_ALLOWED_KEY_DIRS
+        } else {
+            process.env.SSH_MCP_ALLOWED_KEY_DIRS = previous
+        }
+    })
+    for (const validate of [validateKeyFile, validateConfigFile]) {
+        validate(path.join(alias, 'regular'))
+        validate(path.join(trusted, 'regular'))
+        assert.throws(() => validate(path.join(alias, 'escape', 'regular')), /symlink target falls outside/)
+        assert.throws(() => validate(path.join(outside, 'regular')), /Invalid (private key|config) path/)
+    }
 })
 
 test('SSH port schemas reject out-of-range and fractional values', () => {
@@ -1213,6 +1243,25 @@ test('failed atomic SFTP download preserves the existing target and removes temp
     const directory = makeTempDir(t)
     const localPath = path.join(directory, 'target.txt')
     fs.writeFileSync(localPath, 'original')
+    const originalCreateWriteStream = fs.createWriteStream
+    let localStreamClosed
+    t.after(() => {
+        fs.createWriteStream = originalCreateWriteStream
+        syncBuiltinESMExports()
+    })
+    fs.createWriteStream = (filename, options) => {
+        const stream = originalCreateWriteStream(filename, {
+            ...options,
+            fs: {
+                open: (...args) => setTimeout(() => fs.open(...args), 30),
+                write: fs.write,
+                close: fs.close,
+            },
+        })
+        localStreamClosed = new Promise((resolve) => stream.once('close', resolve))
+        return stream
+    }
+    syncBuiltinESMExports()
     const sftp = {
         stat(_remotePath, callback) {
             callback(null, { size: 12 })
@@ -1236,6 +1285,7 @@ test('failed atomic SFTP download preserves the existing target and removes temp
         downloadFile('unused', '/remote/target.txt', localPath, undefined, sftp),
         /injected download failure/
     )
+    await localStreamClosed
     assert.equal(fs.readFileSync(localPath, 'utf8'), 'original')
     assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
 })
@@ -1649,7 +1699,10 @@ test('I019 missing remote parents return actionable preparation failures before 
     const originalSftp = sessionManager.getSftp
     let writes = 0
     sessionManager.getSftp = async () => ({
-        ...fixtureSftp(),
+        stat(name, callback) {
+            assert.equal(name, '/owned/missing')
+            callback(Object.assign(new Error('No such file'), { code: 2 }))
+        },
         createWriteStream() {
             ++writes
             throw new Error('Unexpected upload')
@@ -1668,7 +1721,7 @@ test('I019 missing remote parents return actionable preparation failures before 
     const response = await handlers.get('ssh_sync')({
         alias: 'owned-parent',
         localPath: source,
-        remotePath: path.join(root, 'missing', 'owned.txt'),
+        remotePath: '/owned/missing/owned.txt',
         direction: 'upload',
     })
     const result = JSON.parse(response.content[0].text)
@@ -1682,8 +1735,11 @@ test('I019 missing remote parents return actionable preparation failures before 
 
 test('I005 exec_script preserves interpreter argv and legacy execution through the registered tool', async (t) => {
     const root = makeTempDir(t)
-    const remote = path.join(root, 'owned script.py')
+    const remote = path.join(root, 'owned script.py').split(path.sep).join('/')
     const marker = path.join(root, 'unexpected')
+    const shell =
+        process.platform === 'win32' ? path.join(process.env.ProgramFiles, 'Git', 'bin', 'bash.exe') : '/bin/sh'
+    const interpreter = process.platform === 'win32' ? 'python' : 'python3'
     const originalExec = sessionManager.exec
     const originalSftp = sessionManager.getSftp
     const handlers = new Map()
@@ -1696,7 +1752,7 @@ test('I005 exec_script preserves interpreter argv and legacy execution through t
         if (command === 'mktemp /tmp/mcp-ssh-script.XXXXXX') {
             return { success: true, stdout: remote + '\n', stderr: '', exitCode: 0 }
         }
-        const result = await exec(command)
+        const result = await exec(command, { shell })
         return { ...result, success: true, exitCode: 0, shell: 'posix' }
     }
     sessionManager.getSftp = async () => ({
@@ -1714,14 +1770,14 @@ test('I005 exec_script preserves interpreter argv and legacy execution through t
         { name: 'legacy', script: 'printf legacy', expected: 'legacy' },
         {
             name: 'isolated',
-            interpreter: 'python3',
+            interpreter,
             interpreterArgs: ['-I'],
             script: 'import sys; print(sys.flags.isolated)',
             expected: '1',
         },
         {
             name: 'literal argument',
-            interpreter: 'python3',
+            interpreter,
             interpreterArgs: ['-I', '-X', `owned=${literal}`],
             script: 'import sys; print(sys._xoptions["owned"])',
             expected: literal,

@@ -46,6 +46,7 @@ class FakeClient extends EventEmitter {
             this.lastForwardOutStream = new PassThrough()
             callback(null, this.lastForwardOutStream)
         }
+        this.emit('forwardOut')
     }
 
     forwardIn(_host, port, callback) {
@@ -77,42 +78,52 @@ test('graceful local close waits for listener release and permits immediate rebi
     await new Promise((resolve) => rebound.close(resolve))
 })
 
-test('graceful local timeout reports released listener and retains state for force retry', async () => {
+test(
+    'graceful local timeout reports released listener and retains state for force retry',
+    { timeout: 5000 },
+    async (t) => {
+        const manager = new ForwardManager()
+        t.after(() => manager.closeByAlias('server'))
+        const client = new FakeClient()
+        const channelReady = new Promise((resolve) => client.once('forwardOut', resolve))
+        const created = await manager.forwardLocal({ getClient: () => client }, 'server', 0, '127.0.0.1', 80)
+        const socket = await connect(created.localPort)
+        t.after(() => socket.destroy())
+        await channelReady
+
+        const timedOut = await manager.close(
+            created.forwardId,
+            { getClient: () => client },
+            { mode: 'graceful', timeoutMs: 5 }
+        )
+        assert.equal(timedOut.success, false)
+        assert.equal(timedOut.listenerReleased, true)
+        assert.equal(timedOut.activeConnections, 1)
+        assert.deepEqual(
+            manager.list().map(({ lifecycle, acceptingConnections }) => ({ lifecycle, acceptingConnections })),
+            [{ lifecycle: 'closing', acceptingConnections: false }]
+        )
+
+        const forced = await manager.close(
+            created.forwardId,
+            { getClient: () => client },
+            { mode: 'force', timeoutMs: 1000 }
+        )
+        assert.equal(forced.success, true)
+        assert.equal(forced.listenerReleased, true)
+        assert.equal(manager.list().length, 0)
+    }
+)
+
+test('force local close destroys active connections before releasing listener', { timeout: 5000 }, async (t) => {
     const manager = new ForwardManager()
+    t.after(() => manager.closeByAlias('server'))
     const client = new FakeClient()
+    const channelReady = new Promise((resolve) => client.once('forwardOut', resolve))
     const created = await manager.forwardLocal({ getClient: () => client }, 'server', 0, '127.0.0.1', 80)
     const socket = await connect(created.localPort)
-
-    const timedOut = await manager.close(
-        created.forwardId,
-        { getClient: () => client },
-        { mode: 'graceful', timeoutMs: 5 }
-    )
-    assert.equal(timedOut.success, false)
-    assert.equal(timedOut.listenerReleased, true)
-    assert.equal(timedOut.activeConnections, 1)
-    assert.deepEqual(
-        manager.list().map(({ lifecycle, acceptingConnections }) => ({ lifecycle, acceptingConnections })),
-        [{ lifecycle: 'closing', acceptingConnections: false }]
-    )
-
-    const forced = await manager.close(
-        created.forwardId,
-        { getClient: () => client },
-        { mode: 'force', timeoutMs: 1000 }
-    )
-    assert.equal(forced.success, true)
-    assert.equal(forced.listenerReleased, true)
-    assert.equal(manager.list().length, 0)
-    socket.destroy()
-})
-
-test('force local close destroys active connections before releasing listener', async () => {
-    const manager = new ForwardManager()
-    const client = new FakeClient()
-    const created = await manager.forwardLocal({ getClient: () => client }, 'server', 0, '127.0.0.1', 80)
-    const socket = await connect(created.localPort)
-    await new Promise((resolve) => setImmediate(resolve))
+    t.after(() => socket.destroy())
+    await channelReady
     assert.ok(client.lastForwardOutStream)
 
     const result = await manager.close(
@@ -236,12 +247,16 @@ test('disconnect cancels a pending local listener before it can be published', a
     assert.equal(manager.list().length, 0)
 })
 
-test('pending forwardOut keeps close retryable until its callback is drained', async () => {
+test('pending forwardOut keeps close retryable until its callback is drained', { timeout: 5000 }, async (t) => {
     const manager = new ForwardManager()
+    t.after(() => manager.closeByAlias('server'))
     const client = new FakeClient({ deferForwardOut: true })
+    const channelPending = new Promise((resolve) => client.once('forwardOut', resolve))
     const deps = { getClient: () => client }
     const created = await manager.forwardLocal(deps, 'server', 0, '127.0.0.1', 80)
     const socket = await connect(created.localPort)
+    t.after(() => socket.destroy())
+    await channelPending
 
     const timedOut = await manager.close(created.forwardId, deps, { mode: 'force', timeoutMs: 5 })
     assert.equal(timedOut.success, false)
@@ -260,39 +275,48 @@ test('pending forwardOut keeps close retryable until its callback is drained', a
     socket.destroy()
 })
 
-test('SSH-04: a late forwardOut channel is rejected after only its local socket closes', async (t) => {
-    const manager = new ForwardManager()
-    const client = new FakeClient({ deferForwardOut: true })
-    const deps = { getClient: () => client }
-    const created = await manager.forwardLocal(deps, 'server', 0, '127.0.0.1', 80)
-    t.after(() => manager.closeByAlias('server'))
-    const socket = await connect(created.localPort)
-    t.after(() => socket.destroy())
-    for (let i = 0; i < 100 && !client.forwardOutCallback; ++i) {
-        await new Promise((resolve) => setImmediate(resolve))
+test(
+    'SSH-04: a late forwardOut channel is rejected after only its local socket closes',
+    { timeout: 5000 },
+    async (t) => {
+        const manager = new ForwardManager()
+        t.after(() => manager.closeByAlias('server'))
+        const client = new FakeClient({ deferForwardOut: true })
+        const channelPending = new Promise((resolve) => client.once('forwardOut', resolve))
+        const deps = { getClient: () => client }
+        const created = await manager.forwardLocal(deps, 'server', 0, '127.0.0.1', 80)
+        const socket = await connect(created.localPort)
+        t.after(() => socket.destroy())
+        await channelPending
+        const session = manager.sessions.get(created.forwardId)
+        const local = [...session.connections][0]
+        local.destroy()
+        await new Promise((resolve) => local.once('close', resolve))
+        const late = new PassThrough()
+        client.forwardOutCallback(null, late)
+        assert.equal(late.destroyed, true)
+        assert.equal(session.active, true)
+        assert.equal(session.activeConnections, 0)
+        assert.equal(session.connections.size, 0)
+        assert.equal(session.pendingChannelOpens, 0)
     }
-    const session = manager.sessions.get(created.forwardId)
-    const local = [...session.connections][0]
-    local.destroy()
-    await new Promise((resolve) => local.once('close', resolve))
-    const late = new PassThrough()
-    client.forwardOutCallback(null, late)
-    assert.equal(late.destroyed, true)
-    assert.equal(session.active, true)
-    assert.equal(session.activeConnections, 0)
-    assert.equal(session.connections.size, 0)
-    assert.equal(session.pendingChannelOpens, 0)
-})
+)
 
-test('local forwards bound pending SSH channel opens per alias', async () => {
+test('local forwards bound pending SSH channel opens per alias', { timeout: 5000 }, async (t) => {
     const manager = new ForwardManager()
+    t.after(() => manager.closeByAlias('server'))
     const client = new FakeClient({ deferForwardOut: true })
     const deps = { getClient: () => client }
     const created = await manager.forwardLocal(deps, 'server', 0, '127.0.0.1', 80)
     const sockets = await Promise.all(Array.from({ length: 33 }, () => connect(created.localPort)))
-    for (let attempt = 0; attempt < 100 && client.forwardOutCalls < 32; ++attempt) {
-        await new Promise((resolve) => setImmediate(resolve))
+    for (const socket of sockets) {
+        t.after(() => socket.destroy())
     }
+    await Promise.race(
+        sockets.map((socket) =>
+            socket.closed ? Promise.resolve() : new Promise((resolve) => socket.once('close', resolve))
+        )
+    )
 
     assert.equal(client.forwardOutCalls, 32)
     for (const callback of client.forwardOutCallbacks) {

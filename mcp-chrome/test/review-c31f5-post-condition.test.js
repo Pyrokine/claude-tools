@@ -31,6 +31,15 @@ async function fixture(context, spec, run) {
         if (state.actions === 1 && state.reads === 0 && state.deadline === undefined && ms > 0 && ms <= 70) {
             state.deadline = lastNow + ms;
             state.trace.push({ phase: 'budget-scheduled', deadline: state.deadline, timeout: ms });
+            if (spec.name === 'false') {
+                state.frozen = lastNow;
+            }
+        }
+        if (spec.name === 'false' && state.reads > 0 && ms > 0 && ms <= 70) {
+            return nativeTimer(() => {
+                state.frozen += ms;
+                callback(...args);
+            }, ms);
         }
         return nativeTimer(callback, ms, ...args);
     });
