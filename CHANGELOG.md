@@ -1,5 +1,139 @@
 # Changelog
 
+## v1.20.0 - 2026-11-20
+
+## Versions
+
+- mcp-claude-history: 2.2.0 → 2.2.1
+- mcp-chrome Server and Extension: 3.1.0 → 3.1.1
+- mcp-ssh: 3.2.0 → 3.3.0
+- skill-cc-session-fix: documentation updated, no standalone version
+- skill-elenchus: 1.2.0, documentation updated
+
+## What's Changed
+
+### mcp-claude-history
+
+- fix: Redact complete Cookie values across ordinary, indexed and streamed records while preserving enclosing JSON and original Unicode range coordinates
+- fix: Normalize case-insensitive literal queries one Unicode scalar at a time so normal and indexed searches use the same matching rules
+- fix: Return consistent invalid-range details for ordinary and indexed reads, including original content size, parsed offsets and a valid range example
+- fix: Reduce large-history scan costs while preserving complete JSON validation, exact match counts, tool attribution, and the existing 120-second deadline and 32 MiB result cache
+- fix: Preserve exact source selection and report metadata omissions, missing sessions and ambiguous session IDs
+- docs: Update both READMEs and the regression guide for search behavior, redaction and diagnostics
+
+### mcp-chrome
+
+- fix: Reuse trusted work groups across restarts and expand frozen tool groups in the background, preserving user group settings and separate active connections
+- fix: Traverse adjacent background history entries without user activation, retaining in-flight navigation handling, direction boundaries and unknown dispatched results
+- fix: Support viewport, User-Agent, emulation, raw CDP and precise evaluation on controlled `about:blank` pages
+- fix: Reuse the same CDP endpoint and preserve the previous connection when a replacement fails
+- fix: Bind iframe preparation to frame and document identities and discard late preparation results
+- fix: Prepare background keyboard focus before native typing, restore it before post-condition checks, and preserve acknowledged input when a later step fails
+- fix: Validate the original selection before replacement and preserve frame-local geometry for nested frames, transformed elements and screenshot clipping
+- fix: Recalculate pointer coordinates after synchronous scrolling and while verification controls move
+- fix: Preserve per-axis wheel scrolling across layout, CSS zoom and overscroll boundaries, including listener-driven layout changes
+- fix: Handle cyclic and shared evaluation results and preserve action status when result serialization fails
+- fix: Scope Cookie operations to the selected store, browser context, path and partition, retaining partial deletion progress
+- fix: Preserve Fetch ownership and valid request references across cleanup and raw CDP commands
+- fix: Filter SSE and WebSocket messages by their originating URL, preserve active sockets across child-frame navigation, and retain the native navigation result after observation ends
+- fix: Preserve classified transport errors, request budgets and action state when diagnostic preparation or restricted-page checks fail
+- fix: Keep browser-event owner cleanup ordered, discard late download bodies from expired requests, and redact sensitive URLs in log and error text
+- fix: Accept an empty User-Agent value to clear a page override
+- docs: Consolidate bilingual installation, page-management, input and browser-event guidance, with reusable regression instructions
+
+### mcp-ssh
+
+- feat: Send UTF-8 `stdin` through `ssh_exec` with ssh2 or OpenSSH, keeping input separate from command text and diagnostics
+- feat: Limit synchronization transfer rates with `bandwidthLimitKiBps` for rsync and SFTP
+- fix: Propagate request cancellation through connection preparation, command batches, parallel execution, temporary scripts and SFTP writes; preserve uncertain remote process state in the result
+- fix: Apply the download deadline to transfer and failure diagnostics, stop further remote probing after cancellation, and preserve separate transfer and verification results
+- fix: Return the SFTP login identity and actual owner, group and permissions after directory creation; preserve acknowledged creation when later metadata reads fail
+- fix: Distinguish unrequested directory checks from mismatches and reuse single-file digests between requested verification results
+- docs: Clarify execution identity, per-stage timeouts and the 30000 ms cleanup ceiling, transfer verification and private-key path examples in both READMEs
+
+### skill-cc-session-fix
+
+- docs: Describe Python, Claude Code CLI and optional Ruff requirements for offline diagnosis, repair and recovery verification
+
+### skill-elenchus
+
+- docs: Describe Git and Host file, command and agent capabilities required by each review stage
+
+### Shared formatting and documentation
+
+- chore: Pin Prettier 3.9.5 and share formatting rules across the CLI and JetBrains project settings, with rustfmt handling Rust
+- fix: Keep text checkouts on LF while preserving binary bytes, and keep the extensionless Prettier configuration in strict JSON
+- test: Check formatter and linter round trips, semantic diagnostics and public-file coverage in the existing cross-platform workflow
+- docs: Update the bilingual tool index, installation instructions, migration notes and formatting commands
+
+---
+
+## 版本
+
+- mcp-claude-history：2.2.0 → 2.2.1
+- mcp-chrome Server 和 Extension：3.1.0 → 3.1.1
+- mcp-ssh：3.2.0 → 3.3.0
+- skill-cc-session-fix：文档更新，无独立版本号
+- skill-elenchus：1.2.0，文档更新
+
+## 更新内容
+
+### mcp-claude-history
+
+- fix: 普通、索引和流式记录完整遮蔽 Cookie 值，保留外层 JSON 与原文 Unicode range 坐标
+- fix: 不区分大小写的普通文本查询按 Unicode scalar 转换，使普通与索引搜索采用相同匹配规则
+- fix: 普通与索引读取返回一致的无效范围诊断，包含原文长度、解析后的偏移和合法范围示例
+- fix: 降低大历史扫描开销，保留完整 JSON 校验、精确命中计数、工具归因以及原有 120 秒期限与 32 MiB 结果缓存
+- fix: 保留精确来源选择，明确返回元数据省略、会话缺失与会话 ID 歧义
+- docs: 同步中英文 README 与回归指南中的搜索行为、脱敏和诊断说明
+
+### mcp-chrome
+
+- fix: 重启后复用可信工作组，在后台展开冻结的工具组，保留用户分组设置及独立活动连接的分组
+- fix: 后台前进和后退逐项访问相邻历史记录，保留在途导航处理、方向边界及已派发结果未知的状态
+- fix: 受控 `about:blank` 页面支持视口、User-Agent、设备模拟、原始 CDP 和 precise 求值
+- fix: 复用相同 CDP 端点，替换连接失败时保留原连接
+- fix: iframe 准备绑定 frame 与文档身份，丢弃迟到的准备结果
+- fix: 后台原生输入前准备键盘焦点，在后置检查前恢复原设置；后续步骤失败时保留已经确认的输入
+- fix: 替换前验证原选区，嵌套 frame、变换元素和截图裁剪保持正确的局部坐标
+- fix: 同步滚动后和验证控件移动期间重新计算指针坐标
+- fix: 按轴保留不同布局、CSS zoom 和 overscroll 边界下的 wheel 滚动行为，处理事件监听器引起的布局变化
+- fix: 处理循环引用及共享对象的求值结果，结果序列化失败时保留动作状态
+- fix: Cookie 操作限定到所选 store、浏览器上下文、path 和 partition，保留部分删除进度
+- fix: 清理与原始 CDP 命令保留 Fetch 归属及有效请求引用
+- fix: SSE 与 WebSocket 按来源 URL 筛选，子 frame 导航保留其他活动 socket，观察结束后保留原生导航结果
+- fix: 诊断准备或受限页面检查失败时，保留已经分类的传输错误、请求预算和动作状态
+- fix: 按顺序清理浏览器事件 owner，丢弃已失效请求的迟到下载正文，遮蔽日志和错误文本中的敏感 URL
+- fix: 支持通过空 User-Agent 值清除页面覆盖
+- docs: 整理中英文安装、页面管理、输入和浏览器事件说明，保留可复用回归指导
+
+### mcp-ssh
+
+- feat: `ssh_exec` 通过 ssh2 或 OpenSSH 传递 UTF-8 `stdin`，输入与命令文本、诊断信息分开处理
+- feat: rsync 和 SFTP 同步支持通过 `bandwidthLimitKiBps` 限制传输速率
+- fix: 连接准备、批量与并行命令、临时脚本和 SFTP 写入响应请求取消；远端进程状态不明时在结果中保留说明
+- fix: 下载与失败诊断共用期限，取消后停止远端探测，分别保留传输与校验结果
+- fix: 创建目录后返回 SFTP 登录身份以及实际 owner、group 和权限；后续元数据读取失败时保留已确认的创建结果
+- fix: 区分未请求的目录检查与不匹配结果，请求单文件校验时复用摘要
+- docs: 同步中英文 README 中的执行身份、各阶段超时及 30000 ms 清理上限、传输校验和私钥路径示例
+
+### skill-cc-session-fix
+
+- docs: 说明离线诊断、修复和恢复验证所需的 Python、Claude Code CLI 与可选 Ruff
+
+### skill-elenchus
+
+- docs: 说明各评审阶段需要的 Git 与 Host 文件、命令及 agent 能力
+
+### 公共格式与文档
+
+- chore: 固定 Prettier 3.9.5，CLI 与 JetBrains 项目设置使用同一格式规则，Rust 由 rustfmt 管理
+- fix: 文本检出统一使用 LF，二进制字节保持；无扩展名的 Prettier 配置采用严格 JSON
+- test: 既有跨平台 workflow 检查格式化器与 linter 往返、语义诊断和公共文件覆盖
+- docs: 更新中英文工具索引、安装说明、迁移说明与格式命令
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.19.0...v1.20.0
+
 ## v1.19.0 - 2026-11-07
 
 ## Versions
@@ -20,8 +154,10 @@
   de-duplication, filtering and pagination
 - fix: Preserve source selection, scan metadata, tool attribution and byte budgets across search, context, trace and
   export paths
-- fix: Keep complete JSON bodies parseable after redaction in normal records, streamed records and exports, while preserving original character ranges
-- fix: Set and verify Windows private DACLs through native APIs, preserving trusted owners and full export coverage without per-file PowerShell startup
+- fix: Keep complete JSON bodies parseable after redaction in normal records, streamed records and exports, while
+  preserving original character ranges
+- fix: Set and verify Windows private DACLs through native APIs, preserving trusted owners and full export coverage
+  without per-file PowerShell startup
 - fix: Accept returned canonical Windows drive paths as export destinations
 
 ### mcp-chrome
@@ -33,28 +169,37 @@
   cancellation and output failures
 - fix: Use current frame-local coordinates for background input and release held keys and browser resources after
   cancellation
-- fix: Calibrate Challenge OS mouse coordinates during debugger-banner animations, preserving the path hover and original request deadline
-- fix: Preserve fallback console calls once when debugger collection resumes, without duplicating Runtime history or restoring cleared calls
-- fix: Deliver native background key events and editing commands with request-scoped focus emulation; restore the original setting before verification, keep the actual tab and window focus unchanged, and report temporary document visibility and cleanup failures
+- fix: Calibrate Challenge OS mouse coordinates during debugger-banner animations, preserving the path hover and
+  original request deadline
+- fix: Preserve fallback console calls once when debugger collection resumes, without duplicating Runtime history or
+  restoring cleared calls
+- fix: Deliver native background key events and editing commands with request-scoped focus emulation; restore the
+  original setting before verification, keep the actual tab and window focus unchanged, and report temporary document
+  visibility and cleanup failures
 - fix: Respect document-scoped read access and preserve cookie isolation and diagnostic redaction
 - fix: Redact input find and replacement values from locator error logs
-- fix: Avoid native mouse release after a rejected press when background element clicks use synthetic events, while retaining cleanup for unknown results
+- fix: Avoid native mouse release after a rejected press when background element clicks use synthetic events, while
+  retaining cleanup for unknown results
 - fix: Reconnect a restarted MCP Server without waiting for periodic discovery or interrupting other server connections
 - fix: Preserve named input values and traverse deeply nested state trees without reading sensitive input values
 - fix: Use the full element-wait deadline and return actual locator match counts across both backends
 - fix: Retire navigation-expired Fetch references while keeping native parameter refusals recoverable
-- fix: Apply network URL filters to paused requests and authentication events before limiting results, preserving pending requests during log clearing
-- fix: Keep CDP native event handling independent of the connection request's expired deadline, cancellation and action state, while preserving each explicit command's request budget
+- fix: Apply network URL filters to paused requests and authentication events before limiting results, preserving
+  pending requests during log clearing
+- fix: Keep CDP native event handling independent of the connection request's expired deadline, cancellation and action
+  state, while preserving each explicit command's request budget
 - fix: Preserve the selected target when a failed lookup or closed-page response finishes
 - fix: Return the actual before/after state when CDP closes a page through browse or manage
 - fix: Redact credentials and sensitive query values in URL-bearing headers and raw handshake metadata
 - fix: Keep dispatched CDP context-loss results unknown and reject unsupported iframe retry policies before execution
 - fix: Return specific frame and selector errors across both backends and stop invalid selector retries
 - fix: Support cross-origin and open-Shadow iframe actions without extending the request deadline
-- fix: Return promptly when native and page history have no entry, preserving valid history navigation and request deadlines
+- fix: Return promptly when native and page history have no entry, preserving valid history navigation and request
+  deadlines
 - fix: Keep iframe probes independent of background-page timers and loading siblings, and release them on cancellation
 - fix: Keep stable input targets actionable beside looping, unrelated scrollers
-- fix: Update Zod to 4.6.7 and compatible locked dependencies for upstream validation, HTTP parsing, URI and address security fixes
+- fix: Update Zod to 4.6.7 and compatible locked dependencies for upstream validation, HTTP parsing, URI and address
+  security fixes
 
 ### mcp-ssh
 
@@ -65,9 +210,11 @@
 - fix: Preserve completed transfers, partial byte counts and failure stages across timeouts, cancellation and lost SFTP
   replies
 - fix: Validate read targets, synchronization parents, Windows filenames and ACLs before the affected file operations
-- fix: Wait for a failed download's local stream to close before removing temporary files, preserving the existing target
+- fix: Wait for a failed download's local stream to close before removing temporary files, preserving the existing
+  target
 - fix: Resolve trusted SSH key and configuration root aliases while rejecting links outside allowed roots
-- fix: Update Zod to 4.6.7 and compatible locked dependencies for upstream validation, HTTP parsing, URI and address security fixes
+- fix: Update Zod to 4.6.7 and compatible locked dependencies for upstream validation, HTTP parsing, URI and address
+  security fixes
 
 ### skill-cc-session-fix
 
@@ -571,7 +718,8 @@
   failures
 - fix: Omit password values from Extension accessibility names without reading them; retain labels and ordinary input
   values
-- fix: Report native script termination and Runtime internal errors as unknown results in evaluate and advanced CDP
+- fix: Report script termination by the browser and Runtime internal errors as unknown results in evaluate and advanced
+  CDP
   commands; prevent direct retries after uncertain evaluation timeouts or stale contexts without replaying commands
 - fix: Keep CDP partial-creation errors consistent with the unmanaged state returned by page lists
 - fix: Wait for CSS-hidden CDP elements to become visible without failing on an unavailable box model
@@ -1599,7 +1747,7 @@
 ### mcp-chrome 1.7.0
 
 - feat: actionability checks before click — 5-item check (visible, enabled, pointer-events, in-viewport, covered) +
-  progressive backoff retry [0,20,100,100,500ms] + auto scroll-into-view
+  progressive backoff retry `[0,20,100,100,500ms]` + auto scroll-into-view
 - feat: `input dispatch` mode — set value via nativeInputValueSetter + trigger input/change events, compatible with
   React/Vue controlled components
 - feat: `input force` — bypass actionability checks
@@ -1646,7 +1794,7 @@
 ### mcp-chrome 1.7.0
 
 - feat: 点击前可操作性检查 —
-  5 项检查（可见、可用、pointer-events、视口内、未被遮挡）+ 渐进退避重试 [0,20,100,100,500ms] + 自动 scroll-into-view
+  5 项检查（可见、可用、pointer-events、视口内、未被遮挡）+ 渐进退避重试 `[0,20,100,100,500ms]` + 自动 scroll-into-view
 - feat: `input dispatch` 模式 — 通过 nativeInputValueSetter 设置 value + 触发 input/change 事件，兼容 React/Vue 受控组件
 - feat: `input force` — 跳过可操作性检查
 - feat: `extract depth` — state 提取的 DOM 遍历深度限制

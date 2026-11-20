@@ -56,15 +56,19 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ## 子模块版本
 
-- mcp-claude-history 2.2.0：会话名称、大规模历史精确检索、来源目录分页、全文导出、精确来源恢复与私有导出目录
+- mcp-claude-history 2.2.1：会话名称、大规模历史精确检索、来源目录分页、全文导出、精确来源恢复与私有导出目录
 
-- mcp-chrome 3.1.0：本地文件上传、字段值保护、任务页面管理、Cloudflare 完成状态、open Shadow DOM 与嵌套 frame、对话框、原响应与下载收件、请求控制、限定范围的 HTTP 认证及 WebSocket/SSE 观察
+- mcp-chrome 3.1.1：本地文件上传、字段值保护、任务页面管理、Cloudflare 完成状态、open Shadow DOM 与嵌套 frame、
+  对话框、原响应与下载收件、请求控制、限定范围的 HTTP 认证及 WebSocket/SSE 观察
 
-- mcp-ssh 3.2.0：解释器独立参数、传输进度、已有 OpenSSH master 复用、显式文件校验、目录筛选分页与 SFTP/输出修正
+- mcp-ssh 3.3.0：解释器独立参数、传输进度、已有 OpenSSH master 复用、命令标准输入、传输限速、显式文件校验、目录筛选分页与 SFTP/输出修正
 
 - skill-elenchus 1.2.0：差异、完整快照和设计范围，证据分级与共享评审预算
 
-创建 Chrome 任务页面时使用 `taskHint` 和 `note`，Extension 任务分组跨重载保留名称和创建来源，新建前查看并复用已有页
+创建 Chrome 任务页面时使用 `taskHint` 和 `note`，新建前查看并复用已有页
+Extension 将持续工作的页面跨步骤保留在同一可信组，独立活动连接分别组织；用 `updateGroup` 自主设置简短用途名，如 MCP·发版
+新组初始展开，操作冻结的可信工具组时自动展开并保持前台标签；标题、颜色及新建页或更新备注时的既有折叠设置保持
+重启后 attach 原工作页恢复分组，完整任务名称保存在页面元数据中
 默认在已有窗口后台创建页面，任务结束后仅关闭明确为本任务创建的临时页，保留用户页面和可复用产物
 
 使用 `input` 的 `{type:"upload", target:{css:"input[type=file]"}, files:["./review.zip"]}` 在 Extension 或 CDP 模式选择本地文件
@@ -77,6 +81,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 显式选择已有主连接复用，默认 ssh2 后端使用 known-host 信任记录：未知主机在认证前记录，变化或撤销的 key
 明确拒绝；首次连接需要独立身份保证时，预置信任记录
 `ssh_sync(verify={sha256: true})` 支持普通文件和目录，传输结果与校验结果分开报告
+`ssh_exec` 的 `stdin` 接收 UTF-8 标准输入，`ssh_sync` 的 `bandwidthLimitKiBps` 按 KiB/s 限制传输速率，省略时使用原默认行为
 
 `ssh_list_dir` 支持名称／时间筛选与显式条数／字节预算，内部同步目录清单保持完整；使用 `history_search(mode="sources")`
 对来源分组分页，再执行扫描；`output_content="full"` 将文件正文导出与响应预览分开处理，限制与失败处理见各模块 README

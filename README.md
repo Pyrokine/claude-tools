@@ -56,22 +56,25 @@ Each subdirectory README includes source build instructions and client-specific 
 
 ## Module versions
 
-- mcp-claude-history 2.2.0: Session titles, exact large-history search, paged source catalogs, full-content exports,
+- mcp-claude-history 2.2.1: Session titles, exact large-history search, paged source catalogs, full-content exports,
   precise source recovery, and private output bundles
 
-- mcp-chrome 3.1.0: Local file uploads, hidden-field value protection, middle-button events, focus-only editing
+- mcp-chrome 3.1.1: Local file uploads, hidden-field value protection, middle-button events, focus-only editing
   commands, task page controls, Cloudflare completion checks, open Shadow DOM and nested frames, browser dialogs,
   original response/download capture, request routing, scoped HTTP authentication, and WebSocket/SSE observation
 
-- mcp-ssh 3.2.0: Interpreter arguments and transfer progress, with OpenSSH master reuse, explicit file verification,
-  filtered directory pages, and SFTP/output corrections
+- mcp-ssh 3.3.0: Interpreter arguments and transfer progress, with OpenSSH master reuse, command stdin, transfer
+  bandwidth
+  limits, explicit file verification, filtered directory pages, and SFTP/output corrections
 
 - skill-elenchus 1.2.0: Diff, snapshot and design scopes, evidence levels, and shared review budgets
 
-Use `taskHint` and `note` when creating a Chrome task page. Extension task groups retain their names and creation
-records across reloads; list existing pages before creating another. Default page creation uses an existing window in
-the background. At task end, close only pages created for that task and explicitly intended to be temporary; retain
-user pages and reusable output.
+Use `taskHint` and `note` when creating a Chrome task page, and list existing pages before creating another. Extension
+keeps continuous work in a trusted group across steps, while independent active connections use separate groups. Give
+the group a short purpose name with `updateGroup`, such as `MCP · Release`. New groups start expanded. Page work resumes a frozen trusted tool group without selecting a tab; titles and colors
+are preserved, and page creation or metadata changes keep existing collapsed state. Attach a previous work page to restore its group after a
+restart. Full task names stay in page metadata. Default creation uses an existing window in the background. At task
+end, close only pages created for that task and explicitly intended to be temporary; retain user pages and reusable output.
 
 Use `input` with `{type:"upload", target:{css:"input[type=file]"}, files:["./review.zip"]}` to select local files in
 Extension or CDP mode. Paths belong to the MCP Server machine; `files:[]` clears the selection. The combined file
@@ -85,7 +88,10 @@ OpenSSH reuse is opt-in with `ssh_connect(backend="openssh", configHost="myserve
 known-host records: an unknown host is recorded before authentication, while a changed or revoked key is rejected.
 Pre-provision a trusted record when the first connection requires an independently verified identity.
 `ssh_sync(verify={sha256: true})` verifies a regular file as well as a directory, with separate transfer and
-verification results. `ssh_list_dir` supports name/time filters and explicit item/byte budgets, without truncating
+verification results. Pass `stdin` to `ssh_exec` to send UTF-8 input, and set `bandwidthLimitKiBps` on `ssh_sync` to
+limit the
+transfer rate in KiB/s; omitted values retain the default behavior.
+`ssh_list_dir` supports name/time filters and explicit item/byte budgets, without truncating
 internal synchronization listings. Use `history_search(mode="sources")` to page source groups before scanning, and
 `output_content="full"` to export text independently of response previews. See the module READMEs for limits and failure
 behavior.
