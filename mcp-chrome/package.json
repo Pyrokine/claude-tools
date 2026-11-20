@@ -14,8 +14,8 @@
         "prepack": "npm run build && npm run build:extension",
         "lint": "eslint \"{src,extension/src}/**/*.ts\" \"{test,extension/test}/**/*.{js,mjs}\" \"extension/vite*.ts\"",
         "lint:fix": "npm run lint -- --fix",
-        "format": "prettier -w src test \"extension/{src/**,test/**,vite*.ts}\" \"*.md\"",
-        "format:check": "prettier -c src test \"extension/{src/**,test/**,vite*.ts}\" \"*.md\"",
+        "format": "prettier --write . --ignore-path ../.gitignore --ignore-path ../.prettierignore",
+        "format:check": "prettier --check . --ignore-path ../.gitignore --ignore-path ../.prettierignore",
         "test": "npm run build && node --test test/*.test.js",
         "test:extension": "npm --prefix extension test"
     },
@@ -46,7 +46,7 @@
         "@types/node": "^26.1.1",
         "@types/ws": "^8.18.1",
         "eslint": "^10.7.0",
-        "prettier": "^3.9.5",
+        "prettier": "3.9.5",
         "typescript": "npm:@typescript/typescript6@^6.0.2",
         "typescript-eslint": "^8.64.0",
         "typescript7": "npm:typescript@^7.0.2"

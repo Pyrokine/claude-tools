@@ -16,8 +16,8 @@
         "lint": "eslint \"src/**/*.ts\" \"test/**/*.mjs\"",
         "lint:fix": "eslint \"src/**/*.ts\" \"test/**/*.mjs\" --fix",
         "test": "npm run build && node test/run-tests.mjs",
-        "format": "prettier --write src/ test/ README.md README_zh.md TESTING.md",
-        "format:check": "prettier --check src/ test/ README.md README_zh.md TESTING.md"
+        "format": "prettier --write . --ignore-path ../.gitignore --ignore-path ../.prettierignore",
+        "format:check": "prettier --check . --ignore-path ../.gitignore --ignore-path ../.prettierignore"
     },
     "keywords": [
         "mcp",
@@ -43,7 +43,7 @@
         "@types/node": "^26.1.1",
         "@types/ssh2": "^1.15.5",
         "eslint": "^10.7.0",
-        "prettier": "^3.9.5",
+        "prettier": "3.9.5",
         "typescript": "npm:@typescript/typescript6@^6.0.2",
         "typescript-eslint": "^8.64.0",
         "typescript7": "npm:typescript@^7.0.2"

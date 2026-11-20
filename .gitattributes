@@ -1,4 +1,4 @@
-* whitespace=-blank-at-eof
+* text=auto eol=lf whitespace=-blank-at-eof
 *.sh text eol=lf
 *.bash text eol=lf
 *.ps1 text eol=lf

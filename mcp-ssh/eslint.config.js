@@ -14,23 +14,6 @@ export default tseslint.config(
             // 未使用变量：允许 _ 前缀的参数
             '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
 
-            // 空行控制
-            'no-multiple-empty-lines': ['warn', { max: 1, maxEOF: 0, maxBOF: 0 }],
-            'lines-between-class-members': ['warn', 'always', { exceptAfterSingleLine: true }],
-            'padding-line-between-statements': [
-                'warn',
-                { blankLine: 'always', prev: 'import', next: '*' },
-                { blankLine: 'any', prev: 'import', next: 'import' },
-            ],
-
-            // 关键字/运算符间距
-            'keyword-spacing': ['warn', { before: true, after: true }],
-            'space-infix-ops': 'warn',
-            'space-before-blocks': 'warn',
-
-            // else/catch/finally 与大括号同行
-            'brace-style': ['warn', '1tbs', { allowSingleLine: false }],
-
             // 类成员排序
             '@typescript-eslint/member-ordering': [
                 'warn',

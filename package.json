@@ -1,0 +1,12 @@
+{
+    "name": "claude-tools-formatting",
+    "private": true,
+    "scripts": {
+        "format": "prettier --write .",
+        "format:check": "prettier --check .",
+        "test:format": "node --test formatting.test.mjs"
+    },
+    "devDependencies": {
+        "prettier": "3.9.5"
+    }
+}

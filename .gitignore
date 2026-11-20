@@ -6,8 +6,30 @@ dist/
 target/
 
 # IDE
-.idea/
+.idea/*
+!.idea/compiler.xml
+!.idea/prettier.xml
+!.idea/codeStyles/
+.idea/codeStyles/*
+!.idea/codeStyles/codeStyleConfig.xml
+!.idea/codeStyles/Project.xml
+!.idea/jsLinters/
+.idea/jsLinters/*
+!.idea/jsLinters/eslint.xml
+!.idea/inspectionProfiles/
+.idea/inspectionProfiles/*
+!.idea/inspectionProfiles/Project_Default.xml
+!.idea/scopes/
+.idea/scopes/*
+!.idea/scopes/PrettierManaged.xml
+!.idea/scopes/RustfmtManaged.xml
+!.idea/scopes/PrettierIgnoreFile.xml
+!.idea/scopes/NodeEsmTopLevelAwait.xml
+!.idea/dictionaries/
+.idea/dictionaries/*
+!.idea/dictionaries/project.xml
 .vscode/
+*.iml
 *.swp
 
 # OS

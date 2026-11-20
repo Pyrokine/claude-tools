@@ -111,12 +111,17 @@ jobs:
                   assert.equal(pack.name, expectedName);
                   assert.equal(path.basename(pack.filename), pack.filename);
                   const tarball = path.join(process.env.ARTIFACT_DIR, pack.filename);
-                  const pkg = JSON.parse(execFileSync('tar', ['-xOzf', tarball, 'package/package.json'], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+                  const pkg = JSON.parse(
+                      execFileSync('tar', ['-xOzf', tarball, 'package/package.json'], {
+                          encoding: 'utf8',
+                          maxBuffer: 1024 * 1024,
+                      })
+                  );
                   assert.equal(pkg.name, expectedName);
                   assert.equal(pkg.version, pack.version);
                   assert.equal(pkg.gitHead, process.env.GITHUB_SHA);
                   assert.equal(pkg.repository?.url, 'git+https://github.com/Pyrokine/claude-tools.git');
-                  const files = new Set(pack.files.map(file => file.path));
+                  const files = new Set(pack.files.map((file) => file.path));
                   assert.ok(files.has('dist/index.js'));
                   if (process.env.MODULE === 'mcp-chrome') {
                       assert.ok(files.has('extension/dist/manifest.json'));
@@ -125,9 +130,20 @@ jobs:
                   const bytes = fs.readFileSync(tarball);
                   const integrity = `sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`;
                   assert.equal(integrity, pack.integrity);
-                  const metadata = { name: pkg.name, version: pkg.version, commit: pkg.gitHead, repository: pkg.repository.url, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), integrity };
+                  const metadata = {
+                      name: pkg.name,
+                      version: pkg.version,
+                      commit: pkg.gitHead,
+                      repository: pkg.repository.url,
+                      sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+                      integrity,
+                  };
                   fs.renameSync(tarball, path.join(process.env.ARTIFACT_DIR, 'package.tgz'));
-                  fs.writeFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), `${JSON.stringify(metadata, null, 2)}\n`, { flag: 'wx' });
+                  fs.writeFileSync(
+                      path.join(process.env.ARTIFACT_DIR, 'metadata.json'),
+                      `${JSON.stringify(metadata, null, 2)}\n`,
+                      { flag: 'wx' }
+                  );
                   console.log(`${metadata.name}@${metadata.version}: ${metadata.sha256}, commit ${metadata.commit}`);
                   NODE
 
@@ -206,16 +222,29 @@ jobs:
                   const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/);
                   assert.ok(match, 'npm 版本格式无效');
                   const [major, minor, patch] = match.slice(1).map(Number);
-                  assert.ok(major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))), 'npm 必须支持 Trusted Publishing');
+                  assert.ok(
+                      major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))),
+                      'npm 必须支持 Trusted Publishing'
+                  );
                   for (const key of ['NPM_TOKEN', 'NODE_AUTH_TOKEN', 'NPM_ID_TOKEN']) {
                       assert.ok(!process.env[key], '认证 job 不使用预先提供的 npm token');
                   }
-                  const metadata = JSON.parse(fs.readFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), 'utf8'));
+                  const metadata = JSON.parse(
+                      fs.readFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), 'utf8')
+                  );
                   const tarball = path.join(process.env.ARTIFACT_DIR, 'package.tgz');
                   const bytes = fs.readFileSync(tarball);
                   assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), metadata.sha256);
-                  assert.equal(`sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`, metadata.integrity);
-                  const pkg = JSON.parse(execFileSync('tar', ['-xOzf', tarball, 'package/package.json'], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+                  assert.equal(
+                      `sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`,
+                      metadata.integrity
+                  );
+                  const pkg = JSON.parse(
+                      execFileSync('tar', ['-xOzf', tarball, 'package/package.json'], {
+                          encoding: 'utf8',
+                          maxBuffer: 1024 * 1024,
+                      })
+                  );
                   assert.equal(metadata.name, `@pyrokine/${process.env.MODULE}`);
                   assert.equal(pkg.name, metadata.name);
                   assert.equal(pkg.version, metadata.version);
@@ -231,10 +260,14 @@ jobs:
                   node --input-type=module <<'NODE'
                   import fs from 'node:fs';
                   const packageName = `@pyrokine/${process.env.MODULE}`;
-                  const mask = value => console.log(`::add-mask::${value.replaceAll('%', '%25')}`);
+                  const mask = (value) => console.log(`::add-mask::${value.replaceAll('%', '%25')}`);
                   async function request(url, options = {}) {
                       try {
-                          return await fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(30000) });
+                          return await fetch(url, {
+                              ...options,
+                              redirect: 'error',
+                              signal: AbortSignal.timeout(30000),
+                          });
                       } catch {
                           throw new Error('OIDC 请求失败或超时');
                       }
@@ -259,7 +292,12 @@ jobs:
                       }
                       const url = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
                       url.searchParams.set('audience', 'npm:registry.npmjs.org');
-                      const github = await request(url, { headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}`, Accept: 'application/json' } });
+                      const github = await request(url, {
+                          headers: {
+                              Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}`,
+                              Accept: 'application/json',
+                          },
+                      });
                       if (!github.ok) throw new Error(`GitHub OIDC 请求失败，HTTP ${github.status}`);
                       const jwt = secret((await json(github)).value);
                       let claims;
@@ -268,10 +306,18 @@ jobs:
                       } catch {
                           throw new Error('GitHub OIDC 身份声明无效');
                       }
-                      if (claims.repository !== 'Pyrokine/claude-tools' || claims.ref !== 'refs/heads/main' || claims.sha !== process.env.EXPECTED_COMMIT || claims.sub !== 'repo:Pyrokine/claude-tools:environment:npm-publish') {
+                      if (
+                          claims.repository !== 'Pyrokine/claude-tools' ||
+                          claims.ref !== 'refs/heads/main' ||
+                          claims.sha !== process.env.EXPECTED_COMMIT ||
+                          claims.sub !== 'repo:Pyrokine/claude-tools:environment:npm-publish'
+                      ) {
                           throw new Error('GitHub OIDC 身份与批准的仓库、分支、环境或提交不符');
                       }
-                      const npm = await request(`https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(packageName)}`, { method: 'POST', headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/json' } });
+                      const npm = await request(
+                          `https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(packageName)}`,
+                          { method: 'POST', headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/json' } }
+                      );
                       if (npm.status !== 201) throw new Error(`npm Trusted Publisher 认证失败，HTTP ${npm.status}`);
                       const exchanged = await json(npm);
                       secret(exchanged.token);
@@ -285,8 +331,7 @@ jobs:
                   NODE
 
             - name: 发布已批准的模块并核对 registry
-              if:
-                  (matrix.module == 'mcp-chrome' && inputs.publish_chrome) || (matrix.module == 'mcp-ssh' &&
+              if: (matrix.module == 'mcp-chrome' && inputs.publish_chrome) || (matrix.module == 'mcp-ssh' &&
                   inputs.publish_ssh)
               env:
                   ARTIFACT_DIR: ${{ runner.temp }}/npm-release-${{ matrix.module }}
@@ -296,13 +341,30 @@ jobs:
                   import path from 'node:path';
                   import { spawnSync } from 'node:child_process';
                   import { setTimeout as delay } from 'node:timers/promises';
-                  const metadata = JSON.parse(fs.readFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), 'utf8'));
+                  const metadata = JSON.parse(
+                      fs.readFileSync(path.join(process.env.ARTIFACT_DIR, 'metadata.json'), 'utf8')
+                  );
                   const tarball = path.join(process.env.ARTIFACT_DIR, 'package.tgz');
-                  const published = spawnSync('npm', ['publish', tarball, '--ignore-scripts', '--provenance', '--access', 'public', '--registry', 'https://registry.npmjs.org'], { encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024 });
+                  const published = spawnSync(
+                      'npm',
+                      [
+                          'publish',
+                          tarball,
+                          '--ignore-scripts',
+                          '--provenance',
+                          '--access',
+                          'public',
+                          '--registry',
+                          'https://registry.npmjs.org',
+                      ],
+                      { encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024 }
+                  );
                   process.stdout.write(published.stdout ?? '');
                   process.stderr.write(published.stderr ?? '');
                   const marker = `+ ${metadata.name}@${metadata.version}`;
-                  const commandSucceeded = published.status === 0 && (published.stdout ?? '').split(/\r?\n/).some(line => line.trim() === marker);
+                  const commandSucceeded =
+                      published.status === 0 &&
+                      (published.stdout ?? '').split(/\r?\n/).some((line) => line.trim() === marker);
                   let verified = false;
                   for (let attempt = 0; attempt < 20; ++attempt) {
                       try {
@@ -312,7 +374,10 @@ jobs:
                           if (response.ok) {
                               const data = await response.json();
                               const version = data.versions?.[metadata.version];
-                              verified = version?.gitHead === metadata.commit && version?.dist?.integrity === metadata.integrity && data['dist-tags']?.latest === metadata.version;
+                              verified =
+                                  version?.gitHead === metadata.commit &&
+                                  version?.dist?.integrity === metadata.integrity &&
+                                  data['dist-tags']?.latest === metadata.version;
                               if (verified) break;
                           }
                       } catch {
@@ -321,7 +386,9 @@ jobs:
                       if (attempt < 19) await delay(15000);
                   }
                   if (!commandSucceeded || !verified) {
-                      console.error(`npm 命令成功回显=${commandSucceeded}，registry 身份校验=${verified}；未自动重发，请核对实际版本后处理`);
+                      console.error(
+                          `npm 命令成功回显=${commandSucceeded}，registry 身份校验=${verified}；未自动重发，请核对实际版本后处理`
+                      );
                       process.exitCode = 1;
                   } else {
                       const message = `${metadata.name}@${metadata.version}: 已核对 registry gitHead、integrity 与 latest`;

@@ -1,6 +1,24 @@
+# Dependencies, generated output and task records
 node_modules/
 dist/
-extension/dist/
 coverage/
+.ccg/
+target/
+out/
+test-output/
+.nyc_output/
+.ruff_cache/
+__pycache__/
 *.min.css
 package-lock.json
+
+# Private tooling and runtime state
+.claude/
+.antigravitycli/
+.baidu-cc/
+.idea/
+.vscode/
+.chrome-mcp-profile/
+.ssh-mcp-pro/
+.env
+.env.local

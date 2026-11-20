@@ -121,6 +121,63 @@ The [cross-platform workflow](./.github/workflows/windows-tests.yml) checks Ubun
 the same workflow commit. This automated gate complements the module regression guides and current release
 authorization.
 
+## Formatting
+
+Run `npm ci` in the repository root to install the locked Prettier 3.9.5 for both the IDE and command line:
+
+```bash
+npm ci
+npm run format:check
+```
+
+Prettier owns layout for its supported files, and rustfmt owns Rust layout. ESLint and Stylelint retain code-quality
+checks. The root `.prettierrc` and `.editorconfig` define four-space indentation and LF. JS/TS strings prefer single
+quotes; HTML attributes and JSON use double quotes. Only `*.js` uses statement semicolons; TS, MJS and CJS keep the
+existing no-semicolon style. Markdown preserves prose line breaks and embedded code formatting.
+The extensionless `.prettierrc` uses strict JSON and a filename-specific `parser: json` override for its own formatting.
+
+Git uses `.gitattributes` to keep text checkouts on LF even with `core.autocrlf=true`, while binary files retain their bytes.
+
+The 120-column width is a wrapping target. Keep the formatter's output for complete URLs, string literals and preserved
+prose that exceed it.
+
+The root `format:check` checks all supported public files, including root configuration, workflows, module source and
+tests, extension HTML, and skill documentation. Run `npm run format` to apply the same scope. `.prettierignore` excludes
+private settings and runtime state, dependencies, build output, caches, task records, and generated lockfiles.
+
+Module commands use the same root configuration and ignore rules, limited to that module's directory:
+
+```bash
+npm --prefix mcp-chrome run format:check
+npm --prefix mcp-ssh run format:check
+cargo fmt --manifest-path mcp-claude-history/Cargo.toml --check
+```
+
+Use `npm run format` in the relevant TypeScript module or `cargo fmt` in the Rust module to apply formatting.
+After installing the Chrome server, extension and SSH development dependencies, run `npm run test:format` in the root.
+It checks CLI file coverage, the effective rules, and repeated Prettier/ESLint and Prettier/Stylelint fixes, including
+retained semantic diagnostics. The existing cross-platform workflow runs both `format:check` and `test:format`.
+
+For CCG quality checks on formatter-managed source, run the format checks above and use
+`/ccg:verify-quality mcp-chrome/src mcp-ssh/src mcp-claude-history/src --skip-line-length`.
+This delegates the text line-length rule while retaining file coverage, type checks and other quality checks.
+
+Install and enable a Prettier IDE plugin compatible with your JetBrains IDE build.
+The shared `.idea/prettier.xml` uses **Automatic configuration** and the root formatting rules; the root and module
+packages pin Prettier 3.9.5. It enables **Run on 'Reformat Code' action** (`Ctrl+Alt+L`) and **Run on save** for JS/TS,
+JSON, stylesheets, Vue/Astro, Markdown, HTML, YAML and `.prettierrc`. These settings are under **Settings → Languages &
+Frameworks → JavaScript → Prettier**.
+
+In **Settings → Tools → Actions on Save → Reformat code**, select only the file types outside Prettier's coverage.
+This selection is private to the project's workspace. ESLint's semantic fixes, **Optimize imports** and **Rearrange
+entries** can remain enabled. Initialize dependent objects in the constructor in dependency order.
+The shared project code style uses double-quoted HTML attributes. Project inspection scopes delegate line width to
+Prettier/rustfmt and indentation checks to Prettier, retaining other code inspections.
+Other editors should use the same pinned formatter versions and repository configuration.
+The shared `.idea/compiler.xml` selects the complete TypeScript language service already installed at
+`mcp-ssh/node_modules/@typescript/old/lib`. This keeps import optimization responsive while the existing build commands
+continue to use TypeScript 7; the compatibility package's API wrapper does not start a language-service session.
+
 ## npm publishing for maintainers
 
 The default npm release path is the [npm Trusted Publishing workflow](./.github/workflows/npm-publish.yml) on GitHub

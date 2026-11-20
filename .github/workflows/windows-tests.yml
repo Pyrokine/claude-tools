@@ -45,6 +45,7 @@ jobs:
                   node-version: ${{ matrix.node }}
                   cache: npm
                   cache-dependency-path: |
+                      package-lock.json
                       mcp-chrome/package-lock.json
                       mcp-chrome/extension/package-lock.json
                       mcp-ssh/package-lock.json
@@ -116,6 +117,9 @@ jobs:
             - name: Install SSH packages
               run: npm ci
               working-directory: mcp-ssh
+
+            - name: Check repository formatting and formatter/linter consistency
+              run: npm ci && npm run format:check && npm run test:format
 
             - name: Test and lint SSH
               run: npm test && npm run lint
