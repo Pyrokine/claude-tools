@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -45,7 +46,7 @@ import { checkWindowsAcl, windowsAclScript, windowsTemporaryPathScript } from '.
 const fixtureHostKey = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public).getPublicSSH()
 const fixtureTrustFile = path.join(os.homedir(), '.ssh', `known_hosts-fixture-${process.pid}`)
 
-function fixture(t, getManager) {
+function fixture(t, getManager = undefined) {
     const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-windows-')))
     t.after(async () => {
         const manager = getManager?.()
@@ -127,7 +128,10 @@ test(
             connects.push(config)
             this._sock = new PassThrough()
             this._protocol = { disconnect() {} }
-            config.hostVerifier(fixtureHostKey, (accepted) => {
+            const verifyHost = /** @type {(key: Buffer, callback: (accepted: boolean) => void) => void} */ (
+                config.hostVerifier
+            )
+            verifyHost(fixtureHostKey, (accepted) => {
                 this.emit(accepted ? 'ready' : 'error', ...(accepted ? [] : [new Error('fixture host rejected')]))
             })
             return this
@@ -1124,7 +1128,7 @@ test('S4: Windows script bodies preserve Unicode for PowerShell and switch cmd t
     assert.deepEqual([...Buffer.from(psBody).subarray(0, 3)], [0xef, 0xbb, 0xbf])
     assert.match(cmdBody, /^@chcp 65001>nul \|\| exit \/b 1\r\n@echo 中文/)
     assert.equal(windowsScriptContent(psBody, 'powershell'), psBody)
-    assert.equal(windowsScriptContent(String.fromCharCode(0xfeff) + '@echo 中文', 'cmd'), cmdBody)
+    assert.equal(windowsScriptContent(String.fromCharCode(65279) + '@echo 中文', 'cmd'), cmdBody)
     if (process.platform !== 'win32') {
         t.skip('Native Windows PowerShell and cmd execution requires a Windows runner')
         return
@@ -1247,7 +1251,7 @@ test(
         const result = await syncFiles('windows-rsync', source, 'C:\\Remote Files\\target.txt', 'upload')
         assert.equal(result.success, true)
         assert.equal(result.selectedTransport, 'rsync')
-        const args = fs.readFileSync(argsFile, 'utf8').split('\n').filter(Boolean)
+        const args = fs.readFileSync(argsFile).toString('utf8').split('\n').filter(Boolean)
         assert.ok(args.includes('--protect-args'))
         assert.ok(args.some((arg) => arg.includes("--rsync-path=& 'C:\\Rsync Tools\\rsync.exe'")))
         assert.ok(args.includes('tester@example.com:/c/Remote Files/target.txt'))
@@ -1638,7 +1642,7 @@ test(
         fs.mkdirSync(path.join(exactTarget, 'Exact'), { recursive: true })
         fs.writeFileSync(path.join(exactTarget, 'Exact', 'keep.txt'), 'preserved')
         assert.equal((await syncFiles(alias, exactTarget, '/source', 'download')).success, true)
-        assert.equal(fs.readFileSync(path.join(exactTarget, 'Exact', 'keep.txt'), 'utf8'), 'preserved')
+        assert.equal(fs.readFileSync(path.join(exactTarget, 'Exact', 'keep.txt')).toString('utf8'), 'preserved')
         await t.test('case-sensitive directory keeps A and a distinct', async (child) => {
             const sensitive = path.join(directory, 'sensitive')
             fs.mkdirSync(sensitive)
@@ -2018,11 +2022,11 @@ test(
         })
         const handler = tools(registerFileTools).get('ssh_read_file').handler
         for (const encoding of ['utf16le', 'utf16be']) {
-            for (const [text, maxBytes] of [
+            for (const [text, maxBytes] of /** @type {Array<[string, number]>} */ ([
                 ['A', 1],
                 ['😀A', 2],
                 ['😀A', 3],
-            ]) {
+            ])) {
                 const bytes = Buffer.from(text, 'utf16le')
                 if (encoding === 'utf16be') {
                     bytes.swap16()
@@ -2145,7 +2149,7 @@ test('R2/R3: decoded prefixes, BOM progress, binary bytes, and EOF boundaries re
         assert.deepEqual(Buffer.from(binary.content_base64, 'base64'), bytes.subarray(0, 3 * width))
     }
     for (const encoding of ['utf16le', 'utf16be']) {
-        const bytes = Buffer.from(String.fromCharCode(0xfeff) + 'A😀B', 'utf16le')
+        const bytes = Buffer.from(String.fromCharCode(65279) + 'A😀B', 'utf16le')
         if (encoding === 'utf16be') {
             bytes.swap16()
         }
@@ -2503,7 +2507,7 @@ test(
         assert.equal(result.success, true, JSON.stringify(result))
         assert.equal(result.selectedTransport, 'rsync')
         assert.equal(commands.length, 2)
-        const calls = fs.readFileSync(record, 'utf8')
+        const calls = fs.readFileSync(record).toString('utf8')
         assert.match(calls, /IdentityAgent=none/)
         assert.match(calls, /-i /)
         assert.match(calls, /rsync -avz/)

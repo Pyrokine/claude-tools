@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
@@ -143,6 +144,7 @@ test(
         assert.equal(manager.getSessionConnectionInfo('one').masterReused, true)
         assert.equal(manager.getSessionConnectionInfo('one').identityStatus, 'master_trusted')
         assert.equal(manager.getSessionConnectionInfo('one').observedLogin.username, f.user)
+        /** @type {import('../dist/types.js').ExecResult[]} */
         const results = await Promise.all([
             manager.exec('one', `printf '%s\\n' "$MCP_FIXTURE"; pwd; printf 'no newline' >&2`, { cwd: f.directory }),
             manager.exec('one', 'printf remote; exit 255'),
@@ -152,10 +154,57 @@ test(
         assert.equal(results[1].stdout, 'remote')
         assert.equal(results[1].exitCode, 255)
         assert.equal(results[1].failureKind, 'remote_command')
+        const entries = new Map()
+        registerExecTools({
+            registerTool(name, definition, handler) {
+                entries.set(name, { definition, handler })
+            },
+        })
+        await sessionManager.connect({ backend: 'openssh', ...f.resolved, alias: 'stdin-master' })
+        await sessionManager.connect({
+            host: '127.0.0.1',
+            username: f.user,
+            port: f.port,
+            privateKeyPath: path.join(f.directory, 'key'),
+            alias: 'stdin-ssh2',
+        })
+        t.after(() => sessionManager.disconnectAll())
+        const input = 'private-input-中文\n\0tail'
+        for (const alias of ['stdin-master', 'stdin-ssh2']) {
+            const entry = entries.get('ssh_exec')
+            for (const stdin of [input, '']) {
+                const args = entry.definition.inputSchema.parse({ alias, command: 'wc -c', stdin })
+                const result = JSON.parse((await entry.handler(args)).content[0].text)
+                assert.equal(result.success, true, JSON.stringify(result))
+                assert.equal(Number(result.stdout.trim()), Buffer.byteLength(stdin))
+            }
+            const controller = new AbortController()
+            const pending = entry.handler(
+                { alias, command: 'cat >/dev/null; sleep 0.2', stdin: input },
+                { signal: controller.signal }
+            )
+            const timer = setTimeout(() => controller.abort(), 30)
+            const cancelled = JSON.parse((await pending).content[0].text)
+            clearTimeout(timer)
+            assert.equal(cancelled.success, false)
+            assert.equal(cancelled.details.operationStatus, 'unknown')
+            assert.equal(JSON.stringify(cancelled).includes(input), false)
+            assert.equal((await sessionManager.exec(alias, 'printf alive')).stdout, 'alive')
+        }
+
+        const shell = await manager.exec(
+            'one',
+            'set -o pipefail; values=(first second); [[ ${values[1]} == second ]] && printf bash; exit 7'
+        )
+        assert.equal(shell.stdout, 'bash')
+        assert.equal(shell.exitCode, 7)
+        assert.equal(shell.failureKind, 'remote_command')
+        assert.equal(shell.stderr, '')
+
         assert.equal(manager.disconnect('one'), true)
         assert.equal((await manager.exec('two', 'printf remaining')).stdout, 'remaining')
         assert.equal(f.master.exitCode, null)
-        assert.equal((f.log().match(/Accepted publickey/g) ?? []).length, 1)
+        assert.equal((f.log().match(/Accepted publickey/g) ?? []).length, 2)
         await assert.rejects(async () => manager.getSftp('two'), /does not support SFTP/)
     }
 )
@@ -261,7 +310,7 @@ test(
             assert.equal(data.details.code, 'unsupported_backend', JSON.stringify(data))
             assert.equal(data.details.backend, 'openssh')
             assert.equal(fs.existsSync(target), false)
-            assert.equal(fs.readFileSync(source, 'utf8'), 'fixture')
+            assert.equal(fs.readFileSync(source).toString('utf8'), 'fixture')
         }
         assert.equal((f.log().match(/Accepted publickey/g) ?? []).length, 1)
     }
@@ -282,6 +331,11 @@ test(
         const handlers = new Map()
         registerFileTools({ registerTool: (name, definition, handler) => handlers.set(name, { definition, handler }) })
         const sync = handlers.get('ssh_sync')
+        /** @type {[
+         * import('../dist/types.js').ExecResult,
+         * import('../dist/types.js').ExecResult,
+         * ReturnType<typeof import('../dist/tools/utils.js').formatResult>,
+         * ]} */
         const [first, second, transfer] = await Promise.all([
             sessionManager.exec('parallel', 'sleep .1; printf first'),
             sessionManager.exec('parallel', 'sleep .1; printf second'),
@@ -358,7 +412,7 @@ test(
                     assert.equal(result.verification.kind, 'single_file')
                     assert.equal(result.verification.local.sha256, result.verification.remote.sha256)
                     const target = directoryTarget ? path.join(destination, path.basename(source)) : destination
-                    assert.equal(fs.readFileSync(target, 'utf8'), content)
+                    assert.equal(fs.readFileSync(target).toString('utf8'), content)
                 }
             }
         }
@@ -564,7 +618,9 @@ test(
         })
         t.after(() => client.close())
         await client.connect(transport)
-        const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+        const version = JSON.parse(
+            fs.readFileSync(new URL('../package.json', import.meta.url)).toString('utf8')
+        ).version
         assert.deepEqual(client.getServerVersion(), { name: 'mcp-ssh', version })
         const tool = (await client.listTools()).tools.find((tool) => tool.name === 'ssh_list_dir')
         for (const field of ['namePattern', 'modifiedAfter', 'modifiedBefore', 'offset', 'limit', 'maxBytes']) {
@@ -629,9 +685,9 @@ test(
         assert.equal(downloaded.filesTransferred, 123)
         assert.equal(downloaded.verificationStatus, 'matched')
         assert.equal(fs.readdirSync(target).length, 123)
-        assert.equal(fs.readFileSync(path.join(target, 'file-119.log'), 'utf8'), 'fixture 119')
-        assert.equal(fs.readFileSync(path.join(target, '.hidden.log'), 'utf8'), 'hidden content')
-        assert.equal(fs.readFileSync(path.join(target, 'z-directory', 'nested.txt'), 'utf8'), 'nested content')
+        assert.equal(fs.readFileSync(path.join(target, 'file-119.log')).toString('utf8'), 'fixture 119')
+        assert.equal(fs.readFileSync(path.join(target, '.hidden.log')).toString('utf8'), 'hidden content')
+        assert.equal(fs.readFileSync(path.join(target, 'z-directory', 'nested.txt')).toString('utf8'), 'nested content')
         await call('ssh_connect', {
             backend: 'openssh',
             configHost: 'fixture',
@@ -665,3 +721,100 @@ test.after(async () => {
     await new Promise((resolve) => setTimeout(resolve, 50))
     fs.rmSync(root, { recursive: true, force: true })
 })
+
+test(
+    'M16-S01: native ssh -G default alias reconnects after resolving a different port and hostname',
+    { skip: process.platform !== 'linux' },
+    async (t) => {
+        const f = await fixture(t)
+        const entries = new Map()
+        registerConnectionTools({
+            registerTool(name, _definition, handler) {
+                entries.set(name, handler)
+            },
+        })
+        t.after(() => sessionManager.disconnectAll())
+        for (let i = 0; i < 2; ++i) {
+            const result = JSON.parse(
+                (
+                    await entries.get('ssh_connect')({
+                        backend: 'openssh',
+                        host: 'fixture',
+                        user: f.user,
+                        configPath: f.configPath,
+                    })
+                ).content[0].text
+            )
+            assert.equal(result.success, true, JSON.stringify(result))
+            assert.equal(result.alias, `${f.user}@127.0.0.1:${f.port}`)
+            assert.equal(
+                JSON.parse((await entries.get('ssh_disconnect')({ alias: result.alias })).content[0].text).success,
+                true
+            )
+            assert.equal(f.master.exitCode, null)
+        }
+    }
+)
+
+test(
+    'M16-S03: native Match exec descendants stop on timeout, abort and output limit without closing master',
+    { skip: process.platform !== 'linux' },
+    async (t) => {
+        const f = await fixture(t)
+        const manager = new SessionManager(path.join(f.directory, 'bounded-sessions.json'))
+        await manager.connect({ backend: 'openssh', ...f.resolved, alias: 'survivor' })
+        t.after(() => manager.disconnectAll())
+        for (const mode of ['timeout', 'abort', 'output']) {
+            const marker = path.join(f.directory, `marker-${mode}`)
+            const script = path.join(f.directory, `match-${mode}.sh`)
+            fs.writeFileSync(
+                script,
+                `(sleep 0.6; printf touched > '${marker}') &\n` +
+                    (mode === 'output' ? 'head -c 700000 /dev/zero >&2\n' : '') +
+                    'exit 0\n'
+            )
+            const configPath = path.join(f.directory, `match-${mode}.conf`)
+            fs.writeFileSync(configPath, fs.readFileSync(f.configPath).toString('utf8') + `Match exec "sh ${script}"\n`)
+            const controller = new AbortController()
+            const started = Date.now()
+            const pending = resolveOpenSshConfig(
+                { configHost: 'fixture', configPath, readyTimeout: 100 },
+                controller.signal
+            )
+            const timer =
+                mode === 'abort' ? setTimeout(() => controller.abort(new Error('owned abort')), 40) : undefined
+            await assert.rejects(
+                pending,
+                mode === 'timeout' ? /timed out/ : mode === 'abort' ? /owned abort/ : /output limit/
+            )
+            clearTimeout(timer)
+            assert.ok(Date.now() - started < 450)
+            await new Promise((resolve) => setTimeout(resolve, 650))
+            assert.equal(fs.existsSync(marker), false, mode)
+            assert.equal((await manager.exec('survivor', 'printf available')).stdout, 'available')
+            assert.equal(f.master.exitCode, null)
+        }
+    }
+)
+
+test(
+    'M16-S04: OpenSSH metadata cancellation closes only the stat channel',
+    { skip: process.platform !== 'linux' },
+    async (t) => {
+        const f = await fixture(t)
+        const manager = new SessionManager(path.join(f.directory, 'stat-sessions.json'))
+        await manager.connect({ backend: 'openssh', ...f.resolved, alias: 'metadata' })
+        t.after(() => manager.disconnectAll())
+        const connection = manager.getOpenSshConnection('metadata')
+        const open = connection.open.bind(connection)
+        connection.open = (_command) => open('sleep 2')
+        const controller = new AbortController()
+        const pending = connection.stat('/owned', 3000, true, controller.signal)
+        const timer = setTimeout(() => controller.abort(new Error('stat cancelled')), 40)
+        await assert.rejects(pending, /stat cancelled/)
+        clearTimeout(timer)
+        connection.open = open
+        assert.equal((await manager.exec('metadata', 'printf available')).stdout, 'available')
+        assert.equal(f.master.exitCode, null)
+    }
+)

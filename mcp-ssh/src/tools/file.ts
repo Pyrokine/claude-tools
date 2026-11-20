@@ -41,7 +41,12 @@ import {
     sftpPath,
 } from '../remote-platform.js'
 import { sessionManager } from '../session-manager.js'
-import { SftpOperationTimeoutError, sftpOperationOutcome, withSftpOperationTimeout } from '../sftp-timeout.js'
+import {
+    normalizeSftpOperationTimeout,
+    sftpOperationOutcome,
+    SftpOperationTimeoutError,
+    withSftpOperationTimeout,
+} from '../sftp-timeout.js'
 import { buildTransferOutcome } from '../transfer-outcome.js'
 import type { TransferProgress } from '../types.js'
 import { operationTimeoutSchema } from './schema.js'
@@ -113,7 +118,7 @@ function compareDirectoryTimes(left: string, right: string): number {
     }
     // 保留 ISO 8601 的亚毫秒部分，避免 Date.parse 截断时间边界
     const [leftFraction, rightFraction] = [left, right].map((value) =>
-        (value.match(/\.(?<fraction>\d+)/)?.[1].slice(3) ?? '').replace(/0+$/, '')
+        (value.match(/\.(?<fraction>\d+)/)?.groups?.fraction.slice(3) ?? '').replace(/0+$/, '')
     )
     return leftFraction < rightFraction ? -1 : leftFraction > rightFraction ? 1 : 0
 }
@@ -178,7 +183,19 @@ const syncSchema = z.object({
         .describe('upload 时是否跟随本地 symlink，默认 false（跳过 symlink 并 warn，避免上传链接目标内容）'),
     preflightTimeout: z.number().int().positive().max(60000).optional().describe('传输能力预检超时，默认 10000ms'),
     connectTimeout: z.number().int().positive().max(120000).optional().describe('rsync SSH 连接超时，默认 30000ms'),
-    operationTimeout: z.number().int().positive().max(3600000).optional().describe('同步操作超时，默认 600000ms'),
+    operationTimeout: z
+        .number()
+        .int()
+        .positive()
+        .max(3600000)
+        .optional()
+        .describe('同步总期限（含预检、传输、校验），默认 600000 ms；宿主请求期限独立生效'),
+    bandwidthLimitKiBps: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('本次同步的总传输速率上限，单位 KiB/s（1 KiB = 1024 bytes），适用于 rsync/SFTP，默认不限速'),
     verifyOwner: z
         .union([z.string(), z.number()])
         .optional()
@@ -1142,6 +1159,7 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
             args.atomic === true && !privateTempCreated,
             args.timeout
         )
+        // noinspection JSUnusedAssignment -- read by the failure cleanup path
         uploadedTempCreated = args.atomic === true
         let verification: Record<string, unknown> | undefined
         let verificationError: unknown
@@ -1305,17 +1323,27 @@ async function handleUpload(args: z.infer<typeof uploadSchema>) {
     }
 }
 
-async function handleDownload(args: z.infer<typeof downloadSchema>) {
+async function handleDownload(
+    args: z.infer<typeof downloadSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
+    const deadline = Date.now() + normalizeSftpOperationTimeout(args.timeout)
     try {
+        extra?.signal.throwIfAborted()
         args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+            // noinspection ExceptionCaughtLocallyJS — 超时经统一错误响应返回并共享剩余诊断期限
+            throw new SftpOperationTimeoutError(args.timeout ?? 600_000)
+        }
         const downloadResult = await fileOps.downloadFile(
             args.alias,
             args.remotePath,
             args.localPath,
             undefined,
             undefined,
-            undefined,
-            args.timeout
+            extra?.signal,
+            remaining
         )
         return formatResult({ ...downloadResult, message: `Downloaded to ${args.localPath}` })
     } catch (error) {
@@ -1326,7 +1354,10 @@ async function handleDownload(args: z.infer<typeof downloadSchema>) {
             diagnostics: {
                 local: summarizeLocalPathProbe(fileOps.probeLocalPath(args.localPath)),
                 localParent: summarizeLocalPathProbe(fileOps.probeLocalPath(path.dirname(args.localPath))),
-                remoteParent: await probeRemoteParent(args.alias, args.remotePath),
+                remoteParent:
+                    !extra?.signal.aborted && Date.now() < deadline
+                        ? await probeRemoteParent(args.alias, args.remotePath, deadline - Date.now(), extra?.signal)
+                        : undefined,
             },
         })
     }
@@ -1350,10 +1381,20 @@ async function handleReadFile(args: z.infer<typeof readFileSchema>) {
     }
 }
 
-async function handleWriteFile(args: z.infer<typeof writeFileSchema>) {
+async function handleWriteFile(
+    args: z.infer<typeof writeFileSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     try {
         args.remotePath = normalizeRemotePath(args.alias, args.remotePath)
-        const result = await fileOps.writeFile(args.alias, args.remotePath, args.content, args.append, args.timeout)
+        const result = await fileOps.writeFile(
+            args.alias,
+            args.remotePath,
+            args.content,
+            args.append,
+            args.timeout,
+            extra?.signal
+        )
         return formatResult(result)
     } catch (error) {
         return formatFileOperationError(error)
@@ -1468,7 +1509,32 @@ async function handleMkdir(args: z.infer<typeof mkdirSchema>) {
             args.timeout,
             sessionManager.getRemotePathStyle(args.alias)
         )
-        return formatResult({ success, path: args.remotePath })
+        const session = sessionManager.listSessionDetails().find((item) => item.alias === args.alias)
+        const result = {
+            success,
+            path: args.remotePath,
+            loginUser: session?.username,
+            runAs: session?.runAs,
+            creationIdentity: 'sftp_login',
+        }
+        try {
+            const info = await fileOps.getFileInfo(args.alias, args.remotePath, args.timeout)
+            return formatResult({
+                ...result,
+                owner: info.owner,
+                group: info.group,
+                mode: info.mode,
+                permissions: info.permissions,
+            })
+        } catch (error) {
+            return formatResult({
+                ...result,
+                operationStatus: 'completed',
+                retryable: false,
+                metadataStatus: 'unavailable',
+                metadataError: JSON.parse(formatFileOperationError(error).content[0].text),
+            })
+        }
     } catch (error) {
         return formatFileOperationError(error)
     }
@@ -1508,7 +1574,9 @@ async function handleSync(
             success: false,
             transferSuccess: false,
             code: 'UNSUPPORTED_SYNC_VERIFICATION',
-            error: 'verifyOwner/verifyMode require a non-dryRun single-file upload; use verify.owner/verify.mode for directory or download verification',
+            error:
+                'verifyOwner/verifyMode require a non-dryRun single-file upload; ' +
+                'use verify.owner/verify.mode for directory or download verification',
         })
     }
     if (args.verify?.deletions && args.delete !== true) {
@@ -1548,7 +1616,9 @@ async function handleSync(
             success: false,
             transferSuccess: false,
             code: 'UNSUPPORTED_SYNC_VERIFICATION',
-            error: 'verifyOwner/verifyMode require a single-file upload; use verify.owner/verify.mode for directory verification',
+            error:
+                'verifyOwner/verifyMode require a single-file upload; ' +
+                'use verify.owner/verify.mode for directory verification',
             diagnostics,
         })
     }
@@ -1587,13 +1657,17 @@ async function handleSync(
                                         progressToken,
                                         progress: current,
                                         message:
-                                            `${args.direction === 'upload' ? '上传' : '下载'}：${update.transferred} bytes，${update.percent}%` +
+                                            `${args.direction === 'upload' ? '上传' : '下载'}：` +
+                                            `${update.transferred} bytes，` +
+                                            `${update.percent}%` +
                                             (update.total > 0 ? `，当前文件共 ${update.total} bytes` : ''),
                                     },
                                 })
                       )
                       .catch((error: unknown) => {
-                          progressWarning = `MCP progress notification failed: ${error instanceof Error ? error.message : String(error)}`
+                          progressWarning =
+                              'MCP progress notification failed: ' +
+                              (error instanceof Error ? error.message : String(error))
                           console.warn(`[ssh_sync] ${progressWarning}`)
                       })
                       .finally(() => {
@@ -1608,10 +1682,12 @@ async function handleSync(
         control.signal?.throwIfAborted()
         const probeTimeout = remainingTimeout()
         if (probeTimeout <= 0) {
+            // noinspection ExceptionCaughtLocallyJS — 超时仍保留传输诊断
             throw new Error('sync operation timeout was exhausted before remote probing')
         }
         diagnostics.remoteParent = await probeRemoteParent(args.alias, args.remotePath, probeTimeout, control.signal)
         if (remainingTimeout() <= 0) {
+            // noinspection ExceptionCaughtLocallyJS — 超时仍保留传输诊断
             throw new Error('sync operation timeout was exhausted before transfer started')
         }
         const remoteSource =
@@ -1632,11 +1708,10 @@ async function handleSync(
                 transferSuccess: false,
                 operationStatus: 'failed',
                 failureStage: 'remote_prepare',
-                code: remoteParent.exists === false ? 'REMOTE_PARENT_NOT_FOUND' : 'REMOTE_PARENT_NOT_DIRECTORY',
-                error:
-                    remoteParent.exists === false
-                        ? '远端父目录不存在，请先用 ssh_mkdir 创建后重新上传'
-                        : '远端父路径是文件，请改用目录作为父路径',
+                code: !remoteParent.exists ? 'REMOTE_PARENT_NOT_FOUND' : 'REMOTE_PARENT_NOT_DIRECTORY',
+                error: !remoteParent.exists
+                    ? '远端父目录不存在，请先用 ssh_mkdir 创建后重新上传'
+                    : '远端父路径是文件，请改用目录作为父路径',
                 diagnostics,
             })
         }
@@ -1711,7 +1786,9 @@ async function handleSync(
             exclude: args.exclude,
             recursive: args.recursive,
             followSymlinks: args.followSymlinks,
-            verifySha256: args.verify?.sha256 === true,
+            // 工具层负责带预算和文件稳定性检查的摘要，传输层只返回元数据
+            verifySha256: false,
+            bandwidthLimitKiBps: args.bandwidthLimitKiBps,
             preflightTimeout: args.preflightTimeout,
             connectTimeout: args.connectTimeout,
             operationTimeout: transferTimeout,
@@ -1739,6 +1816,7 @@ async function handleSync(
         )
         let verification: Record<string, unknown> | undefined
         let verificationError: unknown
+        let contentVerification: Record<string, unknown> | undefined
         if (verificationRequested && syncResult.success) {
             try {
                 const ownerModeVerification = await buildSyncUploadVerification(
@@ -1746,7 +1824,7 @@ async function handleSync(
                     args.direction === 'upload' ? localBefore : localAfter,
                     control
                 )
-                const contentVerification = sourceIsDirectory
+                contentVerification = sourceIsDirectory
                     ? await buildDirectorySyncVerification(
                           args,
                           args.direction === 'upload' ? localBefore : localAfter,
@@ -1766,6 +1844,19 @@ async function handleSync(
             }
         }
         const outcome = buildTransferOutcome(syncResult.success, verificationRequested, verification, verificationError)
+        if (syncResult.verification && args.verify?.sha256) {
+            const local = contentVerification?.local as { sha256?: string } | undefined
+            const remote = contentVerification?.remote as { sha256?: string } | undefined
+            syncResult.verification = {
+                ...syncResult.verification,
+                status: verificationError ? 'error' : contentVerification?.skipped ? 'skipped' : 'completed',
+                hashAlgorithm: 'sha256',
+                hashMatch: (contentVerification?.checks as Record<string, boolean> | undefined)?.sha256,
+                local: { ...(syncResult.verification.local as object), sha256: local?.sha256 },
+                remote: { ...(syncResult.verification.remote as object), sha256: remote?.sha256 },
+                ...(verificationError ? verificationErrorDetails(verificationError) : {}),
+            }
+        }
         const verificationMessage =
             verificationError instanceof Error ? verificationError.message : String(verificationError)
         return formatResult({
@@ -1811,10 +1902,10 @@ export function registerFileTools(server: McpServer): void {
         {
             description:
                 '从远程服务器原子下载文件。新文件使用 0600，替换普通文件时保留其 rwx 权限；symlink、目录和其他非普通目标会被拒绝。timeout ' +
-                '限制单个 SFTP 操作，超时后远端传输状态可能未知。',
+                '限制下载与失败诊断的总期限，取消或超期后停止远端探测。',
             inputSchema: downloadSchema,
         },
-        (args) => handleDownload(args)
+        (args, extra) => handleDownload(args, extra)
     )
 
     server.registerTool(
@@ -1832,7 +1923,7 @@ export function registerFileTools(server: McpServer): void {
             description: '写入内容到远程文件。timeout 限制单个 SFTP 操作，超时后远端写入状态可能未知。',
             inputSchema: writeFileSchema,
         },
-        (args) => handleWriteFile(args)
+        (args, extra) => handleWriteFile(args, extra)
     )
 
     server.registerTool(
@@ -1858,7 +1949,8 @@ export function registerFileTools(server: McpServer): void {
     server.registerTool(
         'ssh_mkdir',
         {
-            description: '创建远程目录',
+            description:
+                '以 SFTP 登录身份创建远程目录，连接 runAs 仅影响命令执行；返回实际 owner、group 和 mode，不自动修改权限；创建已确认后元信息读取失败时保持 success=true，metadataStatus=unavailable，可用 ssh_file_info 重新读取元信息',
             inputSchema: mkdirSchema,
         },
         (args) => handleMkdir(args)

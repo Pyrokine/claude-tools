@@ -6,14 +6,16 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js'
+import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js'
 import { randomUUID } from 'crypto'
 import { z } from 'zod'
 import { classifyCommandRisk, type CommandRisk } from '../command-risk.js'
 import * as fileOps from '../file-ops.js'
-import { sftpOperationOutcome } from '../sftp-timeout.js'
 import { OpenSshError } from '../openssh.js'
 import { encodedPowershell, quotePowershell, sftpPath } from '../remote-platform.js'
 import { sessionManager } from '../session-manager.js'
+import { sftpOperationOutcome } from '../sftp-timeout.js'
 import {
     DEFAULT_EXEC_MAX_OUTPUT_SIZE,
     DEFAULT_EXEC_TIMEOUT_MS,
@@ -22,7 +24,7 @@ import {
 } from '../types.js'
 import { utf8SafeEnd } from '../utf8.js'
 import { windowsTemporaryPathScript } from '../windows-acl.js'
-import { sshPortSchema } from './schema.js'
+import { operationTimeoutSchema, sshPortSchema } from './schema.js'
 import { escapeShellArg, formatError, formatResult } from './utils.js' // ========== Schemas ==========
 
 // ========== Schemas ==========
@@ -36,6 +38,10 @@ const maxOutputSizeSchema = z
     .describe('stdout/stderr 各自的 UTF-8 字节上限，超过后截断并返回提示')
 
 const execSchema = z.object({
+    stdin: z
+        .string()
+        .optional()
+        .describe('以 UTF-8 写入命令标准输入并发送 EOF，省略时保持原输入行为；输入不加入命令、日志或错误'),
     alias: z.string().describe('连接别名'),
     command: z.string().describe('要执行的命令'),
     timeout: z
@@ -127,16 +133,25 @@ const execScriptSchema = z.object({
     runAs: z.string().optional().describe('本次脚本使用的目标用户'),
     cwd: z.string().optional().describe('工作目录（可选）'),
     env: z.record(z.string(), z.string()).optional().describe('额外环境变量'),
-    timeout: z.number().optional().describe('上传、准备和执行各阶段的超时（毫秒）'),
+    timeout: operationTimeoutSchema
+        .optional()
+        .describe(
+            '上传、准备、执行各阶段的独立超时，最大 3600000 ms；清理独立计时，使用该值与 30000 ms 中的较小值，省略时为 30000 ms；未传时命令默认 30000 ms、SFTP 默认 600000 ms；宿主请求期限单独生效，长任务用 ssh_operation_start'
+        ),
     keepScript: z.boolean().optional().describe('是否保留远端临时脚本，默认 false'),
     maxOutputSize: maxOutputSizeSchema,
 })
 
 // ========== Handlers ==========
 
-async function handleExec(args: z.infer<typeof execSchema>) {
+async function handleExec(
+    args: z.infer<typeof execSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     try {
         const result = await sessionManager.exec(args.alias, args.command, {
+            stdin: args.stdin,
+            signal: extra?.signal,
             timeout: args.timeout,
             cwd: args.cwd,
             env: args.env,
@@ -155,12 +170,16 @@ async function handleExec(args: z.infer<typeof execSchema>) {
     }
 }
 
-async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
+async function handleExecAsUser(
+    args: z.infer<typeof execAsUserSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     try {
         sessionManager.requirePosixPrivilege(args.alias)
         if (args.targetUser) {
             const result = await sessionManager.execAsUser(args.alias, args.command, args.targetUser, {
                 timeout: args.timeout,
+                signal: extra?.signal,
                 cwd: args.cwd,
                 env: args.env,
                 maxOutputSize: args.maxOutputSize,
@@ -173,6 +192,7 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
         }
         const result = await sessionManager.exec(args.alias, args.command, {
             timeout: args.timeout,
+            signal: extra?.signal,
             cwd: args.cwd,
             env: args.env,
             maxOutputSize: args.maxOutputSize,
@@ -187,10 +207,14 @@ async function handleExecAsUser(args: z.infer<typeof execAsUserSchema>) {
     }
 }
 
-async function handleExecSudo(args: z.infer<typeof execSudoSchema>) {
+async function handleExecSudo(
+    args: z.infer<typeof execSudoSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     try {
         const result = await sessionManager.execSudo(args.alias, args.command, args.sudoPassword, {
             timeout: args.timeout,
+            signal: extra?.signal,
             maxOutputSize: args.maxOutputSize,
             runAs: args.runAs,
             useLoginUser: args.useLoginUser,
@@ -246,7 +270,10 @@ function executionFailure(error: unknown): Partial<ExecResult> & { success: fals
     }
 }
 
-async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
+async function handleExecBatch(
+    args: z.infer<typeof execBatchSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     try {
         const stopOnError = args.stopOnError !== false
         type BatchEntry = { index: number; commandRedacted: true; commandRisk?: CommandRisk } & Partial<ExecResult>
@@ -254,9 +281,11 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
         const budget = { remaining: REQUEST_OUTPUT_LIMIT, truncated: false }
 
         for (let i = 0; i < args.commands.length; i++) {
+            extra?.signal.throwIfAborted()
             try {
                 const execResult = await sessionManager.exec(args.alias, args.commands[i], {
                     timeout: args.timeout,
+                    signal: extra?.signal,
                     maxOutputSize: Math.max(1, Math.min(DEFAULT_EXEC_MAX_OUTPUT_SIZE, budget.remaining)),
                 })
                 results.push({
@@ -282,7 +311,7 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
                         : undefined,
                     ...boundExecOutput(failure, budget),
                 })
-                if (stopOnError) {
+                if (stopOnError || extra?.signal.aborted) {
                     break
                 }
             }
@@ -302,22 +331,34 @@ async function handleExecBatch(args: z.infer<typeof execBatchSchema>) {
     }
 }
 
-async function handleQuickExec(args: z.infer<typeof quickExecSchema>) {
+async function handleQuickExec(
+    args: z.infer<typeof quickExecSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     const tempAlias = `_quick_${randomUUID()}`
     try {
-        await sessionManager.connect({
-            host: args.host,
-            port: args.port ?? 22,
-            username: args.user,
-            password: args.password,
-            privateKeyPath: args.keyPath,
-            agent: args.agent,
-            remotePlatform: args.remotePlatform,
-            commandShell: args.commandShell,
-            alias: tempAlias,
-            readyTimeout: args.readyTimeout,
+        extra?.signal.throwIfAborted()
+        await sessionManager.connect(
+            {
+                host: args.host,
+                port: args.port ?? 22,
+                username: args.user,
+                password: args.password,
+                privateKeyPath: args.keyPath,
+                agent: args.agent,
+                remotePlatform: args.remotePlatform,
+                commandShell: args.commandShell,
+                alias: tempAlias,
+                readyTimeout: args.readyTimeout,
+            },
+            undefined,
+            extra?.signal
+        )
+        extra?.signal.throwIfAborted()
+        const result = await sessionManager.exec(tempAlias, args.command, {
+            timeout: args.timeout,
+            signal: extra?.signal,
         })
-        const result = await sessionManager.exec(tempAlias, args.command, { timeout: args.timeout })
         return formatResult(result)
     } catch (error) {
         return formatError(error)
@@ -329,12 +370,14 @@ async function handleQuickExec(args: z.infer<typeof quickExecSchema>) {
 async function mapWithConcurrency<T, R>(
     items: T[],
     limit: number,
-    worker: (item: T, index: number) => Promise<R>
+    worker: (item: T, index: number) => Promise<R>,
+    signal?: AbortSignal
 ): Promise<R[]> {
     const results = new Array<R>(items.length)
     let nextIndex = 0
     const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
         while (nextIndex < items.length) {
+            signal?.throwIfAborted()
             const index = nextIndex++
             results[index] = await worker(items[index], index)
         }
@@ -343,24 +386,33 @@ async function mapWithConcurrency<T, R>(
     return results
 }
 
-async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
+async function handleExecParallel(
+    args: z.infer<typeof execParallelSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     try {
         const concurrency = Math.min(args.maxConcurrency ?? EXEC_PARALLEL_DEFAULT_CONCURRENCY, args.aliases.length)
         const budget = { remaining: REQUEST_OUTPUT_LIMIT, truncated: false }
-        const results = await mapWithConcurrency(args.aliases, concurrency, async (alias) => {
-            try {
-                const execResult = await sessionManager.exec(alias, args.command, {
-                    timeout: args.timeout,
-                    maxOutputSize: Math.max(
-                        1,
-                        Math.min(args.maxOutputSize ?? DEFAULT_EXEC_MAX_OUTPUT_SIZE, budget.remaining)
-                    ),
-                })
-                return { alias, ...boundExecOutput(execResult, budget) }
-            } catch (err) {
-                return { alias, ...boundExecOutput(executionFailure(err), budget) }
-            }
-        })
+        const results = await mapWithConcurrency(
+            args.aliases,
+            concurrency,
+            async (alias) => {
+                try {
+                    const execResult = await sessionManager.exec(alias, args.command, {
+                        timeout: args.timeout,
+                        signal: extra?.signal,
+                        maxOutputSize: Math.max(
+                            1,
+                            Math.min(args.maxOutputSize ?? DEFAULT_EXEC_MAX_OUTPUT_SIZE, budget.remaining)
+                        ),
+                    })
+                    return { alias, ...boundExecOutput(execResult, budget) }
+                } catch (err) {
+                    return { alias, ...boundExecOutput(executionFailure(err), budget) }
+                }
+            },
+            extra?.signal
+        )
 
         return formatResult({
             success: results.every((r) => r.success),
@@ -378,7 +430,11 @@ async function handleExecParallel(args: z.infer<typeof execParallelSchema>) {
 
 async function cleanupRemoteScript(alias: string, remotePath: string, timeout?: number): Promise<string | undefined> {
     try {
-        await fileOps.removeRemoteFile(alias, remotePath, timeout)
+        await fileOps.removeRemoteFile(
+            alias,
+            remotePath,
+            Math.min(timeout ?? DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_EXEC_TIMEOUT_MS)
+        )
         return undefined
     } catch (error) {
         return error instanceof Error ? error.message : String(error)
@@ -400,7 +456,7 @@ function resolveScriptUsers(args: z.infer<typeof execScriptSchema>): { effective
 }
 
 export function windowsScriptContent(script: string, interpreter: string): string {
-    const bom = String.fromCharCode(0xfeff)
+    const bom = String.fromCharCode(65279)
     if (interpreter.toLowerCase().startsWith('cmd')) {
         return `@chcp 65001>nul || exit /b 1\r\n${script.startsWith(bom) ? script.slice(1) : script}`
     }
@@ -412,13 +468,15 @@ async function prepareRemoteScript(
     remotePath: string,
     effectiveUser: string | undefined,
     loginUser: string | undefined,
-    timeout: number | undefined
+    timeout: number | undefined,
+    signal?: AbortSignal
 ): Promise<void> {
     const quotedPath = escapeShellArg(remotePath)
     const ownershipCommand =
         effectiveUser && effectiveUser !== loginUser ? `chown ${escapeShellArg(effectiveUser)} ${quotedPath} && ` : ''
     const result = await sessionManager.exec(alias, `${ownershipCommand}chmod 700 ${quotedPath}`, {
         timeout,
+        signal,
         useLoginUser: true,
         maxOutputSize: 4096,
     })
@@ -428,21 +486,27 @@ async function prepareRemoteScript(
     }
 }
 
-async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
+async function handleExecScript(
+    args: z.infer<typeof execScriptSchema>,
+    extra?: RequestHandlerExtra<ServerRequest, ServerNotification>
+) {
     let remotePath: string | undefined
     let remoteSftpPath: string | undefined
     let ownsRemotePath = false
     let executionStarted = false
     try {
+        extra?.signal.throwIfAborted()
         if (sessionManager.getOpenSshConnection(args.alias)) {
-            throw new OpenSshError(
-                'The OpenSSH backend does not support temporary script uploads; use ssh_exec for inline commands',
-                {
-                    code: 'unsupported_backend',
-                    backend: 'openssh',
-                    capability: 'script_upload',
-                    retryable: false,
-                }
+            return formatError(
+                new OpenSshError(
+                    'The OpenSSH backend does not support temporary script uploads; use ssh_exec for inline commands',
+                    {
+                        code: 'unsupported_backend',
+                        backend: 'openssh',
+                        capability: 'script_upload',
+                        retryable: false,
+                    }
+                )
             )
         }
         const windows = sessionManager.getRemotePlatform(args.alias) === 'windows'
@@ -454,7 +518,7 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
         }
         validateScriptUser(effectiveUser)
         if (windows && !['powershell', 'powershell.exe', 'cmd', 'cmd.exe'].includes(interpreter.toLowerCase())) {
-            throw new Error('Windows script interpreter must be cmd or powershell')
+            return formatError(new Error('Windows script interpreter must be cmd or powershell'))
         }
         if (windows) {
             const suffix = interpreter.toLowerCase().startsWith('cmd') ? '.cmd' : '.ps1'
@@ -464,15 +528,19 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
                 encodedPowershell(windowsTemporaryPathScript(name)),
                 {
                     timeout: args.timeout,
+                    signal: extra?.signal,
                     useLoginUser: true,
                     maxOutputSize: 4096,
                 }
             )
             if (!tempResult.success) {
-                throw new Error(
-                    tempResult.stderr.includes('privacy_not_enforced_on_windows')
-                        ? 'privacy_not_enforced_on_windows: remote temporary directory ACL was not verified'
-                        : `Remote Windows temporary directory lookup failed: ${tempResult.stderr || tempResult.stdout}`
+                return formatError(
+                    new Error(
+                        tempResult.stderr.includes('privacy_not_enforced_on_windows')
+                            ? 'privacy_not_enforced_on_windows: remote temporary directory ACL was not verified'
+                            : 'Remote Windows temporary directory lookup failed: ' +
+                                  (tempResult.stderr || tempResult.stdout)
+                    )
                 )
             }
             remotePath = tempResult.stdout.trim()
@@ -481,19 +549,21 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
                 /[\r\n\0]/.test(remotePath) ||
                 !(remotePath.endsWith(`\\${name}`) || remotePath.endsWith(`/${name}`))
             ) {
-                throw new Error('Remote Windows temporary directory lookup failed')
+                return formatError(new Error('Remote Windows temporary directory lookup failed'))
             }
             remoteSftpPath = sftpPath(remotePath, sessionManager.getRemotePathStyle(args.alias))
             await fileOps.prepareWindowsRemotePrivateFile(
                 args.alias,
                 remoteSftpPath,
                 args.timeout ?? DEFAULT_EXEC_TIMEOUT_MS,
-                remotePath
+                remotePath,
+                extra?.signal
             )
             ownsRemotePath = true
         } else {
             const tempResult = await sessionManager.exec(args.alias, 'mktemp /tmp/mcp-ssh-script.XXXXXX', {
                 timeout: args.timeout,
+                signal: extra?.signal,
                 useLoginUser: true,
                 maxOutputSize: 4096,
             })
@@ -506,17 +576,19 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
         }
 
         if (!remoteSftpPath) {
-            throw new Error('Remote temporary script path was not created')
+            return formatError(new Error('Remote temporary script path was not created'))
         }
         await fileOps.writeFile(
             args.alias,
             remoteSftpPath,
             windows ? windowsScriptContent(args.script, interpreter) : args.script,
             false,
-            args.timeout
+            args.timeout,
+            extra?.signal
         )
+        extra?.signal.throwIfAborted()
         if (!windows) {
-            await prepareRemoteScript(args.alias, remotePath, effectiveUser, loginUser, args.timeout)
+            await prepareRemoteScript(args.alias, remotePath, effectiveUser, loginUser, args.timeout, extra?.signal)
         }
 
         const command = windows
@@ -534,11 +606,14 @@ async function handleExecScript(args: z.infer<typeof execScriptSchema>) {
             : [interpreter, ...interpreterArgs, remotePath].map(escapeShellArg).join(' ')
         const execOptions = {
             timeout: args.timeout,
+            signal: extra?.signal,
             cwd: args.cwd,
             env: args.env,
             maxOutputSize: args.maxOutputSize,
             runAs: args.targetUser ?? args.runAs,
         }
+        extra?.signal.throwIfAborted()
+        // noinspection JSUnusedAssignment -- read by the failure cleanup path
         executionStarted = true
         const result = args.targetUser
             ? await sessionManager.execAsUser(args.alias, command, args.targetUser, execOptions)
@@ -574,7 +649,7 @@ export function registerExecTools(server: McpServer): void {
 返回: stdout, stderr, exitCode, duration`,
             inputSchema: execSchema,
         },
-        (args) => handleExec(args)
+        (args, extra) => handleExec(args, extra)
     )
 
     server.registerTool(
@@ -590,7 +665,7 @@ export function registerExecTools(server: McpServer): void {
 示例: ssh_exec_as_user(alias="server", command="whoami", targetUser="appuser")`,
             inputSchema: execAsUserSchema,
         },
-        (args) => handleExecAsUser(args)
+        (args, extra) => handleExecAsUser(args, extra)
     )
 
     server.registerTool(
@@ -599,7 +674,7 @@ export function registerExecTools(server: McpServer): void {
             description: '使用 sudo 执行命令。runAs、useLoginUser 与 loadProfile 的身份优先级与 ssh_exec 相同。',
             inputSchema: execSudoSchema,
         },
-        (args) => handleExecSudo(args)
+        (args, extra) => handleExecSudo(args, extra)
     )
 
     server.registerTool(
@@ -610,7 +685,7 @@ export function registerExecTools(server: McpServer): void {
 如需命令间共享环境（如 export 变量），用分号拼接为单条命令通过 ssh_exec 执行`,
             inputSchema: execBatchSchema,
         },
-        (args) => handleExecBatch(args)
+        (args, extra) => handleExecBatch(args, extra)
     )
 
     server.registerTool(
@@ -620,7 +695,7 @@ export function registerExecTools(server: McpServer): void {
                 '一次性执行命令（自动连接、执行、断开）。readyTimeout 只限制建立 SSH 连接，timeout 只限制命令执行，适用于单次命令。',
             inputSchema: quickExecSchema,
         },
-        (args) => handleQuickExec(args)
+        (args, extra) => handleQuickExec(args, extra)
     )
 
     server.registerTool(
@@ -634,15 +709,18 @@ export function registerExecTools(server: McpServer): void {
 返回每个主机的执行结果`,
             inputSchema: execParallelSchema,
         },
-        (args) => handleExecParallel(args)
+        (args, extra) => handleExecParallel(args, extra)
     )
 
     server.registerTool(
         'ssh_exec_script',
         {
-            description: '上传远端临时脚本并执行，默认执行后清理脚本；timeout 同时用于上传、准备和执行阶段',
+            description:
+                '上传远端临时脚本并执行，默认执行后清理脚本；timeout 分别限制上传、准备和执行阶段，最大 3600000 ms；' +
+                '清理独立计时，使用请求值与 30000 ms 中的较小值，省略时为 30000 ms；' +
+                '宿主中止后远端进程停止状态未知，长任务用 ssh_operation_start/status/read/cancel',
             inputSchema: execScriptSchema,
         },
-        (args) => handleExecScript(args)
+        (args, extra) => handleExecScript(args, extra)
     )
 }

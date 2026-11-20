@@ -249,7 +249,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
         const commandShell =
             args.commandShell ?? template.commandShell ?? (remotePlatform === 'windows' ? 'powershell' : 'posix')
         if ((remotePlatform === 'windows') !== (commandShell !== 'posix')) {
-            throw new Error('commandShell must match remotePlatform')
+            return formatError(new Error('commandShell must match remotePlatform'))
         }
         const remotePathStyle =
             args.remotePathStyle ?? template.remotePathStyle ?? (remotePlatform === 'windows' ? 'win32' : 'posix')
@@ -261,6 +261,7 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
         const env = mergeEnv(template.env, args.env)
         const keepaliveInterval = args.keepaliveInterval ?? template.keepaliveInterval
         const readyTimeout = args.readyTimeout ?? template.readyTimeout
+        let preparationGeneration: number | undefined
         let jumpHostResolved:
             | {
                   host: string
@@ -280,14 +281,13 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                 args.jumpHost ||
                 template.jumpHost
             ) {
-                throw new OpenSshError(
-                    'OpenSSH master reuse does not accept new authentication or jumpHost parameters',
-                    {
+                return formatError(
+                    new OpenSshError('OpenSSH master reuse does not accept new authentication or jumpHost parameters', {
                         code: 'unsupported_backend',
                         backend,
                         capability: 'new_authentication',
                         retryable: false,
-                    }
+                    })
                 )
             }
             if (
@@ -296,32 +296,44 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
                 remotePathStyle !== 'posix' ||
                 (rsyncProfile && rsyncProfile !== 'posix')
             ) {
-                throw new OpenSshError('OpenSSH master reuse requires a POSIX remote shell and path style', {
-                    code: 'unsupported_backend',
-                    backend,
-                    capability: 'platform',
-                    retryable: false,
-                })
+                return formatError(
+                    new OpenSshError('OpenSSH master reuse requires a POSIX remote shell and path style', {
+                        code: 'unsupported_backend',
+                        backend,
+                        capability: 'platform',
+                        retryable: false,
+                    })
+                )
             }
-            const resolved = await resolveOpenSshConfig({
-                configHost,
-                configPath,
-                host,
-                username: user,
-                port,
-                controlPath,
-                readyTimeout,
-            })
+            const preparationAlias = requestedAlias ?? (user && host ? `${user}@${host}:${port ?? 22}` : undefined)
+            const prepared = await sessionManager.prepareConnection(preparationAlias, (signal) =>
+                resolveOpenSshConfig(
+                    {
+                        configHost,
+                        configPath,
+                        host,
+                        username: user,
+                        port,
+                        controlPath,
+                        readyTimeout,
+                    },
+                    signal
+                )
+            )
+            const { result: resolved, generation } = prepared
+            preparationGeneration = generation
             host = resolved.host
             user = resolved.username
             port = resolved.port
             controlPath = resolved.controlPath
         } else if (controlPath !== undefined) {
-            throw new OpenSshError('controlPath requires backend=openssh', {
-                code: 'invalid_openssh_config',
-                backend,
-                retryable: false,
-            })
+            return formatError(
+                new OpenSshError('controlPath requires backend=openssh', {
+                    code: 'invalid_openssh_config',
+                    backend,
+                    retryable: false,
+                })
+            )
         } else if (configHost) {
             const allHosts = parseSSHConfig(configPath)
             const hostConfig = allHosts.find((h) => h.host === configHost)
@@ -421,29 +433,32 @@ async function handleConnect(args: z.infer<typeof connectSchema>) {
         const reusableSessions = sessionsBeforeConnect
             .filter((session) => session.identity === identity && session.alias !== finalAlias && session.connected)
             .map((session) => ({ alias: session.alias, runAs: session.runAs, connectedAt: session.connectedAt }))
-        const alias = await sessionManager.connect({
-            backend,
-            controlPath,
-            host,
-            port: finalPort,
-            username: user,
-            password,
-            privateKeyPath: keyPath,
-            agent,
-            remotePlatform,
-            commandShell,
-            remotePathStyle,
-            rsyncExecutable,
-            rsyncProfile,
-            alias: finalAlias,
-            template: args.template,
-            runAs,
-            defaultEnv,
-            env,
-            keepaliveInterval,
-            readyTimeout,
-            jumpHost,
-        })
+        const alias = await sessionManager.connect(
+            {
+                backend,
+                controlPath,
+                host,
+                port: finalPort,
+                username: user,
+                password,
+                privateKeyPath: keyPath,
+                agent,
+                remotePlatform,
+                commandShell,
+                remotePathStyle,
+                rsyncExecutable,
+                rsyncProfile,
+                alias: finalAlias,
+                template: args.template,
+                runAs,
+                defaultEnv,
+                env,
+                keepaliveInterval,
+                readyTimeout,
+                jumpHost,
+            },
+            preparationGeneration
+        )
         const connected = sessionManager.getSessionConnectionInfo(alias)
         return formatResult({
             success: true,

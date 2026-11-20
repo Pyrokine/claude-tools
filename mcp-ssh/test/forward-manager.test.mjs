@@ -13,6 +13,7 @@ function listen(port) {
     })
 }
 
+/** @returns {Promise<import('node:net').Socket>} */
 function connect(port) {
     return new Promise((resolve, reject) => {
         const socket = net.connect(port, '127.0.0.1')

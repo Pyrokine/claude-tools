@@ -231,7 +231,10 @@ Add to your MCP settings (e.g., `~/.claude/settings.json` or client-specific con
 OpenSSH
 entries also include `masterReused` and `identityStatus` . Use `detail=true` for connection details or `fields=[...]`
 to
-select fields. Neither mode returns `keyPath`. For ssh2, `connected` checks the underlying socket's writable/open state, so a dead transport is reported disconnected before a delayed close event arrives. An implicit bastion alias that conflicts with another live connection uses a target-scoped alias; compatible bastions are still shared, and an explicitly chosen conflicting alias returns an error.
+select fields. Neither mode returns `keyPath`. For ssh2, `connected` checks the underlying socket's writable/open
+state, so dead transport is reported disconnected before a delayed close event arrives. An implicit bastion alias
+that conflicts with another live connection uses a target-scoped alias; compatible bastions are still shared, and
+an explicitly chosen conflicting alias returns an error.
 
 ssh2 connections enable TCP_NODELAY to reduce waiting between interactive commands and small-file SFTP requests.
 Direct,
@@ -256,11 +259,21 @@ pending, a channel returned by the delayed callback is destroyed before the conn
 | `ssh_quick_exec`    | One-shot: connect, execute, disconnect        |
 | `ssh_exec_script`   | Upload and run a temporary remote script      |
 
-`ssh_exec_script.interpreter` is an executable name or path. Pass flags separately as `interpreterArgs`, such as `interpreter="python3", interpreterArgs=["-I"]`. Each array entry is one escaped argument; omitting the array preserves the default empty argument list. POSIX defaults to bash; Windows defaults to the connection shell and retains its cmd or PowerShell script invocation.
+`ssh_exec_script.interpreter` is an executable name or path. Pass flags separately as `interpreterArgs`, such as
+`interpreter="python3", interpreterArgs=["-I"]`. Each array entry is one escaped argument; omitting the array
+preserves the default empty argument list. POSIX defaults to bash; Windows defaults to the connection shell and
+retains its cmd or PowerShell script invocation.
 
 For a Windows remote, `ssh_exec_script` saves PowerShell scripts as UTF-8 with BOM so Windows PowerShell reads Unicode
 correctly. CMD scripts switch to code page 65001 before running UTF-8 commands; an unavailable code page stops
 execution. POSIX scripts retain their original content.
+
+Host cancellation stops subsequent batch commands and queued parallel work, including batches with `stopOnError=false`.
+It also stops later script upload, permission preparation, interpreter dispatch, and password input to a late sudo
+channel.
+Script cleanup uses a separate timeout of at most 30000 ms and removes only this request's temporary file.
+`keepScript=true` retains a script once execution has started; an upload or preparation failure still cleans it up.
+Canceling a request closes its own channels and leaves other requests and any reused OpenSSH master available.
 
 ### Tracked operations
 
@@ -285,7 +298,8 @@ execution. POSIX scripts retain their original content.
 | `ssh_mkdir`      | Create remote directory                  |
 | `ssh_sync`       | Smart sync with rsync (fallback to SFTP) |
 
-`ssh_read_file` accepts regular files, including empty files. A directory is rejected before opening a read stream with guidance to use `ssh_list_dir`; other non-regular targets return a type error.
+`ssh_read_file` accepts regular files, including empty files. A directory is rejected before opening a read stream
+with guidance to use `ssh_list_dir`; other non-regular targets return a type error.
 
 ### PTY Sessions (Persistent Interactive Terminal)
 
@@ -454,7 +468,7 @@ that command. A reported exit signal is retained as `exitSignal` and classified 
 ### Basic: Connect and Execute
 
 ```
-ssh_connect(host="<server-host>", user="root", keyPath="/home/.ssh/id_rsa", alias="myserver")
+ssh_connect(host="<server-host>", user="root", keyPath="~/.ssh/id_rsa", alias="myserver")
 ssh_exec(alias="myserver", command="ls -la /home")
 ssh_disconnect(alias="myserver")
 ```
@@ -492,6 +506,11 @@ ssh_exec(alias="app-dev", command="whoami", useLoginUser=true)
 from the session that was actually published. Concurrent calls reuse an alias only when the complete session
 configuration matches, including endpoint, authentication, `runAs`, environment, jump host, keepalive, and timeout
 settings. A conflicting pending or active connection is rejected even when its `user@host:port` identity is unchanged.
+Conflict errors include `details.differingFields` with configuration field names only. OpenSSH configuration preparation
+registers the requested alias, `configHost`, or initial endpoint. Disconnect cancels its owned `ssh -G` process and
+prevents a later connection, including the preparation-to-connect handoff. A later connection can reuse the resolved
+alias when `ssh -G` changes the hostname, user, or port.
+
 Missing templates include available template names when they can be loaded. Missing `configHost` returns SSH config
 candidates and suggests `ssh_config_list`.
 
@@ -503,12 +522,12 @@ Connect to internal server via jump host:
 ssh_connect(
   host="<internal-host>",
   user="root",
-  keyPath="/home/.ssh/id_rsa",
+  keyPath="~/.ssh/id_rsa",
   alias="internal",
   jumpHost={
     host: "bastion.example.com",
     user: "admin",
-    keyPath: "/home/.ssh/bastion_key"
+    keyPath: "~/.ssh/bastion_key"
   }
 )
 ```
@@ -518,7 +537,7 @@ ssh_connect(
 Perfect for scenarios where you SSH as root but need to run commands as another user:
 
 ```
-1. ssh_connect(host="<server-host>", user="root", keyPath="/home/.ssh/id_rsa", alias="server")
+1. ssh_connect(host="<server-host>", user="root", keyPath="~/.ssh/id_rsa", alias="server")
 2. ssh_exec_as_user(alias="server", command="whoami", targetUser="appuser")
    // Output: appuser
 ```
@@ -623,11 +642,12 @@ ssh_exec_script(alias="server", script=<script-above>, timeout=30000)
 ssh_read_file(alias="server", remotePath="/tmp/mcp-log-errors.txt", maxBytes=65536)
 ```
 
-This keeps log querying in the general command and file tools instead of adding a separate log-specific MCP surface.
-The
-`ssh_exec_script.timeout` value applies while uploading the temporary script, preparing its permissions, and running
-it.
-A stalled SFTP upload therefore ends on the requested timeout instead of using the default SFTP budget.
+Log querying uses the general command and file tools. `ssh_exec_script.timeout` independently limits temporary script
+upload, permission preparation, and execution. Explicit values use positive integer milliseconds, up to 3600000. Cleanup
+has its own timeout: the smaller of the requested value and 30000 ms, or 30000 ms when omitted. Without an explicit
+timeout, commands retain their 30000 ms default and SFTP retains 600000 ms. Host request deadlines apply separately.
+Use `ssh_operation_start/status/read/cancel` for long observations: a host abort of synchronous exec leaves the remote
+process's stop state unknown.
 
 ### With Environment Variables
 
@@ -635,7 +655,7 @@ A stalled SFTP upload therefore ends on the requested timeout instead of using t
 ssh_connect(
   host="<server-host>",
   user="root",
-  keyPath="/home/.ssh/id_rsa",
+  keyPath="~/.ssh/id_rsa",
   env={"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
 )
 ```
@@ -649,7 +669,7 @@ No need to manage connections for single commands. `ssh_quick_exec` creates a un
 ssh_quick_exec(
   host="<server-host>",
   user="root",
-  keyPath="/home/.ssh/id_rsa",
+  keyPath="~/.ssh/id_rsa",
   command="uptime"
 )
 ```
@@ -720,7 +740,9 @@ tools.
 
 `ssh_upload` , `ssh_download` , `ssh_read_file` , `ssh_write_file` , `ssh_list_dir` , `ssh_file_info` , and
 `ssh_mkdir` accept
-`timeout` for one SFTP operation. It defaults to 10 minutes and accepts up to one hour. Timeouts retain local and
+`timeout` for one SFTP operation. Downloads use one total deadline for transfer and failure diagnostics;
+when time expires or the host cancels, remote probing stops and local diagnostics remain available. It defaults to
+10 minutes and accepts up to one hour. Timeouts retain local and
 remote probe diagnostics. Uploads and writes report `operationStatus="unknown"` when an
 OPEN, WRITE, or CLOSE request was dispatched without a completion reply. Explicit server refusal returns `failed` .
 Read-only upload preflight failures also return `failed` ,
@@ -842,9 +864,18 @@ mode. Directory sources reject `recursive=false`. Relative exclude patterns are 
 source root; patterns without `/` match each basename. A trailing `/` restricts a pattern to directories:
 `provider/` skips directories with that basename and their contents while retaining regular files named `provider`.
 
-A single-file upload requires an existing remote parent directory. A known missing parent or a parent that is a file fails before upload with `failureStage="remote_prepare"` and `REMOTE_PARENT_NOT_FOUND` or `REMOTE_PARENT_NOT_DIRECTORY`; use `ssh_mkdir` for a missing parent. Directory sync retains its recursive creation behavior. Downloads create missing local parents; an rsync parent-preparation failure returns `failureStage="local_prepare"` before the transfer process starts.
+A single-file upload requires an existing remote parent directory. A known missing parent or a parent that is a
+file fails before upload with `failureStage="remote_prepare"` and `REMOTE_PARENT_NOT_FOUND` or
+`REMOTE_PARENT_NOT_DIRECTORY`; use `ssh_mkdir` for a missing parent. Directory sync retains its recursive creation
+behavior. Downloads create missing local parents; a failure during rsync parent preparation returns
+`failureStage="local_prepare"` before the transfer process starts.
 
-Clients requesting `_meta.progressToken` receive `notifications/progress` from SFTP and rsync transfers, including recursive sync, at most once per second while transfer bytes advance. `progress` is an increasing notification sequence; `message` reports the current file's bytes and percentage, with its total when known. Calls without a token keep the same transfer result. Cancellation stops later notifications. Notification errors produce a warning, with `progressWarning` when available, while the transfer retains its own outcome. The operation deadline and the client's absolute request deadline remain separate from progress-driven idle-timeout resets.
+Clients requesting `_meta.progressToken` receive `notifications/progress` from SFTP and rsync transfers, including
+recursive sync, at most once per second while transfer bytes advance. `progress` is an increasing notification
+sequence; `message` reports the current file's bytes and percentage, with its total when known. Calls without a
+token keep the same transfer result. Cancellation stops later notifications. Notification errors produce a warning,
+with `progressWarning` when available, while the transfer retains its own outcome. The operation deadline and the
+client's absolute request deadline remain separate from progress-driven idle-timeout resets.
 
 For a regular file, `verify.sha256`, `verify.owner`, `verify.mode`, and Windows `verify.aclSddl` apply to the actual
 transferred file in either direction. The result uses `kind="single_file"` and includes the file digest, not a
@@ -855,7 +886,7 @@ local and remote hashing, including the SFTP transport check. `verify.count`, `v
 require a directory source and are rejected before transfer for a file. A known source file larger than the requested
 hash budget is also rejected before transfer.
 
-Directory verification builds bounded local and remote manifests. It can compare entry count, an SHA-256 root
+Directory verification builds bounded local and remote manifests. It can compare entry count, a SHA-256 root
 manifest,
 owner, all four octal mode digits (including setuid, setgid, and sticky), stale entries, and deletion results.
 `verify.deletions=true` requires `delete=true` ; it records the destination before transfer and only checks whether
@@ -896,6 +927,29 @@ owned
 hash streams and stops later checks, while preserving completed file and byte counters and `transferSuccess` ; the
 result
 has `success=false` and a timed-out verification outcome.
+
+`bandwidthLimitKiBps` optionally limits aggregate transfer payload to KiB/s (1 KiB = 1024 bytes), for rsync and
+SFTP, in either direction. Omit it for the existing unrestricted speed. Concurrent and recursive SFTP file
+transfers share one limit; metadata and explicitly requested verification reads have separate costs. For example,
+`ssh_sync(..., bandwidthLimitKiBps=1024)` requests 1 MiB/s.
+
+Canceling a running rsync request terminates and waits for its own local process group, retaining reported
+itemization/deletion counts and `lastProgress`. The result is `cancelled=true`, `operationStatus="unknown"`: remote
+writes or deletions already dispatched require inspection. The alias, other requests, and the reused OpenSSH master
+remain available.
+
+Directory `checks` uses `null` for unrequested checks, `true` for an executed match, and `false` for a mismatch.
+Top-level `verificationStatus` distinguishes unrequested, skipped, matched, mismatched, and error outcomes.
+Explicit single-file SHA-256 verification reads each endpoint once and shares its digest with
+`transportVerification`; byte limits and metadata stability checks still apply.
+
+`ssh_mkdir` uses the SFTP login identity, independently of command `runAs`. Its response includes `loginUser`,
+`runAs`, `creationIdentity="sftp_login"`, and actual numeric `owner`, `group`, `mode`, and `permissions`. Directory
+access follows those returned permissions; the tool preserves ownership and permission policy. Once creation is
+acknowledged, a later metadata read failure returns `success=true`, `operationStatus="completed"`, `retryable=false`,
+and `metadataStatus="unavailable"`. `metadataError` contains the metadata failure in the existing error format,
+including any timeout details; unavailable `owner`, `group`, `mode`, and `permissions` are omitted. Use `ssh_file_info`
+to read metadata again. Directory creation failures retain their original error response.
 
 Directory root digests sort paths by their UTF-8 bytes, independent of enumeration order or locale. Case-distinct and
 Unicode NFC/NFD-distinct names remain separate entries; file names are not normalized.
@@ -1072,6 +1126,11 @@ also include
 `connectionStep` as `key_read`, `jump_connect`, `jump_forward`, or `target_connect`.
 
 ### Exec Options
+
+`ssh_exec(..., stdin="text")` sends UTF-8 input followed by EOF through ssh2 or the reused OpenSSH channel. Empty
+input sends EOF; omitting `stdin` retains existing behavior. Input stays out of the command string and
+input-delivery errors. A canceled request closes its own channel and returns remote state `unknown`, while the
+alias and master remain available. Commands that intentionally print their input still control their own output.
 
 | Option          | Type    | Default       | Description                                |
 | --------------- | ------- | ------------- | ------------------------------------------ |

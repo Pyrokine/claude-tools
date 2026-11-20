@@ -87,7 +87,7 @@ export class SftpWriteState {
 
     constructor(readonly remotePath: string) {}
 
-    track(sftp: SFTPWrapper): SFTPWrapper {
+    track(sftp: SFTPWrapper, signal?: AbortSignal): SFTPWrapper {
         return new Proxy(sftp, {
             get: (target, property, receiver): unknown => {
                 const method: unknown = Reflect.get(target, property)
@@ -109,6 +109,10 @@ export class SftpWriteState {
                 return (...args: unknown[]) => {
                     const stage = property === 'ext_openssh_rename' ? 'rename' : property
                     const callback = args.pop() as (...values: unknown[]) => void
+                    if (signal?.aborted && property !== 'close') {
+                        callback(signal.reason ?? new Error('SFTP operation cancelled'))
+                        return
+                    }
                     this.stage = stage
                     ++this.pending
                     try {
@@ -128,7 +132,12 @@ export class SftpWriteState {
                                 } else if (stage === 'open') {
                                     this.remoteCreated = true
                                 }
-                                callback(error, ...values)
+                                if (signal?.aborted && stage === 'open' && !error) {
+                                    target.end()
+                                    callback(signal.reason ?? new Error('SFTP operation cancelled'))
+                                } else {
+                                    callback(error, ...values)
+                                }
                             },
                         ])
                     } catch (error) {

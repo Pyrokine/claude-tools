@@ -1,11 +1,11 @@
-import { spawn, type ChildProcess } from 'child_process'
+import { type ChildProcess, spawn } from 'child_process'
 import { createHash, randomBytes } from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { PassThrough, Transform } from 'stream'
-import type { CommandChannel, OpenSshMasterInfo, SSHConnectionConfig } from './types.js'
-import { escapeShellArg, expandTilde } from './tools/utils.js'
 import { validateConfigFile } from './security.js'
+import { escapeShellArg, expandTilde } from './tools/utils.js'
+import type { CommandChannel, OpenSshMasterInfo, SSHConnectionConfig } from './types.js'
 
 const CONFIG_OUTPUT_LIMIT = 512 * 1024
 const CONTROL_OUTPUT_LIMIT = 16 * 1024
@@ -29,50 +29,34 @@ async function captureSsh(
     timeout: number,
     maxBytes: number,
     signal?: AbortSignal,
-    track?: (child: ChildProcess) => void
+    track?: (child: ChildProcess, processGroup: boolean) => void
 ): Promise<{ stdout: string; stderr: string; status: number | null }> {
+    signal?.throwIfAborted()
     return new Promise((resolve, reject) => {
-        const child = spawn('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, signal })
-        track?.(child)
+        const child = spawn('ssh', args, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+            detached: true,
+        })
+        track?.(child, true)
         const stdout: Buffer[] = []
         const stderr: Buffer[] = []
         let bytes = 0
+        let settled = false
         let failure: Error | undefined
-        const timer = setTimeout(() => {
-            failure = new OpenSshError(`OpenSSH request timed out after ${timeout}ms`, {
-                code: 'openssh_timeout',
-                backend: 'openssh',
-                timeout,
-                operationStatus: 'unknown',
-                retryable: false,
-            })
-            child.kill('SIGKILL')
-        }, timeout)
-        const collect =
-            (chunks: Buffer[]) =>
-            (chunk: Buffer): void => {
-                bytes += chunk.length
-                if (bytes > maxBytes) {
-                    failure ??= new OpenSshError('OpenSSH response exceeded its output limit', {
-                        code: 'openssh_output_limit',
-                        backend: 'openssh',
-                        maxBytes,
-                        retryable: false,
-                    })
-                    child.kill('SIGKILL')
-                } else {
-                    chunks.push(chunk)
-                }
+        let stopTimer: NodeJS.Timeout | undefined
+        const finish = (error?: Error, status: number | null = null): void => {
+            if (settled) {
+                return
             }
-        child.stdout.on('data', collect(stdout))
-        child.stderr.on('data', collect(stderr))
-        child.once('error', (error) => {
-            failure ??= error
-        })
-        child.once('close', (status) => {
+            settled = true
             clearTimeout(timer)
-            if (failure) {
-                reject(failure)
+            clearTimeout(stopTimer)
+            signal?.removeEventListener('abort', onAbort)
+            if (error) {
+                child.stdout.destroy()
+                child.stderr.destroy()
+                reject(error)
             } else {
                 resolve({
                     stdout: Buffer.concat(stdout).toString('utf8'),
@@ -80,19 +64,81 @@ async function captureSsh(
                     status,
                 })
             }
-        })
+        }
+        const stop = (error: Error): void => {
+            if (settled || failure) {
+                return
+            }
+            failure = error
+            if (child.pid) {
+                try {
+                    process.kill(-child.pid, 'SIGKILL')
+                } catch (cleanupError) {
+                    if ((cleanupError as NodeJS.ErrnoException).code !== 'ESRCH') {
+                        console.error('OpenSSH process cleanup failed:', cleanupError)
+                    }
+                }
+            }
+            child.stdout.destroy()
+            child.stderr.destroy()
+            stopTimer = setTimeout(() => finish(error), 100)
+        }
+        const onAbort = (): void =>
+            stop(signal?.reason instanceof Error ? signal.reason : new Error('OpenSSH request cancelled'))
+        const timer = setTimeout(() => {
+            stop(
+                new OpenSshError(`OpenSSH request timed out after ${timeout}ms`, {
+                    code: 'openssh_timeout',
+                    backend: 'openssh',
+                    timeout,
+                    operationStatus: 'unknown',
+                    retryable: false,
+                })
+            )
+        }, timeout)
+        signal?.addEventListener('abort', onAbort, { once: true })
+        if (signal?.aborted) {
+            onAbort()
+        }
+        const collect =
+            (chunks: Buffer[]) =>
+            (chunk: Buffer): void => {
+                if (settled) {
+                    return
+                }
+                bytes += chunk.length
+                if (bytes > maxBytes) {
+                    stop(
+                        new OpenSshError('OpenSSH response exceeded its output limit', {
+                            code: 'openssh_output_limit',
+                            backend: 'openssh',
+                            maxBytes,
+                            retryable: false,
+                        })
+                    )
+                } else {
+                    chunks.push(chunk)
+                }
+            }
+        child.stdout.on('data', collect(stdout))
+        child.stderr.on('data', collect(stderr))
+        child.once('error', (error) => stop(error))
+        child.once('close', (status) => finish(failure, status))
     })
 }
 
-export async function resolveOpenSshConfig(input: {
-    configHost?: string
-    configPath?: string
-    host?: string
-    username?: string
-    port?: number
-    controlPath?: string
-    readyTimeout?: number
-}): Promise<{ host: string; username: string; port: number; controlPath: string }> {
+export async function resolveOpenSshConfig(
+    input: {
+        configHost?: string
+        configPath?: string
+        host?: string
+        username?: string
+        port?: number
+        controlPath?: string
+        readyTimeout?: number
+    },
+    signal?: AbortSignal
+): Promise<{ host: string; username: string; port: number; controlPath: string }> {
     if (process.platform === 'win32') {
         throw new OpenSshError('The OpenSSH master backend requires a local POSIX platform', {
             code: 'unsupported_backend',
@@ -124,7 +170,7 @@ export async function resolveOpenSshConfig(input: {
         args.push('-S', path.resolve(expandTilde(input.controlPath)))
     }
     args.push('--', destination)
-    const result = await captureSsh(args, input.readyTimeout ?? 30_000, CONFIG_OUTPUT_LIMIT)
+    const result = await captureSsh(args, input.readyTimeout ?? 30_000, CONFIG_OUTPUT_LIMIT, signal)
     if (result.status !== 0) {
         invalidConfig(`OpenSSH configuration could not be resolved: ${result.stderr.trim()}`)
     }
@@ -154,11 +200,12 @@ export async function resolveOpenSshConfig(input: {
 class OpenSshChannel extends PassThrough implements CommandChannel {
     readonly stderr = new PassThrough()
     readonly ready: Promise<void>
+    readonly stdin?: import('stream').Writable
     private readonly child: ChildProcess
     private resolveReady!: () => void
     private rejectReady!: (error: Error) => void
 
-    constructor(args: string[], command: string, track: (child: ChildProcess) => void) {
+    constructor(args: string[], command: string, track: (child: ChildProcess) => void, withInput: boolean) {
         super({ emitClose: false })
         this.ready = new Promise((resolve, reject) => {
             this.resolveReady = resolve
@@ -170,9 +217,13 @@ class OpenSshChannel extends PassThrough implements CommandChannel {
         const prefix = Buffer.from(`\x1eMCPSSH:${token}:`)
         const script =
             `printf ${escapeShellArg(`\x1eMCPSSH:${token}:START\x1f`)} >&2; ` +
-            `sh -c ${escapeShellArg(command)}; status=$?; ` +
+            `( eval ${escapeShellArg(command)} ); status=$?; ` +
             `printf ${escapeShellArg(`\x1eMCPSSH:${token}:END:%s\x1f`)} "$status" >&2; exit "$status"`
-        this.child = spawn('ssh', [...args, script], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+        this.child = spawn('ssh', [...args, script], {
+            stdio: [withInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+        })
+        this.stdin = this.child.stdin ?? undefined
         track(this.child)
         let pending = Buffer.alloc(0)
         let remoteExitCode: number | undefined
@@ -312,7 +363,7 @@ export class OpenSshConnection {
             CONTROL_OUTPUT_LIMIT,
             signal
         )
-        const pid = Number(/Master running \(pid=(?<pid>\d+)\)/.exec(checked.stderr)?.[1])
+        const pid = Number(/Master running \(pid=(?<pid>\d+)\)/.exec(checked.stderr)?.groups?.pid)
         if (checked.status !== 0 || !Number.isSafeInteger(pid) || pid <= 0) {
             throw new OpenSshError(`OpenSSH master is unavailable: ${checked.stderr.trim()}`, {
                 code: 'master_unavailable',
@@ -325,6 +376,7 @@ export class OpenSshConnection {
         signal?.addEventListener('abort', abort, { once: true })
         try {
             if (signal?.aborted) {
+                // noinspection ExceptionCaughtLocallyJS -- 准备失败时仅清理本次绑定的 alias channel
                 throw signal.reason
             }
             const marker = randomBytes(32).toString('hex')
@@ -339,6 +391,7 @@ export class OpenSshConnection {
             const start = observed.stdout.lastIndexOf(`${marker}\n`)
             const lines = observed.stdout.slice(start + marker.length + 1).split('\n')
             if (observed.status !== 0 || start < 0 || !/^\d+$/.test(lines[0]) || !lines[1]) {
+                // noinspection ExceptionCaughtLocallyJS -- 准备失败时仅清理本次绑定的 alias channel
                 throw new OpenSshError('The existing OpenSSH master did not provide its login identity', {
                     code: 'master_identity_unavailable',
                     backend: 'openssh',
@@ -346,6 +399,7 @@ export class OpenSshConnection {
                 })
             }
             if (lines[1] !== config.username) {
+                // noinspection ExceptionCaughtLocallyJS -- 准备失败时仅清理本次绑定的 alias channel
                 throw new OpenSshError('The existing master login does not match the requested user', {
                     code: 'master_identity_mismatch',
                     backend: 'openssh',
@@ -451,11 +505,12 @@ export class OpenSshConnection {
         }
     }
 
-    open(command: string): CommandChannel & { ready: Promise<void> } {
-        return new OpenSshChannel(this.arguments(), command, this.trackProcess)
+    open(command: string, withInput: boolean = false): CommandChannel & { ready: Promise<void> } {
+        return new OpenSshChannel(this.arguments(), command, this.trackProcess, withInput)
     }
 
-    consume(command: string, consume: (chunk: Buffer) => void, timeout: number): Promise<void> {
+    consume(command: string, consume: (chunk: Buffer) => void, timeout: number, signal?: AbortSignal): Promise<void> {
+        signal?.throwIfAborted()
         const stream = this.open(command)
         return new Promise((resolve, reject) => {
             let settled = false
@@ -466,6 +521,7 @@ export class OpenSshConnection {
                 }
                 settled = true
                 clearTimeout(timer)
+                signal?.removeEventListener('abort', onAbort)
                 if (error) {
                     stream.destroy()
                     reject(error)
@@ -473,6 +529,8 @@ export class OpenSshConnection {
                     resolve()
                 }
             }
+            const onAbort = (): void =>
+                finish(signal?.reason instanceof Error ? signal.reason : new Error('OpenSSH request cancelled'))
             const timer = setTimeout(
                 () =>
                     finish(
@@ -486,6 +544,10 @@ export class OpenSshConnection {
                     ),
                 timeout
             )
+            signal?.addEventListener('abort', onAbort, { once: true })
+            if (signal?.aborted) {
+                onAbort()
+            }
             stream.on('data', (chunk: Buffer) => {
                 if (settled) {
                     return
@@ -519,7 +581,7 @@ export class OpenSshConnection {
         })
     }
 
-    async capture(command: string, timeout: number, maxBytes: number): Promise<Buffer> {
+    async capture(command: string, timeout: number, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
         const chunks: Buffer[] = []
         let size = 0
         await this.consume(
@@ -536,17 +598,19 @@ export class OpenSshConnection {
                 }
                 chunks.push(chunk)
             },
-            timeout
+            timeout,
+            signal
         )
         return Buffer.concat(chunks)
     }
 
-    async stat(remotePath: string, timeout: number, follow: boolean = true) {
+    async stat(remotePath: string, timeout: number, follow: boolean = true, signal?: AbortSignal) {
         const format = '%f\\0%s\\0%u\\0%g\\0%Y\\0%X\\0%d:%i:%s:%y:%z\\0'
         const bytes = await this.capture(
             `LC_ALL=C stat ${follow ? '-L ' : ''}--printf=${escapeShellArg(format)} -- ${escapeShellArg(remotePath)}`,
             timeout,
-            4096
+            4096,
+            signal
         )
         const fields = bytes.toString('utf8').split('\0')
         const values = [Number.parseInt(fields[0], 16), ...fields.slice(1, 6).map(Number)]

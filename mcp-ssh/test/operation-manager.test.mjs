@@ -4,7 +4,11 @@ import test from 'node:test'
 import { OperationManager } from '../dist/operation-manager.js'
 
 function createChannel() {
-    const stream = new PassThrough()
+    const stream = /** @type {PassThrough & {
+        stderr: PassThrough,
+        marker?: string,
+        emit(event: string, ...args: unknown[]): boolean,
+    }} */ (new PassThrough())
     stream.stderr = new PassThrough()
     return stream
 }

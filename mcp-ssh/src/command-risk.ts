@@ -128,7 +128,7 @@ function withoutQuotedText(command: string, shell: CommandShell): string {
                     const bodyStart = index
                     let bodyEnd = limit
                     let afterDelimiter = limit
-                    // Delimiters are case-sensitive; input quotes never change shell quote state.
+                    // Delimiters are case-sensitive; quoted input leaves the command parser quote state unchanged.
                     for (let lineStart = index; lineStart < limit;) {
                         let lineEnd = lineStart
                         let line = ''

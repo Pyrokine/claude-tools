@@ -11,6 +11,8 @@ import { format, promisify } from 'node:util'
 import ssh2 from 'ssh2'
 import { SessionManager } from '../dist/session-manager.js'
 
+/** @type {(command: string, options?: import('node:child_process').ExecOptions) =>
+ * Promise<{stdout: string, stderr: string}>} */
 const exec = promisify(execCallback)
 const execFile = promisify(execFileCallback)
 
@@ -101,7 +103,10 @@ test('MH-SSH-03 real ssh2 channel closure retains unknown or known exit metadata
                         const session = accept()
                         session.on('exec', (accept) => {
                             const stream = accept()
-                            const record = manager.operationManager.operations.values().next().value
+                            const records = /** @type {Map<string, {marker: string}>} */ (
+                                Reflect.get(manager.operationManager, 'operations')
+                            )
+                            const record = records.values().next().value
                             stream.stderr.write(`__MCP_SSH_OPERATION__:${record.marker}:4321:0\n`)
                             if (code !== undefined) {
                                 stream.exit(code)
@@ -115,7 +120,7 @@ test('MH-SSH-03 real ssh2 channel closure retains unknown or known exit metadata
                 server.once('error', reject)
                 server.listen(0, '127.0.0.1', () => resolve())
             })
-            const client = new ssh2.Client()
+            const client = /** @type {ssh2.Client & {_sock: PassThrough}} */ (new ssh2.Client())
             t.after(async () => {
                 client.end()
                 for (const peer of peers) {
@@ -124,7 +129,7 @@ test('MH-SSH-03 real ssh2 channel closure retains unknown or known exit metadata
                 await new Promise((resolve) => server.close(resolve))
             })
             await new Promise((resolve, reject) => {
-                client.once('ready', resolve)
+                client.once('ready', () => resolve())
                 client.once('error', reject)
                 client.connect({
                     host: '127.0.0.1',
@@ -137,7 +142,10 @@ test('MH-SSH-03 real ssh2 channel closure retains unknown or known exit metadata
             })
             manager.sessions.set('fixture', createSession(client))
             const started = await manager.operationManager.start('fixture', 'fixture')
-            const record = manager.operationManager.operations.get(started.operationId)
+            const records = /** @type {Map<string, {finishedAt: number | null, stream: PassThrough}>} */ (
+                Reflect.get(manager.operationManager, 'operations')
+            )
+            const record = records.get(started.operationId)
             if (record.finishedAt === null) {
                 await new Promise((resolve) => record.stream.once('close', resolve))
             }
@@ -357,7 +365,7 @@ test('connect rejects conflicting configurations that reuse the same alias', asy
 
 test('I065 session listings use the ssh2 transport state before delayed close events', (t) => {
     const { manager } = createManager(t)
-    const client = new ssh2.Client()
+    const client = /** @type {ssh2.Client & {_sock: PassThrough}} */ (new ssh2.Client())
     manager.sessions.set('owned-stale', createSession(client))
     assert.throws(() => client.exec('true', () => {}), /Not connected/)
     assert.equal(manager.listSessions()[0].connected, false)

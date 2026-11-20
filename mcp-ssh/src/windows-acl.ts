@@ -29,8 +29,8 @@ export function windowsAclScript(filePath: string, apply: boolean): string {
                   '}\n' +
                   'foreach ($sid in @($identity, $system, $administrators)) {\n' +
                   '    $rule = [System.Security.AccessControl.FileSystemAccessRule]::ne' +
-                  'w($sid, [System.Security.AccessControl.FileSystemRights]::FullContro' +
-                  'l, [System.Security.AccessControl.AccessControlType]::Allow)\n' +
+                  'w($sid, [System.Security.AccessControl.FileSystemRights]::' +
+                  'FullControl, [System.Security.AccessControl.AccessControlType]::Allow)\n' +
                   '    $acl.AddAccessRule($rule)\n' +
                   '}\n' +
                   'Set-Acl -LiteralPath $path -AclObject $acl\n' +
@@ -99,10 +99,10 @@ export function windowsTemporaryPathScript(name: string): string {
         '    }\n' +
         '    $rights = [System.Security.AccessControl.FileSystemRights]::Delete ' +
         '-bor\n' +
-        '        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirec' +
-        'toriesAndFiles -bor\n' +
-        '        [System.Security.AccessControl.FileSystemRights]::ChangePermissi' +
-        'ons -bor\n' +
+        '        [System.Security.AccessControl.FileSystemRights]::' +
+        'DeleteSubdirectoriesAndFiles -bor\n' +
+        '        [System.Security.AccessControl.FileSystemRights]::' +
+        'ChangePermissions -bor\n' +
         '        [System.Security.AccessControl.FileSystemRights]::TakeOwnership\n' +
         '    if ($current.FullName -eq $directory.FullName) {\n' +
         '        $rights = $rights -bor ' +

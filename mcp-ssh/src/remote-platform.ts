@@ -132,8 +132,8 @@ export function windowsCaseSemanticsScript(parent: string, names?: string[]): st
         `${
             names === undefined
                 ? '[string[]](ConvertFrom-Json ' +
-                  '([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Consol' +
-                  'e]::In.ReadToEnd()))))'
+                  '([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(' +
+                  '[Console]::In.ReadToEnd()))))'
                 : `[string[]]@(${names.map(quotePowershell).join(', ')})`
         }` +
         '\n' +

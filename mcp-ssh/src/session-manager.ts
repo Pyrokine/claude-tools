@@ -85,6 +85,7 @@ interface PendingConnection {
 }
 
 interface InFlightConnection {
+    fields?: Record<string, string | undefined>
     identity: string
     fingerprint: string
     promise: Promise<string>
@@ -159,7 +160,9 @@ export class SessionManager {
     /** per-alias connect 进行中的 Promise,防止并发 connect 同一 alias 时重复建连 */
     private connectInFlight: Map<string, InFlightConnection> = new Map()
     private pendingConnections: Map<string, PendingConnection> = new Map()
+    private preparingConnections = new Map<string, Set<AbortController>>()
     private connectionGenerations: Map<string, number> = new Map()
+    private cancellationSequence = 0
     private readonly knownHosts = new KnownHosts()
     private readonly ptyManager = new PtyManager()
     private readonly forwardManager = new ForwardManager()
@@ -187,7 +190,8 @@ export class SessionManager {
     /**
      * 建立 SSH 连接（per-alias mutex，防止并发 connect 同一 alias 重复建连）
      */
-    async connect(config: SSHConnectionConfig): Promise<string> {
+    async connect(config: SSHConnectionConfig, preparationGeneration?: number, signal?: AbortSignal): Promise<string> {
+        signal?.throwIfAborted()
         const platform = config.remotePlatform ?? 'posix'
         const shell = config.commandShell ?? (platform === 'windows' ? 'powershell' : 'posix')
         if ((platform === 'windows') !== (shell !== 'posix')) {
@@ -203,8 +207,12 @@ export class SessionManager {
             })
         }
         const alias = this.generateAlias(config)
+        if (preparationGeneration !== undefined && preparationGeneration < this.getConnectionGeneration(alias)) {
+            throw new Error(`Connection for alias '${alias}' was cancelled after configuration preparation`)
+        }
 
-        const fingerprint = this.connectionFingerprint(config)
+        const fields: Record<string, string | undefined> = {}
+        const fingerprint = this.connectionFingerprint(config, fields)
         const requestedIdentity = this.configIdentity(config)
         const inFlight = this.connectInFlight.get(alias)
         if (inFlight) {
@@ -212,6 +220,7 @@ export class SessionManager {
                 throw new CommandError(`Alias '${alias}' already has a different connection attempt in progress`, {
                     alias,
                     existingIdentity: inFlight.identity,
+                    differingFields: Object.keys(fields).filter((key) => fields[key] !== inFlight.fields?.[key]),
                     requestedIdentity,
                     suggestion: '请等待当前连接完成、换一个 alias，或先 ssh_disconnect 取消当前连接',
                 })
@@ -245,8 +254,15 @@ export class SessionManager {
             },
         }
         this.pendingConnections.set(alias, pendingConnection)
+        const onAbort = (): void => {
+            if (this.pendingConnections.get(alias) === pendingConnection) {
+                this.cancelPendingConnection(alias)
+            }
+        }
+        signal?.addEventListener('abort', onAbort, { once: true })
         const connectAttempt = Promise.race([this.connectInternal(config, alias, pendingConnection), cancellation])
         const promise = connectAttempt.finally(() => {
+            signal?.removeEventListener('abort', onAbort)
             if (this.connectInFlight.get(alias)?.promise === promise) {
                 this.connectInFlight.delete(alias)
             }
@@ -254,8 +270,32 @@ export class SessionManager {
                 this.pendingConnections.delete(alias)
             }
         })
-        this.connectInFlight.set(alias, { identity: requestedIdentity, fingerprint, promise })
+        this.connectInFlight.set(alias, { identity: requestedIdentity, fingerprint, fields, promise })
         return promise
+    }
+
+    async prepareConnection<T>(
+        alias: string | undefined,
+        prepare: (signal: AbortSignal) => Promise<T>
+    ): Promise<{ result: T; generation?: number }> {
+        const generation = this.cancellationSequence
+        const controller = new AbortController()
+        const attempts =
+            alias === undefined ? undefined : (this.preparingConnections.get(alias) ?? new Set<AbortController>())
+        if (alias !== undefined) {
+            attempts!.add(controller)
+            this.preparingConnections.set(alias, attempts!)
+        }
+        try {
+            const result = await prepare(controller.signal)
+            controller.signal.throwIfAborted()
+            return { result, generation }
+        } finally {
+            attempts?.delete(controller)
+            if (alias !== undefined && attempts?.size === 0 && this.preparingConnections.get(alias) === attempts) {
+                this.preparingConnections.delete(alias)
+            }
+        }
     }
 
     /**
@@ -321,7 +361,11 @@ export class SessionManager {
 
     /** 断开所有活跃会话（SIGINT/SIGTERM 时调用） */
     async disconnectAll(): Promise<void> {
-        const aliases = new Set([...this.sessions.keys(), ...this.pendingConnections.keys()])
+        const aliases = new Set([
+            ...this.sessions.keys(),
+            ...this.pendingConnections.keys(),
+            ...this.preparingConnections.keys(),
+        ])
         for (const alias of aliases) {
             this.disconnect(alias)
         }
@@ -624,6 +668,7 @@ export class SessionManager {
         sudoPassword?: string,
         options: ExecOptions = {}
     ): Promise<ExecResult> {
+        options.signal?.throwIfAborted()
         this.requirePosixPrivilege(alias)
         if (!sudoPassword) {
             return this.exec(alias, `sudo ${command}`, options)
@@ -711,11 +756,34 @@ export class SessionManager {
                 stderrTruncated,
                 maxOutputSize,
             })
+            const clearTimer = (): void => {
+                clearTimeout(timeoutId)
+                options.signal?.removeEventListener('abort', onAbort)
+            }
+            const onAbort = (): void => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                endDecoders()
+                clearTimer()
+                this.closeClientChannel(streamRef ?? undefined)
+                reject(
+                    new CommandError('SSH command request was cancelled; remote process state is unknown', {
+                        failureKind: 'ssh_transport',
+                        operationStatus: 'unknown',
+                        retryable: false,
+                        ...this.outputMetadata(outputPreview()),
+                        ...this.resultMetadata(session, options, context),
+                    })
+                )
+            }
             const timeoutId = setTimeout(() => {
                 if (settled) {
                     return
                 }
                 settled = true
+                clearTimer()
                 endDecoders()
                 try {
                     streamRef?.close()
@@ -725,9 +793,14 @@ export class SessionManager {
                 reject(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
             }, timeout)
 
+            options.signal?.addEventListener('abort', onAbort, { once: true })
+            if (options.signal?.aborted) {
+                onAbort()
+                return
+            }
             session.client.exec(fullCommand, {}, (err, stream) => {
                 if (!this.isCurrentSession(alias, session)) {
-                    clearTimeout(timeoutId)
+                    clearTimer()
                     this.closeClientChannel(stream)
                     if (!settled) {
                         settled = true
@@ -737,7 +810,7 @@ export class SessionManager {
                     return
                 }
                 if (err) {
-                    clearTimeout(timeoutId)
+                    clearTimer()
                     if (!settled) {
                         settled = true
                         endDecoders()
@@ -756,7 +829,7 @@ export class SessionManager {
                         return
                     }
                     settled = true
-                    clearTimeout(timeoutId)
+                    clearTimer()
                     endDecoders()
                     reject(
                         new CommandError(error.message, {
@@ -776,7 +849,7 @@ export class SessionManager {
                 stream.end()
 
                 stream.on('close', (code?: number | null, signal?: string) => {
-                    clearTimeout(timeoutId)
+                    clearTimer()
                     if (settled) {
                         return
                     }
@@ -974,7 +1047,7 @@ export class SessionManager {
         return `${config.username}@${config.host}:${config.port ?? 22}`
     }
 
-    private connectionFingerprint(config: SSHConnectionConfig): string {
+    private connectionFingerprint(config: SSHConnectionConfig, fields?: Record<string, string | undefined>): string {
         const secretHash = (value: string | undefined): string | undefined =>
             value === undefined ? undefined : createHash('sha256').update(value).digest('hex')
         const sortedEntries = (values: Record<string, string> | undefined): [string, string][] | undefined =>
@@ -1009,9 +1082,13 @@ export class SessionManager {
             passphrase: secretHash(value.passphrase),
             jumpHost: value.jumpHost ? payload(value.jumpHost) : undefined,
         })
-        return createHash('sha256')
-            .update(JSON.stringify(payload(config)))
-            .digest('hex')
+        const normalized = payload(config)
+        if (fields) {
+            for (const [key, value] of Object.entries(normalized)) {
+                fields[key] = JSON.stringify(value)
+            }
+        }
+        return createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
     }
 
     private resultMetadata(
@@ -1136,7 +1213,8 @@ export class SessionManager {
         session: SSHSession,
         command: string,
         options: Ssh2ExecOptions,
-        callback: (error: Error | undefined, stream?: CommandChannel) => void
+        callback: (error: Error | undefined, stream?: CommandChannel) => void,
+        withInput: boolean = false
     ): void {
         if (session.backend === 'openssh') {
             if (options.pty) {
@@ -1151,12 +1229,14 @@ export class SessionManager {
                 return
             }
             try {
-                callback(undefined, session.transport.open(command))
+                callback(undefined, session.transport.open(command, withInput))
             } catch (error) {
                 callback(error instanceof Error ? error : new Error(String(error)))
             }
         } else {
-            session.client.exec(command, options, callback)
+            session.client.exec(command, options, (error, channel) => {
+                callback(error, channel ? Object.assign(channel, { stdin: channel }) : undefined)
+            })
         }
     }
 
@@ -1391,6 +1471,7 @@ export class SessionManager {
             })
 
             const clearTimer = () => {
+                options.signal?.removeEventListener('abort', onAbort)
                 if (timeoutId) {
                     clearTimeout(timeoutId)
                     timeoutId = null
@@ -1408,79 +1489,129 @@ export class SessionManager {
                 reject(error)
             }
 
+            const onAbort = (): void =>
+                rejectOnce(
+                    new CommandError('SSH command request was cancelled; remote process state is unknown', {
+                        failureKind: 'ssh_transport',
+                        operationStatus: 'unknown',
+                        retryable: false,
+                        ...this.outputMetadata(outputPreview()),
+                        ...this.resultMetadata(session, options, context),
+                    })
+                )
+            if (options.signal?.aborted) {
+                onAbort()
+                return
+            }
+            options.signal?.addEventListener('abort', onAbort, { once: true })
+
             timeoutId = setTimeout(() => {
                 endDecoders()
                 rejectOnce(this.createCommandTimeoutError(alias, timeout, context, outputPreview()))
             }, timeout)
 
-            this.openCommandChannel(session, fullCommand, execOptions, (err, stream) => {
-                if (!this.isCurrentSession(alias, session)) {
-                    this.closeClientChannel(stream)
-                    rejectOnce(new Error('Exec was cancelled because the SSH session changed'))
-                    return
-                }
-                if (err || !stream) {
-                    rejectOnce(err ?? new Error('Exec did not return a command channel'))
-                    return
-                }
-                if (settled) {
-                    this.closeClientChannel(stream)
-                    return
-                }
+            this.openCommandChannel(
+                session,
+                fullCommand,
+                execOptions,
+                (err, stream) => {
+                    if (!this.isCurrentSession(alias, session)) {
+                        this.closeClientChannel(stream)
+                        rejectOnce(new Error('Exec was cancelled because the SSH session changed'))
+                        return
+                    }
+                    if (err || !stream) {
+                        rejectOnce(err ?? new Error('Exec did not return a command channel'))
+                        return
+                    }
+                    if (settled) {
+                        this.closeClientChannel(stream)
+                        return
+                    }
 
-                activeStream = stream
-                stream.on('error', (error: Error) => {
-                    rejectOnce(
-                        new CommandError(error.message, {
-                            failureKind: 'ssh_transport',
-                            operationStatus: 'unknown',
-                            retryable: false,
+                    activeStream = stream
+                    stream.on('error', (error: Error) => {
+                        rejectOnce(
+                            new CommandError(
+                                options.stdin === undefined
+                                    ? error.message
+                                    : 'SSH command channel failed; remote process state is unknown',
+                                {
+                                    failureKind: 'ssh_transport',
+                                    operationStatus: 'unknown',
+                                    retryable: false,
+                                    stdout,
+                                    stderr,
+                                    ...this.outputMetadata(outputPreview()),
+                                    ...this.resultMetadata(session, options, context),
+                                }
+                            )
+                        )
+                    })
+
+                    stream.on('close', (code?: number | null, signal?: string) => {
+                        if (settled) {
+                            return
+                        }
+                        settled = true
+                        endDecoders()
+                        clearTimer()
+                        resolve({
+                            success: code === 0,
                             stdout,
                             stderr,
+                            exitCode: code ?? null,
+                            duration: Date.now() - startTime,
+                            ...this.commandExitMetadata(code, signal),
+                            stdoutTruncated: stdoutTruncated || undefined,
+                            stderrTruncated: stderrTruncated || undefined,
                             ...this.outputMetadata(outputPreview()),
+                            ...this.emptyOutputFailureMetadata(code, outputPreview()),
                             ...this.resultMetadata(session, options, context),
                         })
-                    )
-                })
-
-                stream.on('close', (code?: number | null, signal?: string) => {
-                    if (settled) {
-                        return
-                    }
-                    settled = true
-                    endDecoders()
-                    clearTimer()
-                    resolve({
-                        success: code === 0,
-                        stdout,
-                        stderr,
-                        exitCode: code ?? null,
-                        duration: Date.now() - startTime,
-                        ...this.commandExitMetadata(code, signal),
-                        stdoutTruncated: stdoutTruncated || undefined,
-                        stderrTruncated: stderrTruncated || undefined,
-                        ...this.outputMetadata(outputPreview()),
-                        ...this.emptyOutputFailureMetadata(code, outputPreview()),
-                        ...this.resultMetadata(session, options, context),
                     })
-                })
 
-                stream.on('data', (data: Buffer) => {
-                    if (settled) {
-                        return
-                    }
-                    stdoutBytes += data.length
-                    appendStdout(stdoutDecoder.write(data))
-                })
+                    stream.on('data', (data: Buffer) => {
+                        if (settled) {
+                            return
+                        }
+                        stdoutBytes += data.length
+                        appendStdout(stdoutDecoder.write(data))
+                    })
 
-                stream.stderr.on('data', (data: Buffer) => {
-                    if (settled) {
-                        return
+                    stream.stderr.on('data', (data: Buffer) => {
+                        if (settled) {
+                            return
+                        }
+                        stderrBytes += data.length
+                        appendStderr(stderrDecoder.write(data))
+                    })
+                    if (options.stdin !== undefined) {
+                        const inputFailure = (): void =>
+                            rejectOnce(
+                                new CommandError(
+                                    'SSH command input could not be delivered; remote process state is unknown',
+                                    { failureKind: 'ssh_transport', operationStatus: 'unknown', retryable: false }
+                                )
+                            )
+                        if (!stream.stdin) {
+                            inputFailure()
+                            return
+                        }
+                        stream.stdin.on('error', inputFailure)
+                        try {
+                            stream.stdin.end(options.stdin, 'utf8', (error?: Error | null) => {
+                                if (error) {
+                                    inputFailure()
+                                }
+                            })
+                        } catch {
+                            inputFailure()
+                        }
                     }
-                    stderrBytes += data.length
-                    appendStderr(stderrDecoder.write(data))
-                })
-            })
+                },
+                options.stdin !== undefined
+            )
         })
     }
 
@@ -1494,11 +1625,17 @@ export class SessionManager {
         if (existing && this.isAlive(existing)) {
             const existingIdentity = this.sessionIdentity(existing)
             const requestedIdentity = this.configIdentity(config)
-            if (this.connectionFingerprint(existing.config) !== pendingConnection.fingerprint) {
+            const existingFields: Record<string, string | undefined> = {}
+            const requestedFields: Record<string, string | undefined> = {}
+            this.connectionFingerprint(config, requestedFields)
+            if (this.connectionFingerprint(existing.config, existingFields) !== pendingConnection.fingerprint) {
                 throw new CommandError(`Alias '${alias}' is already connected with different session configuration`, {
                     alias,
                     existingIdentity,
                     requestedIdentity,
+                    differingFields: Object.keys(requestedFields).filter(
+                        (key) => requestedFields[key] !== existingFields[key]
+                    ),
                     suggestion: '请换一个 alias，或先 ssh_disconnect 断开已有同名会话',
                 })
             }
@@ -1555,9 +1692,9 @@ export class SessionManager {
             keepaliveInterval: config.keepaliveInterval ?? this.defaultKeepaliveInterval,
             keepaliveCountMax: config.keepaliveCountMax ?? this.defaultKeepaliveCountMax,
             debug: (message: string): void => {
-                const algorithm = /^Handshake: Host key format: ([\w@.-]+)$/.exec(message)
+                const algorithm = /^Handshake: Host key format: (?<algorithm>[\w@.-]+)$/.exec(message)
                 if (algorithm) {
-                    hostKeyAlgorithm = algorithm[1]
+                    hostKeyAlgorithm = algorithm.groups!.algorithm
                 }
             },
             hostVerifier: (key: Buffer, callback: (verified: boolean) => void): void => {
@@ -1618,6 +1755,7 @@ export class SessionManager {
                 if (process.platform === 'win32') {
                     const aclStatus = checkWindowsAcl(keyPath)
                     if (aclStatus !== 'key_path_usable') {
+                        // noinspection ExceptionCaughtLocallyJS -- 密钥校验错误通过连接阶段统一返回
                         throw new CommandError(`Private key ACL check failed: ${aclStatus}`, { code: aclStatus })
                     }
                 }
@@ -1636,9 +1774,11 @@ export class SessionManager {
                     : undefined)
             if (agent && agent !== 'none') {
                 if (agent === 'pageant' && process.platform !== 'win32') {
+                    // noinspection ExceptionCaughtLocallyJS -- agent 校验错误通过连接阶段统一返回
                     throw new Error('Pageant authentication is only available on Windows')
                 }
                 if (agent !== 'pageant' && !agent.startsWith('\\\\.\\pipe\\') && !fs.existsSync(agent)) {
+                    // noinspection ExceptionCaughtLocallyJS -- agent 校验错误通过连接阶段统一返回
                     throw new Error('SSH agent socket or pipe is unavailable')
                 }
                 connectConfig.agent = agent
@@ -1930,11 +2070,18 @@ export class SessionManager {
     }
 
     private cancelPendingConnection(alias: string): boolean {
-        this.connectionGenerations.set(alias, this.getConnectionGeneration(alias) + 1)
+        this.connectionGenerations.set(alias, ++this.cancellationSequence)
+        const preparations = this.preparingConnections.get(alias)
+        this.preparingConnections.delete(alias)
+        for (const controller of preparations ?? []) {
+            controller.abort(
+                new Error(`Connection for alias '${alias}' was cancelled during configuration preparation`)
+            )
+        }
         const pending = this.pendingConnections.get(alias)
         const inFlight = this.connectInFlight.delete(alias)
         if (!pending) {
-            return inFlight
+            return inFlight || (preparations?.size ?? 0) > 0
         }
         this.pendingConnections.delete(alias)
         pending.cancel(new Error(`Connection for alias '${alias}' was cancelled`))

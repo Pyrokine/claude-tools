@@ -401,7 +401,7 @@ channel 关闭且没有收到退出状态时，返回 `exitCode=null`、`failure
 ### 基础：连接和执行
 
 ```
-ssh_connect(host="<server-host>", user="root", keyPath="/home/.ssh/id_rsa", alias="myserver")
+ssh_connect(host="<server-host>", user="root", keyPath="~/.ssh/id_rsa", alias="myserver")
 ssh_exec(alias="myserver", command="ls -la /home")
 ssh_disconnect(alias="myserver")
 ```
@@ -438,6 +438,19 @@ ssh_exec(alias="app-dev", command="whoami", useLoginUser=true)
 host、keepalive 和 timeout；pending 或 active 连接的配置冲突时会被拒绝，即使 `user@host:port`
 identity 相同，template 缺失时返回可用模板名，`configHost` 缺失时返回 SSH config 候选并提示调用 `ssh_config_list`
 
+配置冲突通过 `details.differingFields` 返回不同的配置字段名，字段值和凭证保持私有
+OpenSSH 配置准备按请求 alias、`configHost` 或初始连接地址登记，disconnect 会终止本次自有 `ssh -G` 进程
+准备结束与连接登记之间发生的取消同样生效，`ssh -G` 改变主机名、用户或端口后，后续请求仍可重新连接解析后的 alias
+
+`ssh_exec(..., stdin="text")` 经 ssh2 或复用的 OpenSSH 通道写入 UTF-8 内容并发送 EOF，空字符串只发送 EOF，省略时保持原输入行为，输入不写入命令字符串或输入发送错误，
+请求取消会关闭本次通道并返回远端状态 `unknown`，alias 与 master 继续可用，命令主动输出输入内容时按实际命令输出返回
+
+宿主取消请求后，批量命令与排队中的并行任务停止派发，`stopOnError=false` 同样生效
+脚本停止后续上传、权限准备和解释器执行，迟到的 sudo 通道不再接收密码
+脚本清理使用独立期限，最长 30000 ms，仅删除本次创建的临时文件
+`keepScript=true` 在开始执行后保留脚本，上传或准备失败时仍执行清理
+取消仅关闭本次通道，其他请求及复用的 OpenSSH master 继续可用
+
 ### 跳板机
 
 通过跳板机连接内网服务器：
@@ -446,12 +459,12 @@ identity 相同，template 缺失时返回可用模板名，`configHost` 缺失�
 ssh_connect(
   host="<internal-host>",
   user="root",
-  keyPath="/home/.ssh/id_rsa",
+  keyPath="~/.ssh/id_rsa",
   alias="internal",
   jumpHost={
     host: "bastion.example.com",
     user: "admin",
-    keyPath: "/home/.ssh/bastion_key"
+    keyPath: "~/.ssh/bastion_key"
   }
 )
 ```
@@ -461,7 +474,7 @@ ssh_connect(
 适用于 SSH 以 root 登录，但需要以其他用户执行命令的场景：
 
 ```
-1. ssh_connect(host="<server-host>", user="root", keyPath="/home/.ssh/id_rsa", alias="server")
+1. ssh_connect(host="<server-host>", user="root", keyPath="~/.ssh/id_rsa", alias="server")
 2. ssh_exec_as_user(alias="server", command="whoami", targetUser="appuser")
    // 输出: appuser
 ```
@@ -554,8 +567,9 @@ ssh_exec_script(alias="server", script=<script-above>, timeout=30000)
 ssh_read_file(alias="server", remotePath="/tmp/mcp-log-errors.txt", maxBytes=65536)
 ```
 
-日志查询由通用命令和文件工具组合完成，不再提供独立的日志专用 MCP 工具；`ssh_exec_script.timeout`
-同时用于临时脚本上传、权限准备和执行阶段；SFTP 上传停滞时按请求的 timeout 结束，不再使用默认 SFTP 预算
+日志查询由通用命令和文件工具组合完成；`ssh_exec_script.timeout` 分别限制临时脚本上传、权限准备和执行阶段，每阶段独立计时，显式值为正整数，最大 3600000 ms；清理阶段独立计时，使用请求值与 30000 ms 中的较小值，省略参数时为 30000 ms
+
+未传显式超时时，命令保持 30000 ms 默认值，SFTP 保持 600000 ms 默认值，宿主请求期限独立生效；长时间观察使用 `ssh_operation_start/status/read/cancel`，同步 exec 被宿主中止时远端进程停止状态仍为未知
 
 ### 设置环境变量
 
@@ -563,7 +577,7 @@ ssh_read_file(alias="server", remotePath="/tmp/mcp-log-errors.txt", maxBytes=655
 ssh_connect(
   host="<server-host>",
   user="root",
-  keyPath="/home/.ssh/id_rsa",
+  keyPath="~/.ssh/id_rsa",
   env={"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
 )
 ```
@@ -577,7 +591,7 @@ ssh_connect(
 ssh_quick_exec(
   host="<server-host>",
   user="root",
-  keyPath="/home/.ssh/id_rsa",
+  keyPath="~/.ssh/id_rsa",
   command="uptime"
 )
 ```
@@ -638,7 +652,8 @@ user、cwd 和可用的后续读取建议，`ssh_read_file` 默认读取 1 MiB�
 `next_offset`；行范围读取不执行远端 shell 工具
 
 `ssh_upload`、`ssh_download`、`ssh_read_file`、`ssh_write_file`、`ssh_list_dir`、`ssh_file_info` 和 `ssh_mkdir`
-支持单个 SFTP 操作的 `timeout`，默认 10 分钟，最大 1 小时，超时保留本地与远端探测诊断
+支持 `timeout`，默认 10 分钟，最大 1 小时，下载与失败诊断共用一次总期限
+取消或超期后停止远端探测，保留原错误与本地详情，其他文件工具仍按单个 SFTP 操作计时
 上传和写入已派发 OPEN、WRITE 或 CLOSE 且丢失完成应答时，返回 `operationStatus="unknown"`；服务端明确拒绝返回 `failed`
 上传前只读探测失败也返回 `failed`，`failureStage="preflight"`，已确认写入字节为 0
 `failureStage`、受影响路径与 `acknowledgedBytes` 保留已确认进度，`retryable=false` 表示写入不会自动重放，重写前检查路径状态
@@ -751,7 +766,8 @@ ssh_sync(..., delete=true, verify={deletions: true})
 会被明确拒绝，相对排除模式按源目录下的相对路径匹配，不含 `/` 的模式匹配每一级 basename
 尾部 `/` 将模式限定为目录，`provider/` 排除每一级同名目录及其内容，保留名为 `provider` 的普通文件
 
-单文件上传要求远端父目录存在，已知父目录缺失或父路径为文件时，在上传前返回 `failureStage="remote_prepare"` 和 `REMOTE_PARENT_NOT_FOUND` 或 `REMOTE_PARENT_NOT_DIRECTORY`
+单文件上传要求远端父目录存在，已知父目录缺失或父路径为文件时，在上传前返回 `failureStage="remote_prepare"` 和 `REMOTE_PARENT_NOT_FOUND` 或
+`REMOTE_PARENT_NOT_DIRECTORY`
 缺失目录使用 `ssh_mkdir` 创建，目录同步仍按递归创建规则执行
 下载自动创建缺失的本地父目录，rsync 的本地准备失败在传输进程启动前返回 `failureStage="local_prepare"`
 
@@ -796,6 +812,20 @@ session 不经过这项凭证选择，也不回退到 SFTP，`preflightTimeout`�
 本地与远端目录遍历、内容哈希、删除基线及传输后的 ACL 校验共用这条绝对期限
 校验超期会关闭本次持有的哈希流并停止后续检查，保留已完成的文件数、字节数与 `transferSuccess`，整体返回 `success=false`
 并明确报告校验超期
+
+`bandwidthLimitKiBps` 为可选总传输限速，单位 KiB/s（1 KiB = 1024 bytes），适用于双向 rsync 和 SFTP，省略时保持原不限速行为，SFTP 并发文件和递归子目录共用本次限速，
+元数据和显式校验读取单独消耗资源，例如 `ssh_sync(..., bandwidthLimitKiBps=1024)` 请求 1 MiB/s
+
+取消运行中的 rsync 请求时，工具终止并等待本次自有本地进程组，保留已报告的文件明细、删除计数和 `lastProgress`，返回 `cancelled=true`、`operationStatus="unknown"`，
+已派发的远端写入和删除需要检查实际状态，alias、其他请求和复用的 OpenSSH master 保持可用
+
+目录 `checks` 使用 `null` 表示未请求，`true` 表示已执行且匹配，`false` 表示不匹配，顶层 `verificationStatus` 区分未请求、跳过、匹配、不匹配和错误，
+显式单文件 SHA-256 校验只完整读取每端一次，并将摘要共享给 `transportVerification`，保留字节预算及元数据稳定性检查
+
+`ssh_mkdir` 使用 SFTP 登录身份，命令 `runAs` 单独生效，响应包含 `loginUser`、`runAs`、`creationIdentity="sftp_login"` 和实际数值 `owner`、
+`group`、`mode` 及 `permissions`，后续目录访问由返回的权限决定，工具保持既有属主和权限策略
+创建已确认后，后续元信息读取失败时返回 `success=true`、`operationStatus="completed"`、`retryable=false` 和 `metadataStatus="unavailable"`，
+`metadataError` 按既有错误格式保留元信息读取错误及超时详情，未取得的 `owner`、`group`、`mode` 和 `permissions` 省略，使用 `ssh_file_info` 重新读取元信息，目录创建自身失败时保留原错误响应
 
 目录根摘要按路径的 UTF-8 字节排序，不依赖枚举顺序或 locale，大小写不同与 NFC/NFD 不同的名称保持独立，不归一化文件名
 

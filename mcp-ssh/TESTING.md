@@ -9,6 +9,8 @@
 - 本地有可用的 SSH 配置（建议 ~/.ssh/config 至少含一个 Host，或一个支持 password/keyPath 的目标主机）
 - 测试账号需要可执行 ls/whoami/echo 等基本命令
 - 有可写测试目录（远端 /tmp，本地 /tmp/mcp-ssh-test/）
+- 使用系统 OpenSSH／rsync 的用例，将整个 MCP 进程置于自有隔离容器，或为每次系统 `ssh` 调用显式指定私有 `-F` 配置、`UserKnownHostsFile` 和 `GlobalKnownHostsFile`，所有配置与信任记录指向本次自有目录
+- POSIX OpenSSH 按登录账户的 passwd home 解析默认用户配置与 `~` 路径，测试同时隔离这些路径，私有 HOME／USERPROFILE 继续用于 MCP 自身状态
 
 **记号约定**：
 
@@ -21,7 +23,7 @@
 ## 本地隔离回归
 
 `test/run-tests.mjs`
-为测试进程创建私有 HOME/USERPROFILE，清除继承的 agent、模板和路径策略变量夹具中的 config、密钥、信任记录与持久化文件均使用合成数据，连接替身先调用实际
+为测试进程创建私有 HOME/USERPROFILE，清除继承的 agent、模板和路径策略变量；测试中的 config、密钥、信任记录与持久化文件均使用合成数据，连接替身先调用实际
 hostVerifier，再发送 ready
 真实 SFTP 测试通过 `npm test` 或 `node test/run-tests.mjs` 执行，保留实际持久化
 runner 在导入 singleton 前设置私有 HOME/USERPROFILE 与 `SSH_MCP_TEST_HOME`，连接前核对 marker 和实际 persistPath
@@ -46,7 +48,8 @@ OpenSSH 夹具只建立本次测试自己的 loopback sshd 和 master，退出�
 
 自动入口：`test/host-key.test.mjs`，名称包含 `G073`
 
-验收：使用合成 Ed25519 和 RSA pin 与真实 loopback ssh2 握手，换 key 在 authentication 前拒绝，`details.hostKey.algorithm` 为实际协商结果，RSA SHA2 算法与 `ssh-rsa` key type 分别保留
+验收：使用合成 Ed25519 和 RSA pin 与真实 loopback ssh2 握手，换 key 在 authentication 前拒绝，`details.hostKey.algorithm` 为实际协商结果，
+RSA SHA2 算法与 `ssh-rsa` key type 分别保留
 当前与已存 SHA-256 指纹准确，用户文件和第二信任文件中的冲突行号均返回，原字节、权限与 inode 保持不变
 
 ### SSH-01 rekey
@@ -472,7 +475,8 @@ chunk，在普通 exec 和带密码的 sudo 分支分别执行；最后一个 ch
 
 自动入口：`test/ssh-regressions.test.mjs`，名称包含 `G091`
 
-验收：公开 `ssh_exec` 和 `ssh_exec_batch` 省略 timeout 时按实际默认 30000 ms 分类；显式 300000 ms 为有界，600000 ms 下无界 find 与递归 grep 返回 `unbounded_search`
+验收：公开 `ssh_exec` 和 `ssh_exec_batch` 省略 timeout 时按实际默认 30000 ms 分类；显式 300000 ms 为有界，600000 ms 下无界 find 与递归 grep 返回
+`unbounded_search`
 数字 `-maxdepth` 限定的 find 不报告无界；同请求中另一个无界搜索、破坏性命令和 `tail -f` 继续分别返回风险，执行次数与结果保持
 
 ### exec-command-risk-heredoc-01
@@ -662,7 +666,7 @@ offset 返回明确 UTF-8 boundary 错误
 
 **步骤**：
 
-1. `ssh_pty_start(alias=..., command="top -b -n 1")` → ptyId
+1. `ssh_pty_start(alias=..., command='top -b -n 1 -p "$$"')` → ptyId，仅观察本次测试 shell 的 PID
 2. 1s 后 `ssh_pty_read(ptyId=..., mode="screen")`
 3. close
 
@@ -956,6 +960,16 @@ Host 加载身份单独核验
 
 **预期**：含 sub 子目录
 
+### mkdir-02-metadata-outcome
+
+**前置条件**：已构建的源码、已安装的 MCP SDK 和 ssh2，进程启动前使用临时 HOME/TMP；SFTP 协议在内存通道中传递，SDK 使用 InMemoryTransport
+
+**步骤**：执行 `test/finding-regressions.test.mjs` 中的 `MKDIR-METADATA` 用例，经注册的 `ssh_mkdir` 执行非递归创建，使用真实 ssh2 SFTP 协议类确认 MKDIR 成功应答，再分别制造后续 SFTP 获取超时／拒绝、STAT 无应答超时和 STATUS permission denied；对照正常 STAT、主 MKDIR permission denied，以及目录已创建但主 MKDIR 成功应答未返回的超时
+
+**预期**：已确认创建时保持 `success=true`、`operationStatus="completed"`、`retryable=false`，元信息故障使用 `metadataStatus="unavailable"` 和独立 `metadataError`，后者保留原错误或超时详情；缺失的属主、组和权限字段省略，目录仍存在，单次调用仅派发一次 MKDIR，迟到的元信息 SFTP 资源关闭且不派发 STAT；正常响应字段保持，主创建失败／未知继续返回原错误并停止元信息请求，所有自有 SFTP wrapper 关闭
+
+**验证范围**：实际 SDK 注册及调用、ssh2 SFTP 编解码和本地临时目录；真实 SSH 传输、远端 sshd 和现场账号权限使用独立环境验收
+
 ### upload-01
 
 **步骤**：本地 `echo "abc" > /tmp/mcp-up.txt`；
@@ -1099,7 +1113,8 @@ SFTP 上传、下载和本地／远端／OpenSSH manifest 使用相同的目录�
 
 自动入口：`test/ssh-regressions.test.mjs`，名称包含 `G086`
 
-验收：目录上传、download 或 dryRun 请求使用 `verifyOwner`／`verifyMode` 时，在任何传输和远端探测前返回 `UNSUPPORTED_SYNC_VERIFICATION`、`transferSuccess=false`
+验收：目录上传、download 或 dryRun 请求使用 `verifyOwner`／`verifyMode` 时，在任何传输和远端探测前返回 `UNSUPPORTED_SYNC_VERIFICATION`、
+`transferSuccess=false`
 单文件 upload 继续执行所请求校验，目录使用 `verify.owner`／`verify.mode`；源读取或路径策略错误保留原错误与结构化 details，零传输
 
 ### sync-follow-symlink-allowlist-01
@@ -1202,7 +1217,7 @@ mode 条目，生成本地与远端 manifest；再分别清除目标 manifest �
 3. `ssh_upload(localPath="/etc/passwd", remotePath="/tmp/x")` 应被拒绝
 4. `ssh_upload(localPath="/tmp/foo", remotePath="/tmp/x")` 应通过
 
-**预期**：白名单生效，未设环境变量时不限制；失败响应包含 local、remoteParent 诊断
+**预期**：白名单生效，未设环境变量时不限制；本地白名单拒绝时，`diagnostics.local.allowList` 包含 `configured=true` 和 `matched=false`，远端目标保持原状；进入远端预检后的上传失败返回 `local` 和 `remoteParent` 诊断
 
 ---
 
@@ -1391,6 +1406,60 @@ SSH 连接，sshd 的新认证计数为零；实际复用失败路径执行失�
 请求 password/key/agent/jumpHost、PTY、forward、独立 SFTP 工具、临时脚本上传或 Windows 组合；同步时移除本机/远端 rsync 或所需
 GNU 工具预期在相关副作用之前返回具体能力错误，
 不转用 ssh2/SFTP，不新建 master；脚本不创建临时远端文件，显式 configPath 保留路径和文件大小校验
+
+### SSH-R8 取消、Shell、摘要与反馈结果
+
+自动入口：`test/finding-regressions.test.mjs` 和 `test/openssh.test.mjs`
+
+验收：在 rsync 自有真实子进程输出部分文件、删除及进度后取消，请求等待进程退出，保留统计并返回 unknown，原进程与其他 alias/master 可用；OpenSSH 普通 exec 执行 Bash 数组、
+`[[ ... ]]`、pipefail 和 exit 7，保留登录 shell 语义及 START/END 退出状态；双向 SFTP 单文件显式摘要每端只读取一次，
+公开结果与 transportVerification 摘要一致；仅请求 count 时其他 checks 为 null，整体匹配结果仍正确
+
+F336：设置连接 runAs 后通过公开 mkdir handler 创建自有目录，返回 SFTP login 身份与实际 stat 的 uid/gid/mode，保持原权限策略
+
+F398：公开 schema 拒绝零、负数及小数限速，双向 SFTP 并发及递归文件共用 KiB/s 总预算，rsync 消费同单位的 --bwlimit，默认不限速
+
+F405/F407：脚本阶段 timeout 接受正整数至 3600000 ms，超过上限在派发前拒绝；宿主绝对期限与阶段期限分别记录，长任务使用 operation 状态查询及身份校验取消
+
+### F310／F384／SSH-R8-C01 配置与标准输入
+
+自动入口：`test/finding-regressions.test.mjs`、`test/openssh.test.mjs`
+
+验收：活跃和等待连接的配置冲突只返回安全字段名，错误不包含配置值；公开 ssh_exec 的 stdin 在真实自有 loopback ssh2 和 OpenSSH master 通道中传递 UTF-8、NUL 和空输入，
+并发送 EOF，省略时保持原行为；输入发送错误隐藏原始异常内容，请求取消返回 unknown，迟到通道不继续发送输入，其他 alias 和 master 继续可用
+
+POSIX 本机的 OpenSSH 配置准备使用延迟输出合成配置的自有进程，准备期间 disconnect 返回成功，等待进程退出后 connect 失败且零次进入连接阶段
+Windows 本机返回 `unsupported_backend`，`capability` 为 `local_platform`，不启动子进程或进入连接阶段，准备状态清理后 disconnect 返回未找到连接
+各平台继续验证准备结束与连接登记之间发生 disconnect 时，连接代次检查仍拒绝旧请求
+
+### M16-S01 配置准备与最终别名
+
+自动入口：`test/finding-regressions.test.mjs`、`test/openssh.test.mjs`，名称包含 `M16-S01`
+
+验收：合成配置把默认端口 22 与初始主机名解析为 loopback 的自有端口和地址，连续连接、断开、再连接均成功
+准备或交接期间取消最终 alias 会拒绝旧请求，无关 alias 的取消保留当前请求，用户 master 继续工作
+
+### M16-S02 公开执行取消
+
+自动入口：`test/finding-regressions.test.mjs`，名称包含 `M16-S02`
+
+验收：真实 SDK 取消 batch 与 parallel 后，后续派发次数为 0，`stopOnError=false` 同样停止
+脚本上传取消后不再执行 chmod 或解释器，仅清理所属临时脚本；迟到 SFTP 不发送 OPEN／WRITE
+密码 sudo 的迟到 channel 不发送 stdin，取消后其他请求与 master 继续工作
+
+### M16-S03 OpenSSH 所属进程组
+
+自动入口：`test/openssh.test.mjs`，名称包含 `M16-S03`
+
+验收：原生 `ssh -G` 的合成 `Match exec` 后代保持 stdio 并延迟写 marker
+超时、取消和输出限额三条路径及时结束所属进程组，marker 不产生，其他 alias 与 master 继续可用
+
+### M16-S04 下载与诊断共用期限
+
+自动入口：`test/finding-regressions.test.mjs`、`test/openssh.test.mjs`，名称包含 `M16-S04`
+
+验收：250 ms 下载期限耗尽后不再请求远端诊断，提前失败只用剩余期限探测父目录
+诊断中取消立即结束所属 SFTP 或 OpenSSH stat 通道，保留原下载错误、本地详情和原子目标文件
 
 ## 测试清理
 

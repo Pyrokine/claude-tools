@@ -14,7 +14,16 @@ if (testFiles.length === 0) {
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'mcp-ssh-test-home-'))
 const env = { ...process.env, HOME: home, USERPROFILE: home, SSH_MCP_TEST_HOME: home }
-for (const name of ['SSH_AUTH_SOCK', 'SSH_MCP_TEMPLATES', 'SSH_MCP_ALLOWED_KEY_DIRS', 'SSH_MCP_FILE_OPS_ALLOW_DIRS']) {
+for (const name of [
+    'SSH_AUTH_SOCK',
+    'SSH_AGENT_PID',
+    'SSH_ASKPASS',
+    'SSH_ASKPASS_REQUIRE',
+    'SSH_SK_PROVIDER',
+    'SSH_MCP_TEMPLATES',
+    'SSH_MCP_ALLOWED_KEY_DIRS',
+    'SSH_MCP_FILE_OPS_ALLOW_DIRS',
+]) {
     delete env[name]
 }
 try {

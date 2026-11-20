@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import assert from 'node:assert/strict'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -8,6 +9,7 @@ import ssh2 from 'ssh2'
 import { KnownHosts } from '../dist/known-hosts.js'
 import { exec as execCallback, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+
 import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -36,13 +38,15 @@ import {
 } from '../dist/file-ops.js'
 import { formatFileMode, formatFilePermissions, parseExpectedFileMode } from '../dist/file-mode.js'
 import { sessionManager, SessionManager } from '../dist/session-manager.js'
-import { validateKeyFile, validateConfigFile } from '../dist/security.js'
+import { validateConfigFile, validateKeyFile } from '../dist/security.js'
 import { registerExecTools } from '../dist/tools/exec.js'
 import { createAtomicUploadPath, registerFileTools } from '../dist/tools/file.js'
 import { dynamicSshPortSchema, sshPortSchema } from '../dist/tools/schema.js'
 import { buildTransferOutcome } from '../dist/transfer-outcome.js'
 import { checkWindowsAcl } from '../dist/windows-acl.js'
 
+/** @type {(command: string, options?: import('node:child_process').ExecOptions) =>
+ * Promise<{stdout: string, stderr: string}>} */
 const exec = promisify(execCallback)
 
 // File-operation fixtures replace getSftp without opening a real SessionManager connection.
@@ -50,6 +54,11 @@ const originalPathStyle = sessionManager.getRemotePathStyle.bind(sessionManager)
 const originalPlatform = sessionManager.getRemotePlatform.bind(sessionManager)
 sessionManager.getRemotePathStyle = (alias) => (sessionManager.sessions.has(alias) ? originalPathStyle(alias) : 'posix')
 sessionManager.getRemotePlatform = (alias) => (sessionManager.sessions.has(alias) ? originalPlatform(alias) : 'posix')
+
+/** @type {{
+ * rename: (from: import('node:fs').PathLike, to: import('node:fs').PathLike) => Promise<void>,
+ * }} */
+const filePromises = fs.promises
 
 function makeTempDir(t) {
     const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-ssh-test-')))
@@ -208,7 +217,7 @@ test('failed recursive upload retains successful parent-directory statistics', a
     assert.equal(result.bytesTransferred, Buffer.byteLength('retained'))
     assert.deepEqual(result.stats, { added: 1, updated: 0, deleted: 0, skipped: 0, failed: 1 })
     assert.match(result.output, /fixture upload failed/)
-    assert.equal(fs.readFileSync(path.join(target, 'done.txt'), 'utf8'), 'retained')
+    assert.equal(fs.readFileSync(path.join(target, 'done.txt')).toString('utf8'), 'retained')
 })
 
 test('SFTP upload rejects errored and unfinished streams that close without error events', async (t) => {
@@ -260,7 +269,7 @@ test('SFTP upload rejects errored and unfinished streams that close without erro
     })
     const target = path.join(directory, 'complete.txt')
     assert.equal((await uploadFile('fixture', source, target)).success, true)
-    assert.equal(fs.readFileSync(target, 'utf8'), 'data')
+    assert.equal(fs.readFileSync(target).toString('utf8'), 'data')
 })
 
 test('SFTP upload accepts acknowledged close before finish and rejects incomplete acknowledgements', async (t) => {
@@ -270,11 +279,11 @@ test('SFTP upload accepts acknowledged close before finish and rejects incomplet
     t.after(() => {
         sessionManager.getSftp = originalGetSftp
     })
-    for (const [content, acknowledged] of [
+    for (const [content, acknowledged] of /** @type {Array<[string, boolean]>} */ ([
         ['data', true],
         ['', true],
         ['data', false],
-    ]) {
+    ])) {
         fs.writeFileSync(source, content)
         let stream
         sessionManager.getSftp = async () => ({
@@ -464,7 +473,7 @@ test('explicit single-file SHA-256 verification works on an exec-disabled SFTP s
         assert.equal(result.verification.kind, 'single_file')
         assert.equal(result.verification.checks.sha256, true)
         assert.equal(result.verificationStatus, 'matched')
-        assert.equal(fs.readFileSync(target, 'utf8'), 'verified through SFTP')
+        assert.equal(fs.readFileSync(target).toString('utf8'), 'verified through SFTP')
     }
 })
 
@@ -566,7 +575,7 @@ test('SSH key and config validators resolve trusted root aliases and reject desc
         validate(path.join(alias, 'regular'))
         validate(path.join(trusted, 'regular'))
         assert.throws(() => validate(path.join(alias, 'escape', 'regular')), /symlink target falls outside/)
-        assert.throws(() => validate(path.join(outside, 'regular')), /Invalid (private key|config) path/)
+        assert.throws(() => validate(path.join(outside, 'regular')), /Invalid (?:private key|config) path/)
     }
 })
 
@@ -617,6 +626,7 @@ test('command risk ignores here-doc input and resumes Shell scanning after the e
         "python3 -I - <<'PY'\nprint(oct(0o100600 & 0o777))\nPY",
         "cat <<'EOF'\nrm -rf /tmp/example &\nit's only input\n$(rm -rf /tmp/example)\nEOF",
         'cat <<"EOF"\nrm -rf /tmp/example &\n`rm -rf /tmp/example`\nEOF',
+        // noinspection SpellCheckingInspection -- partial quoting is part of the here-doc delimiter fixture
         "cat <<E'OF'\nrm -rf /tmp/example &\n$(rm -rf /tmp/example)\nEOF",
         'cat <<E"OF"\nrm -rf /tmp/example &\n$(rm -rf /tmp/example)\nEOF',
         'cat <<\\EOF\nrm -rf /tmp/example &\n$(rm -rf /tmp/example)\nEOF',
@@ -1235,7 +1245,7 @@ test('atomic SFTP download replaces the target only after a complete transfer', 
 
     const result = await downloadFile('unused', '/remote/target.txt', localPath, undefined, sftp)
     assert.equal(result.atomic, true)
-    assert.equal(fs.readFileSync(localPath, 'utf8'), payload)
+    assert.equal(fs.readFileSync(localPath).toString('utf8'), payload)
     assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
 })
 
@@ -1253,7 +1263,8 @@ test('failed atomic SFTP download preserves the existing target and removes temp
         const stream = originalCreateWriteStream(filename, {
             ...options,
             fs: {
-                open: (...args) => setTimeout(() => fs.open(...args), 30),
+                open: (filename, flags, mode, callback) =>
+                    setTimeout(() => fs.open(filename, flags, mode, callback), 30),
                 write: fs.write,
                 close: fs.close,
             },
@@ -1286,7 +1297,7 @@ test('failed atomic SFTP download preserves the existing target and removes temp
         /injected download failure/
     )
     await localStreamClosed
-    assert.equal(fs.readFileSync(localPath, 'utf8'), 'original')
+    assert.equal(fs.readFileSync(localPath).toString('utf8'), 'original')
     assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
 })
 
@@ -1314,7 +1325,7 @@ test('synchronous SFTP read stream failure closes an owned session without tempo
 
     await assert.rejects(downloadFile('owned', '/remote/target.txt', localPath), /injected stream construction failure/)
     assert.equal(endCalls, 1)
-    assert.equal(fs.readFileSync(localPath, 'utf8'), 'original')
+    assert.equal(fs.readFileSync(localPath).toString('utf8'), 'original')
     assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
 })
 
@@ -1336,7 +1347,7 @@ test('clean premature SFTP EOF preserves the existing target and removes tempora
         downloadFile('unused', '/remote/target.txt', localPath, undefined, sftp),
         /Transfer size mismatch/
     )
-    assert.equal(fs.readFileSync(localPath, 'utf8'), 'original')
+    assert.equal(fs.readFileSync(localPath).toString('utf8'), 'original')
     assert.deepEqual(fs.readdirSync(directory), ['target.txt'])
 })
 
@@ -1387,7 +1398,7 @@ test('atomic SFTP download keeps temporary files private and preserves ordinary 
         remoteStream.push(null)
         const result = await pending
         assert.equal(result.success, true)
-        assert.equal(fs.readFileSync(localPath, 'utf8'), payload.toString())
+        assert.equal(fs.readFileSync(localPath).toString('utf8'), payload.toString())
         assert.equal(fs.statSync(localPath).mode & 0o7777, entry.expected)
         assert.equal(
             fs.readdirSync(directory).some((name) => name.startsWith(`.${entry.name}.mcp-tmp-`)),
@@ -1433,7 +1444,7 @@ test('atomic SFTP download rejects non-regular local targets before remote reads
     }
     assert.equal(statCalls, 0)
     assert.equal(readCalls, 0)
-    assert.equal(fs.readFileSync(source, 'utf8'), 'original')
+    assert.equal(fs.readFileSync(source).toString('utf8'), 'original')
 })
 
 test('recursive SFTP mkdir creates missing parents without remote exec', async () => {
@@ -1673,6 +1684,7 @@ test('I051 notification failures keep transfers visible and cancelled probes can
     abort.abort(new Error('Owned request cancelled'))
     let timer
     try {
+        /** @type {ReturnType<typeof import('../dist/tools/utils.js').formatResult> | null} */
         const cancelled = await Promise.race([
             pending,
             new Promise((resolve) => {
@@ -2586,6 +2598,7 @@ test('MH-SSH-01 OpenSSH manifests consume one absolute deadline across remote ph
                 )
             )
         },
+        // noinspection JSUnusedGlobalSymbols -- consumed through the OpenSSH connection interface
         async hashFile(_path, _algorithm, timeout) {
             calls.push(['hash', timeout])
             t.mock.timers.tick(20)
@@ -2764,7 +2777,7 @@ test(
         assert.equal(matchesDirectoryExclude('other/cache/ignored.txt', exclude), false)
         assert.equal(comparison.matched, true)
         assert.equal(comparison.checks.deletions, true)
-        assert.equal(comparison.checks.staleFiles, true)
+        assert.equal(comparison.checks.staleFiles, null)
         assert.equal(comparison.summary.deletionCandidates, 1)
         assert.equal(comparison.summary.deletedEntries, 1)
 
@@ -2773,7 +2786,7 @@ test(
         const failed = compareDirectoryManifests(expectedManifest, actualWithStale, request, baselineManifest)
         assert.equal(failed.matched, false)
         assert.equal(failed.checks.deletions, false)
-        assert.equal(failed.checks.staleFiles, true)
+        assert.equal(failed.checks.staleFiles, null)
         assert.equal(failed.summary.remainingDeletionCandidates, 1)
     }
 )
@@ -2906,7 +2919,7 @@ test('rsync directory sync uses source contents and skips links and special entr
         /recursive=false is not supported for directory sources/
     )
     const result = await syncFiles('rsync-test', source, '/remote/target', 'upload')
-    const rsyncArgs = fs.readFileSync(argsFile, 'utf8').split('\n').filter(Boolean)
+    const rsyncArgs = fs.readFileSync(argsFile).toString('utf8').split('\n').filter(Boolean)
 
     assert.equal(result.success, true)
     assert.equal(result.selectedTransport, 'rsync')
@@ -2919,7 +2932,7 @@ test('rsync directory sync uses source contents and skips links and special entr
     const followedResult = await syncFiles('rsync-test', source, '/remote/followed', 'upload', {
         followSymlinks: true,
     })
-    const followedArgs = fs.readFileSync(argsFile, 'utf8').split('\n').filter(Boolean)
+    const followedArgs = fs.readFileSync(argsFile).toString('utf8').split('\n').filter(Boolean)
     assert.equal(followedResult.success, true)
     assert.equal(followedResult.selectedTransport, 'rsync')
     assert.equal(followedArgs.includes('-L'), true)
@@ -3131,7 +3144,10 @@ test(
                     client: {
                         end() {},
                         exec(command, _options, callback) {
-                            const stream = new Readable({ read() {} })
+                            const stream = /** @type {Readable & {
+                                stderr: Readable,
+                                emit(event: string, ...args: unknown[]): boolean,
+                            }} */ (new Readable({ read() {} }))
                             stream.stderr = new Readable({ read() {} })
                             const child = spawn('/bin/sh', ['-c', command], {
                                 cwd: directory,
@@ -3291,7 +3307,7 @@ test('session summaries stay brief while internal transfer capability retains ro
     assert.equal(unavailableAgent.decisionReason, 'ssh_agent_socket_unavailable')
 })
 
-async function r29SftpFixture(t, faultStage, rejectRequest = false, timeoutResponse = false) {
+async function r29SftpFixture(t, faultStage = undefined, rejectRequest = false, timeoutResponse = false) {
     const testHome = process.env.SSH_MCP_TEST_HOME
     assert.ok(testHome, 'Run real SFTP regressions through test/run-tests.mjs')
     assert.equal(process.env.HOME, testHome)
@@ -3303,7 +3319,9 @@ async function r29SftpFixture(t, faultStage, rejectRequest = false, timeoutRespo
     const beforeAllow = process.env.SSH_MCP_ALLOWED_KEY_DIRS
     process.env.SSH_MCP_ALLOWED_KEY_DIRS = directory
     sessionManager.knownHosts = new KnownHosts(path.join(directory, 'known_hosts'), [])
-    const privateKey = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({
+    const privateKey = /** @type {import('node:crypto').KeyObject} */ (
+        generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey
+    ).export({
         type: 'sec1',
         format: 'pem',
     })
@@ -3385,6 +3403,8 @@ async function r29SftpFixture(t, faultStage, rejectRequest = false, timeoutRespo
                             id,
                             filename,
                             () => {
+                                // SFTP OPEN flags are a wire-protocol bit mask.
+                                // noinspection JSBitwiseOperatorUsage
                                 const mode = flags & 32 ? 'wx' : flags & 4 ? 'a' : flags & 8 ? 'w' : 'r'
                                 const fd = fs.openSync(filename, mode, attrs.mode ?? 0o600)
                                 handle = Buffer.from(String(++sequence))
@@ -3452,7 +3472,7 @@ async function r29SftpFixture(t, faultStage, rejectRequest = false, timeoutRespo
             })
         )
     })
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
     const alias = `r29-${process.pid}`
     t.after(async () => {
         sessionManager.disconnect(alias)
@@ -3606,14 +3626,14 @@ test('R29-SSH-02: script writes and download publication retain their error stag
         const localPath = path.join(directory, 'local.txt')
         fs.writeFileSync(remotePath, 'new-content')
         fs.writeFileSync(localPath, 'old-content')
-        t.mock.method(fs.promises, 'rename', async () => {
+        t.mock.method(filePromises, 'rename', async () => {
             throw Object.assign(new Error('synthetic local rename refusal'), { code: 'EACCES' })
         })
         const result = await call('ssh_download', { remotePath, localPath, timeout: 2000 })
         assert.equal(result.operationStatus, 'failed', JSON.stringify(result))
         assert.equal(result.failureStage, 'local_rename')
         assert.equal(result.targetReplaced, false)
-        assert.equal(fs.readFileSync(localPath, 'utf8'), 'old-content')
+        assert.equal(fs.readFileSync(localPath).toString('utf8'), 'old-content')
         assert.equal(
             fs.readdirSync(directory).some((name) => name.includes('.mcp-tmp-')),
             false
@@ -3713,7 +3733,9 @@ await import(${JSON.stringify(moduleUrl('index.js'))})
         assert.equal(sync.body.bytesTransferred, 4)
         assert.equal(sync.body.acknowledgedBytes, 7)
         const counts = { connections: fixture.peers.size, authentications: fixture.authentications() }
-        const replacement = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({
+        const replacement = /** @type {import('node:crypto').KeyObject} */ (
+            generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey
+        ).export({
             type: 'sec1',
             format: 'pem',
         })

@@ -1,7 +1,9 @@
+import { Buffer } from 'node:buffer'
 import assert from 'node:assert/strict'
 import { createHash, createHmac, generateKeyPairSync } from 'node:crypto'
 import childProcess, { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+
 import { once } from 'node:events'
 import { syncBuiltinESMExports } from 'node:module'
 import net from 'node:net'
@@ -39,16 +41,36 @@ const other = ssh2.utils.parseKey(changed.private).getPublicSSH()
 const line = (hostname, blob = raw) =>
     `${hostname}` + ' ' + `${ssh2.utils.parseKey(blob).type}` + ' ' + `${blob.toString('base64')}` + '\n'
 const ecdsa = {
-    private: generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({ type: 'sec1', format: 'pem' }),
+    private: /** @type {import('node:crypto').KeyObject} */ (
+        generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey
+    ).export({ type: 'sec1', format: 'pem' }),
 }
 const changedEcdsa = {
-    private: generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({ type: 'sec1', format: 'pem' }),
+    private: /** @type {import('node:crypto').KeyObject} */ (
+        generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey
+    ).export({ type: 'sec1', format: 'pem' }),
 }
 const rsa = {
-    private: generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' }),
+    private: /** @type {import('node:crypto').KeyObject} */ (
+        generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey
+    ).export({ type: 'pkcs1', format: 'pem' }),
 }
 const ecdsaRaw = ssh2.utils.parseKey(ecdsa.private).getPublicSSH()
 const rsaRaw = ssh2.utils.parseKey(rsa.private).getPublicSSH()
+
+/** @type {{
+ * rename: (from: import('node:fs').PathLike, to: import('node:fs').PathLike) => Promise<void>,
+ * rmdir: (name: import('node:fs').PathLike) => Promise<void>,
+ * readdir: (name: import('node:fs').PathLike) => Promise<string[]>,
+ * lstat: (name: import('node:fs').PathLike) => Promise<import('node:fs').Stats>,
+ * open: (
+ *   name: import('node:fs').PathLike,
+ *   flags: string | number,
+ *   mode?: number
+ * ) => Promise<import('node:fs/promises').FileHandle>,
+ * unlink: (name: import('node:fs').PathLike) => Promise<void>,
+ * }} */
+const filePromises = fs.promises
 
 function fixture(t) {
     const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-host-key-')))
@@ -97,16 +119,18 @@ function systemAliasFixture(t) {
     })
     t.mock.method(os, 'homedir', () => home)
     // Map the default system paths onto an owned tree with a real /etc -> /private/etc-style link.
-    for (const method of ['existsSync', 'realpathSync']) {
-        const original = fs[method].bind(fs)
-        t.mock.method(fs, method, (input, ...args) => {
-            if (typeof input === 'string' && (input === '/etc' || input.startsWith('/etc/'))) {
-                checked.add(input)
-                input = path.join(directory, input.slice(1))
-            }
-            return original(input, ...args)
-        })
+    const existsSync = fs.existsSync
+    const realpathSync = fs.realpathSync
+    /** @param {import('node:fs').PathLike} input */
+    const mapSystemPath = (input) => {
+        if (typeof input === 'string' && (input === '/etc' || input.startsWith('/etc/'))) {
+            checked.add(input)
+            return path.join(directory, input.slice(1))
+        }
+        return input
     }
+    t.mock.method(fs, 'existsSync', (input) => existsSync(mapSystemPath(input)))
+    t.mock.method(fs, 'realpathSync', (input, options) => realpathSync(mapSystemPath(input), options))
     syncBuiltinESMExports()
     return { directory, home, system, file: path.join(home, '.ssh', 'known_hosts'), checked }
 }
@@ -126,7 +150,7 @@ for (const missingDirectory of [false, true]) {
             assert.equal((await trust.verify('alias.example.com', 22, raw)).status, 'added')
             assert.equal((await trust.verify('alias.example.com', 22, raw)).status, 'known')
             await assert.rejects(trust.verify('alias.example.com', 22, other), /changed/)
-            assert.equal(fs.readFileSync(file, 'utf8'), line('alias.example.com'))
+            assert.equal(fs.readFileSync(file).toString('utf8'), line('alias.example.com'))
             assert.ok(checked.has('/etc/ssh/ssh_known_hosts'))
             assert.ok(checked.has('/etc/ssh/ssh_known_hosts2'))
         }
@@ -350,7 +374,7 @@ test('SSH-01: existing pins select trusted algorithms without changing trust fil
                 }
                 assert.ok(remote.authentication() > 0)
             }
-            assert.equal(fs.readFileSync(file, 'utf8'), entries)
+            assert.equal(fs.readFileSync(file).toString('utf8'), entries)
             const after = fs.statSync(file)
             assert.equal(after.ino, before.ino)
             assert.equal(after.mode, before.mode)
@@ -372,7 +396,7 @@ test('SSH-01: bastion and target independently prefer their existing pin types',
     assert.equal(manager.getSessionConnectionInfo('fixture').hostKeys.length, 2)
     await manager.reconnect('fixture')
     assert.deepEqual(target.negotiated, ['rsa-sha2-512', 'rsa-sha2-512'])
-    assert.equal(fs.readFileSync(file, 'utf8'), entries)
+    assert.equal(fs.readFileSync(file).toString('utf8'), entries)
 })
 
 test('SSH-01: reconnect reads updated trusted algorithms', async (t) => {
@@ -386,12 +410,14 @@ test('SSH-01: reconnect reads updated trusted algorithms', async (t) => {
     fs.writeFileSync(file, updated)
     await manager.reconnect('fixture')
     assert.deepEqual(remote.negotiated, ['ecdsa-sha2-nistp256', 'ssh-ed25519'])
-    assert.equal(fs.readFileSync(file, 'utf8'), updated)
+    assert.equal(fs.readFileSync(file).toString('utf8'), updated)
 })
 
 test('G073: rejected real handshakes report negotiated algorithm and conflicting synthetic pins', async (t) => {
     const changedRsa = {
-        private: generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({
+        private: /** @type {import('node:crypto').KeyObject} */ (
+            generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey
+        ).export({
             type: 'pkcs1',
             format: 'pem',
         }),
@@ -429,8 +455,8 @@ test('G073: rejected real handshakes report negotiated algorithm and conflicting
                 return true
             })
             assert.equal(remote.authentication(), 0)
-            assert.equal(fs.readFileSync(file, 'utf8'), contents)
-            assert.equal(fs.readFileSync(`${file}2`, 'utf8'), contents)
+            assert.equal(fs.readFileSync(file).toString('utf8'), contents)
+            assert.equal(fs.readFileSync(`${file}2`).toString('utf8'), contents)
             assert.equal(fs.statSync(file).mode, before.mode)
             assert.equal(fs.statSync(file).ino, before.ino)
         })
@@ -442,7 +468,7 @@ test('SSH-01: real ssh2 first trust is saved before authentication and reconnect
     const remote = await server(t)
     await manager.connect(connection(remote.port))
     assert.equal(manager.getSessionConnectionInfo('fixture').hostKey.status, 'added')
-    assert.match(fs.readFileSync(file, 'utf8'), /ssh-ed25519/)
+    assert.match(fs.readFileSync(file).toString('utf8'), /ssh-ed25519/)
     assert.ok(remote.authentication() > 0)
     await manager.reconnect('fixture')
     assert.equal(manager.getSessionConnectionInfo('fixture').hostKey.status, 'known')
@@ -465,7 +491,7 @@ test('R-01: real rekey after the initial deadline accepts the same key and rejec
     await manager.connect(connection(remote.port))
     const client = manager.sessions.get('fixture').client
     const peer = [...remote.clients][0]
-    const original = fs.readFileSync(file, 'utf8')
+    const original = fs.readFileSync(file).toString('utf8')
     const clock = Date.now
     t.mock.method(Date, 'now', () => clock() + 31000)
     const handshakes = Promise.all([
@@ -486,7 +512,7 @@ test('R-01: real rekey after the initial deadline accepts the same key and rejec
     assert.match(error.message, /Host denied/)
     await closed
     assert.equal(manager.sessions.get('fixture').connected, false)
-    assert.equal(fs.readFileSync(file, 'utf8'), original)
+    assert.equal(fs.readFileSync(file).toString('utf8'), original)
     assert.equal(verify.mock.calls.length, 3)
 })
 
@@ -511,7 +537,7 @@ test('R29-SSH-01: rekey trust failures stop direct, target and jump reconnects b
                 const failedRemote = role === 'jump' ? jump : remote
                 const failedSession = manager.sessions.get(failedAlias)
                 const peer = [...failedRemote.clients][0]
-                const original = fs.readFileSync(file, 'utf8')
+                const original = fs.readFileSync(file).toString('utf8')
                 if (revoked) {
                     fs.appendFileSync(file, `@revoked ${line(`[127.0.0.1]:${failedRemote.port}`)}`)
                 } else {
@@ -623,7 +649,7 @@ test('SSH-01: public registered ssh_connect callback reports persisted trust fro
     assert.equal(result.hostKey.status, 'added')
     assert.match(result.hostKey.fingerprint, /^SHA256:/)
     assert.equal(result.hostKeys[0].port, remote.port)
-    assert.ok(fs.readFileSync(file, 'utf8').includes(`[127.0.0.1]:${remote.port}`))
+    assert.ok(fs.readFileSync(file).toString('utf8').includes(`[127.0.0.1]:${remote.port}`))
     assert.ok(remote.authentication() > 0)
 })
 
@@ -692,7 +718,7 @@ test('SSH-01: known_hosts supports hashes, patterns, negation, IPv6, multiple ke
     assert.equal((await trust.verify('other.example.net', 22, raw)).status, 'known')
     assert.equal((await trust.verify('example.org', 22, raw)).status, 'known')
     assert.equal((await trust.verify('blocked.example.com', 22, other)).status, 'added')
-    assert.match(fs.readFileSync(file, 'utf8'), /^# keep comment/)
+    assert.match(fs.readFileSync(file).toString('utf8'), /^# keep comment/)
     if (process.platform !== 'win32') {
         fs.chmodSync(file, 0o444)
         assert.equal((await trust.verify('a.example.com', 22, raw)).status, 'known')
@@ -718,7 +744,7 @@ test('SSH-01: competing first keys serialize; cancelled waits leave no owned loc
     controller.abort(new Error('fixture cancellation'))
     await assert.rejects(pending)
     assert.equal(fs.existsSync(`${file}.mcp-lock`), true)
-    assert.equal(fs.readFileSync(file, 'utf8').includes('cancel.example.com'), false)
+    assert.equal(fs.readFileSync(file).toString('utf8').includes('cancel.example.com'), false)
 })
 
 test('SSH-01: independent processes cannot register conflicting first keys', async (t) => {
@@ -748,7 +774,7 @@ try {
         })
     const results = await Promise.all([run(raw), run(other)])
     assert.deepEqual(results.sort(), [0, 1])
-    assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').length, 1)
+    assert.equal(fs.readFileSync(file).toString('utf8').trim().split('\n').length, 1)
     assert.equal(fs.existsSync(`${file}.mcp-lock`), false)
 })
 
@@ -880,12 +906,12 @@ for (const phase of ['preparing', 'prepared', 'published', 'appended', 'released
             const child = lockWriter(t, file, phase)
             assert.deepEqual(await child.next(), { phase })
             await child.stop()
-            const previous = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
+            const previous = fs.existsSync(file) ? fs.readFileSync(file).toString('utf8') : ''
             assert.equal(
                 (await trust.verify('recovered.example.com', 22, raw, undefined, Date.now() + 300)).status,
                 'added'
             )
-            assert.equal(fs.readFileSync(file, 'utf8'), previous + line('recovered.example.com'))
+            assert.equal(fs.readFileSync(file).toString('utf8'), previous + line('recovered.example.com'))
             assert.equal(fs.existsSync(`${file}.mcp-lock`), false)
             const leftovers = fs.readdirSync(directory).filter((name) => name.includes('.prepare-'))
             assert.equal(leftovers.length, phase === 'preparing' ? 1 : 0)
@@ -921,7 +947,7 @@ test(
         assert.deepEqual(await second.next(), { phase: 'done', status: 'added' })
         assert.equal((await first.exit).code, 0)
         assert.equal((await second.exit).code, 0)
-        assert.equal(fs.readFileSync(file, 'utf8'), line('first.example.com') + line('second.example.com'))
+        assert.equal(fs.readFileSync(file).toString('utf8'), line('first.example.com') + line('second.example.com'))
     }
 )
 
@@ -935,7 +961,7 @@ for (const state of ['live', 'EPERM', 'foreign-domain', 'reused-pid']) {
             assert.deepEqual(await child.next(), { phase: 'published' })
             const lock = `${file}.mcp-lock`
             let [owner] = fs.readdirSync(lock)
-            const record = JSON.parse(fs.readFileSync(path.join(lock, owner), 'utf8'))
+            const record = JSON.parse(fs.readFileSync(path.join(lock, owner)).toString('utf8'))
             if (state === 'foreign-domain' || state === 'reused-pid') {
                 await child.stop()
                 if (state === 'foreign-domain') {
@@ -957,7 +983,7 @@ for (const state of ['live', 'EPERM', 'foreign-domain', 'reused-pid']) {
                     return kill(pid, signal)
                 })
             }
-            const contents = fs.readFileSync(path.join(lock, owner), 'utf8')
+            const contents = fs.readFileSync(path.join(lock, owner)).toString('utf8')
             await assert.rejects(
                 trust.verify('blocked.example.com', 22, raw, undefined, Date.now() + 100),
                 new RegExp('locked', '')
@@ -967,7 +993,7 @@ for (const state of ['live', 'EPERM', 'foreign-domain', 'reused-pid']) {
             const failure = assert.rejects(pending, /fixture cancellation/)
             controller.abort(new Error('fixture cancellation'))
             await failure
-            assert.equal(fs.readFileSync(path.join(lock, owner), 'utf8'), contents)
+            assert.equal(fs.readFileSync(path.join(lock, owner)).toString('utf8'), contents)
             assert.equal(fs.existsSync(file), false)
             assert.equal(
                 fs.readdirSync(directory).some((name) => name.includes('.prepare-')),
@@ -1035,11 +1061,11 @@ for (const platform of ['darwin', 'win32']) {
                     }
                     return true
                 })
-                const rename = fs.promises.rename.bind(fs.promises)
-                t.mock.method(fs.promises, 'rename', async (...args) => {
+                const rename = filePromises.rename.bind(filePromises)
+                t.mock.method(filePromises, 'rename', async (...args) => {
                     const [entry] = fs.readdirSync(args[0])
                     assert.equal(
-                        JSON.parse(fs.readFileSync(path.join(args[0], entry), 'utf8')).domain,
+                        JSON.parse(fs.readFileSync(path.join(args[0], entry)).toString('utf8')).domain,
                         `${platform}:${boot}`
                     )
                     return rename(...args)
@@ -1054,13 +1080,13 @@ for (const platform of ['darwin', 'win32']) {
                         )
                         assert.equal(probes, 1)
                         assert.equal(fs.existsSync(lock), false)
-                        assert.equal(fs.readFileSync(file, 'utf8'), line('recovered.example.com'))
+                        assert.equal(fs.readFileSync(file).toString('utf8'), line('recovered.example.com'))
                     } else {
                         await assert.rejects(
                             trust.verify('blocked.example.com', 22, raw, undefined, Date.now() + 120),
                             /locked/
                         )
-                        assert.equal(fs.readFileSync(path.join(lock, owner), 'utf8'), record)
+                        assert.equal(fs.readFileSync(path.join(lock, owner)).toString('utf8'), record)
                         assert.equal(fs.existsSync(file), false)
                         assert.equal(probes > 0, state === 'live' || state === 'EPERM')
                     }
@@ -1083,7 +1109,7 @@ test(
         const child = lockWriter(t, file, 'published')
         assert.deepEqual(await child.next(), { phase: 'published' })
         const [owner] = fs.readdirSync(`${file}.mcp-lock`)
-        const record = JSON.parse(fs.readFileSync(path.join(`${file}.mcp-lock`, owner), 'utf8'))
+        const record = JSON.parse(fs.readFileSync(path.join(`${file}.mcp-lock`, owner)).toString('utf8'))
         assert.match(record.domain, new RegExp(`^${process.platform}:[\\da-f-]{36}$`))
         await child.stop()
         assert.equal(
@@ -1098,12 +1124,12 @@ for (const state of ['gone', 'new-owner', 'empty-denied', 'read-denied']) {
     test(`QL-SSH-01: EPERM lock release handles ${state} without deleting another owner`, async (t) => {
         const { file, trust } = fixture(t)
         const lock = `${file}.mcp-lock`
-        const rmdir = fs.promises.rmdir.bind(fs.promises)
-        const readdir = fs.promises.readdir.bind(fs.promises)
+        const rmdir = filePromises.rmdir.bind(filePromises)
+        const readdir = filePromises.readdir.bind(filePromises)
         let releasing = false
         let observed = false
         const denied = Object.assign(new Error('fixture directory removal denied'), { code: 'EPERM' })
-        t.mock.method(fs.promises, 'rmdir', async (directory) => {
+        t.mock.method(filePromises, 'rmdir', async (directory) => {
             if (directory === lock && fs.existsSync(file)) {
                 releasing = true
                 if (state === 'gone') {
@@ -1115,7 +1141,7 @@ for (const state of ['gone', 'new-owner', 'empty-denied', 'read-denied']) {
             }
             return rmdir(directory)
         })
-        t.mock.method(fs.promises, 'readdir', async (directory) => {
+        t.mock.method(filePromises, 'readdir', async (directory) => {
             if (releasing && directory === lock) {
                 observed = true
                 if (state === 'read-denied') {
@@ -1135,9 +1161,9 @@ for (const state of ['gone', 'new-owner', 'empty-denied', 'read-denied']) {
             assert.equal((await trust.verify('released.example.com', 22, raw)).status, 'added')
         }
         assert.equal(observed, true)
-        assert.equal(fs.readFileSync(file, 'utf8'), line('released.example.com'))
+        assert.equal(fs.readFileSync(file).toString('utf8'), line('released.example.com'))
         if (state === 'new-owner') {
-            assert.equal(fs.readFileSync(path.join(lock, 'new-owner'), 'utf8'), 'preserve')
+            assert.equal(fs.readFileSync(path.join(lock, 'new-owner')).toString('utf8'), 'preserve')
         }
         assert.equal(fs.existsSync(lock), state !== 'gone')
     })
@@ -1149,8 +1175,8 @@ test('QL-SSH-01: legacy empty lock files are retained with a bounded explanatory
     fs.writeFileSync(lock, '', { mode: 0o600 })
     let now = Date.now()
     t.mock.method(Date, 'now', () => now)
-    const lstat = fs.promises.lstat.bind(fs.promises)
-    t.mock.method(fs.promises, 'lstat', async (...args) => {
+    const lstat = filePromises.lstat.bind(filePromises)
+    t.mock.method(filePromises, 'lstat', async (...args) => {
         const stat = await lstat(...args)
         if (args[0] === lock) {
             now += 100
@@ -1161,7 +1187,7 @@ test('QL-SSH-01: legacy empty lock files are retained with a bounded explanatory
         trust.verify('legacy.example.com', 22, raw, undefined, Date.now() + 100),
         /locked.*legacy.*retained/
     )
-    assert.equal(fs.readFileSync(lock, 'utf8'), '')
+    assert.equal(fs.readFileSync(lock).toString('utf8'), '')
     assert.equal(fs.existsSync(file), false)
     assert.deepEqual(fs.readdirSync(directory), [path.basename(lock)])
 })
@@ -1169,7 +1195,7 @@ test('QL-SSH-01: legacy empty lock files are retained with a bounded explanatory
 test('QL-SSH-01: publication settles before cancellation releases only its own owner', async (t) => {
     const { directory, file, trust } = fixture(t)
     const controller = new AbortController()
-    const rename = fs.promises.rename.bind(fs.promises)
+    const rename = filePromises.rename.bind(filePromises)
     let published
     const reached = new Promise((resolve) => {
         published = resolve
@@ -1178,7 +1204,7 @@ test('QL-SSH-01: publication settles before cancellation releases only its own o
     const released = new Promise((resolve) => {
         resume = resolve
     })
-    t.mock.method(fs.promises, 'rename', async (...args) => {
+    t.mock.method(filePromises, 'rename', async (...args) => {
         await rename(...args)
         published()
         await released
@@ -1202,9 +1228,9 @@ for (const racing of [false, true]) {
         if (!racing) {
             fs.mkdirSync(lock, { mode: 0o700 })
         }
-        const rename = fs.promises.rename.bind(fs.promises)
+        const rename = filePromises.rename.bind(filePromises)
         let calls = 0
-        t.mock.method(fs.promises, 'rename', async (...args) => {
+        t.mock.method(filePromises, 'rename', async (...args) => {
             ++calls
             if (racing && calls === 1) {
                 fs.mkdirSync(lock, { mode: 0o700 })
@@ -1221,7 +1247,7 @@ for (const racing of [false, true]) {
 
 test('QL-SSH-01: an actual publication permission failure is reported without waiting', async (t) => {
     const { directory, trust } = fixture(t)
-    t.mock.method(fs.promises, 'rename', async () => {
+    t.mock.method(filePromises, 'rename', async () => {
         throw Object.assign(new Error('fixture rename denied'), { code: 'EPERM' })
     })
     await assert.rejects(trust.verify('denied.example.com', 22, raw), /EPERM.*fixture rename denied/)
@@ -1233,8 +1259,8 @@ test('SSH-01: failed trust append preserves earlier records and their access mod
     const original = '# preserve comment\n' + line('existing.example.com')
     fs.writeFileSync(file, original, { mode: 0o644 })
     const mode = fs.statSync(file).mode
-    const open = fs.promises.open.bind(fs.promises)
-    t.mock.method(fs.promises, 'open', async (...args) => {
+    const open = filePromises.open.bind(filePromises)
+    t.mock.method(filePromises, 'open', async (...args) => {
         const handle = await open(...args)
         if (args[0] === file) {
             const write = handle.writeFile.bind(handle)
@@ -1251,7 +1277,7 @@ test('SSH-01: failed trust append preserves earlier records and their access mod
         /append.*unknown.*not rolled back.*EIO.*fixture write failure/
     )
     assert.equal(
-        fs.readFileSync(file, 'utf8'),
+        fs.readFileSync(file).toString('utf8'),
         original + line('new.example.com').slice(0, 10) + line('external.example.com', other)
     )
     assert.equal(fs.statSync(file).mode, mode)
@@ -1312,10 +1338,10 @@ for (const failure of ['sync', 'cancel', 'deadline', 'close']) {
                 const replacement = '# replacement\n' + line('replacement.example.com', other)
                 fs.writeFileSync(file, original, { mode: 0o644 })
                 const access = accessState(file)
-                const open = fs.promises.open.bind(fs.promises)
+                const open = filePromises.open.bind(filePromises)
                 let verificationDeadline
                 const controller = new AbortController()
-                t.mock.method(fs.promises, 'open', async (...args) => {
+                t.mock.method(filePromises, 'open', async (...args) => {
                     const handle = await open(...args)
                     if (args[0] === file) {
                         const sync = handle.sync.bind(handle)
@@ -1375,11 +1401,11 @@ for (const failure of ['sync', 'cancel', 'deadline', 'close']) {
                 assert.match(result.error, /append.*unknown.*not rolled back/)
                 assert.equal(remote.authentication(), 0)
                 const appended = original + line(`[127.0.0.1]:${remote.port}`) + external
-                assert.equal(fs.readFileSync(replace ? `${file}.previous` : file, 'utf8'), appended)
+                assert.equal(fs.readFileSync(replace ? `${file}.previous` : file).toString('utf8'), appended)
                 assert.match(observed?.message ?? '', /append.*unknown.*not rolled back/)
                 assert.equal(accessState(replace ? `${file}.previous` : file), access)
                 if (replace) {
-                    assert.equal(fs.readFileSync(file, 'utf8'), replacement)
+                    assert.equal(fs.readFileSync(file).toString('utf8'), replacement)
                 }
                 assert.equal(fs.existsSync(`${file}.mcp-lock`), false)
             }
@@ -1392,8 +1418,8 @@ test('QL-SSH-02: original write, close, and release failures remain visible toge
     const original = '# comment\n' + line('existing.example.com')
     fs.writeFileSync(file, original, { mode: 0o644 })
     const access = accessState(file)
-    const open = fs.promises.open.bind(fs.promises)
-    t.mock.method(fs.promises, 'open', async (...args) => {
+    const open = filePromises.open.bind(filePromises)
+    t.mock.method(filePromises, 'open', async (...args) => {
         const handle = await open(...args)
         if (args[0] === file) {
             const write = handle.writeFile.bind(handle)
@@ -1409,8 +1435,8 @@ test('QL-SSH-02: original write, close, and release failures remain visible toge
         }
         return handle
     })
-    const unlink = fs.promises.unlink.bind(fs.promises)
-    t.mock.method(fs.promises, 'unlink', async (...args) => {
+    const unlink = filePromises.unlink.bind(filePromises)
+    t.mock.method(filePromises, 'unlink', async (...args) => {
         if (path.dirname(args[0]) === `${file}.mcp-lock`) {
             throw Object.assign(new Error('release cleanup failure'), { code: 'EACCES' })
         }
@@ -1429,7 +1455,7 @@ test('QL-SSH-02: original write, close, and release failures remain visible toge
         assert.equal(error.cause.errors.length, 3)
         return true
     })
-    assert.equal(fs.readFileSync(file, 'utf8'), original + line('new.example.com').slice(0, 10))
+    assert.equal(fs.readFileSync(file).toString('utf8'), original + line('new.example.com').slice(0, 10))
     assert.equal(accessState(file), access)
 })
 

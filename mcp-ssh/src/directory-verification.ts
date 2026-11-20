@@ -665,13 +665,13 @@ export async function createOpenSshDirectoryManifest(
             },
             remaining()
         )
-        if (pending.length || fields.length) {
-            throw new Error('OpenSSH manifest ended with incomplete metadata')
-        }
     } catch (error) {
         if (error !== limit) {
             throw error
         }
+    }
+    if (!limitReason && (pending.length || fields.length)) {
+        throw new Error('OpenSSH manifest ended with incomplete metadata')
     }
     if (!limitReason && request.sha256) {
         let hashedBytes = 0
@@ -827,18 +827,18 @@ export function compareDirectoryManifests(
     }
     const checks = {
         entries: missing === 0 && typeMismatch === 0,
-        count: request.count ? expected.count === actual.count : true,
-        sha256: request.sha256 ? expected.rootSha256 === actual.rootSha256 : true,
-        owner: request.owner ? ownerMismatch === 0 : true,
-        mode: request.mode ? modeMismatch === 0 : true,
+        count: request.count ? expected.count === actual.count : null,
+        sha256: request.sha256 ? expected.rootSha256 === actual.rootSha256 : null,
+        owner: request.owner ? ownerMismatch === 0 : null,
+        mode: request.mode ? modeMismatch === 0 : null,
         deletions: request.deletions
             ? deletionBaseline !== undefined && remainingDeletionCandidates.length === 0
-            : true,
-        staleFiles: request.staleFiles ? stale === 0 : true,
+            : null,
+        staleFiles: request.staleFiles ? stale === 0 : null,
     }
     return {
         kind: 'directory',
-        matched: Object.values(checks).every(Boolean),
+        matched: Object.values(checks).every((value) => value !== false),
         checks,
         expected: { count: expected.count, rootSha256: request.sha256 ? expected.rootSha256 : undefined },
         actual: { count: actual.count, rootSha256: request.sha256 ? actual.rootSha256 : undefined },

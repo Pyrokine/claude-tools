@@ -2,11 +2,12 @@
  * SSH MCP Pro - 类型定义
  */
 
-import type { Readable } from 'stream'
+import type { Readable, Writable } from 'stream'
 
 export interface CommandChannel extends Readable {
     readonly stderr: Readable
     readonly ready?: Promise<void>
+    readonly stdin?: Writable
     close(): void
 }
 
@@ -123,6 +124,8 @@ export interface ConnectionFailureDetails {
 }
 
 export interface ExecOptions {
+    stdin?: string
+    signal?: AbortSignal
     timeout?: number // 命令超时（毫秒）
     env?: Record<string, string> // 额外环境变量
     cwd?: string // 工作目录

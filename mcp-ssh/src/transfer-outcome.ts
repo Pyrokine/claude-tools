@@ -21,7 +21,7 @@ function collectChecks(value: unknown, prefix: string, failed: string[], skipped
     }
     if (record.checks && typeof record.checks === 'object') {
         for (const [name, matched] of Object.entries(record.checks as Record<string, unknown>)) {
-            if (matched !== true) {
+            if (matched !== true && matched !== null) {
                 failed.push(prefix ? `${prefix}.${name}` : name)
             }
         }

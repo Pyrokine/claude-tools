@@ -195,6 +195,7 @@ async function inspectLock(
             if (error instanceof SyntaxError) {
                 return 'lock owner identity could not be verified; it was retained'
             }
+            // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
             throw error
         }
         if (
@@ -216,6 +217,7 @@ async function inspectLock(
                 return
             }
             if ((error as NodeJS.ErrnoException).code !== 'EPERM') {
+                // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                 throw error
             }
             return 'lock owner liveness could not be verified (EPERM); it was retained'
@@ -361,6 +363,7 @@ export class KnownHosts {
             await fs.promises.mkdir(preparation, { mode: 0o700 })
             prepared = true
             if (process.platform === 'win32' && checkWindowsAcl(preparation, true) !== 'key_path_usable') {
+                // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                 throw new HostKeyError('known_hosts lock preparation permissions could not be verified')
             }
             await fs.promises.writeFile(
@@ -376,6 +379,7 @@ export class KnownHosts {
             while (!owned) {
                 signal?.throwIfAborted()
                 if (Date.now() >= lockDeadline) {
+                    // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                     throw new HostKeyError(`known_hosts is locked: ${waitingReason}`)
                 }
                 let waiting = await inspectLock(lockPath, domain)
@@ -390,6 +394,7 @@ export class KnownHosts {
                     } catch (error) {
                         const code = (error as NodeJS.ErrnoException).code
                         if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(code ?? '')) {
+                            // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                             throw error
                         }
                         const target = await fs.promises.lstat(lockPath).catch((cause: NodeJS.ErrnoException) => {
@@ -400,6 +405,7 @@ export class KnownHosts {
                         if (target?.isDirectory()) {
                             await removeEmptyLock(lockPath)
                         } else if ((code === 'EPERM' || code === 'EACCES') && !target?.isFile()) {
+                            // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                             throw error
                         }
                         waiting = 'another writer published its lock'
@@ -407,6 +413,7 @@ export class KnownHosts {
                 }
                 if (!owned) {
                     if (Date.now() >= lockDeadline) {
+                        // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                         throw new HostKeyError(`known_hosts is locked: ${waiting}`)
                     }
                     await delay(Math.min(25, lockDeadline - Date.now()), undefined, { signal })
@@ -428,6 +435,7 @@ export class KnownHosts {
                 assertIntegrity(real)
                 const opened = await file.stat()
                 if (before && (opened.ino !== before.ino || opened.dev !== before.dev || opened.size !== before.size)) {
+                    // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                     throw new HostKeyError('known_hosts changed while opening it')
                 }
                 const entry =
@@ -549,6 +557,7 @@ export class KnownHosts {
                     key = decodeBase64(fields[2] ?? '')
                     const parsed = ssh2.utils.parseKey(key)
                     if (parsed instanceof Error || parsed.type !== fields[1]) {
+                        // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                         throw new Error('key type mismatch')
                     }
                 } catch {
@@ -590,7 +599,8 @@ export class KnownHosts {
                 .map((entry) => `${entry.keyType} ${entry.fingerprint} at ${entry.file}:${entry.line}`)
                 .join('; ')
             throw new HostKeyError(
-                `Host key changed for ${hostname}; received ${hostKey.keyType} ${hostKey.fingerprint}; stored ${stored}; verify and update known_hosts before reconnecting`,
+                `Host key changed for ${hostname}; received ${hostKey.keyType} ${hostKey.fingerprint}; ` +
+                    `stored ${stored}; verify and update known_hosts before reconnecting`,
                 { hostKey }
             )
         }
