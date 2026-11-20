@@ -179,6 +179,10 @@ export function escapeXPathString(str: string): string {
     return `concat(${parts.join(', ')})`
 }
 
+export function getWindowsPowerShellEnv(): NodeJS.ProcessEnv {
+    return Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'psmodulepath'))
+}
+
 async function restrictPrivatePath(path: string, directory: boolean): Promise<void> {
     if (process.platform !== 'win32') {
         await chmod(path, directory ? 0o700 : 0o600)
@@ -230,7 +234,7 @@ if (-not $ownerAllowed) { throw 'owner cannot read private output' }
             'powershell.exe',
             ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
             {
-                env: { ...process.env, MCP_CHROME_PRIVATE_PATH: path },
+                env: { ...getWindowsPowerShellEnv(), MCP_CHROME_PRIVATE_PATH: path },
                 timeout: 10_000,
                 windowsHide: true,
                 maxBuffer: 16_384,

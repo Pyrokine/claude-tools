@@ -1329,6 +1329,7 @@ extract(type="html", target={ css: ".card" }, images="data")
 MiB；启动时只清理超过 24 小时且所属进程已退出的带归属标记目录，成功写入 `tmp:` 文件或目录的响应会返回 `retention`
 清理条件，`cwd:` 响应不带此字段，重启后仍需通过 MCP 访问的文件使用
 `cwd:`，输出路径拒绝 Windows 保留设备名、ADS、非法字符以及末尾空格或点号；Windows 上写入敏感内容前须验证私有 DACL
+Windows 权限检查和系统鼠标命令忽略继承的 `PSModulePath`，从 PowerShell 7 启动 MCP 时仍可使用 Windows PowerShell 5.1
 
 路径语法错误返回 `INVALID_ARGUMENT`，允许 `.` 组件，继续拒绝 `..` 组件根目录外的路径及链接越界返回
 `PATH_NOT_ALLOWED`，两类错误均在 `error.context.cwd` 返回 server 的实际工作目录，范围拒绝另返回 `allowedRoots` 使用

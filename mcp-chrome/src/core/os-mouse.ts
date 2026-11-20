@@ -11,7 +11,7 @@ import { promisify } from 'node:util'
 import { generateBezierPath, getMouseMoveDelay } from '../anti-detection/behavior.js'
 import { sanitizeErrorMessage } from './error-sanitizer.js'
 import { OsMouseError, TimeoutError } from './errors.js'
-import { remainingNavigationTimeout, withNavigationBudget } from './utils.js'
+import { getWindowsPowerShellEnv, remainingNavigationTimeout, withNavigationBudget } from './utils.js'
 
 const execFileDefault = promisify(execFileCallback)
 const EXEC_TIMEOUT_MS = 5_000
@@ -22,7 +22,7 @@ const MIN_PATH_STEPS = 12
 export type ExecFileFn = (
     file: string,
     args: readonly string[],
-    options?: { timeout?: number; signal?: AbortSignal }
+    options?: { timeout?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv }
 ) => Promise<{ stdout: string; stderr: string }>
 
 export type SleepFn = (ms: number) => Promise<void>
@@ -300,6 +300,7 @@ function budgetedExecFile(execFile: ExecFileFn, deadline?: number, signal?: Abor
             () =>
                 execFile(file, args, {
                     ...options,
+                    ...(file === 'powershell.exe' ? { env: getWindowsPowerShellEnv() } : {}),
                     signal,
                     timeout:
                         deadline === undefined
@@ -635,7 +636,11 @@ export async function osLeftClick(x: number, y: number, deps: OsLeftClickDeps = 
                   } finally {
                       // A dispatched press may have reached the OS even when its subprocess was canceled.
                       await withNavigationBudget(
-                          () => (deps.execFile ?? execFileDefault)(file, up, { timeout: EXEC_TIMEOUT_MS }),
+                          () =>
+                              (deps.execFile ?? execFileDefault)(file, up, {
+                                  timeout: EXEC_TIMEOUT_MS,
+                                  ...(file === 'powershell.exe' ? { env: getWindowsPowerShellEnv() } : {}),
+                              }),
                           Date.now() + EXEC_TIMEOUT_MS
                       ).catch((error: unknown) => {
                           throw new OsMouseError(

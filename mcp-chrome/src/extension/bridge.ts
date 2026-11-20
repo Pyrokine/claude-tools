@@ -1665,7 +1665,7 @@ export class ExtensionBridge implements IBrowserDriver {
         try {
             const prepared = (await this.httpServer.sendCommand(
                 'prepare_frame_evaluation',
-                { tabId: this.requireCurrentTabId(), frameId, timeout: remaining() },
+                { tabId: this.requireCurrentTabId(), frameId, deadline, timeout: remaining() },
                 remaining()
             )) as { preparedContext?: Record<string, unknown> } | null
             if (
@@ -1698,6 +1698,7 @@ export class ExtensionBridge implements IBrowserDriver {
                     expression,
                     returnByValue: true,
                     awaitPromise: true,
+                    deadline,
                     timeout: remaining(),
                     staleContextRetry,
                     ...(preparedContext ? { preparedContext } : {}),

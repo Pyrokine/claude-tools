@@ -1466,7 +1466,8 @@ startup, marked sessions older than 24 hours are removed only after their proces
 remain accessible after restarting the server. Successful responses that save a `tmp:` file or directory include a
 `retention` field describing the cleanup condition; `cwd:` responses omit it. Output paths reject Windows reserved
 device names, alternate data streams, invalid characters, and trailing spaces or dots. On Windows, private file
-permissions must be verified before writing sensitive content.
+permissions must be verified before writing sensitive content. Windows permission checks and native pointer commands
+ignore inherited `PSModulePath`, allowing MCP to start under PowerShell 7 while using Windows PowerShell 5.1.
 
 Invalid path syntax returns `INVALID_ARGUMENT`; `.` components are accepted and `..` components remain rejected. Paths
 outside an allowed root, including symlink escapes, return `PATH_NOT_ALLOWED`. Both errors include the server's actual

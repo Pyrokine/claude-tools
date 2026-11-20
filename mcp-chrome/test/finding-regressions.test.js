@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { createContext, runInContext, runInNewContext } from 'node:vm';
 import { AutoWait } from '../dist/core/auto-wait.js';
 import { Locator } from '../dist/core/locator.js';
+import { osLeftClick } from '../dist/core/os-mouse.js';
 import { deflateSync } from 'node:zlib';
 
 import { CDPClient, getBrowserWSEndpoint } from '../dist/cdp/client.js';
@@ -45,6 +46,7 @@ import { EvaluateResultTooLargeError, formatCdpException } from '../dist/core/ty
 import { getUnifiedSession } from '../dist/core/unified-session.js';
 import {
     getControlledTempRoot,
+    getWindowsPowerShellEnv,
     resolveScopedInputPath,
     resolveScopedOutputPath,
     waitForNavigationQueue,
@@ -2173,6 +2175,7 @@ test('C31F14 Bridge prepares iframe context before sending the user expression',
         'before-main-cancel',
         'before-main-deadline',
         'legacy',
+        'clock-advancing',
         'main-timeout',
     ]) {
         await t.test(scenario, async () => {
@@ -2193,6 +2196,21 @@ test('C31F14 Bridge prepares iframe context before sending the user expression',
             const messages = [];
             const warnings = [];
             const restoreConsole = patchProperties(console, { warn: (message) => warnings.push(message) });
+            let clock = Date.now();
+            const restoreClock = ['legacy', 'clock-advancing'].includes(scenario)
+                ? patchProperties(Date, { now: () => clock })
+                : undefined;
+            const sendCommand = rpc.sendCommand.bind(rpc);
+            const restoreSendCommand = restoreClock
+                ? patchProperties(rpc, {
+                      sendCommand: (action, params, timeout, dispatchedAction) => {
+                          if (action === 'evaluate_in_frame') {
+                              clock += 5;
+                          }
+                          return sendCommand(action, params, timeout, dispatchedAction);
+                      },
+                  })
+                : undefined;
             rpc.clientSocket = { readyState: 1 };
             rpc.isConnected = () => true;
             rpc.sendMessage = (_socket, message) => {
@@ -2296,6 +2314,8 @@ test('C31F14 Bridge prepares iframe context before sending the user expression',
                 }
                 assert.equal(rpc.messageHandlers.size, 0);
             } finally {
+                restoreSendCommand?.();
+                restoreClock?.();
                 restoreConsole();
             }
         });
@@ -12638,7 +12658,7 @@ test('W4 scoped output rejects Windows devices and manages only marked temporary
         await assert.rejects(() => resolveScopedOutputPath(invalid, serverName), /Windows/);
     }
     if (process.platform === 'win32') {
-        const env = { ...process.env, MCP_CHROME_PRIVATE_PATH: output.absolutePath };
+        const env = { ...getWindowsPowerShellEnv(), MCP_CHROME_PRIVATE_PATH: output.absolutePath };
         const options = { env, timeout: 10_000 };
         const verify = `$ErrorActionPreference = 'Stop'
 $a = Get-Acl -LiteralPath $env:MCP_CHROME_PRIVATE_PATH
@@ -12677,6 +12697,107 @@ if (@($a.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdenti
     await assert.rejects(() => stat(join(session, 'must-not-create')), { code: 'ENOENT' });
     assert.equal(await readFile(output.absolutePath, { encoding: 'utf8' }), 'private content');
 });
+
+test('W4 native PowerShell environment removes module overrides without changing its parent', () => {
+    for (const name of ['PSModulePath', 'PSMODULEPATH', 'psmodulepath']) {
+        const restore = patchProperties(process.env, {
+            [name]: 'owned-module-path',
+            MCP_CHROME_POWERSHELL_ENV_TEST: 'owned-preserved-value',
+        });
+        try {
+            const env = getWindowsPowerShellEnv();
+            assert.equal(
+                Object.keys(env).some((key) => key.toLowerCase() === 'psmodulepath'),
+                false
+            );
+            assert.equal(env.MCP_CHROME_POWERSHELL_ENV_TEST, 'owned-preserved-value');
+            assert.equal(process.env[name], 'owned-module-path');
+        } finally {
+            restore();
+        }
+    }
+});
+
+test('CH-08 Windows PowerShell movement and release isolate module overrides', async (t) => {
+    const restore = patchProperties(process.env, {
+        PSModulePath: 'owned-module-path',
+        MCP_CHROME_POWERSHELL_ENV_TEST: 'owned-preserved-value',
+    });
+    try {
+        for (const cancel of [false, true]) {
+            await t.test(cancel ? 'cancelled press' : 'completed click', async () => {
+                const abort = new AbortController();
+                const calls = [];
+                const operation = osLeftClick(12, 34, {
+                    platform: 'win32',
+                    signal: abort.signal,
+                    path: [{ x: 12, y: 34 }],
+                    sleep: async () => {},
+                    execFile: async (file, args, options) => {
+                        assert.equal(file, 'powershell.exe');
+                        assert.ok(options.env);
+                        assert.equal(
+                            Object.keys(options.env).some((key) => key.toLowerCase() === 'psmodulepath'),
+                            false
+                        );
+                        assert.equal(options.env.MCP_CHROME_POWERSHELL_ENV_TEST, 'owned-preserved-value');
+                        calls.push(args.at(-1));
+                        if (cancel && /mouse_event\(2,/.test(args.at(-1))) {
+                            abort.abort(new Error('owned Windows press cancelled'));
+                        }
+                        return { stdout: '', stderr: '' };
+                    },
+                });
+                if (cancel) {
+                    await assert.rejects(operation, /owned Windows press cancelled/);
+                } else {
+                    await operation;
+                }
+                assert.equal(calls.length, 3);
+                assert.match(calls.at(-1), /mouse_event\(4,/);
+            });
+        }
+        assert.equal(process.env.PSModulePath, 'owned-module-path');
+    } finally {
+        restore();
+    }
+});
+
+test(
+    'W4 Windows private output ignores inherited PowerShell module overrides',
+    { skip: process.platform !== 'win32' ? 'Windows PowerShell module fixture' : false },
+    async (t) => {
+        const root = await mkdtemp(join(tmpdir(), 'mcp-chrome-owned-module-'));
+        t.after(() => rm(root, { recursive: true, force: true }));
+        const moduleRoot = join(root, 'Microsoft.PowerShell.Security');
+        await mkdir(moduleRoot);
+        await writeFile(
+            join(moduleRoot, 'Microsoft.PowerShell.Security.psd1'),
+            "@{ RootModule = 'Microsoft.PowerShell.Security.psm1'; ModuleVersion = '99.0.0'; FunctionsToExport = @('Get-Acl') }"
+        );
+        await writeFile(
+            join(moduleRoot, 'Microsoft.PowerShell.Security.psm1'),
+            "function Get-Acl { throw 'owned module override' }\nExport-ModuleMember -Function Get-Acl\n"
+        );
+        const output = join(root, 'private-output.txt');
+        const env = { ...process.env, PSModulePath: root, MCP_CHROME_PRIVATE_PATH: output };
+        await assert.rejects(
+            execFileAsync(
+                'powershell.exe',
+                ['-NoProfile', '-NonInteractive', '-Command', 'Get-Acl -LiteralPath $env:MCP_CHROME_PRIVATE_PATH'],
+                { env, timeout: 10_000 }
+            ),
+            /owned module override/
+        );
+        const utilsUrl = new URL('../dist/core/utils.js', import.meta.url).href;
+        const script = `
+import { writePrivateFile } from ${JSON.stringify(utilsUrl)};
+await writePrivateFile(${JSON.stringify(output)}, 'owned private output', 'utf8');
+`;
+        await execFileAsync(process.execPath, ['--input-type=module', '-e', script], { env, timeout: 30_000 });
+        assert.equal(await readFile(output, 'utf8'), 'owned private output');
+    }
+);
 
 test('C13 scoped path errors distinguish invalid arguments and allowed roots', async (t) => {
     const fixture = await mkdtemp(join(tmpdir(), 'mcp-chrome-path-test-'));

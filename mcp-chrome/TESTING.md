@@ -583,6 +583,7 @@ API，控制的页面计时器或原生 API 延迟须与自然后台限频分别
 C31F14 的 precise iframe 执行先通过内部 `prepare_frame_evaluation` 解析 owner/context，该请求不携带用户表达式；准备成功后使用同一期限发送现有 `evaluate_in_frame`，执行前复查文档、父文档、URL、session 与 context 身份
 准备失败、取消及到期分别核对 `false/not_started`、用户脚本零派发与 revision 保持；表达式已发送后的未知结果仍为 `unknown`，仅显式 `readOnly` 保留原一次 stale 重试
 Bridge 自动回归另验准备 ACK 后、主请求发送前取消或耗尽期限，公开结果保持 `false/not_started/context`；页面条件跨准备和执行保留，旧 Extension 明确不支持准备动作时给出可见兼容提示，其余准备错误直接结束请求
+在准备 ACK 与实际执行 RPC 之间用受控时钟推进五毫秒，分别覆盖现代和旧 Extension 兼容分支，两条命令携带同一绝对期限，执行阶段的期限保持原值
 准备完成后删除 iframe、拒绝 attach 或耗尽脚本预算时，通过实际 ActionHandler 核对零执行与 revision 保持；`readOnly` 首次脚本已派发后再发生准备错误，执行状态保持 `unknown`
 分别延迟 `DOM.getFrameOwner`、`DOM.resolveNode` 和启动 owner promise 的 `Runtime.callFunctionOn` 原生回执，在取消与到期后、原回执仍未返回时验证同 tab 后继可完成；迟到回执仅触发对象取消和释放，旧 token 拒绝接收，用户脚本保持零派发
 
@@ -793,6 +794,8 @@ container/祖先/root/body/viewport 的完整原生 wheel 位置，混合输入�
   ADS、保留设备名、非法字符及组件末尾空格/点号必须在创建目录前被拒绝；Windows 上文件内容写入前必须验证私有 DACL，缺少
   PowerShell 或校验失败时返回
   `privacy_not_enforced_on_windows`
+- Windows 模块环境回归：用自有 `Microsoft.PowerShell.Security` 模块覆盖 `Get-Acl` 并令其明确报错，先验证直接继承该模块路径的权限查询失败，再验证实际 `writePrivateFile` 完成私有输出；父环境保持原值
+- Windows 系统鼠标回归：move/down/up 的内部 PowerShell 命令均隔离继承的模块路径，按下后取消仍发送释放命令，保留其他环境变量
 
 ---
 
