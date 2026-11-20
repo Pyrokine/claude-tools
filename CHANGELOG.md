@@ -1,5 +1,57 @@
 # Changelog
 
+## v1.20.1 - 2026-11-21
+
+## Versions
+
+- mcp-claude-history: 2.2.1
+- mcp-chrome Server and Extension: 3.1.1 → 3.1.2
+- mcp-ssh: 3.3.0 → 3.3.1
+- skill-elenchus: 1.2.0
+
+## What's Changed
+
+### mcp-chrome
+
+- fix: Keep the same absolute deadline across iframe preparation and execution, including legacy Extension compatibility
+- fix: Isolate internal Windows PowerShell module lookup from an inherited PowerShell 7 module path for private output and native pointer commands
+- test: Cover deadline propagation, inherited module overrides, and pointer release after cancellation
+
+### mcp-ssh
+
+- fix: Start the lock-contention budget after host-key trust preparation and apply the caller deadline to metadata, permissions, and trust reads
+- fix: Give internal host-key verification the existing 30-second default while retaining explicit caller deadlines, cancellation, and lock-owner protection
+- fix: Isolate internal Windows PowerShell permission, boot-identity, and filename checks from inherited module paths
+- test: Retain native permission checks and real session persistence while isolating the intended lock and SFTP fault phases
+- docs: Synchronize bilingual behavior descriptions and reusable regression guidance
+
+---
+
+## 版本
+
+- mcp-claude-history：2.2.1
+- mcp-chrome Server 和 Extension：3.1.1 → 3.1.2
+- mcp-ssh：3.3.0 → 3.3.1
+- skill-elenchus：1.2.0
+
+## 更新内容
+
+### mcp-chrome
+
+- fix: iframe 准备与执行共用同一绝对期限，保留旧 Extension 兼容分支
+- fix: Windows 私有输出与系统鼠标命令隔离继承的 PowerShell 7 模块路径
+- test: 覆盖期限传递、继承模块覆盖和取消后的鼠标释放
+
+### mcp-ssh
+
+- fix: 主机信任准备完成后开始锁竞争预算，元数据、权限和信任读取共用调用方期限
+- fix: 内部主机密钥验证采用现有 30 秒默认期限，保留显式调用方期限、取消及锁持有者保护
+- fix: Windows 权限、启动身份与文件名检查隔离继承的 PowerShell 模块路径
+- test: 保留原生权限检查与真实会话持久化，使锁和 SFTP 故障用例验证各自目标阶段
+- docs: 同步中英文行为说明与可复用回归指导
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.20.0...v1.20.1
+
 ## v1.20.0 - 2026-11-20
 
 ## Versions

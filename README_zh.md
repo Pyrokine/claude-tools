@@ -58,10 +58,9 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 - mcp-claude-history 2.2.1：会话名称、大规模历史精确检索、来源目录分页、全文导出、精确来源恢复与私有导出目录
 
-- mcp-chrome 3.1.1：本地文件上传、字段值保护、任务页面管理、Cloudflare 完成状态、open Shadow DOM 与嵌套 frame、
-  对话框、原响应与下载收件、请求控制、限定范围的 HTTP 认证及 WebSocket/SSE 观察
+- mcp-chrome 3.1.2：iframe 准备与执行共用期限、Windows PowerShell 兼容、本地文件上传、字段值保护、任务页面管理、Cloudflare 完成状态、open Shadow DOM 与嵌套 frame、对话框、原响应与下载收件、请求控制、限定范围的 HTTP 认证及 WebSocket/SSE 观察
 
-- mcp-ssh 3.3.0：解释器独立参数、传输进度、已有 OpenSSH master 复用、命令标准输入、传输限速、显式文件校验、目录筛选分页与 SFTP/输出修正
+- mcp-ssh 3.3.1：主机信任全过程期限与独立锁竞争预算、Windows PowerShell 兼容、解释器独立参数、传输进度、已有 OpenSSH master 复用、命令标准输入、传输限速、显式文件校验、目录筛选分页与 SFTP/输出修正
 
 - skill-elenchus 1.2.0：差异、完整快照和设计范围，证据分级与共享评审预算
 

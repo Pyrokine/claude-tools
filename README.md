@@ -59,13 +59,14 @@ Each subdirectory README includes source build instructions and client-specific 
 - mcp-claude-history 2.2.1: Session titles, exact large-history search, paged source catalogs, full-content exports,
   precise source recovery, and private output bundles
 
-- mcp-chrome 3.1.1: Local file uploads, hidden-field value protection, middle-button events, focus-only editing
-  commands, task page controls, Cloudflare completion checks, open Shadow DOM and nested frames, browser dialogs,
-  original response/download capture, request routing, scoped HTTP authentication, and WebSocket/SSE observation
+- mcp-chrome 3.1.2: Shared iframe deadlines and Windows PowerShell compatibility, with local file uploads, hidden-field
+  value protection, middle-button events, focus-only editing commands, task page controls, Cloudflare completion checks,
+  open Shadow DOM and nested frames, browser dialogs, original response/download capture, request routing, scoped HTTP
+  authentication, and WebSocket/SSE observation
 
-- mcp-ssh 3.3.0: Interpreter arguments and transfer progress, with OpenSSH master reuse, command stdin, transfer
-  bandwidth
-  limits, explicit file verification, filtered directory pages, and SFTP/output corrections
+- mcp-ssh 3.3.1: Deadline-bounded host trust and Windows PowerShell compatibility, with interpreter arguments, transfer
+  progress, OpenSSH master reuse, command stdin, transfer bandwidth limits, explicit file verification, filtered
+  directory pages, and SFTP/output corrections
 
 - skill-elenchus 1.2.0: Diff, snapshot and design scopes, evidence levels, and shared review budgets
 
