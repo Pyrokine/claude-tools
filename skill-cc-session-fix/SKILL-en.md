@@ -1,14 +1,29 @@
 ---
 name: cc-session-fix
 description: >-
-  Fix Claude Code session jsonl issues — /resume failures, wrong context after resume, oversized jsonl, "Resume
-  cancelled", /compact "Invalid signature in thinking block". Diagnoses uuid chain, compact_boundary and resume leaf
-  selection; safely truncates, removes thinking blocks and appends custom-title.
-argument-hint: "[session-id or path]"
+    Fix Claude Code session jsonl issues — /resume failures, wrong context after resume, oversized jsonl, "Resume
+    cancelled", /compact "Invalid signature in thinking block". Diagnoses uuid chain, compact_boundary and resume leaf
+    selection; safely truncates, removes thinking blocks and appends custom-title.
+argument-hint: '[session-id or path]'
 ---
+
+# Claude Code Session JSONL Diagnostics and Repair
 
 Diagnostic and repair toolkit for Claude Code session JSONL files. Handles `/resume` failures, wrong-anchor recovery,
 oversized transcripts and thinking signature errors.
+
+## Dependencies and optional capabilities
+
+Diagnose and repair an existing JSONL file directly with the Python scripts. They use only the Python standard library
+and the bundled `session_io.py`.
+
+- **Python 3.8 or later**: Required for diagnosis, repair and isolated regression tests. Provide `python3` in the
+  execution environment; script entry points follow, and test prerequisites are in [TESTING.md](TESTING.md)
+- **Claude Code CLI**: Required for creating sessions, loading this Skill and verifying recovery through `/resume`.
+  Offline JSONL processing can run without starting it. Install Claude Code in the target environment; see
+  [README.md](README.md#install) for Skill installation
+- **Ruff**: Optional for Python static checks during maintenance. Install `ruff` in the maintenance environment;
+  commands are in [TESTING.md](TESTING.md)
 
 ## Scripts
 
@@ -16,8 +31,7 @@ oversized transcripts and thinking signature errors.
   inferred resume leaf and truncation recommendation
 - **[scripts/truncate.py](scripts/truncate.py)**: Keep first N lines, remove thinking blocks, append custom-title,
   validate the final JSONL and UUID chain; `--new-session` writes a new UUID file and retains the original
-- `scripts/session_io.py` shares the standard-library implementation between both entry points; no dependencies to
-  install
+- `scripts/session_io.py` shares the implementation between both entry points
 
 ## Typical workflow
 

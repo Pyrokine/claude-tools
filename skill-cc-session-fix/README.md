@@ -86,7 +86,7 @@ scripts/truncate.py <target> --line <N> --title "..." --new-session # fork to fr
 
 Stop every process writing the session before repairing in place. For an active session, use `--new-session`; it leaves
 the source path untouched. A change detected during reading or preparation refuses publication, so retry from a fresh
-diagnosis. Windows checks descriptor ctime independently from path metadata, so differing creation-time and change-time
+diagnosis. Windows checks descriptor ctime independently of path metadata, so differing creation-time and change-time
 values do not reject a stable file; file identity, size, modification time and mode remain checked.
 
 - Each in-place repair preserves a unique `.bak.<random-id>` backup, printed as `Backup`
@@ -154,8 +154,12 @@ memory.
 
 ## Regression tests
 
-Python 3.8 or later is required. Tests use synthetic JSONL under isolated HOME directories, including native Windows
-DACL and replacement cases when run on Windows.
+The diagnostic and repair scripts, as well as the tests, require Python 3.8 or later and use only the standard library.
+Existing JSONL files can be processed without starting Claude Code. Verifying actual `/resume` recovery requires the
+Claude Code CLI. Ruff is optional for the static check below.
+
+Tests use synthetic JSONL under isolated HOME directories, including native Windows DACL and replacement cases when run
+on Windows.
 
 ```bash
 python3 -I -B scripts/test_session_fix.py -v

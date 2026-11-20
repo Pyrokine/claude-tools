@@ -25,7 +25,7 @@ replaces the validator or publication algorithm with a substitute.
 
 - **SF-01 links**
     - Inputs and operation: Project-scoped lookup encounters a symlink into another project
-    - Acceptance: Id/prefix lookup refuses the cross-project file; an explicit existing file path retains its precedence
+    - Acceptance: ID/prefix lookup refuses the cross-project file; an explicit existing file path retains its precedence
 
 - **SF-02 backups**
     - Inputs and operation: Two successive in-place truncations, plus a deliberately occupied backup name
@@ -35,7 +35,7 @@ replaces the validator or publication algorithm with a substitute.
 - **SF-02 changes**
     - Inputs and operation: Append immediately before backup creation, or change the source between read and commit
       using the real platform publication primitive while the original descriptor remains open
-    - Acceptance: Refuse overwrite, retain the modified source and report recovery/staging paths
+    - Acceptance: Refuse overwriting, retain the modified source and report recovery/staging paths
 
 - **SF-02 platform timestamps**
     - Inputs and operation: Give Windows path stat a creation-time ctime different from the descriptor's change-time

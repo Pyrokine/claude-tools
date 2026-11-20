@@ -137,7 +137,10 @@ DACL，原地备份保留原文件的访问控制，发布失败会报告私有�
 
 ## 回归测试
 
-需要 Python 3.8 或更新版本，测试只使用隔离 HOME 下的合成 JSONL，在 Windows 上会执行原生 DACL 和文件替换用例
+诊断、修复脚本和测试都需要 Python 3.8 或更新版本，仅使用标准库，已有 JSONL 文件可直接处理，无需启动 Claude Code
+实际 `/resume` 恢复验证需要 Claude Code CLI，下方静态检查使用可选的 Ruff
+
+测试只使用隔离 HOME 下的合成 JSONL，在 Windows 上会执行原生 DACL 和文件替换用例
 
 ```bash
 python3 -I -B scripts/test_session_fix.py -v

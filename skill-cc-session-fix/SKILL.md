@@ -1,13 +1,25 @@
 ---
 name: cc-session-fix
 description: >-
-  修复 Claude Code session jsonl 问题 — /resume 失败、resume 后上下文错位、jsonl 过大、resume cancelled、/compact 报 Invalid signature in
-  thinking block，诊断 uuid 链、compact_boundary、resume leaf 选择，安全截断并补 custom-title，当用户说 resume 失败、resume 恢复错位、jsonl
-  太大、resume 卡住、compact 失败、thinking block 签名错误时使用
-argument-hint: "[session-id or path]"
+    修复 Claude Code session jsonl 问题 — /resume 失败、resume 后上下文错位、jsonl 过大、resume cancelled、/compact
+    报 Invalid signature in thinking block，诊断 uuid 链、compact_boundary、resume leaf 选择，安全截断并补
+    custom-title，当用户说 resume 失败、resume 恢复错位、jsonl 太大、resume 卡住、compact 失败、thinking block 签名错误时使用
+argument-hint: '[session-id or path]'
 ---
 
+# Claude Code Session JSONL 诊断与修复
+
 Claude Code session JSONL 诊断与修复工具，处理 `/resume` 失败、上下文错位、文件过大和 thinking 签名错误
+
+## 依赖与可选能力
+
+已有 JSONL 文件可直接使用 Python 脚本诊断和修复，脚本仅使用 Python 标准库与本目录的 `session_io.py`
+
+- **Python 3.8 或更新版本**：诊断、修复及隔离回归测试必需，在执行环境提供 `python3`，脚本入口见下文，
+  测试前置条件见 [TESTING.md](TESTING.md)
+- **Claude Code CLI**：创建会话、加载此 Skill，以及使用 `/resume` 验证恢复效果时必需，离线处理已有 JSONL 时无需启动，
+  在目标环境安装 Claude Code，Skill 安装见 [README_zh.md](README_zh.md#安装)
+- **Ruff**：维护时执行 Python 静态检查的可选工具，在维护环境安装 `ruff`，检查命令见 [TESTING.md](TESTING.md)
 
 ## 脚本
 
@@ -15,7 +27,7 @@ Claude Code session JSONL 诊断与修复工具，处理 `/resume` 失败、上�
   leaf 推断和截断建议
 - **[scripts/truncate.py](scripts/truncate.py)**：截到 N 行、删除 thinking
   block、追加 custom-title、验证最终 JSONL 和 uuid 链；`--new-session` 生成新 UUID，保留原文件
-- `scripts/session_io.py` 为两个入口共享的标准库实现，无需安装依赖
+- `scripts/session_io.py` 为两个入口共享的实现
 
 ## 典型流程
 

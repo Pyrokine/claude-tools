@@ -1,8 +1,8 @@
 ---
 name: elenchus
-description:
-    Evidence-led dialectical analysis for L1/L2 code, design and decision tasks, with diff/full/design scopes, bounded
-    independent review and conclusion-first output
+description: >-
+    Evidence-led dialectical analysis for L1/L2 code, design and decision tasks, with diff/full/design scopes,
+    bounded independent review and conclusion-first output
 argument-hint: '[mode=diff|full|design] [analysis target] [depth=L0|L1|L2]'
 version: 1.2.0
 ---
@@ -14,6 +14,19 @@ consequences.
 
 Establish the target, current authority and completion conditions first. Scope and depth are separate choices. A review
 result does not authorize edits, commits or publication.
+
+## Dependencies and optional capabilities
+
+Prepare capabilities for the actual stages below; retain each stage's existing scope, tools and completion conditions.
+
+- **Git**: Required when checking code changes, commits or working-tree differences. Provide `git` and use the actual
+  repository path
+- **Host file and command tools**: Use the Host's currently available, authorized file, terminal or target-environment
+  tools to read source, rules or logs absent from context and run controlled verification, as needed for evidence
+  collection and verification
+- **Host agent tools**: Required only when delegating independent L2 scopes or verifiers. Use the Host's supported
+  delegation, wait and completion interfaces; check availability and authority before dispatch, then wait for results
+  and completion notifications
 
 ## 1 Analysis Scope
 
