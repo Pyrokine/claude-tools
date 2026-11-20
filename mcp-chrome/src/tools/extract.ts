@@ -92,8 +92,15 @@ const extractSchema = z
             .optional()
             .describe(
                 '目标元素（attribute 必填；text/html 可选，省略则提取整个页面；text 对 HTML 使用 innerText，SVG/XML 使用 textContent；' +
-                    'screenshot 可选用于元素截图；state 可选（仅 Extension）用于返回目标子树；metadata 不需要）'
+                    'screenshot 可选用于元素截图；state 可选用于返回目标子树；metadata 不需要）'
             ),
+        maxChars: z.number().int().positive().optional().describe('text：最多返回的 UTF-16 字符数，省略时保留完整文本'),
+        offset: z
+            .number()
+            .int()
+            .nonnegative()
+            .optional()
+            .describe('text：本次文本的 UTF-16 起始位置，默认 0，使用返回的 nextOffset 继续读取'),
         attribute: z.string().optional().describe('属性名（attribute）'),
         images: z
             .enum(['info', 'data'])
@@ -155,6 +162,9 @@ const extractSchema = z
         frame: frameZodSchema.describe('iframe selector／索引或逐层路径（如 ["iframe#outer", 0]），省略时使用主文档'),
     })
     .superRefine((args, context) => {
+        if (args.type !== 'text' && (args.maxChars !== undefined || args.offset !== undefined)) {
+            context.addIssue({ code: 'custom', path: ['maxChars'], message: 'maxChars 和 offset 仅用于 text' })
+        }
         if (args.diffOutput && !args.compareWith) {
             context.addIssue({
                 code: 'custom',
@@ -178,6 +188,7 @@ interface ExtractContext {
     unifiedSession: ReturnType<typeof getUnifiedSession>
     session: ReturnType<typeof getSession>
     useExtension: boolean
+    deadline: number
 }
 
 async function handleExtract(args: ExtractArgs, signal?: AbortSignal): Promise<ExtractToolResponse> {
@@ -215,9 +226,8 @@ async function handleExtract(args: ExtractArgs, signal?: AbortSignal): Promise<E
                         }
                         const session = getSession()
 
-                        // Extension 路径：等待目标元素出现（如果指定了 target + timeout）
-                        if (useExtension && args.target && args.timeout !== undefined) {
-                            await waitForTargetExtension(
+                        if (args.target && args.timeout !== undefined && (useExtension || args.type === 'screenshot')) {
+                            await waitForTarget(
                                 unifiedSession,
                                 args.target,
                                 remainingNavigationTimeout(deadline),
@@ -230,7 +240,10 @@ async function handleExtract(args: ExtractArgs, signal?: AbortSignal): Promise<E
                                 !useExtension && args.target
                                     ? { ...args, timeout: targetLookupTimeout(Math.max(1, deadline - Date.now())) }
                                     : args
-                            return await handleExtractInFrame({ unifiedSession, session, useExtension }, scopedArgs)
+                            return await handleExtractInFrame(
+                                { unifiedSession, session, useExtension, deadline },
+                                scopedArgs
+                            )
                         } catch (error) {
                             if (!useExtension && args.target && error instanceof ElementNotFoundError) {
                                 await enrichTargetError(error, unifiedSession, args.target, {
@@ -310,11 +323,22 @@ async function handleTextExtract(
     const text = useExtension
         ? await extractTextExtension(unifiedSession, args.target, args.timeout)
         : await extractText(session, args.target, args.timeout)
+    const offset = args.offset ?? 0
+    const content = text.slice(offset, args.maxChars === undefined ? undefined : offset + args.maxChars)
+    const pagination =
+        args.maxChars === undefined && args.offset === undefined
+            ? {}
+            : {
+                  offset,
+                  totalLength: text.length,
+                  nextOffset: offset + content.length < text.length ? offset + content.length : null,
+                  truncated: offset > 0 || content.length < text.length,
+              }
     if (args.output) {
-        const outputPath = await writeOutputFile(args.output, text, 'utf-8')
-        return formatResponse({ success: true, type: 'text', output: outputPath, size: text.length })
+        const outputPath = await writeOutputFile(args.output, content, 'utf-8')
+        return formatResponse({ success: true, type: 'text', output: outputPath, size: content.length, ...pagination })
     }
-    return formatResponse({ success: true, type: 'text', content: text })
+    return formatResponse({ success: true, type: 'text', content, ...pagination })
 }
 
 async function handleHtmlExtract(context: ExtractContext, args: ExtractArgs): Promise<ExtractToolResponse> {
@@ -369,10 +393,12 @@ async function handleAttributeExtract(
 }
 
 async function handleScreenshotExtract(
-    { unifiedSession, useExtension }: ExtractContext,
+    { unifiedSession, useExtension, deadline }: ExtractContext,
     args: ExtractArgs
 ): Promise<ExtractToolResponse> {
+    const remaining = (): number => remainingNavigationTimeout(deadline)
     let clip: { x: number; y: number; width: number; height: number } | undefined
+    let clippedToVisibleArea = false
     if (args.target && !args.clip) {
         const {
             selector,
@@ -385,7 +411,7 @@ async function handleScreenshotExtract(
         const pointTarget = 'x' in args.target && 'y' in args.target ? args.target : null
         const found = pointTarget
             ? useExtension
-                ? await unifiedSession.findAtPoint(pointTarget.x, pointTarget.y, nth, args.timeout)
+                ? await unifiedSession.findAtPoint(pointTarget.x, pointTarget.y, nth, remaining(), 'frame')
                 : await unifiedSession
                       .evaluate<Awaited<ReturnType<typeof unifiedSession.find>>[number] | null>(
                           `(() => {
@@ -401,16 +427,16 @@ async function handleScreenshotExtract(
                           };
                       })()`,
                           undefined,
-                          args.timeout
+                          remaining()
                       )
                       .then((element) => (element && nth === 0 ? [element] : []))
-            : await unifiedSession.find(selector, text, xpath, args.timeout, semantic, nth)
+            : await unifiedSession.find(selector, text, xpath, remaining(), semantic, nth, 'frame')
         const target = found[0]
         if (!target || target.rect.width <= 0 || target.rect.height <= 0) {
             throw new TargetNotFoundError(
                 await buildTargetDiagnostics(unifiedSession, args.target, {
                     nth,
-                    timeout: args.timeout,
+                    timeout: remaining(),
                     frame: args.frame,
                     matchCount: null,
                     lastState: target ? 'zero-size' : 'not-found',
@@ -419,14 +445,125 @@ async function handleScreenshotExtract(
             )
         }
 
-        const scrollOffset =
-            args.frame === undefined ? await getPageScrollOffset(unifiedSession, args.timeout) : { x: 0, y: 0 }
-        clip = {
-            x: target.rect.x + scrollOffset.x,
-            y: target.rect.y + scrollOffset.y,
-            width: target.rect.width,
-            height: target.rect.height,
+        const visible = await unifiedSession.evaluate<{
+            rect: { x: number; y: number; width: number; height: number }
+            clipped: boolean
+            error?: string
+        }>(
+            `(() => {
+            (${installDomHelpers.toString()})();
+            return (query, nth, point, clipViewport) => {
+                const helpers = globalThis.__mcpDomHelpers;
+                const element = point ? helpers.deepElementFromPoint(point.x, point.y) : helpers.query(query)[nth];
+                if (!element) return { rect: { x: 0, y: 0, width: 0, height: 0 }, clipped: true };
+                const original = element.getBoundingClientRect();
+                let left = original.left, top = original.top, right = original.right, bottom = original.bottom;
+                const parentOf = (node) => node.assignedSlot || node.parentElement || node.getRootNode().host || null;
+                let position = getComputedStyle(element).position;
+                let escaping = position === 'absolute' || position === 'fixed';
+                for (let parent = parentOf(element); parent; parent = parentOf(parent)) {
+                    const style = getComputedStyle(parent);
+                    if (escaping) {
+                        const containing = style.transform !== 'none' || style.perspective !== 'none' ||
+                            style.filter !== 'none' || /(?:paint|layout|strict|content)/.test(style.contain) ||
+                            (position === 'absolute' && style.position !== 'static');
+                        if (!containing) continue;
+                        escaping = false;
+                    }
+                    const clipsHorizontally = /^(?:hidden|clip|scroll|auto)$/.test(style.overflowX);
+                    const clipsVertically = /^(?:hidden|clip|scroll|auto)$/.test(style.overflowY);
+                    if (clipsHorizontally || clipsVertically) {
+                        for (let owner = parent; owner; owner = parentOf(owner)) {
+                            const css = getComputedStyle(owner);
+                            const matrix = new DOMMatrix(css.transform === 'none' ? undefined : css.transform);
+                            if (!matrix.is2D || Math.abs(matrix.a - 1) > 1e-12 || Math.abs(matrix.d - 1) > 1e-12 ||
+                                Math.abs(matrix.b) > 1e-12 || Math.abs(matrix.c) > 1e-12 ||
+                                (css.rotate && css.rotate !== 'none' && Number.parseFloat(css.rotate) !== 0) ||
+                                (css.scale && css.scale !== 'none' &&
+                                    css.scale.split(/\\s+/).some(value => Number(value) !== 1)) ||
+                                (Number.parseFloat(css.zoom) || 1) !== 1) {
+                                return { rect: { x: 0, y: 0, width: 0, height: 0 }, clipped: false,
+                                    error: 'Overflow clip geometry requires translation-only ancestors' };
+                            }
+                        }
+                        const bounds = parent.getBoundingClientRect();
+                        if (clipsHorizontally) {
+                            left = Math.max(left, bounds.left + parent.clientLeft);
+                            right = Math.min(right, bounds.left + parent.clientLeft + parent.clientWidth);
+                        }
+                        if (clipsVertically) {
+                            top = Math.max(top, bounds.top + parent.clientTop);
+                            bottom = Math.min(bottom, bounds.top + parent.clientTop + parent.clientHeight);
+                        }
+                    }
+                    if (style.position === 'absolute' || style.position === 'fixed') {
+                        position = style.position;
+                        escaping = true;
+                    }
+                }
+                if (clipViewport) {
+                    left = Math.max(left, 0); top = Math.max(top, 0);
+                    right = Math.min(right, innerWidth); bottom = Math.min(bottom, innerHeight);
+                }
+                return { rect: { x: left, y: top,
+                    width: Math.max(0, right - left), height: Math.max(0, bottom - top) },
+                    clipped: left !== original.left || top !== original.top ||
+                        right !== original.right || bottom !== original.bottom };
+            };
+        })()`,
+            undefined,
+            remaining(),
+            [{ selector, text, xpath, semantic }, nth, pointTarget, args.frame !== undefined]
+        )
+        if (visible.error) {
+            throw new StructuredToolError(
+                'FRAME_GEOMETRY_UNAVAILABLE',
+                visible.error,
+                '使用未变换的滚动容器或显式根页面 clip',
+                { actionExecuted: false, actionStatus: 'not_started' }
+            )
         }
+        if (visible.rect.width <= 0 || visible.rect.height <= 0) {
+            throw new StructuredToolError(
+                'ELEMENT_NOT_VISIBLE',
+                '目标元素位于滚动容器的已绘制区域之外',
+                '滚动目标容器使元素可见后再截图',
+                { actionExecuted: false, actionStatus: 'not_started' }
+            )
+        }
+        clippedToVisibleArea = visible.clipped
+        let rect = visible.rect
+        if (useExtension && args.frame !== undefined) {
+            const offset = unifiedSession.getFrameOffset()
+            if (!offset) {
+                throw new StructuredToolError(
+                    'FRAME_GEOMETRY_UNAVAILABLE',
+                    '无法将 frame 截图区域映射到根页面',
+                    '重新读取 frame 文档和布局',
+                    { actionExecuted: false, actionStatus: 'not_started' }
+                )
+            }
+            rect = { ...rect, x: rect.x + offset.x, y: rect.y + offset.y }
+        }
+        if (!useExtension && args.frame !== undefined) {
+            const session = getSession()
+            const points = []
+            for (const x of [rect.x, rect.x + rect.width]) {
+                for (const y of [rect.y, rect.y + rect.height]) {
+                    points.push(await session.mapFramePoint({ x, y }, remainingNavigationTimeout(deadline)))
+                }
+            }
+            const left = Math.min(...points.map((point) => point.x))
+            const top = Math.min(...points.map((point) => point.y))
+            rect = {
+                x: left,
+                y: top,
+                width: Math.max(...points.map((point) => point.x)) - left,
+                height: Math.max(...points.map((point) => point.y)) - top,
+            }
+        }
+        const scrollOffset = await getPageScrollOffset(unifiedSession, remaining())
+        clip = { x: rect.x + scrollOffset.x, y: rect.y + scrollOffset.y, width: rect.width, height: rect.height }
     }
 
     clip = args.clip ?? clip
@@ -447,7 +584,7 @@ async function handleScreenshotExtract(
     const encodedDimensions = readImageDimensions(screenshotBuffer, screenshot.format)
     const fallbackDimensions = encodedDimensions
         ? undefined
-        : await getScreenshotFallbackDimensions(unifiedSession, clip, fullPage, scale, args.timeout)
+        : await getScreenshotFallbackDimensions(unifiedSession, clip, fullPage, scale, remaining())
     const dimensions = encodedDimensions ?? fallbackDimensions
     const metadata: Record<string, unknown> = {
         format: screenshot.format,
@@ -460,6 +597,7 @@ async function handleScreenshotExtract(
         scale,
         fullPage,
         clip,
+        ...(clippedToVisibleArea ? { clippedToVisibleArea: true } : {}),
         size: screenshotBuffer.length,
         byteSize: screenshotBuffer.length,
         capabilities: screenshotCapabilities(),
@@ -522,8 +660,8 @@ async function handleStateExtract(
             } = targetToFindParams(args.target as Target & { nth?: number })
             const candidates =
                 'x' in args.target && 'y' in args.target
-                    ? await unifiedSession.findAtPoint(args.target.x, args.target.y)
-                    : await unifiedSession.find(selector, text, xpath, args.timeout, semantic)
+                    ? await unifiedSession.findAtPoint(args.target.x, args.target.y, undefined, undefined, 'frame')
+                    : await unifiedSession.find(selector, text, xpath, args.timeout, semantic, undefined, 'frame')
             throw new TargetNotFoundError(
                 await buildTargetDiagnostics(unifiedSession, args.target, {
                     nth: nthParam ?? 0,
@@ -682,11 +820,7 @@ async function getPageScrollOffset(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     timeout: number | undefined
 ): Promise<PageScrollOffset> {
-    return unifiedSession.evaluate<PageScrollOffset>(
-        '(() => ({ x: window.scrollX || 0, y: window.scrollY || 0 }))()',
-        undefined,
-        timeout
-    )
+    return unifiedSession.getPageScrollOffset(timeout)
 }
 
 interface ImageDimensions {
@@ -871,8 +1005,8 @@ async function handleHtmlWithImages(
             if (!refId) {
                 const matches =
                     'x' in args.target && 'y' in args.target
-                        ? await unifiedSession.findAtPoint(args.target.x, args.target.y)
-                        : await unifiedSession.find(selector, text, xpath, args.timeout, semantic)
+                        ? await unifiedSession.findAtPoint(args.target.x, args.target.y, undefined, undefined, 'frame')
+                        : await unifiedSession.find(selector, text, xpath, args.timeout, semantic, undefined, 'frame')
                 throw new TargetNotFoundError(
                     await buildTargetDiagnostics(unifiedSession, args.target, {
                         nth,
@@ -885,7 +1019,7 @@ async function handleHtmlWithImages(
             }
             result = await unifiedSession.getHtmlWithImagesByRef(refId)
         } else {
-            const matches = await unifiedSession.find(selector, text, xpath, args.timeout, semantic, nth)
+            const matches = await unifiedSession.find(selector, text, xpath, args.timeout, semantic, nth, 'frame')
             if (matches.length === 0) {
                 throw new TargetNotFoundError(
                     await buildTargetDiagnostics(unifiedSession, args.target, {
@@ -897,7 +1031,15 @@ async function handleHtmlWithImages(
                     })
                 )
             }
-            result = await extractHtmlWithImagesByTarget(unifiedSession, selector, text, xpath, nth, args.timeout)
+            result = await extractHtmlWithImagesByTarget(
+                unifiedSession,
+                selector,
+                text,
+                xpath,
+                nth,
+                args.timeout,
+                semantic
+            )
         }
     } else {
         result = useExtension
@@ -960,27 +1102,15 @@ async function extractHtmlWithImagesByTarget(
     text: string | undefined,
     xpath: string | undefined,
     nth: number,
-    timeout: number | undefined
+    timeout: number | undefined,
+    semantic: ReturnType<typeof targetToFindParams>['semantic']
 ): Promise<{ html: string; images: ImageInfo[] }> {
     return unifiedSession.evaluate<{ html: string; images: ImageInfo[] }>(
-        `(function(selector, text, xpath, nth) {
-            var candidates = [];
-            if (xpath) {
-                var snapshot = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                for (var i = 0; i < snapshot.snapshotLength; i++) candidates.push(snapshot.snapshotItem(i));
-            } else if (selector) {
-                candidates = Array.from(document.querySelectorAll(selector));
-            } else if (text) {
-                candidates = Array.from(document.querySelectorAll('*')).filter(function(element) {
-                    return (element.textContent || '').includes(text);
-                });
-            }
-            if (text && (selector || xpath)) {
-                candidates = candidates.filter(function(element) {
-                    return (element.textContent || '').includes(text);
-                });
-            }
-            var root = candidates[nth];
+        `(() => { (${installDomHelpers.toString()})(); return function(selector, text, xpath, nth, semantic) {
+            const root = globalThis.__mcpDomHelpers.query({
+                selector: selector ?? undefined, text: text ?? undefined,
+                xpath: xpath ?? undefined, semantic: semantic ?? undefined
+            })[nth];
             if (!root || !root.outerHTML) return { html: '', images: [] };
             var imageNodes = [];
             if (root.tagName === 'IMG') imageNodes.push(root);
@@ -1003,10 +1133,10 @@ async function extractHtmlWithImagesByTarget(
                 };
             });
             return { html: root.outerHTML, images: images };
-        })`,
+        }; })()`,
         undefined,
         timeout,
-        [selector ?? null, text ?? null, xpath ?? null, nth]
+        [selector ?? null, text ?? null, xpath ?? null, nth, semantic ?? null]
     )
 }
 
@@ -1425,8 +1555,8 @@ async function findTargetRefExtension(
     const { selector, text, xpath, nth, semantic } = targetToFindParams(target as Target & { nth?: number })
     const matches =
         'x' in target && 'y' in target
-            ? await unifiedSession.findAtPoint(target.x, target.y, nth ?? 0, timeout)
-            : await unifiedSession.find(selector, text, xpath, timeout, semantic, nth ?? 0)
+            ? await unifiedSession.findAtPoint(target.x, target.y, nth ?? 0, timeout, 'frame')
+            : await unifiedSession.find(selector, text, xpath, timeout, semantic, nth ?? 0, 'frame')
     return matches[0]?.refId
 }
 
@@ -1483,12 +1613,9 @@ async function extractAttributeExtension(
 }
 
 /**
- * Extension 模式：等待目标元素出现
- *
- * 在 extract 操作前轮询 find()，直到找到匹配元素或超时，
- * 用于实现 extract 的 timeout 参数语义
+ * 在提取前轮询 find()，直到找到指定索引的元素或超时
  */
-async function waitForTargetExtension(
+async function waitForTarget(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     target: Target,
     timeout: number,
@@ -1529,14 +1656,14 @@ async function waitForTargetExtension(
         }
 
         const remaining = timeout - elapsed
-        if (!unifiedSession.isExtensionConnected()) {
+        if (unifiedSession.getMode() === 'extension' && !unifiedSession.isExtensionConnected()) {
             lastError = new Error('Extension 未连接')
             await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelay, remaining)))
             continue
         }
 
         try {
-            const elements = await unifiedSession.find(selector, text, xpath, remaining, semantic)
+            const elements = await unifiedSession.find(selector, text, xpath, remaining, semantic, undefined, 'frame')
             matchCount = elements.length < 50 ? elements.length : null
             candidates = elements
             const selected =
@@ -1549,7 +1676,8 @@ async function waitForTargetExtension(
                               xpath,
                               Math.max(1, timeout - (Date.now() - startTime)),
                               semantic,
-                              nth
+                              nth,
+                              'frame'
                           )
                       )[0]
             if (selected) {

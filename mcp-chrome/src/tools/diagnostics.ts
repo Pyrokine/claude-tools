@@ -1,5 +1,5 @@
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
-import { getErrorSource } from '../core/errors.js'
+import { getErrorSource, setErrorPageContext } from '../core/errors.js'
 import { formatErrorResponse, formatResponse, getUnifiedSession } from '../core/index.js'
 import { withNavigationBudget } from '../core/utils.js'
 import { sanitizeUrlRecords } from './network-sanitizer.js'
@@ -66,6 +66,7 @@ export async function startDiagnostics(
         }
     } catch (error) {
         if (getErrorSource(error) === 'budget') {
+            setErrorPageContext(error, { diagnosticsPreparation: true })
             unifiedSession.annotateUserActionError?.(error)
             throw error
         }

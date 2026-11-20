@@ -11,7 +11,7 @@ import { ExtensionHttpServer } from '../dist/extension/http-server.js';
 import { registerInputTool } from '../dist/tools/input.js';
 
 function extensionModule(path, imports, globals = {}) {
-    const source = readFileSync(new URL(`../extension/src/${path}.ts`, import.meta.url), 'utf8');
+    const source = readFileSync(new URL(`../extension/src/${path}.ts`, import.meta.url), { encoding: 'utf8' });
     const code = ts.transpileModule(source, {
         compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
     }).outputText;
@@ -27,6 +27,7 @@ function wheelRealm() {
     const events = [];
     const scrolls = [];
     const element = {
+        isConnected: true,
         scrollWidth: 1000,
         clientWidth: 100,
         scrollLeft: 0,
@@ -47,7 +48,7 @@ function wheelRealm() {
             this.scrollTop += y;
         },
     };
-    const root = { style: { overflowX: 'visible', overflowY: 'visible' } };
+    const root = { isConnected: true, style: { overflowX: 'visible', overflowY: 'visible' } };
     element.parentElement = root;
     const realm = vm.createContext({
         document: { documentElement: root, elementFromPoint: () => element },
@@ -157,6 +158,7 @@ async function publicWheel(mode, scenario, options = {}) {
     httpServer.clientSocket = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             if (message.type === 'cancel') {
@@ -269,9 +271,17 @@ async function publicWheel(mode, scenario, options = {}) {
 
 for (const mode of ['precise', 'stealth']) {
     for (const scenario of ['unchanged', 'after-resolve', 'after-helper', 'removed', 'after-effect-rejection']) {
-        test(`C31-03 public input ${mode}/${scenario} reaches the production wheel handler and restores frame identity`, async () => {
-            await publicWheel(mode, scenario);
-        });
+        test(
+            'C31-03 public input ' +
+                `${mode}` +
+                '/' +
+                `${scenario}` +
+                ' reaches the production wheel handler and ' +
+                'restores frame identity',
+            async () => {
+                await publicWheel(mode, scenario);
+            }
+        );
     }
 }
 
@@ -282,6 +292,7 @@ function scrollingRealm({ axis = 'x', delta = 200, shadow = false, cancelAt, atB
     const document = {};
     const node = (name, parentElement, overflowX = 'hidden', overflowY = 'hidden') => ({
         name,
+        isConnected: true,
         parentElement,
         currentCSSZoom: 1,
         scrollWidth: 1000,
@@ -290,6 +301,14 @@ function scrollingRealm({ axis = 'x', delta = 200, shadow = false, cancelAt, atB
         clientHeight: 100,
         scrollLeft: delta < 0 ? 400 : 0,
         scrollTop: delta < 0 ? 400 : 0,
+        /** @type {number | undefined} */
+        minX: undefined,
+        /** @type {number | undefined} */
+        maxX: undefined,
+        /** @type {number | undefined} */
+        minY: undefined,
+        /** @type {number | undefined} */
+        maxY: undefined,
         style: {
             overflowX,
             overflowY,
@@ -394,53 +413,78 @@ for (const mode of ['precise', 'stealth']) {
     for (const axis of ['x', 'y']) {
         for (const delta of [200, -200]) {
             for (const atBoundary of [false, true]) {
-                test(`C31F-03A public ${mode} ${axis}/${delta} chooses the ancestor with remaining range; boundary=${atBoundary}`, async () => {
-                    const document = scrollingRealm({ axis, delta, atBoundary });
-                    await publicWheel(mode, 'unchanged', {
-                        document,
-                        event: { type: 'wheel', target: { x: 40, y: 30 }, [axis === 'x' ? 'deltaX' : 'deltaY']: delta },
-                        verify({ payload, injections }) {
-                            assert.equal(payload.retryable, false);
-                            assert.deepEqual(document.scrolls, [
-                                {
-                                    name: atBoundary ? 'outer' : 'container',
-                                    x: axis === 'x' ? delta : 0,
-                                    y: axis === 'y' ? delta : 0,
-                                },
-                            ]);
-                            assert.equal(document.events.length, 1);
-                            assert.deepEqual([document.events[0].clientX, document.events[0].clientY], [40, 30]);
-                            assert.ok(injections.every(({ target }) => target.documentIds[0] === 'document-a'));
-                        },
-                    });
-                });
+                test(
+                    'C31F-03A public ' +
+                        `${mode}` +
+                        ' ' +
+                        `${axis}` +
+                        '/' +
+                        `${delta}` +
+                        ' chooses the ancestor with remaining range; ' +
+                        'boundary=' +
+                        `${atBoundary}` +
+                        '',
+                    async () => {
+                        const document = scrollingRealm({ axis, delta, atBoundary });
+                        await publicWheel(mode, 'unchanged', {
+                            document,
+                            event: {
+                                type: 'wheel',
+                                target: { x: 40, y: 30 },
+                                [axis === 'x' ? 'deltaX' : 'deltaY']: delta,
+                            },
+                            verify({ payload, injections }) {
+                                assert.equal(payload.retryable, false);
+                                assert.deepEqual(document.scrolls, [
+                                    {
+                                        name: atBoundary ? 'outer' : 'container',
+                                        x: axis === 'x' ? delta : 0,
+                                        y: axis === 'y' ? delta : 0,
+                                    },
+                                ]);
+                                assert.equal(document.events.length, 1);
+                                assert.deepEqual([document.events[0].clientX, document.events[0].clientY], [40, 30]);
+                                assert.ok(injections.every(({ target }) => target.documentIds[0] === 'document-a'));
+                            },
+                        });
+                    }
+                );
             }
         }
     }
     for (const shadow of [false, true]) {
         for (const cancelAt of [undefined, 'inner', 'container', 'host', 'document']) {
-            test(`C31F-03B/C public ${mode} shadow=${shadow} cancel=${cancelAt ?? 'none'} preserves propagation and default action`, async () => {
-                const document = scrollingRealm({ axis: 'y', shadow, cancelAt });
-                await publicWheel(mode, 'unchanged', {
-                    document,
-                    event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
-                    verify({ payload }) {
-                        assert.equal(payload.actionStatus, 'completed');
-                        assert.equal(payload.actionExecuted, true);
-                        assert.equal(payload.eventsExecuted, 1);
-                        assert.equal(document.events.length, 1);
-                        const event = document.events[0];
-                        assert.equal(event.composed, true);
-                        assert.equal(event.bubbles, true);
-                        assert.equal(event.cancelable, true);
-                        assert.equal(event.defaultPrevented, Boolean(cancelAt));
-                        assert.ok(document.received.includes('host'));
-                        assert.ok(document.received.includes('document'));
-                        assert.equal(document.scrolls.length, cancelAt ? 0 : 1);
-                        assert.equal(document.container.scrollTop, cancelAt ? 0 : 200);
-                    },
-                });
-            });
+            test(
+                'C31F-03B/C public ' +
+                    `${mode}` +
+                    ' shadow=' +
+                    `${shadow}` +
+                    ' cancel=' +
+                    `${cancelAt ?? 'none'}` +
+                    ' preserves propagation and default action',
+                async () => {
+                    const document = scrollingRealm({ axis: 'y', shadow, cancelAt });
+                    await publicWheel(mode, 'unchanged', {
+                        document,
+                        event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
+                        verify({ payload }) {
+                            assert.equal(payload.actionStatus, 'completed');
+                            assert.equal(payload.actionExecuted, true);
+                            assert.equal(payload.eventsExecuted, 1);
+                            assert.equal(document.events.length, 1);
+                            const event = document.events[0];
+                            assert.equal(event.composed, true);
+                            assert.equal(event.bubbles, true);
+                            assert.equal(event.cancelable, true);
+                            assert.equal(event.defaultPrevented, Boolean(cancelAt));
+                            assert.ok(document.received.includes('host'));
+                            assert.ok(document.received.includes('document'));
+                            assert.equal(document.scrolls.length, cancelAt ? 0 : 1);
+                            assert.equal(document.container.scrollTop, cancelAt ? 0 : 200);
+                        },
+                    });
+                }
+            );
         }
     }
 }
@@ -449,40 +493,32 @@ for (const mode of ['precise', 'stealth']) {
     for (const axis of ['x', 'y']) {
         for (const start of [0, -300, -900]) {
             for (const delta of [-200, 200]) {
-                test(`C31F2-02 public ${mode} ${axis} negative range ${start}/${delta} uses actual movement`, async () => {
-                    const document = scrollingRealm({ axis, delta });
-                    const property = axis === 'x' ? 'scrollLeft' : 'scrollTop';
-                    if (axis === 'x') {
-                        document.container.style.direction = 'rtl';
-                    } else {
-                        Object.assign(document.container.style, { display: 'flex', flexDirection: 'column-reverse' });
-                    }
-                    document.container[axis === 'x' ? 'minX' : 'minY'] = -900;
-                    document.container[axis === 'x' ? 'maxX' : 'maxY'] = 0;
-                    document.container[property] = start;
-                    document.outer[property] = 400;
-                    const end = Math.max(-900, Math.min(0, start + delta));
-                    await publicWheel(mode, 'unchanged', {
-                        document,
-                        event: { type: 'wheel', target: { x: 40, y: 30 }, [axis === 'x' ? 'deltaX' : 'deltaY']: delta },
-                        verify() {
-                            assert.equal(document.container[property], end);
-                            assert.equal(document.outer[property], end === start ? 400 + delta : 400);
-                            assert.equal(document.events.length, 1);
-                        },
-                    });
-                });
-            }
-        }
-        for (const policy of ['auto', 'contain', 'none']) {
-            for (const delta of [-200, 200]) {
-                for (const boundary of [false, true]) {
-                    test(`C31F2-03 public ${mode} ${axis}/${policy}/${delta} boundary=${boundary} preserves chaining`, async () => {
+                test(
+                    'C31F2-02 public ' +
+                        `${mode}` +
+                        ' ' +
+                        `${axis}` +
+                        ' negative range ' +
+                        `${start}` +
+                        '/' +
+                        `${delta}` +
+                        ' uses actual movement',
+                    async () => {
                         const document = scrollingRealm({ axis, delta });
                         const property = axis === 'x' ? 'scrollLeft' : 'scrollTop';
-                        document.container[property] = boundary ? (delta > 0 ? 900 : 0) : 400;
+                        if (axis === 'x') {
+                            document.container.style.direction = 'rtl';
+                        } else {
+                            Object.assign(document.container.style, {
+                                display: 'flex',
+                                flexDirection: 'column-reverse',
+                            });
+                        }
+                        document.container[axis === 'x' ? 'minX' : 'minY'] = -900;
+                        document.container[axis === 'x' ? 'maxX' : 'maxY'] = 0;
+                        document.container[property] = start;
                         document.outer[property] = 400;
-                        document.container.style[axis === 'x' ? 'overscrollBehaviorX' : 'overscrollBehaviorY'] = policy;
+                        const end = Math.max(-900, Math.min(0, start + delta));
                         await publicWheel(mode, 'unchanged', {
                             document,
                             event: {
@@ -490,20 +526,60 @@ for (const mode of ['precise', 'stealth']) {
                                 target: { x: 40, y: 30 },
                                 [axis === 'x' ? 'deltaX' : 'deltaY']: delta,
                             },
-                            verify({ payload }) {
-                                assert.equal(
-                                    document.outer[property],
-                                    boundary && policy === 'auto' ? 400 + delta : 400
-                                );
-                                assert.equal(
-                                    document.container[property],
-                                    boundary ? (delta > 0 ? 900 : 0) : 400 + delta
-                                );
-                                assert.equal(payload.actionStatus, 'completed');
+                            verify() {
+                                assert.equal(document.container[property], end);
+                                assert.equal(document.outer[property], end === start ? 400 + delta : 400);
                                 assert.equal(document.events.length, 1);
                             },
                         });
-                    });
+                    }
+                );
+            }
+        }
+        for (const policy of ['auto', 'contain', 'none']) {
+            for (const delta of [-200, 200]) {
+                for (const boundary of [false, true]) {
+                    test(
+                        'C31F2-03 public ' +
+                            `${mode}` +
+                            ' ' +
+                            `${axis}` +
+                            '/' +
+                            `${policy}` +
+                            '/' +
+                            `${delta}` +
+                            ' boundary=' +
+                            `${boundary}` +
+                            ' preserves chaining',
+                        async () => {
+                            const document = scrollingRealm({ axis, delta });
+                            const property = axis === 'x' ? 'scrollLeft' : 'scrollTop';
+                            document.container[property] = boundary ? (delta > 0 ? 900 : 0) : 400;
+                            document.outer[property] = 400;
+                            document.container.style[axis === 'x' ? 'overscrollBehaviorX' : 'overscrollBehaviorY'] =
+                                policy;
+                            await publicWheel(mode, 'unchanged', {
+                                document,
+                                event: {
+                                    type: 'wheel',
+                                    target: { x: 40, y: 30 },
+                                    [axis === 'x' ? 'deltaX' : 'deltaY']: delta,
+                                },
+                                verify({ payload }) {
+                                    assert.equal(
+                                        document.outer[property],
+                                        boundary && policy === 'auto' ? 400 + delta : 400
+                                    );
+                                    assert.equal(
+                                        document.container[property],
+                                        boundary ? (delta > 0 ? 900 : 0) : 400 + delta
+                                    );
+                                    assert.equal(payload.actionStatus, 'completed');
+                                    assert.equal(document.events.length, 1);
+                                },
+                            });
+                        }
+                    );
                 }
             }
         }
@@ -550,27 +626,46 @@ for (const mode of ['precise', 'stealth']) {
     ]) {
         for (const axis of ['x', 'y']) {
             for (const delta of [-200, 200]) {
-                test(`C31F5-01 public ${mode} ${display}/${overflow}/${policy} ${axis}/${delta} follows its principal box`, async () => {
-                    const document = scrollingRealm({ axis, delta });
-                    const property = axis === 'x' ? 'scrollLeft' : 'scrollTop';
-                    document.container[property] = document.outer[property] = 400;
-                    Object.assign(document.container.style, {
-                        display,
-                        [axis === 'x' ? 'overflowX' : 'overflowY']: overflow,
-                        [axis === 'x' ? 'overscrollBehaviorX' : 'overscrollBehaviorY']: policy,
-                    });
-                    await publicWheel(mode, 'unchanged', {
-                        document,
-                        event: { type: 'wheel', target: { x: 40, y: 30 }, [axis === 'x' ? 'deltaX' : 'deltaY']: delta },
-                        verify() {
-                            assert.equal(
-                                document.container[property],
-                                scrollBox && overflow === 'auto' ? 400 + delta : 400
-                            );
-                            assert.equal(document.outer[property], scrollBox ? 400 : 400 + delta);
-                        },
-                    });
-                });
+                test(
+                    'C31F5-01 public ' +
+                        `${mode}` +
+                        ' ' +
+                        `${display}` +
+                        '/' +
+                        `${overflow}` +
+                        '/' +
+                        `${policy}` +
+                        ' ' +
+                        `${axis}` +
+                        '/' +
+                        `${delta}` +
+                        ' follows its principal box',
+                    async () => {
+                        const document = scrollingRealm({ axis, delta });
+                        const property = axis === 'x' ? 'scrollLeft' : 'scrollTop';
+                        document.container[property] = document.outer[property] = 400;
+                        Object.assign(document.container.style, {
+                            display,
+                            [axis === 'x' ? 'overflowX' : 'overflowY']: overflow,
+                            [axis === 'x' ? 'overscrollBehaviorX' : 'overscrollBehaviorY']: policy,
+                        });
+                        await publicWheel(mode, 'unchanged', {
+                            document,
+                            event: {
+                                type: 'wheel',
+                                target: { x: 40, y: 30 },
+                                [axis === 'x' ? 'deltaX' : 'deltaY']: delta,
+                            },
+                            verify() {
+                                assert.equal(
+                                    document.container[property],
+                                    scrollBox && overflow === 'auto' ? 400 + delta : 400
+                                );
+                                assert.equal(document.outer[property], scrollBox ? 400 : 400 + delta);
+                            },
+                        });
+                    }
+                );
             }
         }
     }
@@ -586,24 +681,39 @@ for (const mode of ['precise', 'stealth']) {
     ]) {
         for (const position of ['absolute', 'fixed']) {
             for (const shadow of [false, true]) {
-                test(`C31F5-02 public ${mode} ${position}/${display}/${property}/${value}/shadow=${shadow} keeps the actual containing block`, async () => {
-                    const document = scrollingRealm({ axis: 'y', shadow });
-                    document.inner.style.position = position;
-                    document.container.style.overflowY = 'visible';
-                    document.outer.scrollTop = 400;
-                    Object.assign(document.container.style, { display, [property]: value });
-                    if (establishes && !shadow) {
-                        document.inner.offsetParent = document.container;
+                test(
+                    'C31F5-02 public ' +
+                        `${mode}` +
+                        ' ' +
+                        `${position}` +
+                        '/' +
+                        `${display}` +
+                        '/' +
+                        `${property}` +
+                        '/' +
+                        `${value}` +
+                        '/shadow=' +
+                        `${shadow}` +
+                        ' keeps the actual containing block',
+                    async () => {
+                        const document = scrollingRealm({ axis: 'y', shadow });
+                        document.inner.style.position = position;
+                        document.container.style.overflowY = 'visible';
+                        document.outer.scrollTop = 400;
+                        Object.assign(document.container.style, { display, [property]: value });
+                        if (establishes && !shadow) {
+                            document.inner.offsetParent = document.container;
+                        }
+                        await publicWheel(mode, 'unchanged', {
+                            document,
+                            event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
+                            verify() {
+                                assert.equal(document.outer.scrollTop, establishes ? 600 : 400);
+                                assert.equal(document.viewport.y, establishes ? 0 : 200);
+                            },
+                        });
                     }
-                    await publicWheel(mode, 'unchanged', {
-                        document,
-                        event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
-                        verify() {
-                            assert.equal(document.outer.scrollTop, establishes ? 600 : 400);
-                            assert.equal(document.viewport.y, establishes ? 0 : 200);
-                        },
-                    });
-                });
+                );
             }
         }
     }
@@ -619,23 +729,33 @@ for (const mode of ['precise', 'stealth']) {
                   ['flow-root list-item', true],
                   ['inline flow-root list-item', true],
               ]) {
-            test(`C31F5-02 public ${mode} ${side}/${display} shares containment eligibility with body propagation`, async () => {
-                const document = scrollingRealm({ axis: 'y' });
-                for (const node of [document.inner, document.container, document.outer]) {
-                    Object.assign(node.style, { overflowX: 'visible', overflowY: 'visible' });
+            test(
+                'C31F5-02 public ' +
+                    `${mode}` +
+                    ' ' +
+                    `${side}` +
+                    '/' +
+                    `${display}` +
+                    ' shares containment eligibility with body ' +
+                    'propagation',
+                async () => {
+                    const document = scrollingRealm({ axis: 'y' });
+                    for (const node of [document.inner, document.container, document.outer]) {
+                        Object.assign(node.style, { overflowX: 'visible', overflowY: 'visible' });
+                    }
+                    Object.assign(document[side].style, { display, contain: 'layout' });
+                    document.body.style.overflowX = document.body.style.overflowY = 'hidden';
+                    document.body.scrollTop = document.viewport.y = 400;
+                    await publicWheel(mode, 'unchanged', {
+                        document,
+                        event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
+                        verify() {
+                            assert.equal(document.body.scrollTop, 400);
+                            assert.equal(document.viewport.y, independent ? 600 : 400);
+                        },
+                    });
                 }
-                Object.assign(document[side].style, { display, contain: 'layout' });
-                document.body.style.overflowX = document.body.style.overflowY = 'hidden';
-                document.body.scrollTop = document.viewport.y = 400;
-                await publicWheel(mode, 'unchanged', {
-                    document,
-                    event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
-                    verify() {
-                        assert.equal(document.body.scrollTop, 400);
-                        assert.equal(document.viewport.y, independent ? 600 : 400);
-                    },
-                });
-            });
+            );
         }
     }
 }
@@ -653,47 +773,70 @@ for (const mode of ['precise', 'stealth']) {
         ['body', 'containerType', 'scroll-state', false],
         ['body', 'contain', 'none', false],
     ]) {
-        test(`C31F4-03 public ${mode} ${side}/${property}/${value} uses effective containment for overflow propagation`, async () => {
-            const document = scrollingRealm({ axis: 'y' });
-            for (const node of [document.inner, document.container, document.outer]) {
-                Object.assign(node.style, { overflowX: 'visible', overflowY: 'visible' });
+        test(
+            'C31F4-03 public ' +
+                `${mode}` +
+                ' ' +
+                `${side}` +
+                '/' +
+                `${property}` +
+                '/' +
+                `${value}` +
+                ' uses effective containment for overflow ' +
+                'propagation',
+            async () => {
+                const document = scrollingRealm({ axis: 'y' });
+                for (const node of [document.inner, document.container, document.outer]) {
+                    Object.assign(node.style, { overflowX: 'visible', overflowY: 'visible' });
+                }
+                document[side].style[property] = value;
+                document.body.style.overflowX = document.body.style.overflowY = 'auto';
+                document.body.scrollTop = 400;
+                document.viewport.y = 400;
+                await publicWheel(mode, 'unchanged', {
+                    document,
+                    event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
+                    verify() {
+                        assert.equal(document.body.scrollTop, independent ? 600 : 400);
+                        assert.equal(document.viewport.y, independent ? 400 : 600);
+                    },
+                });
             }
-            document[side].style[property] = value;
-            document.body.style.overflowX = document.body.style.overflowY = 'auto';
-            document.body.scrollTop = 400;
-            document.viewport.y = 400;
-            await publicWheel(mode, 'unchanged', {
-                document,
-                event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
-                verify() {
-                    assert.equal(document.body.scrollTop, independent ? 600 : 400);
-                    assert.equal(document.viewport.y, independent ? 400 : 600);
-                },
-            });
-        });
+        );
     }
     for (const display of ['inline', 'contents', 'block']) {
         for (const overflow of ['hidden', 'auto']) {
             for (const policy of ['contain', 'none']) {
-                test(`C31F4-04 public ${mode} ${display}/${overflow}/${policy} only consumes a real scrolling box boundary`, async () => {
-                    const document = scrollingRealm({ axis: 'y' });
-                    document.outer.scrollTop = 400;
-                    Object.assign(document.container.style, {
-                        display,
-                        overflowY: overflow,
-                        overscrollBehaviorY: policy,
-                    });
-                    document.container.scrollTop = 0;
-                    document.container.scrollHeight = document.container.clientHeight;
-                    await publicWheel(mode, 'unchanged', {
-                        document,
-                        event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
-                        verify() {
-                            assert.equal(document.container.scrollTop, 0);
-                            assert.equal(document.outer.scrollTop, display === 'block' ? 400 : 600);
-                        },
-                    });
-                });
+                test(
+                    'C31F4-04 public ' +
+                        `${mode}` +
+                        ' ' +
+                        `${display}` +
+                        '/' +
+                        `${overflow}` +
+                        '/' +
+                        `${policy}` +
+                        ' only consumes a real scrolling box boundary',
+                    async () => {
+                        const document = scrollingRealm({ axis: 'y' });
+                        document.outer.scrollTop = 400;
+                        Object.assign(document.container.style, {
+                            display,
+                            overflowY: overflow,
+                            overscrollBehaviorY: policy,
+                        });
+                        document.container.scrollTop = 0;
+                        document.container.scrollHeight = document.container.clientHeight;
+                        await publicWheel(mode, 'unchanged', {
+                            document,
+                            event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
+                            verify() {
+                                assert.equal(document.container.scrollTop, 0);
+                                assert.equal(document.outer.scrollTop, display === 'block' ? 400 : 600);
+                            },
+                        });
+                    }
+                );
             }
         }
     }
@@ -707,36 +850,49 @@ for (const mode of ['precise', 'stealth']) {
         ['fixed', 'none', false, true],
         ['fixed', 'transform', false, true],
     ]) {
-        test(`C31F4-05 public ${mode} ${position}/${containing}/self=${self}/shadow=${shadow} follows its containing block`, async () => {
-            const document = scrollingRealm({ axis: 'y', shadow });
-            document.inner.style.position = position;
-            document.outer.scrollTop = 400;
-            if (containing === 'transform') {
-                document.outer.style.transform = 'matrix(1,0,0,1,0,0)';
+        test(
+            'C31F4-05 public ' +
+                `${mode}` +
+                ' ' +
+                `${position}` +
+                '/' +
+                `${containing}` +
+                '/self=' +
+                `${self}` +
+                '/shadow=' +
+                `${shadow}` +
+                ' follows its containing block',
+            async () => {
+                const document = scrollingRealm({ axis: 'y', shadow });
+                document.inner.style.position = position;
+                document.outer.scrollTop = 400;
+                if (containing === 'transform') {
+                    document.outer.style.transform = 'matrix(1,0,0,1,0,0)';
+                }
+                if (containing === 'contain') {
+                    document.outer.style.contain = 'layout';
+                }
+                if (containing !== 'none' && !shadow) {
+                    document.inner.offsetParent = document.outer;
+                }
+                if (self) {
+                    document.inner.style.overflowY = 'auto';
+                }
+                await publicWheel(mode, 'unchanged', {
+                    document,
+                    event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
+                    verify() {
+                        assert.equal(document.inner.scrollTop, self ? 200 : 0);
+                        assert.equal(document.outer.scrollTop, !self && containing !== 'none' ? 600 : 400);
+                        assert.equal(document.container.scrollTop, position === 'static' ? 200 : 0);
+                        assert.equal(
+                            document.viewport.y,
+                            !self && position !== 'static' && containing === 'none' ? 200 : 0
+                        );
+                    },
+                });
             }
-            if (containing === 'contain') {
-                document.outer.style.contain = 'layout';
-            }
-            if (containing !== 'none' && !shadow) {
-                document.inner.offsetParent = document.outer;
-            }
-            if (self) {
-                document.inner.style.overflowY = 'auto';
-            }
-            await publicWheel(mode, 'unchanged', {
-                document,
-                event: { type: 'wheel', target: { x: 40, y: 30 }, deltaY: 200 },
-                verify() {
-                    assert.equal(document.inner.scrollTop, self ? 200 : 0);
-                    assert.equal(document.outer.scrollTop, !self && containing !== 'none' ? 600 : 400);
-                    assert.equal(document.container.scrollTop, position === 'static' ? 200 : 0);
-                    assert.equal(
-                        document.viewport.y,
-                        !self && position !== 'static' && containing === 'none' ? 200 : 0
-                    );
-                },
-            });
-        });
+        );
     }
     for (const axis of ['x', 'y']) {
         for (const delta of [-200, 200]) {
@@ -784,29 +940,43 @@ for (const mode of ['precise', 'stealth']) {
             }
             for (const overflow of ['hidden', 'clip', 'visible']) {
                 for (const policy of ['auto', 'contain', 'none']) {
-                    test(`C31F3-05 public ${mode} ${overflow}/${policy} ${axis}/${delta} separates user scrolling from chain boundary`, async () => {
-                        const document = scrollingRealm({ axis, delta });
-                        const property = axis === 'x' ? 'scrollLeft' : 'scrollTop';
-                        document.outer[property] = 400;
-                        document.container[property] = 0;
-                        document.container.style[axis === 'x' ? 'overflowX' : 'overflowY'] = overflow;
-                        document.container.style[axis === 'x' ? 'overscrollBehaviorX' : 'overscrollBehaviorY'] = policy;
-                        await publicWheel(mode, 'unchanged', {
-                            document,
-                            event: {
-                                type: 'wheel',
-                                target: { x: 40, y: 30 },
-                                [axis === 'x' ? 'deltaX' : 'deltaY']: delta,
-                            },
-                            verify() {
-                                assert.equal(document.container[property], 0);
-                                assert.equal(
-                                    document.outer[property],
-                                    overflow === 'hidden' && policy !== 'auto' ? 400 : 400 + delta
-                                );
-                            },
-                        });
-                    });
+                    test(
+                        'C31F3-05 public ' +
+                            `${mode}` +
+                            ' ' +
+                            `${overflow}` +
+                            '/' +
+                            `${policy}` +
+                            ' ' +
+                            `${axis}` +
+                            '/' +
+                            `${delta}` +
+                            ' separates user scrolling from chain boundary',
+                        async () => {
+                            const document = scrollingRealm({ axis, delta });
+                            const property = axis === 'x' ? 'scrollLeft' : 'scrollTop';
+                            document.outer[property] = 400;
+                            document.container[property] = 0;
+                            document.container.style[axis === 'x' ? 'overflowX' : 'overflowY'] = overflow;
+                            document.container.style[axis === 'x' ? 'overscrollBehaviorX' : 'overscrollBehaviorY'] =
+                                policy;
+                            await publicWheel(mode, 'unchanged', {
+                                document,
+                                event: {
+                                    type: 'wheel',
+                                    target: { x: 40, y: 30 },
+                                    [axis === 'x' ? 'deltaX' : 'deltaY']: delta,
+                                },
+                                verify() {
+                                    assert.equal(document.container[property], 0);
+                                    assert.equal(
+                                        document.outer[property],
+                                        overflow === 'hidden' && policy !== 'auto' ? 400 : 400 + delta
+                                    );
+                                },
+                            });
+                        }
+                    );
                 }
             }
         }

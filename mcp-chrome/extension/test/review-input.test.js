@@ -23,6 +23,7 @@ function shadowFixture() {
                 namespaceURI: 'http://www.w3.org/1999/xhtml',
                 id: tagName.toLowerCase(),
                 isConnected: true,
+                disabled: false,
                 parentNode: null,
             });
         }

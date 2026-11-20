@@ -14,8 +14,33 @@ export class ExpectedOperationError extends Error {
     }
 }
 
-export function isExpectedOperationError(err: unknown): boolean {
-    return err instanceof ExpectedOperationError
+export function isExpectedOperationError(err: unknown, action?: string): boolean {
+    if (err instanceof ExpectedOperationError) {
+        return true
+    }
+    if (!(err instanceof Error)) {
+        return false
+    }
+    // 原生拒绝按 action 匹配，同文案的用户脚本异常仍使用 error 日志
+    switch (action) {
+        case 'console_enable':
+            return err.message === 'Cannot access a chrome:// URL'
+        case 'browser_events':
+            return (
+                err.message === 'Dialog is no longer pending' ||
+                err.message === 'Browser event ref kind does not match the requested view' ||
+                err.message === 'Browser event ref expired, evicted, or belongs to another owner/page/session'
+            )
+        case 'cookies_set':
+            return (
+                err.message ===
+                'partitionKey has a first party value for hasCrossSiteAncestor when the url and the topLevelSite are not first party.'
+            )
+        case 'challenge_inspect':
+            return /^Frame with ID \d+ was removed\.?$/.test(err.message)
+        default:
+            return false
+    }
 }
 
 // chrome.debugger 的预期拒绝保留失败响应，使用 warning 诊断

@@ -12,6 +12,7 @@ function wheelDocument() {
     const scrolls = [];
     const hits = [];
     const element = {
+        isConnected: true,
         scrollWidth: 1000,
         clientWidth: 100,
         scrollLeft: 0,
@@ -32,7 +33,7 @@ function wheelDocument() {
             this.scrollTop += y;
         },
     };
-    const root = { style: { overflowX: 'visible', overflowY: 'visible' } };
+    const root = { isConnected: true, style: { overflowX: 'visible', overflowY: 'visible' } };
     element.parentElement = root;
     const realm = vm.createContext({
         document: {

@@ -56,7 +56,7 @@ const evaluateSchema = z.object({
             `输出文件路径（可选），相对路径默认写入 ${TMP_PATH_PREFIX}，` +
                 `持久化到仓库请显式写 ${CWD_PATH_PREFIX}，字符串结果直接写原始文本，其他类型写 JSON；` +
                 '绝对路径仅限当前工作目录或本次 Server 会话的受控临时目录，实际允许根见 error.context.allowedRoots；' +
-                'Extension precise 主 frame 的对象结果字符预算为 16 Mi，深度 8、节点 2000 上限不变，临时输出仍受配额约束'
+                'Extension precise 主 frame 的对象结果字符预算为 16 Mi，深度 64、节点 100000；内联仍为深度 8、节点 2000，临时输出仍受配额约束'
         ),
     timeout: z
         .number()
@@ -74,7 +74,9 @@ const evaluateSchema = z.object({
         .enum(['never', 'readOnly'])
         .optional()
         .describe(
-            'iframe precise 的 context 重试策略；默认 never 不重放，readOnly 仅适用于 Extension，表示脚本无副作用并允许重新解析后重放一次；CDP iframe 请求 readOnly 时在派发前返回能力错误'
+            'iframe precise 的 context 重试策略；默认 never ' +
+                '不重放，readOnly 仅适用于 Extension，表示脚本无副作用并允许重新解析后重放一次；C' +
+                'DP iframe 请求 readOnly 时在派发前返回能力错误'
         ),
     diagnostics: z
         .boolean()

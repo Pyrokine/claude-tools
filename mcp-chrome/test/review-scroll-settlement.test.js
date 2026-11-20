@@ -4,7 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 import ts from 'typescript';
 
-const inputSource = fs.readFileSync(new URL('../src/tools/input.ts', import.meta.url), 'utf8');
+const inputSource = fs.readFileSync(new URL('../src/tools/input.ts', import.meta.url), { encoding: 'utf8' });
 const start = inputSource.indexOf('async function getTargetPointExtension(');
 const end = inputSource.indexOf('\ninterface CdpInputContext', start);
 assert.ok(start >= 0 && end > start);

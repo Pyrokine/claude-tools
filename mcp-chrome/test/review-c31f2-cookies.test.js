@@ -48,7 +48,8 @@ function compile(source, imports, globals = {}) {
 }
 
 function extensionCookies(chrome) {
-    const source = (file) => readFileSync(new URL(`../extension/src/${file}.ts`, import.meta.url), 'utf8');
+    const source = (file) =>
+        readFileSync(new URL(`../extension/src/${file}.ts`, import.meta.url), { encoding: 'utf8' });
     const errors = compile(source('types/expected-errors'), {});
     const schemas = compile(source('types/schemas'), { zod: { z } });
     const text = source('background/action-utils');
@@ -107,6 +108,7 @@ async function withProtocol(backend, options, run) {
     cdp.ws = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const command = JSON.parse(text);
             calls.push({ ...command, aborted: state.serverSignal?.aborted === true });
@@ -192,6 +194,7 @@ async function withProtocol(backend, options, run) {
     bridge.httpServer.helloReceived = true;
     bridge.httpServer.clientSocket = {
         readyState: 1,
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             wire.push(message);
@@ -357,18 +360,24 @@ for (const backend of ['cdp', 'extension']) {
             }
         );
     }
-    test(`C31F2-01 ${backend} already cancelled public extra.signal rejects before driver or API dispatch`, async () => {
-        await withProtocol(backend, {}, async ({ direct, calls, wire }) => {
-            const controller = new AbortController();
-            controller.abort('cancel before dispatch');
-            const response = await direct(controller.signal);
-            const body = JSON.parse(response.content[0].text);
-            assert.equal(body.error.code, 'CANCELLED');
-            assert.equal(body.error.context.actionStatus, 'not_started');
-            assert.equal(calls.length, 0);
-            assert.equal(wire.length, 0);
-        });
-    });
+    test(
+        'C31F2-01 ' +
+            `${backend}` +
+            ' already cancelled public extra.signal ' +
+            'rejects before driver or API dispatch',
+        async () => {
+            await withProtocol(backend, {}, async ({ direct, calls, wire }) => {
+                const controller = new AbortController();
+                controller.abort('cancel before dispatch');
+                const response = await direct(controller.signal);
+                const body = JSON.parse(response.content[0].text);
+                assert.equal(body.error.code, 'CANCELLED');
+                assert.equal(body.error.context.actionStatus, 'not_started');
+                assert.equal(calls.length, 0);
+                assert.equal(wire.length, 0);
+            });
+        }
+    );
 }
 
 test(
@@ -476,24 +485,32 @@ test(
 );
 
 for (const options of [{ temporary: true }, { temporary: true, rejectAttach: true }]) {
-    test(`C31F3-01 temporary attach ${options.rejectAttach ? 'native rejection' : 'normal clear'} ends ownership`, async () => {
-        await withProtocol('cdp', options, async ({ state, client, args, cdp, calls }) => {
-            const result = await client.callTool({ name: 'cookies', arguments: args });
-            assert.equal(result.isError === true, options.rejectAttach === true);
-            assert.equal(state.deletes, options.rejectAttach ? 0 : 3);
-            assert.equal(
-                calls.filter((entry) => entry.method === 'Target.detachFromTarget').length,
-                options.rejectAttach ? 0 : 3
-            );
-            assert.deepEqual([...state.sessions], ['owned-session']);
-            assert.equal(cdp.callbacks.size, 0);
-        });
-    });
+    test(
+        'C31F3-01 temporary attach ' +
+            `${options.rejectAttach ? 'native rejection' : 'normal clear'}` +
+            ' ends ownership',
+        async () => {
+            await withProtocol('cdp', options, async ({ state, client, args, cdp, calls }) => {
+                const result = await client.callTool({ name: 'cookies', arguments: args });
+                assert.equal(result.isError === true, options.rejectAttach === true);
+                assert.equal(state.deletes, options.rejectAttach ? 0 : 3);
+                assert.equal(
+                    calls.filter((entry) => entry.method === 'Target.detachFromTarget').length,
+                    options.rejectAttach ? 0 : 3
+                );
+                assert.deepEqual([...state.sessions], ['owned-session']);
+                assert.equal(cdp.callbacks.size, 0);
+            });
+        }
+    );
 }
 
 for (const options of [{ rejectDetach: true }, { holdDetach: true }]) {
     test(
-        `C31F3-01 late detach ${options.holdDetach ? 'timeout' : 'failure'} remains visible and owned until connection close`,
+        'C31F3-01 late detach ' +
+            `${options.holdDetach ? 'timeout' : 'failure'}` +
+            ' remains visible and owned until connection ' +
+            'close',
         { timeout: 10000 },
         async () => {
             const warnings = [];
@@ -548,6 +565,7 @@ test('C31F3-01 timed-out owned acquisition still consumes and cleans its late re
     cdp.ws = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const packet = JSON.parse(text);
             if (packet.method === 'Target.attachToTarget') {

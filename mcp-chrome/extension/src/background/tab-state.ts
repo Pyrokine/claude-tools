@@ -13,6 +13,7 @@ interface ManagedTabRecord {
     metadata: Omit<PageMetadata, 'origin'>
     trustedGroupId?: number
     trustedWindowId?: number
+    groupOwnerId?: string
 }
 
 interface ManagedTabSnapshot {
@@ -164,19 +165,49 @@ export async function updateManagedTabMetadata(
     return getManagedTabMetadata(tabId)
 }
 
-export async function setManagedTabGroup(tabId: number, groupId: number, windowId: number): Promise<void> {
+export async function setManagedTabGroup(
+    tabId: number,
+    groupId: number,
+    windowId: number,
+    serverInstanceId?: string | null,
+    previousOwnerId?: string | null
+): Promise<boolean> {
+    let assigned = false
     await updateManagedTabs((tabs) => {
         const record = tabs.get(tabId)
         if (!record?.managed || record.origin !== 'created') {
             return false
         }
+        if (
+            previousOwnerId !== undefined &&
+            (record.trustedGroupId !== groupId ||
+                record.trustedWindowId !== windowId ||
+                (record.groupOwnerId ?? null) !== previousOwnerId)
+        ) {
+            return false
+        }
+        const member = [...tabs.values()].find(
+            (owner) => owner.tabId !== tabId && owner.trustedGroupId === groupId && owner.trustedWindowId === windowId
+        )
+        const groupOwnerId = serverInstanceId ?? member?.groupOwnerId
         record.trustedGroupId = groupId
         record.trustedWindowId = windowId
+        for (const owner of tabs.values()) {
+            if (owner.trustedGroupId === groupId && owner.trustedWindowId === windowId) {
+                if (groupOwnerId === undefined) {
+                    delete owner.groupOwnerId
+                } else {
+                    owner.groupOwnerId = groupOwnerId
+                }
+            }
+        }
+        assigned = true
         return true
     })
+    return assigned
 }
 
-/** Native membership, never a group title, establishes reusable task groups */
+/** Native membership, never a group title, establishes reusable automatic groups */
 export async function refreshManagedTabRelations(assertActive?: () => void): Promise<void> {
     await updateManagedTabs(async (records) => {
         const tabs = await chrome.tabs.query({})
@@ -191,6 +222,7 @@ export async function refreshManagedTabRelations(assertActive?: () => void): Pro
             if (!tab || tab.groupId !== record.trustedGroupId || tab.windowId !== record.trustedWindowId) {
                 delete record.trustedGroupId
                 delete record.trustedWindowId
+                delete record.groupOwnerId
                 changed = true
             }
         }
@@ -220,6 +252,7 @@ export async function refreshManagedTabRelations(assertActive?: () => void): Pro
             } else if (record.trustedGroupId !== undefined && invalidGroups.has(record.trustedGroupId)) {
                 delete record.trustedGroupId
                 delete record.trustedWindowId
+                delete record.groupOwnerId
                 changed = true
             }
         }
@@ -309,6 +342,9 @@ export function restoreManagedTabs(): Promise<void> {
                         ? {
                               trustedGroupId: record.trustedGroupId,
                               trustedWindowId: record.trustedWindowId,
+                              ...(typeof record.groupOwnerId === 'string' && record.groupOwnerId
+                                  ? { groupOwnerId: record.groupOwnerId }
+                                  : {}),
                           }
                         : {}),
                 })

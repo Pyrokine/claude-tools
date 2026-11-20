@@ -206,6 +206,8 @@ export class BrowserEventController {
     private sequence = 0
     private entries = new Map<string, Entry>()
     private requests = new Map<string, Request[]>()
+    private readonly socketRefs = new Map<string, string>()
+    private readonly streamSocketRefs = new WeakMap<Entry, string>()
     private extras = new Map<string, { request: unknown[]; response: unknown[] }>()
     private pauses = new Map<string, Pause>()
     private bodies = new Map<string, BytePayload>()
@@ -226,7 +228,19 @@ export class BrowserEventController {
     private fetchConfig: Promise<unknown> = Promise.resolve()
     private active = true
     private documentRevision = 0
-    private downloadBodies = new Map<string, Array<{ ref: string; frameId?: string; url: string }>>()
+    private downloadGeneration = 0
+    private readonly downloadBodies = new Map<
+        string,
+        Array<{
+            ref: string
+            frameId: string
+            url: string
+            sessionId?: string
+            generation: number
+            documentRevision: number
+        }>
+    >()
+
     private downloadWaiters = new Set<() => void>()
     private cleanupFailures: Array<{
         timestamp: number
@@ -274,6 +288,8 @@ export class BrowserEventController {
             sessionId === this.identity.nativeSessionId
         ) {
             this.documentRevision++
+            this.socketRefs.clear()
+            this.downloadBodies.clear()
             void this.abortPending('navigation')
             this.challenged.clear()
             if (this.dialog) {
@@ -281,6 +297,25 @@ export class BrowserEventController {
                 this.dialog = undefined
             }
         } else if (method === 'Page.frameNavigated') {
+            if (sessionId !== this.identity.nativeSessionId) {
+                for (const key of this.socketRefs.keys()) {
+                    if (key.startsWith(this.key('', sessionId))) {
+                        this.socketRefs.delete(key)
+                    }
+                }
+            }
+            for (const [frameId, candidates] of this.downloadBodies) {
+                const remaining = candidates.filter(
+                    (candidate) =>
+                        candidate.frameId !== p.frame?.id &&
+                        (sessionId === this.identity.nativeSessionId || candidate.sessionId !== sessionId)
+                )
+                if (remaining.length) {
+                    this.downloadBodies.set(frameId, remaining)
+                } else {
+                    this.downloadBodies.delete(frameId)
+                }
+            }
             for (const pause of this.pauses.values()) {
                 if (
                     (p.frame?.id && pause.frameId === p.frame.id) ||
@@ -356,12 +391,23 @@ export class BrowserEventController {
                 }
             }
         } else if (this.capture.has('stream') && /^Network\.(?:webSocket|eventSource)/.test(method)) {
+            const socketKey = this.key(p.requestId, sessionId)
+            const socketCreated = method === 'Network.webSocketCreated'
+            const socketRef =
+                !socketCreated && method.startsWith('Network.webSocket') ? this.socketRefs.get(socketKey) : undefined
+            const request = this.latest(p.requestId, sessionId)
+            const requestRef =
+                socketRef !== undefined
+                    ? this.entries.get(socketRef)?.requestRef
+                    : socketCreated && request?.url !== p.url
+                      ? undefined
+                      : request?.ref
             const data = p.response?.payloadData ?? p.data
             const dataText = typeof data === 'string' ? data : undefined
             const encoded = dataText === undefined ? undefined : new TextEncoder().encode(dataText)
             const truncated = (encoded?.length ?? 0) > MAX_MESSAGE
             const message = truncated ? new TextDecoder().decode(encoded!.subarray(0, MAX_MESSAGE)) : dataText
-            this.make('stream', {
+            const entry = this.make('stream', {
                 ...p,
                 response: p.response ? { ...p.response, payloadData: message } : undefined,
                 data: message,
@@ -375,9 +421,17 @@ export class BrowserEventController {
                       ? 'received'
                       : 'lifecycle',
                 sessionId,
-                requestRef: this.latest(p.requestId, sessionId)?.ref,
+                requestRef,
                 sequence: this.sequence + 1,
             })
+            if (socketCreated) {
+                this.socketRefs.set(socketKey, entry.ref)
+            } else if (socketRef !== undefined) {
+                this.streamSocketRefs.set(entry, socketRef)
+            }
+            if (method === 'Network.webSocketClosed') {
+                this.socketRefs.delete(socketKey)
+            }
         } else if (method === 'Fetch.requestPaused') {
             void this.onPaused(p, sessionId).catch((e) => {
                 this.recordCleanupFailure(e, method, p.requestId, sessionId)
@@ -394,8 +448,16 @@ export class BrowserEventController {
             if (existing) {
                 return
             }
-            const candidates = p.frameId ? (this.downloadBodies.get(p.frameId) ?? []) : []
-            const captured = candidates.length === 1 && candidates[0].url === p.url ? candidates[0] : undefined
+            const candidates = (p.frameId ? (this.downloadBodies.get(p.frameId) ?? []) : []).filter(
+                (candidate) =>
+                    candidate.generation === this.downloadGeneration &&
+                    candidate.documentRevision === this.documentRevision &&
+                    candidate.sessionId === (sessionId ?? this.identity.nativeSessionId)
+            )
+            const candidate = candidates.length === 1 && candidates[0].url === p.url ? candidates[0] : undefined
+            const source = candidate && (this.entries.get(candidate.ref) as Pause | undefined)
+            const captured =
+                candidate && source && !source.abortReason && this.bodies.has(candidate.ref) ? candidate : undefined
             const entry = this.make('download', {
                 ...p,
                 sessionId,
@@ -449,12 +511,17 @@ export class BrowserEventController {
     async command(
         action: BrowserEventAction,
         command: EventCommand,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        assertActive?: () => void
     ): Promise<Record<string, unknown>> {
-        signal?.throwIfAborted()
-        if (!this.active) {
-            throw new Error('Browser event session is closed')
+        const assertRequestActive = () => {
+            assertActive?.()
+            signal?.throwIfAborted()
+            if (!this.active) {
+                throw new Error('Browser event session is closed')
+            }
         }
+        assertRequestActive()
         if (action === 'read') {
             return this.read(command as unknown as BrowserEventRead)
         }
@@ -500,6 +567,9 @@ export class BrowserEventController {
         if (action === 'networkCapture') {
             if (op === 'start') {
                 this.capture = new Set((command.include as string[]) ?? [])
+                if (!this.capture.has('stream')) {
+                    this.socketRefs.clear()
+                }
                 await this.send('Network.enable', {
                     maxTotalBufferSize: MAX_BYTES,
                     maxResourceBufferSize: MAX_BODY,
@@ -507,28 +577,35 @@ export class BrowserEventController {
                 })
             } else {
                 this.capture.clear()
+                this.socketRefs.clear()
             }
             return this.status()
         }
         if (action === 'route') {
-            if (op === 'add') {
-                if (this.routes.size >= 100) {
-                    throw new Error('Route limit reached (100); remove unused rules')
-                }
-                const rule = this.make('route', { urlPattern: command.urlPattern, stage: command.stage ?? 'Request' })
-                this.routes.set(rule.ref, {
-                    urlPattern: String(command.urlPattern),
-                    stage: String(command.stage ?? 'Request'),
-                })
-                try {
-                    await this.configureFetch()
-                } catch (e) {
-                    this.routes.delete(rule.ref)
-                    throw e
-                }
-                return { ...this.status(), rule: redact(rule) }
+            if (op !== 'add' && op !== 'remove') {
+                return this.resolvePause(command)
             }
-            if (op === 'remove') {
+            return this.queueFetch(async () => {
+                if (op === 'add') {
+                    if (this.routes.size >= 100) {
+                        throw new Error('Route limit reached (100); remove unused rules')
+                    }
+                    const rule = this.make('route', {
+                        urlPattern: command.urlPattern,
+                        stage: command.stage ?? 'Request',
+                    })
+                    this.routes.set(rule.ref, {
+                        urlPattern: String(command.urlPattern),
+                        stage: String(command.stage ?? 'Request'),
+                    })
+                    try {
+                        await this.configureFetch(assertRequestActive)
+                    } catch (e) {
+                        this.routes.delete(rule.ref)
+                        throw e
+                    }
+                    return { ...this.status(), rule: redact(rule) }
+                }
                 this.require(command.ref, 'route')
                 this.routes.delete(command.ref!)
                 await Promise.all(
@@ -536,44 +613,47 @@ export class BrowserEventController {
                         .filter((pause) => pause.ruleRef === command.ref)
                         .map((pause) => this.abortOne(pause, 'route removed'))
                 )
-                await this.configureFetch()
+                await this.configureFetch(assertRequestActive)
                 return this.status()
-            }
-            return this.resolvePause(command)
+            }, assertRequestActive)
         }
         if (action === 'httpAuth') {
-            if (op === 'set') {
-                const scope = command.scope as { source: string; origin: string; realm?: string }
-                const origin = new URL(scope.origin).origin
-                if (origin !== scope.origin) {
-                    throw new Error('Authentication scope must be an exact origin without path or credentials')
+            return this.queueFetch(async () => {
+                if (op === 'set') {
+                    const scope = command.scope as { source: string; origin: string; realm?: string }
+                    const origin = new URL(scope.origin).origin
+                    if (origin !== scope.origin) {
+                        throw new Error('Authentication scope must be an exact origin without path or credentials')
+                    }
+                    this.credentials = {
+                        ...scope,
+                        origin,
+                        username: String(command.username),
+                        password: String(command.password),
+                    }
+                } else {
+                    this.credentials = undefined
+                    await this.abortPending('authentication cleared', 'auth')
                 }
-                this.credentials = {
-                    ...scope,
-                    origin,
-                    username: String(command.username),
-                    password: String(command.password),
-                }
-            } else {
-                this.credentials = undefined
-                await this.abortPending('authentication cleared', 'auth')
-            }
-            await this.configureFetch()
-            return this.status()
+                await this.configureFetch(assertRequestActive)
+                return this.status()
+            }, assertRequestActive)
         }
         if (action === 'download') {
-            if (op === 'watch') {
-                this.downloading = true
-                this.downloadPattern = String(command.urlPattern ?? '*')
-                await this.send('Page.enable')
-                await this.configureFetch()
-                return this.status()
-            }
-            if (op === 'stop') {
-                this.downloading = false
-                await this.abortPending('download observation stopped', 'download-capture')
-                await this.configureFetch()
-                return this.status()
+            if (op === 'watch' || op === 'stop') {
+                return this.queueFetch(async () => {
+                    this.downloadGeneration++
+                    this.downloadBodies.clear()
+                    this.downloading = op === 'watch'
+                    if (op === 'watch') {
+                        this.downloadPattern = String(command.urlPattern ?? '*')
+                        await this.send('Page.enable')
+                    } else {
+                        await this.abortPending('download observation stopped', 'download-capture')
+                    }
+                    await this.configureFetch(assertRequestActive)
+                    return this.status()
+                }, assertRequestActive)
             }
             const entry = this.require(command.ref, 'download')
             if (op === 'wait') {
@@ -583,10 +663,17 @@ export class BrowserEventController {
                 throw new Error(`Download state is ${entry.state}; original file is not complete`)
             }
             const body = typeof entry.bodyRef === 'string' ? this.bodies.get(entry.bodyRef) : undefined
-            if (!body) {
-                throw new Error(String(entry.artifactReason ?? 'Original download bytes expired or were evicted'))
+            if (!body || !this.hasDownloadBody(entry)) {
+                throw new Error(
+                    String(entry.artifactReason ?? 'Original download bytes unavailable, expired or evicted')
+                )
             }
-            return { ...this.status(), download: redact(entry), payload: body, bytes: bytes(body) }
+            return {
+                ...this.status(),
+                download: redact({ ...entry, artifact: 'available', artifactReason: undefined }),
+                payload: body,
+                bytes: bytes(body),
+            }
         }
         throw new Error('Unsupported browser event action')
     }
@@ -598,96 +685,136 @@ export class BrowserEventController {
     }
 
     async suspend(reason: string): Promise<Record<string, unknown>> {
-        this.credentials = undefined
-        this.rawAuthentication = false
-        this.dialogWatching = false
-        this.capture.clear()
-        this.downloading = false
-        await this.abortPending(reason)
-        const unresolved = [...this.pauses.values()]
-        if (unresolved.length) {
-            return {
-                ...this.status(),
-                suspended: false,
-                reason,
-                unresolved: unresolved.map((p) => ({ ref: p.ref, state: p.state, cleanupError: p.cleanupError })),
+        return this.queueFetch(async () => {
+            this.credentials = undefined
+            this.rawAuthentication = false
+            this.dialogWatching = false
+            this.capture.clear()
+            this.socketRefs.clear()
+            this.downloading = false
+            this.downloadGeneration++
+            this.downloadBodies.clear()
+            await this.abortPending(reason)
+            const unresolved = [...this.pauses.values()]
+            if (unresolved.length) {
+                return {
+                    ...this.status(),
+                    suspended: false,
+                    reason,
+                    unresolved: unresolved.map((p) => ({
+                        ref: p.ref,
+                        state: p.state,
+                        cleanupError: p.cleanupError,
+                    })),
+                }
             }
-        }
-        this.routes.clear()
-        await this.configureFetch()
-        return { ...this.status(), suspended: true, reason }
+            this.routes.clear()
+            await this.configureFetch()
+            return { ...this.status(), suspended: true, reason }
+        })
     }
 
     async dispose(reason: string): Promise<Record<string, unknown>> {
-        const result = await this.suspend(reason)
-        if (result.suspended === false) {
-            throw Object.assign(new Error('Browser event cleanup outcome unknown'), { context: result })
-        }
-        this.active = false
-        this.entries.clear()
-        this.bodies.clear()
-        this.requests.clear()
-        this.extras.clear()
-        this.challenged.clear()
-        this.downloadBodies.clear()
-        this.cleanupFailures = []
-        this.bodyBytes = 0
-        for (const reject of this.dialogWaiters) {
-            reject(new Error(reason))
-        }
-        this.dialogWaiters.clear()
-        this.notifyDownloads()
-        return result
+        const disposed = this.suspend(reason).then((result) => {
+            if (result.suspended === false) {
+                throw Object.assign(new Error('Browser event cleanup outcome unknown'), { context: result })
+            }
+            this.active = false
+            this.entries.clear()
+            this.bodies.clear()
+            this.requests.clear()
+            this.extras.clear()
+            this.challenged.clear()
+            this.downloadBodies.clear()
+            this.cleanupFailures = []
+            this.bodyBytes = 0
+            // 进行中的原生命令沿用自身的完成、取消与超时结果
+            this.dialogWaiters.clear()
+            this.notifyDownloads()
+            return result
+        })
+        this.fetchConfig = disposed
+        return disposed
     }
 
-    async rawFetch(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-        if (method === 'Fetch.enable') {
-            const patterns = params.patterns as Array<{ urlPattern?: string; requestStage?: string }> | undefined
-            for (const [key, rule] of this.routes) {
-                if (rule.raw) {
-                    this.routes.delete(key)
-                }
+    async rawFetch(method: string, params: Record<string, unknown> = {}, assertActive?: () => void): Promise<unknown> {
+        const assertRequestActive = () => {
+            assertActive?.()
+            if (!this.active) {
+                throw new Error('Browser event session is closed')
             }
-            if ((patterns?.length ?? 1) + this.routes.size > 100) {
-                throw new Error('Route limit reached (100)')
-            }
-            const rule = this.make('route', { raw: true })
-            for (const [index, p] of (patterns ?? [{}]).entries()) {
-                this.routes.set(`${rule.ref}/${index}`, {
-                    urlPattern: p.urlPattern ?? '*',
-                    stage: p.requestStage ?? 'Request',
-                    raw: true,
-                })
-            }
-            this.rawAuthentication = params.handleAuthRequests === true
-            this.fetchEnabled = true
-            const combined = [...this.routes.values()].map((rule) => ({
-                urlPattern: rule.urlPattern,
-                requestStage: rule.stage,
-            }))
-            if (this.downloading) {
-                combined.push({ urlPattern: this.downloadPattern, requestStage: 'Response' })
-            }
-            if (this.credentials) {
-                combined.push({ urlPattern: '*', requestStage: 'Request' })
-            }
-            return this.send(method, {
-                ...params,
-                patterns: combined,
-                handleAuthRequests: !!this.credentials || this.rawAuthentication,
-            })
         }
-        if (method === 'Fetch.disable') {
-            await this.abortPending('raw Fetch.disable')
-            if (this.pauses.size) {
-                throw new Error('Fetch cleanup incomplete; debugger remains attached')
-            }
-            this.routes.clear()
-            this.credentials = undefined
-            this.rawAuthentication = false
-            this.downloading = false
-            this.fetchEnabled = false
-            return this.send(method, params)
+        assertActive?.()
+        if (method === 'Fetch.enable' || method === 'Fetch.disable') {
+            return this.queueFetch(async () => {
+                const previous = {
+                    routes: this.routes,
+                    credentials: this.credentials,
+                    rawAuthentication: this.rawAuthentication,
+                    downloading: this.downloading,
+                    fetchEnabled: this.fetchEnabled,
+                }
+                let nativeParams = params
+                if (method === 'Fetch.enable') {
+                    const patterns = params.patterns as
+                        Array<{ urlPattern?: string; requestStage?: string }> | undefined
+                    const routes = new Map([...this.routes].filter(([, rule]) => !rule.raw))
+                    if ((patterns?.length ?? 1) + routes.size > 100) {
+                        throw new Error('Route limit reached (100)')
+                    }
+                    const rule = this.make('route', { raw: true })
+                    for (const [index, p] of (patterns ?? [{}]).entries()) {
+                        routes.set(`${rule.ref}/${index}`, {
+                            urlPattern: p.urlPattern ?? '*',
+                            stage: p.requestStage ?? 'Request',
+                            raw: true,
+                        })
+                    }
+                    this.routes = routes
+                    this.rawAuthentication = params.handleAuthRequests === true
+                    this.fetchEnabled = true
+                    const combined = [...this.routes.values()].map((rule) => ({
+                        urlPattern: rule.urlPattern,
+                        requestStage: rule.stage,
+                    }))
+                    if (this.downloading) {
+                        combined.push({ urlPattern: this.downloadPattern, requestStage: 'Response' })
+                    }
+                    if (this.credentials) {
+                        combined.push({ urlPattern: '*', requestStage: 'Request' })
+                    }
+                    nativeParams = {
+                        ...params,
+                        patterns: combined,
+                        handleAuthRequests: !!this.credentials || this.rawAuthentication,
+                    }
+                } else {
+                    await this.abortPending('raw Fetch.disable')
+                    if (this.pauses.size) {
+                        throw new Error('Fetch cleanup incomplete; debugger remains attached')
+                    }
+                    this.routes = new Map()
+                    this.credentials = undefined
+                    this.rawAuthentication = false
+                    this.downloading = false
+                    this.fetchEnabled = false
+                }
+                const configured = { routes: this.routes, rawAuthentication: this.rawAuthentication }
+                if (method === 'Fetch.enable') {
+                    // Events from either configuration can precede the native acknowledgement.
+                    this.routes = new Map([...previous.routes, ...configured.routes])
+                    this.rawAuthentication ||= previous.rawAuthentication
+                }
+                try {
+                    assertRequestActive()
+                    const result = await this.send(method, nativeParams)
+                    Object.assign(this, configured)
+                    return result
+                } catch (error) {
+                    Object.assign(this, this.nativeRefusal(error).refused ? previous : configured)
+                    throw error
+                }
+            }, assertRequestActive)
         }
         const candidates = [...this.pauses.values()].filter((p) => p.requestId === params.requestId)
         if (candidates.length > 1) {
@@ -819,6 +946,14 @@ export class BrowserEventController {
         return entry
     }
 
+    private hasDownloadBody(entry: Entry): boolean {
+        if (typeof entry.bodyRef !== 'string' || !this.bodies.has(entry.bodyRef)) {
+            return false
+        }
+        const capture = this.entries.get(entry.bodyRef) as Pause | undefined
+        return capture?.kind === 'download-capture' && capture.state === 'resolved' && !capture.abortReason
+    }
+
     private saveBody(ref: string, payload: BytePayload): void {
         const length = bytes(payload)
         if (length >= MAX_BODY) {
@@ -849,7 +984,7 @@ export class BrowserEventController {
         return this.requests.get(this.key(requestId, sessionId))?.at(-1)
     }
 
-    private nativeFailure(entry: Pause, error: unknown): void {
+    private nativeRefusal(error: unknown): { refused: boolean; expired: boolean } {
         const context = (error as { context?: { nativeCode?: number; actionExecuted?: unknown; method?: string } })
             ?.context
         const message = this.failure(error)
@@ -868,15 +1003,26 @@ export class BrowserEventController {
             }
         }
         const fromPage = getErrorSource(error) === 'page'
+        return {
+            refused:
+                !fromPage &&
+                (context?.actionExecuted === false ||
+                    (error as { actionExecuted?: unknown })?.actionExecuted === false ||
+                    [-32601, -32602].includes(code ?? 0)),
+            expired: !fromPage && code === -32602 && nativeMessage === 'Invalid InterceptionId.',
+        }
+    }
+
+    private nativeFailure(entry: Pause, error: unknown): void {
+        const { refused, expired } = this.nativeRefusal(error)
         clearTimeout(entry.timer)
-        entry.error = message
-        if (!fromPage && code === -32602 && nativeMessage === 'Invalid InterceptionId.') {
+        entry.error = this.failure(error)
+        if (expired) {
             entry.state = 'expired'
             entry.reason = 'Native interception no longer exists'
             this.pauses.delete(entry.ref)
             return
         }
-        const refused = !fromPage && (context?.actionExecuted === false || [-32601, -32602].includes(code ?? 0))
         entry.state = refused ? 'pending' : 'unknown'
         const remaining = entry.timestamp + PAUSE_TTL - Date.now()
         if (refused && remaining > 0) {
@@ -989,44 +1135,47 @@ export class BrowserEventController {
         }
     }
 
-    private async configureFetch(): Promise<void> {
-        this.fetchConfig = this.fetchConfig
+    private queueFetch<T>(operation: () => Promise<T>, assertActive?: () => void): Promise<T> {
+        const configured = this.fetchConfig
             .catch(() => {})
-            .then(async () => {
-                // A body read owns its pause until getResponseBody completes, including stop/cleanup.
-                await Promise.all([...this.pauses.values()].map((p) => p.bodyRead))
-                if ([...this.pauses.values()].some((p) => p.state === 'unknown')) {
-                    throw new Error(
-                        'Fetch cleanup outcome is unknown; configuration and debugger attachment are preserved'
-                    )
-                }
-                const patterns = [...this.routes.values()].map((r) => ({
-                    urlPattern: r.urlPattern,
-                    requestStage: r.stage,
-                }))
-                if (this.downloading) {
-                    patterns.push({ urlPattern: this.downloadPattern, requestStage: 'Response' })
-                }
-                if (this.credentials || (this.rawAuthentication && patterns.length === 0)) {
-                    patterns.push({ urlPattern: '*', requestStage: 'Request' })
-                }
-                if (patterns.length || this.credentials || this.rawAuthentication) {
-                    await this.send('Fetch.enable', {
-                        patterns,
-                        handleAuthRequests: !!this.credentials || this.rawAuthentication,
-                    })
-                    this.fetchEnabled = true
-                } else if (this.fetchEnabled) {
-                    if (this.pauses.size) {
-                        throw new Error(
-                            'Fetch cleanup is incomplete; pending requests and debugger attachment are preserved'
-                        )
-                    }
-                    await this.send('Fetch.disable')
-                    this.fetchEnabled = false
-                }
+            .then(() => {
+                assertActive?.()
+                return operation()
             })
-        await this.fetchConfig
+        this.fetchConfig = configured
+        return configured
+    }
+
+    private async configureFetch(assertActive?: () => void): Promise<void> {
+        // A body read owns its pause until getResponseBody completes, including stop/cleanup.
+        await Promise.all([...this.pauses.values()].map((p) => p.bodyRead))
+        assertActive?.()
+        if ([...this.pauses.values()].some((p) => p.state === 'unknown')) {
+            throw new Error('Fetch cleanup outcome is unknown; configuration and debugger attachment are preserved')
+        }
+        const patterns = [...this.routes.values()].map((r) => ({
+            urlPattern: r.urlPattern,
+            requestStage: r.stage,
+        }))
+        if (this.downloading) {
+            patterns.push({ urlPattern: this.downloadPattern, requestStage: 'Response' })
+        }
+        if (this.credentials || (this.rawAuthentication && patterns.length === 0)) {
+            patterns.push({ urlPattern: '*', requestStage: 'Request' })
+        }
+        if (patterns.length || this.credentials || this.rawAuthentication) {
+            await this.send('Fetch.enable', {
+                patterns,
+                handleAuthRequests: !!this.credentials || this.rawAuthentication,
+            })
+            this.fetchEnabled = true
+        } else if (this.fetchEnabled) {
+            if (this.pauses.size) {
+                throw new Error('Fetch cleanup is incomplete; pending requests and debugger attachment are preserved')
+            }
+            await this.send('Fetch.disable')
+            this.fetchEnabled = false
+        }
     }
 
     private async onPaused(p: NativeEvent, sessionId?: string): Promise<void> {
@@ -1065,6 +1214,20 @@ export class BrowserEventController {
             networkRef: this.latest(p.networkId, sessionId)?.ref,
         }) as Pause
         this.pauses.set(entry.ref, entry)
+        const generation = this.downloadGeneration
+        const documentRevision = this.documentRevision
+        if (this.downloading && attachment && p.frameId && matches(p.request.url, this.downloadPattern)) {
+            const candidates = this.downloadBodies.get(p.frameId) ?? []
+            candidates.push({
+                ref: entry.ref,
+                frameId: p.frameId,
+                url: p.request.url,
+                sessionId: sessionId ?? this.identity.nativeSessionId,
+                generation,
+                documentRevision,
+            })
+            this.downloadBodies.set(p.frameId, candidates.slice(-MAX_ENTRIES))
+        }
         entry.timer = setTimeout(() => {
             void this.abortOne(entry, 'pause timeout')
         }, PAUSE_TTL)
@@ -1083,17 +1246,19 @@ export class BrowserEventController {
                         body: string
                         base64Encoded: boolean
                     }
-                    this.saveBody(entry.ref, { encoding: body.base64Encoded ? 'base64' : 'utf8', data: body.body })
-                    if (p.frameId) {
-                        const candidates = this.downloadBodies.get(p.frameId) ?? []
-                        candidates.push({ ref: entry.ref, frameId: p.frameId, url: p.request.url })
-                        this.downloadBodies.set(p.frameId, candidates.slice(-MAX_ENTRIES))
+                    if (
+                        !this.downloading ||
+                        generation !== this.downloadGeneration ||
+                        documentRevision !== this.documentRevision
+                    ) {
+                        entry.abortReason ??= 'download capture identity changed'
                     }
                     if (entry.abortReason) {
                         await this.send('Fetch.failRequest', { ...native, errorReason: 'Aborted' }, sessionId)
                         entry.state = 'aborted'
                         entry.reason = entry.abortReason
                     } else {
+                        this.saveBody(entry.ref, { encoding: body.base64Encoded ? 'base64' : 'utf8', data: body.body })
                         await this.send('Fetch.continueResponse', native, sessionId)
                         entry.state = 'resolved'
                     }
@@ -1357,16 +1522,29 @@ export class BrowserEventController {
         if (selected && selected.kind !== kind) {
             throw new Error('Browser event ref kind does not match the requested view')
         }
-        const entries = [...this.entries.values()].filter(
-            (e) =>
-                e.kind === kind &&
-                (!selected || e.ref === selected.ref) &&
-                (!options.urlPattern ||
-                    matches(
-                        String(e.url ?? (e.request as NativeEvent['request'] | undefined)?.url ?? ''),
-                        options.urlPattern
-                    ))
-        )
+        const entries = [...this.entries.values()].filter((e) => {
+            if (e.kind !== kind || (selected && e.ref !== selected.ref)) {
+                return false
+            }
+            if (!options.urlPattern) {
+                return true
+            }
+            const parent =
+                e.kind === 'stream' && typeof e.requestRef === 'string' ? this.entries.get(e.requestRef) : undefined
+            const socketRef = this.streamSocketRefs.get(e)
+            const socket = socketRef === undefined ? undefined : this.entries.get(socketRef)
+            const url =
+                e.url ??
+                (e.request as NativeEvent['request'] | undefined)?.url ??
+                (socketRef !== undefined
+                    ? socket?.nativeMethod === 'Network.webSocketCreated'
+                        ? socket.url
+                        : undefined
+                    : parent?.kind === 'request'
+                      ? parent.url
+                      : undefined)
+            return (e.kind !== 'stream' || typeof url === 'string') && matches(String(url ?? ''), options.urlPattern)
+        })
         const logs = entries.slice(-(options.limit ?? 100)).map((e) => {
             if (kind === 'request' && view === 'summary') {
                 return redact({
@@ -1394,8 +1572,8 @@ export class BrowserEventController {
                     : {}),
                 ...(kind === 'download'
                     ? {
-                          artifact:
-                              typeof e.bodyRef === 'string' && this.bodies.has(e.bodyRef) ? 'available' : 'unavailable',
+                          artifact: this.hasDownloadBody(e) ? 'available' : 'unavailable',
+                          artifactReason: this.hasDownloadBody(e) ? undefined : e.artifactReason,
                       }
                     : {}),
             })
@@ -1449,7 +1627,15 @@ export class BrowserEventController {
                 abort()
             }
         })
-        return { ...this.status(), download: redact(entry) }
+        const available = this.hasDownloadBody(entry)
+        return {
+            ...this.status(),
+            download: redact({
+                ...entry,
+                artifact: available ? 'available' : 'unavailable',
+                artifactReason: available ? undefined : entry.artifactReason,
+            }),
+        }
     }
 }
 

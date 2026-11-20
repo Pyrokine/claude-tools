@@ -23,6 +23,7 @@ import { withNavigationBudget } from '../dist/core/utils.js'
 const { registerInputTool } = await import(process.env.COORD_INPUT_MODULE ?? '../dist/tools/input.js')
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const chromePath = process.argv[2] ?? process.env.CHROME_PATH
+const headful = process.env.COORD_HEADFUL === '1'
 assert.ok(chromePath, 'Pass CHROME_PATH and optional OUTPUT_JSON')
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-c31f6-coordinates-'))
 const output = path.resolve(process.argv[3] ?? path.join(work, 'results.json'))
@@ -37,9 +38,16 @@ const result = {
     observerReads: 0,
     nativeReferences: 0,
     nativeDispatches: 0,
+    nativeCommands: [],
     productionCommands: [],
     boundary:
-        'Actual SDK Client/McpServer tools/call and production CDPClient/Session in an isolated Chrome. Extension uses production Bridge parameters and installed production ActionHandler via an explicit test worker carrier; HTTP/WebSocket extension discovery is outside this runner.',
+        'Actual SDK Client/McpServer tools/call and ' +
+        'production CDPClient/Session in an isolated ' +
+        'Chrome. Extension uses production Bridge ' +
+        'parameters and installed production ' +
+        'ActionHandler via an explicit test worker ' +
+        'carrier; HTTP/WebSocket extension discovery ' +
+        'is outside this runner.',
 }
 const extension = path.join(work, 'extension')
 fs.mkdirSync(extension)
@@ -70,29 +78,47 @@ await build({
     },
 })
 const pageBody =
-    '<input id="pad" type="checkbox" style="position:absolute;left:80px;top:60px;width:120px;height:100px;margin:0"><button id="disabled" disabled style="position:absolute;left:270px;top:60px">Disabled</button><input id="edit" style="position:absolute;left:80px;top:190px;width:140px"><p tabindex="-1" id="text" style="position:absolute;left:80px;top:230px;font:20px monospace">alpha bravo charlie</p><div id="drop" style="position:absolute;left:240px;top:190px;width:100px;height:100px">drop</div>'
-const http = createServer((request, response) => {
-    if (request.url === '/owned-download') {
-        response.setHeader('Content-Type', 'application/octet-stream')
-        response.setHeader('Content-Disposition', 'attachment; filename="owned-download.txt"')
-        response.end('owned download regression\n')
-        return
+    '<input id="pad" type="checkbox" ' +
+    'style="position:absolute;left:80px;top:60px;' +
+    'width:120px;height:100px;margin:0"><button ' +
+    'id="disabled" disabled style="position:absolut' +
+    'e;left:270px;top:60px">Disabled</button>' +
+    '<input id="edit" style="position:absolute;' +
+    'left:80px;top:190px;width:140px"><p ' +
+    'tabindex="-1" id="text" ' +
+    'style="position:absolute;left:80px;top:230px;' +
+    'font:20px monospace">alpha bravo charlie</p>' +
+    '<div id="drop" style="position:absolute;' +
+    'left:240px;top:190px;width:100px;' +
+    'height:100px">drop</div>'
+const http = createServer(
+    /**
+     * @param {import('node:http').IncomingMessage} request
+     * @param {import('node:http').ServerResponse} response
+     */
+    (request, response) => {
+        if (request.url === '/owned-download') {
+            response.setHeader('Content-Type', 'application/octet-stream')
+            response.setHeader('Content-Disposition', 'attachment; filename="owned-download.txt"')
+            response.end('owned download regression\n')
+            return
+        }
+        if (request.url?.startsWith('/csp-')) {
+            response.setHeader(
+                'Content-Security-Policy',
+                `script-src 'self'${request.url.startsWith('/csp-allowed') ? " 'unsafe-eval'" : ''}`
+            )
+        }
+        response.setHeader('Content-Type', 'text/html')
+        response.end('<!doctype html><title>Owned coordinates</title><body style="margin:0">' + pageBody + '</body>')
     }
-    if (request.url?.startsWith('/csp-')) {
-        response.setHeader(
-            'Content-Security-Policy',
-            `script-src 'self'${request.url.startsWith('/csp-allowed') ? " 'unsafe-eval'" : ''}`
-        )
-    }
-    response.setHeader('Content-Type', 'text/html')
-    response.end('<!doctype html><title>Owned coordinates</title><body style="margin:0">' + pageBody + '</body>')
-})
-await new Promise((resolve) => http.listen(0, '127.0.0.1', resolve))
+)
+await new Promise((resolve) => http.listen(0, '127.0.0.1', () => resolve(undefined)))
 const base = `http://127.0.0.1:${http.address().port}`
 const chrome = spawn(
     chromePath,
     [
-        '--headless=new',
+        ...(headful ? ['--no-startup-window'] : ['--headless=new']),
         '--no-sandbox',
         '--window-size=1600,1300',
         '--disable-background-networking',
@@ -106,10 +132,11 @@ const chrome = spawn(
         '--remote-debugging-pipe',
         '--enable-unsafe-extension-debugging',
         `--user-data-dir=${path.join(work, 'profile')}`,
-        base + '/',
+        ...(headful ? [] : [base + '/']),
     ],
     { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] }
 )
+result.browserArguments = chrome.spawnargs
 chrome.stderr.pipe(fs.createWriteStream(path.join(work, 'chrome.log'), { mode: 0o600 }))
 let seq = 0,
     buffer = ''
@@ -190,23 +217,27 @@ function payload(response) {
     assert.ok(text.startsWith('{'), text)
     return JSON.parse(text)
 }
-async function invoke(name, args) {
+async function invoke(name, args, options) {
     ++result.sdkCalls
     return payload(
-        await client.callTool({
-            name,
-            arguments: {
-                targetId: mode === 'cdp' ? rootId : String(tabId),
-                ...(['input', 'evaluate'].includes(name)
-                    ? { timeout: 7000, ...(frameSelection ? { frame: frameSelection } : {}) }
-                    : {}),
-                ...args,
+        await client.callTool(
+            {
+                name,
+                arguments: {
+                    targetId: mode === 'cdp' ? rootId : String(tabId),
+                    ...(['input', 'evaluate'].includes(name)
+                        ? { timeout: 7000, ...(frameSelection ? { frame: frameSelection } : {}) }
+                        : {}),
+                    ...args,
+                },
             },
-        })
+            undefined,
+            options
+        )
     )
 }
-async function call(events, extra = {}) {
-    return invoke('input', { events, ...extra })
+async function call(events, extra = {}, options) {
+    return invoke('input', { events, ...extra }, options)
 }
 function completed(body, count) {
     assert.equal(body.actionStatus, 'completed', JSON.stringify(body))
@@ -229,6 +260,7 @@ async function record(id, run) {
     try {
         Object.assign(check, await run(check))
         if (process.env.COORD_BUSINESS_FAILURE === id) {
+            // noinspection ExceptionCaughtLocallyJS — 将受控失败收集为测试结果
             throw new Error('Controlled business failure: ' + id)
         }
         check.status = 'PASS'
@@ -245,6 +277,7 @@ async function record(id, run) {
 function configure() {
     window.__coordAbort?.abort()
     window.__coordAbort = new AbortController()
+    window.__coordCaptureTimes = false
     window.__coordEvents = []
     window.__coordActions = 0
     for (const type of [
@@ -265,6 +298,9 @@ function configure() {
                 const touch = event.changedTouches?.[0]
                 const targetRect = window.__coordCaptureRects ? event.composedPath()[0].getBoundingClientRect?.() : null
                 window.__coordEvents.push({
+                    ...(window.__coordCaptureTimes
+                        ? { time: performance.now(), visibility: document.visibilityState }
+                        : {}),
                     ...(targetRect
                         ? {
                               targetRect: {
@@ -289,6 +325,9 @@ function configure() {
                 })
                 if (type === 'wheel') {
                     event.preventDefault()
+                    if (window.__coordCaptureTimes) {
+                        window.__coordEvents.at(-1).defaultPrevented = event.defaultPrevented
+                    }
                     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
                         ++window.__coordActions
                     }
@@ -298,6 +337,98 @@ function configure() {
         )
     }
     return { width: innerWidth, height: innerHeight }
+}
+function observeSettlementResources() {
+    const { EventTarget } = window
+    const add = EventTarget.prototype.addEventListener
+    const remove = EventTarget.prototype.removeEventListener
+    const NativeChannel = window.MessageChannel
+    const requestFrame = window.requestAnimationFrame.bind(window)
+    const cancelFrame = window.cancelAnimationFrame.bind(window)
+    const setTimer = window.setTimeout.bind(window)
+    const clearTimer = window.clearTimeout.bind(window)
+    const listeners = []
+    const ports = []
+    const frames = new Set()
+    const timers = new Set()
+    let framesCreated = 0
+    let timersCreated = 0
+    EventTarget.prototype.addEventListener = function (type, listener, ...rest) {
+        if (['scroll', 'scrollend', 'visibilitychange'].includes(type)) {
+            listeners.push({ target: this, type, listener })
+        }
+        return add.call(this, type, listener, ...rest)
+    }
+    EventTarget.prototype.removeEventListener = function (type, listener, ...rest) {
+        const index = listeners.findIndex(
+            (value) => value.target === this && value.type === type && value.listener === listener
+        )
+        if (index >= 0) {
+            listeners.splice(index, 1)
+        }
+        return remove.call(this, type, listener, ...rest)
+    }
+    window.MessageChannel = function () {
+        const channel = new NativeChannel()
+        for (const port of [channel.port1, channel.port2]) {
+            const close = port.close.bind(port)
+            const record = { closed: false }
+            ports.push(record)
+            port.close = () => {
+                record.closed = true
+                close()
+            }
+        }
+        return channel
+    }
+    window.requestAnimationFrame = (callback) => {
+        const id = requestFrame((time) => {
+            frames.delete(id)
+            callback.call(window, time)
+        })
+        ++framesCreated
+        frames.add(id)
+        return id
+    }
+    window.cancelAnimationFrame = (id) => {
+        frames.delete(id)
+        cancelFrame(id)
+    }
+    window.setTimeout = (callback, ms, ...args) => {
+        const id = setTimer(
+            (...values) => {
+                timers.delete(id)
+                callback.apply(window, values)
+            },
+            ms,
+            ...args
+        )
+        ++timersCreated
+        timers.add(id)
+        return id
+    }
+    window.clearTimeout = (id) => {
+        timers.delete(id)
+        clearTimer(id)
+    }
+    window.__coordResources = () => ({
+        listeners: listeners.map((value) => value.type),
+        ports: ports.map((value) => value.closed),
+        framesCreated,
+        framesRemaining: frames.size,
+        timersCreated,
+        timersRemaining: timers.size,
+    })
+    window.__coordRestoreResources = () => {
+        EventTarget.prototype.addEventListener = add
+        EventTarget.prototype.removeEventListener = remove
+        window.MessageChannel = NativeChannel
+        window.requestAnimationFrame = requestFrame
+        window.cancelAnimationFrame = cancelFrame
+        window.setTimeout = setTimer
+        window.clearTimeout = clearTimer
+    }
+    return true
 }
 const fixtureScript = (expression) => script(selectedFrame, expression)
 async function clear() {
@@ -315,7 +446,11 @@ async function setup(styles = []) {
     frameIds = []
     await script(
         0,
-        `(()=>{document.body.innerHTML=${JSON.stringify(styles.length ? '' : pageBody)};document.body.style.cssText='margin:0;min-width:1600px;min-height:1250px';window.scrollTo(0,0);return true})()`
+        '(()=>{document.body.innerHTML=' +
+            `${JSON.stringify(styles.length ? '' : pageBody)}` +
+            ";document.body.style.cssText='margin:0;" +
+            "min-width:1600px;min-height:1250px';" +
+            'window.scrollTo(0,0);return true})()'
     )
     let parent = 0
     for (let i = 0; i < styles.length; i++) {
@@ -324,7 +459,21 @@ async function setup(styles = []) {
         const style = styles[i].css
         await script(
             parent,
-            `(()=>{document.body.style.cssText='margin:0';document.body.innerHTML=${JSON.stringify(`<iframe id="frame${i}" src="${src}" style="position:absolute;width:400px;height:320px;border:0;left:100px;top:100px;transform-origin:0 0;${style}"></iframe>`)};return true})()`
+            "(()=>{document.body.style.cssText='margin:0';" +
+                'document.body.innerHTML=' +
+                ('' +
+                    JSON.stringify(
+                        '<iframe id="frame' +
+                            `${i}` +
+                            '" src="' +
+                            `${src}` +
+                            '" style="position:absolute;width:400px;' +
+                            'height:320px;border:0;left:100px;top:100px;' +
+                            'transform-origin:0 0;' +
+                            `${style}` +
+                            '"></iframe>'
+                    )) +
+                ';return true})()'
         )
         const frames = await until(async () => {
             const frames = await worker(`coordinates.frames(${tabId})`)
@@ -337,6 +486,10 @@ async function setup(styles = []) {
     selectedFrame = parent
     await fixtureScript(`(${configure.toString()})()`)
     await script(0, `(${configure.toString()})()`)
+    await fixtureScript(
+        'document.visibilityState === "visible" ? ' +
+            'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)))) : true'
+    )
     if (mode === 'cdp') {
         await session.selectPage(rootId)
         unified.activeMode = 'cdp'
@@ -355,7 +508,20 @@ async function oracle(point = { x: 140, y: 110 }) {
         const parent = i === 0 ? 0 : frameIds[i - 1]
         p = await script(
             parent,
-            `(()=>{const e=document.querySelector('#frame${i}'),s=getComputedStyle(e),o=s.transformOrigin.split(' ').map(Number.parseFloat);const m=new DOMMatrix(s.transform==='none'?undefined:s.transform);const z=Number(s.zoom)||1;const p=new DOMPoint(${p.x}+e.clientLeft,${p.y}+e.clientTop);const v=m.transformPoint(new DOMPoint(p.x-o[0],p.y-o[1]));return {x:(e.offsetLeft+o[0]+v.x)*z-scrollX,y:(e.offsetTop+o[1]+v.y)*z-scrollY}})()`
+            "(()=>{const e=document.querySelector('#frame" +
+                `${i}` +
+                "'),s=getComputedStyle(e)," +
+                "o=s.transformOrigin.split(' " +
+                "').map(Number.parseFloat);const m=s.transform==='none'?new DOMMatrix():" +
+                "e.computedStyleMap().get('transform').toMatrix();const z=Number(s.zoom)||1;const p=new " +
+                'DOMPoint(' +
+                `${p.x}` +
+                '+e.clientLeft,' +
+                `${p.y}` +
+                '+e.clientTop);const v=m.transformPoint(new ' +
+                'DOMPoint(p.x-o[0],p.y-o[1]));return ' +
+                '{x:(e.offsetLeft+o[0]+v.x)*z-scrollX,' +
+                'y:(e.offsetTop+o[1]+v.y)*z-scrollY}})()'
         )
     }
     return mode === 'cdp' ? { x: Math.round(p.x), y: Math.round(p.y) } : p
@@ -365,6 +531,7 @@ async function native(type, point, mask = 0, button = 'left') {
     const dispatch = async (params) => {
         ++result.nativeDispatches
         await observer.send('Input.dispatchMouseEvent', params, observerSession)
+        result.nativeCommands.push({ method: 'Input.dispatchMouseEvent', params })
     }
     if (type === 'wheel') {
         await dispatch({ type: 'mouseWheel', ...point, deltaX: 0, deltaY: 120, modifiers: mask })
@@ -417,7 +584,9 @@ async function cspPage(strict) {
 try {
     const port = await until(() => {
         try {
-            return Number(fs.readFileSync(path.join(work, 'profile/DevToolsActivePort'), 'utf8').split('\n')[0])
+            return Number(
+                fs.readFileSync(path.join(work, 'profile/DevToolsActivePort'), { encoding: 'utf8' }).split('\n')[0]
+            )
         } catch {
             return false
         }
@@ -426,6 +595,25 @@ try {
     const version = await (await globalThis.fetch(`http://127.0.0.1:${port}/json/version`)).json()
     await observer.connect(version.webSocketDebuggerUrl)
     result.browser = await observer.send('Browser.getVersion')
+    if (headful) {
+        const protocol = await (await globalThis.fetch(`http://127.0.0.1:${port}/json/protocol`)).json()
+        const createTarget = protocol.domains
+            .find((domain) => domain.domain === 'Target')
+            .commands.find((command) => command.name === 'createTarget')
+        assert.ok(createTarget.parameters.some((parameter) => parameter.name === 'windowState'))
+        const target = await observer.send('Target.createTarget', {
+            url: base + '/',
+            background: true,
+            newWindow: true,
+            windowState: 'minimized',
+        })
+        const { windowId } = await observer.send('Browser.getWindowForTarget', target)
+        await observer.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
+        result.headfulWindow = await until(async () => {
+            const bounds = await observer.send('Browser.getWindowBounds', { windowId })
+            return bounds.bounds.windowState === 'minimized' && { windowId, ...bounds }
+        })
+    }
     const page = (await observer.send('Target.getTargets')).targetInfos.find(
         (t) => t.type === 'page' && t.url === base + '/'
     )
@@ -471,7 +659,14 @@ try {
         ++result.bridgeCalls
         result.bridgeCommands.push({ action, params })
         void worker(
-            `(async()=>{try{return {success:true,data:await coordinates.command(${JSON.stringify(action)},${JSON.stringify(params)})}}catch(error){return {success:false,error:error instanceof Error?error.message:String(error)}}})()`
+            '(async()=>{try{return {success:true,' +
+                'data:await coordinates.command(' +
+                `${JSON.stringify(action)}` +
+                ',' +
+                `${JSON.stringify(params)}` +
+                ')}}catch(error){return {success:false,' +
+                'error:error instanceof Error?error.message:Str' +
+                'ing(error)}}})()'
         )
             .then((reply) => {
                 const response = { id: message.id, ...reply }
@@ -539,16 +734,27 @@ try {
             assert.equal(entry.watch.success, true, JSON.stringify(entry.watch))
             try {
                 await fixtureScript(
-                    `(()=>{const a=document.createElement('a');a.id='owned-download';a.href=${JSON.stringify(base + '/owned-download')};a.textContent='Download';a.style.cssText='position:absolute;left:80px;top:300px';document.body.append(a);return true})()`
+                    "(()=>{const a=document.createElement('a');" +
+                        "a.id='owned-download';a.href=" +
+                        `${JSON.stringify(base + '/owned-download')}` +
+                        ";a.textContent='Download';" +
+                        "a.style.cssText='position:absolute;left:80px;" +
+                        "top:300px';document.body.append(a);return " +
+                        'true})()'
                 )
                 entry.body = await call([{ type: 'click', target: { css: '#owned-download' } }])
                 completed(entry.body, 1)
                 await until(() => fs.existsSync(path.join(directory, 'owned-download.txt')))
                 assert.equal(
-                    fs.readFileSync(path.join(directory, 'owned-download.txt'), 'utf8'),
+                    fs.readFileSync(path.join(directory, 'owned-download.txt'), { encoding: 'utf8' }),
                     'owned download regression\n'
                 )
-                entry.logs = await invoke('logs', { type: 'download' })
+                entry.logs = await until(async () => {
+                    const observed = await invoke('logs', { type: 'download' })
+                    return observed.logs.some((value) => value.kind === 'download' && value.state === 'completed')
+                        ? observed
+                        : false
+                })
                 assert.ok(entry.logs.count > 0, JSON.stringify(entry))
                 assert.ok(
                     entry.logs.logs.some((value) => value.kind === 'download' && value.state === 'completed'),
@@ -569,25 +775,41 @@ try {
                             { type: 'mousedown', target: { css: '#pad' } },
                         ]) {
                             await record(`c31f13-preparation-${framed}-${consumer.type}`, async (entry) => {
-                                unified.setInputMode(inputMode)
+                                unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                                 await setup(framed ? [{ css: 'height:320px' }] : [])
                                 entry.frame = frameSelection ?? null
-                                await fixtureScript(`(() => {
-                                    window.__c31f13InputEvents=[];window.__c31f13HelperOutputs=0;
-                                    for(const type of ['mousemove','mousedown','mouseup','touchstart','click'])document.addEventListener(type,event=>window.__c31f13InputEvents.push(event.type),{capture:true,signal:window.__coordAbort.signal});
-                                    window.__c31f13Stringify=JSON.stringify;
-                                    JSON.stringify=(value,...args)=>{
-                                        if(value&&typeof value==='object'&&['x','y','width','height'].every(key=>Object.hasOwn(value,key))){
-                                            ++window.__c31f13HelperOutputs;throw new Error('OWNED_COORDINATE_OUTPUT_FAILURE');
-                                        }
-                                        return window.__c31f13Stringify(value,...args);
-                                    };
-                                    return true;
-                                })()`)
+                                await fixtureScript(
+                                    '(() => {\n                                    ' +
+                                        'window.__c31f13InputEvents=[];' +
+                                        'window.__c31f13HelperOutputs=0;\n              ' +
+                                        '                      for(const type of ' +
+                                        "['mousemove','mousedown','mouseup'," +
+                                        "'touchstart','click'])document.addEventListene" +
+                                        'r(type,event=>window.__c31f13InputEvents.push(' +
+                                        'event.type),{capture:true,' +
+                                        'signal:window.__coordAbort.signal});\n         ' +
+                                        '                           ' +
+                                        'window.__c31f13Stringify=JSON.stringify;\n     ' +
+                                        '                               ' +
+                                        'JSON.stringify=(value,...args)=>{\n            ' +
+                                        '                            if(value&&typeof ' +
+                                        "value==='object'&&['x','y','width'," +
+                                        "'height'].every(key=>Object.hasOwn(value," +
+                                        'key))){\n                                      ' +
+                                        '      ++window.__c31f13HelperOutputs;throw ' +
+                                        "new Error('OWNED_COORDINATE_OUTPUT_FAILURE');\n" +
+                                        '                                        }\n    ' +
+                                        '                                    return ' +
+                                        'window.__c31f13Stringify(value,...args);\n     ' +
+                                        '                               };\n            ' +
+                                        '                        return true;\n         ' +
+                                        '                       })()'
+                                )
                                 try {
                                     entry.body = await call([consumer])
                                     entry.effects = await fixtureScript(
-                                        '({events:window.__c31f13InputEvents,helperOutputs:window.__c31f13HelperOutputs})'
+                                        '({events:window.__c31f13InputEvents,' +
+                                            'helperOutputs:window.__c31f13HelperOutputs})'
                                     )
                                     assert.equal(entry.effects.helperOutputs, 1, JSON.stringify(entry))
                                     assert.deepEqual(entry.effects.events, [], JSON.stringify(entry))
@@ -631,49 +853,100 @@ try {
                         await record(
                             `c31f10-controlled-${inputMode}-${framed}-${control.kind}-${control.tag}`,
                             async (entry) => {
-                                unified.setInputMode(inputMode)
+                                unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                                 await setup(framed ? [{ css: 'height:320px' }] : [])
                                 entry.control = control
                                 entry.frame = frameSelection ?? null
-                                entry.before = await fixtureScript(`(async () => {
-                                const {tag,kind}=${JSON.stringify(control)};
-                                const adopted=kind.startsWith('adopted');
-                                let source=document,foreign;
-                                if(adopted){
-                                    const frame=document.createElement('iframe');frame.hidden=true;
-                                    const ready=new Promise(resolve=>frame.onload=resolve);
-                                    frame.srcdoc='<!doctype html><body>owned source realm</body>';
-                                    document.body.append(frame);await ready;
-                                    source=frame.contentDocument;foreign=frame.contentWindow;
-                                }
-                                const Native=tag==='input'?window.HTMLInputElement:tag==='textarea'?window.HTMLTextAreaElement:window.HTMLSelectElement;
-                                const name='owned-controlled-'+tag;
-                                if(kind==='customized'&&!customElements.get(name))customElements.define(name,class extends Native{},{extends:tag});
-                                const el=source.createElement(tag,kind==='customized'?{is:name}:undefined);
-                                if(tag==='select')for(const value of ['old','updated']){
-                                    const option=source.createElement('option');option.value=value;option.textContent=value;el.append(option);
-                                }
-                                el.id='controlled-field';el.style.cssText='display:block;position:relative;margin:20px;width:140px';
-                                if(kind==='file'||kind==='adopted-file')el.type='file';
-                                else if(tag==='div')el.textContent='old';
-                                else el.value='old';
-                                if(kind==='readonly')el.readOnly=true;
-                                if(kind==='editable')el.contentEditable='true';
-                                if(adopted)document.adoptNode(el);
-                                if(kind==='fieldset'||kind==='legend'){
-                                    const fieldset=document.createElement('fieldset');fieldset.disabled=true;
-                                    if(kind==='legend'){const legend=document.createElement('legend');legend.append(el);fieldset.append(legend);}
-                                    else fieldset.append(el);
-                                    document.body.append(fieldset);
-                                }else document.body.append(el);
-                                window.__controlledEvents=[];
-                                for(const type of ['focus','input','change'])el.addEventListener(type,event=>window.__controlledEvents.push({type:event.type,trusted:event.isTrusted}),{capture:true,signal:window.__coordAbort.signal});
-                                const Foreign=foreign&&(tag==='input'?foreign.HTMLInputElement:tag==='textarea'?foreign.HTMLTextAreaElement:foreign.HTMLSelectElement);
-                                return {tag:el.localName,namespace:el.namespaceURI,value:tag==='div'?el.textContent:el.value,
-                                    ownDisabled:el.disabled,effectiveDisabled:el.matches(':disabled'),
-                                    ownerDocumentMatches:el.ownerDocument===document,queryMatches:document.querySelector('#controlled-field')===el,
-                                    localInstance:el instanceof Native,foreignInstance:Foreign?el instanceof Foreign:null};
-                            })()`)
+                                entry.before = await fixtureScript(
+                                    '(async () => {\n                               ' +
+                                        ' const {tag,kind}=' +
+                                        `${JSON.stringify(control)}` +
+                                        ';\n                                const ' +
+                                        "adopted=kind.startsWith('adopted');\n          " +
+                                        '                      let source=document,' +
+                                        'foreign;\n                                ' +
+                                        'if(adopted){\n                                 ' +
+                                        "   const frame=document.createElement('iframe'" +
+                                        ');frame.hidden=true;\n                         ' +
+                                        '           const ready=new Promise(resolve=>' +
+                                        'frame.onload=resolve);\n                       ' +
+                                        "             frame.srcdoc='<!doctype html>" +
+                                        "<body>owned source realm</body>';\n            " +
+                                        '                        ' +
+                                        'document.body.append(frame);await ready;\n     ' +
+                                        '                               ' +
+                                        'source=frame.contentDocument;' +
+                                        'foreign=frame.contentWindow;\n                 ' +
+                                        '               }\n                             ' +
+                                        "   const Native=tag==='input'?window.HTMLInput" +
+                                        "Element:tag==='textarea'?window.HTMLTextAreaEl" +
+                                        'ement:window.HTMLSelectElement;\n              ' +
+                                        '                  const ' +
+                                        "name='owned-controlled-'+tag;\n                " +
+                                        "                if(kind==='customized'&&!custo" +
+                                        'mElements.get(name))customElements.define(name' +
+                                        ',class extends Native{},{extends:tag});\n      ' +
+                                        '                          const ' +
+                                        'el=source.createElement(tag,' +
+                                        "kind==='customized'?{is:name}:undefined);\n    " +
+                                        '                            ' +
+                                        "if(tag==='select')for(const value of ['old'," +
+                                        "'updated']){\n                                 " +
+                                        "   const option=source.createElement('option')" +
+                                        ';option.value=value;option.textContent=value;' +
+                                        'el.append(option);\n                           ' +
+                                        '     }\n                                ' +
+                                        "el.id='controlled-field';" +
+                                        "el.style.cssText='display:block;" +
+                                        "position:relative;margin:20px;width:140px';\n  " +
+                                        '                              ' +
+                                        "if(kind==='file'||kind==='adopted-file')el.typ" +
+                                        "e='file';\n                                " +
+                                        "else if(tag==='div')el.textContent='old';\n    " +
+                                        '                            else ' +
+                                        "el.value='old';\n                              " +
+                                        "  if(kind==='readonly')el.readOnly=true;\n     " +
+                                        '                           ' +
+                                        "if(kind==='editable')el.contentEditable='true'" +
+                                        ';\n                                ' +
+                                        'if(adopted)document.adoptNode(el);\n           ' +
+                                        "                     if(kind==='fieldset'||kin" +
+                                        "d==='legend'){\n                               " +
+                                        "     const fieldset=document.createElement('fi" +
+                                        "eldset');fieldset.disabled=true;\n             " +
+                                        "                       if(kind==='legend'){con" +
+                                        "st legend=document.createElement('legend');" +
+                                        'legend.append(el);fieldset.append(legend);}\n  ' +
+                                        '                                  else ' +
+                                        'fieldset.append(el);\n                         ' +
+                                        '           document.body.append(fieldset);\n   ' +
+                                        '                             }else ' +
+                                        'document.body.append(el);\n                    ' +
+                                        '            window.__controlledEvents=[];\n    ' +
+                                        '                            for(const type of ' +
+                                        "['focus','input','change'])el.addEventListener" +
+                                        '(type,event=>window.__controlledEvents.push({t' +
+                                        'ype:event.type,trusted:event.isTrusted}),' +
+                                        '{capture:true,signal:window.__coordAbort.signa' +
+                                        'l});\n                                const ' +
+                                        "Foreign=foreign&&(tag==='input'?foreign.HTMLIn" +
+                                        "putElement:tag==='textarea'?foreign.HTMLTextAr" +
+                                        'eaElement:foreign.HTMLSelectElement);\n        ' +
+                                        '                        return ' +
+                                        '{tag:el.localName,namespace:el.namespaceURI,' +
+                                        "value:tag==='div'?el.textContent:el.value,\n   " +
+                                        '                                 ' +
+                                        'ownDisabled:el.disabled,' +
+                                        "effectiveDisabled:el.matches(':disabled'),\n   " +
+                                        '                                 ' +
+                                        'ownerDocumentMatches:el.ownerDocument===docume' +
+                                        "nt,queryMatches:document.querySelector('#contr" +
+                                        "olled-field')===el,\n                          " +
+                                        '          localInstance:el instanceof Native,' +
+                                        'foreignInstance:Foreign?el instanceof ' +
+                                        'Foreign:null};\n                            ' +
+                                        '})()'
+                                )
                                 if (control.kind.startsWith('adopted')) {
                                     assert.equal(entry.before.localInstance, false)
                                     assert.equal(entry.before.foreignInstance, true)
@@ -686,10 +959,14 @@ try {
                                         text: 'updated',
                                     },
                                 ])
-                                entry.after = await fixtureScript(`(() => {
-                                const el=document.querySelector('#controlled-field');
-                                return {value:el.localName==='div'?el.textContent:el.value,events:window.__controlledEvents};
-                            })()`)
+                                entry.after = await fixtureScript(
+                                    '(() => {\n                                ' +
+                                        "const el=document.querySelector('#controlled-f" +
+                                        "ield');\n                                " +
+                                        "return {value:el.localName==='div'?el.textCont" +
+                                        'ent:el.value,events:window.__controlledEvents}' +
+                                        ';\n                            })()'
+                                )
                                 assert.equal(entry.before.ownerDocumentMatches, true)
                                 assert.equal(entry.before.queryMatches, true)
                                 if (control.accept) {
@@ -712,7 +989,7 @@ try {
                     }
                 }
                 await record(`c31f9-taginput-${inputMode}-${framed}`, async (entry) => {
-                    unified.setInputMode(inputMode)
+                    unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                     await setup(framed ? [{ css: 'height:320px' }] : [])
                     await fixtureScript(`(() => {
                         const field=document.createElement('input');field.id='tag-entry';
@@ -741,24 +1018,37 @@ try {
                 })
                 for (const kind of ['tab', 'score']) {
                     await record(`c31f9-semantic-${inputMode}-${framed}-${kind}`, async (entry) => {
-                        unified.setInputMode(inputMode)
+                        unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                         await setup(framed ? [{ css: 'height:320px' }] : [])
                         entry.frame = frameSelection ?? null
-                        await fixtureScript(`(() => {
-                            const box=document.createElement('div');
-                            box.style.cssText='position:absolute;left:80px;top:320px';
-                            box.innerHTML='<div id="react-tabs-2" role="tab" tabindex="0"><span>编译</span></div><button class="score" data-score="-2"><span>-2</span></button><button class="score" data-score="2"><span> 2 </span></button>';
-                            document.body.append(box);
-                            window.__semanticSelection=null;
-                            box.addEventListener('click',event=>{
-                                const target=event.target.closest('[role=tab],button');
-                                if(target){
-                                    window.__semanticSelection=target.dataset.score ?? target.id;
-                                    if(target.matches('[role=tab]'))target.setAttribute('aria-selected','true');
-                                }
-                            },{signal:window.__coordAbort.signal});
-                            return true;
-                        })()`)
+                        await fixtureScript(
+                            '(() => {\n                            const ' +
+                                "box=document.createElement('div');\n           " +
+                                "                 box.style.cssText='position:a" +
+                                "bsolute;left:80px;top:320px';\n                " +
+                                "            box.innerHTML='<div " +
+                                'id="react-tabs-2" role="tab" tabindex="0">' +
+                                '<span>编译</span></div><button class="score" ' +
+                                'data-score="-2"><span>-2</span></button>' +
+                                '<button class="score" data-score="2"><span> 2 ' +
+                                "</span></button>';\n                           " +
+                                ' document.body.append(box);\n                  ' +
+                                '          window.__semanticSelection=null;\n   ' +
+                                '                         ' +
+                                "box.addEventListener('click',event=>{\n        " +
+                                '                        const ' +
+                                "target=event.target.closest('[role=tab]," +
+                                "button');\n                                " +
+                                'if(target){\n                                  ' +
+                                '  window.__semanticSelection=target.dataset.sc' +
+                                'ore ?? target.id;\n                            ' +
+                                "        if(target.matches('[role=tab]'))target" +
+                                ".setAttribute('aria-selected','true');\n       " +
+                                '                         }\n                   ' +
+                                '         },{signal:window.__coordAbort.signal}' +
+                                ');\n                            return true;\n  ' +
+                                '                      })()'
+                        )
                         const target =
                             kind === 'tab'
                                 ? { role: 'tab', name: '编', exact: false }
@@ -844,7 +1134,12 @@ try {
                                       kind,
                                       output: true,
                                       originalMessage: 'OWNED_FIRST_OUTPUT_FAILURE',
-                                      statement: `let calls=0;JSON.stringify=()=>{if(++calls===1)throw new Error("OWNED_FIRST_OUTPUT_FAILURE");return ${JSON.stringify(value)}};return 42`,
+                                      statement:
+                                          'let calls=0;JSON.stringify=()=>' +
+                                          '{if(++calls===1)throw new ' +
+                                          'Error("OWNED_FIRST_OUTPUT_FAILURE");return ' +
+                                          `${JSON.stringify(value)}` +
+                                          '};return 42',
                                   })),
                                   ...[
                                       ['materialize-invalid', 'owned invalid JSON'],
@@ -866,7 +1161,10 @@ try {
                                       kind,
                                       boundary: true,
                                       output: true,
-                                      statement: `JSON.stringify=()=>${JSON.stringify(value)};return document.querySelectorAll("input")`,
+                                      statement:
+                                          'JSON.stringify=()=>' +
+                                          `${JSON.stringify(value)}` +
+                                          ';return document.querySelectorAll("input")',
                                   })),
                                   ...[
                                       ['return-undefined', 'return undefined', null],
@@ -887,42 +1185,58 @@ try {
                                       boundary: true,
                                       output: true,
                                       statement:
-                                          'JSON.stringify=()=>{throw new Error("owned JSON serializer unavailable")};return 42',
+                                          'JSON.stringify=()=>{throw new Error(' +
+                                          '"owned JSON serializer unavailable")};return 42',
                                   },
                                   {
                                       kind: 'get-prototype',
                                       boundary: true,
                                       output: true,
                                       statement:
-                                          'return new Proxy({owned:true,value:42},{getPrototypeOf(){throw new Error("owned prototype read")}})',
+                                          'return new Proxy({owned:true,value:42},' +
+                                          '{getPrototypeOf(){throw new Error("owned ' +
+                                          'prototype read")}})',
                                   },
                                   {
                                       kind: 'node-name',
                                       boundary: true,
                                       output: true,
                                       statement:
-                                          'const value=document.createTextNode("owned");Object.defineProperty(value,"nodeName",{get(){throw new Error("owned nodeName read")}});return value',
+                                          'const value=document.createTextNode("owned");' +
+                                          'Object.defineProperty(value,"nodeName",' +
+                                          '{get(){throw new Error("owned nodeName ' +
+                                          'read")}});return value',
                                   },
                                   {
                                       kind: 'parent-element',
                                       boundary: true,
                                       output: true,
                                       statement:
-                                          'const value=document.createTextNode("owned");Object.defineProperty(value,"parentElement",{get(){throw new Error("owned parentElement read")}});return value',
+                                          'const value=document.createTextNode("owned");' +
+                                          'Object.defineProperty(value,"parentElement",' +
+                                          '{get(){throw new Error("owned parentElement ' +
+                                          'read")}});return value',
                                   },
                                   {
                                       kind: 'node-list-constructor',
                                       boundary: true,
                                       output: true,
                                       statement:
-                                          'const value=document.querySelectorAll("input");Object.defineProperty(value,"constructor",{get(){throw new Error("owned NodeList constructor read")}});return value',
+                                          'const value=document.querySelectorAll("input")' +
+                                          ';Object.defineProperty(value,"constructor",' +
+                                          '{get(){throw new Error("owned NodeList ' +
+                                          'constructor read")}});return value',
                                   },
                                   {
                                       kind: 'collection-constructor',
                                       boundary: true,
                                       output: true,
                                       statement:
-                                          'const value=document.getElementsByTagName("input");Object.defineProperty(value,"constructor",{get(){throw new Error("owned HTMLCollection constructor read")}});return value',
+                                          'const value=document.getElementsByTagName("inp' +
+                                          'ut");Object.defineProperty(value,' +
+                                          '"constructor",{get(){throw new Error("owned ' +
+                                          'HTMLCollection constructor read")}});return ' +
+                                          'value',
                                   },
                                   {
                                       kind: 'revoked-proxy',
@@ -935,7 +1249,17 @@ try {
                     ]
                     for (const spec of cases) {
                         await record(
-                            `${spec.originalMessage ? 'c31f13' : spec.boundary ? 'c31f12' : 'c31f11'}-output-${evaluationMode}-${framed}-${withArgs}-${spec.kind}`,
+                            '' +
+                                `${spec.originalMessage ? 'c31f13' : spec.boundary ? 'c31f12' : 'c31f11'}` +
+                                '-output-' +
+                                `${evaluationMode}` +
+                                '-' +
+                                `${framed}` +
+                                '-' +
+                                `${withArgs}` +
+                                '-' +
+                                `${spec.kind}` +
+                                '',
                             async (entry) => {
                                 await cspPage(false)
                                 await setup(framed ? [{ css: 'height:320px' }] : [])
@@ -1067,7 +1391,10 @@ try {
                     const fn =
                         evaluationMode === 'stealth'
                             ? 'function(){window.__cspActions++;return 42}'
-                            : 'function(){window.__cspActions++;return new Promise((resolve,reject)=>setTimeout(()=>{try{resolve(eval("42"))}catch(error){reject(error)}},0))}'
+                            : 'function(){window.__cspActions++;return new ' +
+                              'Promise((resolve,reject)=>setTimeout(()=>' +
+                              '{try{resolve(eval("42"))}catch(error){reject(e' +
+                              'rror)}},0))}'
                     entry.body = await invoke('evaluate', {
                         mode: evaluationMode,
                         script: withArgs ? fn : `(${fn})()`,
@@ -1109,11 +1436,15 @@ try {
                                 `c31f9-visibility-${inputMode}-${framed}-${states.join('-')}-${action}`,
                                 async (entry) => {
                                     visibilityBackground ??= await worker(
-                                        `chrome.tabs.create({url:${JSON.stringify(base + '/visibility-background')},active:false})`
+                                        'chrome.tabs.create({url:' +
+                                            `${JSON.stringify(base + '/visibility-background')}` +
+                                            ',active:false})'
                                     )
                                     const setVisibility = async (state) => {
                                         await worker(
-                                            `chrome.tabs.update(${state === 'visible' ? tabId : visibilityBackground.id},{active:true})`
+                                            'chrome.tabs.update(' +
+                                                `${state === 'visible' ? tabId : visibilityBackground.id}` +
+                                                ',{active:true})'
                                         )
                                         await until(() =>
                                             fixtureScript(`document.visibilityState === ${JSON.stringify(state)}`)
@@ -1121,37 +1452,73 @@ try {
                                     }
                                     await worker(`chrome.tabs.update(${tabId},{active:true})`)
                                     await setup(framed ? [{ css: 'height:320px' }] : [])
+                                    entry.frame = frameSelection ?? null
                                     await setVisibility(states[0])
-                                    unified.setInputMode(inputMode)
-                                    await fixtureScript(`(() => {
-                                    document.body.style.minHeight='3000px';window.__coordCaptureRects=true;
-                                    const pad=document.querySelector('#pad');pad.style.cssText='position:absolute;left:80px;top:2100px;width:80px;height:70px;margin:0';
-                                    window.__visStates=[{state:document.visibilityState,time:performance.now()}];
-                                    window.__visStarted=false;window.__visReady=false;window.__visHeldFrames=0;window.__visHeldMessages=0;
-                                    window.__visReleaseFrame=undefined;window.__visMessages=[];
-                                    const nativeRAF=window.requestAnimationFrame.bind(window), NativeChannel=window.MessageChannel;
-                                    window.__visRestore=()=>{window.requestAnimationFrame=nativeRAF;window.MessageChannel=NativeChannel};
-                                    document.addEventListener('visibilitychange',()=>{
-                                        window.__visStates.push({state:document.visibilityState,time:performance.now()});
-                                        pad.style.left='240px';
-                                        if(document.visibilityState==='visible') nativeRAF(()=>{pad.style.left='280px'});
-                                    },{signal:window.__coordAbort.signal});
-                                    window.requestAnimationFrame=callback=>{
-                                        const id=nativeRAF(time=>{
-                                            if(window.__visReady) callback(time);
-                                            else {window.__visHeldFrames++;window.__visReleaseFrame=()=>nativeRAF(callback)}
-                                        });
-                                        window.__visStarted=true;return id;
-                                    };
-                                    window.MessageChannel=function(){
-                                        const channel=new NativeChannel(), post=channel.port2.postMessage.bind(channel.port2);
-                                        channel.port2.postMessage=value=>{
-                                            if(!window.__visReady){window.__visStarted=true;window.__visHeldMessages++;window.__visMessages.push(()=>post(value))}
-                                            else post(value);
-                                        };return channel;
-                                    };
-                                    return true;
-                                })()`)
+                                    unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
+                                    await fixtureScript(
+                                        '(() => {\n                                    ' +
+                                            "document.body.style.minHeight='3000px';" +
+                                            'window.__coordCaptureRects=true;\n             ' +
+                                            '                       const ' +
+                                            "pad=document.querySelector('#pad');" +
+                                            "pad.style.cssText='position:absolute;" +
+                                            'left:80px;top:2100px;width:80px;height:70px;' +
+                                            "margin:0';\n                                   " +
+                                            ' window.__visStates=[{state:document.visibilit' +
+                                            'yState,time:performance.now()}];\n             ' +
+                                            '                       window.__visStarted=fal' +
+                                            'se;window.__visReady=false;' +
+                                            'window.__visHeldFrames=0;' +
+                                            'window.__visHeldMessages=0;\n                  ' +
+                                            '                  window.__visReleaseFrame=und' +
+                                            'efined;window.__visMessages=[];\n              ' +
+                                            '                      const ' +
+                                            'nativeRAF=window.requestAnimationFrame.bind(wi' +
+                                            'ndow), NativeChannel=window.MessageChannel;\n  ' +
+                                            '                                  ' +
+                                            'window.__visRestore=()=>' +
+                                            '{window.requestAnimationFrame=nativeRAF;' +
+                                            'window.MessageChannel=NativeChannel};\n        ' +
+                                            '                            ' +
+                                            "document.addEventListener('visibilitychange'," +
+                                            '()=>{\n                                        ' +
+                                            'window.__visStates.push({state:document.visibi' +
+                                            'lityState,time:performance.now()});\n          ' +
+                                            '                              ' +
+                                            "pad.style.left='240px';\n                      " +
+                                            '                  if(document.visibilityState=' +
+                                            "=='visible') nativeRAF(()=>" +
+                                            "{pad.style.left='280px'});\n                   " +
+                                            '                 },{signal:window.__coordAbort' +
+                                            '.signal});\n                                   ' +
+                                            ' window.requestAnimationFrame=callback=>{\n    ' +
+                                            '                                    const ' +
+                                            'id=nativeRAF(time=>{\n                         ' +
+                                            '                   if(window.__visReady) ' +
+                                            'callback(time);\n                              ' +
+                                            '              else {window.__visHeldFrames++;' +
+                                            'window.__visReleaseFrame=()=>' +
+                                            'nativeRAF(callback)}\n                         ' +
+                                            '               });\n                           ' +
+                                            '             window.__visStarted=true;return ' +
+                                            'id;\n                                    };\n   ' +
+                                            '                                 ' +
+                                            'window.MessageChannel=function(){\n            ' +
+                                            '                            const channel=new ' +
+                                            'NativeChannel(), post=channel.port2.postMessag' +
+                                            'e.bind(channel.port2);\n                       ' +
+                                            '                 channel.port2.postMessage=val' +
+                                            'ue=>{\n                                        ' +
+                                            '    if(!window.__visReady){window.__visStarted' +
+                                            '=true;window.__visHeldMessages++;' +
+                                            'window.__visMessages.push(()=>post(value))}\n  ' +
+                                            '                                          ' +
+                                            'else post(value);\n                            ' +
+                                            '            };return channel;\n                ' +
+                                            '                    };\n                       ' +
+                                            '             return true;\n                    ' +
+                                            '            })()'
+                                    )
                                     const sequence =
                                         action === 'down-up'
                                             ? [{ type: 'mousedown', target: { css: '#pad' } }, { type: 'mouseup' }]
@@ -1159,6 +1526,9 @@ try {
                                     const first = (await worker('coordinates.nativeInputs()')).length
                                     let pending
                                     let settled = false
+                                    await fixtureScript(
+                                        `(window.__coordCaptureTimes=true,(${observeSettlementResources.toString()})())`
+                                    )
                                     try {
                                         pending = call(sequence, { timeout: 2000 })
                                         void pending.then(
@@ -1170,19 +1540,44 @@ try {
                                             }
                                         )
                                         await until(() => fixtureScript('window.__visStarted'))
+                                        entry.preparation = await fixtureScript(
+                                            '({time:performance.now(),visibility:document.visibilityState})'
+                                        )
+                                        assert.equal(settled, false, JSON.stringify(entry))
                                         for (const state of states.slice(1)) {
                                             await setVisibility(state)
                                         }
                                         if (!settled) {
                                             await fixtureScript(
-                                                `(()=>{window.__visReady=true;for(const post of window.__visMessages)post();window.__visMessages=[];if(document.visibilityState==='visible')window.__visReleaseFrame?.();return true})()`
+                                                '(()=>{window.__visReady=true;for(const post ' +
+                                                    'of window.__visMessages)post();' +
+                                                    'window.__visMessages=[];' +
+                                                    "if(document.visibilityState==='visible')window" +
+                                                    '.__visReleaseFrame?.();return true})()'
                                             )
                                         }
                                         entry.body = await pending
                                         entry.tool = await events()
                                         entry.inputs = (await worker('coordinates.nativeInputs()')).slice(first)
                                         entry.visibility = await fixtureScript(
-                                            '({states:__visStates,heldFrames:__visHeldFrames,heldMessages:__visHeldMessages,final:document.visibilityState})'
+                                            '({states:__visStates,heldFrames:__visHeldFrame' +
+                                                's,heldMessages:__visHeldMessages,' +
+                                                'final:document.visibilityState,time:performance.now(),' +
+                                                'rect:document.querySelector("#pad").getBoundingClientRect().toJSON()})'
+                                        )
+                                        entry.settlementResources = await fixtureScript('window.__coordResources()')
+                                        assert.deepEqual(entry.settlementResources.listeners, [], JSON.stringify(entry))
+                                        assert.ok(entry.settlementResources.ports.length > 0, JSON.stringify(entry))
+                                        assert.ok(entry.settlementResources.ports.every(Boolean), JSON.stringify(entry))
+                                        assert.equal(
+                                            entry.settlementResources.framesRemaining,
+                                            0,
+                                            JSON.stringify(entry)
+                                        )
+                                        assert.equal(
+                                            entry.settlementResources.timersRemaining,
+                                            0,
+                                            JSON.stringify(entry)
                                         )
                                         assert.equal(entry.visibility.final, states.at(-1))
                                         assert.deepEqual(
@@ -1190,6 +1585,17 @@ try {
                                             states,
                                             JSON.stringify(entry)
                                         )
+                                        assert.ok(entry.preparation.time <= entry.visibility.states[1].time)
+                                        assert.ok(
+                                            entry.visibility.states.every(
+                                                (value, index, values) =>
+                                                    index === 0 || value.time >= values[index - 1].time
+                                            )
+                                        )
+                                        for (const event of entry.tool) {
+                                            assert.ok(event.time >= entry.visibility.states.at(-1).time)
+                                            assert.equal(event.visibility, states.at(-1))
+                                        }
                                         assert.notEqual(entry.body.error?.code, 'TIMEOUT', JSON.stringify(entry))
                                         assert.doesNotMatch(
                                             entry.body.error?.message ?? '',
@@ -1224,8 +1630,23 @@ try {
                                             assert.deepEqual(entry.inputs, [])
                                             assert.deepEqual(entry.tool, [])
                                         }
+                                        await clear()
+                                        entry.oracle = await oracle({
+                                            x: entry.visibility.rect.x + entry.visibility.rect.width / 2,
+                                            y: entry.visibility.rect.y + entry.visibility.rect.height / 2,
+                                        })
+                                        await native(action, entry.oracle)
+                                        entry.reference = await events()
+                                        const reference = entry.reference.find(
+                                            (event) => event.type === (action === 'down-up' ? 'mousedown' : 'mousemove')
+                                        )
+                                        assert.equal(reference?.target, 'pad', JSON.stringify(entry))
+                                        assert.equal(reference.trusted, true)
+                                        assert.equal(reference.visibility, states.at(-1))
                                     } finally {
-                                        await fixtureScript('(window.__visRestore(),true)')
+                                        await fixtureScript(
+                                            '(window.__coordRestoreResources(),window.__visRestore(),true)'
+                                        )
                                         await pending?.catch(() => {})
                                         await worker(`chrome.tabs.update(${tabId},{active:true})`)
                                     }
@@ -1247,104 +1668,356 @@ try {
                         'dynamic-shadow',
                         'repeated-source',
                         'sync-unrelated',
+                        'unrelated-reused',
+                        'sync-unrelated-cancel',
                     ]) {
+                        const cancel = observation === 'sync-unrelated-cancel'
+                        const scene = cancel ? 'sync-unrelated' : observation
                         for (const action of ['mousemove', 'down-up']) {
                             await record(
-                                `${observation === 'sync-unrelated' ? 'c31f13' : ['dynamic-shadow', 'repeated-source'].includes(observation) ? 'c31f12' : 'c31f11'}-observation-${inputMode}-${framed}-${observation}-${action}`,
+                                [
+                                    scene === 'sync-unrelated'
+                                        ? 'c31f13'
+                                        : ['dynamic-shadow', 'repeated-source', 'unrelated-reused'].includes(scene)
+                                          ? 'c31f12'
+                                          : 'c31f11',
+                                    cancel ? 'cancel' : 'observation',
+                                    inputMode,
+                                    framed,
+                                    observation,
+                                    action,
+                                ].join('-'),
                                 async (entry) => {
-                                    unified.setInputMode(inputMode)
+                                    unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                                     await setup(framed ? [{ css: 'height:320px' }] : [])
                                     entry.frame = frameSelection ?? null
-                                    entry.before = await fixtureScript(`(() => {
-                                    document.body.innerHTML='<div id="outer" style="position:absolute;left:10px;top:20px;width:380px;height:250px;overflow:auto"><div style="position:relative;width:360px;height:1200px"><div id="inner" style="position:absolute;left:0;top:20px;width:350px;height:150px;overflow:auto"><div style="position:relative;width:330px;height:3500px"><input id="pad" type="checkbox" style="position:absolute;left:50px;top:2100px;width:60px;height:50px;margin:0"></div></div></div></div><div id="other-root" style="position:fixed;left:1000px;top:10px"></div>';
-                                    document.body.style.cssText='margin:0;min-height:900px';
-                                    const scene=${JSON.stringify(observation)},pad=document.querySelector('#pad'),inner=document.querySelector('#inner');
-                                    const host=document.querySelector('#other-root');
-                                    const root=scene==='foreign-shadow'?host.attachShadow({mode:'open'}):host;
-                                    root.innerHTML='<div id="second" style="width:100px;height:100px;overflow:auto"><div style="height:1000px;width:50px"></div></div><div id="third" style="width:100px;height:100px;overflow:auto"><div style="height:1000px;width:50px"></div></div>';
-                                    const second=root.querySelector('#second'),third=root.querySelector('#third'),signal=window.__coordAbort.signal;
-                                    window.__cascadeTrace=[];window.__coordCaptureRects=true;window.__unrelatedFrame=undefined;window.__cascadeDone=false;
-                                    const log=name=>{const r=pad.getBoundingClientRect();window.__cascadeTrace.push({name,time:performance.now(),x:r.x,y:r.y,inner:inner.scrollTop,second:second.scrollTop,third:third.scrollTop,sourceRoot:second.getRootNode().constructor.name})};
-                                    const final=()=>{pad.style.left='220px';window.__cascadeDone=true;log('final-after')};
-                                    second.addEventListener('scroll',()=>log('second-capture'),{capture:true,signal});
-                                    second.addEventListener('scrollend',()=>log('second-end'),{capture:true,signal});
-                                    if(scene==='early-capture')document.addEventListener('scroll',event=>{
-                                        if(event.target===second){log('second');third.scrollTop=70;event.stopImmediatePropagation()}
-                                        if(event.target===third){final();event.stopImmediatePropagation()}
-                                    },{capture:true,signal});
-                                    else {
-                                        let repeats=0;
-                                        second.addEventListener('scroll',()=>{
-                                            log('second');
-                                            if(scene==='foreign-shadow'||scene==='dynamic-shadow')third.scrollTop=70;
-                                            if(scene==='repeated-source'){if(++repeats<4)second.scrollTop+=10;else final()}
-                                            if(scene==='sync-unrelated'&&window.__syncUnrelated)second.scrollTop=second.scrollTop===60?70:60;
-                                        },{once:!['repeated-source','sync-unrelated'].includes(scene),signal});
-                                        third.addEventListener('scroll',final,{once:true,signal});
+                                    entry.before = await fixtureScript(
+                                        '(() => {\n                                    ' +
+                                            'document.body.innerHTML=\'<div id="outer" ' +
+                                            'style="position:absolute;left:10px;top:20px;' +
+                                            'width:380px;height:250px;overflow:auto"><div ' +
+                                            'style="position:relative;width:360px;' +
+                                            'height:1200px"><div id="inner" ' +
+                                            'style="position:absolute;left:0;top:20px;' +
+                                            'width:350px;height:150px;overflow:auto"><div ' +
+                                            'style="position:relative;width:330px;' +
+                                            'height:3500px"><input id="pad" ' +
+                                            'type="checkbox" style="position:absolute;' +
+                                            'left:50px;top:2100px;width:60px;height:50px;' +
+                                            'margin:0"></div></div></div></div><div ' +
+                                            'id="other-root" style="position:fixed;' +
+                                            'left:1000px;top:10px"></div>\';\n               ' +
+                                            '                     document.body.style.cssTe' +
+                                            "xt='margin:0;min-height:900px';\n              " +
+                                            '                      const scene=' +
+                                            `${JSON.stringify(scene === 'unrelated-reused' ? 'unrelated-scroll' : scene)}` +
+                                            ",pad=document.querySelector('#pad')," +
+                                            "inner=document.querySelector('#inner');\n      " +
+                                            '                              const ' +
+                                            "host=document.querySelector('#other-root');\n  " +
+                                            '                                  const ' +
+                                            "root=scene==='foreign-shadow'?host.attachShado" +
+                                            "w({mode:'open'}):host;\n                       " +
+                                            '             root.innerHTML=\'<div id="second" ' +
+                                            'style="width:100px;height:100px;' +
+                                            'overflow:auto"><div style="height:1000px;' +
+                                            'width:50px"></div></div><div id="third" ' +
+                                            'style="width:100px;height:100px;' +
+                                            'overflow:auto"><div style="height:1000px;' +
+                                            'width:50px"></div></div>\';\n                   ' +
+                                            '                 const second=root.querySelect' +
+                                            "or('#second'),third=root.querySelector('#third" +
+                                            "'),signal=window.__coordAbort.signal;\n        " +
+                                            '                            ' +
+                                            'window.__cascadeTrace=[];' +
+                                            'window.__coordCaptureRects=true;' +
+                                            'window.__unrelatedFrame=undefined;' +
+                                            'window.__cascadeDone=false;\n                  ' +
+                                            '                  const log=name=>{const ' +
+                                            'r=pad.getBoundingClientRect();' +
+                                            'window.__cascadeTrace.push({name,' +
+                                            'time:performance.now(),x:r.x,y:r.y,' +
+                                            'inner:inner.scrollTop,second:second.scrollTop,' +
+                                            'third:third.scrollTop,sourceRoot:second.getRoo' +
+                                            'tNode().constructor.name})};\n                 ' +
+                                            '                   const final=()=>' +
+                                            "{pad.style.left='220px';" +
+                                            "window.__cascadeDone=true;log('final-after')};" +
+                                            '\n                                    ' +
+                                            "second.addEventListener('scroll',()=>" +
+                                            "log('second-capture'),{capture:true,signal});\n" +
+                                            '                                    ' +
+                                            "second.addEventListener('scrollend',()=>" +
+                                            "log('second-end'),{capture:true,signal});\n    " +
+                                            '                                ' +
+                                            "if(scene==='early-capture')document.addEventLi" +
+                                            "stener('scroll',event=>{\n                     " +
+                                            '                   if(event.target===second){l' +
+                                            "og('second');third.scrollTop=70;" +
+                                            'event.stopImmediatePropagation()}\n            ' +
+                                            '                            ' +
+                                            'if(event.target===third){final();' +
+                                            'event.stopImmediatePropagation()}\n            ' +
+                                            '                        },{capture:true,' +
+                                            'signal});\n                                    ' +
+                                            'else {\n                                       ' +
+                                            ' let repeats=0;\n                              ' +
+                                            "          second.addEventListener('scroll'," +
+                                            '()=>{\n                                        ' +
+                                            "    log('second');\n                           " +
+                                            "                 if(scene==='foreign-shadow'||" +
+                                            "scene==='dynamic-shadow')third.scrollTop=70;\n " +
+                                            '                                           ' +
+                                            "if(scene==='repeated-source'){if(++repeats<4)s" +
+                                            'econd.scrollTop+=10;else final()}\n            ' +
+                                            '                                ' +
+                                            "if(scene==='sync-unrelated'&&window.__syncUnre" +
+                                            'lated)second.scrollTop=second.scrollTop===60?7' +
+                                            '0:60;\n                                        ' +
+                                            "},{once:!['repeated-source'," +
+                                            "'sync-unrelated'].includes(scene),signal});\n  " +
+                                            '                                      ' +
+                                            "third.addEventListener('scroll',final," +
+                                            '{once:true,signal});\n                         ' +
+                                            '           }\n                                 ' +
+                                            "   inner.addEventListener('scroll',()=>{\n     " +
+                                            '                                   ' +
+                                            "log('inner');\n                                " +
+                                            "        if(scene==='dynamic-shadow'){host.atta" +
+                                            "chShadow({mode:'open'}).append(second,third);" +
+                                            "log('root-created')}\n                         " +
+                                            "               if(scene==='unrelated-scroll'){" +
+                                            '\n                                            ' +
+                                            'final();let next=60;\n                         ' +
+                                            '                   const tick=()=>' +
+                                            '{second.scrollTop=next;next=next===60?70:60;' +
+                                            "log('unrelated');window.__unrelatedFrame=reque" +
+                                            'stAnimationFrame(tick)};\n                     ' +
+                                            '                       window.__unrelatedFrame' +
+                                            '=requestAnimationFrame(tick);\n                ' +
+                                            '                        }else ' +
+                                            "if(scene==='sync-unrelated'){\n                " +
+                                            '                            final();' +
+                                            'window.__syncUnrelated=true;' +
+                                            'second.scrollTop=60;\n                         ' +
+                                            '               }else second.scrollTop=60;\n    ' +
+                                            '                                },{once:true,' +
+                                            'signal});\n                                    ' +
+                                            "signal.addEventListener('abort',()=>" +
+                                            '{window.__syncUnrelated=false;' +
+                                            'cancelAnimationFrame(window.__unrelatedFrame)}' +
+                                            ',{once:true});\n                               ' +
+                                            "     for(const type of ['mousemove'," +
+                                            "'mousedown','mouseup'])document.addEventListen" +
+                                            'er(type,()=>log(type),{capture:true,signal});\n' +
+                                            '                                    ' +
+                                            "log('configured');return " +
+                                            '{visibility:document.visibilityState,' +
+                                            'foreignRoot:second.getRootNode()!==document,' +
+                                            'rect:pad.getBoundingClientRect().toJSON()};\n  ' +
+                                            '                              })()'
+                                    )
+                                    if (observation === 'unrelated-reused') {
+                                        await fixtureScript(`(() => {
+                                            const second=document.querySelector('#second');
+                                            const reused=new Event('scroll');
+                                            window.__reusedScrollEvents=[];
+                                            second.addEventListener('scroll',event=>{
+                                                if(event===reused)window.__reusedScrollEvents.push({
+                                                    trusted:event.isTrusted,stamp:event.timeStamp,
+                                                    offset:second.scrollTop,time:performance.now()});
+                                                else if(event.isTrusted){
+                                                    second.dispatchEvent(reused);second.dispatchEvent(reused);
+                                                }
+                                            },{signal:window.__coordAbort.signal});
+                                            return true;
+                                        })()`)
                                     }
-                                    inner.addEventListener('scroll',()=>{
-                                        log('inner');
-                                        if(scene==='dynamic-shadow'){host.attachShadow({mode:'open'}).append(second,third);log('root-created')}
-                                        if(scene==='unrelated-scroll'){
-                                            final();let next=60;
-                                            const tick=()=>{second.scrollTop=next;next=next===60?70:60;log('unrelated');window.__unrelatedFrame=requestAnimationFrame(tick)};
-                                            window.__unrelatedFrame=requestAnimationFrame(tick);
-                                        }else if(scene==='sync-unrelated'){
-                                            final();window.__syncUnrelated=true;second.scrollTop=60;
-                                        }else second.scrollTop=60;
-                                    },{once:true,signal});
-                                    signal.addEventListener('abort',()=>{window.__syncUnrelated=false;cancelAnimationFrame(window.__unrelatedFrame)},{once:true});
-                                    for(const type of ['mousemove','mousedown','mouseup'])document.addEventListener(type,()=>log(type),{capture:true,signal});
-                                    log('configured');return {visibility:document.visibilityState,foreignRoot:second.getRootNode()!==document,rect:pad.getBoundingClientRect().toJSON()};
-                                })()`)
                                     const sequence =
                                         action === 'down-up'
                                             ? [{ type: 'mousedown', target: { css: '#pad' } }, { type: 'mouseup' }]
                                             : [{ type: 'mousemove', target: { css: '#pad' } }]
-                                    await fixtureScript(`(() => {
-                                        const add=EventTarget.prototype.addEventListener,remove=EventTarget.prototype.removeEventListener,NativeChannel=window.MessageChannel;
-                                        const listeners=[],ports=[];
-                                        EventTarget.prototype.addEventListener=function(type,listener,...rest){
-                                            if(['scroll','scrollend','visibilitychange'].includes(type))listeners.push({target:this,type,listener});
-                                            return add.call(this,type,listener,...rest);
-                                        };
-                                        EventTarget.prototype.removeEventListener=function(type,listener,...rest){
-                                            const index=listeners.findIndex(value=>value.target===this&&value.type===type&&value.listener===listener);
-                                            if(index>=0)listeners.splice(index,1);
-                                            return remove.call(this,type,listener,...rest);
-                                        };
-                                        window.MessageChannel=function(){
-                                            const channel=new NativeChannel();
-                                            for(const port of [channel.port1,channel.port2]){
-                                                const close=port.close.bind(port),record={closed:false};ports.push(record);
-                                                port.close=()=>{record.closed=true;close()};
-                                            }
-                                            return channel;
-                                        };
-                                        window.__settlementResources=()=>{
-                                            EventTarget.prototype.addEventListener=add;EventTarget.prototype.removeEventListener=remove;window.MessageChannel=NativeChannel;
-                                            return {listeners:listeners.map(value=>value.type),ports:ports.map(value=>value.closed)};
-                                        };
-                                        return true;
-                                    })()`)
+                                    await fixtureScript(
+                                        '(() => {\n                                     ' +
+                                            '   const add=EventTarget.prototype.addEventLis' +
+                                            'tener,remove=EventTarget.prototype.removeEvent' +
+                                            'Listener,NativeChannel=window.MessageChannel;\n' +
+                                            '                                        const ' +
+                                            'listeners=[],ports=[];\n                       ' +
+                                            '                 EventTarget.prototype.addEven' +
+                                            'tListener=function(type,listener,...rest){\n   ' +
+                                            '                                         ' +
+                                            "if(['scroll','scrollend'," +
+                                            "'visibilitychange'].includes(type))listeners.p" +
+                                            'ush({target:this,type,listener});\n            ' +
+                                            '                                return ' +
+                                            'add.call(this,type,listener,...rest);\n        ' +
+                                            '                                };\n           ' +
+                                            '                             ' +
+                                            'EventTarget.prototype.removeEventListener=func' +
+                                            'tion(type,listener,...rest){\n                 ' +
+                                            '                           const ' +
+                                            'index=listeners.findIndex(value=>' +
+                                            'value.target===this&&value.type===type&&value.' +
+                                            'listener===listener);\n                        ' +
+                                            '                    if(index>' +
+                                            '=0)listeners.splice(index,1);\n                ' +
+                                            '                            return ' +
+                                            'remove.call(this,type,listener,...rest);\n     ' +
+                                            '                                   };\n        ' +
+                                            '                                ' +
+                                            'window.MessageChannel=function(){\n            ' +
+                                            '                                const ' +
+                                            'channel=new NativeChannel();\n                 ' +
+                                            '                           for(const port of ' +
+                                            '[channel.port1,channel.port2]){\n              ' +
+                                            '                                  const ' +
+                                            'close=port.close.bind(port),' +
+                                            'record={closed:false};ports.push(record);\n    ' +
+                                            '                                            ' +
+                                            'port.close=()=>{record.closed=true;close()};\n ' +
+                                            '                                           }\n ' +
+                                            '                                           ' +
+                                            'return channel;\n                              ' +
+                                            '          };\n                                 ' +
+                                            '       window.__settlementResources=()=>{\n    ' +
+                                            '                                        ' +
+                                            'EventTarget.prototype.addEventListener=add;' +
+                                            'EventTarget.prototype.removeEventListener=remo' +
+                                            've;window.MessageChannel=NativeChannel;\n      ' +
+                                            '                                      return ' +
+                                            '{listeners:listeners.map(value=>value.type),' +
+                                            'ports:ports.map(value=>value.closed)};\n       ' +
+                                            '                                 };\n          ' +
+                                            '                              return true;\n   ' +
+                                            '                                 })()'
+                                    )
+                                    const firstNative = (await worker('coordinates.nativeInputs()')).length
                                     try {
-                                        entry.body = await call(sequence, { timeout: 1200 })
+                                        if (cancel) {
+                                            const controller = new AbortController()
+                                            const originalCommand = bridge.httpServer.sendCommand
+                                            const recordStart = result.handlerRecords.length
+                                            let releasePreparation
+                                            let pendingCall
+                                            bridge.httpServer.sendCommand = async (name, params, timeout, ...args) => {
+                                                const answer = await originalCommand.call(
+                                                    bridge.httpServer,
+                                                    name,
+                                                    params,
+                                                    timeout,
+                                                    ...args
+                                                )
+                                                if (
+                                                    !releasePreparation &&
+                                                    (['evaluate', 'evaluate_in_frame'].includes(name) ||
+                                                        (name === 'debugger_send' &&
+                                                            params.method === 'Runtime.evaluate'))
+                                                ) {
+                                                    entry.preparationHeldAt = performance.now()
+                                                    const scope = unified.tabLockContext.getStore()
+                                                    return withNavigationBudget(
+                                                        () =>
+                                                            new Promise((resolve) => {
+                                                                releasePreparation = () => resolve(answer)
+                                                            }),
+                                                        Math.min(Date.now() + timeout, scope.deadline),
+                                                        scope.signal
+                                                    )
+                                                }
+                                                return answer
+                                            }
+                                            try {
+                                                pendingCall = call(
+                                                    sequence,
+                                                    { timeout: 1200 },
+                                                    {
+                                                        signal: controller.signal,
+                                                    }
+                                                ).then(
+                                                    (response) => ({ response }),
+                                                    (error) => ({ cancelled: String(error) })
+                                                )
+                                                await until(() => entry.preparationHeldAt)
+                                                entry.loadAtCancel = await fixtureScript(
+                                                    '({active:window.__syncUnrelated,' +
+                                                        'scrolls:window.__cascadeTrace.filter(event=>event.name==="second").length})'
+                                                )
+                                                assert.equal(entry.loadAtCancel.active, true)
+                                                assert.ok(entry.loadAtCancel.scrolls > 0)
+                                                controller.abort(new Error('SDK cancellation after scroll preparation'))
+                                                entry.clientOutcome = await pendingCall
+                                                entry.handler = await until(() =>
+                                                    result.handlerRecords
+                                                        .slice(recordStart)
+                                                        .find(
+                                                            (item) =>
+                                                                item.name === 'input' && item.finished !== undefined
+                                                        )
+                                                )
+                                                entry.body = entry.handler.internalReply
+                                                assert.ok(entry.clientOutcome.cancelled)
+                                                assert.ok(entry.handler.aborted !== undefined)
+                                            } finally {
+                                                controller.abort(new Error('Observation cancellation settled'))
+                                                bridge.httpServer.sendCommand = originalCommand
+                                                releasePreparation?.()
+                                                await pendingCall
+                                            }
+                                        } else {
+                                            entry.body = await call(sequence, { timeout: 1200 })
+                                        }
                                     } finally {
                                         entry.settlementResources = await fixtureScript(
                                             'window.__settlementResources()'
                                         )
                                     }
+                                    entry.inputs = (await worker('coordinates.nativeInputs()')).slice(firstNative)
                                     entry.tool = await events()
-                                    entry.layout = await fixtureScript(`(() => {
-                                    cancelAnimationFrame(window.__unrelatedFrame);
-                                    const r=document.querySelector('#pad').getBoundingClientRect();
-                                    return {trace:window.__cascadeTrace,sourceActive:window.__syncUnrelated===true,rect:{x:r.x,y:r.y,width:r.width,height:r.height}};
-                                })()`)
+                                    if (observation === 'unrelated-reused') {
+                                        entry.reusedEvents = await fixtureScript('window.__reusedScrollEvents')
+                                        assert.ok(entry.reusedEvents.length >= 2)
+                                        assert.ok(
+                                            entry.reusedEvents.every(
+                                                (event) => !event.trusted && event.stamp === entry.reusedEvents[0].stamp
+                                            )
+                                        )
+                                    }
+                                    if (cancel) {
+                                        assert.equal(entry.body.eventsExecuted, 0)
+                                        assert.deepEqual(entry.inputs, [])
+                                        assert.deepEqual(entry.tool, [])
+                                        assert.deepEqual(entry.settlementResources.listeners, [])
+                                        assert.ok(entry.settlementResources.ports.length > 0)
+                                        assert.ok(entry.settlementResources.ports.every(Boolean))
+                                        entry.cancelLoadFinal = await fixtureScript(
+                                            '({active:window.__syncUnrelated,' +
+                                                'scrolls:window.__cascadeTrace.filter(event=>event.name==="second").length})'
+                                        )
+                                        assert.equal(entry.cancelLoadFinal.active, true)
+                                        await fixtureScript('(window.__syncUnrelated=false,true)')
+                                        return
+                                    }
+                                    entry.layout = await fixtureScript(
+                                        '(() => {\n                                    ' +
+                                            'cancelAnimationFrame(window.__unrelatedFrame);' +
+                                            '\n                                    const ' +
+                                            "r=document.querySelector('#pad').getBoundingCl" +
+                                            'ientRect();\n                                  ' +
+                                            '  return {trace:window.__cascadeTrace,' +
+                                            'sourceActive:window.__syncUnrelated===true,' +
+                                            'rect:{x:r.x,y:r.y,width:r.width,' +
+                                            'height:r.height}};\n                           ' +
+                                            '     })()'
+                                    )
                                     if (['dynamic-shadow', 'repeated-source'].includes(observation)) {
                                         entry.layoutAtReturn = entry.layout
                                         await until(() => fixtureScript('window.__cascadeDone===true'))
                                         entry.layout = await fixtureScript(
-                                            `(() => {const r=document.querySelector('#pad').getBoundingClientRect();return {trace:window.__cascadeTrace,rect:{x:r.x,y:r.y,width:r.width,height:r.height}}})()`
+                                            "(() => {const r=document.querySelector('#pad')" +
+                                                '.getBoundingClientRect();return ' +
+                                                '{trace:window.__cascadeTrace,rect:{x:r.x,' +
+                                                'y:r.y,width:r.width,height:r.height}}})()'
                                         )
                                         entry.observation = {
                                             finalAtReturn: entry.layoutAtReturn.trace.some(
@@ -1363,7 +2036,9 @@ try {
                                             await native(action, entry.probeOracle)
                                             entry.probeReference = await events()
                                             entry.probeLoad = await fixtureScript(
-                                                '({active:window.__syncUnrelated,sourceEvents:window.__cascadeTrace.filter(event=>event.name==="second").length})'
+                                                '({active:window.__syncUnrelated,' +
+                                                    'sourceEvents:window.__cascadeTrace.filter(even' +
+                                                    't=>event.name==="second").length})'
                                             )
                                             assert.equal(entry.probeLoad.active, true)
                                             assert.ok(
@@ -1429,33 +2104,89 @@ try {
                             await record(
                                 `c31f10-cascade-${inputMode}-${framed}-${cascade}-${action}`,
                                 async (entry) => {
-                                    unified.setInputMode(inputMode)
+                                    unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                                     await setup(framed ? [{ css: 'height:320px' }] : [])
                                     entry.frame = frameSelection ?? null
-                                    entry.before = await fixtureScript(`(() => {
-                                    document.body.innerHTML='<div id="outer" style="position:absolute;left:10px;top:20px;width:380px;height:250px;overflow:auto"><div style="position:relative;width:360px;height:1200px"><div id="inner" style="position:absolute;left:0;top:20px;width:350px;height:150px;overflow:auto"><div style="position:relative;width:330px;height:3500px"><input id="pad" type="checkbox" style="position:absolute;left:50px;top:2100px;width:60px;height:50px;margin:0"></div></div></div></div><div id="second" style="position:absolute;left:450px;top:10px;width:100px;height:100px;overflow:auto"><div style="height:1000px;width:50px"></div></div><div id="third" style="position:absolute;left:600px;top:10px;width:100px;height:100px;overflow:auto"><div style="height:1000px;width:50px"></div></div>';
-                                    document.body.style.cssText='margin:0;min-height:900px';
-                                    const pad=document.querySelector('#pad'),inner=document.querySelector('#inner'),
-                                        outer=document.querySelector('#outer'),second=document.querySelector('#second'),third=document.querySelector('#third');
-                                    window.__cascadeTrace=[];window.__coordCaptureRects=true;
-                                    const log=name=>{const r=pad.getBoundingClientRect();window.__cascadeTrace.push({name,time:performance.now(),x:r.x,y:r.y,
-                                        inner:inner.scrollTop,outer:outer.scrollTop,second:second.scrollTop,third:third.scrollTop})};
-                                    const signal=window.__coordAbort.signal;
-                                    inner.addEventListener('scroll',()=>{
-                                        log('inner-before');
-                                        if(${JSON.stringify(cascade)}==='ancestor')outer.scrollTop=40;else second.scrollTop=60;
-                                        log('inner-after');
-                                    },{once:true,signal});
-                                    const final=()=>{log('final-before');pad.style.left='220px';log('final-after')};
-                                    if(${JSON.stringify(cascade)}==='ancestor')outer.addEventListener('scroll',final,{once:true,signal});
-                                    else second.addEventListener('scroll',()=>{
-                                        log('second');
-                                        if(${JSON.stringify(cascade)}==='two-siblings')third.scrollTop=70;else final();
-                                    },{once:true,signal});
-                                    if(${JSON.stringify(cascade)}==='two-siblings')third.addEventListener('scroll',final,{once:true,signal});
-                                    for(const type of ['mousemove','mousedown','mouseup'])document.addEventListener(type,()=>log(type),{capture:true,signal});
-                                    log('configured');return {visibility:document.visibilityState,rect:pad.getBoundingClientRect().toJSON()};
-                                })()`)
+                                    entry.before = await fixtureScript(
+                                        '(() => {\n                                    ' +
+                                            'document.body.innerHTML=\'<div id="outer" ' +
+                                            'style="position:absolute;left:10px;top:20px;' +
+                                            'width:380px;height:250px;overflow:auto"><div ' +
+                                            'style="position:relative;width:360px;' +
+                                            'height:1200px"><div id="inner" ' +
+                                            'style="position:absolute;left:0;top:20px;' +
+                                            'width:350px;height:150px;overflow:auto"><div ' +
+                                            'style="position:relative;width:330px;' +
+                                            'height:3500px"><input id="pad" ' +
+                                            'type="checkbox" style="position:absolute;' +
+                                            'left:50px;top:2100px;width:60px;height:50px;' +
+                                            'margin:0"></div></div></div></div><div ' +
+                                            'id="second" style="position:absolute;' +
+                                            'left:450px;top:10px;width:100px;height:100px;' +
+                                            'overflow:auto"><div style="height:1000px;' +
+                                            'width:50px"></div></div><div id="third" ' +
+                                            'style="position:absolute;left:600px;top:10px;' +
+                                            'width:100px;height:100px;overflow:auto"><div ' +
+                                            'style="height:1000px;width:50px"></div></div>' +
+                                            "';\n                                    " +
+                                            "document.body.style.cssText='margin:0;" +
+                                            "min-height:900px';\n                           " +
+                                            "         const pad=document.querySelector('#pa" +
+                                            "d'),inner=document.querySelector('#inner'),\n  " +
+                                            '                                      ' +
+                                            "outer=document.querySelector('#outer')," +
+                                            "second=document.querySelector('#second')," +
+                                            "third=document.querySelector('#third');\n      " +
+                                            '                              ' +
+                                            'window.__cascadeTrace=[];' +
+                                            'window.__coordCaptureRects=true;\n             ' +
+                                            '                       const log=name=>{const ' +
+                                            'r=pad.getBoundingClientRect();' +
+                                            'window.__cascadeTrace.push({name,' +
+                                            'time:performance.now(),x:r.x,y:r.y,\n          ' +
+                                            '                              ' +
+                                            'inner:inner.scrollTop,outer:outer.scrollTop,' +
+                                            'second:second.scrollTop,' +
+                                            'third:third.scrollTop})};\n                    ' +
+                                            '                const signal=window.__coordAbo' +
+                                            'rt.signal;\n                                   ' +
+                                            " inner.addEventListener('scroll',()=>{\n       " +
+                                            '                                 ' +
+                                            "log('inner-before');\n                         " +
+                                            '               if(' +
+                                            `${JSON.stringify(cascade)}` +
+                                            "==='ancestor')outer.scrollTop=40;else " +
+                                            'second.scrollTop=60;\n                         ' +
+                                            "               log('inner-after');\n           " +
+                                            '                         },{once:true,' +
+                                            'signal});\n                                    ' +
+                                            "const final=()=>{log('final-before');" +
+                                            "pad.style.left='220px';log('final-after')};\n  " +
+                                            '                                  if(' +
+                                            `${JSON.stringify(cascade)}` +
+                                            "==='ancestor')outer.addEventListener('scroll'," +
+                                            'final,{once:true,signal});\n                   ' +
+                                            '                 else second.addEventListener(' +
+                                            "'scroll',()=>{\n                               " +
+                                            "         log('second');\n                      " +
+                                            '                  if(' +
+                                            `${JSON.stringify(cascade)}` +
+                                            "==='two-siblings')third.scrollTop=70;else " +
+                                            'final();\n                                    ' +
+                                            '},{once:true,signal});\n                       ' +
+                                            '             if(' +
+                                            `${JSON.stringify(cascade)}` +
+                                            "==='two-siblings')third.addEventListener('scro" +
+                                            "ll',final,{once:true,signal});\n               " +
+                                            '                     for(const type of ' +
+                                            "['mousemove','mousedown'," +
+                                            "'mouseup'])document.addEventListener(type,()=>" +
+                                            'log(type),{capture:true,signal});\n            ' +
+                                            "                        log('configured');" +
+                                            'return {visibility:document.visibilityState,' +
+                                            'rect:pad.getBoundingClientRect().toJSON()};\n  ' +
+                                            '                              })()'
+                                    )
                                     const sequence =
                                         action === 'down-up'
                                             ? [{ type: 'mousedown', target: { css: '#pad' } }, { type: 'mouseup' }]
@@ -1464,10 +2195,15 @@ try {
                                     entry.body = await call(sequence, { timeout: 1200 })
                                     entry.inputs = (await worker('coordinates.nativeInputs()')).slice(first)
                                     entry.tool = await events()
-                                    entry.layout = await fixtureScript(`(() => {
-                                    const r=document.querySelector('#pad').getBoundingClientRect();
-                                    return {trace:window.__cascadeTrace,rect:{x:r.x,y:r.y,width:r.width,height:r.height}};
-                                })()`)
+                                    entry.layout = await fixtureScript(
+                                        '(() => {\n                                    ' +
+                                            "const r=document.querySelector('#pad').getBoun" +
+                                            'dingClientRect();\n                            ' +
+                                            '        return {trace:window.__cascadeTrace,' +
+                                            'rect:{x:r.x,y:r.y,width:r.width,' +
+                                            'height:r.height}};\n                           ' +
+                                            '     })()'
+                                    )
                                     completed(entry.body, sequence.length)
                                     assert.ok(
                                         entry.layout.trace.some((event) => event.name === 'final-after'),
@@ -1505,32 +2241,50 @@ try {
                             )
                         }
                     }
-                    for (const scene of ['document', 'raf', 'nested']) {
+                    for (const scene of ['document', 'raf', 'nested', 'continuous']) {
                         for (const action of ['mousemove', 'down-up']) {
                             await record(`c31f9-cascade-${inputMode}-${framed}-${scene}-${action}`, async (entry) => {
-                                unified.setInputMode(inputMode)
+                                unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                                 await setup(framed ? [{ css: 'height:320px' }] : [])
                                 entry.frame = frameSelection ?? null
                                 await fixtureScript(`(() => {
-                                    document.body.style.minHeight='3000px';window.__coordCaptureRects=true;
-                                    const pad=document.querySelector('#pad');
+                                    document.body.style.minHeight='3000px';
+                                    window.__coordCaptureRects=true;
+                                    window.__coordCaptureTimes=true;
+                                    const pad=document.querySelector('#pad'), continuous=${scene === 'continuous'};
                                     pad.style.cssText='position:absolute;left:80px;top:2100px;width:80px;height:70px;margin:0';
                                     let scroller=window, listener=window;
-                                    if(${scene === 'nested'}){
-                                        const box=document.createElement('div');box.style.cssText='position:absolute;left:0;top:30px;width:400px;height:200px;overflow:auto';
-                                        const content=document.createElement('div');content.style.cssText='position:relative;width:380px;height:3000px';
-                                        content.append(pad);box.append(content);document.body.append(box);scroller=box;listener=box;
+                                    if(${scene === 'nested'}) {
+                                        const box=document.createElement('div'), content=document.createElement('div');
+                                        box.style.cssText='position:absolute;left:0;top:30px;width:400px;height:200px;overflow:auto';
+                                        content.style.cssText='position:relative;width:380px;height:3000px';
+                                        content.append(pad);box.append(content);document.body.append(box);
+                                        scroller=box;listener=box;
                                     }
-                                    window.__cascade=[];window.__cascadeInput=null;
+                                    const requestFrame=window.requestAnimationFrame.bind(window),
+                                        cancelFrame=window.cancelAnimationFrame.bind(window);
+                                    window.__cascade=[];window.__cascadeInput=null;window.__cascadeFrame=null;
+                                    window.__cascadeStop=()=>{
+                                        if(window.__cascadeFrame!==null)cancelFrame(window.__cascadeFrame);
+                                        window.__cascadeFrame=null;
+                                    };
+                                    window.__coordAbort.signal.addEventListener('abort',window.__cascadeStop,{once:true});
                                     listener.addEventListener('scroll',()=>{
                                         const step=window.__cascade.length;
-                                        if(step>1)return;
-                                        window.__cascade.push({step,time:performance.now(),y:scroller===window?scrollY:scroller.scrollTop});
+                                        if(!continuous&&step>1)return;
+                                        const observation={step,time:performance.now(),y:scroller===window?scrollY:scroller.scrollTop,
+                                            visibility:document.visibilityState};
+                                        window.__cascade.push(observation);
                                         pad.style.left=step===0?'140px':'240px';
-                                        if(step===0){
-                                            const again=()=>scroller.scrollBy(0,30);
-                                            ${scene === 'raf' ? 'requestAnimationFrame(again)' : 'again()'};
+                                        if(step===0||continuous){
+                                            const again=()=>{
+                                                window.__cascadeFrame=null;
+                                                if(!window.__coordAbort.signal.aborted)scroller.scrollBy(0,30);
+                                            };
+                                            if(${scene === 'raf' || scene === 'continuous'})window.__cascadeFrame=requestFrame(again);
+                                            else again();
                                         }
+                                        observation.completedAt=performance.now();
                                     },{signal:window.__coordAbort.signal});
                                     document.addEventListener(${JSON.stringify(action === 'down-up' ? 'mousedown' : 'mousemove')},()=>{
                                         window.__cascadeInput={phase:window.__cascade.length,time:performance.now()};
@@ -1541,38 +2295,80 @@ try {
                                     action === 'down-up'
                                         ? [{ type: 'mousedown', target: { css: '#pad' } }, { type: 'mouseup' }]
                                         : [{ type: 'mousemove', target: { css: '#pad' } }]
-                                entry.body = await call(sequence, { timeout: 2000 })
-                                entry.tool = await events()
-                                entry.layout = await fixtureScript(
-                                    `(()=>{const r=document.querySelector('#pad').getBoundingClientRect();return {steps:__cascade,input:__cascadeInput,rect:{x:r.x,y:r.y,width:r.width,height:r.height}}})()`
-                                )
-                                completed(entry.body, sequence.length)
-                                assert.equal(entry.layout.steps.length, 2, JSON.stringify(entry))
-                                assert.equal(entry.layout.input?.phase, 2, JSON.stringify(entry))
-                                const type = action === 'down-up' ? 'mousedown' : 'mousemove'
-                                const event = entry.tool.find((value) => value.type === type)
-                                assert.ok(event, JSON.stringify(entry))
-                                assert.equal(event.target, 'pad', JSON.stringify(entry))
-                                assert.ok(
-                                    Math.abs(event.x - (event.targetRect.x + event.targetRect.width / 2)) <= 1,
-                                    JSON.stringify(entry)
-                                )
-                                assert.ok(
-                                    Math.abs(event.y - (event.targetRect.y + event.targetRect.height / 2)) <= 1,
-                                    JSON.stringify(entry)
-                                )
-                                await clear()
-                                entry.oracle = await oracle({
-                                    x: entry.layout.rect.x + entry.layout.rect.width / 2,
-                                    y: entry.layout.rect.y + entry.layout.rect.height / 2,
-                                })
-                                await native(action, entry.oracle)
-                                entry.reference = await events()
-                                assert.equal(
-                                    entry.reference.find((value) => value.type === type)?.target,
-                                    'pad',
-                                    JSON.stringify(entry)
-                                )
+                                if (scene === 'continuous') {
+                                    entry.warmup = await invoke('evaluate', { script: 'true', timeout: 2000 })
+                                    assert.equal(entry.warmup.success, true, JSON.stringify(entry))
+                                }
+                                const first = (await worker('coordinates.nativeInputs()')).length
+                                await fixtureScript(`(${observeSettlementResources.toString()})()`)
+                                try {
+                                    entry.timeout = scene === 'continuous' ? 100 : 2000
+                                    const started = performance.now()
+                                    entry.body = await call(sequence, { timeout: entry.timeout })
+                                    entry.callElapsedMs = performance.now() - started
+                                    entry.settlementResources = await fixtureScript('window.__coordResources()')
+                                    entry.tool = await events()
+                                    entry.inputs = (await worker('coordinates.nativeInputs()')).slice(first)
+                                    entry.layout = await fixtureScript(
+                                        '({steps:__cascade,input:__cascadeInput,time:performance.now(),' +
+                                            'visibility:document.visibilityState,fixtureFrame:window.__cascadeFrame,' +
+                                            'rect:document.querySelector("#pad").getBoundingClientRect().toJSON()})'
+                                    )
+                                    assert.deepEqual(entry.settlementResources.listeners, [], JSON.stringify(entry))
+                                    assert.ok(entry.settlementResources.ports.length > 0, JSON.stringify(entry))
+                                    assert.ok(entry.settlementResources.ports.every(Boolean), JSON.stringify(entry))
+                                    assert.equal(entry.settlementResources.framesRemaining, 0, JSON.stringify(entry))
+                                    assert.equal(entry.settlementResources.timersRemaining, 0, JSON.stringify(entry))
+                                    if (scene === 'continuous') {
+                                        assert.ok(entry.layout.steps.length > 1, JSON.stringify(entry))
+                                        assert.equal(entry.body.actionExecuted, false, JSON.stringify(entry))
+                                        assert.equal(entry.body.eventsExecuted, 0)
+                                        assert.equal(entry.layout.input, null)
+                                        assert.match(
+                                            JSON.stringify(entry.body),
+                                            /TIMEOUT|SCROLL_SETTLEMENT_TIMEOUT|超时/i
+                                        )
+                                        assert.deepEqual(entry.inputs, [])
+                                        assert.deepEqual(entry.tool, [])
+                                        return
+                                    }
+                                    completed(entry.body, sequence.length)
+                                    assert.equal(entry.layout.steps.length, 2, JSON.stringify(entry))
+                                    assert.equal(entry.layout.input?.phase, 2, JSON.stringify(entry))
+                                    assert.ok(entry.layout.input.time >= entry.layout.steps.at(-1).completedAt)
+                                    const type = action === 'down-up' ? 'mousedown' : 'mousemove'
+                                    const event = entry.tool.find((value) => value.type === type)
+                                    assert.ok(event, JSON.stringify(entry))
+                                    assert.equal(event.target, 'pad', JSON.stringify(entry))
+                                    assert.ok(event.time >= entry.layout.steps.at(-1).completedAt)
+                                    assert.ok(
+                                        Math.abs(event.x - (event.targetRect.x + event.targetRect.width / 2)) <= 1,
+                                        JSON.stringify(entry)
+                                    )
+                                    assert.ok(
+                                        Math.abs(event.y - (event.targetRect.y + event.targetRect.height / 2)) <= 1,
+                                        JSON.stringify(entry)
+                                    )
+                                    await clear()
+                                    entry.oracle = await oracle({
+                                        x: entry.layout.rect.x + entry.layout.rect.width / 2,
+                                        y: entry.layout.rect.y + entry.layout.rect.height / 2,
+                                    })
+                                    await native(action, entry.oracle)
+                                    entry.reference = await events()
+                                    assert.equal(
+                                        entry.reference.find((value) => value.type === type)?.target,
+                                        'pad',
+                                        JSON.stringify(entry)
+                                    )
+                                } finally {
+                                    entry.fixtureResources = await fixtureScript(
+                                        '(() => {window.__coordAbort.abort();window.__coordRestoreResources();' +
+                                            'return {frame:window.__cascadeFrame,aborted:window.__coordAbort.signal.aborted}})()'
+                                    )
+                                    assert.equal(entry.fixtureResources.frame, null)
+                                    assert.equal(entry.fixtureResources.aborted, true)
+                                }
                             })
                         }
                     }
@@ -1583,23 +2379,49 @@ try {
             for (const framed of [false, true]) {
                 for (const action of ['click', 'touch']) {
                     await record(`c31f9-adjacent-${inputMode}-${framed}-${action}`, async (entry) => {
-                        unified.setInputMode(inputMode)
+                        unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                         await setup(framed ? [{ css: 'height:320px' }] : [])
                         entry.frame = frameSelection ?? null
                         await fixtureScript(
-                            `(()=>{document.body.style.minHeight='3000px';window.__coordCaptureRects=true;const pad=document.querySelector('#pad');pad.style.cssText='position:absolute;left:80px;top:2100px;width:80px;height:70px;margin:0';addEventListener('scroll',()=>{pad.style.left='240px'},{once:true,signal:window.__coordAbort.signal});return true})()`
+                            "(()=>{document.body.style.minHeight='3000px';" +
+                                'window.__coordCaptureRects=true;const ' +
+                                "pad=document.querySelector('#pad');" +
+                                "pad.style.cssText='position:absolute;" +
+                                'left:80px;top:2100px;width:80px;height:70px;' +
+                                "margin:0';window.__adjacentScroll=[];addEventListener('scroll',()=>" +
+                                "{pad.style.left='240px';window.__adjacentScroll.push({time:performance.now(),left:pad.getBoundingClientRect().left,visibility:document.visibilityState})},{once:true," +
+                                'signal:window.__coordAbort.signal});return ' +
+                                'true})()'
                         )
                         const sequence =
                             action === 'touch'
                                 ? [{ type: 'touchstart', target: { css: '#pad' } }, { type: 'touchend' }]
                                 : [{ type: 'click', target: { css: '#pad' } }]
-                        entry.body = await call(sequence, { timeout: 2000 })
+                        await fixtureScript(
+                            `(window.__coordCaptureTimes=true,(${observeSettlementResources.toString()})())`
+                        )
+                        try {
+                            entry.body = await call(sequence, { timeout: 2000 })
+                        } finally {
+                            entry.settlementResources = await fixtureScript(
+                                '(() => {const resources=window.__coordResources();window.__coordRestoreResources();return resources})()'
+                            )
+                        }
                         entry.tool = await events()
+                        entry.scroll = await fixtureScript('window.__adjacentScroll')
+                        assert.deepEqual(entry.settlementResources.listeners, [], JSON.stringify(entry))
+                        assert.ok(entry.settlementResources.ports.every(Boolean), JSON.stringify(entry))
+                        assert.equal(entry.settlementResources.framesRemaining, 0, JSON.stringify(entry))
+                        assert.equal(entry.settlementResources.timersRemaining, 0, JSON.stringify(entry))
+                        assert.equal(entry.scroll.length, 1, JSON.stringify(entry))
+                        assert.equal(entry.scroll[0].left, 240, JSON.stringify(entry))
                         completed(entry.body, sequence.length)
                         const type = action === 'touch' ? 'touchstart' : 'click'
                         const event = entry.tool.find((value) => value.type === type)
                         assert.ok(event, JSON.stringify(entry))
                         assert.equal(event.target, 'pad', JSON.stringify(entry))
+                        assert.ok(event.time >= entry.scroll[0].time, JSON.stringify(entry))
+                        assert.equal(event.visibility, 'visible')
                         assert.ok(
                             Math.abs(event.x - (event.targetRect.x + event.targetRect.width / 2)) <= 1,
                             JSON.stringify(entry)
@@ -1643,155 +2465,264 @@ try {
             unified.activeMode = 'extension'
             unified.cdpExplicitlySelected = false
             unified.setInputMode('precise')
-            for (const [operation, framed, pageError] of [
-                ['evaluate', false, false],
-                ['evaluate', true, false],
-                ['input', false, false],
-                ['evaluate', false, true],
-            ]) {
+            for (const [operation, framed, variant] of ['evaluate', 'input'].flatMap((operation) =>
+                [false, true].flatMap((framed) =>
+                    ['native', 'page', 'method', 'parameters'].map((variant) => [operation, framed, variant])
+                )
+            )) {
+                const pageError = variant === 'page'
+                const protocolError = variant === 'method' || variant === 'parameters'
+                await record(`c31f7-origin-${operation}-${framed ? 'frame' : 'main'}-${variant}`, async (entry) => {
+                    await setup(framed ? [{ css: '' }] : [])
+                    await fixtureScript('(globalThis.__c31f7Actions=0,true)')
+                    const marker = 'C31F7_TERMINATE_' + operation + '_' + framed
+                    let termination
+                    await observer.send('Runtime.enable', {}, observerSession)
+                    const terminate = (params, sessionId) => {
+                        if (sessionId === observerSession && params.args?.some((arg) => arg.value === marker)) {
+                            entry.terminationRequested = true
+                            termination = observer.send('Runtime.terminateExecution', {}, observerSession).then(() => {
+                                entry.terminationAcknowledged = true
+                            })
+                        }
+                    }
+                    if (variant === 'native') {
+                        observer.onEvent('Runtime.consoleAPICalled', terminate)
+                    }
+                    const firstReply = result.rpcReplies.length
+                    const firstInput = (await worker('coordinates.nativeInputs()')).length
+                    const firstProtocolError = (await worker('coordinates.protocolErrors()')).length
+                    if (protocolError) {
+                        await worker(`coordinates.setProtocolFault(${JSON.stringify(variant)})`)
+                    }
+                    try {
+                        entry.body = await invoke(operation, {
+                            ...(operation === 'evaluate'
+                                ? { script: 'globalThis.__c31f7Actions++' }
+                                : {
+                                      events: [
+                                          { type: 'keydown', key: 'a' },
+                                          { type: 'keyup', key: 'a' },
+                                      ],
+                                  }),
+                            timeout: 5000,
+                            postCondition: {
+                                script: pageError
+                                    ? '() => {throw new Error("Execution was terminated")}'
+                                    : protocolError
+                                      ? 'true'
+                                      : `() => {console.debug(${JSON.stringify(marker)});while(true){}}`,
+                                timeout: 1500,
+                                interval: 50,
+                            },
+                        })
+                        await termination
+                        entry.nativeReplies = result.rpcReplies.slice(firstReply).filter((reply) => !reply.success)
+                        entry.inputs = (await worker('coordinates.nativeInputs()')).slice(firstInput)
+                        entry.actions = await fixtureScript('globalThis.__c31f7Actions')
+                        assert.equal(entry.body.actionStatus, 'completed')
+                        assert.equal(entry.body.retryable, false)
+                        if (variant === 'native') {
+                            assert.equal(entry.terminationAcknowledged, true)
+                        }
+                        entry.nativeContexts = entry.nativeReplies.map((reply) => JSON.parse(reply.error).error.context)
+                        for (const context of entry.nativeContexts) {
+                            assert.equal(context.nativeSource, 'chrome.debugger')
+                            assert.equal(typeof context.method, 'string')
+                            assert.equal(typeof context.nativeCode, 'number')
+                            assert.equal(typeof context.nativeMessage, 'string')
+                        }
+                        if (protocolError) {
+                            entry.protocolErrors = (await worker('coordinates.protocolErrors()')).slice(
+                                firstProtocolError
+                            )
+                            assert.equal(entry.protocolErrors.length, 1)
+                            assert.equal(entry.nativeContexts.length, 1)
+                            assert.equal(entry.nativeContexts[0].nativeCode, variant === 'method' ? -32601 : -32602)
+                        }
+                        if (pageError) {
+                            assert.deepEqual(entry.nativeContexts, [])
+                        }
+                        if (operation === 'evaluate') {
+                            assert.equal(entry.actions, 1)
+                        } else {
+                            assert.equal(entry.body.eventsExecuted, 2)
+                            assert.equal(
+                                entry.inputs.filter((input) => input.method === 'Input.dispatchKeyEvent').length,
+                                2
+                            )
+                        }
+                        assert.equal(entry.body.verificationStatus, variant === 'native' ? 'unavailable' : 'error')
+                        assert.equal(entry.body.postCondition.retryable, variant === 'native')
+                    } finally {
+                        await worker('coordinates.setProtocolFault(null)')
+                        observer.offEvent('Runtime.consoleAPICalled', terminate)
+                    }
+                })
+            }
+        }
+        for (const operation of ['evaluate', 'input']) {
+            for (const snapshotIndex of [1, 2]) {
+                const precondition = snapshotIndex === 2
                 await record(
-                    `c31f7-origin-${operation}-${framed ? 'frame' : 'main'}-${pageError ? 'page' : 'native'}`,
+                    precondition ? `c31f8-condition-snapshot-${operation}` : `c31f7-before-snapshot-${operation}`,
                     async (entry) => {
-                        await setup(framed ? [{ css: '' }] : [])
-                        await fixtureScript('(globalThis.__c31f7Actions=0,true)')
-                        const marker = 'C31F7_TERMINATE_' + operation + '_' + framed
-                        let termination
-                        await observer.send('Runtime.enable', {}, observerSession)
-                        const terminate = (params, sessionId) => {
-                            if (sessionId === observerSession && params.args?.some((arg) => arg.value === marker)) {
-                                entry.terminationRequested = true
-                                termination = observer
-                                    .send('Runtime.terminateExecution', {}, observerSession)
-                                    .then(() => {
-                                        entry.terminationAcknowledged = true
-                                    })
+                        await setup([])
+                        await fixtureScript(
+                            '(()=>{globalThis.__c31f7Actions=0;' +
+                                'globalThis.__c31f7Keys=[];for(const type of ' +
+                                "['keydown','keyup'])document.addEventListener(" +
+                                'type,event=>__c31f7Keys.push([type,' +
+                                'event.key]),{signal:window.__coordAbort.signal' +
+                                '});return true})()'
+                        )
+                        const targetId = mode === 'extension' ? String(tabId) : rootId
+                        const expected = precondition ? await unified.getPageSnapshot(targetId, 7000) : null
+                        const condition = unified.withPageCondition
+                        const snapshot = unified.getPageSnapshot
+                        const driver = mode === 'extension' ? bridge : session
+                        const driverSnapshot = driver.getPageSnapshot
+                        const cdp = session.cdp
+                        const receive = cdp.handleMessage
+                        const send = cdp.ws.send
+                        const snapshotCommands = new Set()
+                        let readingSnapshot = false
+                        let originalError
+                        driver.getPageSnapshot = async (...args) => {
+                            readingSnapshot = true
+                            try {
+                                return await driverSnapshot.apply(driver, args)
+                            } catch (error) {
+                                originalError = error
+                                entry.originalError = { name: error.name, code: error.code, message: error.message }
+                                throw error
+                            } finally {
+                                readingSnapshot = false
                             }
                         }
-                        if (!pageError) {
-                            observer.onEvent('Runtime.consoleAPICalled', terminate)
+                        const recordError = (error) => {
+                            entry.sameErrorInstance = error === originalError
+                            entry.sameErrorType = error.constructor === originalError?.constructor
+                            throw error
                         }
-                        const firstReply = result.rpcReplies.length
+                        unified.getPageSnapshot = async (...args) => {
+                            try {
+                                return await snapshot.apply(unified, args)
+                            } catch (error) {
+                                return recordError(error)
+                            }
+                        }
+                        entry.actionScopes = 0
+                        unified.withPageCondition = async (...args) => {
+                            ++entry.actionScopes
+                            try {
+                                return await condition.apply(unified, args)
+                            } catch (error) {
+                                return recordError(error)
+                            }
+                        }
+                        if (mode === 'cdp') {
+                            cdp.ws.send = (text, ...args) => {
+                                const command = JSON.parse(text)
+                                if (readingSnapshot && command.method === 'Target.getTargetInfo') {
+                                    snapshotCommands.add(command.id)
+                                }
+                                return send.apply(cdp.ws, [text, ...args])
+                            }
+                            cdp.handleMessage = (data) => {
+                                const reply = JSON.parse(data.toString())
+                                if (
+                                    snapshotCommands.has(reply.id) &&
+                                    reply.result?.targetInfo &&
+                                    --snapshotsUntilHold === 0
+                                ) {
+                                    heldSnapshot = reply
+                                    return
+                                }
+                                return receive.call(cdp, data)
+                            }
+                        }
                         const firstInput = (await worker('coordinates.nativeInputs()')).length
+                        const firstCommand = result.productionCommands.length
+                        snapshotsUntilHold = snapshotIndex
+                        heldSnapshot = undefined
                         try {
                             entry.body = await invoke(operation, {
                                 ...(operation === 'evaluate'
                                     ? { script: 'globalThis.__c31f7Actions++' }
                                     : {
                                           events: [
-                                              { type: 'keydown', key: 'a' },
-                                              { type: 'keyup', key: 'a' },
+                                              { type: 'keydown', key: 'x' },
+                                              { type: 'keyup', key: 'x' },
                                           ],
                                       }),
-                                timeout: 5000,
-                                postCondition: {
-                                    script: pageError
-                                        ? '() => {throw new Error("Execution was terminated")}'
-                                        : `() => {console.debug(${JSON.stringify(marker)});while(true){}}`,
-                                    timeout: 1500,
-                                    interval: 50,
-                                },
+                                ...(expected
+                                    ? operation === 'evaluate'
+                                        ? { expectedUrl: expected.url }
+                                        : { expectedRevision: expected.revision }
+                                    : {}),
+                                timeout: precondition ? 300 : 200,
                             })
-                            await termination
-                            entry.nativeReplies = result.rpcReplies.slice(firstReply).filter((reply) => !reply.success)
-                            entry.inputs = (await worker('coordinates.nativeInputs()')).slice(firstInput)
-                            entry.actions = await fixtureScript('globalThis.__c31f7Actions')
-                            assert.equal(entry.body.actionStatus, 'completed')
+                            entry.heldSnapshot = heldSnapshot
+                            entry.inputs =
+                                mode === 'extension'
+                                    ? (await worker('coordinates.nativeInputs()')).slice(firstInput)
+                                    : result.productionCommands
+                                          .slice(firstCommand)
+                                          .filter((command) => command.method.startsWith('Input.'))
+                            entry.dom = await fixtureScript('({actions:__c31f7Actions,keys:__c31f7Keys})')
+                            assert.ok(mode === 'extension' ? heldSnapshot?.success : heldSnapshot?.result?.targetInfo)
+                            assert.equal(entry.sameErrorInstance, true)
+                            assert.equal(entry.sameErrorType, true)
+                            assert.equal(entry.actionScopes, precondition ? 1 : 0)
+                            assert.deepEqual(entry.inputs, [])
+                            assert.deepEqual(entry.dom, { actions: 0, keys: [] })
+                            assert.equal(entry.body.actionExecuted, false)
+                            assert.equal(entry.body.actionStatus, 'not_started')
+                            assert.equal(entry.body.failureStage, precondition ? 'precondition' : 'context')
                             assert.equal(entry.body.retryable, false)
-                            if (!pageError) {
-                                assert.equal(entry.terminationAcknowledged, true)
+                            if (operation === 'input') {
+                                assert.equal(entry.body.eventsExecuted, 0)
+                                assert.equal(entry.body.remainingEventsNotExecuted, 2)
                             }
-                            if (operation === 'evaluate') {
-                                assert.equal(entry.actions, 1)
-                            } else {
-                                assert.equal(entry.body.eventsExecuted, 2)
-                                assert.equal(
-                                    entry.inputs.filter((input) => input.method === 'Input.dispatchKeyEvent').length,
-                                    2
-                                )
+                            assert.equal(entry.body.error.context.actionExecuted, 'unknown')
+                            assert.equal(entry.body.pageContext.contextPhase, precondition ? 'precondition' : 'before')
+                            if (expected) {
+                                assert.equal(entry.body.pageContext.before.url, expected.url)
                             }
-                            assert.equal(entry.body.verificationStatus, pageError ? 'error' : 'unavailable')
-                            assert.equal(entry.body.postCondition.retryable, !pageError)
                         } finally {
-                            observer.offEvent('Runtime.consoleAPICalled', terminate)
+                            unified.withPageCondition = condition
+                            unified.getPageSnapshot = snapshot
+                            driver.getPageSnapshot = driverSnapshot
+                            cdp.ws.send = send
+                            cdp.handleMessage = receive
+                            snapshotsUntilHold = 0
+                            if (heldSnapshot) {
+                                if (mode === 'extension') {
+                                    bridge.httpServer.handleMessage(JSON.stringify(heldSnapshot))
+                                } else {
+                                    receive.call(cdp, JSON.stringify(heldSnapshot))
+                                }
+                            }
+                            heldSnapshot = undefined
+                            entry.afterLateReply = await fixtureScript('({actions:__c31f7Actions,keys:__c31f7Keys})')
+                            assert.deepEqual(entry.afterLateReply, { actions: 0, keys: [] })
                         }
+                        entry.followEvaluate = await invoke('evaluate', {
+                            script: 'globalThis.__afterSnapshot=(globalThis.__afterSnapshot||0)+1',
+                            timeout: 500,
+                        })
+                        entry.followInput = await call(
+                            [
+                                { type: 'keydown', key: 'z' },
+                                { type: 'keyup', key: 'z' },
+                            ],
+                            { timeout: 400 }
+                        )
+                        assert.equal(entry.followEvaluate.success, true)
+                        assert.equal(entry.followInput.success, true)
                     }
                 )
-            }
-            for (const operation of ['evaluate', 'input']) {
-                for (const snapshotIndex of [1, 2]) {
-                    const precondition = snapshotIndex === 2
-                    await record(
-                        precondition ? `c31f8-condition-snapshot-${operation}` : `c31f7-before-snapshot-${operation}`,
-                        async (entry) => {
-                            await setup([])
-                            await fixtureScript(
-                                `(()=>{globalThis.__c31f7Actions=0;globalThis.__c31f7Keys=[];for(const type of ['keydown','keyup'])document.addEventListener(type,event=>__c31f7Keys.push([type,event.key]),{signal:window.__coordAbort.signal});return true})()`
-                            )
-                            const expected = precondition ? await unified.getPageSnapshot(String(tabId), 7000) : null
-                            const condition = unified.withPageCondition
-                            entry.actionScopes = 0
-                            unified.withPageCondition = async (...args) => {
-                                ++entry.actionScopes
-                                return condition.apply(unified, args)
-                            }
-                            const firstInput = (await worker('coordinates.nativeInputs()')).length
-                            snapshotsUntilHold = snapshotIndex
-                            heldSnapshot = undefined
-                            try {
-                                entry.body = await invoke(operation, {
-                                    ...(operation === 'evaluate'
-                                        ? { script: 'globalThis.__c31f7Actions++' }
-                                        : {
-                                              events: [
-                                                  { type: 'keydown', key: 'x' },
-                                                  { type: 'keyup', key: 'x' },
-                                              ],
-                                          }),
-                                    ...(expected
-                                        ? operation === 'evaluate'
-                                            ? { expectedUrl: expected.url }
-                                            : { expectedRevision: expected.revision }
-                                        : {}),
-                                    timeout: precondition ? 300 : 200,
-                                })
-                                entry.heldSnapshot = heldSnapshot
-                                entry.inputs = (await worker('coordinates.nativeInputs()')).slice(firstInput)
-                                entry.dom = await fixtureScript('({actions:__c31f7Actions,keys:__c31f7Keys})')
-                                assert.ok(heldSnapshot?.success)
-                                assert.equal(entry.actionScopes, precondition ? 1 : 0)
-                                assert.deepEqual(entry.inputs, [])
-                                assert.deepEqual(entry.dom, { actions: 0, keys: [] })
-                                assert.equal(entry.body.actionExecuted, false)
-                                assert.equal(entry.body.actionStatus, 'not_started')
-                                assert.equal(entry.body.failureStage, precondition ? 'precondition' : 'context')
-                                assert.equal(entry.body.retryable, false)
-                                if (operation === 'input') {
-                                    assert.equal(entry.body.eventsExecuted, 0)
-                                    assert.equal(entry.body.remainingEventsNotExecuted, 2)
-                                }
-                                assert.equal(entry.body.error.context.actionExecuted, 'unknown')
-                                assert.equal(
-                                    entry.body.pageContext.contextPhase,
-                                    precondition ? 'precondition' : 'before'
-                                )
-                                if (expected) {
-                                    assert.equal(entry.body.pageContext.before.url, expected.url)
-                                }
-                            } finally {
-                                unified.withPageCondition = condition
-                                snapshotsUntilHold = 0
-                                if (heldSnapshot) {
-                                    bridge.httpServer.handleMessage(JSON.stringify(heldSnapshot))
-                                }
-                                heldSnapshot = undefined
-                                entry.afterLateReply = await fixtureScript(
-                                    '({actions:__c31f7Actions,keys:__c31f7Keys})'
-                                )
-                                assert.deepEqual(entry.afterLateReply, { actions: 0, keys: [] })
-                            }
-                        }
-                    )
-                }
             }
         }
         if (mode === 'extension') {
@@ -1803,31 +2734,66 @@ try {
                                 await record(
                                     `c31f8-scroll-${inputMode}-${framed}-${slotted}-${propagation}-${action}`,
                                     async (entry) => {
-                                        unified.setInputMode(inputMode)
+                                        unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                                         await setup(framed ? [{ css: 'height:320px' }] : [])
-                                        await fixtureScript(`(() => {
-                                            document.body.style.cssText='margin:0;min-height:3000px';
-                                            window.__coordCaptureRects=true;
-                                            let pad=document.querySelector('#pad'), scroller=document, root=window;
-                                            if (${slotted}) {
-                                                document.body.innerHTML='<div id="host" style="display:block;position:absolute;left:0;top:30px;width:380px;height:200px"></div>';
-                                                const host=document.querySelector('#host');
-                                                root=host.attachShadow({mode:'open'});
-                                                root.innerHTML='<div id="scroller" style="width:380px;height:200px;overflow:auto;position:relative"><div id="content" style="position:relative;width:380px;height:3500px"><slot name="target"></slot></div></div>';
-                                                scroller=root.querySelector('#scroller');
-                                                pad=document.createElement('input');pad.id='pad';pad.type='checkbox';pad.slot='target';host.append(pad);
-                                            }
-                                            pad.style.cssText='position:absolute;left:80px;top:2100px;width:80px;height:70px;margin:0';
-                                            window.__c31f8Scroll=[];
-                                            const capture=${propagation === 'capture-stop'};
-                                            (capture ? root : scroller).addEventListener('scroll', event => {
-                                                window.__c31f8Scroll.push({target:event.target.id||event.target.nodeName,position:scroller===document?window.scrollY:scroller.scrollTop});
-                                                if (${slotted}) pad.style.left='240px';
-                                                if (${propagation === 'stop-immediate'}) event.stopImmediatePropagation();
-                                                if (${propagation === 'stop' || propagation === 'capture-stop'}) event.stopPropagation();
-                                            }, {capture,once:true,signal:window.__coordAbort.signal});
-                                            return true;
-                                        })()`)
+                                        await fixtureScript(
+                                            '(() => {\n                                     ' +
+                                                "       document.body.style.cssText='margin:0;" +
+                                                "min-height:3000px';\n                          " +
+                                                '                  window.__coordCaptureRects=t' +
+                                                'rue;\n                                         ' +
+                                                "   let pad=document.querySelector('#pad'), " +
+                                                'scroller=document, root=window;\n              ' +
+                                                '                              if (' +
+                                                `${slotted}` +
+                                                ') {\n                                          ' +
+                                                '      document.body.innerHTML=\'<div id="host" ' +
+                                                'style="display:block;position:absolute;left:0;' +
+                                                'top:30px;width:380px;height:200px"></div>\';\n  ' +
+                                                '                                              ' +
+                                                "const host=document.querySelector('#host');\n  " +
+                                                '                                              ' +
+                                                "root=host.attachShadow({mode:'open'});\n       " +
+                                                '                                         ' +
+                                                'root.innerHTML=\'<div id="scroller" ' +
+                                                'style="width:380px;height:200px;overflow:auto;' +
+                                                'position:relative"><div id="content" ' +
+                                                'style="position:relative;width:380px;' +
+                                                'height:3500px"><slot name="target"></slot>' +
+                                                "</div></div>';\n                               " +
+                                                "                 scroller=root.querySelector('" +
+                                                "#scroller');\n                                 " +
+                                                "               pad=document.createElement('inp" +
+                                                "ut');pad.id='pad';pad.type='checkbox';" +
+                                                "pad.slot='target';host.append(pad);\n          " +
+                                                '                                  }\n          ' +
+                                                '                                  ' +
+                                                "pad.style.cssText='position:absolute;" +
+                                                'left:80px;top:2100px;width:80px;height:70px;' +
+                                                "margin:0';\n                                   " +
+                                                '         window.__c31f8Scroll=[];\n            ' +
+                                                '                                const capture=' +
+                                                `${propagation === 'capture-stop'}` +
+                                                ';\n                                            ' +
+                                                "(capture ? root : scroller).addEventListener('" +
+                                                "scroll', event => {\n                          " +
+                                                '                      window.__c31f8Scroll.pus' +
+                                                'h({target:event.target.id||event.target.nodeNa' +
+                                                'me,position:scroller===document?window.scrollY' +
+                                                ':scroller.scrollTop});\n                       ' +
+                                                "                         pad.style.left='240px';\n                    " +
+                                                '                            if (' +
+                                                `${propagation === 'stop-immediate'}` +
+                                                ') event.stopImmediatePropagation();\n          ' +
+                                                '                                      if (' +
+                                                `${propagation === 'stop' || propagation === 'capture-stop'}` +
+                                                ') event.stopPropagation();\n                   ' +
+                                                '                         }, {capture,' +
+                                                'once:true,signal:window.__coordAbort.signal});' +
+                                                '\n                                            ' +
+                                                'return true;\n                                 ' +
+                                                '       })()'
+                                        )
                                         const sequence =
                                             action === 'down-up'
                                                 ? [{ type: 'mousedown', target: { css: '#pad' } }, { type: 'mouseup' }]
@@ -1835,7 +2801,11 @@ try {
                                         entry.body = await call(sequence, { timeout: 1200 })
                                         entry.tool = await events()
                                         entry.layout = await fixtureScript(
-                                            `(() => {const r=document.querySelector('#pad').getBoundingClientRect();return {rect:{x:r.x,y:r.y,width:r.width,height:r.height},scroll:window.__c31f8Scroll,visibility:document.visibilityState}})()`
+                                            "(() => {const r=document.querySelector('#pad')" +
+                                                '.getBoundingClientRect();return {rect:{x:r.x,' +
+                                                'y:r.y,width:r.width,height:r.height},' +
+                                                'scroll:window.__c31f8Scroll,' +
+                                                'visibility:document.visibilityState}})()'
                                         )
                                         await clear()
                                         entry.oracle = await oracle({
@@ -1883,10 +2853,16 @@ try {
                 for (const mutation of ['remove', 'replace']) {
                     for (const prefix of [false, true]) {
                         await record(`c31f7-ref-${inputMode}-${mutation}-${prefix}`, async (entry) => {
-                            unified.setInputMode(inputMode)
+                            unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                             await setup([{ css: 'height:320px' }])
                             await fixtureScript(
-                                `(()=>{document.body.style.minHeight='1800px';const pad=document.querySelector('#pad');pad.style.top='900px';addEventListener('scroll',()=>{${mutation === 'remove' ? 'pad.remove()' : 'pad.replaceWith(pad.cloneNode(true))'}},{once:true,signal:window.__coordAbort.signal});return true})()`
+                                "(()=>{document.body.style.minHeight='1800px';" +
+                                    "const pad=document.querySelector('#pad');" +
+                                    "pad.style.top='900px';addEventListener('scroll" +
+                                    "',()=>{" +
+                                    (mutation === 'remove' ? 'pad.remove()' : 'pad.replaceWith(pad.cloneNode(true))') +
+                                    '},{once:true,signal:window.__coordAbort.signal' +
+                                    '});return true})()'
                             )
                             const first = (await worker('coordinates.nativeInputs()')).length
                             entry.body = await call([
@@ -1910,7 +2886,7 @@ try {
                         await record(
                             `c31f7-scroll-${inputMode}-${transformed}-${relocate}-${action}`,
                             async (entry) => {
-                                unified.setInputMode(inputMode)
+                                unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                                 await setup([
                                     {
                                         css:
@@ -1921,7 +2897,21 @@ try {
                                     },
                                 ])
                                 await fixtureScript(
-                                    `(()=>{document.body.style.minHeight='1800px';window.__coordCaptureRects=true;const pad=document.querySelector('#pad');pad.style.cssText='position:absolute;left:80px;top:900px;width:80px;height:70px;margin:0';if(${relocate})addEventListener('scroll',()=>{pad.style.left='240px'},{once:true,signal:window.__coordAbort.signal});if(${action === 'touchmove'})document.addEventListener('touchstart',()=>{pad.style.left=(parseFloat(pad.style.left)+25)+'px'},{once:true,signal:window.__coordAbort.signal});return true})()`
+                                    "(()=>{document.body.style.minHeight='1800px';" +
+                                        'window.__coordCaptureRects=true;const ' +
+                                        "pad=document.querySelector('#pad');" +
+                                        "pad.style.cssText='position:absolute;" +
+                                        'left:80px;top:900px;width:80px;height:70px;' +
+                                        "margin:0';if(" +
+                                        `${relocate}` +
+                                        ")addEventListener('scroll',()=>" +
+                                        "{pad.style.left='240px'},{once:true," +
+                                        'signal:window.__coordAbort.signal});if(' +
+                                        `${action === 'touchmove'}` +
+                                        ")document.addEventListener('touchstart',()=>" +
+                                        '{pad.style.left=(parseFloat(pad.style.left)+25' +
+                                        ")+'px'},{once:true,signal:window.__coordAbort." +
+                                        'signal});return true})()'
                                 )
                                 const target = { css: '#pad' }
                                 const sequence =
@@ -1940,7 +2930,9 @@ try {
                                 await delay(30)
                                 entry.tool = await events()
                                 entry.rect = await fixtureScript(
-                                    `(()=>{const r=document.querySelector('#pad').getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height}})()`
+                                    "(()=>{const r=document.querySelector('#pad').g" +
+                                        'etBoundingClientRect();return{x:r.x,y:r.y,' +
+                                        'width:r.width,height:r.height}})()'
                                 )
                                 const type =
                                     action === 'down-up' ? 'mousedown' : action === 'touch' ? 'touchstart' : action
@@ -2029,76 +3021,151 @@ try {
             await setup(styles)
             for (const selector of [false, true]) {
                 for (const action of ['wheel', 'mousemove', 'click']) {
-                    await record(`${name}-${selector ? 'selector' : 'point'}-${action}`, async () => {
-                        await clear()
-                        const localPoint =
-                            mode === 'extension' && !['ordinary', 'translate', 'scale2'].includes(name)
-                                ? { x: 140.25, y: 110.25 }
-                                : { x: 140, y: 110 }
-                        const nativeStart =
-                            mode === 'extension' ? (await worker('coordinates.nativeInputs()')).length : 0
-                        const target = selector ? { css: '#pad' } : localPoint
-                        const body = await call([
-                            { type: action, target, ...(action === 'wheel' ? { deltaY: 120 } : {}) },
-                        ])
-                        completed(body, 1)
-                        await delay(30)
-                        const tool = await events()
-                        if (mode === 'extension' && selector && action === 'wheel') {
-                            assert.equal(result.bridgeCommands.findLast((c) => c.action === 'scroll')?.params.y, 120)
-                            assert.equal(
-                                tool.some((e) => e.type === 'wheel'),
-                                false
-                            )
-                            return {
-                                body,
-                                tool,
-                                contract: 'Existing explicit ref programmatic scroll, no synthesized wheel',
+                    for (const inputMode of mode === 'extension' && action !== 'wheel'
+                        ? ['precise', 'stealth']
+                        : ['precise']) {
+                        await record(
+                            `${inputMode === 'stealth' ? 'stealth-' : ''}${name}-${selector ? 'selector' : 'point'}-${action}`,
+                            async (entry) => {
+                                unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
+                                if (inputMode === 'stealth') {
+                                    await fixtureScript('(window.__coordCaptureRects=true,true)')
+                                }
+                                await clear()
+                                const localPoint =
+                                    mode === 'extension' && !['ordinary', 'translate', 'scale2'].includes(name)
+                                        ? { x: 140.25, y: 110.25 }
+                                        : { x: 140, y: 110 }
+                                const nativeStart =
+                                    mode === 'extension' ? (await worker('coordinates.nativeInputs()')).length : 0
+                                const target = selector ? { css: '#pad' } : localPoint
+                                const body = await call([
+                                    { type: action, target, ...(action === 'wheel' ? { deltaY: 120 } : {}) },
+                                ])
+                                completed(body, 1)
+                                await delay(30)
+                                const tool = await events()
+                                if (mode === 'extension' && selector && action === 'wheel') {
+                                    assert.equal(
+                                        result.bridgeCommands.findLast((c) => c.action === 'scroll')?.params.y,
+                                        120
+                                    )
+                                    assert.equal(
+                                        tool.some((e) => e.type === 'wheel'),
+                                        false
+                                    )
+                                    return {
+                                        body,
+                                        tool,
+                                        contract: 'Existing explicit ref programmatic scroll, no synthesized wheel',
+                                    }
+                                }
+                                assert.ok(
+                                    tool.some((e) => e.type === action),
+                                    'Expected event: ' + JSON.stringify(tool)
+                                )
+                                assert.ok(
+                                    tool.every((e) => e.target === 'pad'),
+                                    JSON.stringify(tool)
+                                )
+                                await clear()
+                                let point = await oracle(selector ? { x: 140, y: 110 } : localPoint)
+                                if (mode === 'extension' && inputMode === 'precise' && action !== 'wheel') {
+                                    const inputs = (await worker('coordinates.nativeInputs()')).slice(nativeStart)
+                                    const dispatched = inputs.find((c) => c.method === 'Input.dispatchMouseEvent')
+                                    assert.ok(dispatched, 'Native Extension input was not dispatched')
+                                    assert.ok(
+                                        Math.abs(point.x - dispatched.params.x) < 0.02 &&
+                                            Math.abs(point.y - dispatched.params.y) < 0.02,
+                                        JSON.stringify({ point, dispatched })
+                                    )
+                                    point = { x: dispatched.params.x, y: dispatched.params.y }
+                                }
+                                await native(action, point)
+                                const reference = await events()
+                                const filter = (list) =>
+                                    list.filter((e) =>
+                                        action === 'click'
+                                            ? ['mousedown', 'mouseup', 'click'].includes(e.type)
+                                            : e.type === action
+                                    )
+                                Object.assign(entry, { body, point, tool, reference, inputMode })
+                                if (inputMode === 'stealth') {
+                                    const toolEvents = comparable(filter(tool))
+                                    const nativeEvents = comparable(filter(reference))
+                                    const semantic = (list) => list.map(({ x: _x, y: _y, ...event }) => event)
+                                    assert.deepEqual(semantic(toolEvents), semantic(nativeEvents))
+                                    entry.nativeClientQuantization = []
+                                    entry.nativeDispatchPoint = result.nativeCommands.at(-1).params
+                                    assert.equal(entry.nativeDispatchPoint.x, point.x)
+                                    assert.equal(entry.nativeDispatchPoint.y, point.y)
+                                    for (let index = 0; index < toolEvents.length; ++index) {
+                                        const actual = toolEvents[index]
+                                        const native = nativeEvents[index]
+                                        const intended = selector
+                                            ? {
+                                                  x: actual.targetRect.x + actual.targetRect.width / 2,
+                                                  y: actual.targetRect.y + actual.targetRect.height / 2,
+                                              }
+                                            : localPoint
+                                        const difference = {
+                                            x: Math.trunc(intended.x) - native.x,
+                                            y: Math.trunc(intended.y) - native.y,
+                                        }
+                                        assert.equal(actual.x, Math.trunc(intended.x))
+                                        assert.equal(actual.y, Math.trunc(intended.y))
+                                        for (const axis of ['x', 'y']) {
+                                            assert.ok(Number.isInteger(native[axis]))
+                                            assert.ok(
+                                                difference[axis] === 0 || difference[axis] === 1,
+                                                JSON.stringify({ intended, native, difference })
+                                            )
+                                        }
+                                        assert.ok(
+                                            native.x >= native.targetRect.x &&
+                                                native.x < native.targetRect.x + native.targetRect.width
+                                        )
+                                        assert.ok(
+                                            native.y >= native.targetRect.y &&
+                                                native.y < native.targetRect.y + native.targetRect.height
+                                        )
+                                        entry.nativeClientQuantization.push({
+                                            type: actual.type,
+                                            intended,
+                                            actual: { x: actual.x, y: actual.y },
+                                            native: { x: native.x, y: native.y },
+                                            difference,
+                                        })
+                                    }
+                                } else {
+                                    assert.deepEqual(comparable(filter(tool)), comparable(filter(reference)))
+                                }
                             }
-                        }
-                        assert.ok(
-                            tool.some((e) => e.type === action),
-                            'Expected event: ' + JSON.stringify(tool)
                         )
-                        assert.ok(
-                            tool.every((e) => e.target === 'pad'),
-                            JSON.stringify(tool)
-                        )
-                        await clear()
-                        let point = await oracle(selector ? { x: 140, y: 110 } : localPoint)
-                        if (mode === 'extension' && action !== 'wheel') {
-                            const inputs = (await worker('coordinates.nativeInputs()')).slice(nativeStart)
-                            const dispatched = inputs.find((c) => c.method === 'Input.dispatchMouseEvent')
-                            assert.ok(dispatched, 'Native Extension input was not dispatched')
-                            assert.ok(
-                                Math.abs(point.x - dispatched.params.x) < 0.02 &&
-                                    Math.abs(point.y - dispatched.params.y) < 0.02,
-                                JSON.stringify({ point, dispatched })
-                            )
-                            point = { x: dispatched.params.x, y: dispatched.params.y }
-                        }
-                        await native(action, point)
-                        const reference = await events()
-                        const filter = (list) =>
-                            list.filter((e) =>
-                                action === 'click'
-                                    ? ['mousedown', 'mouseup', 'click'].includes(e.type)
-                                    : e.type === action
-                            )
-                        assert.deepEqual(comparable(filter(tool)), comparable(filter(reference)))
-                        return { body, point, tool, reference }
-                    })
+                    }
                 }
             }
         }
         await setup([])
+        await fixtureScript(`(() => {
+            window.__coordCaptureTimes=true;
+            window.__modifierKeys=[];
+            for(const type of ['keydown','keyup'])document.addEventListener(type,event=>{
+                window.__modifierKeys.push({type,key:event.key,time:performance.now(),trusted:event.isTrusted,
+                    altKey:event.altKey,ctrlKey:event.ctrlKey,metaKey:event.metaKey,shiftKey:event.shiftKey});
+            },{capture:true,signal:window.__coordAbort.signal});
+            return true;
+        })()`)
         for (const inputMode of mode === 'extension' ? ['stealth', 'precise'] : ['precise']) {
-            unified.setInputMode(inputMode)
+            unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
             for (const keys of [[], ['Alt'], ['Control'], ['Meta'], ['Shift'], ['Control', 'Shift']]) {
                 for (const action of ['wheel', 'mousemove', 'down-up', 'click', 'right', 'force', 'ref-actionable']) {
                     await record(`modifiers-${inputMode}-${keys.join('+') || 'none'}-${action}`, async () => {
                         const mask = keys.reduce((v, k) => v | { Alt: 1, Control: 2, Meta: 4, Shift: 8 }[k], 0)
                         await clear()
+                        await fixtureScript('(window.__modifierKeys=[],true)')
+                        const firstCommand = result.bridgeCommands.length
+                        const firstNative = (await worker('coordinates.nativeInputs()')).length
                         const target =
                             action === 'force' || action === 'ref-actionable' ? { css: '#pad' } : { x: 140, y: 110 }
                         const actions =
@@ -2117,6 +3184,8 @@ try {
                                               : {}),
                                       },
                                   ]
+                        const viewportBefore =
+                            action === 'wheel' ? await fixtureScript('({x:scrollX,y:scrollY})') : undefined
                         const sequence = [
                             ...keys.map((key) => ({ type: 'keydown', key })),
                             ...actions,
@@ -2145,14 +3214,69 @@ try {
                         const applicationActions = await fixtureScript('window.__coordActions')
                         if (action === 'wheel') {
                             assert.equal(applicationActions, mask ? 1 : 0)
+                            assert.equal(tool.find((event) => event.type === 'wheel')?.defaultPrevented, true)
+                            assert.deepEqual(await fixtureScript('({x:scrollX,y:scrollY})'), viewportBefore)
                         }
-                        return { mask, body, tool, applicationActions }
+                        const keyEvents = await fixtureScript('window.__modifierKeys')
+                        assert.deepEqual(
+                            keyEvents.map(({ type, key }) => ({ type, key })),
+                            [
+                                ...keys.map((key) => ({ type: 'keydown', key })),
+                                ...[...keys].reverse().map((key) => ({ type: 'keyup', key })),
+                            ]
+                        )
+                        let released
+                        if (keys.length) {
+                            const type =
+                                action === 'down-up'
+                                    ? 'mousedown'
+                                    : action === 'right'
+                                      ? 'contextmenu'
+                                      : ['force', 'ref-actionable'].includes(action)
+                                        ? 'click'
+                                        : action
+                            const pointer = tool.find((event) => event.type === type)
+                            assert.ok(pointer.time >= keyEvents[keys.length - 1].time)
+                            assert.ok(pointer.time <= keyEvents[keys.length].time)
+                            const releasedBody = await call(actions)
+                            completed(releasedBody, actions.length)
+                            const releasedTool = (await events()).slice(tool.length)
+                            assert.ok(releasedTool.length > 0)
+                            for (const event of releasedTool) {
+                                assert.equal(event.target, 'pad')
+                                for (const field of ['altKey', 'ctrlKey', 'metaKey', 'shiftKey']) {
+                                    assert.equal(event[field], false, JSON.stringify(event))
+                                }
+                            }
+                            assert.equal(unified.modifiers, 0)
+                            assert.equal(unified.pressedKeys.size, 0)
+                            if (action === 'wheel') {
+                                assert.equal(await fixtureScript('window.__coordActions'), applicationActions)
+                                assert.equal(
+                                    releasedTool.find((event) => event.type === 'wheel')?.defaultPrevented,
+                                    true
+                                )
+                                assert.deepEqual(await fixtureScript('({x:scrollX,y:scrollY})'), viewportBefore)
+                            }
+                            released = { body: releasedBody, tool: releasedTool }
+                        }
+                        return {
+                            mask,
+                            body,
+                            tool,
+                            applicationActions,
+                            keyEvents,
+                            released,
+                            commands: result.bridgeCommands.slice(firstCommand),
+                            nativeInputs: (await worker('coordinates.nativeInputs()')).slice(firstNative),
+                            viewportBefore,
+                        }
                     })
                 }
             }
         }
         for (const inputMode of mode === 'extension' ? ['stealth', 'precise'] : ['precise']) {
-            unified.setInputMode(inputMode)
+            unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
             await setup([{ css: 'transform:scale(1.6);border:6px solid black' }])
             for (const keys of [[], ['Alt'], ['Control'], ['Meta'], ['Shift'], ['Control', 'Shift']]) {
                 for (const action of ['wheel', 'right', 'ref', 'force']) {
@@ -2199,18 +3323,26 @@ try {
         }
         unified.setInputMode('precise')
         await setup([{ css: 'transform:scale(1.6);border:6px solid black' }])
-        await record('touch-point-selector', async () => {
-            const body = await call([
-                { type: 'touchstart', target: { x: 140, y: 110 } },
-                { type: 'touchmove', target: { css: '#pad' } },
-                { type: 'touchend' },
-            ])
-            completed(body, 3)
-            const tool = await events()
-            assert.ok(tool.some((e) => e.type === 'touchstart' && e.target === 'pad'))
-            assert.ok(tool.some((e) => e.type === 'touchend' && e.target === 'pad'))
-            return { body, tool }
-        })
+        for (const inputMode of mode === 'extension' ? ['precise', 'stealth'] : ['precise']) {
+            unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
+            await record(
+                inputMode === 'precise' ? 'touch-point-selector' : 'stealth-touch-point-selector',
+                async () => {
+                    await clear()
+                    const body = await call([
+                        { type: 'touchstart', target: { x: 140, y: 110 } },
+                        { type: 'touchmove', target: { css: '#pad' } },
+                        { type: 'touchend' },
+                    ])
+                    completed(body, 3)
+                    const tool = await events()
+                    assert.ok(tool.some((e) => e.type === 'touchstart' && e.target === 'pad'))
+                    assert.ok(tool.some((e) => e.type === 'touchend' && e.target === 'pad'))
+                    return { body, tool, inputMode }
+                }
+            )
+        }
+        unified.setInputMode('precise')
         await record('selection-local-focus', async () => {
             const body = await call([{ type: 'select', target: { css: '#text' }, find: 'bravo' }])
             completed(body, 1)
@@ -2248,22 +3380,32 @@ try {
             return { body, tool }
         })
         if (mode === 'extension') {
-            await record('drag-ref', async () => {
-                const body = await call([{ type: 'drag', target: { css: '#pad' }, to: { css: '#drop' } }])
-                completed(body, 1)
-                return { body, tool: await events() }
-            })
+            for (const inputMode of ['precise', 'stealth']) {
+                unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
+                await record(inputMode === 'precise' ? 'drag-ref' : 'stealth-drag-ref', async () => {
+                    await clear()
+                    const body = await call([{ type: 'drag', target: { css: '#pad' }, to: { css: '#drop' } }])
+                    completed(body, 1)
+                    const tool = await events()
+                    assert.equal(tool.filter((event) => event.type === 'drop').length, 1)
+                    assert.equal(tool.find((event) => event.type === 'drop')?.target, 'drop')
+                    return { body, tool, inputMode }
+                })
+            }
+            unified.setInputMode('precise')
         }
         await setup([])
         for (const inputMode of mode === 'extension' ? ['stealth', 'precise'] : ['precise']) {
-            unified.setInputMode(inputMode)
+            unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
             for (const control of ['default', 'preventDefault', 'disabled']) {
                 await record(`activation-${inputMode}-${control}`, async () => {
                     await clear()
                     await fixtureScript('(document.getElementById("pad").checked=false,true)')
                     if (control === 'preventDefault') {
                         await fixtureScript(
-                            '(document.getElementById("pad").addEventListener("click",e=>e.preventDefault(),{once:true}),true)'
+                            '(document.getElementById("pad").addEventListen' +
+                                'er("click",e=>e.preventDefault(),{once:true}),' +
+                                'true)'
                         )
                     }
                     const body = await call(
@@ -2335,14 +3477,29 @@ try {
                     [1, 1],
                 ]) {
                     for (const selector of [false, true]) {
-                        const id = `dynamic-zoom-${from}-${to}-${nested ? 'nested' : 'single'}-${selector ? 'selector' : 'point'}`
+                        const id =
+                            'dynamic-zoom-' +
+                            `${from}` +
+                            '-' +
+                            `${to}` +
+                            '-' +
+                            `${nested ? 'nested' : 'single'}` +
+                            '-' +
+                            `${selector ? 'selector' : 'point'}` +
+                            ''
                         await record(id, async () => {
                             await setup([
                                 { css: `zoom:${from}` },
                                 ...(nested ? [{ css: 'left:20px;top:20px;transform:scale(.8)' }] : []),
                             ])
                             await fixtureScript(
-                                `(() => {window.__zoomChanged=false;document.addEventListener('wheel',()=>{${nested ? 'parent.frameElement' : 'frameElement'}.style.zoom=${JSON.stringify(String(to))};window.__zoomChanged=true},{once:true});return true})()`
+                                '(() => {window.__zoomChanged=false;' +
+                                    "document.addEventListener('wheel',()=>{" +
+                                    `${nested ? 'parent.frameElement' : 'frameElement'}` +
+                                    '.style.zoom=' +
+                                    `${JSON.stringify(String(to))}` +
+                                    ';window.__zoomChanged=true},{once:true});' +
+                                    'return true})()'
                             )
                             const body = await call([
                                 { type: 'wheel', target: { x: 140, y: 110 }, deltaY: 1 },
@@ -2379,7 +3536,11 @@ try {
                         await setup([{ css: 'zoom:2' }, { css: 'left:20px;top:20px;transform:scale(.8)' }])
                         await script(
                             frameIds[0],
-                            `(() => {document.documentElement.style.${property}=${JSON.stringify(property === 'rotate' ? '30deg' : '-1 1')};return true})()`
+                            '(() => {document.documentElement.style.' +
+                                `${property}` +
+                                '=' +
+                                `${JSON.stringify(property === 'rotate' ? '30deg' : '-1 1')}` +
+                                ';return true})()'
                         )
                         const first = result.productionCommands.length
                         const body = await call([
@@ -2480,7 +3641,11 @@ try {
                         framed,
                         ending,
                         boundary:
-                            'Actual SDK, installed ActionHandler and native DOM key events; only successful post-action page_snapshot delivery is withheld with the production budget/cancellation helper',
+                            'Actual SDK, installed ActionHandler and ' +
+                            'native DOM key events; only successful ' +
+                            'post-action page_snapshot delivery is ' +
+                            'withheld with the production ' +
+                            'budget/cancellation helper',
                     }
                     ;(result.extensionLifecycle ??= []).push(entry)
                     const originalCommand = bridge.httpServer.sendCommand
@@ -2503,22 +3668,34 @@ try {
                             options
                         )
                     }
-                    const install = `(() => {
-                        window.__lateAbort?.abort(); window.__lateAbort=new AbortController();
-                        window.__lateKeys=new Set(); window.__lateEvents=[];
-                        document.body.innerHTML='<input id="late-edit" type="text">';
-                        for(const type of ['keydown','keyup']) document.addEventListener(type,event=>{
-                            if(type==='keydown')window.__lateKeys.add(event.key);else window.__lateKeys.delete(event.key);
-                            window.__lateEvents.push({type,key:event.key,trusted:event.isTrusted});
-                        },{signal:window.__lateAbort.signal});
-                        document.querySelector('input').focus(); return true;
-                    })()`
+                    const install =
+                        '(() => {\n                        ' +
+                        'window.__lateAbort?.abort(); ' +
+                        'window.__lateAbort=new AbortController();\n    ' +
+                        '                    window.__lateKeys=new ' +
+                        'Set(); window.__lateEvents=[];\n               ' +
+                        "         document.body.innerHTML='<input " +
+                        'id="late-edit" type="text">\';\n                ' +
+                        "        for(const type of ['keydown'," +
+                        "'keyup']) document.addEventListener(type," +
+                        'event=>{\n                            ' +
+                        "if(type==='keydown')window.__lateKeys.add(even" +
+                        't.key);else window.__lateKeys.delete(event.key' +
+                        ');\n                            ' +
+                        'window.__lateEvents.push({type,key:event.key,' +
+                        'trusted:event.isTrusted});\n                   ' +
+                        '     },{signal:window.__lateAbort.signal});\n  ' +
+                        "                      document.querySelector('" +
+                        "input').focus(); return true;\n                " +
+                        '    })()'
                     const state = '({held:[...window.__lateKeys],events:window.__lateEvents})'
                     let handler
                     try {
                         await read(tabId, 0, install)
                         other = await worker(
-                            `chrome.tabs.create({url:${JSON.stringify(base + '/?late-metadata=' + framed + '-' + ending)},active:false})`
+                            'chrome.tabs.create({url:' +
+                                `${JSON.stringify(base + '/?late-metadata=' + framed + '-' + ending)}` +
+                                ',active:false})'
                         )
                         await worker(`coordinates.adopt(${other.id})`)
                         await until(() => read(other.id, 0, 'document.readyState==="complete"'))
@@ -2528,7 +3705,10 @@ try {
                             await read(
                                 other.id,
                                 0,
-                                `(() => {const f=document.createElement('iframe');f.id='late-frame';f.src=${JSON.stringify(src)};document.body.append(f);return true})()`
+                                "(() => {const f=document.createElement('iframe" +
+                                    "');f.id='late-frame';f.src=" +
+                                    `${JSON.stringify(src)}` +
+                                    ';document.body.append(f);return true})()'
                             )
                             const frames = await until(async () => {
                                 const frames = await worker(`coordinates.frames(${other.id})`)
@@ -2698,18 +3878,32 @@ try {
             for (const framed of [false, true]) {
                 for (const action of ['mousemove', 'down-up']) {
                     await record(`c31f8-hidden-${inputMode}-${framed}-${action}`, async (entry) => {
-                        unified.setInputMode(inputMode)
+                        unified.setInputMode(/** @type {'precise' | 'stealth'} */ (inputMode))
                         await setup(framed ? [{ css: 'height:320px' }] : [])
-                        await fixtureScript(`(() => {
-                            document.body.style.minHeight='3000px';window.__coordCaptureRects=true;
-                            const pad=document.querySelector('#pad');
-                            pad.style.cssText='position:absolute;left:80px;top:2100px;width:80px;height:70px;margin:0';
-                            window.addEventListener('scroll',event=>{pad.style.left='240px';event.stopImmediatePropagation()},{capture:true,once:true,signal:window.__coordAbort.signal});
-                            return true;
-                        })()`)
+                        await fixtureScript(
+                            '(() => {\n                            ' +
+                                "document.body.style.minHeight='3000px';" +
+                                'window.__coordCaptureRects=true;\n             ' +
+                                '               const pad=document.querySelecto' +
+                                "r('#pad');\n                            " +
+                                "pad.style.cssText='position:absolute;" +
+                                'left:80px;top:2100px;width:80px;height:70px;' +
+                                "margin:0';\n                            " +
+                                "window.__c31f8Scroll=[];window.addEventListener('scroll',event=>" +
+                                "{pad.style.left='240px';window.__c31f8Scroll.push({at:performance.now(),visibility:document.visibilityState});" +
+                                'event.stopImmediatePropagation()},' +
+                                '{capture:true,once:true,' +
+                                'signal:window.__coordAbort.signal});\n         ' +
+                                '                   return true;\n              ' +
+                                '          })()'
+                        )
                         backgroundPage ??= await pipe('Target.createTarget', { url: 'about:blank' })
                         entry.beforeVisibility = await fixtureScript('document.visibilityState')
                         assert.equal(entry.beforeVisibility, 'hidden')
+                        await fixtureScript(
+                            '(() => {window.__c31f8RAF=0;const id=requestAnimationFrame(()=>++window.__c31f8RAF);' +
+                                'window.__coordAbort.signal.addEventListener("abort",()=>cancelAnimationFrame(id),{once:true});return true})()'
+                        )
                         const sequence =
                             action === 'down-up'
                                 ? [{ type: 'mousedown', target: { css: '#pad' } }, { type: 'mouseup' }]
@@ -2719,7 +3913,10 @@ try {
                         entry.inputs = (await worker('coordinates.nativeInputs()')).slice(first)
                         entry.tool = await events()
                         entry.layout = await fixtureScript(
-                            `(() => {const r=document.querySelector('#pad').getBoundingClientRect();return {rect:{x:r.x,y:r.y,width:r.width,height:r.height},visibility:document.visibilityState}})()`
+                            "(() => {const r=document.querySelector('#pad')" +
+                                '.getBoundingClientRect();return {rect:{x:r.x,' +
+                                'y:r.y,width:r.width,height:r.height},' +
+                                'visibility:document.visibilityState}})()'
                         )
                         await clear()
                         entry.oracle = await oracle({
@@ -2735,6 +3932,19 @@ try {
                             JSON.stringify(entry)
                         )
                         assert.equal(entry.layout.visibility, 'hidden')
+                        entry.scrollAtReturn = await fixtureScript('window.__c31f8Scroll')
+                        await until(async () => {
+                            const observation = await fixtureScript(
+                                '({scroll:window.__c31f8Scroll,raf:window.__c31f8RAF,visibility:document.visibilityState})'
+                            )
+                            entry.scrollObserved = observation.scroll
+                            entry.rafObserved = observation.raf
+                            entry.observedVisibility = observation.visibility
+                            return entry.scrollObserved.length > 0
+                        })
+                        assert.ok(entry.scrollObserved.every((event) => event.visibility === 'hidden'))
+                        assert.equal(entry.observedVisibility, 'hidden')
+                        assert.equal(entry.rafObserved, 0)
                         if (inputMode === 'precise') {
                             assert.equal(entry.body.error.code, 'NATIVE_INPUT_UNAVAILABLE')
                             assert.equal(entry.body.actionExecuted, false)
@@ -2780,6 +3990,7 @@ try {
         try {
             await close()
             if (process.env.COORD_CLEANUP_FAILURE === name) {
+                // noinspection ExceptionCaughtLocallyJS — 将受控清理失败收集为测试结果
                 throw new Error('Controlled cleanup failure: ' + name)
             }
         } catch (error) {
@@ -2796,6 +4007,7 @@ try {
             const exited = once(chrome, 'exit')
             chrome.kill('SIGTERM')
             await Promise.race([exited, delay(3000)])
+            // noinspection PointlessBooleanExpressionJS — 等待期间进程可以退出
             if (chrome.exitCode === null && chrome.signalCode === null) {
                 chrome.kill('SIGKILL')
                 await exited

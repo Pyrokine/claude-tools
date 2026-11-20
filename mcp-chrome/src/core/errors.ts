@@ -8,7 +8,7 @@
  * - 参考《代码整洁之道》§7.4：给出异常发生的环境说明
  */
 
-import { sanitizePageUrls, sanitizeUrl } from '../tools/network-sanitizer.js'
+import { sanitizePageUrls, sanitizeUrl, sanitizeUrlsInText } from '../tools/network-sanitizer.js'
 import type { Target } from './types.js'
 
 /**
@@ -120,8 +120,8 @@ export function creationError(error: unknown, context: ErrorContext): Structured
     }
     const facts = { ...context, ...body.error.context }
     if (typeof facts.createdTargetId === 'string') {
-        facts.actionExecuted = body.error.context?.actionExecuted ?? true
-        facts.actionStatus = body.error.context?.actionStatus ?? 'partial'
+        facts.actionExecuted = true
+        facts.actionStatus = 'partial'
     }
     return new StructuredToolError(
         body.error.code === 'UNKNOWN_ERROR'
@@ -469,6 +469,11 @@ export function formatErrorResponse(error: unknown): {
                 message: errorMessage,
             },
         }
+
+    const errorBody = errorJson as { error?: { message?: string } }
+    if (typeof errorBody.error?.message === 'string') {
+        errorBody.error = { ...errorBody.error, message: sanitizeUrlsInText(errorBody.error.message) }
+    }
 
     // 定位上下文中的 visible/hidden 描述元素状态，不代表窗口焦点要求
     const context = (errorJson as { error?: { context?: ErrorContext } }).error?.context

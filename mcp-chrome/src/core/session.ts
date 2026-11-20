@@ -9,26 +9,17 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import {
-    BROWSER_EVENT_METHODS,
-    BrowserEventController,
-    eventRefTarget,
-    type BrowserEventAction,
-    type EventCommand,
-} from './browser-events.js'
-import { browserEventCommandSchema } from './browser-event-schema.js'
-import { installDomHelpers } from './dom-helpers.js'
-import type {
-    BrowserRequestContext,
-    FrameSelection,
-    SemanticTarget,
-    CookieScope,
-    UserActionKind,
-} from './browser-driver.js'
 import { BehaviorSimulator, getAntiDetectionScript } from '../anti-detection/index.js'
 import { BrowserLauncher, CDPClient, getBrowserWSEndpoint, getTargets } from '../cdp/index.js'
 import { assertScreenshotBase64Budget, assertScreenshotBudget } from '../tools/png.js'
 import { AutoWait } from './auto-wait.js'
+import type {
+    BrowserRequestContext,
+    CookieScope,
+    FrameSelection,
+    SemanticTarget,
+    UserActionKind,
+} from './browser-driver.js'
 import {
     type ActionableClickResult,
     type CookieFilter,
@@ -56,6 +47,15 @@ import {
     type SetCookieParams,
     type StaleContextRetryPolicy,
 } from './browser-driver.js'
+import { browserEventCommandSchema } from './browser-event-schema.js'
+import {
+    BROWSER_EVENT_METHODS,
+    type BrowserEventAction,
+    BrowserEventController,
+    type EventCommand,
+    eventRefTarget,
+} from './browser-events.js'
+import { installDomHelpers } from './dom-helpers.js'
 import {
     CDPError,
     creationError,
@@ -190,7 +190,15 @@ class SessionManager implements IBrowserDriver {
     private operationLock: Promise<void> = Promise.resolve()
     private consoleLogs: ConsoleLogEntry[] = []
     private networkRequests: NetworkRequestEntry[] = []
-    private targetLogs = new Map<string, { console: ConsoleLogEntry[]; network: NetworkRequestEntry[] }>()
+    private targetLogs = new Map<
+        string,
+        {
+            console: ConsoleLogEntry[]
+            network: NetworkRequestEntry[]
+            requests: SessionManager['requestMap']
+        }
+    >()
+
     private nextConsoleLogSequence = 0
     private nextNetworkRequestSequence = 0
     private challengeRequired = false
@@ -398,6 +406,7 @@ class SessionManager implements IBrowserDriver {
                 remaining()
                 const pageTarget = targets.find((t) => t.type === 'page')
                 if (!pageTarget) {
+                    // noinspection ExceptionCaughtLocallyJS -- 外层关闭本次创建的 client 与 launcher
                     throw new Error('未找到页面')
                 }
 
@@ -428,41 +437,49 @@ class SessionManager implements IBrowserDriver {
      * 连接到已运行的浏览器
      */
     async connect(options: ConnectOptions): Promise<TargetInfo> {
+        const { host = '127.0.0.1', port, timeout = DEFAULT_TIMEOUT, stealth = 'safe' } = options
+        const scope = this.requestContext?.()
+        const signal = scope?.signal
+        const deadline = Math.min(Date.now() + timeout, scope?.deadline ?? Infinity)
+        const remaining = () => {
+            signal?.throwIfAborted()
+            return remainingNavigationTimeout(deadline)
+        }
+        remaining()
         return this.withLock(async () => {
-            const { host = '127.0.0.1', port, timeout = DEFAULT_TIMEOUT, stealth = 'safe' } = options
-
-            // 关闭现有会话
-            this.resetState()
-
-            // 保存 stealth 模式
-            this.stealthMode = stealth
-
-            // 获取 WebSocket 端点
-            const endpoint = await getBrowserWSEndpoint(host, port)
-
-            // 连接 CDP
-            this.cdp = new CDPClient(() => this.requestContext?.())
-            await this.cdp.connect(endpoint, timeout)
-            this.connectedPort = port
-
-            // 获取第一个页面
-            const targets = await getTargets(host, port)
-            const pageTarget = targets.find((t) => t.type === 'page')
-
+            const endpoint = await getBrowserWSEndpoint(host, port, remaining(), signal)
+            const targets = await getTargets(host, port, remaining(), signal)
+            remaining()
+            const reused = this.cdp?.isConnected === true && this.cdp.endpoint === endpoint
+            const pageTarget =
+                (reused
+                    ? targets.find((target) => target.id === this.currentTargetId && target.type === 'page')
+                    : undefined) ?? targets.find((target) => target.type === 'page')
             if (!pageTarget) {
                 throw new Error('未找到页面')
             }
 
-            // 附加到页面
-            await this.attachToTargetInternal(pageTarget.id)
-
+            const stealthChanged = this.stealthMode !== stealth
+            if (!reused) {
+                this.resetState()
+                this.cdp = new CDPClient(() => this.requestContext?.())
+                await this.cdp.connect(endpoint, remaining())
+                this.connectedPort = port
+            }
+            this.stealthMode = stealth
+            if (reused && this.currentTargetId === pageTarget.id && this.sessionId && stealthChanged) {
+                await this.initSession(deadline)
+            } else {
+                await this.attachToTargetInternal(pageTarget.id, deadline)
+            }
+            remaining()
             return {
                 targetId: pageTarget.id,
                 type: pageTarget.type,
                 url: pageTarget.url,
                 title: pageTarget.title,
             }
-        })
+        }, deadline)
     }
 
     /**
@@ -700,6 +717,7 @@ class SessionManager implements IBrowserDriver {
         const frame = this.frameScopes.get(this.selectedFrame)
         return new Locator(this.cdp!, target, frame?.sessionId ?? this.sessionId!, {
             contextId: frame?.contextId,
+            frameId: frame?.frameId,
             localPoint: frame
                 ? async (timeout) => {
                       const deadline = Date.now() + timeout
@@ -888,45 +906,52 @@ class SessionManager implements IBrowserDriver {
         // 归一化换行：\r\n 和 \r 都视作单个 \n
         const normalized = text.replace(/\r\n?/g, '\n')
         for (const char of normalized) {
-            if (char === '\n') {
-                // Enter 键：char 通道不接受 \n，必须分发 keyDown + char('\r') + keyUp
-                const enterParams = {
-                    key: 'Enter',
-                    code: 'Enter',
-                    windowsVirtualKeyCode: 13,
-                    nativeVirtualKeyCode: 13,
-                    modifiers: this.modifiers,
-                }
-                const keyDownTimeout = remainingTimeout()
-                try {
-                    await this.send('Input.dispatchKeyEvent', { type: 'keyDown', ...enterParams }, keyDownTimeout)
+            const keyParams =
+                char === '\n'
+                    ? {
+                          key: 'Enter',
+                          code: 'Enter',
+                          windowsVirtualKeyCode: 13,
+                          nativeVirtualKeyCode: 13,
+                          modifiers: this.modifiers,
+                      }
+                    : { modifiers: this.modifiers, text: char }
+            const keyDownTimeout = remainingTimeout()
+            let failed = false
+            let failure: unknown
+            try {
+                await this.send('Input.dispatchKeyEvent', { type: 'keyDown', ...keyParams }, keyDownTimeout)
+                if (char === '\n') {
+                    // Enter 键：char 通道不接受 \n，必须分发 keyDown + char('\r') + keyUp
                     await this.send(
                         'Input.dispatchKeyEvent',
-                        { type: 'char', text: '\r', ...enterParams },
+                        { type: 'char', text: '\r', ...keyParams },
                         remainingTimeout()
                     )
-                } finally {
-                    await this.send(
-                        'Input.dispatchKeyEvent',
-                        { type: 'keyUp', ...enterParams },
-                        Math.max(1, deadline - Date.now())
-                    )
                 }
-            } else {
-                const keyDownTimeout = remainingTimeout()
+            } catch (error) {
+                failed = true
+                failure = error
+            } finally {
                 try {
                     await this.send(
                         'Input.dispatchKeyEvent',
-                        { type: 'keyDown', modifiers: this.modifiers, text: char },
-                        keyDownTimeout
+                        { type: 'keyUp', ...keyParams },
+                        Math.max(1, deadline - Date.now()),
+                        undefined,
+                        true
                     )
-                } finally {
-                    await this.send(
-                        'Input.dispatchKeyEvent',
-                        { type: 'keyUp', modifiers: this.modifiers, text: char },
-                        Math.max(1, deadline - Date.now())
-                    )
+                } catch (error) {
+                    if (failed) {
+                        console.warn('[MCP] Typing key release failed after input error:', error)
+                    } else {
+                        failed = true
+                        failure = error
+                    }
                 }
+            }
+            if (failed) {
+                throw failure
             }
             if (delay > 0) {
                 await new Promise((r) => setTimeout(r, Math.min(delay, remainingTimeout())))
@@ -1230,7 +1255,8 @@ class SessionManager implements IBrowserDriver {
                     ...(value !== undefined ? {value: value} : {}),
                     selector: selectorFor(el),
                     visible: visible,
-                    disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
+                    disabled: el.matches(':disabled') || Boolean(el.disabled) ||
+                        el.getAttribute('aria-disabled') === 'true',
                     bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
                     covered: Boolean(visible && top && top !== el && !el.contains(top)),
                     frameId: 0
@@ -1239,10 +1265,15 @@ class SessionManager implements IBrowserDriver {
         }`
         if (target && 'x' in target && 'y' in target) {
             const elements = await this.evaluate<InteractiveElementInfo[] | null>(
-                `(() => {
-                    const root = globalThis.__mcpDomHelpers.deepElementFromPoint(${JSON.stringify(target.x)}, ${JSON.stringify(target.y)});
-                    return root ? (${script}).call(root) : null;
-                })()`,
+                '(() => {\n                    const root = ' +
+                    'globalThis.__mcpDomHelpers.deepElementFromPoin' +
+                    't(' +
+                    `${JSON.stringify(target.x)}` +
+                    ', ' +
+                    `${JSON.stringify(target.y)}` +
+                    ');\n                    return root ? (' +
+                    `${script}` +
+                    ').call(root) : null;\n                })()',
                 undefined,
                 timeout
             )
@@ -1906,28 +1937,41 @@ class SessionManager implements IBrowserDriver {
                         {
                             contextId: owner.contextId,
                             returnByValue: false,
-                            expression: `(() => {
-                            const walk=document.createTreeWalker(document,NodeFilter.SHOW_ELEMENT);
-                            for(let el=walk.nextNode();el;el=walk.nextNode()) {
-                                const r=el.getBoundingClientRect();
-                                if (!(r.width>0 && r.height>0) || el.getClientRects().length!==1) continue;
-                                let aligned=true;
-                                for(let p=el;p;p=p.parentElement) {
-                                    const s=getComputedStyle(p),m=new DOMMatrix(s.transform==='none'?undefined:s.transform);
-                                    if(!m.is2D || Math.abs(m.b)>1e-12 || Math.abs(m.c)>1e-12 || m.a<=0 || m.d<=0 ||
-                                        (s.rotate&&s.rotate!=='none'&&!/^(?:[xyz] )?0deg$/.test(s.rotate)) ||
-                                        (s.scale&&s.scale!=='none'&&s.scale.split(/\\s+/).some(value=>Number(value)<=0))) {aligned=false;break}
-                                }
-                                if(aligned)return el;
-                            }
-                            return null;
-                        })()`,
+                            expression:
+                                '(() => {\n                            const ' +
+                                'walk=document.createTreeWalker(document,' +
+                                'NodeFilter.SHOW_ELEMENT);\n                    ' +
+                                '        for(let el=walk.nextNode();el;' +
+                                'el=walk.nextNode()) {\n                        ' +
+                                '        const r=el.getBoundingClientRect();\n  ' +
+                                '                              if (!(r.width>0 ' +
+                                '&& r.height>0) || el.getClientRects().length!=' +
+                                '=1) continue;\n                                ' +
+                                'let aligned=true;\n                            ' +
+                                '    for(let p=el;p;p=p.parentElement) {\n      ' +
+                                '                              const ' +
+                                's=getComputedStyle(p),m=new ' +
+                                "DOMMatrix(s.transform==='none'?undefined:s.tra" +
+                                'nsform);\n                                    ' +
+                                'if(!m.is2D || Math.abs(m.b)>1e-12 || ' +
+                                'Math.abs(m.c)>1e-12 || m.a<=0 || m.d<=0 ||\n   ' +
+                                '                                     ' +
+                                "(s.rotate&&s.rotate!=='none'&&!/^(?:[xyz] " +
+                                ')?0deg$/.test(s.rotate)) ||\n                  ' +
+                                "                      (s.scale&&s.scale!=='non" +
+                                "e'&&s.scale.split(/\\s+/).some(value=>" +
+                                'Number(value)<=0))) {aligned=false;break}\n    ' +
+                                '                            }\n                ' +
+                                '                if(aligned)return el;\n        ' +
+                                '                    }\n                        ' +
+                                '    return null;\n                        })()',
                         },
                         owner.sessionId,
                         remaining()
                     )
                     const objectId = anchor.result.objectId
                     if (!objectId) {
+                        // noinspection ExceptionCaughtLocallyJS -- 外层统一返回 frame 几何错误
                         throw new Error('Frame zoom viewport anchor is unavailable')
                     }
                     try {
@@ -1940,7 +1984,9 @@ class SessionManager implements IBrowserDriver {
                             {
                                 objectId,
                                 functionDeclaration:
-                                    'function(){const r=this.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height}}',
+                                    'function(){const r=this.getBoundingClientRect();' +
+                                    'return {x:r.x,y:r.y,width:r.width,' +
+                                    'height:r.height}}',
                                 returnByValue: true,
                             },
                             owner.sessionId,
@@ -1955,6 +2001,7 @@ class SessionManager implements IBrowserDriver {
                             remaining()
                         )
                         if (!(r.width > 0 && r.height > 0) || q.length !== 8 || !q.every(Number.isFinite)) {
+                            // noinspection ExceptionCaughtLocallyJS -- 统一返回几何错误并释放临时对象
                             throw new Error('Frame zoom viewport anchor is invalid')
                         }
                         const [a, b, c, d] = [
@@ -1969,6 +2016,7 @@ class SessionManager implements IBrowserDriver {
                             Math.abs(q[4] - q[2] - q[6] + q[0]) > 0.001 ||
                             Math.abs(q[5] - q[3] - q[7] + q[1]) > 0.001
                         ) {
+                            // noinspection ExceptionCaughtLocallyJS -- 统一返回几何错误并释放临时对象
                             throw new Error('Frame zoom viewport anchor is singular or non-affine')
                         }
                         const dx = mapped.x - q[0],
@@ -1985,6 +2033,7 @@ class SessionManager implements IBrowserDriver {
                         (c) => c.id === owner.contextId && c.frameId === owner.frameId
                     )
                 ) {
+                    // noinspection ExceptionCaughtLocallyJS -- 外层统一返回 frame 身份变化的几何错误
                     throw new Error('Frame document identity changed before input')
                 }
                 const { node } = await this.cdp!.send<{ node: { frameId?: string } }>(
@@ -1994,6 +2043,7 @@ class SessionManager implements IBrowserDriver {
                     remaining()
                 )
                 if (node.frameId !== owner.frameId) {
+                    // noinspection ExceptionCaughtLocallyJS -- 外层统一返回 frame 身份变化的几何错误
                     throw new Error('Frame owner identity changed before input')
                 }
                 const { model } = await this.cdp!.send<{ model: { content: number[] } }>(
@@ -2023,6 +2073,7 @@ class SessionManager implements IBrowserDriver {
                     q.length !== 8 ||
                     !q.every(Number.isFinite)
                 ) {
+                    // noinspection ExceptionCaughtLocallyJS -- 外层统一返回 frame 几何错误
                     throw new Error('Frame content quad or viewport is unavailable')
                 }
                 const [a, b, c, d, e, f] = [
@@ -2038,6 +2089,7 @@ class SessionManager implements IBrowserDriver {
                     Math.abs(q[4] - q[2] - q[6] + q[0]) > 0.001 ||
                     Math.abs(q[5] - q[3] - q[7] + q[1]) > 0.001
                 ) {
+                    // noinspection ExceptionCaughtLocallyJS -- 外层统一返回 frame 几何错误
                     throw new Error('Frame content quad is singular or non-affine')
                 }
                 mapped = { x: a * mapped.x + c * mapped.y + e, y: b * mapped.x + d * mapped.y + f }
@@ -2310,13 +2362,22 @@ class SessionManager implements IBrowserDriver {
     ): Promise<void> {
         this.ensureSession()
         const contextId = await this.cookieContext(scope)
-        const target = scope?.targetId ?? this.currentTargetId!
+        let target = scope?.targetId ?? this.currentTargetId!
         const { targetInfo } = await this.sendBrowserCommand<{ targetInfo: { browserContextId?: string } }>(
             'Target.getTargetInfo',
             { targetId: target }
         )
         if (scope?.browserContextId !== undefined && contextId !== targetInfo.browserContextId) {
-            throw new DriverCapabilityError('Cookie deletion requires a target in the selected browser context')
+            const { targetInfos } = await this.sendBrowserCommand<{
+                targetInfos: Array<{ targetId: string; browserContextId?: string; type: string }>
+            }>('Target.getTargets')
+            const selected = targetInfos.find(
+                (candidate) => candidate.type === 'page' && candidate.browserContextId === contextId
+            )
+            if (!selected) {
+                throw new DriverCapabilityError('Cookie deletion requires a target in the selected browser context')
+            }
+            target = selected.targetId
         }
         const cdp = this.cdp!
         let sid = this.targetSessions.get(target)
@@ -2372,7 +2433,12 @@ class SessionManager implements IBrowserDriver {
             throw new Error('clearCookies requires url or domain')
         }
         this.ensureSession()
-        const scope = { ...filter, targetId: filter.targetId ?? this.currentTargetId! }
+        const scope = {
+            ...filter,
+            ...(filter.targetId === undefined && filter.browserContextId === undefined
+                ? { targetId: this.currentTargetId! }
+                : {}),
+        }
         const cookies = await this.getCookies(scope)
         if (
             cookies.some((cookie) => 'partitionKeyOpaque' in cookie && !(cookie as Cookie & CookieScope).partitionKey)
@@ -2443,12 +2509,14 @@ class SessionManager implements IBrowserDriver {
                     )
                 } catch (error) {
                     if (!acknowledged) {
+                        // noinspection ExceptionCaughtLocallyJS -- 外层按 delete 阶段保留实际清除进度
                         throw error
                     }
                     cleanupFailure = { error }
                 }
                 phase = 'verification'
                 if ((await this.getCookies(identityFilter)).some(matches)) {
+                    // noinspection ExceptionCaughtLocallyJS -- 外层按 verification 阶段记录仍存在的 Cookie
                     throw new StructuredToolError(
                         'COOKIE_STILL_PRESENT',
                         '浏览器确认请求后仍存在相同身份的 Cookie',
@@ -2459,6 +2527,7 @@ class SessionManager implements IBrowserDriver {
                 ++progress.count
                 if (cleanupFailure) {
                     phase = 'cleanup'
+                    // noinspection ExceptionCaughtLocallyJS -- 外层同时保留已完成清除与清理失败
                     throw cleanupFailure.error
                 }
             } catch (error) {
@@ -2838,7 +2907,13 @@ class SessionManager implements IBrowserDriver {
      * 多步操作（type 循环、fullPage 截图等）的 await 间隙可能被 close() 打断，
      * ensureSession() 确保在当前 tick 内 this.cdp 非空
      */
-    async send<T>(method: string, params?: object, timeout?: number, dispatchedAction?: UserActionKind): Promise<T> {
+    async send<T>(
+        method: string,
+        params?: object,
+        timeout?: number,
+        dispatchedAction?: UserActionKind,
+        cleanup = false
+    ): Promise<T> {
         const deadline = timeout === undefined ? undefined : Date.now() + timeout
         this.ensureSession()
         const mutation =
@@ -2881,7 +2956,7 @@ class SessionManager implements IBrowserDriver {
         const sessionId = scoped ? frame.sessionId : this.sessionId!
         const nativeParams =
             scoped && method === 'Runtime.evaluate' ? { ...params, contextId: frame.contextId } : params
-        const operation = this.cdp!.send<T>(method, nativeParams, sessionId, remaining, false, dispatchedAction)
+        const operation = this.cdp!.send<T>(method, nativeParams, sessionId, remaining, cleanup, dispatchedAction)
         return blocking
             ? this.ensureEventController(this.currentTargetId!, this.sessionId!)
                   .race(operation)
@@ -2926,6 +3001,7 @@ class SessionManager implements IBrowserDriver {
             )
             objectId = object.objectId
             if (!objectId) {
+                // noinspection ExceptionCaughtLocallyJS -- 外层统一返回 frame 几何错误
                 throw new Error('Frame owner object is unavailable')
             }
             const { result, exceptionDetails } = await this.cdp!.send<{
@@ -2943,6 +3019,7 @@ class SessionManager implements IBrowserDriver {
                 !Number.isFinite(result.value) ||
                 result.value <= 0
             ) {
+                // noinspection ExceptionCaughtLocallyJS -- 统一返回几何错误，finally 释放临时对象
                 throw new Error('Frame owner CSS zoom is unavailable')
             }
             return result.value
@@ -3366,6 +3443,7 @@ class SessionManager implements IBrowserDriver {
         const logs = this.targetLogs.get(targetId)
         this.consoleLogs = logs?.console ?? []
         this.networkRequests = logs?.network ?? []
+        this.requestMap = logs?.requests ?? new Map()
 
         // 初始化会话
         await this.initSession(deadline)
@@ -3414,11 +3492,15 @@ class SessionManager implements IBrowserDriver {
 
     private clearAttachedTargetState(): void {
         if (this.currentTargetId) {
-            this.targetLogs.set(this.currentTargetId, { console: this.consoleLogs, network: this.networkRequests })
+            this.targetLogs.set(this.currentTargetId, {
+                console: this.consoleLogs,
+                network: this.networkRequests,
+                requests: this.requestMap,
+            })
         }
         this.consoleLogs = []
         this.networkRequests = []
-        this.requestMap.clear()
+        this.requestMap = new Map()
         this.challengeRequired = false
         this.runtimeEnabled = false
         this.mainFrameId = null
@@ -3428,6 +3510,14 @@ class SessionManager implements IBrowserDriver {
         this.selectedFrame = 0
         this.currentTargetId = null
         this.state = null
+    }
+
+    private networkState(eventSessionId: string | undefined) {
+        if (this.isCurrentSessionEvent(eventSessionId)) {
+            return { network: this.networkRequests, requests: this.requestMap }
+        }
+        const targetId = [...this.targetSessions].find(([, sid]) => sid === eventSessionId)?.[0]
+        return targetId ? this.targetLogs.get(targetId) : undefined
     }
 
     private isCurrentSessionEvent(eventSessionId: string | undefined): boolean {
@@ -3712,6 +3802,7 @@ class SessionManager implements IBrowserDriver {
                 if (this.currentTargetId === targetId) {
                     this.clearAttachedTargetState()
                 }
+                this.targetLogs.delete(targetId)
                 if (controller) {
                     void controller
                         .dispose('native target detached')
@@ -3802,7 +3893,8 @@ class SessionManager implements IBrowserDriver {
 
         // 网络请求
         this.cdp!.onEvent('Network.requestWillBeSent', (params: unknown, eventSessionId?: string) => {
-            if (!this.isCurrentSessionEvent(eventSessionId)) {
+            const state = this.networkState(eventSessionId)
+            if (!state) {
                 return
             }
             const p = params as {
@@ -3814,7 +3906,7 @@ class SessionManager implements IBrowserDriver {
                 frameId?: string
                 loaderId?: string
             }
-            this.requestMap.set(p.requestId, {
+            state.requests.set(p.requestId, {
                 url: p.request.url,
                 method: p.request.method,
                 type: p.type,
@@ -3826,7 +3918,8 @@ class SessionManager implements IBrowserDriver {
         })
 
         this.cdp!.onEvent('Network.responseReceived', (params: unknown, eventSessionId?: string) => {
-            if (!this.isCurrentSessionEvent(eventSessionId)) {
+            const state = this.networkState(eventSessionId)
+            if (!state) {
                 return
             }
             const p = params as {
@@ -3834,10 +3927,14 @@ class SessionManager implements IBrowserDriver {
                 response: { status: number; headers?: Record<string, unknown> }
                 timestamp: number
             }
-            const request = this.requestMap.get(p.requestId)
+            const request = state.requests.get(p.requestId)
             if (request) {
                 const challenge = isCloudflareChallenge(p.response.headers)
-                if (request.type.toLowerCase() === 'document' && request.frameId === this.mainFrameId) {
+                if (
+                    this.isCurrentSessionEvent(eventSessionId) &&
+                    request.type.toLowerCase() === 'document' &&
+                    request.frameId === this.mainFrameId
+                ) {
                     // 仅新的主文档响应可以解除已知 Challenge，清空日志不能解除该状态
                     this.challengeRequired = challenge
                 }
@@ -3848,27 +3945,28 @@ class SessionManager implements IBrowserDriver {
 
         // 网络请求失败时写入日志再清理 requestMap，防止 diagnostics 丢失失败请求
         const finalizeRequest = (params: unknown, eventSessionId?: string) => {
-            if (!this.isCurrentSessionEvent(eventSessionId)) {
+            const state = this.networkState(eventSessionId)
+            if (!state) {
                 return
             }
             const p = params as { requestId: string; timestamp: number; errorText?: string; type?: string }
-            const request = this.requestMap.get(p.requestId)
+            const request = state.requests.get(p.requestId)
             if (request) {
                 const { _monotonic, ...requestData } = request
                 delete requestData.frameId
                 delete requestData.loaderId
-                this.networkRequests.push({
+                state.network.push({
                     sequence: ++this.nextNetworkRequestSequence,
                     ...requestData,
                     type: p.type ?? requestData.type,
                     errorText: p.errorText,
                     duration: Math.round((p.timestamp - _monotonic) * 1000),
                 })
-                if (this.networkRequests.length > SessionManager.MAX_LOG_ENTRIES) {
-                    this.networkRequests.splice(0, this.networkRequests.length - 800)
+                if (state.network.length > SessionManager.MAX_LOG_ENTRIES) {
+                    state.network.splice(0, state.network.length - 800)
                 }
             }
-            this.requestMap.delete(p.requestId)
+            state.requests.delete(p.requestId)
         }
         this.cdp!.onEvent('Network.loadingFinished', finalizeRequest)
         this.cdp!.onEvent('Network.loadingFailed', finalizeRequest)

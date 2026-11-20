@@ -1,3 +1,5 @@
+import { ExpectedOperationError } from '../types/expected-errors'
+
 const MAX_DIMENSION = 16384
 const MAX_PIXELS = 12_000_000
 const MAX_ESTIMATED_BYTES = 48 * 1024 * 1024
@@ -16,12 +18,37 @@ export function assertScreenshotBudget(width: number, height: number, scale = 1)
         w * h > MAX_PIXELS ||
         w * h * 4 > MAX_ESTIMATED_BYTES
     ) {
-        throw new Error(`screenshot 尺寸 ${w}x${h} 超出预算，请用 clip 或 scale 缩小截图`)
+        throw new ExpectedOperationError(
+            JSON.stringify({
+                error: {
+                    code: 'SCREENSHOT_BUDGET_EXCEEDED',
+                    message: `screenshot 尺寸 ${w}x${h} 超出预算，请用 clip 或 scale 缩小截图`,
+                    context: {
+                        width: w,
+                        height: h,
+                        maxDimension: MAX_DIMENSION,
+                        maxPixels: MAX_PIXELS,
+                        maxEstimatedBytes: MAX_ESTIMATED_BYTES,
+                        actionExecuted: false,
+                        actionStatus: 'not_started',
+                    },
+                },
+            }),
+            false
+        )
     }
 }
 
 export function assertScreenshotBase64Budget(data: string): void {
     if (Math.floor((data.length * 3) / 4) > MAX_ENCODED_BYTES) {
-        throw new Error(`screenshot 数据超过 ${MAX_ENCODED_BYTES} 字节，请用 clip 或 scale 缩小截图`)
+        throw new ExpectedOperationError(
+            JSON.stringify({
+                error: {
+                    code: 'SCREENSHOT_BUDGET_EXCEEDED',
+                    message: `screenshot 数据超过 ${MAX_ENCODED_BYTES} 字节，请用 clip 或 scale 缩小截图`,
+                    context: { maxEncodedBytes: MAX_ENCODED_BYTES, failureStage: 'output' },
+                },
+            })
+        )
     }
 }

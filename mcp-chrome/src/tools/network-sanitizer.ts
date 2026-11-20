@@ -4,6 +4,10 @@ const REDACTED_VALUE = '[REDACTED]'
 const SENSITIVE_QUERY_PARAMETER =
     /^(?:access[_-]?token|api[_-]?key|apikey|auth|authorization|code|credential|id[_-]?token|key|password|passwd|proxy[_-]?authorization|refresh[_-]?token|secret|sig|signature|ticket|token|x-amz-credential|x-amz-security-token|x-amz-signature|x-goog-credential|x-goog-signature)$/i
 
+export function sanitizeUrlsInText(text: string): string {
+    return text.replace(/\bhttps?:\/\/[^\s<>"'`]+/gi, (url) => sanitizeUrl(url).url)
+}
+
 export interface SanitizedUrl {
     url: string
     urlRedacted?: true
@@ -60,17 +64,23 @@ export function sanitizeUrl(rawUrl: string): SanitizedUrl {
 export function sanitizeUrlRecord<T extends { url?: string; urlRedacted?: true }>(
     record: T
 ): T & Omit<SanitizedUrl, 'url'> {
-    if (typeof record.url !== 'string' || record.urlRedacted) {
-        return record
+    let result = record
+    if (typeof record.url === 'string' && !record.urlRedacted) {
+        const sanitized = sanitizeUrl(record.url)
+        if (sanitized.urlRedacted) {
+            result = { ...record, ...sanitized }
+        }
     }
-    const sanitized = sanitizeUrl(record.url)
-    if (!sanitized.urlRedacted) {
-        return record
+    for (const field of ['text', 'errorText']) {
+        const value = (result as Record<string, unknown>)[field]
+        if (typeof value === 'string') {
+            const text = sanitizeUrlsInText(value)
+            if (text !== value) {
+                result = { ...result, [field]: text }
+            }
+        }
     }
-    return {
-        ...record,
-        ...sanitized,
-    }
+    return result
 }
 
 export function sanitizeUrlRecords<T extends { url?: string }>(records: T[]): Array<T & Omit<SanitizedUrl, 'url'>> {
@@ -96,6 +106,11 @@ export function sanitizePageUrls<T>(value: T): T {
                 result[`${field}OriginalLength`] = sanitized.urlOriginalLength
                 result[`${field}RedactedQueryParameters`] = sanitized.redactedQueryParameters
             }
+        }
+    }
+    for (const field of ['message', 'error', 'errorMessage', 'originalOutputError', 'diagnosticsError']) {
+        if (typeof result[field] === 'string') {
+            result[field] = sanitizeUrlsInText(result[field])
         }
     }
     // 只遍历页面与窗口响应字段，保留正文、元标签和用户脚本结果

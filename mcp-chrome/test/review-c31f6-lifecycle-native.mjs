@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
+import { AsyncLocalStorage, createHook } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
-import { once } from 'node:events'
+import { getEventListeners, once } from 'node:events'
 import fs from 'node:fs'
 import { createServer } from 'node:http'
 import os from 'node:os'
@@ -30,15 +31,31 @@ const result = {
     replies: [],
     records: [],
     boundary:
-        'Actual SDK Client/McpServer tools/call, production queue, scope, Session and WebSocket CDPClient, isolated headless Chrome and localhost DOM. Named ACK/deadline and cleanup-failure probes are explicit; all other cases use real time.',
+        'Actual SDK Client/McpServer tools/call, ' +
+        'production queue, scope, Session and WebSocket ' +
+        'CDPClient, isolated headless Chrome and localhost ' +
+        'DOM. Named ACK/deadline and cleanup-failure ' +
+        'probes are explicit; all other cases use real ' +
+        'time.',
 }
-const http = createServer((_request, response) => {
-    response.setHeader('Content-Type', 'text/html')
-    response.end(
-        '<!doctype html><title>Lifecycle regression</title><body><input id="ready" value="ready"><script>globalThis.events=[]; globalThis.held=new Set(); for(const type of ["keydown","keyup"])addEventListener(type,e=>{events.push({type:e.type,key:e.key,trusted:e.isTrusted});if(e.type==="keydown")held.add(e.key);else held.delete(e.key)})</script></body>'
-    )
-})
-await new Promise((resolve) => http.listen(0, '127.0.0.1', resolve))
+const http = createServer(
+    (
+        /** @type {import('node:http').IncomingMessage} */ _request,
+        /** @type {import('node:http').ServerResponse} */ response
+    ) => {
+        response.setHeader('Content-Type', 'text/html')
+        response.end(
+            '<!doctype html><title>Lifecycle regression</title>' +
+                '<body><input id="ready" value="ready"><script>' +
+                'globalThis.events=[]; globalThis.held=new Set(); ' +
+                'for(const type of ["keydown","keyup"]) {' +
+                'addEventListener(type,e=>{events.push({type:e.type,key:e.key,trusted:e.isTrusted});' +
+                'if(e.type==="keydown"){held.add(e.key)}else{held.delete(e.key)}})}</script>' +
+                '</body>'
+        )
+    }
+)
+await new Promise((resolve) => http.listen(0, '127.0.0.1', () => resolve(undefined)))
 const url = `http://127.0.0.1:${http.address().port}/`
 const chrome = spawn(
     chromePath,
@@ -62,6 +79,20 @@ const log = fs.createWriteStream(path.join(work, 'chrome.log'), { mode: 0o600 })
 chrome.stderr.pipe(log)
 const unified = getUnifiedSession()
 const session = getSession()
+const requestObservations = new AsyncLocalStorage()
+const timerOwners = new Map()
+const timerHook = createHook({
+    init(id, type) {
+        const record = requestObservations.getStore()
+        if (type === 'Timeout' && record) {
+            ++record.timersCreated
+            timerOwners.set(id, record)
+        }
+    },
+    destroy(id) {
+        timerOwners.delete(id)
+    },
+}).enable()
 let client
 let server
 let observer
@@ -135,6 +166,26 @@ async function check(name, run) {
             entry.status = 'FAIL'
             entry.settlementError = String(error)
         })
+        await new Promise(setImmediate)
+        await new Promise(setImmediate)
+        entry.requestResources = result.records.slice(firstRecord).map((record) => ({
+            requestId: record.requestId,
+            timersCreated: record.timersCreated,
+            timersRemaining: [...timerOwners.values()].filter((owner) => owner === record).length,
+            abortListeners: getEventListeners(record.signal, 'abort').length,
+        }))
+        if (/^input\/(cancel-|cleanup-)/.test(name)) {
+            try {
+                assert.ok(entry.requestResources.some((resource) => resource.timersCreated > 0))
+                for (const resource of entry.requestResources) {
+                    assert.equal(resource.timersRemaining, 0, JSON.stringify(resource))
+                    assert.equal(resource.abortListeners, 0, JSON.stringify(resource))
+                }
+            } catch (error) {
+                entry.status = 'FAIL'
+                entry.resourceError = String(error)
+            }
+        }
         entry.elapsedMs = performance.now() - entry.started
         entry.records = result.records.slice(firstRecord)
         entry.commandCount = result.commands.length - firstCommand
@@ -232,7 +283,9 @@ try {
     let port
     await until(() => {
         try {
-            port = Number(fs.readFileSync(path.join(work, 'profile/DevToolsActivePort'), 'utf8').split('\n')[0])
+            port = Number(
+                fs.readFileSync(path.join(work, 'profile/DevToolsActivePort'), { encoding: 'utf8' }).split('\n')[0]
+            )
             return port > 0
         } catch {
             return false
@@ -260,22 +313,23 @@ try {
                 started: performance.now(),
                 deadline: realNow() + (args.timeout ?? 30000),
                 signal: extra.signal,
+                timersCreated: 0,
             }
-            extra.signal.addEventListener(
-                'abort',
-                () => {
-                    record.aborted = performance.now()
-                },
-                { once: true }
-            )
+            const aborted = () => {
+                record.aborted = performance.now()
+            }
+            extra.signal.addEventListener('abort', aborted, { once: true })
             result.records.push(record)
-            try {
-                const response = await handler(args, extra)
-                record.internalReply = payload(response)
-                return response
-            } finally {
-                record.finished = performance.now()
-            }
+            return requestObservations.run(record, async () => {
+                try {
+                    const response = await handler(args, extra)
+                    record.internalReply = payload(response)
+                    return response
+                } finally {
+                    record.finished = performance.now()
+                    extra.signal.removeEventListener('abort', aborted)
+                }
+            })
         })
     registerEvaluateTool(server)
     registerInputTool(server)
@@ -337,13 +391,25 @@ try {
         for (const variant of ['terminate', 'timeout', 'page']) {
             const pageError = variant === 'page'
             await check(
-                `${operation}/${pageError ? 'page' : 'native'}-execution-${variant === 'timeout' ? 'timeout' : 'terminated'}`,
+                '' +
+                    `${operation}` +
+                    '/' +
+                    `${pageError ? 'page' : 'native'}` +
+                    '-execution-' +
+                    `${variant === 'timeout' ? 'timeout' : 'terminated'}` +
+                    '',
                 async (entry) => {
                     entry.boundary = pageError
                         ? 'Actual page Error with the same text as native execution termination'
                         : variant === 'timeout'
-                          ? 'Actual Chrome execution timeout: validation function/args use native Runtime.evaluate timeout=1; the original production local deadline and callback remain'
-                          : 'Actual Chrome Runtime.terminateExecution is issued by the independent observer only after the validation console marker proves script execution began'
+                          ? 'Actual Chrome execution timeout: validation ' +
+                            'function/args use native Runtime.evaluate ' +
+                            'timeout=1; the original production local deadline ' +
+                            'and callback remain'
+                          : 'Actual Chrome Runtime.terminateExecution is ' +
+                            'issued by the independent observer only after the ' +
+                            'validation console marker proves script execution ' +
+                            'began'
                     const first = result.commands.length
                     const countBefore = await read('globalThis.actionCount||0')
                     const marker = 'C31F6_NATIVE_TERMINATE_' + operation
@@ -374,8 +440,14 @@ try {
                             ) {
                                 const params = command.params
                                 command.method = 'Runtime.evaluate'
+                                // noinspection JSAnnotator -- arguments is a CDP record field, not Function.arguments
                                 command.params = {
-                                    expression: `(${params.functionDeclaration})(${params.arguments.map((arg) => JSON.stringify(arg.value)).join(',')})`,
+                                    expression:
+                                        '(' +
+                                        `${params.functionDeclaration}` +
+                                        ')(' +
+                                        `${params.arguments.map((arg) => JSON.stringify(arg.value)).join(',')}` +
+                                        ')',
                                     returnByValue: true,
                                     awaitPromise: true,
                                     timeout: 1,
@@ -478,7 +550,10 @@ try {
         const start = result.commands.length
         entry.body = payload(
             await call('evaluate', {
-                script: 'globalThis.pageFailureCount=(globalThis.pageFailureCount||0)+1;throw new Error("Request timeout in execution context")',
+                script:
+                    'globalThis.pageFailureCount=(globalThis.pageFailur' +
+                    'eCount||0)+1;throw new Error("Request timeout in ' +
+                    'execution context")',
             })
         )
         assert.equal(entry.body.actionExecuted, true)
@@ -653,7 +728,10 @@ try {
                     )
                     assert.deepEqual(entry.dom.held, existing ? ['Control'] : [])
                     assert.deepEqual([...unified.pressedKeys], existing ? ['Control'] : [])
-                    assert.ok(entry.clientOutcome.cancelled, 'SDK cancels the waiting client')
+                    assert.ok(
+                        'cancelled' in entry.clientOutcome && entry.clientOutcome.cancelled,
+                        'SDK cancels the waiting client'
+                    )
                     assert.ok(
                         !result.businessResponses.some((reply) => reply.id === record.requestId),
                         'SDK suppresses the cancelled business reply'
@@ -722,8 +800,11 @@ try {
         await check(`input/cleanup-${failure}`, async (entry) => {
             entry.boundary =
                 failure === 'protocol'
-                    ? 'Cleanup keyup is explicitly rewritten to an invalid command and Chrome returns a native protocol failure'
-                    : 'Real Chrome keyup ACK is explicitly withheld; all keys share the production 1000 ms cleanup deadline'
+                    ? 'Cleanup keyup is explicitly rewritten to an ' +
+                      'invalid command and Chrome returns a native ' +
+                      'protocol failure'
+                    : 'Real Chrome keyup ACK is explicitly withheld; all ' +
+                      'keys share the production 1000 ms cleanup deadline'
             const start = result.commands.length
             const keys = failure === 'protocol' ? ['Shift'] : ['Shift', 'Alt', 'Meta']
             const controller = new AbortController()
@@ -782,7 +863,7 @@ try {
             entry.internalReply = record.internalReply
             entry.dom = await read('({held:[...held],events})')
             assert.equal(entry.following.success, true)
-            assert.ok(entry.clientOutcome.cancelled)
+            assert.ok('cancelled' in entry.clientOutcome && entry.clientOutcome.cancelled)
             assert.equal(entry.internalReply.actionExecuted, true)
             assert.equal(entry.internalReply.actionStatus, 'completed')
             assert.equal(entry.internalReply.retryable, false)
@@ -802,7 +883,7 @@ try {
                 assert.equal(
                     new Set(entry.cleanupCommands.map((command) => command.requestDeadline)).size,
                     1,
-                    'All keyups share one absolute cleanup deadline'
+                    'All key releases share one absolute cleanup deadline'
                 )
                 for (const command of entry.cleanupCommands) {
                     assert.ok(command.wall < command.requestDeadline, 'Expired cleanup does not start another keyup')
@@ -868,7 +949,9 @@ try {
         for (const ending of ['deadline', 'cancel']) {
             await check(`input/matched-ACK-then-pageContext-${ending}-${framed ? 'frame' : 'main'}`, async (entry) => {
                 entry.boundary =
-                    'Actual SDK and two isolated owned Chrome pages; only the metadata response after matched verification and target restoration is withheld'
+                    'Actual SDK and two isolated owned Chrome pages; ' +
+                    'only the metadata response after matched ' +
+                    'verification and target restoration is withheld'
                 const defaultTarget = session.currentTargetId
                 const targetId = (await observer.send('Target.createTarget', { url, background: true })).targetId
                 const targetSession = (await observer.send('Target.attachToTarget', { targetId, flatten: true }))
@@ -876,7 +959,13 @@ try {
                 await until(async () => await read('document.readyState === "complete"', targetSession))
                 if (framed) {
                     await read(
-                        `new Promise(resolve => { const frame = document.createElement('iframe'); frame.id='late-frame'; frame.src=${JSON.stringify(url)}; frame.onload=() => { frame.contentDocument.querySelector('input').focus(); resolve(true) }; document.body.append(frame) })`,
+                        'new Promise(resolve => { const frame = ' +
+                            "document.createElement('iframe'); " +
+                            "frame.id='late-frame'; frame.src=" +
+                            `${JSON.stringify(url)}` +
+                            '; frame.onload=() => { frame.contentDocument.q' +
+                            "uerySelector('input').focus(); resolve(true) " +
+                            '}; document.body.append(frame) })',
                         targetSession
                     )
                 }
@@ -937,11 +1026,12 @@ try {
                     await until(() => record.finished !== undefined)
                     entry.afterMetadataMs = record.finished - entry.metadataHeldAt
                     if (ending === 'deadline') {
+                        assert.ok('response' in entry.clientOutcome)
                         entry.body = payload(entry.clientOutcome.response)
                         completed(entry.body, 'matched')
                         assert.equal(typeof entry.body.pageContext.contextError, 'string')
                     } else {
-                        assert.ok(entry.clientOutcome.cancelled)
+                        assert.ok('cancelled' in entry.clientOutcome && entry.clientOutcome.cancelled)
                         assert.ok(!result.businessResponses.some((reply) => reply.id === record.requestId))
                     }
                     const keys = result.commands
@@ -965,7 +1055,9 @@ try {
                     assert.equal(session.getCurrentFrameId(), 0, 'Late release keeps the restored frame selection')
                     entry.inputPage = await read(
                         framed
-                            ? '(() => { const frame = document.querySelector("#late-frame").contentWindow; return {held:[...frame.held],events:frame.events} })()'
+                            ? '(() => { const frame = document.querySelector("#la' +
+                                  'te-frame").contentWindow; return ' +
+                                  '{held:[...frame.held],events:frame.events} })()'
                             : '({held:[...held],events})',
                         targetSession
                     )
@@ -1037,6 +1129,7 @@ try {
     await exited
     http.closeAllConnections()
     await new Promise((resolve) => http.close(resolve))
+    timerHook.disable()
     result.resources = {
         chromeExited: chrome.exitCode !== null || chrome.signalCode !== null,
         observerCallbacks: observer?.callbacks.size,

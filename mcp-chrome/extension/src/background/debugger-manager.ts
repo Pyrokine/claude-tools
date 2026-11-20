@@ -1,6 +1,6 @@
 import { ExpectedOperationError } from '../types/expected-errors.js'
+import { type ActionContext, assertActionActive } from './action-utils.js'
 import type { LogManager } from './log-manager.js'
-import { assertActionActive, type ActionContext } from './action-utils.js'
 
 interface KeyboardFocusLease {
     id: string
@@ -70,7 +70,8 @@ export class DebuggerManager {
     >()
 
     private pendingAttach = new Map<number, Promise<void>>()
-    private frameSessions = new Map<number, Map<string, string>>()
+    /** 子会话记录父 session，父会话断开时移除整条后代链 */
+    private frameSessions = new Map<number, Map<string, string | undefined>>()
     /** cleanup epoch per tab：每次 cleanupTab 自增,attach Promise 完成时比对,避免与并发 cleanup 之间的状态漂移 */
     private cleanupEpoch = new Map<number, number>()
     /** setupListeners 幂等标志,防止热重载多实例叠加注册 */
@@ -253,6 +254,7 @@ export class DebuggerManager {
                         this.keyboardFocusLeases.get(tabId) !== lease ||
                         lease.epoch !== (this.cleanupEpoch.get(tabId) ?? 0)
                     ) {
+                        // noinspection ExceptionCaughtLocallyJS -- 保留按键释放失败，并继续恢复原焦点设置
                         throw new Error('原文档或调试会话已变化，未向新上下文派发 keyUp')
                     }
                     const modifierBits: Record<string, number> = { Alt: 1, Control: 2, Meta: 4, Shift: 8 }
@@ -335,7 +337,7 @@ export class DebuggerManager {
                 flatten: true,
                 filter: [{ type: 'iframe', exclude: false }],
             })
-            for (const sessionId of this.frameSessions.get(tabId)?.values() ?? []) {
+            for (const sessionId of this.frameSessions.get(tabId)?.keys() ?? []) {
                 if (!targets.some((target) => target.sessionId === sessionId)) {
                     targets.push({ tabId, sessionId })
                 }
@@ -387,23 +389,30 @@ export class DebuggerManager {
             }
 
             if (method === 'Target.attachedToTarget') {
-                const p = params as { sessionId: string; targetInfo: { targetId: string; type: string } }
+                const p = params as { sessionId: string; targetInfo: { type: string } }
                 if (p.targetInfo.type === 'iframe') {
-                    const sessions = this.frameSessions.get(tabId) ?? new Map<string, string>()
-                    sessions.set(p.targetInfo.targetId, p.sessionId)
+                    const sessions = this.frameSessions.get(tabId) ?? new Map<string, string | undefined>()
+                    sessions.set(p.sessionId, source.sessionId)
                     this.frameSessions.set(tabId, sessions)
                 }
             }
             if (method === 'Target.detachedFromTarget') {
                 const p = params as { sessionId: string }
-                for (const [id, sessionId] of this.frameSessions.get(tabId) ?? []) {
-                    if (sessionId === p.sessionId) {
-                        this.frameSessions.get(tabId)!.delete(id)
+                const sessions = this.frameSessions.get(tabId)
+                const detached = new Set([p.sessionId])
+                for (const detachedSessionId of detached) {
+                    for (const [sessionId, parentSessionId] of sessions ?? []) {
+                        if (sessionId === detachedSessionId || parentSessionId === detachedSessionId) {
+                            detached.add(sessionId)
+                            sessions!.delete(sessionId)
+                        }
                     }
                 }
                 this.executionContexts.set(
                     tabId,
-                    (this.executionContexts.get(tabId) ?? []).filter((context) => context.sessionId !== p.sessionId)
+                    (this.executionContexts.get(tabId) ?? []).filter(
+                        (context) => context.sessionId === undefined || !detached.has(context.sessionId)
+                    )
                 )
             }
 

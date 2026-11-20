@@ -22,9 +22,9 @@ managed 测试 tab 和测试创建的
 
 - Chrome Extension 已在 `chrome://extensions/` 刷新为最新 dist，popup 显示 **已连接**；调用
   `browse(action="connect")`，确认 `extension.bundleStatus="match"`，活动 `extensionBackgroundBundleHash` 与
-  `expectedBackgroundBundleHash` 相同，不能只比较manifest version
+  `expectedBackgroundBundleHash` 相同，不能只比较 manifest version
 - CC 重启后 Extension 应自动连接本地 MCP Server；除非测试强制 token 或手动连接流程，否则“需要点连接”不能作为发版前置条件
-- MCP server 已加载最新 dist（src 有任何改动 → `npm run build` → 重启 CC，否则跑到的是旧进程）
+- MCP Server 加载最新 dist：源码变化后执行 `npm run build`，在 `/mcp` 中对 mcp-chrome 执行 Reconnect，或重启 CC；核对新进程和实际入口后开始回归
 - 全程使用 `manage action=newPage` 创建的测试 tab， **严禁操作用户已有 tab**
 - 所有浏览操作保持 `activated=false` 并在后台执行；常规回归不调用
   `browse activate=true`、`manage activatePage`、`manage focusWindow` 或 `manage newWindow`
@@ -96,170 +96,499 @@ FAIL 时只需报 ID + 失败断言即可
 
 ### 0.7 隔离自动回归
 
-无需连接真实浏览器的行为回归使用以下命令：
+无需连接真实浏览器的行为回归在独立候选目录中构建并执行：
 
 ```bash
 npm test
 npm run test:extension
 ```
 
-定向回归入口：`test/review-navigation.test.js`、`test/review-events.test.js`、`test/review-input.test.js`、`test/review-c31-cookies.test.js`、`test/review-c31-cancellation.test.js`、`test/review-c31-wheel.test.js`、`test/review-c31f-cookies.test.js`、`test/review-c31f-release.test.js`、`test/review-c31f2-cookies.test.js`、`test/review-c31f3-cancellation.test.js`，Extension 专用回归由现有 Vite 入口加载对应的 `review-input`、`review-c31-cookies`、`review-c31f2-cookies`、`review-c31f3-management` 与 `review-c31-wheel` 测试
+定向回归入口：`test/review-navigation.test.js`、`test/review-events.test.js`、`test/review-input.test.js`、
+`test/review-c31-cookies.test.js`、`test/review-c31-cancellation.test.js`、`test/review-c31-wheel.test.js`、
+`test/review-c31f-cookies.test.js`、`test/review-c31f-release.test.js`、`test/review-c31f2-cookies.test.js`、
+`test/review-c31f3-cancellation.test.js`，Extension 专用回归由现有 Vite 入口加载对应的
+`review-input`、`review-c31-cookies`、`review-c31f2-cookies`、`review-c31f3-management` 与 `review-c31-wheel` 测试
 
-| 编号      | 条件与入口                                                                                                   | 验收                                                                                                           |
-| --------- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| C30-01    | 将源码包解压到独立目录，干净安装、构建并启动实际 stdio 入口                                                  | initialize 与 tools/list 成功，精确列出八个工具，Cookie 源码与其测试可加载                                     |
-| C30-02    | 四种 CDP 导航已由生产等待器确认完成，驱动第一次状态读取发生超时、目标消失或预算耗尽                          | 保留 completed、metadata 阶段与 retryable=false；真正的导航等待失败、派发拒绝、无历史和正常读取各自保持原状态  |
-| C30-03    | 两后端预取消、真实队列中取消、派发后取消、连接等待和 Challenge 等待                                          | 派发前取消为零变更，派发后保留执行事实；同一请求 signal 贯穿锁与后端，监听器和 timer 释放，后续请求仍可执行    |
-| C30-04    | blocked/exempted Cookie metadata，包括缺省 cookie 对象，通过公开 logs 读取 inline 和 output                  | cookieLine、header 和 Cookie 对象中的合成凭据均被脱敏，原因字段保留，显式 requestBody/responseBody 字节不变    |
-| C30-05    | closed、ACK、下一 opening 在同批帧到达，另验证 ACK 前后分批顺序、错误和断连                                  | 下一 ref 保持可处理，旧 ref 的完成、失败或重复操作只更新其自身状态；accept、dismiss 和 prompt 文本均正确       |
-| C30-06    | host 自身 shadow 子节点、嵌套 host、slot、普通 DOM 和独立 overlay                                            | 两后端正常组件可点击，独立 overlay 继续返回 covered，拒绝时没有点击派发                                        |
-| C30-07    | Shadow 内的 stealth、force、后台单击与 controlled 输入                                                       | click、key、input 到达 host/document 监听器且只发送一次；mouseenter、change 保留局部语义，后台执行保留 warning |
-| C30-08    | precise/stealth 的坐标 wheel，选中 frame、元素 target、无 target、取消与到期                                 | 坐标直接派发且不发空 find；frame-local 点和身份传到底层，无 target 沿用当前位置，取消或到期后无额外滚动        |
-| C30-09    | 公开 cookies get/clear 对比 /app、/app/、/app/info、/apple/info 与 target/context、domain、secure、partition | /app Cookie 不匹配 /apple/info，删除命令集合仅含匹配项，其他作用域的合成 Cookie 保持                           |
-| C30-10    | 两端干净安装后读取锁条目和实际 package.json                                                                  | version、resolved 与实际包版本一致；未安装的 optional／其他平台包单独记录                                      |
-| G038/G090 | 输入已完成，验证暂不可用、context/object 失效、停滞读取或脚本失败                                            | 顶层 retryable=false，验证自身重试标记保留；只读检查在原 deadline 内恢复，任意脚本失败立即返回对应状态         |
-| G064/G124 | 元素不可操作，以及页面含 CSS/script、隐藏表单、密码和超过 500 字符的正文                                     | 元素错误提示与页面隐藏区分；文本只取渲染文字和可见非密码值，actual 包含命中文字且有界                          |
+- `C30-01`
+    - 条件与入口：将源码包解压到独立目录，干净安装、构建并启动实际 stdio 入口
+    - 验收：initialize 与 tools/list 成功，精确列出八个工具，Cookie 源码与其测试可加载
 
-| 编号   | 条件与入口                                                                                                                           | 验收                                                                                                                                                        |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31-01 | 同名 Cookie 的不同 path、原始 host-only/domain、partition 与 BrowserContext；枚举后消失、空 ACK 和不可序列化分区                     | 删除使用精确身份并保留其他集合；CDP count 仅统计删除前存在且 ACK 后检查为消失的身份，acknowledged 与 alreadyAbsent 分别计数；不可精确表达的分区在删除前拒绝 |
-| C31-02 | Challenge 只读窗口查询、移动与按下后取消；launch 两次 HTTP、端口复用、spawn 前与握手阶段取消                                         | 尚未派发的移动、点击、profile 与进程保持零次；按下后只允许有界释放；只清理本次未交付进程，保留正常单次启动、焦点/权限拒绝与已存在浏览器                     |
-| C31-03 | 两输入模式的同文档、解析后导航、helper 后导航和 frame 移除；动作注入结果未知对照                                                     | helper 和 wheel 固定同一 documentIds；派发前身份变化时新旧文档均无输入并返回 not_started；已派发后通用拒绝保持 unknown；frame-local 坐标及原 frame 恢复有效 |
-| C31-04 | 第一项、中途、最后一项删除拒绝，已派发后 ACK 丢失，以及删除完成后临时 session detach 失败                                            | 公开 COOKIE_CLEAR_PARTIAL 保留 count、ACK、失败/未知与未处理数量、phase 和 cause，retryable=false；停止后无后续删除；detach 失败保留此前确认进度            |
-| C31-05 | 两后端的 bare get、target/context/store-only、空白 name/domain/url、仅 secure/session/path/partition 与 output；三种合法过滤各自对照 | 非空白 name/domain/url 至少一项，在 Cookie API 与导出文件创建前拒绝不合格请求；合法读取保持范围与内容                                                       |
+- `C30-02`
+    - 条件与入口：四种 CDP 导航已由生产等待器确认完成，驱动第一次状态读取发生超时、目标消失或预算耗尽
+    - 验收：保留 completed、metadata 阶段与 retryable=false；真正的导航等待失败、派发拒绝、无历史和正常读取各自保持原状态
 
-| 编号     | 条件与入口                                                                                                                                      | 验收                                                                                                                                     |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F-01  | 通过真实 CDPClient 在首项、中途和最后一项删除已发送、ACK 前被动或主动关闭；派发前断连、原生拒绝、正常 ACK、真实 timer 与取消对照                | 在途关闭计 unknown，保留方法与原因；首项 unknown、前序已有 ACK 时 partial；明确拒绝与未派发单独计 failed，后续零删除                     |
-| C31F-02  | 公开 browse 的 down 完成后取消，延迟必要 up；随后发起同 tab 导航和 input，覆盖释放成功、失败、5000 ms 清理预算到期、正常慢释放和查询/移动时取消 | 释放完成或有界清理结算前，后续导航及输入零派发；失败或超时保留 releaseStatus=unknown 和明确错误；查询/press 前取消及时结束，队列继续可用 |
-| C31F-03A | precise/stealth、主文档/iframe 的坐标水平与垂直输入，正负方向、最近容器方向到边界及 CSS 水平对照                                                | 选择请求轴上该方向仍有范围的最近祖先；水平独占容器不因 Y 条件被跳过；viewport 保持正确位置，frame-local 坐标有效                         |
-| C31F-03B | 普通 DOM/Shadow 内部，目标、祖先和 document 的显式非 passive 监听器取消；无取消对照                                                             | 有效取消后容器及 viewport 无额外默认滚动；已派发事件仍为 completed、eventsExecuted=1、retryable=false                                    |
-| C31F-03C | wheel 命中开放 ShadowRoot 内部，记录 inner/root/host/document，外层有效取消及普通 DOM 对照                                                      | composed=true，host/document 收到事件；外层取消阻止默认滚动；原文档身份、导航拒绝与未知状态回归保持                                      |
+- `C30-03`
+    - 条件与入口：两后端预取消、真实队列中取消、派发后取消、连接等待和 Challenge 等待
+    - 验收：派发前取消为零变更，派发后保留执行事实；同一请求 signal 贯穿锁与后端，监听器和 timer 释放，后续请求仍可执行
 
-| 编号     | 条件与入口                                                                                                                                                                                | 验收                                                                                                                                                            |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F2-01 | 真实 SDK Client/McpServer 的 tools/call 与 notifications/cancelled，保留生产 requestContext provider 和驱动选择；首项/中途 ACK 前取消、已取消入口、临时 session 清理及 Extension 批次对照 | 服务端 signal 已 aborted 后才放行在途回执，后续新增删除为 0；CDP 保留前序 count/ACK 和在途 unknown；Extension 发出 cancel，生产循环停止；SDK 抑制已取消请求回包 |
-| C31F2-02 | column-reverse、row-reverse、vertical-rl、LTR/RTL，起点/中间/两端、正负输入与 CSS 对照；两模式和主文档/iframe                                                                             | 浏览器实际位移决定该轴是否已消费，反向范围正常滚动自身；真实没有移动且允许传播时由有范围祖先滚动                                                                |
-| C31F2-03 | X/Y 的 contain/none/auto，边界与中间、正负输入及混合轴                                                                                                                                    | contain/none 到边界后对应轴的祖先保持位置，auto 允许传播，中间仍可滚动自身；混合输入分别核对每轴的独立原生单轴参照                                              |
+- `C30-04`
+    - 条件与入口：blocked/exempted Cookie metadata，包括缺省 cookie 对象，通过公开 logs 读取 inline 和 output
+    - 验收：cookieLine、header 和 Cookie 对象中的合成凭据均被脱敏，原因字段保留，显式 requestBody/responseBody 字节不变
 
-| 编号     | 条件与入口                                                                                                                                  | 验收                                                                                                                                         |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F3-01 | 真实 SDK 的首项/中途临时 attach ACK 前取消、同连接重复取消、原生拒绝、删除 ACK 前取消及清理失败；真实 Chrome 同 context 已附加 A 与未附加 B | 后续零删除，迟到成功 sid 有界回收，重复取消不累积遗失 session；A 的 session 保持可用，清理失败保留日志与命令归属，不重放删除                 |
-| C31F3-02 | 公开前序 extract 持锁，六类窗口/分组动作排队取消；生产 ActionHandler/TabHandler 在异步读取期间取消或到期、多步变更及关闭清理                | 服务端确认取消后才释放前序，后续零变更；原生关闭前取消/到期时零 remove，部分变更保留 partial，关闭后的受控状态清理完成；ref 控制仍可独立执行 |
-| C31F3-03 | 真实 SDK 的 extract 排队/在途/预取消、原 timeout 对照、HTML/图片目录真实输出及原子写入各阶段                                                | 排队取消零读取/输出，在途取消发送 cancel，后续元信息和图片读取停止；取消后不发布新文件，已完成文件保留，临时文件清理完成，队列继续可用       |
-| C31F3-04 | body auto/contain/none、body hidden、root hidden、root auto + contain、body 独立滚动，X/Y 正负、两模式与主文档/iframe                       | 分别比较事件命中及 root/body/viewport 位置；传播 overflow 的 body 不额外阻断，hidden/clip viewport 不主动滚动，独立 body 正常滚动            |
-| C31F3-05 | nested hidden/clip/visible 与 auto/contain/none，X/Y 正负、两模式与主文档/iframe，保留普通 auto/scroll 及独立混合轴对照                     | hidden 自身不滚且 contain/none 阻止对应轴，auto 允许传播，clip/visible 不按该滚动容器边界阻止，未受限轴保持原规则                            |
+- `C30-05`
+    - 条件与入口：closed、ACK、下一 opening 在同批帧到达，另验证 ACK 前后分批顺序、错误和断连
+    - 验收：下一 ref 保持可处理，旧 ref 的完成、失败或重复操作只更新其自身状态；accept、dismiss 和 prompt 文本均正确
 
-| 编号     | 条件与入口                                                                                                                                                                          | 验收                                                                                                                                                     |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F4-01 | 实际 SDK → Bridge/HttpServer → 生产 HttpClient cancel → ActionHandler／状态模块；adopt、grant、revoke、metadata、release 的内部排队、身份读取、存储提交，以及授权跨 generation 刷新 | 两端确认取消后释放读取，本请求未提交的 set 为 0，原状态保持；已提交状态同步内存，创建后的登记与关闭后的清理完成，正常与 deadline 对照保持                |
-| C31F4-02 | Cookie、普通日志、事件日志、manage 保存、evaluate 显式／自动保存、extract 对照；实际 open、write、close、rename 与日志 manifest 阶段                                                | 原 signal/deadline 到最终发布；未派发的 rename 与后续 manifest 为 0，旧文件与已发布文件保持，临时文件清理，脚本 completed 事实保持，事件保存独立于页面锁 |
-| C31F4-03 | html/body 的 layout、paint、style、size、inline-size、content、strict，content-visibility、container-type；正常传播与独立 body 控制                                                 | 显式与隐式实际 containment 分别核对，独立 body 正常滚动，真正传播源跳过自身边界，root/body/viewport 的实际位置与原生一致                                 |
-| C31F4-04 | inline／contents／block、hidden／auto、auto／contain／none、空范围与边界，两轴正负及 iframe                                                                                         | 无适用滚动盒的节点不消费 overscroll；真实 hidden 容器自身不滚，实际容器的边界策略保持，比较目标与祖先的位置                                              |
-| C31F4-05 | fixed／absolute 跨过非包含块祖先，普通流、relative／transform／contain／perspective／filter／will-change 包含块及目标自身可滚动                                                     | 目标命中相同，跳过无关面板，实际包含块继续参与；比较目标、面板、root/body/viewport，覆盖两模式、两轴正负与主文档／iframe                                 |
+- `C30-06`
+    - 条件与入口：host 自身 shadow 子节点、嵌套 host、slot、普通 DOM 和独立 overlay
+    - 验收：两后端正常组件可点击，独立 overlay 继续返回 covered，拒绝时没有点击派发
 
-| 编号     | 条件与入口                                                                                                                                                                                     | 验收                                                                                                                                                                      |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F5-01 | flow-root list-item、inline flow-root list-item、-webkit-box、-webkit-inline-box 的 auto 滚动与 hidden + contain/none，flow-root、普通 inline、block 正常控制                                  | 按外部／内部 display 和主盒判断滚动资格，比较自身、祖先和 viewport；真实零范围容器保留边界，非原子 inline list-item 保持非滚动盒行为                                      |
-| C31F5-02 | 非原子 inline list-item 的 transform／contain:layout；block + will-change:contain；inline、inline-block、will-change:content-visibility／filter 控制；absolute/fixed、Shadow、root/body 使用点 | 无效包含块不进入滚动链，保留原生有效定位关系，分别核对滚动盒、transform 与 containment 资格；两模式、主文档／iframe、两轴正负与目标命中保持                               |
-| C31F5-03 | 实际 SDK 的原生预算计时器，读取派发后墙钟位于 deadline−1／deadline、未改真实时钟；同文案页面 throw／reject、true、正常 false；input/evaluate 完成状态                                          | 读取或预算超时为 unavailable，脚本异常为 error，正常 false 为 not_matched；严格保留 70 ms，主动作只执行一次，顶层 retryable=false，校验重试标记独立，pending RPC 最终为 0 |
+- `C30-07`
+    - 条件与入口：Shadow 内的 stealth、force、后台单击与 controlled 输入
+    - 验收：click、key、input 到达 host/document 监听器且只发送一次；mouseenter、change 保留局部语义，后台执行保留 warning
 
-| 编号       | 条件与入口                                                                                                                                                                                 | 验收                                                                                                                                               |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F6-01   | 合法 MathML math→mtext→HTML span 的 block math／inline math；SVG viewport、foreignObject 与 HTML 子盒；聚焦文本 input 的 computed clip 内部横滚；普通 HTML、表单及真实零范围控制           | 比较实际命中、自身、祖先及 viewport，真实滚动盒和边界保留，普通 SVG 不因 block/hidden 声明形成虚假边界                                             |
-| C31F6-02-A | ruby-text 的 transform／translate／rotate／scale／perspective／will-change:transform；ruby-text filter、table-row transform、inline／atomic inline／block 控制                             | 按各属性适用资格判断，保留有效 filter 和表格包含块，非适用盒不改变固定目标的滚动链                                                                 |
-| C31F6-02-B | 内置 will-change 属性名的大写、混合大小写和多值；当前 Chrome 生效的 -webkit 别名；小写、unknown／custom ident／stacking-only 控制                                                          | 大小写与有效别名保持实际包含块效果，CSS.supports 仅作为语法记录，行为由定位与滚动对照验收                                                          |
-| C31F6-02-C | computed preserve-3d 及 used-flat 条件、offset-path、明确 offset-position 和相关 hint；flat、none、normal／auto、独立 distance／rotate、backface 的实际 3D 条件、container-type 控制       | 区分属性族、computed/used 值与盒资格，分别比较真实包含块、命中及滚动                                                                               |
-| C31F6-02-D | HTML→SVG→foreignObject→HTML 的默认包含块，以及显式 transform／layout containment 对照；fixed／absolute                                                                                     | 默认嵌入关系和显式属性均保持真实定位与滚动链                                                                                                       |
-| C31F6-02-E | light DOM 的 fixed／absolute 目标投影到 transformed block slot，composed 路径为 inner→slot→middle→host→outer，offsetParent 返回同 root 的 host；移除 slot transform 对照                   | 更近的有效 composed 包含块优先，middle 正常消费；静态 slot 控制恢复 host 布局链，覆盖两模式、主文档／iframe 与 X 轴代表                            |
-| C31F6-03   | 实际 SDK＋生产 CDPClient＋真实 Chrome：读取中断、iframe[／div[ 原生 SyntaxError、页面异常字符串转换再次抛错、主动作 ACK 后总 deadline 到期；普通 throw／reject、true／false、组合 AND 控制 | 传输／环境读取不可用为 unavailable，页面或选择器错误为 error；总期限到期零验证派发，主动作一次且 completed、顶层 retryable=false，校验自身重试独立 |
-| C31F6-04   | 真实 keydown→wheel／mouse→keyup，Ctrl／Shift／Alt／Meta／Ctrl+Shift；move/down/up、click/contextmenu、precise 右键、force/ref/actionable_click；无修饰键和 precise 原生控制                | 事件四字段完整保留，应用监听器动作及 preventDefault 生效，释放后字段清零，原有无修饰键默认行为保持                                                 |
-| C31F6-05   | 实际 SDK＋真实 Chrome 的普通、translate、scale2 点与 scale2 selector；边框、origin、嵌套 scale／rotate／skew／反射、OOPIF；Extension precise 与 stealth、touch／drag 共享入口              | 以真实命中验收当前输入视口映射，selector 无重复变换，滚动后重新取得几何；不可靠／失效映射当前事件零派发，保留前序完成事实及 target/frame 恢复      |
-| C31F6-06   | 实际 SDK：Shift down，timeout=5000，false 检查 timeout=4000／interval=2000，确认本地等待后取消；后继 500 ms evaluate／400 ms input；既有按键、正常持键、在途读取和清理失败对照             | 取消及时结束等待，新增键得到有界释放后解除锁，既有键保持；DOM／内部键状态、timer／监听器终态分别验证，SDK 抑制取消业务回包与内部 handler 记录分开  |
-| C31F6-07   | 无取消竞争：第一请求真实派发并占锁 900 ms，第二请求 timeout=250；evaluate／input 对照，以及真正派发后 ACK 不明控制                                                                         | 未开始请求零脚本派发，可信 false／status／queue 与全部顶层字段一致；已派发未知保持 unknown，完成事实保持，动作不重放                               |
-| C31F6-08   | 8 次 ±0.25／+0.5／+1，合法 wait.ms=50；方向反转、目标／文档变化、页面自行滚动、短长间隔、方向边界及 snap 小数对照                                                                          | 逐事件与最终累计分别核对；量化暂未产生位移仍由当前容器消费，真实边界按策略传播，snap／clamp 差值不成为后续残差                                     |
-| C31F6-09   | 监听器移除 target／container、reparent，preventDefault 后移除、无变更、合法页面自行滚动、passive／stopPropagation 控制                                                                     | 不误滚新父容器或无关 viewport，保留页面滚动与有效取消；reparent 的旧 outer 按原生稳定观察比较，不强行规定固定增量                                  |
-| C31F6-10   | CSS zoom:2、transform:scale(2)、嵌套 zoom、frame 继承及元素／viewport 单位，两轴正负和边界传播                                                                                             | 元素增量按有效 CSS zoom 换算，一般 transform scale 保持原输入增量语义，viewport 单位独立验收                                                       |
-| C31F6-11   | standards／quirks 的 body block／contents、hidden／auto，root visible／显式 overflow 与 containment 控制                                                                                   | 无主盒 body 不提供 viewport overflow，quirks 的特殊 client／scroll 尺寸如实记录，主盒与尺寸分别判断                                                |
-| C31F6-SNAP | 100 px mandatory 列表从 400 输入 ±40，含 contain；proximity、无 snap 和 +200 控制，等待至少 800 ms 且取得 8 次稳定样本                                                                     | 接受程序化吸附终点，另记录原生 wheel 终点；按此兼容性合同判断，其他滚动偏差仍独立验收                                                              |
+- `C30-08`
+    - 条件与入口：precise/stealth 的坐标 wheel，选中 frame、元素 target、无 target、取消与到期
+    - 验收：坐标直接派发且不发空 find；frame-local 点和身份传到底层，无 target 沿用当前位置，取消或到期后无额外滚动
 
-| 编号     | 条件与入口                                                                                                                                                                | 验收                                                                                                                                                  |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F7-01 | 安装当前 Extension，通过实际 SDK、生产 sendCommand/handleMessage 和 parser，主文档／iframe 的验证 marker 后原生 terminate；evaluate/input、页面同文案及非法方法／参数控制 | 原生中断为 unavailable，页面异常和协议参数错误为 error，保留 native method/code/message；主动作一次且 completed，顶层 retryable=false，子校验重试独立 |
-| C31F7-02 | 普通／变换 iframe，scroll 监听器将目标 left 从 80 改为 240，move/down-up/touch/click、两模式及 CDP；touchstart 后再移位以产生真实 touchmove                               | 滚动事件与其监听器完成后读取当前局部几何，断言事件发生时的目标、rect 和实际坐标，并取得独立原生参照；协议整数取整单列，目标失效时当前事件零派发       |
-| C31F7-03 | 自然 200 ms 总预算，仅保持已成功完成的第一份 page_snapshot ACK，evaluate/input 用户动作零派发；迟到 ACK、真正 unknown、completed 和队列控制                               | 顶层 false/not_started/context，pageContext.contextPhase=before，原 RPC unknown 保留在 error 详情，原 Error 对象和类型保持，后继动作不重放            |
-| C31F7-04 | foreignObject 自身 overflow:auto，以及 hidden+contain/none，两轴正负；普通 SVG、foreignObject 内 HTML 盒控制                                                              | 自身可滚动时优先消费，hidden 边界正确阻断，普通 SVG 不形成虚假边界，两种 Extension 模式共享行为                                                       |
-| C31F7-05 | 高 99.8／宽 219.8、zoom 2 的真实末端，整数尺寸与内部位置对照；120 和连续八次 0.25，X/Y、RTL／反向布局及 auto/contain/none                                                 | 当前调用栈内区分真实末端与尚未量化的输入，实际末端立即按策略传播；ScrollTimeline 的空值、实时值和浮点端点精度分别记录，保留 transform 与 snap 控制    |
-| C31F7-06 | 同容器每次替换命中子节点、监听器每次 scrollBy50、两者组合；八次 0.25、间隔 50 ms，preventDefault 及新容器／文档、外部位置、zoom、方向和 snap 控制                         | 同容器余量连续，事件内页面位移与工具位移分别计算，事件间独立位置变化仍重置，分别核对 402／802 及每步位置，不把 clamp/snap 差值作为后续余量            |
-| C31F7-07 | 坐标专项正常结束和资源关闭失败控制，另保留业务失败与清理失败同时发生                                                                                                      | 使用真实 close API，各资源独立关闭，正常无 cleanupError，任何清理失败产生非零退出，原业务错误与资源终态保留                                           |
+- `C30-09`
+    - 条件与入口：公开 cookies
+      get/clear 对比 /app、/app/、/app/info、/apple/info 与 target/context、domain、secure、partition
+    - 验收：/app Cookie 不匹配 /apple/info，删除命令集合仅含匹配项，其他作用域的合成 Cookie 保持
 
-| 编号     | 条件与入口                                                                                                                                                                                     | 验收                                                                                                                                                                                                                |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F8-01 | 主文档／iframe、precise／stealth，普通 scroll、stopPropagation、stopImmediatePropagation 和 Window capture 阻断；滚动监听器将目标 left 从 80 改为 240，mousemove 与 down-up                    | 可见页面完成滚动与渲染步骤后读取当前局部矩形，传播阻断不耗尽取点预算；实际事件命中目标且位于事件当时的矩形中心，独立原生参照命中相同目标                                                                            |
-| C31F8-02 | light DOM 目标通过 assignedSlot 投影到 Shadow 滚动盒，沿 slot／host 路径滚动，覆盖 C31F8-01 的传播、frame 和输入模式条件                                                                       | 使用实际滚动盒完成后的布局取点，事件坐标与当前 frame-local 矩形一致，目标引用失效控制保持                                                                                                                           |
-| C31F8-03 | 初始 before 快照成功后，保持已成功完成的第二份条件快照 ACK，自然 300 ms 总预算到期；evaluate 使用真实 expectedUrl，input 使用真实 expectedRevision；Extension／CDP、复用 Error 与迟到 ACK 控制 | 主脚本／输入零派发，顶层 false/not_started/precondition，pageContext.contextPhase=precondition，原 Error 身份及辅助 RPC unknown 保留；真实动作 unknown、completed 后元信息失败和后继请求保持原语义                  |
-| C31F8-BG | 自有后台主文档／iframe，precise／stealth 的 mousemove 与 down-up，滚动监听器阻断传播，另有独立原生参照                                                                                         | 页面始终 hidden，取点按当前布局完成，不等待暂停的动画帧；precise 返回 NATIVE_INPUT_UNAVAILABLE、false/not_started、retryable=false，eventsExecuted=0，原生派发及工具 DOM 事件均为 0；stealth 完成且命中当前目标中心 |
+- `C30-10`
+    - 条件与入口：两端干净安装后读取锁条目和实际 package.json
+    - 验收：version、resolved 与实际包版本一致；未安装的 optional／其他平台包单独记录
 
-| 编号     | 条件与入口                                                                                                                                        | 验收                                                                                                                                                             |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F9-01 | 真实 SDK 调用中的目标列表、选择、frame、Challenge、diagnostics、globalThis 与逐事件准备回执未知；主脚本／输入实际派发及前序事件控制               | 主动作未派发时为 false/not_started/context，条件读取使用 precondition，前序事件保留；原 Error、码与辅助 unknown 保留，真正派发后未知仍为 unknown，迟到回执不重放 |
-| C31F9-02 | precise／stealth、参数／无参数下的可信 Function 编译策略拒绝、同 CSP 文案页面 throw／reject 和用户脚本内部 eval 拒绝                              | 仅可信编译拒绝返回 CSP_BLOCKED 且脚本未开始，页面异常保留原文与来源；分别记录受控矩阵和真实浏览器 CSP 结果                                                       |
-| C31F9-03 | controlled 输入的普通容器、disabled、readonly、file input，以及合法 input／textarea／select／contenteditable                                      | 不支持的目标在 focus、setter 与 input/change 前拒绝，合法控件保留原生 setter，文本和事件只更新一次                                                               |
-| C31F9-04 | 一个显式页面长等待期间读取／更新另一页面的无条件 pageMetadata，再对照带 expectedUrl／expectedRevision 的备注请求                                  | 无条件备注按显式目标独立完成，其他请求保持其页面和 frame；带条件备注仍按串行条件检查，失败保留原备注                                                             |
-| C31F9-05 | 前序动作持锁，newPage 的显式 timeout 在队列中耗尽，另对照默认管理期限、正常创建与取消                                                             | 超期请求返回明确错误且零创建，默认期限为 30000 ms；后继请求仍可执行，已派发动作保留实际结果                                                                      |
-| C31F9-06 | 同一浏览器事件 controller 发生超过 20 次具名清理失败，包含可观测 ref、request ID、target、owner 和 native session，再 dispose 并创建新 controller | 字符串与详情逐项对应，只保留最新 20 条；时间、阶段和归属正确，dispose 清除记录，新 controller 为空，已返回详情保持原归属                                         |
+- `G038/G090`
+    - 条件与入口：输入已完成，验证暂不可用、context/object 失效、停滞读取或脚本失败
+    - 验收：顶层 retryable=false，验证自身重试标记保留；只读检查在原 deadline 内恢复，任意脚本失败立即返回对应状态
 
-| 编号     | 条件与入口                                                                                                                                         | 验收                                                                                                                                                 |
-| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F9-07 | 主文档／iframe、precise／stealth、mousemove／down-up，真实 visible→hidden、hidden→visible 及两种往返转换，转换发生在取点准备期间                   | 保留真实 visibilitychange 时间和状态；结束时按当前布局取点，输入命中事件当时的矩形中心；precise 不可用时明确拒绝且零输入；转换不等待暂停的 rAF       |
-| C31F9-08 | 主文档／iframe、precise／stealth、mousemove／down-up，document、rAF 与嵌套滚动盒的监听器触发后续滚动                                               | 最终滚动监听器处理完成后取得当前局部几何；实际事件命中目标中心，独立原生参照命中相同目标；持续滚动在原期限结束且该事件零输入                         |
-| C31F9-09 | CDP precise、Extension precise／stealth 的主文档／iframe，真实滚动监听器改变目标位置后的 click／touch                                              | 保留相邻输入入口，事件坐标与当时 rect 一致，独立原生鼠标／触摸参照命中同一目标                                                                       |
-| C31F9-10 | CSS＋exact 文本区分评分 2／-2；role=tab、name 的部分与精确匹配，嵌套 span、隐藏后代及显式名称优先级；主文档／iframe、两后端和 Extension 两输入模式 | 精确评分只命中正值；tab 等内容命名角色取得可见后代名称，点击实际选中对应 tab；原标签优先级与隐藏规则保持                                             |
-| C31F9-11 | 使用 README 的 TagInput 示例输入文字、显式 Enter down/up，在主文档／iframe、CDP precise 与 Extension precise／stealth 下提交                       | 真实页面生成对应标签且 postCondition 匹配；记录事件完成数和页面标签文本，具体业务站点按实际控件另验                                                  |
-| C31F9-12 | 两后端先 download watch，再点击本地 HTTP attachment，等待独立 Chrome 完成下载，读取 download 日志                                                  | 文件内容正确，日志提供 completed 的原生下载 ref 和可用原始附件，stop 结束观察；隔离 profile 的下载目录由测试载体指定                                 |
-| C31F9-13 | 预算回调在 deadline−1 交付，对照导航等待、队列、Extension RPC、诊断准备与后续页面包装                                                              | 保留原回调立即结束合同；RPC 仍为 unknown 并发送 cancel，handler 清空；诊断传播同一预算 Error，预算结束后零额外上下文读取，原 C-P6/C31F5/C02/C19 保持 |
+- `G064/G124`
+    - 条件与入口：元素不可操作，以及页面含 CSS/script、隐藏表单、密码和超过 500 字符的正文
+    - 验收：元素错误提示与页面隐藏区分；文本只取渲染文字和可见非密码值，actual 包含命中文字且有界
 
-| 编号           | 条件与入口                                                                                                                                             | 验收                                                                                                                                |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| C31F10-01      | 主动作的 frame 准备回执保持期间，同页／跨页无条件 pageMetadata 读取、更新、null 清空，以及带自身条件的串行控制                                         | 无条件备注独立完成且不继承或消费主动作条件；URL 改变后主动作按原条件拒绝，零业务效果，条件与 frame 在请求结束后清除                 |
-| C31F10-02      | 预算回调在 deadline−1 结算，覆盖 list、snapshot、diagnostics 各阶段与已按下键的释放                                                                    | 原预算 Error 与动作事实保持；结算后停止新增业务和后读，独立有界清理释放按键；业务派发与清理分别计数，迟到 ACK 不恢复请求            |
-| C31F10-03      | 页面 throw／reject 的 JSON 文本含 CSP 或业务 code、context 和额外字段，对照真实类型化工具错误及正常结构化返回                                          | 页面消息按原文输出，页面字段不改变顶层动作事实，不生成焦点建议；可信工具错误与正常返回结构保持                                      |
-| C31F10-04      | primitive 字符串 throw／reject，参数／无参数、主文档／iframe、CDP precise 与 Extension precise／stealth；公共提取器另验空串、0、false、null、undefined | 保留无 description 时的 primitive value，已有 description／堆栈优先；原动作失败与来源保持                                           |
-| C31F10-05      | input／textarea／select 位于 disabled fieldset 内，对照首个 legend 和普通可用控件                                                                      | 有效禁用时拒绝且零 focus、setter 和输入事件；首个 legend 内合法控件可更新                                                           |
-| C31F10-06      | ordinary 与 customized built-in 的 input／textarea／select，对照原生 setter 缺失                                                                       | 按实际表单接口选择原生 setter，更新和 input/change 各一次；setter 缺失时明确失败且零副作用                                          |
-| C31F10-FOREIGN | 同源 iframe 创建控件后 adopt 至当前文档，保留 foreign prototype，并对照 adopt 的 file input                                                            | CSS 定位到同一节点，ownerDocument 为当前文档且 local instanceof 为 false；合法控件正常更新，file 在 focus 和输入事件前拒绝          |
-| C31F10-CASCADE | 祖先滚动后依次滚动一个或两个非祖先 sibling，最终监听器移动目标；主文档／iframe、precise／stealth、mousemove／down-up                                   | 保留真实滚动和输入时序，实际事件命中当时的目标中心，独立原生参照命中相同目标；模型另验 Shadow root 的非冒泡通知、传播阻断及资源清理 |
-| C31F10-T01     | 准备阶段超期后的目标恢复，分别读取 restored／failed 的真实终态                                                                                         | restored 对应原目标，failed 对应清空目标和恢复错误；主动作零派发、辅助 unknown、前序进度与清理状态按原断言验收                      |
+- `C31-01`
+    - 条件与入口：同名 Cookie 的不同 path、原始 host-only/domain、partition 与 BrowserContext；枚举后消失、空 ACK 和不可序列化分区
+    - 验收：删除使用精确身份并保留其他集合；CDP
+      count 仅统计删除前存在且 ACK 后检查为消失的身份，acknowledged 与 alreadyAbsent 分别计数；不可精确表达的分区在删除前拒绝
 
-| 编号       | 条件与入口                                                                                                                                | 验收                                                                                                                                |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| C31F11-01  | stealth 返回循环对象、BigInt、toJSON 抛错、Node、NodeList、HTMLCollection，对照正常结构化返回；主文档／iframe、参数／无参数               | 脚本执行一次，序列化失败为 NON_SERIALIZABLE_EVALUATE_RESULT，actionExecuted=true、completed/output、retryable=false；正常返回值保持 |
-| C31F11-02  | throw／Promise.reject 空字符串，对照页面抛出伪造 output 标记及同名结构化错误 JSON；两后端、precise／stealth、主文档／iframe、参数／无参数 | 空原文保持，页面 JSON 按原文返回，类别仍为页面动作失败，页面字段不改变顶层 completed／failed 事实                                   |
-| C31F11-03  | open／refresh／back／forward 的生产导航等待在请求 deadline−1 或 deadline 结算；三类等待器分别对照整请求期限与较短子操作期限               | 整请求结算保存并传播同一预算 Error，停止后续页面与诊断读取，导航只派发一次且保持 unknown／非重试；较短等待超时保留剩余请求预算      |
-| C31F11-T01 | adopt 控件在主动作前检查 localInstance=false、foreignInstance=true；另用正确／错误 realm 观测记录检验前提断言                             | 错误 realm 在业务派发前拒绝；真实 Chrome 合法控件更新和 adopted file 零输入副作用保持                                               |
-| C31F11-OBS | 另一 Shadow root 内 sibling 级联、提前注册的 document capture 监听器触发级联后阻断传播、目标稳定时无关 scroller 持续滚动                  | 按实际事件命中、事件时 rect、动作终态和期限裁定；保留原生时序和独立参照，无关滚动保持目标可操作                                     |
+- `C31-02`
+    - 条件与入口：Challenge 只读窗口查询、移动与按下后取消；launch 两次 HTTP、端口复用、spawn 前与握手阶段取消
+    - 验收：尚未派发的移动、点击、profile 与进程保持零次；按下后只允许有界释放；只清理本次未交付进程，保留正常单次启动、焦点/权限拒绝与已存在浏览器
 
-| 编号        | 条件与入口                                                                                                                                                                                                                                     | 验收                                                                                                                                                                                                                              |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F12-01   | 返回值完成 Promise 等待后的 Proxy getPrototypeOf、Node 及集合诊断 getter 抛错；JSON.stringify 抛错或返回非法／空／非字符串结果、错误详情 JSON 结构无效；对照合法 undefined／函数／0／false／null／空字符串及 revoked Proxy 的 Promise adoption | 输出检查、结果及错误详情解析异常保持 NON_SERIALIZABLE_EVALUATE_RESULT、completed/output、actionExecuted=true、retryable=false；摘要生成失败保留原文并报告具体失败；合法返回值保持，Promise 等待拒绝与页面主动抛错保持页面动作失败 |
-| C31F12-02   | back／forward 主命令明确拒绝、重复拒绝、正常完成、无历史、请求取消和断连                                                                                                                                                                       | 返回原 Error，局部等待的 timer、事件与 disconnected 监听器立即释放；主命令不重放，局部取消不结束仍有效的请求预算，后继请求可用                                                                                                    |
-| C31F12-O-S1 | 准备开始后由滚动监听器新建外部 open Shadow root，再在该 root 中滚动并移动目标                                                                                                                                                                  | 每次稳定采样纳入新 root；保留实际输入时 rect、命中、当前返回快照与后续级联终态，按实际错误命中裁定                                                                                                                                |
-| C31F12-O-S2 | 同一外部源在 scroll 监听器中同步再次滚动，数次后才移动目标；对照无关 rAF 滚动与重复使用的事件对象                                                                                                                                              | 用 scroll 至 scrollend 的偏移变化识别同步后续滚动；同次传播保留首个观察偏移，后续派发更新采样；相关同步级联等待结束，无关 rAF 滚动保持稳定目标可操作，全部监听器按原期限清理                                                      |
+- `C31-03`
+    - 条件与入口：两输入模式的同文档、解析后导航、helper 后导航和 frame 移除；动作注入结果未知对照
+    - 验收：helper 和 wheel 固定同一 documentIds；派发前身份变化时新旧文档均无输入并返回 not_started；已派发后通用拒绝保持 unknown；frame-local 坐标及原 frame 恢复有效
 
-| 编号                | 条件与入口                                                                                                                                         | 验收                                                                                                                                                 |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C31F13-AUX          | mousemove、非左键 click、touchstart、mousedown 的坐标准备求值在类型检查、摘要生成、结果解析或错误详情解析失败，主文档／iframe，对照前序键盘事件    | 首个输入未派发时 false/not_started/context，零坐标输入；前序已确认输入保持计数，辅助错误原完成事实与原错误码保持，后续事件不派发                     |
-| C31F13-DIAG         | 首次输出异常后，错误摘要序列化返回坏 JSON、空串、缺字段、JSON null、非字符串数值或 null；主文档／iframe、参数／无参数                              | error.context.originalOutputError 保留首次诊断，后续解析错误及 completed/output 保持；页面主动抛错的原文与来源保持                                   |
-| C31F13-SCROLL-OBS   | 稳定目标旁的持续同步自滚动，precise／stealth、主文档／iframe、mousemove／down-up，纳入默认观察条件，也可用 COORD_FILTER 含 sync-unrelated 定向执行 | 原 completed 可操作性断言保持；主输入命中当时目标矩形，独立原生参照保持同一滚动负载且命中相同目标，返回后监听器与 MessagePort 已释放，取消时零主输入 |
-| C31F14-FRAME-PROBE  | 可用的所选 iframe 旁有注入拒绝或持续加载的兄弟 frame，分别延迟父页面 isolated／MAIN world 的 500 ms 定时器，对照普通本地文件页                     | selector／index 映射保持真实 sender、document 与 owner 校验；所选 iframe 正常读取，未依赖页面定时器，兄弟 frame 的不可用原因可见                     |
-| C31F14-FRAME-CANCEL | child listener 安装、DOM 与 CDP owner 探测等待期间取消、请求期限耗尽或等待 API 拒绝，随后执行同 tab 请求                                           | 安装等待按 Extension 计时和请求期限结束，不可用原因可见；主脚本未派发时保留 false/not_started；探测资源释放，晚到探测拒绝，后继请求可用              |
+- `C31-04`
+    - 条件与入口：第一项、中途、最后一项删除拒绝，已派发后 ACK 丢失，以及删除完成后临时 session detach 失败
+    - 验收：公开 COOKIE_CLEAR_PARTIAL 保留 count、ACK、失败/未知与未处理数量、phase 和 cause，retryable=false；停止后无后续删除；detach 失败保留此前确认进度
 
-C31F9／C31F10 的阶段、错误、管理与清理控制位于 `test/finding-regressions.test.js`、`test/browser-events.test.js`，请求条件隔离与预算 SDK 条件通过 `test/review-c31f10-request-lifecycle.test.js` 纳入常规测试；Extension 编译、controlled 及 Shadow 事件控制由现有 Vite 测试入口执行
-滚动等待单测执行生产生成脚本，核对级联、隐藏、可见性转换、持续滚动期限，以及所有 scroll／scrollend／visibilitychange 监听器、rAF、计时器和 MessagePort 的清理；`test/review-scroll-settlement.test.js` 纳入 `npm test`，覆盖无关循环滚动、有限级联、持续目标移动和取消后的清理
-frame 探测模型由 Extension 的 ER-08 执行实际注入函数，页面计时器调用直接失败，ER-08a 验证 listener 安装等待的默认期限、取消、请求期限和迟到拒绝；受控计时回调提前 1 ms 时，核对继续等待原绝对期限、TIMEOUT 分类和主脚本零派发；原生验收在独立 Chrome 中使用实际 Extension API，控制的页面计时器或原生 API 延迟须与自然后台限频分别记录
+- `C31-05`
+    - 条件与入口：两后端的 bare
+      get、target/context/store-only、空白 name/domain/url、仅 secure/session/path/partition 与 output；三种合法过滤各自对照
+    - 验收：非空白 name/domain/url 至少一项，在 Cookie API 与导出文件创建前拒绝不合格请求；合法读取保持范围与内容
 
-C31F6／C31F7／C31F8／C31F9／C31F10 验收按语义子条件记录来源、输入、实际命中、事件字段、位置／页面计数和资源终态，实际 SDK、注册 handler、原生参照序列／事件与布局观测分别计数
-真实浏览器结果与 VM／合成协议结果分开，受控 Date 仅用于声明的总预算边界；原 C02 的 70 ms 真实期限和 C19 的 1 ms／原断言保持，首次失败与最终结果分别保存到执行材料
+- `C31F-01`
+    - 条件与入口：通过真实 CDPClient 在首项、中途和最后一项删除已发送、ACK 前被动或主动关闭；派发前断连、原生拒绝、正常 ACK、真实 timer 与取消对照
+    - 验收：在途关闭计 unknown，保留方法与原因；首项 unknown、前序已有 ACK 时 partial；明确拒绝与未派发单独计 failed，后续零删除
+
+- `C31F-02`
+    - 条件与入口：公开 browse 的 down 完成后取消，延迟必要 up；随后发起同 tab 导航和 input，覆盖释放成功、失败、5000
+      ms 清理预算到期、正常慢释放和查询/移动时取消
+    - 验收：释放完成或有界清理结算前，后续导航及输入零派发；失败或超时保留 releaseStatus=unknown 和明确错误；查询/press 前取消及时结束，队列继续可用
+
+- `C31F-03A`
+    - 条件与入口：precise/stealth、主文档/iframe 的坐标水平与垂直输入，正负方向、最近容器方向到边界及 CSS 水平对照
+    - 验收：选择请求轴上该方向仍有范围的最近祖先；水平独占容器不因 Y 条件被跳过；viewport 保持正确位置，frame-local 坐标有效
+
+- `C31F-03B`
+    - 条件与入口：普通 DOM/Shadow 内部，目标、祖先和 document 的显式非 passive 监听器取消；无取消对照
+    - 验收：有效取消后容器及 viewport 无额外默认滚动；已派发事件仍为 completed、eventsExecuted=1、retryable=false
+
+- `C31F-03C`
+    - 条件与入口：wheel 命中开放 ShadowRoot 内部，记录 inner/root/host/document，外层有效取消及普通 DOM 对照
+    - 验收：composed=true，host/document 收到事件；外层取消阻止默认滚动；原文档身份、导航拒绝与未知状态回归保持
+
+- `C31F2-01`
+    - 条件与入口：真实 SDK Client/McpServer 的 tools/call 与 notifications/cancelled，保留生产 requestContext
+      provider 和驱动选择；首项/中途 ACK 前取消、已取消入口、临时 session 清理及 Extension 批次对照
+    - 验收：服务端 signal 已 aborted 后才放行在途回执，后续新增删除为 0；CDP 保留前序 count/ACK 和在途 unknown；Extension 发出 cancel，生产循环停止；SDK 抑制已取消请求回包
+
+- `C31F2-02`
+    - 条件与入口：column-reverse、row-reverse、vertical-rl、LTR/RTL，起点/中间/两端、正负输入与 CSS 对照；两模式和主文档/iframe
+    - 验收：浏览器实际位移决定该轴是否已消费，反向范围正常滚动自身；真实没有移动且允许传播时由有范围祖先滚动
+
+- `C31F2-03`
+    - 条件与入口：X/Y 的 contain/none/auto，边界与中间、正负输入及混合轴
+    - 验收：contain/none 到边界后对应轴的祖先保持位置，auto 允许传播，中间仍可滚动自身；混合输入分别核对每轴的独立原生单轴参照
+
+- `C31F3-01`
+    - 条件与入口：真实 SDK 的首项/中途临时 attach
+      ACK 前取消、同连接重复取消、原生拒绝、删除 ACK 前取消及清理失败；真实 Chrome 同 context 已附加 A 与未附加 B
+    - 验收：后续零删除，迟到成功 sid 有界回收，重复取消不累积遗失 session；A 的 session 保持可用，清理失败保留日志与命令归属，不重放删除
+
+- `C31F3-02`
+    - 条件与入口：公开前序 extract 持锁，六类窗口/分组动作排队取消；生产 ActionHandler/TabHandler 在异步读取期间取消或到期、多步变更及关闭清理
+    - 验收：服务端确认取消后才释放前序，后续零变更；原生关闭前取消/到期时零 remove，部分变更保留 partial，关闭后的受控状态清理完成；ref 控制仍可独立执行
+
+- `C31F3-03`
+    - 条件与入口：真实 SDK 的 extract 排队/在途/预取消、原 timeout 对照、HTML/图片目录真实输出及原子写入各阶段
+    - 验收：排队取消零读取/输出，在途取消发送 cancel，后续元信息和图片读取停止；取消后不发布新文件，已完成文件保留，临时文件清理完成，队列继续可用
+
+- `C31F3-04`
+    - 条件与入口：body auto/contain/none、body hidden、root hidden、root auto +
+      contain、body 独立滚动，X/Y 正负、两模式与主文档/iframe
+    - 验收：分别比较事件命中及 root/body/viewport 位置；传播 overflow 的 body 不额外阻断，hidden/clip
+      viewport 不主动滚动，独立 body 正常滚动
+
+- `C31F3-05`
+    - 条件与入口：nested
+      hidden/clip/visible 与 auto/contain/none，X/Y 正负、两模式与主文档/iframe，保留普通 auto/scroll 及独立混合轴对照
+    - 验收：hidden 自身不滚且 contain/none 阻止对应轴，auto 允许传播，clip/visible 不按该滚动容器边界阻止，未受限轴保持原规则
+
+- `C31F4-01`
+    - 条件与入口：实际 SDK → Bridge/HttpServer → 生产 HttpClient cancel →
+      ActionHandler／状态模块；adopt、grant、revoke、metadata、release 的内部排队、身份读取、存储提交，以及授权跨 generation 刷新
+    - 验收：两端确认取消后释放读取，本请求未提交的 set 为 0，原状态保持；已提交状态同步内存，创建后的登记与关闭后的清理完成，正常与 deadline 对照保持
+
+- `C31F4-02`
+    - 条件与入口：Cookie、普通日志、事件日志、manage 保存、evaluate 显式／自动保存、extract 对照；实际 open、write、close、rename 与日志 manifest 阶段
+    - 验收：原 signal/deadline 到最终发布；未派发的 rename 与后续 manifest 为 0，旧文件与已发布文件保持，临时文件清理，脚本 completed 事实保持，事件保存独立于页面锁
+
+- `C31F4-03`
+    - 条件与入口：html/body 的 layout、paint、style、size、inline-size、content、strict，content-visibility、container-type；
+      正常传播与独立 body 控制
+    - 验收：显式与隐式实际 containment 分别核对，独立 body 正常滚动，真正传播源跳过自身边界，root/body/viewport 的实际位置与原生一致
+
+- `C31F4-04`
+    - 条件与入口：inline／contents／block、hidden／auto、auto／contain／none、空范围与边界，两轴正负及 iframe
+    - 验收：无适用滚动盒的节点不消费 overscroll；真实 hidden 容器自身不滚，实际容器的边界策略保持，比较目标与祖先的位置
+
+- `C31F4-05`
+    - 条件与入口：fixed／absolute 跨过非包含块祖先，普通流、relative／transform／contain／perspective／filter／will-change 包含块及目标自身可滚动
+    - 验收：目标命中相同，跳过无关面板，实际包含块继续参与；比较目标、面板、root/body/viewport，覆盖两模式、两轴正负与主文档／iframe
+
+- `C31F5-01`
+    - 条件与入口：flow-root list-item、inline flow-root
+      list-item、-webkit-box、-webkit-inline-box 的 auto 滚动与 hidden +
+      contain/none，flow-root、普通 inline、block 正常控制
+    - 验收：按外部／内部 display 和主盒判断滚动资格，比较自身、祖先和 viewport；真实零范围容器保留边界，非原子 inline
+      list-item 保持非滚动盒行为
+
+- `C31F5-02`
+    - 条件与入口：非原子 inline list-item 的 transform／contain:layout；block +
+      will-change:contain；inline、inline-block、will-change:content-visibility／filter 控制；absolute/fixed、Shadow、
+      root/body 使用点
+    - 验收：无效包含块不进入滚动链，保留原生有效定位关系，分别核对滚动盒、transform 与 containment 资格；两模式、主文档／iframe、两轴正负与目标命中保持
+
+- `C31F5-03`
+    - 条件与入口：实际 SDK 的原生预算计时器，读取派发后墙钟位于 deadline−1／deadline、未改真实时钟；同文案页面 throw／reject、true、正常 false；input/evaluate 完成状态
+    - 验收：读取或预算超时为 unavailable，脚本异常为 error，正常 false 为 not_matched；严格保留 70
+      ms，主动作只执行一次，顶层 retryable=false，校验重试标记独立，pending RPC 最终为 0
+
+- `C31F6-01`
+    - 条件与入口：合法 MathML math→mtext→HTML span 的 block math／inline math；SVG
+      viewport、foreignObject 与 HTML 子盒；聚焦文本 input 的 computed clip 内部横滚；普通 HTML、表单及真实零范围控制
+    - 验收：比较实际命中、自身、祖先及 viewport，真实滚动盒和边界保留，普通 SVG 不因 block/hidden 声明形成虚假边界
+
+- `C31F6-02-A`
+    - 条件与入口：ruby-text 的 transform／translate／rotate／scale／perspective／will-change:transform；ruby-text
+      filter、table-row transform、inline／atomic inline／block 控制
+    - 验收：按各属性适用资格判断，保留有效 filter 和表格包含块，非适用盒不改变固定目标的滚动链
+
+- `C31F6-02-B`
+    - 条件与入口：内置 will-change 属性名的大写、混合大小写和多值；当前 Chrome 生效的 -webkit 别名；小写、unknown／custom
+      ident／stacking-only 控制
+    - 验收：大小写与有效别名保持实际包含块效果，CSS.supports 仅作为语法记录，行为由定位与滚动对照验收
+
+- `C31F6-02-C`
+    - 条件与入口：computed
+      preserve-3d 及 used-flat 条件、offset-path、明确 offset-position 和相关 hint；flat、none、normal／auto、独立 distance／rotate、
+      backface 的实际 3D 条件、container-type 控制
+    - 验收：区分属性族、computed/used 值与盒资格，分别比较真实包含块、命中及滚动
+
+- `C31F6-02-D`
+    - 条件与入口：HTML→SVG→foreignObject→HTML 的默认包含块，以及显式 transform／layout containment 对照；fixed／absolute
+    - 验收：默认嵌入关系和显式属性均保持真实定位与滚动链
+
+- `C31F6-02-E`
+    - 条件与入口：light DOM 的 fixed／absolute 目标投影到 transformed block
+      slot，composed 路径为 inner→slot→middle→host→outer，offsetParent 返回同 root 的 host；移除 slot transform 对照
+    - 验收：更近的有效 composed 包含块优先，middle 正常消费；静态 slot 控制恢复 host 布局链，覆盖两模式、主文档／iframe 与 X 轴代表
+
+- `C31F6-03`
+    - 条件与入口：实际 SDK＋生产 CDPClient＋真实 Chrome：读取中断、iframe[／div[ 原生 SyntaxError、页面异常字符串转换再次抛错、主动作 ACK 后总 deadline 到期；
+      普通 throw／reject、true／false、组合 AND 控制
+    - 验收：传输／环境读取不可用为 unavailable，页面或选择器错误为 error；总期限到期零验证派发，主动作一次且 completed、顶层 retryable=false，校验自身重试独立
+
+- `C31F6-04`
+    - 条件与入口：真实 keydown→wheel／mouse→keyup，Ctrl／Shift／Alt／Meta／Ctrl+Shift；move/down/up、click/contextmenu、precise 右键、
+      force/ref/actionable_click；无修饰键和 precise 原生控制
+    - 验收：事件四字段完整保留，应用监听器动作及 preventDefault 生效，释放后字段清零，原有无修饰键默认行为保持
+
+- `C31F6-05`
+    - 条件与入口：实际 SDK＋真实 Chrome 的普通、translate、scale2 点与 scale2
+      selector；边框、origin、嵌套 scale／rotate／skew／反射、OOPIF；Extension precise 与 stealth、touch／drag 共享入口
+    - 验收：以真实命中验收当前输入视口映射，selector 无重复变换，滚动后重新取得几何；不可靠／失效映射当前事件零派发，保留前序完成事实及 target/frame 恢复
+
+- `C31F6-06`
+    - 条件与入口：实际 SDK：Shift
+      down，timeout=5000，false 检查 timeout=4000／interval=2000，确认本地等待后取消；后继 500 ms evaluate／400 ms
+      input；既有按键、正常持键、在途读取和清理失败对照
+    - 验收：取消及时结束等待，新增键得到有界释放后解除锁，既有键保持；DOM／内部键状态、timer／监听器终态分别验证，SDK 抑制取消业务回包与内部 handler 记录分开
+
+- `C31F6-07`
+    - 条件与入口：无取消竞争：第一请求真实派发并占锁 900
+      ms，第二请求 timeout=250；evaluate／input 对照，以及真正派发后 ACK 不明控制
+    - 验收：未开始请求零脚本派发，可信 false／status／queue 与全部顶层字段一致；已派发未知保持 unknown，完成事实保持，动作不重放
+
+- `C31F6-08`
+    - 条件与入口：8 次 ±0.25／+0.5／+1，合法 wait.ms=50；方向反转、目标／文档变化、页面自行滚动、短长间隔、方向边界及 snap 小数对照
+    - 验收：逐事件与最终累计分别核对；量化暂未产生位移仍由当前容器消费，真实边界按策略传播，snap／clamp 差值不成为后续残差
+
+- `C31F6-09`
+    - 条件与入口：监听器移除 target／container、reparent，preventDefault 后移除、无变更、合法页面自行滚动、passive／stopPropagation 控制
+    - 验收：不误滚新父容器或无关 viewport，保留页面滚动与有效取消；reparent 的旧 outer 按原生稳定观察比较，不强行规定固定增量
+
+- `C31F6-10`
+    - 条件与入口：CSS zoom:2、transform:scale(2)、嵌套 zoom、frame 继承及元素／viewport 单位，两轴正负和边界传播
+    - 验收：元素增量按有效 CSS zoom 换算，一般 transform scale 保持原输入增量语义，viewport 单位独立验收
+
+- `C31F6-11`
+    - 条件与入口：standards／quirks 的 body block／contents、hidden／auto，root
+      visible／显式 overflow 与 containment 控制
+    - 验收：无主盒 body 不提供 viewport overflow，quirks 的特殊 client／scroll 尺寸如实记录，主盒与尺寸分别判断
+
+- `C31F6-SNAP`
+    - 条件与入口：100 px mandatory 列表从 400 输入 ±40，含 contain；proximity、无 snap 和 +200 控制，等待至少 800
+      ms 且取得 8 次稳定样本
+    - 验收：接受程序化吸附终点，另记录原生 wheel 终点；按此兼容性合同判断，其他滚动偏差仍独立验收
+
+- `C31F7-01`
+    - 条件与入口：安装当前 Extension，通过实际 SDK、生产 sendCommand/handleMessage 和 parser，主文档／iframe 的验证 marker 后原生 terminate；
+      evaluate/input、页面同文案及非法方法／参数控制
+    - 验收：原生中断为 unavailable，页面异常和协议参数错误为 error，保留 native
+      method/code/message；主动作一次且 completed，顶层 retryable=false，子校验重试独立
+
+- `C31F7-02`
+    - 条件与入口：普通／变换 iframe，scroll 监听器将目标 left 从 80 改为 240，move/down-up/touch/click、两模式及 CDP；touchstart 后再移位以产生真实 touchmove
+    - 验收：滚动事件与其监听器完成后读取当前局部几何，断言事件发生时的目标、rect 和实际坐标，并取得独立原生参照；协议整数取整单列，目标失效时当前事件零派发
+
+- `C31F7-03`
+    - 条件与入口：自然 200 ms 总预算，仅保持已成功完成的第一份 page_snapshot
+      ACK，evaluate/input 用户动作零派发；迟到 ACK、真正 unknown、completed 和队列控制
+    - 验收：顶层 false/not_started/context，pageContext.contextPhase=before，原 RPC
+      unknown 保留在 error 详情，原 Error 对象和类型保持，后继动作不重放
+
+- `C31F7-04`
+    - 条件与入口：foreignObject 自身 overflow:auto，以及 hidden+contain/none，两轴正负；普通 SVG、foreignObject 内 HTML 盒控制
+    - 验收：自身可滚动时优先消费，hidden 边界正确阻断，普通 SVG 不形成虚假边界，两种 Extension 模式共享行为
+
+- `C31F7-05`
+    - 条件与入口：高 99.8／宽 219.8、zoom
+      2 的真实末端，整数尺寸与内部位置对照；120 和连续八次 0.25，X/Y、RTL／反向布局及 auto/contain/none
+    - 验收：当前调用栈内区分真实末端与尚未量化的输入，实际末端立即按策略传播；ScrollTimeline 的空值、实时值和浮点端点精度分别记录，保留 transform 与 snap 控制
+
+- `C31F7-06`
+    - 条件与入口：同容器每次替换命中子节点、监听器每次 scrollBy50、两者组合；八次 0.25、间隔 50
+      ms，preventDefault 及新容器／文档、外部位置、zoom、方向和 snap 控制
+    - 验收：同容器余量连续，事件内页面位移与工具位移分别计算，事件间独立位置变化仍重置，分别核对 402／802 及每步位置，不把 clamp/snap 差值作为后续余量
+
+- `C31F7-07`
+    - 条件与入口：坐标专项正常结束和资源关闭失败控制，另保留业务失败与清理失败同时发生
+    - 验收：使用真实 close API，各资源独立关闭，正常无 cleanupError，任何清理失败产生非零退出，原业务错误与资源终态保留
+
+- `C31F8-01`
+    - 条件与入口：主文档／iframe、precise／stealth，普通 scroll、stopPropagation、stopImmediatePropagation 和 Window
+      capture 阻断；滚动监听器将目标 left 从 80 改为 240，mousemove 与 down-up
+    - 验收：可见页面完成滚动与渲染步骤后读取当前局部矩形，传播阻断不耗尽取点预算；实际事件命中目标且位于事件当时的矩形中心，独立原生参照命中相同目标
+
+- `C31F8-02`
+    - 条件与入口：light
+      DOM 目标通过 assignedSlot 投影到 Shadow 滚动盒，沿 slot／host 路径滚动，覆盖 C31F8-01 的传播、frame 和输入模式条件
+    - 验收：使用实际滚动盒完成后的布局取点，事件坐标与当前 frame-local 矩形一致，目标引用失效控制保持
+
+- `C31F8-03`
+    - 条件与入口：初始 before 快照成功后，保持已成功完成的第二份条件快照 ACK，自然 300
+      ms 总预算到期；evaluate 使用真实 expectedUrl，input 使用真实 expectedRevision；Extension／CDP、复用 Error 与迟到 ACK 控制
+    - 验收：主脚本／输入零派发，顶层 false/not_started/precondition，pageContext.contextPhase=precondition，原 Error 身份及辅助 RPC
+      unknown 保留；真实动作 unknown、completed 后元信息失败和后继请求保持原语义
+
+- `C31F8-BG`
+    - 条件与入口：自有后台主文档／iframe，precise／stealth 的 mousemove 与 down-up，滚动监听器阻断传播，另有独立原生参照
+    - 验收：页面始终 hidden，取点按当前布局完成，不等待暂停的动画帧；precise 返回 NATIVE_INPUT_UNAVAILABLE、false/not_started、retryable=false，
+      eventsExecuted=0，原生派发及工具 DOM 事件均为 0；stealth 完成且命中当前目标中心
+
+- `C31F9-01`
+    - 条件与入口：真实 SDK 调用中的目标列表、选择、frame、Challenge、diagnostics、globalThis 与逐事件准备回执未知；主脚本／输入实际派发及前序事件控制
+    - 验收：主动作未派发时为 false/not_started/context，条件读取使用 precondition，前序事件保留；原 Error、码与辅助 unknown 保留，真正派发后未知仍为 unknown，迟到回执不重放
+
+- `C31F9-02`
+    - 条件与入口：precise／stealth、参数／无参数下的可信 Function 编译策略拒绝、同 CSP 文案页面 throw／reject 和用户脚本内部 eval 拒绝
+    - 验收：仅可信编译拒绝返回 CSP_BLOCKED 且脚本未开始，页面异常保留原文与来源；分别记录受控矩阵和真实浏览器 CSP 结果
+
+- `C31F9-03`
+    - 条件与入口：controlled 输入的普通容器、disabled、readonly、file
+      input，以及合法 input／textarea／select／contenteditable
+    - 验收：不支持的目标在 focus、setter 与 input/change 前拒绝，合法控件保留原生 setter，文本和事件只更新一次
+
+- `C31F9-04`
+    - 条件与入口：一个显式页面长等待期间读取／更新另一页面的无条件 pageMetadata，再对照带 expectedUrl／expectedRevision 的备注请求
+    - 验收：无条件备注按显式目标独立完成，其他请求保持其页面和 frame；带条件备注仍按串行条件检查，失败保留原备注
+
+- `C31F9-05`
+    - 条件与入口：前序动作持锁，newPage 的显式 timeout 在队列中耗尽，另对照默认管理期限、正常创建与取消
+    - 验收：超期请求返回明确错误且零创建，默认期限为 30000 ms；后继请求仍可执行，已派发动作保留实际结果
+
+- `C31F9-06`
+    - 条件与入口：同一浏览器事件 controller 发生超过 20 次具名清理失败，包含可观测 ref、request
+      ID、target、owner 和 native session，再 dispose 并创建新 controller
+    - 验收：字符串与详情逐项对应，只保留最新 20 条；时间、阶段和归属正确，dispose 清除记录，新 controller 为空，已返回详情保持原归属
+
+- `C31F9-07`
+    - 条件与入口：主文档／iframe、precise／stealth、mousemove／down-up，真实 visible→hidden、hidden→visible 及两种往返转换，转换发生在取点准备期间
+    - 验收：保留真实 visibilitychange 时间和状态；结束时按当前布局取点，输入命中事件当时的矩形中心；precise 不可用时明确拒绝且零输入；转换不等待暂停的 rAF
+
+- `C31F9-08`
+    - 条件与入口：主文档／iframe、precise／stealth、mousemove／down-up，document、rAF 与嵌套滚动盒的监听器触发后续滚动
+    - 验收：最终滚动监听器处理完成后取得当前局部几何；实际事件命中目标中心，独立原生参照命中相同目标；持续滚动在原期限结束且该事件零输入
+
+- `C31F9-09`
+    - 条件与入口：CDP precise、Extension precise／stealth 的主文档／iframe，真实滚动监听器改变目标位置后的 click／touch
+    - 验收：保留相邻输入入口，事件坐标与当时 rect 一致，独立原生鼠标／触摸参照命中同一目标
+
+- `C31F9-10`
+    - 条件与入口：CSS＋exact 文本区分评分 2／-2；role=tab、name 的部分与精确匹配，嵌套 span、隐藏后代及显式名称优先级；主文档／iframe、两后端和 Extension 两输入模式
+    - 验收：精确评分只命中正值；tab 等内容命名角色取得可见后代名称，点击实际选中对应 tab；原标签优先级与隐藏规则保持
+
+- `C31F9-11`
+    - 条件与入口：使用 README 的 TagInput 示例输入文字、显式 Enter down/up，在主文档／iframe、CDP precise 与 Extension
+      precise／stealth 下提交
+    - 验收：真实页面生成对应标签且 postCondition 匹配；记录事件完成数和页面标签文本，具体业务站点按实际控件另验
+
+- `C31F9-12`
+    - 条件与入口：两后端先 download watch，再点击本地 HTTP attachment，等待独立 Chrome 完成下载，读取 download 日志
+    - 验收：文件内容正确，日志提供 completed 的原生下载 ref 和可用原始附件，stop 结束观察；隔离 profile 的下载目录由测试载体指定
+
+- `C31F9-13`
+    - 条件与入口：预算回调在 deadline−1 交付，对照导航等待、队列、Extension RPC、诊断准备与后续页面包装
+    - 验收：保留原回调立即结束合同；RPC 仍为 unknown 并发送 cancel，handler 清空；诊断传播同一预算 Error，预算结束后零额外上下文读取，原 C-P6/C31F5/C02/C19 保持
+
+- `C31F10-01`
+    - 条件与入口：主动作的 frame 准备回执保持期间，同页／跨页无条件 pageMetadata 读取、更新、null 清空，以及带自身条件的串行控制
+    - 验收：无条件备注独立完成且不继承或消费主动作条件；URL 改变后主动作按原条件拒绝，零业务效果，条件与 frame 在请求结束后清除
+
+- `C31F10-02`
+    - 条件与入口：预算回调在 deadline−1 结算，覆盖 list、snapshot、diagnostics 各阶段与已按下键的释放
+    - 验收：原预算 Error 与动作事实保持；结算后停止新增业务和后读，独立有界清理释放按键；业务派发与清理分别计数，迟到 ACK 不恢复请求
+
+- `C31F10-03`
+    - 条件与入口：页面 throw／reject 的 JSON 文本含 CSP 或业务 code、context 和额外字段，对照真实类型化工具错误及正常结构化返回
+    - 验收：页面消息按原文输出，页面字段不改变顶层动作事实，不生成焦点建议；可信工具错误与正常返回结构保持
+
+- `C31F10-04`
+    - 条件与入口：primitive 字符串 throw／reject，参数／无参数、主文档／iframe、CDP precise 与 Extension
+      precise／stealth；公共提取器另验空串、0、false、null、undefined
+    - 验收：保留无 description 时的 primitive value，已有 description／堆栈优先；原动作失败与来源保持
+
+- `C31F10-05`
+    - 条件与入口：input／textarea／select 位于 disabled fieldset 内，对照首个 legend 和普通可用控件
+    - 验收：有效禁用时拒绝且零 focus、setter 和输入事件；首个 legend 内合法控件可更新
+
+- `C31F10-06`
+    - 条件与入口：ordinary 与 customized built-in 的 input／textarea／select，对照原生 setter 缺失
+    - 验收：按实际表单接口选择原生 setter，更新和 input/change 各一次；setter 缺失时明确失败且零副作用
+
+- `C31F10-FOREIGN`
+    - 条件与入口：同源 iframe 创建控件后 adopt 至当前文档，保留 foreign prototype，并对照 adopt 的 file input
+    - 验收：CSS 定位到同一节点，ownerDocument 为当前文档且 local
+      instanceof 为 false；合法控件正常更新，file 在 focus 和输入事件前拒绝
+
+- `C31F10-CASCADE`
+    - 条件与入口：祖先滚动后依次滚动一个或两个非祖先 sibling，最终监听器移动目标；主文档／iframe、precise／stealth、mousemove／down-up
+    - 验收：保留真实滚动和输入时序，实际事件命中当时的目标中心，独立原生参照命中相同目标；模型另验 Shadow
+      root 的非冒泡通知、传播阻断及资源清理
+
+- `C31F10-T01`
+    - 条件与入口：准备阶段超期后的目标恢复，分别读取 restored／failed 的真实终态
+    - 验收：restored 对应原目标，failed 对应清空目标和恢复错误；主动作零派发、辅助 unknown、前序进度与清理状态按原断言验收
+
+- `C31F11-01`
+    - 条件与入口：stealth 返回循环对象、BigInt、toJSON 抛错、Node、NodeList、HTMLCollection，对照正常结构化返回；主文档／iframe、参数／无参数
+    - 验收：脚本执行一次，序列化失败为 NON_SERIALIZABLE_EVALUATE_RESULT，actionExecuted=true、completed/output、retryable=false；正常返回值保持
+
+- `C31F11-02`
+    - 条件与入口：throw／Promise.reject 空字符串，对照页面抛出伪造 output 标记及同名结构化错误 JSON；两后端、precise／stealth、主文档／iframe、参数／无参数
+    - 验收：空原文保持，页面 JSON 按原文返回，类别仍为页面动作失败，页面字段不改变顶层 completed／failed 事实
+
+- `C31F11-03`
+    - 条件与入口：open／refresh／back／forward 的生产导航等待在请求 deadline−1 或 deadline 结算；三类等待器分别对照整请求期限与较短子操作期限
+    - 验收：整请求结算保存并传播同一预算 Error，停止后续页面与诊断读取，导航只派发一次且保持 unknown／非重试；较短等待超时保留剩余请求预算
+
+- `C31F11-T01`
+    - 条件与入口：adopt 控件在主动作前检查 localInstance=false、foreignInstance=true；另用正确／错误 realm 观测记录检验前提断言
+    - 验收：错误 realm 在业务派发前拒绝；真实 Chrome 合法控件更新和 adopted file 零输入副作用保持
+
+- `C31F11-OBS`
+    - 条件与入口：另一 Shadow root 内 sibling 级联、提前注册的 document
+      capture 监听器触发级联后阻断传播、目标稳定时无关 scroller 持续滚动
+    - 验收：按实际事件命中、事件时 rect、动作终态和期限裁定；保留原生时序和独立参照，无关滚动保持目标可操作
+
+- `C31F12-01`
+    - 条件与入口：返回值完成 Promise 等待后的 Proxy
+      getPrototypeOf、Node 及集合诊断 getter 抛错；JSON.stringify 抛错或返回非法／空／非字符串结果、错误详情 JSON 结构无效；
+      对照合法 undefined／函数／0／false／null／空字符串及 revoked
+      Proxy 的 Promise adoption
+    - 验收：输出检查、结果及错误详情解析异常保持 NON_SERIALIZABLE_EVALUATE_RESULT、completed/output、actionExecuted=true、retryable=false；
+      摘要生成失败保留原文并报告具体失败；合法返回值保持，Promise 等待拒绝与页面主动抛错保持页面动作失败
+
+- `C31F12-02`
+    - 条件与入口：back／forward 主命令明确拒绝、重复拒绝、正常完成、无历史、请求取消和断连
+    - 验收：返回原 Error，局部等待的 timer、事件与 disconnected 监听器立即释放；主命令不重放，局部取消不结束仍有效的请求预算，后继请求可用
+
+- `C31F12-O-S1`
+    - 条件与入口：准备开始后由滚动监听器新建外部 open Shadow root，再在该 root 中滚动并移动目标
+    - 验收：每次稳定采样纳入新 root；保留实际输入时 rect、命中、当前返回快照与后续级联终态，按实际错误命中裁定
+
+- `C31F12-O-S2`
+    - 条件与入口：同一外部源在 scroll 监听器中同步再次滚动，数次后才移动目标；对照无关 rAF 滚动与重复使用的事件对象
+    - 验收：用 scroll 至 scrollend 的偏移变化识别同步后续滚动；同次传播保留首个观察偏移，后续派发更新采样；相关同步级联等待结束，无关 rAF 滚动保持稳定目标可操作，全部监听器按原期限清理
+
+- `C31F13-AUX`
+    - 条件与入口：mousemove、非左键 click、touchstart、mousedown 的坐标准备求值在类型检查、摘要生成、结果解析或错误详情解析失败，主文档／iframe，对照前序键盘事件
+    - 验收：首个输入未派发时 false/not_started/context，零坐标输入；前序已确认输入保持计数，辅助错误原完成事实与原错误码保持，后续事件不派发
+
+- `C31F13-DIAG`
+    - 条件与入口：首次输出异常后，错误摘要序列化返回坏 JSON、空串、缺字段、JSON
+      null、非字符串数值或 null；主文档／iframe、参数／无参数
+    - 验收：error.context.originalOutputError 保留首次诊断，后续解析错误及 completed/output 保持；页面主动抛错的原文与来源保持
+
+- `C31F13-SCROLL-OBS`
+    - 条件与入口：稳定目标旁的持续同步自滚动，precise／stealth、主文档／iframe、mousemove／down-up，纳入默认观察条件，也可用 COORD_FILTER 含 sync-unrelated 定向执行
+    - 验收：原 completed 可操作性断言保持；主输入命中当时目标矩形，独立原生参照保持同一滚动负载且命中相同目标，返回后监听器与 MessagePort 已释放，取消时零主输入
+
+- `C31F14-FRAME-PROBE`
+    - 条件与入口：可用的所选 iframe 旁有注入拒绝或持续加载的兄弟 frame，分别延迟父页面 isolated／MAIN world 的 500
+      ms 定时器，对照普通本地文件页
+    - 验收：selector／index 映射保持真实 sender、document 与 owner 校验；所选 iframe 正常读取，未依赖页面定时器，兄弟 frame 的不可用原因可见
+
+- `C31F14-FRAME-CANCEL`
+    - 条件与入口：child listener 安装、DOM 与 CDP
+      owner 探测等待期间取消、请求期限耗尽或等待 API 拒绝，随后执行同 tab 请求
+    - 验收：安装等待按 Extension 计时和请求期限结束，不可用原因可见；主脚本未派发时保留 false/not_started；探测资源释放，晚到探测拒绝，后继请求可用
+
+C31F9／C31F10 的阶段、错误、管理与清理控制位于
+`test/finding-regressions.test.js`、`test/browser-events.test.js`，请求条件隔离与预算 SDK 条件通过
+`test/review-c31f10-request-lifecycle.test.js`
+纳入常规测试；Extension 编译、controlled 及 Shadow 事件控制由现有 Vite 测试入口执行；滚动等待单测执行生产生成脚本，核对级联、隐藏、可见性转换、持续滚动期限，
+以及所有 scroll／`scrollend`／visibilitychange 监听器、rAF、计时器和 MessagePort 的清理；`test/review-scroll-settlement.test.js`
+纳入
+`npm test`，覆盖无关循环滚动、有限级联、持续目标移动和取消后的清理；frame 探测模型由 Extension 的 ER-08 执行实际注入函数，页面计时器调用直接失败，ER-08a 验证 listener 安装等待的默认期限、
+取消、请求期限和迟到拒绝；受控计时回调提前 1
+ms 时，核对继续等待原绝对期限、TIMEOUT 分类和主脚本零派发；原生验收在独立 Chrome 中使用实际 Extension
+API，控制的页面计时器或原生 API 延迟须与自然后台限频分别记录
+
+C31F14 的 precise iframe 执行先通过内部 `prepare_frame_evaluation` 解析 owner/context，该请求不携带用户表达式；准备成功后使用同一期限发送现有 `evaluate_in_frame`，执行前复查文档、父文档、URL、session 与 context 身份
+准备失败、取消及到期分别核对 `false/not_started`、用户脚本零派发与 revision 保持；表达式已发送后的未知结果仍为 `unknown`，仅显式 `readOnly` 保留原一次 stale 重试
+Bridge 自动回归另验准备 ACK 后、主请求发送前取消或耗尽期限，公开结果保持 `false/not_started/context`；页面条件跨准备和执行保留，旧 Extension 明确不支持准备动作时给出可见兼容提示，其余准备错误直接结束请求
+准备完成后删除 iframe、拒绝 attach 或耗尽脚本预算时，通过实际 ActionHandler 核对零执行与 revision 保持；`readOnly` 首次脚本已派发后再发生准备错误，执行状态保持 `unknown`
+分别延迟 `DOM.getFrameOwner`、`DOM.resolveNode` 和启动 owner promise 的 `Runtime.callFunctionOn` 原生回执，在取消与到期后、原回执仍未返回时验证同 tab 后继可完成；迟到回执仅触发对象取消和释放，旧 token 拒绝接收，用户脚本保持零派发
+
+C31F6／C31F7／C31F8／C31F9／C31F10 验收按语义子条件记录来源、输入、实际命中、事件字段、位置／页面计数和资源终态，实际 SDK、注册 handler、原生参照序列／事件与布局观测分别计数；
+真实浏览器结果与 VM／合成协议结果分开，受控 Date 仅用于声明的总预算边界；原 C02 的 70
+ms 真实期限和 C19 的 1 ms／原断言保持，首次失败与最终结果分别保存到执行材料
 
 两端构建完成后，使用同一 Chrome 执行 C31F6 专项入口，第二个参数可指定 JSON 结果位置：
 
@@ -269,37 +598,76 @@ node test/review-c31f6-wheel-native.mjs /path/to/chrome [OUTPUT_JSON]
 node test/review-c31f6-coordinates-native.mjs /path/to/chrome [OUTPUT_JSON]
 ```
 
-lifecycle 使用实际 SDK 与生产 CDPClient，wheel 使用安装当前生产模块的 Extension handler，coordinates 使用实际 SDK、生产 Bridge 参数和安装的 ActionHandler；coordinates 的测试载体传输与正式 Extension 发现连接分别判断，具体受控条件和调用分类记录在各入口的结果中
-wheel 默认执行全部语义条件，`C31F6_WHEEL_ONLY=1` 限定滚动分区，`C31F6_CASE_FILTER` 用正则筛选滚动条件 ID；定向结果按实际选择记录，不替代完整验收
-coordinates 的 `COORD_MODE=cdp|extension` 选择后端，`COORD_FILTER` 用正则筛选条件 ID；`^extension-late-metadata-` 覆盖已匹配校验之后、页面信息读取期间到期／取消的主文档与 iframe 控制，核对原 tab/session 的 native keyup、原文档键终态、默认页／父文档无按键、handler 结束与 500 ms evaluate／400 ms input 后继请求
-晚 metadata 控制仅保持真实成功 page_snapshot 的响应交付，等待使用生产预算／取消 helper；实际 SDK 回包、内部 handler 完成、DOM 事件与测试页最终清理分别记录
-lifecycle 的 `C31F6_LIFECYCLE_FILTER` 按条件名称筛选，`execution-(terminated|timeout)$` 对比原生终止／原生超时和同文案页面异常；终止由独立观测连接在收到脚本 console marker 后执行 Runtime.terminateExecution，原生超时组将同一验证函数与参数改由 Runtime.evaluate 的 1 ms 期限执行，本地请求期限保持，记录实际原生错误码与页面异常来源
-coordinates 的 `^dynamic-zoom-` 在同一输入请求内由 wheel 监听器改变 iframe／祖先 zoom，比较 1→2、2→1、1→1、单层／嵌套与 point／selector 的实际命中；`^zoom-anchor-` 核对独立 rotate／负 scale 参考盒拒绝、零原生派发和前序 wait 完成事实
+lifecycle 使用实际 SDK 与生产 CDPClient，wheel 使用安装当前生产模块的 Extension
+handler，coordinates 使用实际 SDK、生产 Bridge 参数和安装的 ActionHandler；coordinates 的测试载体传输与正式 Extension 发现连接分别判断，
+具体受控条件和调用分类记录在各入口的结果中；wheel 默认执行全部语义条件，`C31F6_WHEEL_ONLY=1`
+限定滚动分区，`C31F6_CASE_FILTER` 用正则筛选滚动条件 ID；定向结果按实际选择记录，不替代完整验收；coordinates 的
+`COORD_MODE=cdp|extension` 选择后端，`COORD_FILTER` 用正则筛选条件 ID；`^extension-late-metadata-`
+覆盖已匹配校验之后、页面信息读取期间到期／取消的主文档与 iframe 控制，核对原 tab/session 的 native
+keyup、原文档键终态、默认页／父文档无按键、handler 结束与 500 ms evaluate／400 ms
+input 后继请求；晚 metadata 控制仅保持真实成功 page_snapshot 的响应交付，等待使用生产预算／取消 helper；实际 SDK 回包、内部 handler 完成、DOM 事件与测试页最终清理分别记录；
+lifecycle 的
+`C31F6_LIFECYCLE_FILTER` 按条件名称筛选，`execution-(terminated|timeout)$`
+对比原生终止／原生超时和同文案页面异常；终止由独立观测连接在收到脚本 console
+marker 后执行 Runtime.terminateExecution，原生超时组将同一验证函数与参数改由 Runtime.evaluate 的 1
+ms 期限执行，本地请求期限保持，记录实际原生错误码与页面异常来源；coordinates 的 `^dynamic-zoom-`
+在同一输入请求内由 wheel 监听器改变 iframe／祖先 zoom，比较 1→2、2→1、1→1、单层／嵌套与 point／selector 的实际命中；`^zoom-anchor-`
+核对独立 rotate／负 scale 参考盒拒绝、零原生派发和前序 wait 完成事实
 
-C31F7 条件复用上述三个入口：coordinates 的 `^c31f7-origin-` 核对真实原生终止及页面同文案，`^c31f7-before-snapshot-` 核对主动作零派发与原 RPC unknown，`^c31f7-scroll-` 核对实际滚动监听器之后的取点和原生命中；wheel 的 `^c31f7-` 覆盖 foreignObject 自身、分数末端和同容器余量，`^c31f7-boundary-probe-` 为纵轴八组基础观测
+C31F7 条件复用上述三个入口：coordinates 的 `^c31f7-origin-` 核对真实原生终止及页面同文案，`^c31f7-before-snapshot-`
+核对主动作零派发与原 RPC unknown，`^c31f7-scroll-` 核对实际滚动监听器之后的取点和原生命中；wheel 的 `^c31f7-`
+覆盖 foreignObject 自身、分数末端和同容器余量，`^c31f7-boundary-probe-` 为纵轴八组基础观测
 
-C31F8 使用 coordinates 的 `COORD_MODE=extension COORD_FILTER='^c31f8-'`：`^c31f8-scroll-` 覆盖传播与 assignedSlot，`^c31f8-condition-snapshot-` 保持第二份条件快照，`^c31f8-hidden-` 分别核对后台 precise 明确拒绝与 stealth 成功；单测 `finding-regressions.test.js` 的 C31F8 条件覆盖两后端、两种 expected 条件、原 Error 复用、迟到 ACK 和后继请求
+C31F8 使用 coordinates 的 `COORD_MODE=extension COORD_FILTER='^c31f8-'`：`^c31f8-scroll-`
+覆盖传播与 assignedSlot，`^c31f8-condition-snapshot-` 保持第二份条件快照，`^c31f8-hidden-`
+分别核对后台 precise 明确拒绝与 stealth 成功；单测 `finding-regressions.test.js`
+的 C31F8 条件覆盖两后端、两种 expected 条件、原 Error 复用、迟到 ACK 和后继请求
 
-C31F9 使用 coordinates 的 `^c31f9-csp-`、`^c31f9-visibility-`、`^c31f9-cascade-`、`^c31f9-adjacent-` 和 `^c31f9-semantic-` 过滤器分别执行真实 CSP、可见性、滚动级联、相邻输入与语义定位条件，`^c31f9-taginput-` 验证标签提交示例，`^c31f9-download-` 复核下载观察与真实文件的对应关系
-CSP 页面由本地 HTTP 服务发送真实策略 header；页面异常、动态编译拒绝和用户脚本内部 eval 拒绝分别验收
-可见性条件使用真实 tab 转换，并保持页面 rAF／MessageChannel 准备回调至转换结束；document／rAF／nested 级联条件均在同一个 scroller 上二次滚动
+C31F9 使用 coordinates 的 `^c31f9-csp-`、`^c31f9-visibility-`、`^c31f9-cascade-`、`^c31f9-adjacent-` 和
+`^c31f9-semantic-` 过滤器分别执行真实 CSP、可见性、滚动级联、相邻输入与语义定位条件，`^c31f9-taginput-`
+验证标签提交示例，`^c31f9-download-`
+复核下载观察与真实文件的对应关系；CSP 页面由本地 HTTP 服务发送真实策略 header；页面异常、动态编译拒绝和用户脚本内部 eval 拒绝分别验收；可见性条件使用真实 tab 转换，
+并保持页面 rAF／MessageChannel 准备回调至转换结束；document／rAF／nested 级联条件均在同一个 scroller 上二次滚动
 
-C31F10 的 `^c31f10-controlled-` 验证 disabled fieldset、first legend、customized built-in 与同源 adopt 控件；`^c31f10-primitive-` 验证真实浏览器 primitive 字符串异常；`^c31f10-cascade-` 验证祖先、单 sibling 与 two-sibling 的真实滚动级联
-常规 SDK 条件隔离与 deadline−1 预算结算由 `test/review-c31f10-request-lifecycle.test.js` 执行，受控 Extension peer 和时钟边界在结果中注明；真实 Node/V8 Inspector 的异常响应与真实 Chrome 结果分别记录
-C31F11 的常规输出与导航回归由 `test/review-c31f11-output.test.js`、`test/review-c31f11-navigation.test.js` 执行；coordinates 的 `^c31f11-output-` 验证真实浏览器空异常、可信输出失败与正常返回，`^c31f11-observation-` 记录三项坐标观察的真实时序和命中
-外来 realm 用例在主动作前断言 localInstance=false、foreignInstance=true，错误前提直接终止该用例
+C31F10 的 `^c31f10-controlled-` 验证 disabled fieldset、first legend、customized
+built-in 与同源 adopt 控件；`^c31f10-primitive-` 验证真实浏览器 primitive 字符串异常；`^c31f10-cascade-`
+验证祖先、单 sibling 与 two-sibling 的真实滚动级联；常规 SDK 条件隔离与 deadline−1 预算结算由
+`test/review-c31f10-request-lifecycle.test.js` 执行，受控 Extension peer 和时钟边界在结果中注明；真实 Node/V8
+Inspector 的异常响应与真实 Chrome 结果分别记录；C31F11 的常规输出与导航回归由
+`test/review-c31f11-output.test.js`、`test/review-c31f11-navigation.test.js` 执行；coordinates 的 `^c31f11-output-`
+验证真实浏览器空异常、可信输出失败与正常返回，`^c31f11-observation-`
+记录三项坐标观察的真实时序和命中；外来 realm 用例在主动作前断言 localInstance=false、foreignInstance=true，错误前提直接终止该用例
 
-额外边界调查使用 `C31F7_BOUNDARY_OBSERVATIONS=1` 配合 `C31F6_WHEEL_ONLY=1`、`C31F6_CASE_FILTER=^c31f7-boundary-listener-`，记录监听器同次改变尺寸并在内部／末端间移位的原生路由；各次原生结果分别保留，差异仍返回 FAIL 和非零退出，原生路由未稳定时保持未裁定并单独统计
+额外边界调查使用 `C31F7_BOUNDARY_OBSERVATIONS=1` 配合
+`C31F6_WHEEL_ONLY=1`、`C31F6_CASE_FILTER=^c31f7-boundary-listener-`，记录监听器同次改变尺寸并在内部／末端间移位的原生路由；各次原生结果分别保留，
+差异仍返回 FAIL 和非零退出，原生路由未稳定时保持未裁定并单独统计
 
-同阶段边界验收在独立进程中增加 `C31F7_WHEEL_PHASE_CONTROL=1`，仍筛选上述边界条件并限定滚动分区；每份工具及原生输入都在配置页面期间推进虚拟时钟，输入前暂停时钟，使监听器执行期间保持相同的渲染阶段，结果注明 `renderPhaseControl`，位置仍按原 0.02 CSS px 容差逐项比较，事件次数、原始输入和等待预算保持
+同阶段边界验收使用独立进程，同时设置
+`C31F7_WHEEL_PHASE_CONTROL=1`、`C31F7_BOUNDARY_OBSERVATIONS=1`、`C31F6_WHEEL_ONLY=1` 和
+`C31F6_CASE_FILTER=^c31f7-boundary-listener-`；入口在构建和启动 Chrome 前校验 wheel-only、非空且全部包含 eventBoundary 的筛选结果，并拒绝与
+`C31F6_GEOMETRY_DIAGNOSTIC` 混用，不支持的组合直接报错退出
 
-同阶段条件应覆盖 X／Y、auto／contain／none、内部到末端及末端到内部，并与相同条件的原生对原生重复控制一起判断；原生对原生出现差异时保留 FAIL，恢复调查，默认时钟的原始调查结果继续单列
+每份工具、原生和重复原生输入均重新配置相同页面，配置期间推进虚拟时钟，输入前暂停时钟，结果注明
+`renderPhaseControl`，位置仍按原 0.02 CSS px 容差逐项比较，事件次数、原始输入和等待预算保持；`nativeRepeat`、`nativeRepeatSteps` 和
+`nativeControl` 记录第二份原生序列、逐步快照及原生对原生比较，两份原生序列均计入实际派发次数
+
+同阶段条件覆盖 X／Y、auto／contain／none、内部到末端及末端到内部；工具与原生的差异保留原 FAIL，原生对原生出现差异时同时记录
+`nativeControl.status=FAIL` 和位置差异，整体返回 FAIL 并恢复调查，默认时钟的原始调查结果继续单列
+
+自然时钟下的后续分区使用全新独立浏览器，设置 `C31F6_CASE_FILTER=^$`，其余同阶段和 wheel-only 标志保持未设置；按原入口执行主文档修饰键、默认激活、页面错误、geometry 和 frame-modifiers，复用原 wheel 成功记录；混合配置的原始 FAIL 继续保留
 
 Extension 模型同时验证监听器改变尺寸后的起始路径、范围归零、有效取消和三个 overscroll 策略；`remove-target`、`remove-container`、reparent、小数余量及程序化吸附仍由原默认矩阵验收
 
-wheel 入口筛选 `^integer$` 并使用 `WHEEL_CLEANUP_FAILURE=http`，在实际关闭 HTTP 后注入一次具名清理失败，应保留原业务结果、完成 Chrome、日志、pipe 和 profile 清理，并返回 ERROR 和非零退出；再同时设置 `WHEEL_BUSINESS_FAILURE=integer`，核对 `businessStatus=FAIL`、受控业务错误、`cleanupErrors` 与最终资源状态
+wheel 入口筛选 `^integer$` 并使用
+`WHEEL_CLEANUP_FAILURE=http`，在实际关闭 HTTP 后注入一次具名清理失败，应保留原业务结果、完成 Chrome、日志、pipe 和 profile 清理，并返回 ERROR 和非零退出；再同时设置
+`WHEEL_BUSINESS_FAILURE=integer`，核对 `businessStatus=FAIL`、受控业务错误、`cleanupErrors` 与最终资源状态
 
-coordinates 的 `COORD_CLEANUP_FAILURE=session` 在实际关闭该资源后产生一次具名清理失败，用单个正常条件执行时应得到 ERROR 和非零退出；核对 observer、Chrome、HTTP 和 pipe 仍完成清理，完整正常运行应无 cleanupError；再与 `COORD_BUSINESS_FAILURE=ordinary-point-mousemove` 同用，筛选该条件，核对最终 FAIL、原业务错误和具名清理错误同时保留
+原生载体使用短路径的私有 HOME／TMPDIR 和独立 profile，避免 Unix socket 路径超长；Chrome 启动失败、提前退出或 pipe 错误时，应保留原错误并拒绝所有 pending 请求，继续关闭 HTTP、日志、pipe 和自有 profile，记录
+`chromeClosed`、`pipePending` 及其他资源终态；profile 尚未创建时正常完成清理，业务失败与清理失败分别保留，任一失败均返回非零退出
+
+coordinates 的 `COORD_CLEANUP_FAILURE=session`
+在实际关闭该资源后产生一次具名清理失败，用单个正常条件执行时应得到 ERROR 和非零退出；核对 observer、Chrome、HTTP 和 pipe 仍完成清理，完整正常运行应无 cleanupError；再与
+`COORD_BUSINESS_FAILURE=ordinary-point-mousemove` 同用，筛选该条件，核对最终 FAIL、原业务错误和具名清理错误同时保留
 
 安装 Extension 的四个 TypeScript 测试入口使用 test/tsconfig.json，继承现有 Extension 编译选项，执行无输出语义检查：
 
@@ -307,18 +675,27 @@ coordinates 的 `COORD_CLEANUP_FAILURE=session` 在实际关闭该资源后产�
 node node_modules/typescript7/bin/tsc -p test/tsconfig.json --noEmit
 ```
 
-`test/review-c31f5-post-condition.test.js` 通过实际 SDK 和生产注册入口、UnifiedSession、Bridge／HttpServer 验证期限分类，socket 和浏览器结果为受控合成数据，纯自有脚本在 Node 中执行；确定性边界只在读取派发后固定 Date.now，setTimeout 采样保留原生调用与句柄，未改时钟的 70 ms 组单独保留
+`test/review-c31f5-post-condition.test.js`
+通过实际 SDK 和生产注册入口、UnifiedSession、Bridge／HttpServer 验证期限分类，socket 和浏览器结果为受控合成数据，纯自有脚本在 Node 中执行；确定性边界只在读取派发后固定 Date.now，
+setTimeout 采样保留原生调用与句柄，未改时钟的 70
+ms 组单独保留
 
 ```bash
 node --test test/review-c31f5-post-condition.test.js test/review-input.test.js
 ```
 
-原生 wheel 矩阵保留既有组，`source="report"` 标记原报告九组 display 与七组 fixed 包含块场景，两模式和两种 frame 共 64 对；`source="extended"` 单独标记相邻布局扩展，包括 block ruby 的 auto／hidden + contain 及普通 inline ruby 控制，分别记录实际发出的公开输入和原生参照，失败前置不增加调用计数
+原生 wheel 矩阵保留既有组，`source="report"`
+标记原报告九组 display 与七组 fixed 包含块场景，两模式和两种 frame 共 64 对；`source="extended"`
+单独标记相邻布局扩展，包括 block ruby 的 auto／hidden + contain 及普通 inline
+ruby 控制，分别记录实际发出的公开输入和原生参照，失败前置不增加调用计数
 
-`test/review-c31f4-cancellation.test.js` 使用现有 Vite 从 `test/review-c31f4-extension.ts` 构建当前生产模块，Chrome API 和 socket 为受控接口，请求与取消由实际 SDK、HttpClient、ActionHandler 执行，文件发布使用真实本地文件系统
+`test/review-c31f4-cancellation.test.js` 使用现有 Vite 从 `test/review-c31f4-extension.ts` 构建当前生产模块，Chrome
+API 和 socket 为受控接口，请求与取消由实际 SDK、HttpClient、ActionHandler 执行，文件发布使用真实本地文件系统
 
-C19 的 origin-wait 字段传递语义中，verification-failure 保留 1 ms 和原 not_matched 断言，使用受控时钟完成正常 false 读取后再推进期限，合成返回值保持生产的 matched 对象形状
-C02 的表达式／函数／async／Promise／false／抛错语义使用内置受控时钟；真实预算测试保留 70 ms 及 unavailable／retryable=true 断言，单独记录读取与预算时序，完整运行与定向运行的结果分别保存在对应执行材料中
+C19 的 origin-wait 字段传递语义中，verification-failure 保留 1
+ms 和原 not_matched 断言，使用受控时钟完成正常 false 读取后再推进期限，合成返回值保持生产的 matched 对象形状；C02 的表达式／函数／async／Promise／false／抛错语义使用内置受控时钟；
+真实预算测试保留 70
+ms 及 unavailable／retryable=true 断言，单独记录读取与预算时序，完整运行与定向运行的结果分别保存在对应执行材料中
 
 Cookie 原生资源回归使用独立 profile、BrowserContext、A/B 页面和合成 Cookie，先构建 Server，再执行：
 
@@ -326,7 +703,8 @@ Cookie 原生资源回归使用独立 profile、BrowserContext、A/B 页面和�
 node test/review-c31f3-cookie-native.mjs /path/to/chrome [OUTPUT_JSON]
 ```
 
-该入口保持原生连接直到资源存活与回收断言完成，取消通过实际 SDK 通知，pipe 仅控制指定 ACK 交付；构造 attach 拒绝时等待 getTargets 确认目标消失，再派发 attach 并核对其原生错误，另保留成功 attach 后关闭页面的控制，sdkCalls 在实际调用发出时计数，completedChecks 单独记录；命名的清理失败场景注入一次 detach 协议拒绝，分别记录真实资源存活、可见未知状态及探针最终清理
+该入口保持原生连接直到资源存活与回收断言完成，取消通过实际 SDK 通知，pipe 仅控制指定 ACK 交付；构造 attach 拒绝时等待 getTargets 确认目标消失，再派发 attach 并核对其原生错误，
+另保留成功 attach 后关闭页面的控制，sdkCalls 在实际调用发出时计数，completedChecks 单独记录；命名的清理失败场景注入一次 detach 协议拒绝，分别记录真实资源存活、可见未知状态及探针最终清理
 
 原生 wheel 回归需要支持 Extensions.loadUnpacked 的 Chrome 和 Extension 开发依赖，在 mcp-chrome 目录先完成两端构建，再执行：
 
@@ -334,9 +712,12 @@ node test/review-c31f3-cookie-native.mjs /path/to/chrome [OUTPUT_JSON]
 node test/review-c31f2-native.mjs /path/to/chrome
 ```
 
-该入口创建独立 headless 浏览器、profile、测试 Extension 与本地合成页面，保留生产 driver 选择、tab/frame 作用域、input cleanup 和 Bridge/HttpServer，命令输运与页面元信息由测试适配，结果写入本次临时目录并输出路径，可用第二个路径参数指定 JSON 位置；单轴输入比较目标自身、container/祖先/root/body/viewport 的完整原生 wheel 位置，混合输入使用重建页面上的 X-only、Y-only 原生事件分别比较，记录原始快照及事件 isTrusted
+该入口创建独立 headless 浏览器、profile、测试 Extension 与本地合成页面，保留生产 driver 选择、tab/frame 作用域、input
+cleanup 和 Bridge/HttpServer，命令输运与页面元信息由测试适配，结果写入本次临时目录并输出路径，可用第二个路径参数指定 JSON 位置；单轴输入比较目标自身、
+container/祖先/root/body/viewport 的完整原生 wheel 位置，混合输入使用重建页面上的 X-only、Y-only 原生事件分别比较，记录原始快照及事件 isTrusted
 
-原生浏览器定向验收使用独立 profile、隔离 CDP 浏览器或隔离 Extension 和合成页面、Cookie；记录真实 frameId、documentId、旧新文档的 wheel/滚动计数及 Cookie 保留集合，页面脚本或 VM 回归与真实 Extension／桌面行为分别记录
+原生浏览器定向验收使用独立 profile、隔离 CDP 浏览器或隔离 Extension 和合成页面、Cookie；记录真实 frameId、documentId、旧新文档的 wheel/滚动计数及 Cookie 保留集合，
+页面脚本或 VM 回归与真实 Extension／桌面行为分别记录
 
 验收标准：
 
@@ -349,7 +730,8 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - `F072`：在隔离编辑器中确认默认 precise 换行派发 Enter；controlled 完整替换和 editorInsert 选区插入不派发
   Enter，末尾空选区用于追加，业务页面的提交与草稿须单独验收
 - `F074`：dispatch_input 的空结果或缺少布尔 success 返回结构化 unknown，单次派发不重放；合法 null/void 辅助读取及 CH-13 的
-  contenteditable、原生 value setter 仍成立
+  contenteditable、原生 value
+  setter 仍成立
 - Extension 页面创建保留默认 30 秒加载等待与 5 秒 RPC 传输余量，显式 `timeout=0` 不替换成默认值
 - `open`、`back`、`forward`、`refresh`
   从请求入口起共用 timeout，页面选择、队列、协议、加载、Challenge、诊断和恢复不重新开始等待；导航 RPC 不额外增加传输余量，零预算不派发导航
@@ -365,7 +747,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - CDP 历史等待接受当前 session 主 frame 的 BFCache 恢复、同文档或 load 完成事件，不接受普通 frame
   commit、子 frame 或其他 session 的完成事件，完成或失败后清理监听器
 - CDP 导航只接受当前主 frame loader 的目标生命周期事件；同文档 `networkidle`
-  必须等待导航后发起的请求结束并持续静默 500ms
+  必须等待导航后发起的请求结束并持续静默 500 ms
 - Extension 跨文档导航只接受本次主文档的 `documentId`；同文档导航还必须匹配动作前的 `documentId`
   和规范化后的目标 URL；事件先完成后 action 失败仍须返回 action 错误
 - Extension evaluate 必须等待 Promise；显式 timeout 到期后，未完成的 Promise 返回 `Evaluation timeout after <N>ms`
@@ -378,7 +760,8 @@ node test/review-c31f2-native.mjs /path/to/chrome
   保持 timeout，直到新 root Document 开始或 tab cleanup；debugger detach 或 Network 观测未建立时返回明确观测错误
 - `CS-N03`：让 CDP 输入序列阻塞在首次按键 RPC，同时请求 Extension
   connect；后者须等待输入和目标恢复，第二个按键仍发送到 CDP，结束后保留新模式
-- `CS-N05`：同时连接 Extension 与显式 CDP，向 CDP target 传入 `frame`；成功解析或报告 CDP frame 错误，Extension 默认页的计数器不变
+- `CS-N05`：同时连接 Extension 与显式 CDP，向 CDP target 传入 `frame`；成功解析或报告 CDP
+  frame 错误，Extension 默认页的计数器不变
 - `CS-N01`：在 CDP 页面 A 留下日志，临时在 B 执行 evaluate，再读 A/B 日志；各页日志保留且互不混用，显式
   clear、关闭目标和连接重置按各自范围清理
 - `CS-N02`：模拟收到 200 响应头后响应体失败；保留 status 与 errorText，只记录一次终态；正常 body 完成后清理关联，其他 session
@@ -451,7 +834,8 @@ node test/review-c31f2-native.mjs /path/to/chrome
   捕获窗口图像期间触发 A→B→A，图像被丢弃，onActivated 监听清理，稳定 A 的对照成功
 - `CH-09/20`：在途请求开始后调用独立 idle 等待，再 clear 日志，等待必须持续到请求结束加静默期；结束或失败只生成一条新记录，其他
   session 事件不改变等待
-    - CDP 中分别创建 Blob 和 HTTP Worker，确认收到消息并结束 Worker 后，独立 idle 和同文档 `networkidle` 成功；覆盖等待前和等待期间的
+    - CDP 中分别创建 Blob 和 HTTP Worker，确认收到消息并结束 Worker 后，独立 idle 和同文档 `networkidle`
+      成功；覆盖等待前和等待期间的
       Worker 请求，保留原生 `requestWillBeSent` 的 `loaderId` 与终态事件记录
     - 使用普通页面 Fetch 和外部 Script 对照，覆盖等待前和等待期间发起请求；请求结束加静默期后才成功，超时、取消和断连清理等待器；清除日志后完成的有效请求仍可读取
     - 空 `loaderId` 标识 Worker 请求，其缺失终态不阻止页面静默；普通页面 Script 仍参与等待，判定保持网络静默合同
@@ -502,7 +886,8 @@ node test/review-c31f2-native.mjs /path/to/chrome
     - 每个元素包含 `targetId / type / url / title / mode / managed / isActive / windowId / index`
     - 默认 `details=summary`，Extension 返回 `windowCount / windows[].targetIds` 窗口关系
     - Chrome 有聚焦窗口时，`focusedWindowId` 指向该窗口，`activeTargetId` 指向该窗口的活动页面；所有窗口
-      `focused=false` 时省略这两个字段，各窗口仍保留自己的 `activeTabId`
+      `focused=false`
+      时省略这两个字段，各窗口仍保留自己的 `activeTabId`
     - 窗口成员 ID 按 index 顺序排列，不重复完整 tab 对象，完整原生属性通过 `details=full` 获取
     - `targetIds` 和 `managedOnly=true` 筛选页面及所属关系，保留 revision/managed 与 false 原生值
     - favicon data URL 不出现在响应中，完整结果标为 `favIconInline=true`；列表不导航、激活或读取正文
@@ -545,7 +930,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - 前置：当前没有 attach 页面，或 attach 状态为空
 - 操作：`browse { action: "open", url: "about:blank", wait: "load", diagnostics: true }`
 - 断言：`success=true`，响应含 `diagnostics.console` 和 `diagnostics.failedRequests`
-  数组，首次自动创建页面时也返回diagnostics
+  数组，首次自动创建页面时也返回 diagnostics
 - 载体：N/A
 
 ### browse-open-02-wait-networkidle
@@ -572,8 +957,8 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - 操作：`browse { action: "back" }`
 - 断言：`success=true`，当前 URL 回到 `#page-a`
 - 载体：test-page
-- 备注：`chrome.tabs.goBack` 明确返回无历史错误时，只在可注入且非错误页的文档上尝试
-  `history.back()`；其他原生错误不触发脚本
+- 对照：复用已有历史的后台测试 tab，前述两次 open 之间保持零用户激活；跨文档 HTTP 页面重复同一断言，相邻历史项均可逐项访问
+- 前置保护：保持原 tab 激活状态和窗口焦点，导航过程不附加 debugger；在待提交的导航、受限 URL、错误页和主 frame 缺失时保留浏览器原生界面的历史选择规则，保持零脚本注入
 
 ### browse-forward-01
 
@@ -585,10 +970,10 @@ node test/review-c31f2-native.mjs /path/to/chrome
 ### browse-history-errors-01
 
 - 载体：Extension handler 单测，`npm run test:extension`
-- 操作：对 back/forward 分别模拟普通页及 `chrome://`
-  页的原生导航成功、无历史、普通原生错误；无历史分支覆盖普通文档、`chrome://`、浏览器错误页、不存在的主 frame 和注入时文档变为错误页
-- 断言：原生成功不注入脚本；仅明确无历史且文档可注入时执行一次页面历史；受限 URL、错误页和不存在的主 frame 不注入，无历史返回
-  `navigated=false`；其他原生失败保留原错误；注入拒绝保持失败，失败后定时器和导航监听立即清理
+- 操作：对 back/forward 分别模拟可访问主文档、`chrome://`、浏览器错误页和缺失主 frame；覆盖相邻条目被原生 UI 跳过、单项历史、方向边界、Navigation API 仅有同源局部历史、旧浏览器缺少 Navigation API、原生和注入拒绝，以及准备／ACK 期间取消
+- 断言：可访问主文档通过隔离环境中的 History API 只访问相邻一项；Navigation API 仅在完整历史视图内判断方向边界，跨源局部视图保留有效遍历；受限 URL、错误页和不存在的主 frame 使用原生导航，保持零脚本注入，原生无历史返回 `navigated=false`
+- 在途对照：旧主文档仍可访问、浏览器发起的导航尚未提交时，back/forward 保留原生遍历；已派发但没有导航信号时返回 `TIMEOUT` 和 `actionStatus="unknown"`，保留单次派发
+- 失败与清理：原生和注入失败保留原错误，准备取消时导航零派发，已派发时最多一次且不重放，失败、取消和超时后定时器和导航监听立即清理
 
 ### extension-operation-errors-01
 
@@ -600,6 +985,10 @@ node test/review-c31f2-native.mjs /path/to/chrome
   `ExpectedOperationError`，保留错误消息，每次只执行一次调用、不返回假成功；截图尺寸预读失败后不附加 debugger；后台按既有策略记录
   warning 并发送失败响应，真实程序异常保留原错误对象
 - 实际浏览器验收：只在受控测试页制造导航竞态或网络错误，检查失败响应和 Extension console，不在用户页面上操作
+- 日志分类：覆盖 `console_enable` 的受限 URL、`browser_events` 的已关闭弹窗与失效／类型不匹配 ref、`cookies_set` 的分区冲突、
+  `challenge_inspect` 的数字 frameId 已移除拒绝，只有对应 action 和完整消息匹配时使用 warning
+- 日志对照：同文案的用户脚本异常、action 不匹配、附加前后缀、未知程序错误和原生 Runtime 执行终止仍使用 error；验证真实后台消息入口消费 action，
+  原 Error 身份、消息、结构化失败响应、执行状态与重试信息保持
 
 ### browse-refresh-01
 
@@ -832,7 +1221,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - 前置：在独立测试浏览器 attach 到本任务 managed test-page，使用
   `manage { action: "activatePage", targetId: "<测试页 ID>" }` 激活该页，并通过 `evaluate` 确认
   `document.visibilityState === "visible"`，后台计时节流不满足本用例前置
-- 前置：在主框架执行以下一次性测试前置，等待目标脚本首次进入 1000ms 等待后，才安排 300ms 重载，使用
+- 前置：在主框架执行以下一次性测试前置，等待目标脚本首次进入 1000 ms 等待后，才安排 300 ms 重载，使用
   `startedAt`、`reloadedAt` 核对时序，跨工具调用的调度间隔不作为 context 销毁证据
 
     ```javascript
@@ -998,8 +1387,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
     3. `logs type=console` 读取 T2 的唯一 warning
     4. `extract type=text` 读取 T2 独有文本
 - 断言：input 返回 `mode === "extension"` 且 post-condition
-  matched，wait、logs、extract 都命中 T2；T1 的 title、输入值和页面文本不变；每项操作后分别对 T1、T2 提取目标元素，确认没有改变默认目标或写错
-  tab
+  matched，wait、logs、extract 都命中 T2；T1 的 title、输入值和页面文本不变；每项操作后分别对 T1、T2 提取目标元素，确认没有改变默认目标或写错 tab
 - 截图条件：仅在两个测试页均具备可用 compositor
   frame 时增加截图核验；后台 Extension 页明确返回不可见错误时记录原因，不激活用户页面，目标隔离断言仍必须执行
 - 载体：两个 test-page managed tab
@@ -1181,7 +1569,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
 ### extract-screenshot-01-viewport
 
 - 状态：条件，仅在独立 CDP/headless 测试浏览器，或不含用户资产的独立 Extension 测试窗口中执行
-- 前置：CDP/headless 模式可保持后台；Extension 模式需要测试 tab 是独立测试窗口内的活动 tab，页面载入后等待约 800ms
+- 前置：CDP/headless 模式可保持后台；Extension 模式需要测试 tab 是独立测试窗口内的活动 tab，页面载入后等待约 800 ms
 - 操作：`extract { type: "screenshot", output: "cwd:test-output/mcp-shot.png" }`
 - 断言：
     - `success=true`
@@ -1284,7 +1672,9 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - getter 对照：在上述两类自有输入元素上安装会计数并抛错的 value getter，默认 `all`
   和目标子树均成功返回，getter 读取次数为 0；隐藏元素仍保留类型、标签和
   `visible=false`，带 aria-label、label、placeholder 或 title 的元素保留名称
-- 普通值对照：同页无 aria-label、label、placeholder 或 title 的普通 text input 使用非空短 value，`interactiveElements[].value` 与 `pageContent` 保留当前值，`name` 不以 value 代替；submit input 的长标签保留
+- 普通值对照：同页无 aria-label、label、placeholder 或 title 的普通 text
+  input 使用非空短 value，`interactiveElements[].value` 与 `pageContent` 保留当前值，`name` 不以 value 代替；submit
+  input 的长标签保留
 - 显式脚本、HTML、属性和普通 `extract(type=text)` 保持各自原有合同
 - 载体：test-page
 
@@ -1292,7 +1682,8 @@ node test/review-c31f2-native.mjs /path/to/chrome
 
 - 操作：`extract { type: "state", target: { css: ".section:nth-child(2)" } }`
 - 断言：返回子树 `pageContent`，只包含 region 1 内的 heading/button/textbox 等节点
-- CDP 对照：CSS、XPath、role/name、nth 与坐标目标限定同一子树，`depth=0` 可保留匹配的 input 本身；普通值与隐藏／密码值保护采用整页规则
+- CDP 对照：CSS、XPath、role/name、nth 与坐标目标限定同一子树，`depth=0`
+  可保留匹配的 input 本身；普通值与隐藏／密码值保护采用整页规则
 - 失败对照：不存在的元素或无命中的坐标返回明确错误，选择范围保持，不返回整页内容
 - 载体：test-page
 
@@ -1335,12 +1726,12 @@ node test/review-c31f2-native.mjs /path/to/chrome
   selector，连续两次 inline 和一次 `output` 读取均返回原文档 URL/title 和
   `managed=true`，备注保持，回读文件与 inline 一致，frames 中保留该 iframe 的 selector/rect；原生 documentId
   保持，不刷新、导航、替换目标或重新 adopt
-- 恢复边界：正常导航后再次重载可恢复当前文档；release 后重启和重载均不恢复完整权限；用隔离故障注入验证跨浏览器代际的相同
-  tab
+- 恢复边界：正常导航后再次重载可恢复当前文档；release 后重启和重载均不恢复完整权限；用隔离故障注入验证跨浏览器代际的相同 tab
   ID、不同 documentId 不授予权限，缺少 documentId 时原本合法的 create/adopt 和同代际 Worker 恢复仍可用，跨 reload
-  恢复受限并有可见说明
-- 实例与失败：另一独立 Server 返回未知创建来源和空备注，不继承原 Server 的任务提示；关闭目标或目标状态读取失败返回错误，不能将缺失状态返回成
-  `managed=false` 的成功结果；只读页面的 false 值保留，元信息不授权输入或脚本
+  恢复受限并有可见说明；create 的故障对照覆盖导航提交事件早于等待注册、首次仍为 loading 的时序，当前主文档加载完成后在原期限内返回，已知文档身份继续拒绝旧文档完成事件
+- 实例：另一 Extension Server 读取同一已保存页面的创建来源与备注，稳定字段相同，备注不授予读取权限或跨连接所有权；独立 CDP Server 的来源为 unknown，任务备注为空，未记录的来源保持 unknown
+- 失败与权限：关闭目标或目标状态读取失败返回错误，不能将缺失状态返回成
+  `managed=false` 的成功结果；只读页面的 false 值保留，元信息不授权输入或脚本；读取授权仅对获准连接生效，撤权后读取拒绝，adopt 后恢复受控操作
 - 载体：test-page，不操作业务页面
 
 ### extract-frame-01
@@ -1360,6 +1751,12 @@ node test/review-c31f2-native.mjs /path/to/chrome
 ## 5. input
 
 > 以下用例默认 inputMode=precise，stealth 专项在 5.X-stealth 分节，测试载体默认 test-page，特殊情况标注
+
+原生鼠标正例的状态：条件，适用于坐标点击、右键、中键、多击、mousedown、mousemove，以及依赖原生 mousedown 的 mouseup
+
+这些正例使用 0.1 节要求的独立测试浏览器，自有测试页为 active 且可渲染；按原断言核对事件、按键和点击计数，缺少独立环境时记录具体前置条件并标为 SKIP
+
+后台对照继续必跑：precise 坐标、非左键、多击、mousedown 与 mousemove 返回 `NATIVE_INPUT_UNAVAILABLE`、`actionExecuted=false`、`actionStatus=not_started`、`eventsExecuted=0`、`retryable=false`，业务计数不变；普通元素左键单击、force 与 stealth 分别按既有合同验收，见 capability-click-01 与 C31F8-BG
 
 ### 5.1 click / mousedown / mouseup
 
@@ -1407,7 +1804,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
 ### input-click-07-triple
 
 - 操作：`input { events: [{type:"click", ..., clickCount:3}] }`
-- 断言：detail 序列 [1,1,1,2,2,2,3,3,3] + dblclick (detail=2)
+- 断言：detail 序列 `[1,1,1,2,2,2,3,3,3]` + dblclick (detail=2)
 
 ### input-click-08-force
 
@@ -1495,15 +1892,16 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - 操作：`type` target=#edit-contenteditable，text=`OWNED_INPUT`
 - 断言：textContent 包含一次
   `OWNED_INPUT`，移除该 marker 后仍为原文；precise/CDP 在点击建立的光标位置插入，不要求自动移到末尾
-- 追加变体：公开 evaluate 聚焦同一元素，使用 Range.selectNodeContents 和 collapse (false) 建立末尾光标，再用不带 target 的
-  type 输入
-  `OWNED_APPEND`
+- 追加变体：公开 evaluate 聚焦同一元素，使用 Range.selectNodeContents 和 collapse
+  (false) 建立末尾光标，再用不带 target 的
+  type 输入 `OWNED_APPEND`
 - 断言：textContent 严格等于追加前全文加 `OWNED_APPEND`，原有文本保持；不再次点击改变已建立的光标位置
 
 ### input-type-04-delay
 
 - 操作：分别使用 Extension stealth、Extension precise 和 CDP，执行 `type` `text:"abc", delay:50`
-- 断言：stealth 在首字符前不等待，共两次字符间隔，耗时 ≥ 2 × 50 ms = 100 ms；precise 与 CDP 在每个字符后等待，共三次，耗时 ≥ 3 × 50 ms = 150 ms
+- 断言：stealth 在首字符前不等待，共两次字符间隔，耗时 ≥ 2 × 50 ms = 100
+  ms；precise 与 CDP 在每个字符后等待，共三次，耗时 ≥ 3 × 50 ms = 150 ms
 - 页面定时器节流会增加实际耗时，三种路径均须在请求 deadline 内完成并返回完整 `abc`
 
 ### input-type-05-dispatch
@@ -1530,7 +1928,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
 - 断言：`textarea.value` 依次包含 `line1`、LF 和 `line2`（CRLF 被归一化为一个 LF）；页面监听到的 keydown/keyup 计数相等
 - 后台点击变体（CDP）：点击同一自有页面的按钮，通过页面计数器核对一次点击，页面保持后台
 - 位置检查回归：暂停动画帧不阻塞稳定采样；x/y/width/height 任一变化后重试，持续变化在预算内失败
-- 阶段预算回归（注册 input 入口）：1000ms 中定位消耗 400ms，后续检查最多取得 600ms；定位、检查或最终坐标读取耗尽预算后，不派发动作，
+- 阶段预算回归（注册 input 入口）：1000 ms 中定位消耗 400 ms，后续检查最多取得 600 ms；定位、检查或最终坐标读取耗尽预算后，不派发动作，
   `eventsExecuted=0`、
   `actionExecuted=false`；预算充足时正常执行
 - 计时：分别记录工具总耗时与服务内部预算，工具总耗时包含传输和结果处理，不能单独用于判定阶段预算是否重新起算；阶段预算由注册入口回归核对
@@ -1538,20 +1936,24 @@ node test/review-c31f2-native.mjs /path/to/chrome
 
 ### input-type-07-timeout-stop
 
-- 前置：本任务受控 test-page 的 textarea 已清空并获焦，注入 input 计数器；iframe 输入中超时变体使用仅含一个唯一 URL iframe 的自有父页，目标文档、textarea 和计数器已就绪
-- 准备阶段对照：另保留含兄弟 iframe 的自有父页；若整体预算在身份验证期间耗尽，返回 `eventsExecuted=0`、`actionExecuted=false`、`actionStatus="not_started"`，目标文本和 input 计数保持不变；该对照单独记录
+- 前置：本任务受控 test-page 的 textarea 已清空并获焦，注入 input 计数器；iframe 输入中超时变体使用仅含一个唯一 URL
+  iframe 的自有父页，目标文档、textarea 和计数器已就绪
+- 准备阶段对照：另保留含兄弟 iframe 的自有父页；若整体预算在身份验证期间耗尽，返回
+  `eventsExecuted=0`、`actionExecuted=false`、`actionStatus="not_started"`，目标文本和 input 计数保持不变；该对照单独记录
 - 操作：`timeout=1000`，先输入 20 个 `x`、`delay=100`，再排入 `text="after-timeout"` 的 type 事件；分别验证 Extension
   precise/stealth 主文档和 iframe，以及独立 CDP 主文档
-- 断言：返回错误、`eventsExecuted=0`、`actionStatus="unknown"`、`retryable=false`；已收到执行回执时 `actionExecuted=true`，RPC 已派发但回执未知时 `actionExecuted="unknown"`
-- 独立回读：已有文本长度大于 0 且小于 20，不包含 `after-timeout`；立即读取 value/input 计数，1200ms 后再次读取，两次结果一致，调用不等待全部字符输入完才返回
+- 断言：返回错误、`eventsExecuted=0`、`actionStatus="unknown"`、`retryable=false`；已收到执行回执时
+  `actionExecuted=true`，RPC 已派发但回执未知时 `actionExecuted="unknown"`
+- 独立回读：已有文本长度大于 0 且小于 20，不包含
+  `after-timeout`；立即读取 value/input 计数，1200 ms 后再次读取，两次结果一致，调用不等待全部字符输入完才返回
 - 载体：test-page、本任务唯一 URL iframe、独立 CDP 测试会话
 
 ### input-type-08-extended-budget
 
 - 前置：本任务 textarea 已清空并获焦，Extension precise 已连接
 - 操作：`timeout=45000`，输入 330 个 `x`、`delay=100`
-- 断言：整体输入耗时超过 30000ms，仍在本次预算内成功完成，`eventsExecuted=1`、`actionStatus="completed"`，独立读取 value 为全部
-  330 个字符，没有固定 30000ms
+- 断言：整体输入耗时超过 30000 ms，仍在本次预算内成功完成，`eventsExecuted=1`、`actionStatus="completed"`，独立读取 value 为全部
+  330 个字符，没有固定 30000 ms
   RPC 超时
 - 载体：test-page
 
@@ -1562,7 +1964,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
   的 type 事件；覆盖 Extension precise、Extension stealth 与独立 CDP
 - 断言：返回错误、`eventsExecuted=0`、`actionStatus="unknown"`、`retryable=false`，只留下部分文本，后续 marker 未输入；立即读取
   value/input 计数，
-  1200ms 后再次读取，两次结果一致，逐字符输入没有重置整体预算
+  1200 ms 后再次读取，两次结果一致，逐字符输入没有重置整体预算
 - 换行对照：重置 textarea 后，在充足预算内用 `humanize=true` 输入 `a\r\nb\rc`，value 必须为
   `a\nb\nc`，CRLF 只产生一个换行
 - 载体：test-page
@@ -1580,7 +1982,8 @@ node test/review-c31f2-native.mjs /path/to/chrome
 
 - 前置：隔离 ActionHandler/InputEventHandler，保留真实 revision 检查，仅替换 Chrome 按键接口
 - 操作：输入 `AB`，分别在 A 回执后取消或超期；输入 `\nafter`，在 Enter keyDown 回执后取消或超期；另在首次派发前取消
-- 断言：收到回执后的动作上下文为 `actionExecuted=true`、`actionStatus=partial`、`retryable=false`，后续字符不派发，Enter 尝试
+- 断言：收到回执后的动作上下文为
+  `actionExecuted=true`、`actionStatus=partial`、`retryable=false`，后续字符不派发，Enter 尝试
   keyUp，旧 expectedRevision 的下一次操作被拒绝
 - 对照：首次派发前为 not_started、无按键且 revision 不变；公开 input 序列仍使用其 unknown 结果合同，保留已派发状态并禁止自动重放
 - 载体：自动边界回归，真实浏览器使用自有后台测试页检查文本与 revision
@@ -1590,7 +1993,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
 ### input-wait-01
 
 - 操作：`input { events: [{type:"wait", ms:300}] }`
-- 断言：整体耗时 >= 300ms
+- 断言：整体耗时 >= 300 ms
 
 ### 5.5 select / replace
 
@@ -1634,7 +2037,7 @@ node test/review-c31f2-native.mjs /path/to/chrome
   `#edit-textarea`、`#edit-contenteditable` 写入各自唯一文本
 - 操作：对三个元素分别执行 locator target 的 `select`，每次使用唯一 `find` 文本
 - 断言：每次 input 响应的 `mode === "cdp"`；input/textarea 的 `selectionStart`、`selectionEnd`
-  匹配目标文本，contenteditable的 `window.getSelection().toString()` 等于目标文本；错误或响应中不出现 Extension
+  匹配目标文本，contenteditable 的 `window.getSelection().toString()` 等于目标文本；错误或响应中不出现 Extension
   refId 依赖
 - 载体：test-page，CDP 模式
 
@@ -1691,16 +2094,22 @@ node test/review-c31f2-native.mjs /path/to/chrome
 
 ### 5.7 keydown / keyup
 
-Extension precise 在自有后台测试页执行以下用例，监听器同时记录按键、修饰键、repeat 与 `document.visibilityState`；主文档和 iframe 分别执行，`browse list` 中实际活动页与窗口焦点保持原值，结束后的独立读取和 `postCondition` 均观察原文档可见状态
+Extension precise 在自有后台测试页执行以下用例，监听器同时记录按键、修饰键、repeat 与
+`document.visibilityState`；主文档和 iframe 分别执行，`browse list` 中实际活动页与窗口焦点保持原值，结束后的独立读取和
+`postCondition` 均观察原文档可见状态
 
 ### input-keydown-01a-background-focus-lifecycle
 
 - 前置：自有后台页、precise 模式、确定原焦点模拟关闭的调试会话，记录实际活动页、默认目标和文档可见状态
 - 操作：发送普通按键、修饰键、repeat 与 selectAll，读取事件和选区，再读取结束后的可见状态
-- 断言：原生事件和命令生效，临时模拟期间文档报告 `visible`，响应包含对应 `warnings`，结束后恢复原设置，再执行后置验证；实际活动页、窗口焦点和默认目标保持
-- 状态对照：原已开启的模拟保持开启；后台复用会话的原状态未知时返回 `KEYBOARD_FOCUS_STATE_UNKNOWN`、`not_started`，按键零派发且保留原设置
-- 生命周期对照：SDK／Extension 定向回归覆盖准备超时、按下后取消、请求到期、连接断开、文档替换、调试会话变化和迟到回执；需要释放的本请求新增按键与焦点恢复分别尝试，原先按住的键保留，清理失败通过 `keyboardFocusCleanup` 返回
-- 执行状态对照：准备失败保持 `not_started`，已派发且回执未知保持 `unknown`，动作已完成但恢复失败保持 `completed` 并返回失败结果；纯 type、controlled、stealth 与 CDP 保留原输入路径
+- 断言：原生事件和命令生效，临时模拟启用时，文档报告 `visible`，响应包含对应
+  `warnings`，结束后恢复原设置，再执行后置验证；实际活动页、窗口焦点和默认目标保持
+- 状态对照：原已开启的模拟保持开启；后台复用会话的原状态未知时返回
+  `KEYBOARD_FOCUS_STATE_UNKNOWN`、`not_started`，按键零派发且保留原设置
+- 生命周期对照：SDK／Extension 定向回归覆盖准备超时、按下后取消、请求到期、连接断开、文档替换、调试会话变化和迟到回执；需要释放的本请求新增按键与焦点恢复分别尝试，原先按住的键保留，清理失败通过
+  `keyboardFocusCleanup` 返回
+- 执行状态对照：准备失败保持 `not_started`，已派发且回执未知保持 `unknown`，动作已完成但恢复失败保持 `completed`
+  并返回失败结果；纯 type、controlled、stealth 与 CDP 保留原输入路径
 
 ### input-keydown-01-simple
 
@@ -1826,7 +2235,7 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 - 到期对照：独立读取自有按钮坐标和点击计数，发送 `timeout:1500`、`humanize:true`，事件依次为
   `mousemove`（坐标目标、`steps:1000`）、相同目标的 `click`
   及一个可计数事件；返回 timeout，后续事件不执行，立即读取及公开 `wait`
-  1250ms 后再次读取，点击计数均不增加，不等待完整路径完成才返回
+  1250 ms 后再次读取，点击计数均不增加，不等待完整路径完成才返回
 - 已移动后超时：`eventsExecuted=0`、`actionExecuted=true`、`actionStatus="unknown"`、`retryable=false`
   ，不把已执行的鼠标移动报告为未执行，不自动重放
 - 注册入口回归：模拟时钟使首个移动耗尽预算后，只允许一次移动、不点击；覆盖 humanized
@@ -1843,12 +2252,14 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 
 ### target-index-01
 
-- 前置：自有页包含 80 个同类可编辑元素、独立拖动源与目标，以及超过 200 个含相同文本的元素，另在 iframe 中放置相同结构
-- 两种 backend 验证 `nth=0/49/50/60/79` 命中指定元素，`nth=80` 越界；CSS、XPath、CSS+text、纯文本超过 200 的索引和坐标目标分别验证，默认
+- 前置：自有页包含 80 个同类可编辑元素、独立的拖动源和拖动目标，以及超过 200 个含相同文本的元素，另在 iframe 中放置相同结构
+- 两种 backend 验证 `nth=0/49/50/60/79` 命中指定元素，`nth=80`
+  越界；CSS、XPath、CSS+text、纯文本超过 200 的索引和坐标目标分别验证，默认
   find 候选仍最多 50 条
 - Extension 验证命令聚焦、select/replace 聚焦、wheel、drag 两端、controlled 输入、非左键/多击坐标和滚动后重新定位；extract
   验证截图、HTML+images 及定向读取前的等待
-- 对存在的高索引元素，`attached`、`visible` 成功，`hidden`、`detached` 持续等待；隐藏后仅 `hidden` 成功，移除后 `hidden`、
+- 对存在的高索引元素，`attached`、`visible` 成功，`hidden`、`detached` 持续等待；隐藏后仅 `hidden` 成功，移除后
+  `hidden`、
   `detached` 成功；协议错误和断连均保持失败或等待
 - 单目标查询的 0/1 结果不充当匹配总量，未经统计的 `matchCount` 为 null；保留 CDP Locator 已观察到 15 个匹配、`nth=30`
   时的真实计数，诊断候选仍最多 10 条
@@ -1856,20 +2267,23 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 ### input-timeout-01
 
 - 操作：`input { timeout: 500, events: [{type:"click", target:{css:"#nonexistent"}}] }`
-- 断言：在 500ms+ε 内抛错；Extension 返回 `TARGET_NOT_FOUND` 或 timeout 类错误，未找到目标时 `context` 含
+- 断言：在 500 ms+ε 内抛错；Extension 返回 `TARGET_NOT_FOUND` 或 timeout 类错误，未找到目标时 `context` 含
   `locator/matchCount/nth/currentUrl/candidates`；CDP 保留 `ELEMENT_NOT_FOUND` 及 `target/timeout/url` 诊断
 - 两端均验证 `eventsExecuted=0`、`actionExecuted=false`，计时记录工具执行时间，另列传输开销
 
 ### 5.11 upload
 
-上传使用合成文件和自有 localhost 页面，接收端仅监听本机地址；Extension 与 CDP 分别通过当前构建的公开 `input` 入口执行
-测试前列出并复用明确属于本任务的后台页，保持用户页和业务连接；记录 Server 构建与 Extension bundle 身份，确认响应中的实际 backend
+上传使用合成文件和自有 localhost 页面，接收端仅监听本机地址；Extension 与 CDP 分别通过当前构建的公开 `input`
+入口执行
+测试前列出并复用明确属于本任务的后台页，保持用户页和业务连接；记录 Server 构建与 Extension
+bundle 身份，确认响应中的实际 backend
 合成文件放在私有临时目录，测试进程在导入模块前设置私有 HOME/USERPROFILE，完成后清理本任务资源
 
 ### input-upload-01-single
 
 - 前置：自有页包含文件控件及接收端，准备带中文文件名、已知完整字节和修改时间的普通文件，监听 input/change
-- 操作：`input {events:[{type:"upload", target:{css:"input[type=file]"}, files:["./附件.txt"]}]}`，另以绝对路径及 `~/` 路径对照
+- 操作：`input {events:[{type:"upload", target:{css:"input[type=file]"}, files:["./附件.txt"]}]}`，另以绝对路径及 `~/`
+  路径对照
 - 断言：控件文件名、大小、MIME、修改时间与文件一致，事件顺序为 input→change；站点提交后，接收端文件名和完整字节与源文件一致
 - 结果摘要包含文件名、大小、MIME 和事件信息，响应不包含文件正文、base64 或本地绝对路径
 
@@ -1926,7 +2340,7 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 
 ### input-upload-10-verification-unknown
 
-- 前置：自有页监听 change 并发送到本机接收端，另有 change 后自动清空的控件
+- 前置：自有页监听 change 并发送到本机接收端，另有会在 change 后自动清空选择的控件
 - 操作：正常上传、自动清空上传、上传后故意不满足 postCondition；测试传输夹具另模拟提交后回执丢失
 - 断言：正常及自动清空路径均收到完整字节，结果保留赋值时摘要；postCondition 失败保留已完成动作，change 仅触发一次
 - 回执丢失返回 `actionStatus="unknown"`、`retryable=false`，同一请求不重新赋值、不改换 backend，实际状态由独立读取判断
@@ -1970,14 +2384,17 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 
 ### logs-console-05-identical-fallback-events
 
-- 前置：在自有页取得浏览器原生 debugger attach 拒绝，启用 fallback console hook；若浏览器允许多个 debugger，原生 fallback
+- 前置：在自有页取得浏览器原生 debugger attach 拒绝，启用 fallback console
+  hook；若浏览器允许多个 debugger，原生 fallback
   条件项标为未验证，固定时钟回归仍独立执行
-- 操作：固定同一毫秒依次调用 `console.warn('same')`、`console.error('same')`、`console.error('same')`，读取全部日志及 error
-  过滤结果
+- 操作：固定同一毫秒依次调用
+  `console.warn('same')`、`console.error('same')`、`console.error('same')`，读取全部日志及 error 过滤结果
 - 断言：全部结果包含三条独立事件及递增 sequence，error 结果包含两条；再次读取保持条数及 sequence，并发排空后也不增加同一批记录
-- 对照：clear 后为空，hook 继续采集；连续 1005 条相同日志只保留最新 1000 条；Service Worker 恢复及 debugger 切换后保留待排空的独立事件，卸载
+- 对照：clear 后为空，hook 继续采集；连续 1005 条相同日志只保留最新 1000 条；Service
+  Worker 恢复及 debugger 切换后保留待排空的独立事件，卸载
   hook 时保留页面之后安装的 wrapper
-- 切换对照：保留浏览器 Runtime 历史，fallback 中连续两次相同 console 调用后恢复 debugger，结果恰好两条；已读取事件的 sequence 保持，clear 过的事件不重新出现，切换后的新调用以及其他 frame 的独立日志各保留一次
+- 切换对照：保留浏览器 Runtime 历史，fallback 中连续两次相同 console 调用后恢复 debugger，结果恰好两条；已读取事件的 sequence 保持，clear 过的事件不重新出现，
+  切换后的新调用以及其他 frame 的独立日志各保留一次
 
 ### logs-network-01
 
@@ -1993,8 +2410,7 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 - 操作：响应体消费完成，或独立观察到该请求的 `loadingFinished/loadingFailed` 后，调用 `logs { type: "network" }`
 - 断言：返回数组非空，实际包含本次请求，每项含 url/method/status 或 errorText 中可由当前浏览器提供的值；fetch 返回 Response
   不作为请求完成证据
-- 刷新对照：首次读取后再次发起唯一 URL 的 fetch，等待同样的完成条件，后续 logs 必须出现该请求，不以旧的页面或 iframe 条目冒充新
-  fetch
+- 刷新对照：首次读取后再次发起唯一 URL 的 fetch，等待与首次请求相同的完成条件，后续 logs 必须出现该请求，不以旧的页面或 iframe 条目冒充新 fetch
 - debugger 不可用对照为条件项：须取得浏览器对当前 Extension 的原生 attach 拒绝，且只读会话证明也失败；只有外部 holder
   存在不满足此前置，Chrome 允许多个客户端时记录该条件项未验证，
   不伪造拒绝或改写原失败
@@ -2011,7 +2427,8 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 - 前置：接 `logs-network-01`
 - 操作：`logs { type:"network", urlPattern:"*mcp_missing_resource*" }`
 - 断言：每项 url 匹配模式
-- 两种 backend 的 summary／details／stream／paused／auth 分别覆盖匹配与不匹配的请求 URL，暂停事件按嵌套 `request.url` 选择，认证事件保留可过滤的请求 URL
+- 两种 backend 的 summary／details／stream／paused／auth 分别覆盖匹配与不匹配的请求 URL，暂停事件按嵌套 `request.url`
+  选择，认证事件保留可过滤的请求 URL
 - 同时匹配两项且 `limit=1` 时，`count=1`、`totalBuffered=2`；指定 ref 后仍应用 URL 条件，输出中的合成凭证保持脱敏
 - `clear:true` 清除匹配的普通记录，保留仍需显式处理的暂停请求和认证事件；读取操作不发送继续、拒绝或认证命令
 
@@ -2047,7 +2464,8 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
   ，页面正文保持无凭证内容
 - 操作：读取 browse 的 summary/full 列表、attach、页面管理响应和 extract 的 state/metadata/diagnosticBundle，包含其 output
   文件；在该页执行一个成功动作和一个定位失败动作
-- 断言：公开页面 URL 及成功／失败 `pageContext.before/after` 隐去两个 sentinel，普通参数保留，并返回脱敏标记、原始长度和参数名；管理响应的
+- 断言：公开页面 URL 及成功／失败 `pageContext.before/after`
+  隐去两个 sentinel，普通参数保留，并返回脱敏标记、原始长度和参数名；管理响应的
   before/after、窗口 tabs 和分组 tabsBefore/tabsAfter 同样脱敏
 - 断言：原生 pendingUrl/favIconUrl 含认证参数时，返回对应字段名前缀的脱敏标记
 - 操作：使用原始 URL 作为 expectedUrl 执行页面动作，并让用户脚本返回一个自有合成 URL 对象
@@ -2200,7 +2618,7 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
   一致
 - 负例：窗口、来源 tab 和分组不属于同一窗口，或 pinned=true 与已有分组同时指定时，创建前拒绝；跨窗口冲突返回
   `actionExecuted=false`、`actionStatus="not_started"`、`failureStage="preflight"`，独立 list 确认没有新增页
-- 默认创建对照：省略原生位置参数创建自有页，自动显示分组后的实际窗口与创建窗口一致，不移入其他窗口
+- 默认创建对照：省略原生位置参数，使用不同 taskHint 连续创建自有页，复用同一可信工具组，实际窗口与创建窗口一致，不移入其他窗口；显式指定窗口、位置或来源时保持原有位置合同
 - 混合缓存窗口：在默认 MCP 窗口中解除一个自有页的托管，再不带位置参数创建页面，新页仍位于原窗口，窗口数量不增加，新页受控，非托管成员权限不变
 - 错误对照：缓存窗口关闭后使用现有普通窗口；没有普通窗口或原生查询失败时明确报错，窗口数量不增加
 - 清理：关闭新建测试页
@@ -2362,20 +2780,20 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 ### wait-time-01
 
 - 操作：`wait { for:"time", ms:300 }`
-- 断言：在 Server handler 入口与退出采集的单调时钟耗时 ≈ 300ms（允许 ±
-  100ms）；另保留公开调用端到端耗时及其差值，不把传输和宿主调度计入 handler 容差
+- 断言：在 Server handler 入口与退出采集的单调时钟耗时 ≈ 300 ms（允许 ±
+  100 ms）；另保留公开调用端到端耗时及其差值，不把传输和宿主调度计入 handler 容差
 
 ### wait-idle-01
 
-- 前置：attach 全新 test-page，执行 evaluate 创建 Web Worker，每 50ms 更新一次 `#burst-mutation-target`，1s 后停止
+- 前置：attach 全新 test-page，执行 evaluate 创建 Web Worker，每 50 ms 更新一次 `#burst-mutation-target`，1s 后停止
 - 操作：`wait { for:"idle", ms:500, timeout:8000 }`
 - 断言：`success=true`，随后读取 `#burst-mutation-target.dataset.workerTick`
-  大于 0，返回时间在 mutation 结束并达到 500ms DOM 静默后
+  大于 0，返回时间在 mutation 结束并达到 500 ms DOM 静默后
 - 载体：test-page
 
 ### wait-idle-02-timeout
 
-- 前置：attach test-page，执行 evaluate 创建 Web Worker，每 50ms 更新一次
+- 前置：attach test-page，执行 evaluate 创建 Web Worker，每 50 ms 更新一次
   `#burst-mutation-target`，最多 60s 后停止；记录最后一次 mutation 时间，覆盖工具调用间隔
 - 操作：`wait { for:"idle", ms:500, timeout:1200 }`
 - 断言：返回 timeout 错误，消息包含 `DOM 未达到 500ms 静默`
@@ -2405,7 +2823,7 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 
 ### wait-navigation-01
 
-- 前置：attach 到 test-page，执行 evaluate 创建 Web Worker，每 500ms 更新一次 title 和 URL hash，连续更新 120 次
+- 前置：attach 到 test-page，执行 evaluate 创建 Web Worker，每 500 ms 更新一次 title 和 URL hash，连续更新 120 次
 - 操作：`wait { for:"navigation", timeout:5000 }`
 - 断言：wait 返回，title 和 URL hash 均含 `mcp-nav-`
 - 载体：test-page
@@ -2414,7 +2832,7 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
 ### wait-timeout-01
 
 - 操作：`wait { for:"element", target:{css:"#nonexistent"}, timeout:500 }`
-- 断言：约 500ms 后抛 timeout 错误
+- 断言：约 500 ms 后抛 timeout 错误
 
 ---
 
@@ -2450,8 +2868,12 @@ Extension precise 在自有后台测试页执行以下用例，监听器同时�
     - 宿主 wrapper 比卡片宽时也只点左侧卡片；Linux 使用当前 X11 活动窗口原点加窗口边距，并校验窗口标题
     - Linux 不使用 Chrome `screenX`，也不把 `outerHeight - innerHeight` 当作顶栏高度
     - Extension inspect 走 isolated world，检查前卸掉 debugger；点击前再次卸掉 debugger 并读取视口
-    - 先在普通页通过 precise evaluate 建立 debugger，再触发两阶段验证；覆盖最大化无 client shadow 与 125% 缩放窗口，提示条退出动画期间，即使视口尺寸尚未更新，仍按当前内容原点更新系统鼠标终点，保持原 timeout、各控件一次 trusted 点击及业务一次执行
-    - Linux 路径悬停后，以独立的 `mousemove_relative` 阶段往返 1 px；同一 frame、同一文档与同一页面元素内收到本次两条 trusted pointer 事件，指针返回原位后读取当前内容原点；重新定位时再次完成路径、悬停与校准，原路径悬停断言保持
+    - 先在普通页通过 precise evaluate 建立 debugger，再触发两阶段验证；覆盖最大化无 client
+      shadow 与 125% 缩放窗口，提示条退出动画期间，即使视口尺寸尚未更新，仍按当前内容原点更新系统鼠标终点，保持原 timeout、各控件一次 trusted 点击及业务一次执行
+    - 动画对照可在独立 profile 使用 `--animation-duration-scale=4` 延长真实原生动画，通过实际退出时长和连续 rAF 视口记录确认生效；旧视口基线取真实退出前最后一次生产视口读取，并与该时刻的连续记录核对，SDK 的原 timeout 和自动关闭门控保持
+    - Linux 路径悬停后，以独立的 `mousemove_relative` 阶段往返 1
+      px；同一 frame、同一文档与同一页面元素内收到本次两条 trusted
+      pointer 事件，两次相对移动之间保留浏览器事件分发时间，等待共用原 signal 和 deadline，取消或到期后停止后续移动与按下；动画使两条事件目标不同时，返回尚未稳定且不带原点的状态，在原期限内重新检查控件和窗口并采样，同一元素校验成立后才使用原点；指针返回原位后读取当前内容原点，重新定位时再次完成路径、悬停与校准，原路径悬停断言保持
     - 活动页、焦点和标题拒绝条件同时检查绝对移动与相对校准命令为零；观察器在成功、失败、取消和超时后清理，缺少可信事件时在按下前返回明确错误
     - 按下前活动 tab、焦点、窗口标题或验证控件阶段发生变化时，返回明确错误且不按下；坐标更新遇到取消或原 deadline 到达时保持零按下
     - DOM 已有 Cloudflare iframe 时，即使尺寸为 0 也走系统鼠标；后续宿主页验证按钮也走系统鼠标
@@ -2693,32 +3115,81 @@ test-page.html 现有 region（供用例引用）：
 
 ## 12. 浏览器事件与定位上下文
 
-前置：使用自有 localhost 服务、合成文件、测试 Cookie 和合成认证凭证，记录服务端请求次数与动作计数器
-原生测试使用独立 profile 或已受控的可复用测试页，核对加载构建与当前源码匹配
-Extension 原生用例要求可加载测试 Extension 的浏览器；条件不具备时记录具体限制，并独立完成协议回归
-对下载使用本用例创建的目录，按原始字节比较文件，不执行下载内容
+前置：使用自有 localhost 服务、合成文件、测试 Cookie 和合成认证凭证，记录服务端请求次数与动作计数器；原生测试使用独立 profile 或已受控的可复用测试页，核对加载构建与当前源码匹配；
+Extension 原生用例要求可加载测试 Extension 的浏览器；条件不具备时记录具体限制，并独立完成协议回归；对下载使用本用例创建的目录，按原始字节比较文件，不执行下载内容
 
-| 用例 ID                    | 操作                                                                                                                            | 验收结果                                                                                                                                                                                                 |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| capability-launch-01       | Extension 可用时分别省略、显式传入 headless、incognito、profile、executablePath 或 port                                         | 默认使用 Extension；显式进程参数生效并返回实际 CDP 模式，已有 CDP 冲突在新副作用前拒绝                                                                                                                   |
-| capability-storage-01      | 在正常 HTTP 文档和禁止 storage 访问的文档清理站点存储                                                                           | 正常状态实际清除；Runtime 异常返回错误，保留已发生动作信息                                                                                                                                               |
-| capability-click-01        | 监听 pointerdown、mousedown、mouseup、click，在 precise 默认左键、stealth 和 force 下点击                                       | 活动且可渲染的页使用原生输入；后台默认元素单击使用合成事件并返回 warnings；后台坐标或其他原生动作在派发前拒绝；stealth／force 保留明确的合成语义和遮挡处理                                               |
-| capability-name-01         | 多个 aria-labelledby 引用、隐藏标签、Shadow 内重名 ID、6000 层 span 和隐藏文件控件 label                                        | 名称优先级、中文相邻字符和引用所在树正确；state 保留名称及普通当前值，password／hidden／file 值未被读取                                                                                                  |
-| capability-shadow-01       | 用 CSS、text、role、label、nth 执行点击、聚焦、select／replace、state 和上传                                                    | open shadowRoot 可操作、去重且顺序稳定，命中和焦点指向实际控件；XPath 保持原生文档范围                                                                                                                   |
-| capability-frame-01        | 同源／跨源两层 frame、OOPIF 和 Shadow 内 iframe，执行 evaluate、点击、坐标、上传，再读取原默认目标；增加 context 准备超时与取消 | 每层按父文档及 open ShadowRoot 解析，输入绑定所属 session，坐标正确，上传字节一致，退出后恢复原目标；准备使用原请求期限，派发前失败保留 not_started 和零业务执行，重排或文档变化时保留真实身份或明确失败 |
-| capability-cookie-01       | 在两个测试 CookieStore／partition 中设置同名 Cookie，按 target/store/partition 执行 get、set、delete、clear                     | 范围完整传播，其他测试范围保留；后端不支持的字段和 store 冲突在操作前拒绝；部分 clear 失败报告实际数量                                                                                                   |
-| capability-cf-01           | 内嵌控件完成后保留容器，随后 reset／过期；增加第二控件、其他表单 response、隐藏模板和残留 iframe                                | 只将有正确完成证据的控件视为完成；有效 pending 继续等待，普通恢复页面不滚动或重复点击，response 内容不出现在结果                                                                                         |
-| capability-cf-02           | input 或 evaluate 执行一次后触发新 Challenge，并预先配置 Fetch 路由                                                             | 不重放业务动作；后续验证失败保留已执行状态；本实例暂停请求先中止，Fetch 释放结果可见；清理未确认时保留实际连接状态                                                                                       |
-| capability-dialog-01       | watch 后触发 alert／confirm／prompt，原请求阻塞期间通过 logs 获取引用并接受／取消                                               | 读取和处理不等待原页面锁，不自动接受未知弹窗；确认实际关闭，再检查原动作的最终效果；旧引用及其他实例引用拒绝                                                                                             |
-| capability-body-01         | 单次 POST、重定向及二进制响应，故意乱序投递 ExtraInfo                                                                           | 按请求和跳次返回 headers 及完整性，正文 output 与原始字节一致；服务端未收到额外请求；不可用正文明确失败                                                                                                  |
-| capability-exception-01    | 页面异步抛错并附带 sourceURL                                                                                                    | console error 入口保留未捕获异常、来源与位置，过滤及清理语义保持有效                                                                                                                                     |
-| capability-route-01        | 添加匹配规则，读取 paused 后分别 continue、改写、fulfill、fail，并覆盖重复处理、取消、导航与断开                                | 处理绑定同一暂停引用，未匹配请求立即继续；预期 mock 不到达真实服务；过期请求 Aborted，回执未知保留原实例归属且不重发；原生校验拒绝保留可处理引用                                                         |
-| capability-auth-01         | 配置 Server 与 Proxy 的 origin／realm，与 route／download 同时启用，触发匹配、不匹配和重复失败挑战                              | 只在明确范围使用合成凭证，失败重复挑战取消；日志脱敏，clear、CF 暂停与所属会话结束后凭证清除                                                                                                             |
-| capability-stream-01       | WebSocket 双向文本／二进制及 SSE，增加超长消息和缓存压力                                                                        | 来源、方向、opcode、序号和消息一致；握手原始 headers 文本及其中 URL 的凭证脱敏；超长／淘汰／丢失状态可见；clear 不改变活动请求控制                                                                       |
-| capability-download-01     | watch 后下载合成附件，观察 GUID 与终态，wait 后 save 到私有 output                                                              | 原始一次请求，原响应与原生下载及保存产物逐字节一致；completed 与 artifact availability 分开，正文小于 16 MiB；不可用或超额不重新请求                                                                     |
-| capability-event-cancel-01 | 通过公开 MCP 入口取消下载等待、正文读取及原始 Fetch 操作；另在派发前取消                                                        | signal 贯穿后端请求范围，派发前无副作用；已派发操作保留真实已执行／未知状态，暂停请求按其生命周期结束                                                                                                    |
+- `capability-launch-01`
+    - 操作：Extension 可用时分别省略、显式传入 headless、incognito、profile、executablePath 或 port
+    - 验收结果：默认使用 Extension；显式进程参数生效并返回实际 CDP 模式，已有 CDP 冲突在新副作用前拒绝
 
-协议回归对应 `test/browser-events.test.js`、`test/browser-native-transitions.test.js`、`test/capability-regressions.test.js`
+- `capability-storage-01`
+    - 操作：在正常 HTTP 文档和禁止 storage 访问的文档清理站点存储
+    - 验收结果：正常状态实际清除；Runtime 异常返回错误，保留已发生动作信息
+
+- `capability-click-01`
+    - 操作：监听 pointerdown、mousedown、mouseup、click，在 precise 默认左键、stealth 和 force 下点击
+    - 验收结果：活动且可渲染的页使用原生输入；后台默认元素单击使用合成事件并返回 warnings；后台坐标或其他原生动作在派发前拒绝；stealth／force 保留明确的合成语义和遮挡处理
+
+- `capability-name-01`
+    - 操作：多个 aria-labelledby 引用、隐藏标签、Shadow 内重名 ID、6000 层 span 和隐藏文件控件 label
+    - 验收结果：名称优先级、中文相邻字符和引用所在树正确；state 保留名称及普通当前值，password／hidden／file 值未被读取
+
+- `capability-shadow-01`
+    - 操作：用 CSS、text、role、label、nth 执行点击、聚焦、select／replace、state 和上传
+    - 验收结果：open shadowRoot 可操作、去重且顺序稳定，命中和焦点指向实际控件；XPath 保持原生文档范围
+
+- `capability-frame-01`
+    - 操作：同源／跨源两层 frame、OOPIF 和 Shadow 内 iframe，执行 evaluate、点击、坐标、上传，再读取原默认目标；增加 context 准备超时与取消
+    - 验收结果：每层按父文档及 open
+      ShadowRoot 解析，输入绑定所属 session，坐标正确，上传字节一致，退出后恢复原目标；准备使用原请求期限，派发前失败保留 not_started 和零业务执行，重排或文档变化时保留真实身份或明确失败
+
+- `capability-cookie-01`
+    - 操作：在两个测试 CookieStore／partition 中设置同名 Cookie，按 target/store/partition 执行 get、set、delete、clear
+    - 验收结果：范围完整传播，其他测试范围保留；后端不支持的字段和 store 冲突在操作前拒绝；部分 clear 失败报告实际数量
+
+- `capability-cf-01`
+    - 操作：内嵌控件完成后保留容器，随后 reset／过期；增加第二控件、其他表单 response、隐藏模板和残留 iframe
+    - 验收结果：只将有正确完成证据的控件视为完成；有效 pending 继续等待，普通恢复页面不滚动或重复点击，response 内容不出现在结果
+
+- `capability-cf-02`
+    - 操作：input 或 evaluate 执行一次后触发新 Challenge，并预先配置 Fetch 路由
+    - 验收结果：不重放业务动作；后续验证失败保留已执行状态；本实例暂停请求先中止，Fetch 释放结果可见；清理未确认时保留实际连接状态
+
+- `capability-dialog-01`
+    - 操作：watch 后触发 alert／confirm／prompt，原请求阻塞期间通过 logs 获取引用并接受／取消
+    - 验收结果：读取和处理不等待原页面锁，不自动接受未知弹窗；确认实际关闭，再检查原动作的最终效果；旧引用及其他实例引用拒绝
+
+- `capability-body-01`
+    - 操作：单次 POST、重定向及二进制响应，故意乱序投递 ExtraInfo
+    - 验收结果：按请求和跳次返回 headers 及完整性，正文 output 与原始字节一致；服务端未收到额外请求；不可用正文明确失败
+
+- `capability-exception-01`
+    - 操作：页面异步抛错并附带 sourceURL
+    - 验收结果：console error 入口保留未捕获异常、来源与位置，过滤及清理语义保持有效
+
+- `capability-route-01`
+    - 操作：添加匹配规则，读取 paused 后分别 continue、改写、fulfill、fail，并覆盖重复处理、取消、导航与断开
+    - 验收结果：处理绑定同一暂停引用，未匹配请求立即继续；预期 mock 不到达真实服务；过期请求 Aborted，回执未知保留原实例归属且不重发；原生校验拒绝保留可处理引用
+
+- `capability-auth-01`
+    - 操作：配置 Server 与 Proxy 的 origin／realm，与 route／download 同时启用，触发匹配、不匹配和重复失败挑战
+    - 验收结果：只在明确范围使用合成凭证，失败重复挑战取消；日志脱敏，clear、CF 暂停与所属会话结束后凭证清除
+
+- `capability-stream-01`
+    - 操作：WebSocket 双向文本／二进制及 SSE，增加超长消息和缓存压力
+    - 验收结果：来源、方向、opcode、序号和消息一致；握手原始 headers 文本及其中 URL 的凭证脱敏；超长／淘汰／丢失状态可见；clear 不改变活动请求控制
+
+- `capability-download-01`
+    - 操作：watch 后下载合成附件，观察 GUID 与终态，wait 后 save 到私有 output
+    - 验收结果：原始一次请求，原响应与原生下载及保存产物逐字节一致；completed 与 artifact availability 分开，正文小于 16
+      MiB；不可用或超额不重新请求
+
+- `capability-event-cancel-01`
+    - 操作：通过公开 MCP 入口取消下载等待、正文读取及原始 Fetch 操作；另在派发前取消
+    - 验收结果：signal 贯穿后端请求范围，派发前无副作用；已派发操作保留真实已执行／未知状态，暂停请求按其生命周期结束
+
+协议回归对应
+`test/browser-events.test.js`、`test/browser-native-transitions.test.js`、`test/capability-regressions.test.js`
 以及 Extension 标准回归入口导入的 `extension/test/browser-events.test.js`
 协议替身检查身份、清理与错误合同，原生验收分别检查真实事件、文件和页面效果
 
@@ -2737,12 +3208,11 @@ Extension 原生用例要求可加载测试 Extension 的浏览器；条件不�
   `error`，同步 throw 与异步 reject 都验证；已完成动作保留 `actionStatus=completed` 和
   `failureStage=verification`，独立读取业务计数为 1，不重放主动作
 - `ch-timeout-01`: 在自有页初始化 started/completed 计数，通过两种 backend 的 `manage cdp Runtime.evaluate`
-  设置 1ms 协议 timeout，脚本先增加 started，再执行有界计算并增加 completed；独立读取实际计数，原生
+  设置 1 ms 协议 timeout，脚本先增加 started，再执行有界计算并增加 completed；独立读取实际计数，原生
   `Execution was terminated`（含实际 CDP 方法前缀）返回
   `actionExecuted=true`、`actionStatus=unknown`、`retryable=false`，保留原错误码且不重放；两种 backend 的 evaluate
   分别使用有界执行超时，记录真实原生终止、
-  `Runtime`
-  脚本命令的 `Internal error` 或执行中 RPC timeout；这些结果未知的错误均不可直接重试，不把 RPC
+  `Runtime` 脚本命令的 `Internal error` 或执行中 RPC timeout；这些结果未知的错误均不可直接重试，不把 RPC
   timeout 改称原生终止，调用前超时仍保留未执行及可重试状态；页面主动抛出的同名异常仍为动作失败；本地注册 callback 回归须用
   CDPClient 实际消息转换覆盖
   `Runtime.evaluate`、`Runtime.callFunctionOn`、`Runtime.runScript`，同时保留普通参数错误和非脚本命令的负例
@@ -2774,7 +3244,7 @@ Extension 原生用例要求可加载测试 Extension 的浏览器；条件不�
   `Object couldn't be returned by value` 与 `Object reference chain is too long`，错误保留
   `CDP_ERROR`、`actionExecuted=true`、`actionStatus=unknown`、`retryable=false`，独立读取计数只增加一次；iframe
   precise 使用相同断言，`readOnly` 策略也不重放序列化失败
-- `ch-cdp-04`: 页面脚本主动抛出与原生序列化、关闭 tab 或调试错误相同的文本，仍是脚本异常并保留
+- `ch-cdp-04`: 页面脚本主动抛出的文本匹配原生序列化、关闭 tab 或调试错误的文案，仍是脚本异常并保留
   `retryable=false`；原生页面快照及权限检查遇到实际关闭目标时返回失败和 warning，其他查询错误保持原身份
 - `ch-frame-01`: iframe 导航销毁 context 后，默认 `staleContextRetry=never` 不重放有副作用脚本；显式 `readOnly`
   时最多重放一次，并返回策略、retry 和最终 frame/context 摘要
@@ -2792,7 +3262,8 @@ Extension 原生用例要求可加载测试 Extension 的浏览器；条件不�
   ACK，新请求不触发旧协议；两条父端探测均保留随机 token、document 与唯一候选验证，
   结束后拒绝迟到身份上报并释放 CDP 对象
 - `ch-password-01`: 仅用自造 password value、input `find` 和替换 `text` sentinel，分别执行 Extension/CDP 的
-  `select`/`replace` 成功与失败、selector/nth 和 post-condition 对照；完整响应及 `error.logs` 定位日志均不得泄露 sentinel，诊断正文返回
+  `select`/`replace` 成功与失败、selector/nth 和 post-condition 对照；完整响应及 `error.logs`
+  定位日志均不得泄露 sentinel，诊断正文返回
   `redacted=true` 与
   `reason="sensitive_input_or_unresolved_target"`，动作和验证状态保持正确；同页有 password 字段时，普通输入仍返回新增
   console/network 诊断；
@@ -2833,7 +3304,9 @@ Extension 原生用例要求可加载测试 Extension 的浏览器；条件不�
   iframe 时即使尺寸为 0 也走系统鼠标，后续宿主页验证按钮同样走系统鼠标，混合窗口不调用
   `focusWindow`；普通编辑区等无关 div 不因尺寸匹配成为 widget；Linux 用 `xprop` 的 GTK frame
   extents 与实际 client 窗口尺寸核对内容原点，覆盖不对称 shadow、缩放与无 client
-  shadow 的窗口；按 `browse-challenge-02-turnstile-click` 覆盖 debugger 提示条在路径移动期间消失的坐标更新，数据不符或工具缺失时拒绝点击；原生截图中的控件位置、系统鼠标终点和页面实际 click/change 事件须一致，英文、中文均完成
+  shadow 的窗口；按
+  `browse-challenge-02-turnstile-click`
+  覆盖 debugger 提示条在路径移动期间消失的坐标更新，数据不符或工具缺失时拒绝点击；原生截图中的控件位置、系统鼠标终点和页面实际 click/change 事件须一致，英文、中文均完成
   checkbox 到 verify 的两阶段变化，不能以 xdotool
   exit 0 替代；缺少系统鼠标工具或窗口未聚焦返回可见错误，不静默改用 CDP 点击；`diagnostics=true` 不用于 Cloudflare 实测
 - `ch-challenge-10`: 使用真实旧 Extension，保留版本、bundle 身份与原调用；缺少 `page_snapshot`
@@ -2859,7 +3332,8 @@ Extension 原生用例要求可加载测试 Extension 的浏览器；条件不�
   和源站等待状态，每次脚本只执行一次；隐藏成功文案和仍显示的 Turnstile 勾选框不算验证完成，也不把目标页写成已加载
 - `ch-challenge-12`: 两种 backend 的 open、back、forward、refresh 完成验证并进入业务页后，顶层 URL／title
   使用当前页面信息，与 pageContext.after 的最终 URL 一致，敏感 URL 参数继续脱敏，原导航只执行一次；attach
-  和无历史的 back／forward 保持原请求数量，后者保留 navigated=false 并跳过 Challenge；Extension 对只有一个历史项、方向已到边界、受限页和失效主 frame 均及时结束信号等待，保留有效页面历史的既有处理；源站等待时保留
+  和无历史的 back／forward 保持原请求数量，后者保留 navigated=false 并跳过 Challenge；Extension 对只有一个历史项、方向已到边界、受限页和失效主 frame 均及时结束信号等待，
+  保留有效页面历史的既有处理；源站等待时保留
   originResponsePending 语义；最终信息读取共用原 timeout，超时或目标消失返回实际错误，error.context 保留
   actionExecuted=true、actionStatus=completed、failureStage=metadata、retryable=false，独立读取页面后核验结果
 
@@ -3011,11 +3485,17 @@ runner/主机实际执行后才算完成
 
 - 前置：独立 Extension 测试环境，仅包含自有普通窗口和自有测试页
 - 先 list，按任务名称及备注后台 attach 复用，无合适页面才 newPage，并传 taskHint/note
-- 同任务两次创建返回不同页面及相同可信组，组名可读，创建页不激活，窗口数量不增加
+- 同一连接跨步骤、站点和 taskHint 变化创建不同页面，持续复用本工作的可信组；关闭默认页后，组内其他工作页仍支持后续复用，内部子任务不增加组
 - 保留第二个 Server 连接，仅重启第一个 Server；Extension 自动重连且其他连接保持，Server 延迟启动时沿既有退避继续发现，显式断开取消重试
-- Server 重启及 Extension 重载后，来源、备注和组关系保持，后续同任务页复用可信组
-- 两个 Server 并发创建及原生 groupId 变更事件与登记交错时，只产生一个可信任务组
-- 更新 taskHint/note 后 list、topology、metadata 返回同一最新值；全部成员同名后更新组名
+- Extension 重载后保留来源、备注和工作归属；Server 重启后 list、attach 原工作页，再创建时恢复其可信组；文档身份变化后按原恢复规则处理
+- 两个 Server 并发创建时分别组织自己的工作组，即使 taskHint 相同或提供另一活动连接的来源页也保持独立；原生 groupId 事件和登记交错时，同连接保持单个有效工作组
+- 普通 newPage()、newPage(url) 保持有效；新组使用 MCP 加上长度受限的 taskHint、URL 主机名或“浏览”，初始同名组用序号区分；新组初始展开，后台创建保持未激活，窗口数量不增加
+- 内部来源页只传递工作关系，原生 openerTabId、index、windowId、pinned、groupId 的显式位置合同保持
+- 更新 taskHint/note 后 list、topology、metadata 返回同一最新值，标题保持；通过 updateGroup 自主设置简短用途名后，后续页面和备注变化保留标题、颜色和折叠状态
+- 通过可信来源页恢复旧 v2 自动组时，原成员、标题、颜色和折叠状态保持；标题与任务描述相同或采用 MCP · 任务名格式时也保留；其他活动连接的组、用户组和混合组保持原状
+- 新组命名失败时返回实际页面、管理状态和 warning，后续沿有效工作归属复用；复用现有组时不重复写入标题
+- 折叠自有工具组并确认 Chrome 将页面冻结后，页面条件失败保持原展示；条件通过的页面工作自动展开该可信组，脚本只执行一次，标题、颜色、前台标签与窗口焦点保持
+- 页面检查持续等待时，名称、颜色及折叠更新独立完成，展开不等待该检查；用户组、混合组和其他活动连接的组不被工作恢复逻辑改变
 - 旧 v1 记录迁移为 unknown，仍可 attach 和使用受控操作；同名用户组及混合成员组不被认领
 - 移动、关闭或成员变化后清理失效关系；备注更新中的 origin/documentId/groupId 无法改变来源与权限
 - storage 写入失败返回错误，旧值保留，不报告成功；显式授权 close 可关闭 adopted/unknown 受控页
@@ -3024,7 +3504,8 @@ runner/主机实际执行后才算完成
 
 ### navigation-wait-02-live-state-and-url-display
 
-- 两种 backend 的 wait navigation 均脱敏认证查询参数；分别执行 browse close 与 manage closePage，响应返回 affected.before/after，affected.before.url 采用同一脱敏规则
+- 两种 backend 的 wait navigation 均脱敏认证查询参数；分别执行 browse close 与 manage
+  closePage，响应返回 affected.before/after，affected.before.url 采用同一脱敏规则
 - 导航错误与导航超时文案执行相同脱敏，普通查询参数、内部导航和 expectedUrl 使用原值
 - CDP 等待完成后，在原 deadline 剩余预算内读取实时 URL/title，覆盖同文档、跨文档及恢复导航
 - 实时状态失败或预算耗尽时返回 waitCompleted=true、failureStage=snapshot，不返回旧 URL/title，不重复导航
@@ -3034,3 +3515,141 @@ runner/主机实际执行后才算完成
 - `err-drag-refId-stale-01` — 需要 V8 GC 才能让 WeakRef deref 失败，从外部 mcp 工具无法稳定构造， 靠静态代码 review +
   `dist` 字面量 + 正常 drag 端到端 smoke 保证
 - `input-keydown-05-commands-copy-paste` — 依赖剪贴板权限，无权限或 headless 下跳过
+- `C31F8-BG` — 文档持续 `hidden` 时，[HTML 渲染更新](https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering)跳过该文档，
+  [原生 scroll 事件](https://drafts.csswg.org/cssom-view/#scrolling-events)等待恢复可见后派发；持续 `hidden` 与实际滚动回调内阻断传播、移动目标的组合记为 KNOWN-LIMIT
+  后台取点、输入状态和独立原生参照继续按原矩阵验收，回调内位移与传播阻断使用 `C31F8-01/02` 的可见页面条件验证
+
+## 独立候选的目标与生命周期回归
+
+在独立候选目录编译并执行 `node --test test/global-feedback.test.js`，设置 `CHROME_PATH` 后启用自有 headless
+profile 的原生用例
+
+- `CSR-20-01`
+    - 操作：临时选择 B 期间为默认 A 配置观察
+    - 断言：配置等待恢复，目标仍为 A；ref 处理独立可用
+
+- `CSR-20-02`
+    - 操作：Delete、Save 按钮按语义名称提取 HTML＋images
+    - 断言：HTML 和图片均属于 Save，exact/nth 条件保留
+
+- `CSR-20-03`
+    - 操作：CDP iframe 动作后执行内置 selector 验证
+    - 断言：动作单次执行，验证 matched；CDP 使用 never，Extension 使用 readOnly
+
+- `CSR-20-04`
+    - 操作：根页 (500,200) 的无边框 iframe 内截取 (20,30,40,30) 元素
+    - 断言：clip 为 (520,230,40,30)，原生图片区域对应目标
+
+- `CE-NEW01`
+    - 操作：helper 安装 await 期间取消或期限到达
+    - 断言：用户脚本未派发；有效请求使用准备后的剩余期限
+
+- `CE-NEW02`
+    - 操作：延迟旧 Fetch.disable，同时同 owner 重连配置 route
+    - 断言：新配置等待旧清理，使用新 controller，暂停请求仍有消费者
+
+- `E01`
+    - 操作：window_create 移动已有页期间并发 releasePage
+    - 断言：release 等待窗口动作结束，最终页面保持解除受控
+
+- `E06`
+    - 操作：A 的响应传输期间临时选择 B，在 B 被选中时结束 A 请求
+    - 断言：恢复 A 后保留 HTTP status、终态与耗时，B 日志独立
+
+- `F127`
+    - 操作：显式输出超过 2000 节点的 JSON 对象
+    - 断言：在文件预算内完整保存，内联仍受原上限约束，主动作不重放
+
+- `F392`
+    - 操作：普通文件差异页包含 spinner 或通用 h2
+    - 断言：challengeKind 为 none；真实 Cloudflare 标记仍能识别
+
+### 文本、诊断与新页观测定向用例
+
+- `F445`
+    - 操作：分别省略预算、指定 maxChars/offset、指定 output、读取末尾空窗口
+    - 断言：默认内容完整；窗口和文件内容一致；nextOffset 可继续，末尾为 null
+
+- `F078`
+    - 操作：设置合成 UA，再传空字符串
+    - 断言：navigator.userAgent 恢复原值
+
+- `F257/F258`
+    - 操作：控制台文本与错误堆栈含合成 token URL
+    - 断言：敏感参数遮蔽，普通参数保留，正文文件不改变
+
+- `F392`
+    - 操作：普通差异页正文包含 Cloudflare 测试句子
+    - 断言：challengeKind 为 none，标题／DOM 和真实验证正文用例继续有效
+
+- `CE-CAND01`
+    - 操作：原生请求开始后才 Network.enable，并对照新页 networkidle
+    - 断言：记录是否重放开始事件；新页在目标导航前准备网络观察
+
+- `CE-CAND02`
+    - 操作：scale(2) 的 iframe 中记录 trusted pointer，比较根页与平移推定原点
+    - 断言：记录两个原点的差异，offset 路径在使用缩放或旋转几何前明确拒绝
+
+### 检查到期与 overflow 元素截图
+
+- `F090/F187/F397`
+    - 操作：未观察验证时让状态读取到期，分别覆盖主动作未开始／完成、读取未开始／回执未知
+    - 断言：TIMEOUT；主动作状态保留，verificationStatus 为 unavailable，读取 unknown 保留，autoRetry=false
+
+- `F090-known`
+    - 操作：已取得验证 header 或标题后让后续读取到期
+    - 断言：CHALLENGE_TIMEOUT，已知验证类型保留
+
+- `F305`
+    - 操作：600×500 表格放入 180×100 overflow 容器，改变容器与根页滚动后截取表格
+    - 断言：只输出 180×100 已绘制区域，clippedToVisibleArea=true，根页与容器滚动、viewport 均保持
+
+- `F305-frame`
+    - 操作：在 iframe 中对普通元素截图，并对照根页滚动
+    - 断言：frame 坐标只映射一次，根页 clip 正确，原 frame scope 恢复
+
+### 所属状态与几何定向回归
+
+以下控制使用现有 Server／Extension 回归入口，原生几何另使用独立 headless
+profile、自有 HTTP 页面和可加载的测试 Extension；两端构建完成后，在独立候选的 mcp-chrome 目录执行：
+
+```bash
+node test/m16-geometry-native.mjs /path/to/chrome [OUTPUT_JSON]
+```
+
+该入口通过真实 MCP SDK 调用生产 extract，测试 carrier 将命令显式转发给实际 Extension service
+worker 中的生产 ActionHandler
+Extension 发现与自动连接仍按原有连接用例验收，几何结果分别记录 Extension／CDP 的返回字段、原生 PNG 像素和资源清理结果
+
+- `M16-C01`
+    - 条件与入口：Extension owner 清理的 Fetch.disable 首次明确失败，随后同 owner 重连；对照未知暂停请求与原生 detach
+    - 断言：后续动作先受控重试，清理成功后恢复配置；未知资源仍阻止新动作，处理 ref 保留；确认 session／页面结束后释放所属阻挡
+
+- `M16-C02`
+    - 条件与入口：原生几何入口的 scale、rotate、nested iframe；分别提取 text、attribute、accessibility
+      state，记录 debugger attach 次数
+    - 断言：三种读取均命中选定 frame 的目标，内容和属性为 readable，读取期间 attach 次数为 0；默认 viewport 查找及 pointer 校准保护保留
+    - 输入对照：原生坐标入口在变换 frame 中执行 touch-point-selector、selection-local-focus、command-local-focus 和 drag-ref
+    - 输入断言：先以 frame 内引用定位目标，触摸与命令只作用于选定元素，DOM 选区为 bravo，拖拽的源与目标正确，继续使用原有仿射派发
+
+- `M16-C03`
+    - 条件与入口：两个含相同文本的控件，坐标命中后者但焦点在前者；select／replace 与写入前移除目标、改变焦点或选区
+    - 断言：只操作实际命中控件；目标或选区变化时停止写入，其他控件不变；保留密码脱敏、readonly／disabled 和 UNSUPPORTED_SELECTION 断言
+
+- `M16-C04`
+    - 条件与入口：attachment 正文读取暂停时 stop、suspend 或改变文档，再 watch 相同 URL 并收到新 GUID；保留已可靠绑定的历史下载对照
+    - 断言：迟到正文不绑定新 GUID，身份或候选不唯一时 artifact 不可用；已绑定历史引用在缓存保留期间仍可读取，原请求不重放
+
+- `M16-C05`
+    - 条件与入口：原生几何入口中根 scrollY=800、无边框 iframe 的根视口位置为 (500,200)，目标局部矩形为 (20,30,40,30)
+    - 断言：Extension／CDP 的 clip 均为 (520,1030,40,30)，PNG 对应目标；根滚动与原 frame scope 保留，Extension
+      documentId 恢复
+
+- `M16-C06`
+    - 条件与入口：普通标题和普通 headers 下检查持续失败；对照原期限内后续只读检查成功，以及导航已完成
+    - 断言：持续失败保留 unverified，到期为 TIMEOUT／unavailable／autoRetry=false；后续读取成功可解除等待，导航与业务动作不重放，原完成事实保留
+
+- `O-C01`
+    - 条件与入口：原生几何入口中 direct absolute、absolute 祖先中的 static 后代、positioned
+      overflow 和 translation-transform overflow 对照
+    - 断言：前两组原生像素为红色且允许截图；后两组完全被裁剪，原生像素为白色并返回 ELEMENT_NOT_VISIBLE；Extension／CDP 一致

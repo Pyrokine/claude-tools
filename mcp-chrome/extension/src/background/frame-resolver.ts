@@ -1,12 +1,17 @@
 import { ExpectedOperationError, wrapDebuggerError } from '../types/expected-errors'
-import { EvaluateInFrameSchema, GetAllFramesSchema, ResolveFrameSchema } from '../types/schemas'
+import {
+    EvaluateInFrameSchema,
+    GetAllFramesSchema,
+    PrepareFrameEvaluationSchema,
+    ResolveFrameSchema,
+} from '../types/schemas'
 import {
     type ActionContext,
-    type DomFrameSnapshot,
     assertActionActive,
     assertManagedTab,
     assertReadableTab,
     assertScriptable,
+    type DomFrameSnapshot,
     getDomFrameSnapshot,
     getTargetTabId,
     probeCdpFrameOwner,
@@ -32,7 +37,7 @@ export class FrameResolver {
         }
         const selections = Array.isArray(p.frame) ? p.frame : [p.frame]
         let parentFrameId = 0
-        let offset = { x: 0, y: 0 }
+        let offset: { x: number; y: number } | null = { x: 0, y: 0 }
         const path: Array<Record<string, unknown>> = []
         let identity = root
         for (const selection of selections) {
@@ -94,7 +99,10 @@ export class FrameResolver {
                     { tabId, path, selection, actionExecuted: false }
                 )
             }
-            offset = { x: offset.x + selected.contentOffset.x, y: offset.y + selected.contentOffset.y }
+            offset =
+                offset && selected.translationOnly
+                    ? { x: offset.x + selected.contentOffset.x, y: offset.y + selected.contentOffset.y }
+                    : null
             path.push({ selection, domIndex: selected.index, ...this.frameIdentitySummary(identity) })
             parentFrameId = identity.frameId
         }
@@ -169,6 +177,11 @@ export class FrameResolver {
         }
     }
 
+    async prepareFrameEvaluation(params: unknown, context: ActionContext): Promise<unknown> {
+        const p = PrepareFrameEvaluationSchema.parse(params)
+        return this.evaluateInFrame({ ...p, expression: 'void 0', prepareOnly: true }, context)
+    }
+
     /**
      * 在指定 iframe 中以 precise 模式执行 JS
      *
@@ -176,270 +189,368 @@ export class FrameResolver {
      * 然后用 Runtime.evaluate + contextId 在 iframe 主世界中执行代码，绕过 CSP
      */
     async evaluateInFrame(params: unknown, context: ActionContext): Promise<unknown> {
-        const p = EvaluateInFrameSchema.parse(params)
-        const options = params as { returnByValue?: boolean; awaitPromise?: boolean }
-        const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'evaluate_in_frame')
-        await this.debuggerManager.ensureAttached(tabId)
-        const startedAt = Date.now()
-        assertActionActive(context)
-        const originalFrame = await this.getExtensionFrameIdentity(tabId, p.frameId)
-        let retryAttempted = false
-        let retryReason: string | undefined
-        const maxAttempts = p.staleContextRetry === 'readOnly' ? 2 : 1
-
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        let tabId: number | undefined
+        let scriptDispatched = false
+        try {
+            const p = EvaluateInFrameSchema.parse(params)
+            const options = params as { returnByValue?: boolean; awaitPromise?: boolean; prepareOnly?: boolean }
+            tabId = p.tabId
+            tabId = await this.getManagedScriptableTabId(tabId, context, 'evaluate_in_frame')
+            await this.debuggerManager.ensureAttached(tabId)
+            const startedAt = Date.now()
             assertActionActive(context)
-            const remaining = p.timeout === undefined ? undefined : p.timeout - (Date.now() - startedAt)
-            if (remaining !== undefined && remaining <= 0) {
-                throw this.frameEvaluationError(
-                    'FRAME_EVALUATION_TIMEOUT',
-                    'Frame evaluation timed out before resolution',
-                    {
-                        tabId,
-                        extensionFrameId: p.frameId,
-                        timeout: p.timeout,
-                        retryAttempted,
-                        retryReason,
-                    }
-                )
-            }
-            let identity = originalFrame
-            let resolved: { cdpFrameId: string; querySessionId?: string; ownerSessionId?: string }
-            try {
-                identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
-                const resolutionDeadline = startedAt + (p.timeout ?? 2000)
-                for (;;) {
-                    if (
-                        identity.parentFrameId !== originalFrame.parentFrameId ||
-                        identity.frameId !== originalFrame.frameId
-                    ) {
-                        // noinspection ExceptionCaughtLocallyJS -- Report failure
-                        throw this.frameEvaluationError(
-                            'FRAME_IDENTITY_CHANGED',
-                            'Frame identity changed before stale-context retry; refusing to guess target',
-                            {
-                                tabId,
-                                retryAttempted,
-                                retryReason,
-                                originalFrame: this.frameIdentitySummary(originalFrame),
-                                currentFrame: this.frameIdentitySummary(identity),
-                            }
-                        )
-                    }
-                    try {
-                        resolved = await this.resolveCdpFrame(tabId, identity, context)
-                        break
-                    } catch (error) {
-                        const message = error instanceof Error ? error.message : String(error)
+            const originalFrame = await this.getExtensionFrameIdentity(tabId, p.frameId)
+            let retryAttempted = false
+            let retryReason: string | undefined
+            const maxAttempts = p.staleContextRetry === 'readOnly' ? 2 : 1
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                assertActionActive(context)
+                const remaining = p.timeout === undefined ? undefined : p.timeout - (Date.now() - startedAt)
+                if (remaining !== undefined && remaining <= 0) {
+                    throw this.frameEvaluationError(
+                        'FRAME_EVALUATION_TIMEOUT',
+                        'Frame evaluation timed out before resolution',
+                        {
+                            tabId,
+                            extensionFrameId: p.frameId,
+                            timeout: p.timeout,
+                            retryAttempted,
+                            retryReason,
+                        }
+                    )
+                }
+                let identity = originalFrame
+                const prepared = attempt === 0 ? p.preparedContext : undefined
+                let resolved: { cdpFrameId: string; querySessionId?: string; ownerSessionId?: string }
+                try {
+                    identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
+                    if (prepared) {
                         if (
-                            !retryAttempted ||
-                            message !== `No document with id ${identity.documentId} in tab with id ${tabId}`
+                            prepared.tabId !== tabId ||
+                            prepared.frameId !== identity.frameId ||
+                            prepared.documentId !== identity.documentId ||
+                            prepared.parentFrameId !== identity.parentFrameId ||
+                            prepared.parentDocumentId !== identity.parentDocumentId ||
+                            prepared.url !== identity.url
                         ) {
-                            // noinspection ExceptionCaughtLocallyJS -- Report failure
-                            throw error
+                            throw this.frameEvaluationError(
+                                'FRAME_IDENTITY_CHANGED',
+                                'Prepared frame document changed',
+                                {
+                                    tabId,
+                                    actionExecuted: false,
+                                    actionStatus: 'not_started',
+                                    retryable: false,
+                                }
+                            )
                         }
-                        const remainingResolution = resolutionDeadline - Date.now()
-                        if (remainingResolution <= 0) {
-                            // noinspection ExceptionCaughtLocallyJS -- Report failure
-                            throw new Error('Frame document resolution timed out after stale execution context', {
-                                cause: error,
-                            })
+                        resolved = prepared
+                    } else {
+                        const resolutionDeadline = startedAt + (p.timeout ?? 2000)
+                        for (;;) {
+                            if (
+                                identity.parentFrameId !== originalFrame.parentFrameId ||
+                                identity.frameId !== originalFrame.frameId
+                            ) {
+                                // noinspection ExceptionCaughtLocallyJS -- Report failure
+                                throw this.frameEvaluationError(
+                                    'FRAME_IDENTITY_CHANGED',
+                                    'Frame identity changed before stale-context retry; refusing to guess target',
+                                    {
+                                        tabId,
+                                        retryAttempted,
+                                        retryReason,
+                                        originalFrame: this.frameIdentitySummary(originalFrame),
+                                        currentFrame: this.frameIdentitySummary(identity),
+                                    }
+                                )
+                            }
+                            try {
+                                resolved = await this.resolveCdpFrame(tabId, identity, context)
+                                break
+                            } catch (error) {
+                                const message = error instanceof Error ? error.message : String(error)
+                                if (
+                                    !retryAttempted ||
+                                    message !== `No document with id ${identity.documentId} in tab with id ${tabId}`
+                                ) {
+                                    // noinspection ExceptionCaughtLocallyJS -- Report failure
+                                    throw error
+                                }
+                                const remainingResolution = resolutionDeadline - Date.now()
+                                if (remainingResolution <= 0) {
+                                    // noinspection ExceptionCaughtLocallyJS -- Report failure
+                                    throw new Error(
+                                        'Frame document resolution timed out after stale execution context',
+                                        {
+                                            cause: error,
+                                        }
+                                    )
+                                }
+                                await new Promise((resolve) => setTimeout(resolve, Math.min(25, remainingResolution)))
+                                identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
+                            }
                         }
-                        await new Promise((resolve) => setTimeout(resolve, Math.min(25, remainingResolution)))
-                        identity = await this.getExtensionFrameIdentity(tabId, p.frameId)
                     }
-                }
-            } catch (error) {
-                if (!retryAttempted) {
-                    throw error
-                }
-                throw this.frameEvaluationError(
-                    'FRAME_EVALUATION_FAILED',
-                    (error instanceof Error ? error.message : String(error)).slice(0, 500),
-                    {
-                        tabId,
-                        ...this.frameIdentitySummary(identity),
-                        phase: 'retry_resolution',
-                        retryAttempted,
-                        retryReason,
+                } catch (error) {
+                    if (!retryAttempted) {
+                        throw error
                     }
-                )
-            }
-            const queryTarget = { tabId, ...(resolved.querySessionId ? { sessionId: resolved.querySessionId } : {}) }
-            let contexts = this.debuggerManager
-                .getExecutionContexts(tabId)
-                .filter((item) => item.sessionId === resolved.querySessionId)
-            if (contexts.length === 0 || attempt > 0) {
-                await chrome.debugger.sendCommand(queryTarget, 'Runtime.enable')
-            }
-            let targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
-            const deadline = p.timeout === undefined ? Date.now() + 2000 : startedAt + p.timeout
-            while (!targetCtx && Date.now() < deadline) {
-                await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
-                contexts = this.debuggerManager
+                    throw this.frameEvaluationError(
+                        'FRAME_EVALUATION_FAILED',
+                        (error instanceof Error ? error.message : String(error)).slice(0, 500),
+                        {
+                            tabId,
+                            ...this.frameIdentitySummary(identity),
+                            phase: 'retry_resolution',
+                            retryAttempted,
+                            retryReason,
+                        }
+                    )
+                }
+                const queryTarget = {
+                    tabId,
+                    ...(resolved.querySessionId ? { sessionId: resolved.querySessionId } : {}),
+                }
+                let contexts = this.debuggerManager
                     .getExecutionContexts(tabId)
                     .filter((item) => item.sessionId === resolved.querySessionId)
-                targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
-            }
-            if (!targetCtx) {
-                throw this.frameEvaluationError('FRAME_CONTEXT_UNAVAILABLE', 'No execution context for frame', {
-                    tabId,
-                    ...this.frameIdentitySummary(identity),
-                    cdpFrameId: resolved.cdpFrameId,
-                    contextCount: contexts.length,
-                    retryAttempted,
-                    retryReason,
-                })
-            }
-            const owner =
-                identity.frameId === 0
-                    ? 0
-                    : identity.documentId
-                      ? await probeCdpFrameOwner(
-                            tabId,
-                            identity.documentId,
-                            resolved.cdpFrameId,
-                            resolved.ownerSessionId,
-                            context
-                        )
-                      : null
-            const current = await this.getExtensionFrameIdentity(tabId, p.frameId)
-            if (
-                owner !== identity.frameId ||
-                current.documentId !== identity.documentId ||
-                current.url !== identity.url ||
-                current.parentFrameId !== identity.parentFrameId ||
-                !this.debuggerManager
-                    .getExecutionContexts(tabId)
-                    .some(
-                        (item) =>
-                            item.id === targetCtx!.id &&
-                            item.frameId === resolved.cdpFrameId &&
-                            item.isDefault &&
-                            item.sessionId === resolved.querySessionId
-                    )
-            ) {
-                throw this.frameEvaluationError('FRAME_IDENTITY_CHANGED', 'Frame identity changed before dispatch', {
-                    tabId,
-                    actionExecuted: false,
-                    originalFrame: this.frameIdentitySummary(identity),
-                    currentFrame: this.frameIdentitySummary(current),
-                })
-            }
-            // 请求期限和脚本期限可分别缺省，任一缺省时仍需使用另一个预算
-            // noinspection PointlessBooleanExpressionJS
-            const evaluationTimeout =
-                context.deadline === undefined && p.timeout === undefined
-                    ? undefined
-                    : Math.min(
-                          context.deadline === undefined ? Infinity : context.deadline - Date.now(),
-                          p.timeout === undefined ? Infinity : p.timeout - (Date.now() - startedAt)
-                      )
-            if (evaluationTimeout !== undefined && evaluationTimeout <= 0) {
-                throw this.frameEvaluationError(
-                    'FRAME_EVALUATION_TIMEOUT',
-                    'Frame evaluation timed out before Runtime.evaluate',
-                    {
-                        tabId,
-                        ...this.frameIdentitySummary(identity),
-                        cdpFrameId: resolved.cdpFrameId,
-                        executionContextId: targetCtx.id,
-                        timeout: p.timeout,
-                        retryAttempted,
-                        retryReason,
-                    }
+                if (!prepared && (contexts.length === 0 || attempt > 0)) {
+                    await chrome.debugger.sendCommand(queryTarget, 'Runtime.enable')
+                }
+                let targetCtx = contexts.find(
+                    (item) =>
+                        item.frameId === resolved.cdpFrameId &&
+                        item.isDefault &&
+                        (!prepared || item.id === prepared.executionContextId)
                 )
-            }
-            assertActionActive(context)
-            const evalParams: Record<string, unknown> = {
-                contextId: targetCtx.id,
-                expression: p.expression,
-                returnByValue: options.returnByValue ?? true,
-                awaitPromise: options.awaitPromise ?? true,
-                ...(evaluationTimeout !== undefined ? { timeout: evaluationTimeout } : {}),
-            }
-            try {
-                const result = (await chrome.debugger.sendCommand(
-                    queryTarget,
-                    'Runtime.evaluate',
-                    evalParams
-                )) as Record<string, unknown>
-                return {
-                    ...result,
-                    retryAttempted,
-                    retryReason,
-                    staleContextRetry: p.staleContextRetry,
-                    frameContext: {
-                        tabId,
-                        ...this.frameIdentitySummary(identity),
-                        originalUrl: this.frameUrlSummary(originalFrame.url).url,
-                        urlChanged: identity.url !== originalFrame.url,
-                        cdpFrameId: resolved.cdpFrameId,
-                        executionContextId: targetCtx.id,
-                    },
+                const deadline = p.timeout === undefined ? Date.now() + 2000 : startedAt + p.timeout
+                while (!prepared && !targetCtx && Date.now() < deadline) {
+                    assertActionActive(context)
+                    await new Promise((resolve) =>
+                        setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now())))
+                    )
+                    contexts = this.debuggerManager
+                        .getExecutionContexts(tabId)
+                        .filter((item) => item.sessionId === resolved.querySessionId)
+                    targetCtx = contexts.find((item) => item.frameId === resolved.cdpFrameId && item.isDefault)
                 }
-            } catch (error) {
-                const nativeError = wrapDebuggerError(error, {
-                    tabId,
-                    method: 'Runtime.evaluate',
-                    phase: 'command',
-                    frameContext: {
+                if (!targetCtx) {
+                    throw this.frameEvaluationError('FRAME_CONTEXT_UNAVAILABLE', 'No execution context for frame', {
                         tabId,
                         ...this.frameIdentitySummary(identity),
                         cdpFrameId: resolved.cdpFrameId,
-                        executionContextId: targetCtx.id,
-                    },
-                })
-                const message = error instanceof Error ? error.message : String(error)
-                const staleContext =
-                    /context.*(?:destroyed|not found|invalid)|Cannot find context|Execution context/i.test(message)
-                if (!staleContext && nativeError !== error) {
-                    throw nativeError
-                }
-                if (attempt > 0) {
-                    throw this.frameEvaluationError('FRAME_EVALUATION_FAILED', message.slice(0, 500), {
-                        tabId,
-                        ...this.frameIdentitySummary(identity),
-                        cdpFrameId: resolved.cdpFrameId,
-                        executionContextId: targetCtx.id,
+                        contextCount: contexts.length,
                         retryAttempted,
                         retryReason,
+                        actionExecuted: retryAttempted,
+                        actionStatus: retryAttempted ? 'unknown' : 'not_started',
+                        retryable: false,
                     })
                 }
-                if (!staleContext) {
-                    throw error
-                }
-                if (p.staleContextRetry !== 'readOnly') {
+                const owner =
+                    prepared || identity.frameId === 0
+                        ? identity.frameId
+                        : identity.documentId
+                          ? await probeCdpFrameOwner(
+                                tabId,
+                                identity.documentId,
+                                resolved.cdpFrameId,
+                                resolved.ownerSessionId,
+                                context
+                            )
+                          : null
+                const current = await this.getExtensionFrameIdentity(tabId, p.frameId)
+                if (
+                    owner !== identity.frameId ||
+                    current.documentId !== identity.documentId ||
+                    current.url !== identity.url ||
+                    current.parentFrameId !== identity.parentFrameId ||
+                    !this.debuggerManager
+                        .getExecutionContexts(tabId)
+                        .some(
+                            (item) =>
+                                item.id === targetCtx!.id &&
+                                item.frameId === resolved.cdpFrameId &&
+                                item.isDefault &&
+                                item.sessionId === resolved.querySessionId
+                        )
+                ) {
                     throw this.frameEvaluationError(
-                        'FRAME_STALE_CONTEXT',
-                        'Execution context became stale; script was not replayed because staleContextRetry is never',
+                        'FRAME_IDENTITY_CHANGED',
+                        'Frame identity changed before dispatch',
+                        {
+                            tabId,
+                            actionExecuted: retryAttempted,
+                            actionStatus: retryAttempted ? 'unknown' : 'not_started',
+                            retryable: false,
+                            originalFrame: this.frameIdentitySummary(identity),
+                            currentFrame: this.frameIdentitySummary(current),
+                        }
+                    )
+                }
+                // 请求期限和脚本期限可分别缺省，任一缺省时仍需使用另一个预算
+                // noinspection PointlessBooleanExpressionJS
+                const evaluationTimeout =
+                    context.deadline === undefined && p.timeout === undefined
+                        ? undefined
+                        : Math.min(
+                              context.deadline === undefined ? Infinity : context.deadline - Date.now(),
+                              p.timeout === undefined ? Infinity : p.timeout - (Date.now() - startedAt)
+                          )
+                if (evaluationTimeout !== undefined && evaluationTimeout <= 0) {
+                    throw this.frameEvaluationError(
+                        'FRAME_EVALUATION_TIMEOUT',
+                        'Frame evaluation timed out before Runtime.evaluate',
                         {
                             tabId,
                             ...this.frameIdentitySummary(identity),
                             cdpFrameId: resolved.cdpFrameId,
                             executionContextId: targetCtx.id,
-                            retryAttempted: false,
-                            staleContextRetry: p.staleContextRetry,
+                            timeout: p.timeout,
+                            retryAttempted,
+                            retryReason,
                         }
                     )
                 }
-                retryAttempted = true
-                retryReason = message.slice(0, 500)
-                this.debuggerManager.invalidateExecutionContext(tabId, targetCtx.id, resolved.querySessionId)
-                if (p.timeout !== undefined && Date.now() - startedAt >= p.timeout) {
-                    throw this.frameEvaluationError('FRAME_EVALUATION_TIMEOUT', message.slice(0, 500), {
-                        tabId,
-                        ...this.frameIdentitySummary(identity),
-                        cdpFrameId: resolved.cdpFrameId,
-                        executionContextId: targetCtx.id,
-                        timeout: p.timeout,
+                assertActionActive(context)
+                if (options.prepareOnly) {
+                    return {
+                        preparedContext: {
+                            tabId,
+                            frameId: identity.frameId,
+                            documentId: identity.documentId,
+                            parentFrameId: identity.parentFrameId,
+                            parentDocumentId: identity.parentDocumentId,
+                            url: identity.url,
+                            cdpFrameId: resolved.cdpFrameId,
+                            executionContextId: targetCtx.id,
+                            querySessionId: resolved.querySessionId,
+                        },
+                    }
+                }
+                const evalParams: Record<string, unknown> = {
+                    contextId: targetCtx.id,
+                    expression: p.expression,
+                    returnByValue: options.returnByValue ?? true,
+                    awaitPromise: options.awaitPromise ?? true,
+                    ...(evaluationTimeout !== undefined ? { timeout: evaluationTimeout } : {}),
+                }
+                try {
+                    scriptDispatched = true
+                    const result = (await chrome.debugger.sendCommand(
+                        queryTarget,
+                        'Runtime.evaluate',
+                        evalParams
+                    )) as Record<string, unknown>
+                    return {
+                        ...result,
                         retryAttempted,
                         retryReason,
+                        staleContextRetry: p.staleContextRetry,
+                        frameContext: {
+                            tabId,
+                            ...this.frameIdentitySummary(identity),
+                            originalUrl: this.frameUrlSummary(originalFrame.url).url,
+                            urlChanged: identity.url !== originalFrame.url,
+                            cdpFrameId: resolved.cdpFrameId,
+                            executionContextId: targetCtx.id,
+                        },
+                    }
+                } catch (error) {
+                    const nativeError = wrapDebuggerError(error, {
+                        tabId,
+                        method: 'Runtime.evaluate',
+                        phase: 'command',
+                        frameContext: {
+                            tabId,
+                            ...this.frameIdentitySummary(identity),
+                            cdpFrameId: resolved.cdpFrameId,
+                            executionContextId: targetCtx.id,
+                        },
                     })
+                    const message = error instanceof Error ? error.message : String(error)
+                    const staleContext =
+                        /context.*(?:destroyed|not found|invalid)|Cannot find context|Execution context/i.test(message)
+                    if (!staleContext && nativeError !== error) {
+                        throw nativeError
+                    }
+                    if (attempt > 0) {
+                        throw this.frameEvaluationError('FRAME_EVALUATION_FAILED', message.slice(0, 500), {
+                            tabId,
+                            ...this.frameIdentitySummary(identity),
+                            cdpFrameId: resolved.cdpFrameId,
+                            executionContextId: targetCtx.id,
+                            retryAttempted,
+                            retryReason,
+                        })
+                    }
+                    if (!staleContext) {
+                        throw error
+                    }
+                    if (p.staleContextRetry !== 'readOnly') {
+                        throw this.frameEvaluationError(
+                            'FRAME_STALE_CONTEXT',
+                            'Execution context became stale; script was not replayed because staleContextRetry is never',
+                            {
+                                tabId,
+                                ...this.frameIdentitySummary(identity),
+                                cdpFrameId: resolved.cdpFrameId,
+                                executionContextId: targetCtx.id,
+                                retryAttempted: false,
+                                staleContextRetry: p.staleContextRetry,
+                            }
+                        )
+                    }
+                    retryAttempted = true
+                    retryReason = message.slice(0, 500)
+                    this.debuggerManager.invalidateExecutionContext(tabId, targetCtx.id, resolved.querySessionId)
+                    if (p.timeout !== undefined && Date.now() - startedAt >= p.timeout) {
+                        throw this.frameEvaluationError('FRAME_EVALUATION_TIMEOUT', message.slice(0, 500), {
+                            tabId,
+                            ...this.frameIdentitySummary(identity),
+                            cdpFrameId: resolved.cdpFrameId,
+                            executionContextId: targetCtx.id,
+                            timeout: p.timeout,
+                            retryAttempted,
+                            retryReason,
+                        })
+                    }
                 }
             }
+            throw new Error('Stale execution context retry exhausted')
+        } catch (error) {
+            const wrapped =
+                tabId === undefined
+                    ? error instanceof Error
+                        ? error
+                        : new Error(String(error))
+                    : wrapDebuggerError(error, { tabId, phase: 'command' })
+            let detail: { error: { code: string; message: string; context?: Record<string, unknown> } } = {
+                error: { code: 'FRAME_EVALUATION_FAILED', message: wrapped.message },
+            }
+            try {
+                const parsed = JSON.parse(wrapped.message) as typeof detail
+                if (parsed?.error && typeof parsed.error.code === 'string') {
+                    detail = parsed
+                }
+            } catch {
+                // 原生拒绝也可能直接返回未编码的消息
+            }
+            detail.error.context = {
+                ...detail.error.context,
+                actionExecuted: scriptDispatched ? 'unknown' : false,
+                actionStatus: scriptDispatched ? 'unknown' : 'not_started',
+                failureStage: scriptDispatched ? 'action' : 'context',
+                retryable: false,
+                nativeError: (error instanceof Error ? error.message : String(error)).slice(0, 1000),
+            }
+            const message = JSON.stringify(detail)
+            throw !scriptDispatched || wrapped instanceof ExpectedOperationError
+                ? new ExpectedOperationError(message, scriptDispatched ? undefined : false)
+                : new Error(message, { cause: wrapped })
         }
-        throw new Error('Stale execution context retry exhausted')
     }
 
     private frameIdentitySummary(frame: chrome.webNavigation.GetAllFrameResultDetails): Record<string, unknown> {
@@ -481,7 +592,8 @@ export class FrameResolver {
                     suggestion: '请重新读取 frame 列表和页面状态；若 frame 候选不唯一，请改用唯一 URL 或 selector',
                     context,
                 },
-            })
+            }),
+            context.actionExecuted === false ? false : undefined
         )
     }
 

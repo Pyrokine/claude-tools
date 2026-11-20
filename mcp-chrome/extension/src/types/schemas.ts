@@ -42,6 +42,7 @@ export const TabsCreateSchema = z
         groupId: z.number().int().optional(),
         index: z.number().int().nonnegative().optional(),
         openerTabId: tabIdOpt,
+        sourceTabId: tabIdOpt,
         pinned: z.boolean().optional(),
         waitUntil,
         timeout: z.number().nonnegative().optional(),
@@ -315,8 +316,8 @@ export const ViewportMetricsSchema = z.object({
             operation: z.enum(['start', 'read', 'stop']),
             id: z.string().min(1).max(100),
             documentId: z.string().optional(),
-            since: z.number().finite().optional(),
-            position: z.object({ x: z.number().finite(), y: z.number().finite() }).optional(),
+            since: z.number().optional(),
+            position: z.object({ x: z.number(), y: z.number() }).optional(),
         })
         .optional(),
 })
@@ -352,6 +353,7 @@ export const FindSchema = z
             .strict()
             .optional(),
         point: z.object({ x: z.number(), y: z.number() }).optional(),
+        coordinateSpace: z.enum(['viewport', 'frame']).optional(),
         matchIndex: z.number().int().nonnegative().optional(),
     })
     .partial()
@@ -677,10 +679,26 @@ export const ResolveFrameSchema = z.object({
 
 export const GetAllFramesSchema = TabIdOnly
 
-export const EvaluateInFrameSchema = z.object({
+export const PrepareFrameEvaluationSchema = z.object({
     tabId: tabIdOpt,
     frameId: z.number().int().nonnegative(),
-    expression: z.string().min(1),
     timeout: z.number().nonnegative().optional(),
+})
+
+export const EvaluateInFrameSchema = PrepareFrameEvaluationSchema.extend({
+    expression: z.string().min(1),
     staleContextRetry: z.enum(['never', 'readOnly']).default('never'),
+    preparedContext: z
+        .object({
+            tabId: z.number().int().nonnegative(),
+            frameId: z.number().int().nonnegative(),
+            documentId: z.string().min(1),
+            parentFrameId: z.number().int(),
+            parentDocumentId: z.string().optional(),
+            url: z.string(),
+            cdpFrameId: z.string().min(1),
+            executionContextId: z.number().int(),
+            querySessionId: z.string().min(1).optional(),
+        })
+        .optional(),
 })

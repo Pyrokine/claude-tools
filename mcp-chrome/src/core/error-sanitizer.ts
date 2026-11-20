@@ -17,6 +17,7 @@
 
 import * as os from 'os'
 import * as path from 'path'
+import { sanitizeUrlsInText } from '../tools/network-sanitizer.js'
 
 const homeDir = os.homedir()
 const username = path.basename(homeDir)
@@ -59,5 +60,5 @@ export function sanitizeErrorMessage(input: unknown): string {
     // node:internal stack 中的绝对路径
     msg = msg.replace(/at\s+\/[^\s:]+:\d+:\d+/g, 'at <internal>')
 
-    return msg
+    return sanitizeUrlsInText(msg)
 }

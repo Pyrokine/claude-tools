@@ -13,11 +13,11 @@ import { EventEmitter } from 'events'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http'
 import { readFileSync } from 'node:fs'
 import { WebSocket, WebSocketServer } from 'ws'
+import type { BrowserRequestContext, UserActionKind } from '../core/browser-driver.js'
 import { sanitizeErrorMessage } from '../core/error-sanitizer.js'
 import { CDPError, setErrorSource, StructuredToolError } from '../core/errors.js'
 import { ExtensionDisconnectedError } from '../core/extension-errors.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
-import type { BrowserRequestContext, UserActionKind } from '../core/browser-driver.js'
 
 const SERVER_VERSION = (
     JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as { version: string }
@@ -213,6 +213,7 @@ export class ExtensionHttpServer extends EventEmitter {
      * @param requestTimeout 端到端预算（毫秒），包含连接等待和请求超时，
      *                       不传则使用 REQUEST_TIMEOUT (30s)，
      *                       ≤0 直接失败
+     * @param dispatchedAction 本次派发的用户动作类别，用于记录派发状态和结果未知边界
      */
     async sendCommand(
         action: string,
@@ -226,6 +227,13 @@ export class ExtensionHttpServer extends EventEmitter {
             (method === 'Runtime.releaseObject' || method === 'Runtime.releaseObjectGroup')
         const requestScope = this.options.requestContext?.()
         const userAction = requestScope?.userAction
+        const inputAction =
+            userAction?.kind === 'input' &&
+            (action.startsWith('input_') ||
+                (action.startsWith('stealth_') && action !== 'stealth_inject') ||
+                ['click', 'actionable_click', 'dispatch_input', 'drag_and_drop', 'type', 'scroll'].includes(action))
+                ? userAction
+                : undefined
         const scope = cleanup ? undefined : requestScope
         const signal = scope?.signal
         signal?.throwIfAborted()
@@ -297,7 +305,12 @@ export class ExtensionHttpServer extends EventEmitter {
                 remaining
             )
             const handler: MessageHandler = {
-                resolve,
+                resolve: (result) => {
+                    if (inputAction && (result as { success?: boolean } | null)?.success !== false) {
+                        inputAction.acknowledged = true
+                    }
+                    resolve(result)
+                },
                 reject,
                 timeout,
                 sent: false,
@@ -312,21 +325,7 @@ export class ExtensionHttpServer extends EventEmitter {
                 signal?.throwIfAborted()
                 this.sendMessage(socket, message)
                 handler.sent = true
-                if (
-                    userAction &&
-                    (userAction.kind === dispatchedAction ||
-                        (userAction.kind === 'input' &&
-                            (action.startsWith('input_') ||
-                                (action.startsWith('stealth_') && action !== 'stealth_inject') ||
-                                [
-                                    'click',
-                                    'actionable_click',
-                                    'dispatch_input',
-                                    'drag_and_drop',
-                                    'type',
-                                    'scroll',
-                                ].includes(action))))
-                ) {
+                if (userAction && (userAction.kind === dispatchedAction || inputAction)) {
                     userAction.dispatched = true
                 }
             } catch (error) {

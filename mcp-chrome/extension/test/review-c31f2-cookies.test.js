@@ -30,7 +30,10 @@ for (const cancelAt of [1, 2]) {
         try {
             const handler = new CookieHandler();
             await assert.rejects(
-                handler.cookiesClear({ domain: 'example.com', storeId: '0' }, { signal: controller.signal }),
+                handler.cookiesClear(
+                    { domain: 'example.com', storeId: '0' },
+                    { signal: controller.signal, mcpTabGroupId: null, mcpWindowId: null }
+                ),
                 (error) => {
                     const { error: detail } = JSON.parse(error.message);
                     assert.equal(detail.code, 'COOKIE_CLEAR_PARTIAL');
@@ -68,7 +71,7 @@ test('C31F2-01 Extension Cookie actions reject cancellation before any Chrome Co
     try {
         const controller = new AbortController();
         controller.abort('cancel before dispatch');
-        const context = { signal: controller.signal };
+        const context = { signal: controller.signal, mcpTabGroupId: null, mcpWindowId: null };
         const handler = new CookieHandler();
         for (const [method, args] of [
             ['cookiesGet', { name: 'synthetic' }],

@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import WebSocket from 'ws';
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { EventEmitter } from 'node:events';
+import { CDPClient } from '../dist/cdp/client.js';
 import { getSession, getUnifiedSession } from '../dist/core/index.js';
 import { Locator } from '../dist/core/locator.js';
 import { AutoWait } from '../dist/core/auto-wait.js';
@@ -283,9 +283,7 @@ test('CH-16 native strict websocket requires v2 hello and authenticates commands
 
 test('CH-09 independent network idle starts with the current inflight set', async () => {
     const session = getSession();
-    const cdp = new EventEmitter();
-    cdp.onEvent = cdp.on.bind(cdp);
-    cdp.offEvent = cdp.off.bind(cdp);
+    const cdp = new CDPClient();
     const restore = patch(session, { sessionId: 'owned-session', requestMap: new Map([['already-started', {}]]) });
     let completed = false;
     try {
@@ -294,13 +292,98 @@ test('CH-09 independent network idle starts with the current inflight set', asyn
         });
         await new Promise((resolve) => setTimeout(resolve, 15));
         assert.equal(completed, false);
-        cdp.emit('Network.loadingFinished', { requestId: 'already-started' }, 'other-session');
+        cdp.handleMessage(
+            Buffer.from(
+                JSON.stringify({
+                    method: 'Network.loadingFinished',
+                    params: { requestId: 'already-started' },
+                    sessionId: 'other-session',
+                })
+            )
+        );
         await new Promise((resolve) => setTimeout(resolve, 10));
         assert.equal(completed, false);
-        cdp.emit('Network.loadingFinished', { requestId: 'already-started' }, 'owned-session');
+        cdp.handleMessage(
+            Buffer.from(
+                JSON.stringify({
+                    method: 'Network.loadingFinished',
+                    params: { requestId: 'already-started' },
+                    sessionId: 'owned-session',
+                })
+            )
+        );
         await wait;
         assert.equal(completed, true);
         assert.equal(cdp.listenerCount('Network.loadingFinished'), 0);
+        assert.equal(cdp.eventListeners.get('Network.loadingFinished')?.size ?? 0, 0);
+    } finally {
+        restore();
+    }
+});
+
+test('read-only frame waits keep frame-local lookup for ordinary and high nth targets', async () => {
+    const session = getUnifiedSession();
+    const findCalls = [];
+    const element = {
+        refId: 'owned-button',
+        tag: 'button',
+        text: 'Ready',
+        rect: { x: 20, y: 30, width: 40, height: 30 },
+    };
+    const snapshot = { targetId: '101', url: 'https://example.com/owned', revision: 'owned-revision' };
+    const restore = patch(session, {
+        withTabId: (_target, action) => action(),
+        withTabLock: (action) => action(),
+        withFrame: (frame, action) => {
+            assert.equal(frame, 'iframe#scaled');
+            return action();
+        },
+        getCurrentTargetId: () => '101',
+        getPageSnapshot: async () => snapshot,
+        listTargets: async () => [snapshot],
+        listTopology: async () => ({ activeTargetId: null }),
+        getTargetRestoration: () => null,
+        getMode: () => 'extension',
+        isExtensionConnected: () => true,
+        assertRequestActive() {},
+        preserveTargetAfterLookup() {},
+        find: async (...args) => {
+            findCalls.push(args);
+            assert.equal(args[6], 'frame', 'read-only wait must not request pointer viewport geometry');
+            return args[5] === undefined ? Array(50).fill(element) : [element];
+        },
+        getComputedStyleByRef: async (_ref, property) => (property === 'display' ? 'block' : 'visible'),
+    });
+    let callback;
+    registerWaitTool({
+        registerTool(_name, _schema, handler) {
+            callback = handler;
+        },
+    });
+    try {
+        for (const nth of [0, 60]) {
+            for (const state of ['attached', 'visible']) {
+                findCalls.length = 0;
+                const response = await callback(
+                    {
+                        for: 'element',
+                        target: { css: 'button', nth },
+                        state,
+                        targetId: '101',
+                        frame: 'iframe#scaled',
+                        timeout: 1000,
+                    },
+                    {}
+                );
+                assert.notEqual(response.isError, true, JSON.stringify(response));
+                assert.equal(JSON.parse(response.content[0].text).success, true);
+                assert.deepEqual(findCalls[0].slice(4), [undefined, undefined, 'frame']);
+                assert.equal(findCalls.length, nth < 50 ? 1 : 2);
+                if (nth >= 50) {
+                    assert.deepEqual(findCalls[1].slice(4), [undefined, nth, 'frame']);
+                }
+            }
+        }
     } finally {
         restore();
     }
@@ -361,7 +444,7 @@ test(
             await promisify(execFile)('/bin/bash', [script.pathname, '9444', '--owned-flag'], {
                 env: { PATH: directory, CAPTURE: capture, OSTYPE: 'linux-gnu' },
             });
-            const args = (await readFile(capture, 'utf8')).split('\n');
+            const args = (await readFile(capture, { encoding: 'utf8' })).split('\n');
             assert.ok(args.includes('--remote-debugging-port=9444'));
             assert.ok(args.includes('--owned-flag'));
             assert.equal(args.includes('9444'), false);

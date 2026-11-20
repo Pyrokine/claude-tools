@@ -39,21 +39,37 @@ async function fixture(run, mode = 'cdp') {
     const session = getSession();
     const unified = getUnifiedSession();
     const calls = [];
-    const state = { cookies: [], reads: 0, deletes: 0 };
+    const state = {
+        cookies: [],
+        reads: 0,
+        deletes: 0,
+        failRead: 0,
+        targets: [{ targetId: 'page', browserContextId: 'owned', type: 'page' }],
+        sessionContexts: new Map([['owned-session', 'owned']]),
+    };
     const client = new CDPClient();
     client.ws = { readyState: 1 };
     client.send = async (method, params = {}, sid) => {
         calls.push({ method, params, sid });
         if (method === 'Target.getTargetInfo') {
-            return { targetInfo: { targetId: 'page', browserContextId: 'owned' } };
+            const targetInfo = state.targets.find((target) => target.targetId === params.targetId);
+            assert.ok(targetInfo, `Missing synthetic target: ${params.targetId}`);
+            return { targetInfo };
+        }
+        if (method === 'Target.getTargets') {
+            return { targetInfos: state.targets };
         }
         if (method === 'Target.attachToTarget') {
+            const target = state.targets.find((target) => target.targetId === params.targetId);
+            assert.ok(target, `Missing synthetic attach target: ${params.targetId}`);
+            state.sessionContexts.set('temporary', target.browserContextId);
             return { sessionId: 'temporary' };
         }
         if (method === 'Target.detachFromTarget') {
             if (state.detachFailure) {
                 throw new CDPError('synthetic detach rejection', { method });
             }
+            state.sessionContexts.delete(params.sessionId);
             return {};
         }
         if (method === 'Storage.getCookies' || method === 'Network.getCookies') {
@@ -91,9 +107,11 @@ async function fixture(run, mode = 'cdp') {
             }
             if (!state.noRemoval) {
                 const domain = params.domain ?? new URL(params.url).hostname;
+                const context = state.sessionContexts.get(sid);
+                assert.ok(context, `Missing synthetic Cookie session: ${sid}`);
                 state.cookies = state.cookies.filter((entry) => {
                     if (
-                        (entry.context ?? 'owned') !== 'owned' ||
+                        (entry.context ?? 'owned') !== context ||
                         entry.name !== params.name ||
                         entry.domain !== domain
                     ) {
@@ -265,6 +283,71 @@ test('C31-01 URL-only clear pins its selected context and Cookie path', async ()
             calls.some(({ method }) => method === 'Network.getCookies'),
             false
         );
+    });
+});
+
+for (const action of ['clear', 'delete']) {
+    test(`C31-01 explicit context ${action} borrows its own page and preserves the default context`, async () => {
+        await fixture(async ({ invoke, state, calls, session }) => {
+            state.targets.push({ targetId: 'other-page', browserContextId: 'other-context', type: 'page' });
+            state.cookies = [
+                cookie('mcp_test_scope'),
+                cookie('mcp_test_scope', '/', { context: 'other-context' }),
+                cookie('mcp_test_keep', '/', { context: 'other-context' }),
+            ];
+            const result = await invoke({
+                action,
+                browserContextId: 'other-context',
+                url: 'https://example.com/',
+                name: 'mcp_test_scope',
+            });
+            assert.equal(result.response.isError, undefined, JSON.stringify(result.body));
+            if (action === 'clear') {
+                assert.equal(result.body.count, 1);
+                assert.equal(result.body.acknowledged, 1);
+            }
+            assert.deepEqual(
+                state.cookies.map((entry) => [entry.name, entry.context ?? 'owned']),
+                [
+                    ['mcp_test_scope', 'owned'],
+                    ['mcp_test_keep', 'other-context'],
+                ]
+            );
+            assert.equal(session.currentTargetId, 'page');
+            assert.deepEqual([...session.targetSessions], [['page', 'owned-session']]);
+            assert.deepEqual([...state.sessionContexts], [['owned-session', 'owned']]);
+            assert.equal(calls.filter(({ method }) => method === 'Target.attachToTarget').length, 1);
+            assert.equal(calls.find(({ method }) => method === 'Target.attachToTarget').params.targetId, 'other-page');
+            assert.equal(calls.filter(({ method }) => method === 'Network.deleteCookies').length, 1);
+            assert.equal(calls.find(({ method }) => method === 'Network.deleteCookies').sid, 'temporary');
+            assert.equal(
+                calls.find(({ method }) => method === 'Target.detachFromTarget').params.sessionId,
+                'temporary'
+            );
+        });
+    });
+}
+
+test('C31-01 explicit context without a page rejects before a deletion', async () => {
+    await fixture(async ({ invoke, state, calls }) => {
+        state.cookies = [cookie('mcp_test_scope', '/', { context: 'other-context' })];
+        const result = await invoke({
+            action: 'clear',
+            browserContextId: 'other-context',
+            url: 'https://example.com/',
+            name: 'mcp_test_scope',
+        });
+        assert.equal(result.response.isError, true);
+        assert.equal(result.body.error.code, 'COOKIE_CLEAR_PARTIAL');
+        assert.equal(result.body.error.context.count, 0);
+        assert.equal(result.body.error.context.failed, 1);
+        assert.equal(result.body.error.context.unknown, 0);
+        assert.equal(result.body.error.context.actionExecuted, false);
+        assert.equal(
+            calls.some(({ method }) => method === 'Network.deleteCookies'),
+            false
+        );
+        assert.equal(state.cookies.length, 1);
     });
 });
 

@@ -9,11 +9,12 @@
  * - humanize 可选：行为模拟是可选功能
  */
 
-import { randomUUID } from 'node:crypto'
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { prepareUploadFiles, uploadInPage, type UploadPageResult } from '../core/file-upload.js'
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { generateBezierPath, getMouseMoveDelay, getTypingDelay, randomDelay } from '../anti-detection/index.js'
+
+import { installDomHelpers, type SemanticTarget } from '../core/dom-helpers.js'
 import {
     BrowserError,
     ElementNotFoundError,
@@ -22,6 +23,7 @@ import {
     StructuredToolError,
     TimeoutError,
 } from '../core/errors.js'
+import { prepareUploadFiles, uploadInPage, type UploadPageResult } from '../core/file-upload.js'
 import { formatErrorResponse, formatResponse, getSession, getUnifiedSession } from '../core/index.js'
 import { DEFAULT_TIMEOUT, type InputEvent, type Target } from '../core/types.js'
 import { ChallengeDeniedError, challengeResultFields, ChallengeTimeoutError, resolveChallenge } from './challenge.js'
@@ -37,8 +39,6 @@ import {
     targetZodSchema,
 } from './schema.js'
 import { buildTargetDiagnostics, enrichTargetError, targetLookupTimeout } from './target-diagnostics.js'
-
-import { installDomHelpers, type SemanticTarget } from '../core/dom-helpers.js'
 
 const INPUT_WAIT_MAX_MS = 60_000
 const TEXT_SELECTION_INPUT_TYPES = new Set(['text', 'search', 'tel', 'url', 'password'])
@@ -416,6 +416,8 @@ async function handleInput(args: z.infer<typeof inputSchema>, signal?: AbortSign
                                         try {
                                             const payload = JSON.parse(text) as Record<string, unknown>
                                             const message = error instanceof Error ? error.message : String(error)
+                                            const inputActionAcknowledged =
+                                                getErrorPageContext(error)?.inputActionAcknowledged === true
                                             const timedOut = /timeout|超时/i.test(message)
                                             const preActionTimeout = /timeout.*before|超过 input 剩余 timeout/i.test(
                                                 message
@@ -423,6 +425,7 @@ async function handleInput(args: z.infer<typeof inputSchema>, signal?: AbortSign
                                             actionMayHaveExecuted =
                                                 isNativeExecutionResultUnknown(error) || (timedOut && !preActionTimeout)
                                             const preconditionFailed =
+                                                !inputActionAcknowledged &&
                                                 error !== null &&
                                                 typeof error === 'object' &&
                                                 'code' in error &&
@@ -433,15 +436,18 @@ async function handleInput(args: z.infer<typeof inputSchema>, signal?: AbortSign
                                                     : undefined
                                             const contextPhase = getErrorPageContext(error)?.contextPhase
                                             const preparationFailure =
-                                                contextPhase === 'preparation' || contextPhase === 'precondition'
+                                                !inputActionAcknowledged &&
+                                                (contextPhase === 'preparation' || contextPhase === 'precondition')
                                             const explicitNotStarted =
-                                                preparationFailure || executionContext?.actionExecuted === false
+                                                !inputActionAcknowledged &&
+                                                (preparationFailure || executionContext?.actionExecuted === false)
                                             actionExecutedUnknown =
                                                 !explicitNotStarted && executionContext?.actionExecuted === 'unknown'
                                             actionMayHaveExecuted =
                                                 (actionMayHaveExecuted ||
                                                     actionExecutedUnknown ||
-                                                    executionContext?.actionExecuted === true) &&
+                                                    executionContext?.actionExecuted === true ||
+                                                    inputActionAcknowledged) &&
                                                 !preconditionFailed &&
                                                 !explicitNotStarted
                                             const cleanupFailure = progress.actionStatus === 'completed'
@@ -477,7 +483,7 @@ async function handleInput(args: z.infer<typeof inputSchema>, signal?: AbortSign
                                                     : 'failed'
                                             payload.eventsExecuted = eventsExecuted
                                             payload.actionExecuted =
-                                                eventsExecuted > 0
+                                                eventsExecuted > 0 || inputActionAcknowledged
                                                     ? true
                                                     : actionExecutedUnknown
                                                       ? 'unknown'
@@ -659,7 +665,7 @@ async function handleInput(args: z.infer<typeof inputSchema>, signal?: AbortSign
                     payload.diagnosticsError =
                         eventsExecuted > 0 || actionMayHaveExecuted
                             ? 'input 执行后未能取得 diagnostics'
-                            : 'diagnostics 未能在 tab/frame 初始化失败前启动'
+                            : 'input 开始前未能完成 diagnostics'
                 }
                 response.content[0].text = JSON.stringify(payload, null, 2)
             } catch {
@@ -679,6 +685,7 @@ async function handleInput(args: z.infer<typeof inputSchema>, signal?: AbortSign
 type TextLocateResult =
     | {
           type: 'coords'
+          scopeRefId: string
           startX: number
           startY: number
           endX: number
@@ -688,11 +695,13 @@ type TextLocateResult =
       }
     | {
           type: 'range'
+          scopeRefId: string
           formatted?: string
       }
 
 interface InputLocateResult {
     type: 'input'
+    scopeRefId: string
     inputType: string
     selectionStart: number
     selectionEnd: number
@@ -752,8 +761,8 @@ async function executeInputEvent(context: InputExecutionContext, event: InputEve
             // noinspection ExceptionCaughtLocallyJS -- Report failure
             throw new Error('CDP 输入事件缺少 session')
         }
-        await executeCdpEvent(context.session, event, context.humanize, context.timeout)
-        return undefined
+        const warning = await executeCdpEvent(context.session, event, context.humanize, context.timeout)
+        return typeof warning === 'string' ? warning : undefined
     } catch (error) {
         if (context.mode === 'cdp' && error instanceof ElementNotFoundError) {
             const target = error.context.target as Target
@@ -790,14 +799,15 @@ async function focusTargetForCommands(
     const nth0 = params.nth ?? 0
     const els =
         'x' in target && 'y' in target
-            ? await unifiedSession.findAtPoint(target.x, target.y, nth0, remainingInputTimeout(deadline))
+            ? await unifiedSession.findAtPoint(target.x, target.y, nth0, remainingInputTimeout(deadline), 'frame')
             : await unifiedSession.find(
                   params.selector,
                   params.text,
                   params.xpath,
                   remainingInputTimeout(deadline),
                   params.semantic,
-                  nth0
+                  nth0,
+                  'frame'
               )
     if (els.length === 0) {
         throw new StructuredToolError(
@@ -930,7 +940,8 @@ async function focusTargetIfNeeded(
         params.xpath,
         remainingInputTimeout(deadline),
         params.semantic,
-        nth0
+        nth0,
+        'frame'
     )
     if (els.length === 0) {
         throw new StructuredToolError(
@@ -1025,14 +1036,15 @@ async function collectTextSelectionDiagnostics(
                 hasValue: value.length > 0,
                 redacted: sensitive || undefined,
                 visible: rect.width > 0 && rect.height > 0,
-                disabled: Boolean(el.disabled),
+                disabled: el.matches(':disabled') || Boolean(el.disabled),
                 readOnly: Boolean(el.readOnly),
                 contentEditable: Boolean(el.isContentEditable),
                 bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
             };
         }
-        var root = document.body;
-        if (scopeXpath || scopeSelector || scopeText || scopeSemantic) {
+        var point = scopeTarget && 'x' in scopeTarget && 'y' in scopeTarget ? scopeTarget : null;
+        var root = point ? helpers.deepElementFromPoint(point.x, point.y) : document.body;
+        if (!point && (scopeXpath || scopeSelector || scopeText || scopeSemantic)) {
             root = helpers.query({
                 selector:scopeSelector, text:scopeText, xpath:scopeXpath, semantic:scopeSemantic
             })[scopeNth];
@@ -1087,6 +1099,58 @@ async function collectTextSelectionDiagnostics(
     )
 }
 
+function ownsTextSelection(scopeRefId: string, findText: string): boolean {
+    const reference = (
+        window as Window & {
+            __mcpElementMap?: Record<
+                string,
+                WeakRef<Element> & {
+                    selection?: {
+                        startOffset: number
+                        endOffset: number
+                        startContainer?: WeakRef<Node>
+                        endContainer?: WeakRef<Node>
+                    }
+                }
+            >
+        }
+    ).__mcpElementMap?.[scopeRefId]
+    const scope = reference?.deref()
+    const original = reference?.selection
+    if (!scope || !scope.isConnected || !original) {
+        return false
+    }
+    const helpers = globalThis.__mcpDomHelpers!
+    const active = helpers.activeElement()
+    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+        return (
+            active === scope &&
+            active.selectionStart !== null &&
+            active.selectionEnd !== null &&
+            active.selectionStart === original.startOffset &&
+            active.selectionEnd === original.endOffset &&
+            active.selectionStart !== active.selectionEnd &&
+            active.value.slice(active.selectionStart, active.selectionEnd) === findText
+        )
+    }
+    const selection = window.getSelection()
+    const range = selection?.rangeCount === 1 ? selection.getRangeAt(0) : null
+    const anchor = selection?.anchorNode
+    const focus = selection?.focusNode
+    return Boolean(
+        selection &&
+        !selection.isCollapsed &&
+        range &&
+        range.startContainer === original.startContainer?.deref() &&
+        range.endContainer === original.endContainer?.deref() &&
+        range.startOffset === original.startOffset &&
+        range.endOffset === original.endOffset &&
+        range.toString() === findText &&
+        helpers.containsComposed(scope, anchor instanceof Element ? anchor : (anchor?.parentElement ?? null)) &&
+        helpers.containsComposed(scope, focus instanceof Element ? focus : (focus?.parentElement ?? null))
+    )
+}
+
 async function selectText(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
     findText: string,
@@ -1094,7 +1158,7 @@ async function selectText(
     nth = 0,
     timeout?: number,
     privacy?: InputExecutionContext['privacy']
-): Promise<string | undefined> {
+): Promise<{ formatted?: string; scopeRefId: string }> {
     const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
     const sensitiveBefore = privacy?.sensitive ?? false
     if (privacy) {
@@ -1127,12 +1191,35 @@ async function selectText(
           }
         | null
     >(
-        `function(findText, nth, scopeNth, scopeSelector, scopeText, scopeXpath, scopeSemantic) {
+        `function(findText, nth, scopeNth, scopeSelector, scopeText, scopeXpath,
+            scopeSemantic, scopePoint, selectionId) {
         (${installDomHelpers.toString()})();
         var helpers = globalThis.__mcpDomHelpers;
-        // 确定搜索根节点
-        var root = document.body;
-        if (scopeXpath || scopeSelector || scopeText || scopeSemantic) {
+        function rememberScope(element, selectionRange) {
+            var refs = window.__mcpElementMap || (window.__mcpElementMap = {});
+            var reverse = window.__mcpElementToRefId || (window.__mcpElementToRefId = new WeakMap());
+            var refId = reverse.get(element) || selectionId;
+            reverse.set(element, refId);
+            var reference = new WeakRef(element);
+            if (typeof element.selectionStart === 'number' && typeof element.selectionEnd === 'number') {
+                reference.selection = {
+                    startOffset: element.selectionStart,
+                    endOffset: element.selectionEnd
+                };
+            } else if (selectionRange) {
+                reference.selection = {
+                    startContainer: new WeakRef(selectionRange.startContainer),
+                    endContainer: new WeakRef(selectionRange.endContainer),
+                    startOffset: selectionRange.startOffset,
+                    endOffset: selectionRange.endOffset
+                };
+            }
+            refs[refId] = reference;
+            return refId;
+        }
+        // 坐标目标与选择器目标分别限定搜索范围
+        var root = scopePoint ? helpers.deepElementFromPoint(scopePoint.x, scopePoint.y) : document.body;
+        if (!scopePoint && (scopeXpath || scopeSelector || scopeText || scopeSemantic)) {
             root = helpers.query({
                 selector:scopeSelector, text:scopeText, xpath:scopeXpath, semantic:scopeSemantic
             })[scopeNth];
@@ -1162,8 +1249,12 @@ async function selectText(
             }
             // 原子化：定位到 input 同时完成 focus + setSelectionRange，避免外层 mouseClick 聚焦不可靠
             root.focus();
+            if (root.isConnected === false || helpers.activeElement() !== root) return {type: 'noscope'};
             root.setSelectionRange(pos, pos + findText.length);
-            return {type: 'input', inputType: inputType, selectionStart: pos, selectionEnd: pos + findText.length};
+            return {
+                type: 'input', inputType: inputType, scopeRefId: rememberScope(root),
+                selectionStart: pos, selectionEnd: pos + findText.length
+            };
         }
 
         // 在子树中查找 input/textarea
@@ -1190,8 +1281,12 @@ async function selectText(
             }
             if (ip !== -1) {
                 inp.focus();
+                if (inp.isConnected === false || helpers.activeElement() !== inp) return {type: 'noscope'};
                 inp.setSelectionRange(ip, ip + findText.length);
-                return {type: 'input', inputType: childType, selectionStart: ip, selectionEnd: ip + findText.length};
+                return {
+                    type: 'input', inputType: childType, scopeRefId: rememberScope(inp),
+                    selectionStart: ip, selectionEnd: ip + findText.length
+                };
             }
         }
 
@@ -1253,21 +1348,22 @@ async function selectText(
             formatted = startNode.tagName.toLowerCase();
         }
 
+        var selectionRange = document.createRange();
+        selectionRange.setStart(s.node, s.offset);
+        selectionRange.setEnd(e.node, Math.min(e.offset + 1, e.node.textContent.length));
         // contenteditable 使用 DOM Range 建立精确选区；CDP 的 Shift+Click 会把整个编辑区选中。
         if (root instanceof HTMLElement && root.isContentEditable) {
             var selection = window.getSelection();
             if (!selection) return {type: 'notfound'};
-            var selectionRange = document.createRange();
-            selectionRange.setStart(s.node, s.offset);
-            selectionRange.setEnd(e.node, Math.min(e.offset + 1, e.node.textContent.length));
             root.focus();
             selection.removeAllRanges();
             selection.addRange(selectionRange);
-            return {type: 'range', formatted: formatted || undefined};
+            return {type: 'range', scopeRefId: rememberScope(root, selectionRange), formatted: formatted || undefined};
         }
 
         return {
             type: 'coords',
+            scopeRefId: rememberScope(root, selectionRange),
             startX: sr.x + 1,
             startY: sr.y + sr.height / 2,
             endX: er.x + er.width - 1,
@@ -1277,7 +1373,17 @@ async function selectText(
     }`,
         undefined,
         remainingInputTimeout(deadline),
-        [findText, nth, scopeNth, scopeSelector, scopeText, scopeXpath, scopeSemantic],
+        [
+            findText,
+            nth,
+            scopeNth,
+            scopeSelector,
+            scopeText,
+            scopeXpath,
+            scopeSemantic,
+            scopeTarget && 'x' in scopeTarget && 'y' in scopeTarget ? scopeTarget : null,
+            `selection-${randomUUID()}`,
+        ],
         { userAction: 'input' }
     )
     if (
@@ -1346,12 +1452,15 @@ async function selectText(
         )
     }
 
+    if (result.type === 'input' || result.type === 'range') {
+        unifiedSession.acknowledgeInputAction()
+    }
     if (result.type === 'input') {
-        // 注入脚本已完成 focus + setSelectionRange（原子化，避免外层 mouseClick 聚焦不可靠）
-        return undefined
+        // 注入脚本已完成 focus + setSelectionRange，并保留后续写入所需的目标身份
+        return { scopeRefId: result.scopeRefId }
     }
     if (result.type === 'range') {
-        return result.formatted
+        return { scopeRefId: result.scopeRefId, formatted: result.formatted }
     }
 
     // DOM 文本节点：鼠标选择
@@ -1378,7 +1487,7 @@ async function selectText(
     }
     await unifiedSession.keyUp('Shift')
 
-    return coords.formatted
+    return { scopeRefId: coords.scopeRefId, formatted: coords.formatted }
 }
 
 /**
@@ -1680,7 +1789,8 @@ async function handleUnifiedWheel(
             xpath,
             remainingInputTimeout(deadline),
             semantic,
-            nth
+            nth,
+            'frame'
         )
         if (elements.length > 0) {
             remainingInputTimeout(deadline)
@@ -1810,7 +1920,8 @@ async function handleUnifiedUpload(
                 params.xpath,
                 active(),
                 params.semantic,
-                params.nth ?? 0
+                params.nth ?? 0,
+                'frame'
             )
             if (!elements.length) {
                 // noinspection ExceptionCaughtLocallyJS
@@ -1879,15 +1990,7 @@ async function handleUnifiedType(context: UnifiedInputContext, event: InputEvent
     }
     const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
 
-    if (event.target) {
-        await handleUnifiedClick(
-            { ...context, timeout: remainingInputTimeout(deadline) },
-            { type: 'click', target: event.target }
-        )
-        if (!('x' in event.target)) {
-            await focusTargetForCommands(unifiedSession, event.target, remainingInputTimeout(deadline), frame)
-        }
-    } else {
+    if (!event.target) {
         const hasActiveFocus = await unifiedSession.evaluate<boolean>(
             `(() => {
                 (${installDomHelpers.toString()})();
@@ -1902,6 +2005,16 @@ async function handleUnifiedType(context: UnifiedInputContext, event: InputEvent
         }
     }
 
+    const warning = await unifiedSession.prepareKeyboardFocus(remainingInputTimeout(deadline))
+    if (event.target) {
+        await handleUnifiedClick(
+            { ...context, timeout: remainingInputTimeout(deadline) },
+            { type: 'click', target: event.target }
+        )
+        if (!('x' in event.target)) {
+            await focusTargetForCommands(unifiedSession, event.target, remainingInputTimeout(deadline), frame)
+        }
+    }
     const delay = event.delay ?? 0
     if (humanize) {
         for (const char of event.text!.replace(/\r\n?/g, '\n')) {
@@ -1916,7 +2029,7 @@ async function handleUnifiedType(context: UnifiedInputContext, event: InputEvent
     } else {
         await unifiedSession.typeText(event.text!, delay, remainingInputTimeout(deadline))
     }
-    return undefined
+    return warning
 }
 
 function ensureWaitFitsTimeout(ms: number, timeout: number | undefined): void {
@@ -1996,13 +2109,19 @@ async function handleUnifiedReplace(
         actualValue?: string
         reason?: string
     }>(
-        `function(findText, replacementText, nth) {
+        `function(findText, replacementText, nth, point, scopeQuery) {
             (${installDomHelpers.toString()})();
-            var el = globalThis.__mcpDomHelpers.activeElement();
+            var helpers = globalThis.__mcpDomHelpers;
+            var el = helpers.activeElement();
             if (!(el instanceof HTMLInputElement)) return {handled: false};
             var type = (el.type || 'text').toLowerCase();
             if (['text', 'search', 'tel', 'url', 'password'].indexOf(type) !== -1) {
                 return {handled: false, inputType: type};
+            }
+            var scope = point ? helpers.deepElementFromPoint(point.x, point.y) :
+                scopeQuery ? helpers.query(scopeQuery)[scopeQuery.nth || 0] : el;
+            if (!scope || scope.isConnected === false || !helpers.containsComposed(scope, el)) {
+                return {handled: true, success: false, tag: 'input', inputType: type, reason: 'target_changed'};
             }
             var current = String(el.value || '');
             var pos = -1;
@@ -2059,7 +2178,13 @@ async function handleUnifiedReplace(
         }`,
         undefined,
         remainingInputTimeout(deadline),
-        [event.find, event.text, event.nth ?? 0],
+        [
+            event.find,
+            event.text,
+            event.nth ?? 0,
+            event.target && 'x' in event.target && 'y' in event.target ? event.target : null,
+            event.target && !('x' in event.target) ? targetToFindParams(event.target) : null,
+        ],
         { userAction: 'input' }
     )
     if (privacy) {
@@ -2067,6 +2192,14 @@ async function handleUnifiedReplace(
     }
     if (directResult.handled) {
         if (!directResult.success) {
+            if (directResult.reason === 'target_changed') {
+                throw new StructuredToolError(
+                    'TARGET_FOCUS_FAILED',
+                    '目标元素的聚焦已变化，已停止替换',
+                    '读取当前目标内容后重新定位元素',
+                    { target: event.target, reason: directResult.reason }
+                )
+            }
             const valueNotApplied = directResult.reason === 'value_not_applied'
             throw new StructuredToolError(
                 directResult.reason === 'text_not_found'
@@ -2102,7 +2235,7 @@ async function handleUnifiedReplace(
             normalized: directResult.actualValue !== directResult.requestedValue,
         }
     }
-    const formatted = await selectText(
+    const selection = await selectText(
         unifiedSession,
         event.find!,
         event.target,
@@ -2113,17 +2246,13 @@ async function handleUnifiedReplace(
     let selectionConfirmed = false
     for (let i = 0; i < 25; i++) {
         const hasSelection = await unifiedSession.evaluate<boolean>(
-            `(function() {
+            `function(scopeRefId, findText) {
                 (${installDomHelpers.toString()})();
-            var el = globalThis.__mcpDomHelpers.activeElement();
-                if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
-                    return el.selectionStart !== el.selectionEnd;
-                }
-                var sel = window.getSelection();
-                return sel && !sel.isCollapsed;
-            })()`,
+                return (${ownsTextSelection.toString()})(scopeRefId, findText);
+            }`,
             undefined,
-            remainingInputTimeout(deadline)
+            remainingInputTimeout(deadline),
+            [selection.scopeRefId, event.find]
         )
         if (hasSelection) {
             selectionConfirmed = true
@@ -2135,9 +2264,10 @@ async function handleUnifiedReplace(
         throw new Error(`选区同步失败：文本 "${event.find}" 已定位但未能建立选区，无法执行替换`)
     }
 
-    const replaceResult = await unifiedSession.evaluate<'ok' | 'readonly' | 'fallback'>(
-        `function(replacementText) {
+    const replaceResult = await unifiedSession.evaluate<'ok' | 'readonly' | 'fallback' | 'stale'>(
+        `function(replacementText, scopeRefId, findText) {
         (${installDomHelpers.toString()})();
+        if (!(${ownsTextSelection.toString()})(scopeRefId, findText)) return 'stale';
             var el = globalThis.__mcpDomHelpers.activeElement();
         if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.setRangeText) {
             if (el.readOnly || el.disabled) return 'readonly';
@@ -2158,19 +2288,48 @@ async function handleUnifiedReplace(
     }`,
         undefined,
         remainingInputTimeout(deadline),
-        [event.text],
+        [event.text, selection.scopeRefId, event.find],
         { userAction: 'input' }
     )
+    if (replaceResult === 'stale') {
+        throw new StructuredToolError(
+            'TEXT_SELECTION_CHANGED',
+            '替换前目标元素或选区已变化，已停止写入',
+            '读取当前目标内容后重新定位文本',
+            { target: event.target }
+        )
+    }
     if (replaceResult === 'readonly') {
         throw new Error(`目标元素不可编辑，已选中文本 "${event.find}" 但无法替换`)
     }
+    let warning: string | undefined
     if (replaceResult === 'fallback') {
+        warning = await unifiedSession.prepareKeyboardFocus(remainingInputTimeout(deadline))
+        const owned = await unifiedSession.evaluate<boolean>(
+            `function(scopeRefId, findText) {
+                (${installDomHelpers.toString()})();
+                return (${ownsTextSelection.toString()})(scopeRefId, findText);
+            }`,
+            undefined,
+            remainingInputTimeout(deadline),
+            [selection.scopeRefId, event.find]
+        )
+        if (!owned) {
+            throw new StructuredToolError(
+                'TEXT_SELECTION_CHANGED',
+                '继续输入前目标元素或选区已变化，已停止写入',
+                '读取当前目标内容后重新定位文本',
+                { target: event.target }
+            )
+        }
         await unifiedSession.typeText(event.text!, 0, remainingInputTimeout(deadline))
     }
-    if (formatted) {
-        return `替换的文本原在 <${formatted}> 标签内，替换后格式可能丢失`
+    if (selection.formatted) {
+        return [warning, `替换的文本原在 <${selection.formatted}> 标签内，替换后格式可能丢失`]
+            .filter(Boolean)
+            .join('\n')
     }
-    return undefined
+    return warning
 }
 
 async function handleUnifiedEditorContext(
@@ -2225,7 +2384,8 @@ async function handleUnifiedDrag(
             srcParams.xpath,
             timeout,
             srcParams.semantic,
-            srcNth
+            srcNth,
+            'frame'
         )
         const dstEls = await unifiedSession.find(
             dstParams.selector,
@@ -2233,7 +2393,8 @@ async function handleUnifiedDrag(
             dstParams.xpath,
             timeout,
             dstParams.semantic,
-            dstNth
+            dstNth,
+            'frame'
         )
         if (srcEls.length === 0) {
             throw new StructuredToolError(
@@ -2284,15 +2445,7 @@ async function handleUnifiedDrag(
 }
 
 /**
- * Extension 模式：获取目标点坐标
- *
- * iframe 坐标系修正：
- * - 原始坐标 {x, y}：用户意图为 iframe 相对坐标
- *   - precise 模式需加 offset 转为视口绝对坐标（CDP 用绝对坐标）
- *   - stealth 模式直接使用（在 iframe 内派发，本身就是相对坐标）
- * - 元素定位：find() 返回视口绝对坐标
- *   - precise 模式直接使用
- *   - stealth 模式需减 offset 转为 iframe 相对坐标
+ * 通过当前 frame 内的元素引用写入 controlled 文本
  */
 async function inputControlled(
     unifiedSession: ReturnType<typeof getUnifiedSession>,
@@ -2314,7 +2467,7 @@ async function inputControlled(
         semantic,
     } = targetToFindParams(event.target as Target & { nth?: number })
     const nth = nthParam ?? 0
-    const elements = await unifiedSession.find(selector, searchText, xpath, timeout, semantic, nth)
+    const elements = await unifiedSession.find(selector, searchText, xpath, timeout, semantic, nth, 'frame')
     if (elements.length === 0) {
         throw new StructuredToolError(
             'TARGET_NOT_FOUND',
@@ -2473,7 +2626,7 @@ async function getTargetPointExtension(
 
     const { selector, text, xpath, nth: nthParam, semantic } = targetToFindParams(target as Target & { nth?: number })
     const nth = nthParam ?? 0
-    const elements = await unifiedSession.find(selector, text, xpath, remaining(), semantic, nth)
+    const elements = await unifiedSession.find(selector, text, xpath, remaining(), semantic, nth, 'frame')
     if (elements.length === 0) {
         throw new StructuredToolError(
             nth === 0 ? 'TARGET_NOT_FOUND' : 'TARGET_INDEX_OUT_OF_RANGE',
@@ -2483,8 +2636,7 @@ async function getTargetPointExtension(
         )
     }
 
-    // 视口外时滚动后重新取 rect：与 actionableClick (left+single) 行为对齐，
-    // 否则非左键 / 多击的坐标路径在视口外坐标 dispatch，浏览器找不到元素，事件丢失
+    // 由原生滚动处理祖先裁剪；视口外保留居中意图，可见目标使用 nearest 保持位置
     const refId = elements[0].refId
     let rect = await unifiedSession.evaluate<{ x: number; y: number; width: number; height: number } | null>(
         `(async () => {
@@ -2492,8 +2644,9 @@ async function getTargetPointExtension(
             const el = ref?.deref();
             if (!el || !el.isConnected || el.ownerDocument !== document) return null;
             const r = el.getBoundingClientRect();
-            if (${scroll} && (r.top < 0 || r.bottom > window.innerHeight ||
-                r.left < 0 || r.right > window.innerWidth)) {
+            if (${scroll}) {
+                const alignment = r.top < 0 || r.bottom > window.innerHeight ||
+                    r.left < 0 || r.right > window.innerWidth ? 'center' : 'nearest';
                 const positions = [];
                 for (let node = el; node; node = node.assignedSlot || node.parentElement || node.getRootNode?.().host) {
                     if (node !== document.scrollingElement) {
@@ -2501,7 +2654,7 @@ async function getTargetPointExtension(
                     }
                 }
                 positions.push({ target: document, x: window.scrollX, y: window.scrollY });
-                el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                el.scrollIntoView({ block: alignment, inline: alignment, behavior: 'instant' });
                 const changed = positions.filter(({ target, x, y }) => target === document
                     ? x !== window.scrollX || y !== window.scrollY
                     : x !== target.scrollLeft || y !== target.scrollTop);
@@ -2509,7 +2662,8 @@ async function getTargetPointExtension(
                     const channel = new MessageChannel();
                     const scrollTargets = new Set([window, document, ...positions.flatMap(({ target }) =>
                         [target, target.getRootNode?.() || document]),
-                        ...globalThis.__mcpDomHelpers.elements().flatMap(node => node.shadowRoot ? [node.shadowRoot] : [])]);
+                        ...globalThis.__mcpDomHelpers.elements()
+                            .flatMap(node => node.shadowRoot ? [node.shadowRoot] : [])]);
                     let timer, frame, visibilityChanged, scrollChanged, scrollEnded;
                     try {
                         await new Promise((resolve, reject) => {
@@ -2520,16 +2674,21 @@ async function getTargetPointExtension(
                             scrollChanged = event => {
                                 const { target } = event, last = observedScroll.get(target);
                                 if (last?.event === event && last.listenerTarget !== event.currentTarget) return;
-                                if (!last || positions.some(position => position.target === target)) previous = undefined;
+                                if (!last || positions.some(position => position.target === target)) {
+                                    previous = undefined;
+                                }
                                 const offset = scrollPosition(target);
                                 const offsets = last?.offsets || new Set();
                                 offsets.add(offset.join(','));
-                                observedScroll.set(target, { event, listenerTarget: event.currentTarget, offset, offsets });
+                                observedScroll.set(target, {
+                                    event, listenerTarget: event.currentTarget, offset, offsets
+                                });
                             };
                             scrollEnded = ({ target }) => {
                                 const last = observedScroll.get(target), offset = scrollPosition(target);
                                 if (last && offset.some((value, index) => value !== last.offset[index]) &&
-                                    (positions.some(position => position.target === target) || !last.offsets.has(offset.join(',')))) {
+                                    (positions.some(position => position.target === target) ||
+                                        !last.offsets.has(offset.join(',')))) {
                                     previous = undefined;
                                 }
                             };
@@ -2552,6 +2711,10 @@ async function getTargetPointExtension(
                             };
                             channel.port1.onmessage = ({ data }) => {
                                 if (data.turn !== turn) return;
+                                if (!el.isConnected || el.ownerDocument !== document) {
+                                    resolve();
+                                    return;
+                                }
                                 for (const node of globalThis.__mcpDomHelpers.elements()) {
                                     if (node.shadowRoot && !scrollTargets.has(node.shadowRoot)) {
                                         scrollTargets.add(node.shadowRoot);
@@ -2572,6 +2735,20 @@ async function getTargetPointExtension(
                                         schedule();
                                         return;
                                     }
+                                }
+                                if (Date.now() >= ${deadline}) {
+                                    reject(new Error(
+                                        'SCROLL_SETTLEMENT_TIMEOUT: rendering did not finish before the request deadline'
+                                    ));
+                                    return;
+                                }
+                                const before = positions.flatMap(({ target }) => scrollPosition(target));
+                                el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+                                if (positions.flatMap(({ target }) => scrollPosition(target))
+                                    .some((value, index) => value !== before[index])) {
+                                    previous = undefined;
+                                    schedule();
+                                    return;
                                 }
                                 resolve();
                             };
@@ -2616,7 +2793,7 @@ async function getTargetPointExtension(
     }
 
     if (frame !== undefined && scroll) {
-        const refreshed = await unifiedSession.find(selector, text, xpath, remaining(), semantic, nth)
+        const refreshed = await unifiedSession.find(selector, text, xpath, remaining(), semantic, nth, 'frame')
         if (!refreshed[0] || refreshed[0].refId !== refId) {
             throw new StructuredToolError('TARGET_NOT_FOUND', '滚动后目标元素已失效', '重新读取目标元素', {
                 actionExecuted: false,
@@ -2653,20 +2830,20 @@ interface CdpInputContext {
     timeout?: number
 }
 
-type CdpInputHandler = (context: CdpInputContext, event: InputEvent) => Promise<void>
+type CdpInputHandler = (context: CdpInputContext, event: InputEvent) => Promise<string | void>
 
 async function executeCdpEvent(
     session: ReturnType<typeof getSession>,
     event: InputEvent,
     humanize: boolean,
     timeout?: number
-): Promise<void> {
+): Promise<string | void> {
     validateEvent(event)
     const handler = cdpInputHandlers[event.type]
     if (!handler) {
         throw new Error(`未知事件类型: ${(event as { type: string }).type}`)
     }
-    await handler({ session, humanize, timeout }, event)
+    return handler({ session, humanize, timeout }, event)
 }
 
 const cdpInputHandlers: Partial<Record<InputEvent['type'], CdpInputHandler>> = {
@@ -2683,10 +2860,27 @@ const cdpInputHandlers: Partial<Record<InputEvent['type'], CdpInputHandler>> = {
     drag: handleCdpDrag,
 }
 
-async function handleCdpClick({ session, humanize, timeout }: CdpInputContext, event: InputEvent): Promise<void> {
-    if (event.force) {
+async function handleCdpClick(
+    { session, humanize, timeout }: CdpInputContext,
+    event: InputEvent
+): Promise<string | void> {
+    const deadline = Date.now() + (timeout ?? DEFAULT_TIMEOUT)
+    const backgroundClick =
+        !event.force &&
+        !humanize &&
+        event.target !== undefined &&
+        !('x' in event.target) &&
+        (event.button ?? 'left') === 'left' &&
+        (event.clickCount ?? 1) === 1 &&
+        session.getModifiers() === 0 &&
+        (await session.evaluate<boolean>('document.hidden', undefined, remainingInputTimeout(deadline)))
+    if (event.force || backgroundClick) {
+        if (backgroundClick) {
+            const point = await getTargetPoint(session, event.target!, remainingInputTimeout(deadline))
+            session.getBehaviorSimulator().setCurrentPosition(point)
+        }
         const locator = session.createLocator(event.target!, {
-            timeout: targetLookupTimeout(timeout ?? DEFAULT_TIMEOUT),
+            timeout: targetLookupTimeout(remainingInputTimeout(deadline)),
         })
         await locator.evaluateOn(`function() {
             if (!this.isConnected) throw new Error('目标元素已移除，未执行点击');
@@ -2710,10 +2904,10 @@ async function handleCdpClick({ session, humanize, timeout }: CdpInputContext, e
                 }
             }
         }`)
-        return
+        return backgroundClick ? '后台元素单击使用合成事件，isTrusted=false，未激活标签页' : undefined
     }
     if (event.target) {
-        await moveToTarget(session, event.target, humanize, timeout)
+        await moveToTarget(session, event.target, humanize, remainingInputTimeout(deadline))
     }
     const cdpButton = event.button ?? 'left'
     const cdpClickCount = event.clickCount ?? 1

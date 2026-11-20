@@ -5,8 +5,8 @@ import {
     type ActionContext,
     assertActionActive,
     assertManagedTab,
-    getTargetTabId,
     getFrameWheelZoom,
+    getTargetTabId,
     resolveCdpFramePath,
 } from './action-utils'
 import { DebuggerManager } from './debugger-manager'
@@ -593,7 +593,7 @@ export class InputEventHandler {
                             if (remainingX === 0 && remainingY === 0) {
                                 break
                             }
-                            if (node.isConnected === false || (node.ownerDocument && node.ownerDocument !== document)) {
+                            if (!node.isConnected || (node.ownerDocument && node.ownerDocument !== document)) {
                                 continue
                             }
                             const style = window.getComputedStyle(node)
@@ -1147,12 +1147,15 @@ export class InputEventHandler {
             const zoom = (await chrome.debugger.sendCommand(target, 'Runtime.callFunctionOn', {
                 objectId: ownerId,
                 returnByValue: true,
-                functionDeclaration: `function() {
-                    if(this.currentCSSZoom!==undefined)return this.currentCSSZoom;
-                    let zoom=1;
-                    for(let node=this;node;node=node.assignedSlot??node.parentElement??node.getRootNode().host??null)zoom*=parseFloat(getComputedStyle(node).zoom)||1;
-                    return zoom;
-                }`,
+                functionDeclaration:
+                    'function() {\n                    ' +
+                    'if(this.currentCSSZoom!==undefined)return ' +
+                    'this.currentCSSZoom;\n                    let ' +
+                    'zoom=1;\n                    for(let node=this;' +
+                    'node;node=node.assignedSlot??node.parentElemen' +
+                    't??node.getRootNode().host??null)zoom*=parseFl' +
+                    'oat(getComputedStyle(node).zoom)||1;\n         ' +
+                    '           return zoom;\n                }',
             })) as { result: { value?: number }; exceptionDetails?: unknown }
             if (zoom.exceptionDetails || !(zoom.result.value! > 0) || !Number.isFinite(zoom.result.value)) {
                 throw new Error('Frame zoom is unavailable')
@@ -1185,22 +1188,35 @@ export class InputEventHandler {
             const anchor = (await chrome.debugger.sendCommand(target, 'Runtime.callFunctionOn', {
                 objectId: documentId,
                 returnByValue: false,
-                functionDeclaration: `function() {
-                    const walk=this.createTreeWalker(this,NodeFilter.SHOW_ELEMENT);
-                    for(let el=walk.nextNode();el;el=walk.nextNode()) {
-                        const rect=el.getBoundingClientRect();
-                        if(!(rect.width>0&&rect.height>0)||el.getClientRects().length!==1)continue;
-                        let aligned=true;
-                        for(let node=el;node;node=node.parentElement) {
-                            const style=getComputedStyle(node), matrix=new DOMMatrix(style.transform==='none'?undefined:style.transform);
-                            if(!matrix.is2D||Math.abs(matrix.b)>1e-12||Math.abs(matrix.c)>1e-12||matrix.a<=0||matrix.d<=0||
-                                (style.rotate&&style.rotate!=='none'&&!/^(?:[xyz] )?0deg$/.test(style.rotate))||
-                                (style.scale&&style.scale!=='none'&&style.scale.split(/\\s+/).some(value=>Number(value)<=0))) {aligned=false;break;}
-                        }
-                        if(aligned)return el;
-                    }
-                    return null;
-                }`,
+                functionDeclaration:
+                    'function() {\n                    const ' +
+                    'walk=this.createTreeWalker(this,' +
+                    'NodeFilter.SHOW_ELEMENT);\n                    ' +
+                    'for(let el=walk.nextNode();el;' +
+                    'el=walk.nextNode()) {\n                        ' +
+                    'const rect=el.getBoundingClientRect();\n       ' +
+                    '                 if(!(rect.width>' +
+                    '0&&rect.height>0)||el.getClientRects().length!' +
+                    '==1)continue;\n                        let ' +
+                    'aligned=true;\n                        for(let ' +
+                    'node=el;node;node=node.parentElement) {\n      ' +
+                    '                      const ' +
+                    'style=getComputedStyle(node), matrix=new ' +
+                    "DOMMatrix(style.transform==='none'?undefined:s" +
+                    'tyle.transform);\n                            ' +
+                    'if(!matrix.is2D||Math.abs(matrix.b)>' +
+                    '1e-12||Math.abs(matrix.c)>' +
+                    '1e-12||matrix.a<=0||matrix.d<=0||\n            ' +
+                    '                    (style.rotate&&style.rotat' +
+                    "e!=='none'&&!/^(?:[xyz] " +
+                    ')?0deg$/.test(style.rotate))||\n               ' +
+                    "                 (style.scale&&style.scale!=='" +
+                    "none'&&style.scale.split(/\\s+/).some(value=>" +
+                    'Number(value)<=0))) {aligned=false;break;}\n   ' +
+                    '                     }\n                       ' +
+                    ' if(aligned)return el;\n                    }\n ' +
+                    '                   return null;\n              ' +
+                    '  }',
             })) as { result: { objectId?: string }; exceptionDetails?: unknown }
             anchorId = anchor.result.objectId
             if (anchor.exceptionDetails || !anchorId) {
@@ -1210,7 +1226,9 @@ export class InputEventHandler {
                 objectId: anchorId,
                 returnByValue: true,
                 functionDeclaration:
-                    'function(){const r=this.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height}}',
+                    'function(){const r=this.getBoundingClientRect();' +
+                    'return {x:r.x,y:r.y,width:r.width,' +
+                    'height:r.height}}',
             })) as {
                 result: { value?: { x: number; y: number; width: number; height: number } }
                 exceptionDetails?: unknown

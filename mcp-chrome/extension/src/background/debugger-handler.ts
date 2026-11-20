@@ -7,10 +7,10 @@ import {
     assertScriptable,
     getTargetTabId,
 } from './action-utils'
+import type { BrowserEventHandler } from './browser-event-handler'
 import { DebuggerManager } from './debugger-manager'
 import { LogManager } from './log-manager'
 import { remainingNavigationTimeout } from './navigation-handler'
-import type { BrowserEventHandler } from './browser-event-handler'
 
 export class DebuggerHandler {
     browserEvents?: BrowserEventHandler
@@ -49,6 +49,7 @@ export class DebuggerHandler {
                 context.serverInstanceId
             )
             if (suspended?.suspended === false) {
+                // noinspection ExceptionCaughtLocallyJS -- 外层为清理失败附加 detach 阶段与 tab 身份
                 throw new ExpectedOperationError(
                     JSON.stringify({
                         error: {

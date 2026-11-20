@@ -27,7 +27,12 @@ const result = {
     commandReplies: [],
     events: [],
     boundary:
-        'Actual SDK Client/McpServer and production requestContext/queue/driver/CDPClient, isolated native Chrome CookieStore and Target sessions; pipe adapter holds selected real ACKs; the named cleanup-failure case injects one detach protocol rejection without sending that detach',
+        'Actual SDK Client/McpServer and production ' +
+        'requestContext/queue/driver/CDPClient, isolated ' +
+        'native Chrome CookieStore and Target sessions; ' +
+        'pipe adapter holds selected real ACKs; the named ' +
+        'cleanup-failure case injects one detach protocol ' +
+        'rejection without sending that detach',
 }
 const chrome = spawn(
     chromePath,
@@ -170,6 +175,7 @@ try {
     nativeClient.ws = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const command = JSON.parse(text)
             result.commands.push({ ...command, aborted: state.serverRecord?.signal.aborted === true })

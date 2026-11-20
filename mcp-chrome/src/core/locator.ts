@@ -14,7 +14,8 @@
  */
 
 import type { CDPClient } from '../cdp/client.js'
-import { installDomHelpers, type DomQuery } from './dom-helpers.js'
+import { type DomQuery, installDomHelpers } from './dom-helpers.js'
+import { sanitizeErrorMessage } from './error-sanitizer.js'
 import { ElementNotFoundError, StructuredToolError } from './errors.js'
 import { withRetry } from './retry.js'
 import {
@@ -34,7 +35,6 @@ import {
     type Point,
     type Target,
 } from './types.js'
-import { sanitizeErrorMessage } from './error-sanitizer.js'
 
 /**
  * CDP DOM 节点 ID
@@ -51,6 +51,7 @@ type RemoteObjectId = string
  */
 export interface LocatorOptions {
     contextId?: number
+    frameId?: string
     localPoint?: (timeout: number) => Promise<boolean>
     mapPoint?: (point: Point, timeout: number) => Promise<Point>
     mapViewportPoint?: (point: Point, timeout: number) => Promise<Point>
@@ -109,11 +110,6 @@ export class Locator {
     async find(retry = true): Promise<NodeId> {
         this.logs = []
         this.log(`定位元素: ${JSON.stringify(this.target)}`)
-
-        if (isCoordinateTarget(this.target)) {
-            // 坐标定位不需要 NodeId
-            throw new Error('坐标定位不支持 find()，请使用 getClickablePoint()')
-        }
 
         return retry ? withRetry(() => this.findInternal(), { timeout: this.remaining() }) : this.findInternal()
     }
@@ -202,6 +198,9 @@ export class Locator {
      * 查找元素的内部实现（单次尝试）
      */
     private async findInternal(): Promise<NodeId> {
+        if (isCoordinateTarget(this.target)) {
+            return this.queryDom(this.target)
+        }
         if (isRoleTarget(this.target)) {
             return this.findByAccessibility()
         }
@@ -265,18 +264,27 @@ export class Locator {
         if (exact && name !== undefined) {
             queryParams.accessibleName = name
         }
-        const { nodes } = (await this.send('Accessibility.queryAXTree', queryParams)) as {
+        const { result: visibility } = await this.send<{ result: { value?: boolean } }>('Runtime.evaluate', {
+            expression: 'document.hidden',
+            returnByValue: true,
+        })
+        const snapshot =
+            visibility.value === true && (this.contextId === undefined || this.options.frameId !== undefined)
+        const { nodes } = await this.send<{
             nodes: Array<{
                 nodeId: string
-                role: { value: string }
+                role?: { value: string }
                 name?: { value: string }
                 backendDOMNodeId?: number
             }>
-        }
+        }>(
+            snapshot ? 'Accessibility.getFullAXTree' : 'Accessibility.queryAXTree',
+            snapshot ? (this.options.frameId ? { frameId: this.options.frameId } : undefined) : queryParams
+        )
 
         const matchingNodes = nodes.filter(
             (node) =>
-                node.role.value === role &&
+                node.role?.value === role &&
                 (name === undefined || (exact ? node.name?.value === name : node.name?.value.includes(name)))
         )
 
@@ -422,13 +430,17 @@ export class Locator {
         return this.queryDom({ xpath })
     }
 
-    private async queryDom(query: DomQuery, index = this.nth): Promise<NodeId> {
+    private async queryDom(query: DomQuery | Point, index = this.nth): Promise<NodeId> {
+        const matches =
+            'x' in query
+                ? `[globalThis.__mcpDomHelpers.deepElementFromPoint(${JSON.stringify(query.x)},${JSON.stringify(query.y)})].filter(Boolean)`
+                : `globalThis.__mcpDomHelpers.query(${JSON.stringify(query)})`
         const expression =
             '(function(){(' +
             installDomHelpers.toString() +
-            ')();const matches=globalThis.__mcpDomHelpers.query(' +
-            JSON.stringify(query) +
-            ');return {node:matches[' +
+            ')();const matches=' +
+            matches +
+            ';return {node:matches[' +
             index +
             ']??null,count:matches.length};})()'
         const { result, exceptionDetails } = await this.send<{
@@ -439,6 +451,7 @@ export class Locator {
             const exception = exceptionDetails.exception
             const message = exception?.description ?? exceptionDetails.text ?? 'DOM query failed'
             if (
+                !('x' in query) &&
                 (query.selector || query.xpath) &&
                 (exception?.className === 'SyntaxError' ||
                     (exception?.className === 'DOMException' && /^SyntaxError:/.test(message)))

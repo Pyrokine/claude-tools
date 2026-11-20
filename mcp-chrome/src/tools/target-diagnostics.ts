@@ -82,39 +82,60 @@ async function collectPageCandidates(
     try {
         const { selector, text, xpath, semantic } = targetToFindParams(target)
         const query = JSON.stringify({ selector, text, xpath, semantic })
-        const script = `(() => {
-                const matchCount = ${'x' in target ? 'null' : `globalThis.__mcpDomHelpers?.query(${query}).length ?? null`};
-                const active = document.activeElement;
-                return {
-                    matchCount,
-                    activeElement: active ? {
-                        tag: active.tagName.toLowerCase().slice(0, 40),
-                        id: active.id ? active.id.slice(0, ${MAX_CANDIDATE_TEXT}) : undefined,
-                        role: active.getAttribute('role')?.slice(0, 80) || undefined,
-                        inputType: active instanceof HTMLInputElement ? active.type.slice(0, 40) : undefined,
-                        contentEditable: Boolean(active.isContentEditable)
-                    } : null,
-                    candidates: Array.from(document.querySelectorAll(
-                        'input, textarea, select, button, a, [role], [contenteditable="true"]'
-                    ))
-                        .slice(0, ${MAX_CANDIDATES})
-                        .map((el) => {
-                            const rect = el.getBoundingClientRect();
-                            return {
-                                tag: el.tagName.toLowerCase(),
-                                id: el.id || undefined,
-                                role: el.getAttribute('role') || undefined,
-                                label: (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '')
-                                    .slice(0, 80),
-                                text: (el.textContent || '').replace(/\\s+/g, ' ').trim()
-                                    .slice(0, ${MAX_CANDIDATE_TEXT}),
-                                visible: rect.width > 0 && rect.height > 0,
-                                disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
-                                bounds: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
-                            };
-                        })
-                };
-            })()`
+        const script =
+            '(() => {\n                const matchCount = ' +
+            `${'x' in target ? 'null' : `globalThis.__mcpDomHelpers?.query(${query}).length ?? null`}` +
+            ';\n                const active = ' +
+            'document.activeElement;\n                ' +
+            'return {\n                    matchCount,\n     ' +
+            '               activeElement: active ? {\n     ' +
+            '                   tag: ' +
+            'active.tagName.toLowerCase().slice(0, 40),\n   ' +
+            '                     id: active.id ? ' +
+            'active.id.slice(0, ' +
+            `${MAX_CANDIDATE_TEXT}` +
+            ') : undefined,\n                        role: ' +
+            "active.getAttribute('role')?.slice(0, 80) || " +
+            'undefined,\n                        inputType: ' +
+            'active instanceof HTMLInputElement ? ' +
+            'active.type.slice(0, 40) : undefined,\n        ' +
+            '                contentEditable: ' +
+            'Boolean(active.isContentEditable)\n            ' +
+            '        } : null,\n                    ' +
+            'candidates: Array.from(document.querySelectorA' +
+            "ll(\n                        'input, textarea, " +
+            'select, button, a, [role], ' +
+            '[contenteditable="true"]\'\n                    ' +
+            '))\n                        .slice(0, ' +
+            `${MAX_CANDIDATES}` +
+            ')\n                        .map((el) => {\n     ' +
+            '                       const rect = ' +
+            'el.getBoundingClientRect();\n                  ' +
+            '          return {\n                           ' +
+            '     tag: el.tagName.toLowerCase(),\n          ' +
+            '                      id: el.id || undefined,\n' +
+            '                                role: ' +
+            "el.getAttribute('role') || undefined,\n        " +
+            '                        label: ' +
+            "(el.getAttribute('aria-label') || " +
+            "el.getAttribute('placeholder') || '')\n        " +
+            '                            .slice(0, 80),\n   ' +
+            '                             text: ' +
+            "(el.textContent || '').replace(/\\s+/g, ' " +
+            "').trim()\n                                    " +
+            '.slice(0, ' +
+            `${MAX_CANDIDATE_TEXT}` +
+            '),\n                                visible: ' +
+            'rect.width > 0 && rect.height > 0,\n           ' +
+            '                     disabled: ' +
+            'Boolean(el.disabled) || ' +
+            "el.matches(':disabled') || " +
+            "el.getAttribute('aria-disabled') === 'true',\n " +
+            '                               bounds: {x: ' +
+            'rect.x, y: rect.y, width: rect.width, height: ' +
+            'rect.height}\n                            };\n  ' +
+            '                      })\n                };\n  ' +
+            '          })()'
         const budget = Math.min(Math.max(timeout ?? MAX_DIAGNOSTIC_TIMEOUT_MS, 1), MAX_DIAGNOSTIC_TIMEOUT_MS)
         // 原生 CDP 路径不经过会自动重连的 evaluate 分发，避免作用域恢复后的迟到探测
         return unifiedSession.getMode() === 'cdp'

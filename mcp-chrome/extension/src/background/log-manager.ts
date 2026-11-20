@@ -36,6 +36,7 @@ export class LogManager {
         number,
         { binding: string; events: Array<{ contextId: number; message: ConsoleMessage }> }
     >()
+
     private consoleContexts = new Map<number, Map<number, { frameId?: string; isDefault?: boolean }>>()
     private consoleFallbackFrames = new Map<number, string>()
     private networkSequences = new Map<number, number>()

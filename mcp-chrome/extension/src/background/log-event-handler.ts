@@ -233,6 +233,7 @@ export class LogEventHandler {
                     returnByValue: true,
                 })) as { exceptionDetails?: { text?: string } }
                 if (result.exceptionDetails || this.logManager.hasConsoleHandoff(tabId)) {
+                    // noinspection ExceptionCaughtLocallyJS -- 统一报告交接失败并返回实际清理状态
                     throw new Error(result.exceptionDetails?.text ?? 'Console handoff boundary was not received')
                 }
             } else {
@@ -244,6 +245,7 @@ export class LogEventHandler {
                 const residual = (results[0]?.result as ConsoleMessage[]) ?? []
                 const injectionError = (results[0] as { error?: { message?: string } } | undefined)?.error
                 if (injectionError) {
+                    // noinspection ExceptionCaughtLocallyJS -- 统一报告 hook 卸载失败并返回清理状态
                     throw new Error(injectionError.message ?? String(injectionError))
                 }
                 if (residual.length > 0) {
@@ -322,6 +324,7 @@ export class LogEventHandler {
                 await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {})
                 // A native binding hands ownership over in the same page task that uninstalls the hook.
                 if (!(await this.flushAndUninstallConsoleHook(tabId, binding))) {
+                    // noinspection ExceptionCaughtLocallyJS -- finally 清理 binding，随后保留交接错误
                     throw new ExpectedOperationError('Console source handoff failed; page hook cleanup is incomplete')
                 }
             } catch (error) {
@@ -347,6 +350,7 @@ export class LogEventHandler {
                 }
             }
             if (failure) {
+                // noinspection ExceptionCaughtLocallyJS -- 仅 DebuggerBlockedError 进入显式 hook 路径
                 throw failure
             }
         } catch (err) {

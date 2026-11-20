@@ -5,8 +5,8 @@
  */
 
 import { z } from 'zod'
-import type { Target } from '../core/types.js'
 import type { SemanticTarget } from '../core/dom-helpers.js'
+import type { Target } from '../core/types.js'
 
 export const pageTargetIdSchema = z.string().min(1).optional()
 const frameStepSchema = z.union([z.string().min(1), z.number().int().nonnegative()])

@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 import { getSession, getUnifiedSession } from '../dist/core/index.js';
+import { BrowserEventController } from '../dist/core/browser-events.js';
+import { registerBrowseTool } from '../dist/tools/browse.js';
 
 import {
     focusCdpTarget,
@@ -34,7 +36,16 @@ import {
     readChallengeSnapshot,
     waitForChallenge,
 } from '../dist/tools/challenge.js';
-import { ElementNotFoundError, OsMouseError, StructuredToolError } from '../dist/core/errors.js';
+import {
+    CDPError,
+    ElementNotFoundError,
+    formatErrorResponse,
+    getErrorSource,
+    OsMouseError,
+    setErrorSource,
+    StructuredToolError,
+    TimeoutError,
+} from '../dist/core/errors.js';
 import { CDPClient } from '../dist/cdp/client.js';
 import {
     buildOsMovePath,
@@ -48,6 +59,242 @@ import {
     resolveTurnstileOsClickPoint,
     windowNameMatchesPageTitle,
 } from '../dist/core/os-mouse.js';
+
+async function targetPointFixture(visibility = 'hidden') {
+    const source = await readFile(new URL('../dist/tools/input.js', import.meta.url), 'utf8');
+    const start = source.indexOf('async function getTargetPointExtension(');
+    const end = source.indexOf('\nasync function executeCdpEvent(', start);
+    assert.ok(start >= 0 && end > start);
+    const locate = vm.runInNewContext(`${source.slice(start, end)}\ngetTargetPointExtension`, {
+        DEFAULT_TIMEOUT: 500,
+        StructuredToolError,
+        targetToFindParams: (target) => ({ selector: target.css }),
+        throwInputTimeoutError: () => {
+            throw new Error('TIMEOUT');
+        },
+    });
+    const listeners = new Set();
+    const ports = [];
+    const frames = new Set();
+    const calls = [];
+    const observe = (node) =>
+        Object.assign(node, {
+            addEventListener(type, listener) {
+                listeners.add(listener);
+            },
+            removeEventListener(type, listener) {
+                listeners.delete(listener);
+            },
+        });
+    const document = observe({ visibilityState: visibility });
+    const box = observe({ scrollLeft: 0, scrollTop: 0, getRootNode: () => document });
+    const offset = { x: 80, y: 360 };
+    const element = observe({
+        isConnected: true,
+        ownerDocument: document,
+        parentElement: box,
+        scrollLeft: 0,
+        scrollTop: 0,
+        getRootNode: () => document,
+        getBoundingClientRect() {
+            const x = 9 + offset.x - box.scrollLeft;
+            const y = 9 + offset.y - box.scrollTop;
+            return { x, y, left: x, top: y, right: x + 60, bottom: y + 24, width: 60, height: 24 };
+        },
+        scrollIntoView(options) {
+            calls.push({ ...options });
+            const before = [box.scrollLeft, box.scrollTop];
+            for (const [axis, key, size, align] of [
+                ['x', 'scrollLeft', 265, options.inline],
+                ['y', 'scrollTop', 53, options.block],
+            ]) {
+                const length = axis === 'x' ? 60 : 24;
+                if (align === 'center') {
+                    box[key] = Math.max(0, offset[axis] + length / 2 - size / 2);
+                } else if (offset[axis] < box[key]) {
+                    box[key] = offset[axis];
+                } else if (offset[axis] + length > box[key] + size) {
+                    box[key] = offset[axis] + length - size;
+                }
+            }
+            if (before[0] !== box.scrollLeft || before[1] !== box.scrollTop) {
+                setImmediate(() => page.onScroll?.());
+            }
+        },
+    });
+    const window = observe({
+        scrollX: 0,
+        scrollY: 0,
+        innerWidth: 1000,
+        innerHeight: 1164,
+        __mcpElementMap: { pad: new WeakRef(element) },
+    });
+    let rafCalls = 0;
+    const realm = vm.createContext({
+        window,
+        document,
+        setTimeout,
+        clearTimeout,
+        __mcpDomHelpers: { elements: () => [element, box] },
+        requestAnimationFrame(callback) {
+            ++rafCalls;
+            const frame = setImmediate(() => {
+                frames.delete(frame);
+                callback();
+            });
+            frames.add(frame);
+            return frame;
+        },
+        cancelAnimationFrame(frame) {
+            clearImmediate(frame);
+            frames.delete(frame);
+        },
+        MessageChannel: class {
+            constructor() {
+                this.port1 = {
+                    close() {
+                        this.closed = true;
+                    },
+                };
+                this.port2 = {
+                    close() {
+                        this.closed = true;
+                    },
+                    postMessage: (data) =>
+                        setImmediate(() => {
+                            if (!this.port1.closed) {
+                                this.port1.onmessage({ data });
+                            }
+                        }),
+                };
+                ports.push(this.port1, this.port2);
+            }
+        },
+    });
+    const findCalls = [];
+    const session = {
+        find: async (...args) => {
+            findCalls.push(args);
+            return [{ refId: 'pad' }];
+        },
+        evaluate: (script) => vm.runInContext(script, realm),
+    };
+    const page = {
+        element,
+        box,
+        offset,
+        document,
+        window,
+        calls,
+        session,
+        findCalls,
+        locate: (target = { css: '#pad' }, timeout = 500, frame, scroll = true) =>
+            locate(session, target, timeout, frame, scroll),
+        assertPoint(point) {
+            const rect = element.getBoundingClientRect();
+            assert.equal(point.x, rect.x + rect.width / 2);
+            assert.equal(point.y, rect.y + rect.height / 2);
+            assert.ok(point.x >= 9 && point.x < 274 && point.y >= 9 && point.y < 62, JSON.stringify(point));
+        },
+        expireDeadline() {
+            const now = Date.now() + 60_000;
+            vm.runInContext('Date', realm).now = () => now;
+        },
+        assertReleased() {
+            assert.equal(listeners.size, 0);
+            assert.equal(frames.size, 0);
+            assert.ok(ports.every((port) => port.closed));
+            if (visibility === 'hidden') {
+                assert.equal(rafCalls, 0);
+            }
+        },
+    };
+    return page;
+}
+
+test('C31F8 ancestor clipping scrolls an in-viewport target and rechecks layout after scroll listeners', async (t) => {
+    for (const visibility of ['hidden', 'visible']) {
+        for (const ancestry of ['parent', 'slot']) {
+            await t.test(`${visibility} ${ancestry}`, async () => {
+                const page = await targetPointFixture(visibility);
+                if (ancestry === 'slot') {
+                    page.element.assignedSlot = Object.assign(Object.create(page.box), {
+                        parentElement: page.box,
+                        scrollLeft: 0,
+                        scrollTop: 0,
+                    });
+                    page.element.parentElement = null;
+                }
+                page.onScroll = () => {
+                    page.offset.x = 240;
+                };
+                const point = await page.locate();
+                page.assertPoint(point);
+                assert.ok(page.box.scrollTop > 0);
+                assert.ok(page.box.scrollLeft > 0, 'the listener moved the center beyond the horizontal scrollport');
+                page.assertReleased();
+            });
+        }
+    }
+});
+
+test('C31F8 fully visible targets keep their position and outside-viewport targets retain centered scrolling', async () => {
+    const visible = await targetPointFixture();
+    visible.offset.y = 15;
+    const before = visible.element.getBoundingClientRect();
+    visible.assertPoint(await visible.locate());
+    assert.deepEqual(visible.element.getBoundingClientRect(), before);
+    assert.equal(visible.box.scrollLeft, 0);
+    assert.equal(visible.box.scrollTop, 0);
+    visible.assertReleased();
+
+    const outside = await targetPointFixture();
+    outside.offset.y = 2100;
+    outside.assertPoint(await outside.locate());
+    assert.deepEqual(outside.calls[0], { block: 'center', inline: 'center', behavior: 'instant' });
+    outside.assertReleased();
+});
+
+test('C31F8 coordinates and scroll=false preserve their lookup and scrolling contracts', async () => {
+    const page = await targetPointFixture();
+    const point = await page.locate({ x: 17, y: 29 });
+    assert.equal(point.x, 17);
+    assert.equal(point.y, 29);
+    assert.equal(page.findCalls.length, 0);
+    const unscrolled = await page.locate({ css: '#pad' }, 500, undefined, false);
+    assert.equal(unscrolled.x, 119);
+    assert.equal(unscrolled.y, 381);
+    assert.equal(page.calls.length, 0);
+    page.assertReleased();
+});
+
+test('C31F8 frame refresh retains frame-local lookup and rejects a replaced target before dispatch', async () => {
+    const page = await targetPointFixture();
+    page.assertPoint(await page.locate({ css: '#pad' }, 500, 0));
+    assert.equal(page.findCalls.length, 2);
+    assert.ok(page.findCalls.every((args) => args[6] === 'frame'));
+    page.session.find = async () => [{ refId: page.findCalls.length++ ? 'replacement' : 'pad' }];
+    page.findCalls.length = 0;
+    await assert.rejects(page.locate({ css: '#pad' }, 500, 0), /滚动后目标元素已失效/);
+    page.assertReleased();
+});
+
+test('C31F8 repeated listener movement consumes the original deadline and releases observers', async () => {
+    const page = await targetPointFixture('visible');
+    page.onScroll = () => {
+        page.offset.x = page.offset.x === 80 ? 300 : 80;
+    };
+    await assert.rejects(page.locate({ css: '#pad' }, 50), /SCROLL_SETTLEMENT_TIMEOUT|TIMEOUT/);
+    page.assertReleased();
+});
+
+test('C31F8 an expired settlement callback rejects before another native scroll', async () => {
+    const page = await targetPointFixture();
+    page.onScroll = () => page.expireDeadline();
+    await assert.rejects(page.locate(), /SCROLL_SETTLEMENT_TIMEOUT/);
+    assert.equal(page.calls.length, 1);
+    page.assertReleased();
+});
 
 test('CH-08 ordinary verification buttons use page input while Cloudflare frames retain native input', () => {
     for (const scenario of [
@@ -429,7 +676,6 @@ test('C-R11 mouse cleanup distinguishes a rejected press from an unknown result'
                 inputMode: 'precise',
                 getDriver: async () => driver,
                 isExtensionConnected: () => true,
-                withMouseFrame: async (action) => action(),
                 mouseDown: async () => {
                     if (outcome !== 'completed') {
                         throw failure;
@@ -557,6 +803,7 @@ test(
                                         type: inputType,
                                         tagName: 'INPUT',
                                         nodeType: 1,
+                                        isConnected: true,
                                         childNodes: [],
                                         selectionStart: 0,
                                         selectionEnd: 0,
@@ -874,7 +1121,7 @@ test('CH-01 CDP locator focus does not depend on Extension refIds', async () => 
 });
 
 test('CH-01 contenteditable selection uses an exact DOM Range', async () => {
-    const inputSource = await readFile(new URL('../src/tools/input.ts', import.meta.url), 'utf8');
+    const inputSource = await readFile(new URL('../src/tools/input.ts', import.meta.url), { encoding: 'utf8' });
     assert.match(inputSource, /root instanceof HTMLElement && root\.isContentEditable/);
     assert.match(inputSource, /selection\.addRange\(selectionRange\)/);
     assert.match(inputSource, /if \(result\.type === 'range'\)/);
@@ -882,14 +1129,14 @@ test('CH-01 contenteditable selection uses an exact DOM Range', async () => {
 
 test('CH-02 postCondition reports matched and not_matched', async () => {
     const matched = await waitForPostCondition(
-        { evaluate: async () => 1 },
+        { getMode: () => 'extension', evaluate: async () => 1 },
         { selector: '#ready', timeout: 50, interval: 50 },
         'test'
     );
     assert.equal(matched.verificationStatus, 'matched');
 
     const notMatched = await waitForPostCondition(
-        { evaluate: async () => 0 },
+        { getMode: () => 'extension', evaluate: async () => 0 },
         { selector: '#missing', timeout: 50, interval: 50 },
         'test'
     );
@@ -900,6 +1147,7 @@ test('CH-02 postCondition text check emits a valid escaped newline', async () =>
     let evaluatedScript;
     const result = await waitForPostCondition(
         {
+            getMode: () => 'extension',
             evaluate: async (script) => {
                 evaluatedScript = script;
                 return { matched: true, actual: 'ready' };
@@ -916,6 +1164,7 @@ test('CH-02 postCondition text check emits a valid escaped newline', async () =>
 test('CH-02 postCondition distinguishes unavailable from business mismatch', async () => {
     const result = await waitForPostCondition(
         {
+            getMode: () => 'extension',
             evaluate: async () => {
                 throw new Error('Cannot resolve CDP frame for URL');
             },
@@ -931,6 +1180,7 @@ test('CH-02 postCondition uses the evaluate action mode', async () => {
     const modes = [];
     const result = await waitForPostCondition(
         {
+            getMode: () => 'extension',
             evaluate: async (_script, mode) => {
                 modes.push(mode);
                 return 1;
@@ -1086,8 +1336,8 @@ test('console log levels use the public schema vocabulary', () => {
 
 test('CDP console reads enable the Runtime domain before collecting events', async () => {
     const [logsSource, sessionSource] = await Promise.all([
-        readFile(new URL('../src/tools/logs.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/core/session.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../src/tools/logs.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/core/session.ts', import.meta.url), { encoding: 'utf8' }),
     ]);
     assert.match(logsSource, /await unifiedSession\.enableConsole\(\)\s*if \(mode === 'extension'\)/);
     assert.match(sessionSource, /async consoleEnable\(\): Promise<void> \{\s*await this\.ensureRuntimeEnabled\(\)/);
@@ -1196,6 +1446,51 @@ test('target diagnostics redact the live URL before applying the display limit',
     assert.equal(state.url, url);
 });
 
+test('CH-04 target diagnostics retain inherited disabled state and legend exceptions', async () => {
+    const scenarios = [
+        { id: 'fieldset', disabled: false, matched: true, expected: true },
+        { id: 'first-legend', disabled: false, matched: false, expected: false },
+        { id: 'enabled', disabled: false, matched: false, expected: false },
+        { id: 'own-disabled', disabled: true, matched: true, expected: true },
+        { id: 'aria-disabled', disabled: false, matched: false, aria: 'true', expected: true },
+    ];
+    for (const tag of ['input', 'textarea', 'select']) {
+        const elements = scenarios.map((scenario) => ({
+            tagName: tag.toUpperCase(),
+            id: `${scenario.id}-${tag}`,
+            disabled: scenario.disabled,
+            getAttribute: (name) => (name === 'aria-disabled' ? (scenario.aria ?? null) : null),
+            getBoundingClientRect: () => ({ x: 0, y: 0, width: 20, height: 20 }),
+            matches: (selector) => {
+                assert.equal(selector, ':disabled');
+                return scenario.matched;
+            },
+        }));
+        const state = { url: 'https://example.com/fixture', managed: true };
+        const session = {
+            getCurrentTargetId: () => '101',
+            getMode: () => 'extension',
+            getState: () => state,
+            getLiveState: async () => state,
+            isExtensionConnected: () => true,
+            evaluate: async (script) =>
+                vm.runInNewContext(script, {
+                    document: { activeElement: null, querySelectorAll: () => elements },
+                }),
+        };
+        const result = await buildTargetDiagnostics(
+            session,
+            { css: '#fixture' },
+            { nth: 0, timeout: 1000, matchCount: 0, lastState: 'disabled' }
+        );
+        assert.equal(result.diagnosticError, undefined);
+        assert.deepEqual(
+            Array.from(result.candidates, (candidate) => [candidate.id, candidate.disabled]),
+            scenarios.map((scenario) => [`${scenario.id}-${tag}`, scenario.expected])
+        );
+    }
+});
+
 test('CH-04 target candidate summaries are bounded and omit page values', () => {
     const candidates = Array.from({ length: 12 }, (_, index) => ({
         tag: 'input',
@@ -1232,9 +1527,9 @@ test('CH-07 diagnostics remain attached when the main action fails', async () =>
 
 test('CH-04 target diagnostics read live tab state instead of cached attach metadata', async () => {
     const [sessionSource, diagnosticsSource, extractSource] = await Promise.all([
-        readFile(new URL('../src/core/unified-session.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/tools/target-diagnostics.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/tools/extract.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../src/core/unified-session.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/tools/target-diagnostics.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/tools/extract.ts', import.meta.url), { encoding: 'utf8' }),
     ]);
     assert.match(sessionSource, /async getLiveState\(timeout\?: number\)/);
     assert.match(sessionSource, /await this\.extensionBridge!\.listTargets\(timeout\)/);
@@ -1246,7 +1541,7 @@ test('CH-04 target diagnostics read live tab state instead of cached attach meta
 test('CH-05 backend selection happens inside the active tab and frame scopes', async () => {
     const [inputSource, waitSource, logsSource, extractSource] = await Promise.all(
         ['input.ts', 'wait.ts', 'logs.ts', 'extract.ts'].map((file) =>
-            readFile(new URL(`../src/tools/${file}`, import.meta.url), 'utf8')
+            readFile(new URL(`../src/tools/${file}`, import.meta.url), { encoding: 'utf8' })
         )
     );
 
@@ -1278,8 +1573,8 @@ test('CH-05 backend selection happens inside the active tab and frame scopes', a
 
 test('CH-06 Extension only replays stale iframe contexts for read-only scripts', async () => {
     const [resolverSource, schemaSource] = await Promise.all([
-        readFile(new URL('../extension/src/background/frame-resolver.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/types/schemas.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../extension/src/background/frame-resolver.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/types/schemas.ts', import.meta.url), { encoding: 'utf8' }),
     ]);
     assert.match(resolverSource, /p\.staleContextRetry === 'readOnly' \? 2 : 1/);
     assert.match(resolverSource, /script was not replayed because staleContextRetry is never/);
@@ -1288,15 +1583,20 @@ test('CH-06 Extension only replays stale iframe contexts for read-only scripts',
 
 test('CH-06 DOM iframe identity does not depend on webNavigation frame ordering', async () => {
     const [resolverSource, actionUtilsSource, contentSource, pageScriptsSource] = await Promise.all([
-        readFile(new URL('../extension/src/background/frame-resolver.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/action-utils.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/content/content.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/page-scripts.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../extension/src/background/frame-resolver.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/action-utils.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/content/content.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/page-scripts.ts', import.meta.url), { encoding: 'utf8' }),
     ]);
 
     assert.match(
         resolverSource,
-        /getDomFrameSnapshot\(\s*tabId,\s*parentFrameId,\s*selection,\s*parent\.documentId,\s*parent\.url,\s*context\s*\)/
+        new RegExp(
+            'getDomFrameSnapshot\\(\\s*tabId,\\s*parentFrameId,' +
+                '\\s*selection,\\s*parent\\.documentId,\\s*parent\\.url,' +
+                '\\s*context\\s*\\)',
+            ''
+        )
     );
     assert.match(resolverSource, /currentRoot\.documentId !== root\.documentId/);
     assert.match(resolverSource, /identity\.parentDocumentId !== parent\.documentId/);
@@ -1326,10 +1626,9 @@ test(
         assert.equal(resolveExtensionBundleStatus(null, active, true), 'unknown');
         assert.equal(resolveExtensionBundleStatus(expected, null, false), 'pending');
 
-        const clientSource = await readFile(
-            new URL('../extension/src/background/http-client.ts', import.meta.url),
-            'utf8'
-        );
+        const clientSource = await readFile(new URL('../extension/src/background/http-client.ts', import.meta.url), {
+            encoding: 'utf8',
+        });
         assert.match(clientSource, /chrome\.runtime\.getURL\('service-worker-loader\.js'\)/);
         assert.match(clientSource, /backgroundBundleHash/);
     }
@@ -1968,6 +2267,478 @@ test('CH-08 Challenge waits for page recovery and clicks Turnstile checkbox', as
     assert.equal(leftover.clearanceCookiePresent, false);
 });
 
+test('HOST-NAV-01 registered browse retains completed navigation when the observer ends before its native acknowledgement', async () => {
+    const unified = getUnifiedSession();
+    const initialUrl = 'http://127.0.0.1/owned-navigation';
+    const destination = 'chrome://extensions/';
+    let url = initialUrl;
+    let navigations = 0;
+    let finishNative;
+    let entered;
+    let responsePromise;
+    const started = new Promise((resolve) => {
+        entered = resolve;
+    });
+    const controller = new BrowserEventController(
+        { backend: 'extension', targetId: '101', owner: 'owned-navigation', generation: 'owned-navigation' },
+        async () => ({})
+    );
+    const overrides = {
+        isExtensionModeEnabled: () => true,
+        getMode: () => 'extension',
+        getState: () => ({ url, title: 'Owned navigation', managed: true }),
+        getLiveState: async () => ({ url, title: 'Owned navigation', managed: true }),
+        getCurrentTargetId: () => '101',
+        getTargetRestoration: () => undefined,
+        getPageSnapshot: async (targetId) => ({ targetId, url, revision: url === initialUrl ? 'nav-r1' : 'nav-r2' }),
+        listTargets: async () => [{ targetId: '101' }],
+        listTopology: async () => ({ activeTargetId: null }),
+        withTabLock: async (action) => action(),
+        withTabId: async (_id, action) => action(),
+        withPageCondition: async (_args, action) => action(),
+        getChallengeState: async () => null,
+        inspectChallenge: async () => {
+            throw new Error('Cannot access a chrome:// URL');
+        },
+        navigate: async () => {
+            ++navigations;
+            const native = new Promise((resolve) => {
+                finishNative = () => {
+                    url = destination;
+                    resolve();
+                };
+            });
+            const guarded = controller.race(native);
+            entered();
+            await controller.dispose('debugger detached or page released');
+            await guarded;
+        },
+    };
+    const original = new Map(Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(unified, key)]));
+    Object.assign(unified, overrides);
+    try {
+        let handler;
+        registerBrowseTool({
+            registerTool(_name, _options, callback) {
+                handler = callback;
+            },
+        });
+        responsePromise = handler({
+            action: 'open',
+            url: destination,
+            targetId: '101',
+            expectedRevision: 'nav-r1',
+            timeout: 1_000,
+        });
+        await started;
+        await new Promise((resolve) => setImmediate(resolve));
+        finishNative();
+        const response = await responsePromise;
+        const body = JSON.parse(response.content[0].text);
+        assert.equal(response.isError, true);
+        assert.match(body.error.message, /Cannot access a chrome:\/\/ URL/, response.content[0].text);
+        assert.equal(body.error.context.actionExecuted, true);
+        assert.equal(body.error.context.actionStatus, 'completed');
+        assert.equal(body.error.context.failureStage, 'challenge_inspection');
+        assert.equal(body.error.context.retryable, false);
+        assert.equal(body.pageContext.before.url, initialUrl);
+        assert.equal(body.pageContext.after.url, destination);
+        assert.equal(navigations, 1);
+    } finally {
+        finishNative?.();
+        await responsePromise?.catch(() => {});
+        for (const [key, descriptor] of original) {
+            if (descriptor) {
+                Object.defineProperty(unified, key, descriptor);
+            } else {
+                delete unified[key];
+            }
+        }
+    }
+});
+
+test('err-non-scriptable-tab-01 Challenge inspection stops on permanent native access errors', async (t) => {
+    for (const [backend, stage] of [
+        ['extension', 'isolated'],
+        ['extension', 'stealth'],
+        ['extension', 'precise'],
+        ['cdp', 'stealth'],
+        ['cdp', 'precise'],
+    ]) {
+        const stages = backend === 'extension' ? ['isolated', 'stealth', 'precise'] : ['stealth', 'precise'];
+        for (const failure of [
+            new Error('Cannot access a chrome:// URL'),
+            new Error('Cannot execute on restricted URL "chrome://extensions/". Navigate to an http/https page first.'),
+            new Error(
+                'Cannot access contents of url "https://example.com/". ' +
+                    'Extension manifest must request permission to access this host.'
+            ),
+            new Error('The extensions gallery cannot be scripted.'),
+            new StructuredToolError('FRAME_INJECTION_DENIED', 'Host permission is required', 'Check permissions', {}),
+            new CDPError('chrome.debugger.attach: Cannot access a chrome:// URL', {
+                nativeSource: 'chrome.debugger',
+                phase: 'attach',
+                reason: 'target_unavailable',
+            }),
+            new Error(
+                JSON.stringify({
+                    error: { code: 'CDP_ERROR', message: 'chrome.debugger.attach: Cannot access a chrome:// URL' },
+                })
+            ),
+        ]) {
+            await t.test(`${backend}/${stage}: ${failure.message}`, async () => {
+                const attempts = [];
+                const inspect = async (mode) => {
+                    attempts.push(mode);
+                    throw mode === stage ? failure : new Error('Inspection context is temporarily unavailable');
+                };
+                await assert.rejects(
+                    () =>
+                        readChallengeSnapshot({
+                            getMode: () => backend,
+                            getState: () => ({ title: 'Extensions', url: 'chrome://extensions/' }),
+                            inspectChallenge: () => inspect('isolated'),
+                            evaluate: (_code, mode) => inspect(mode),
+                        }),
+                    (error) => error === failure
+                );
+                assert.deepEqual(attempts, stages.slice(0, stages.indexOf(stage) + 1));
+            });
+        }
+    }
+});
+
+test('err-non-scriptable-tab-01 Challenge access errors retain original action execution facts', async () => {
+    for (const actionStatus of ['not_started', 'completed']) {
+        const failure = new CDPError('chrome.debugger.attach: Cannot access a chrome:// URL', {
+            nativeSource: 'chrome.debugger',
+            phase: 'attach',
+            actionExecuted: false,
+            actionStatus: 'not_started',
+        });
+        let sleeps = 0;
+        await assert.rejects(
+            () =>
+                waitForChallenge(
+                    {
+                        getMode: () => 'extension',
+                        getState: () => ({ title: 'Extensions', url: 'chrome://extensions/' }),
+                        getChallengeState: async () => null,
+                        inspectChallenge: async () => {
+                            throw failure;
+                        },
+                        evaluate: async () => assert.fail('A permanent denial must stop inspection channels'),
+                    },
+                    {
+                        action: actionStatus === 'completed' ? 'open' : 'evaluate',
+                        actionStatus,
+                        timeout: 1_000,
+                        now: () => sleeps * 500,
+                        sleep: async () => {
+                            ++sleeps;
+                        },
+                    }
+                ),
+            (error) => {
+                const body = JSON.parse(formatErrorResponse(error).content[0].text);
+                assert.equal(body.error.code, 'CDP_ERROR');
+                assert.equal(body.error.message, failure.message);
+                assert.equal(body.error.context.nativeSource, 'chrome.debugger');
+                assert.equal(body.error.context.phase, 'attach');
+                assert.equal(body.error.context.actionExecuted, actionStatus === 'completed');
+                assert.equal(body.error.context.actionStatus, actionStatus);
+                assert.equal(body.error.context.failureStage, 'challenge_inspection');
+                assert.equal(body.error.context.verificationStatus, 'unavailable');
+                assert.equal(body.error.context.verificationActionExecuted, false);
+                assert.equal(body.error.context.verificationActionStatus, 'not_started');
+                assert.equal(body.error.context.retryable, false);
+                assert.equal(error.cause, failure);
+                return true;
+            }
+        );
+        assert.equal(sleeps, 0);
+    }
+});
+
+test('err-non-scriptable-tab-01 Challenge click revalidation retains completed navigation facts', async () => {
+    const failure = new Error('Cannot access a chrome:// URL');
+    let inspections = 0;
+    let clicks = 0;
+    let clock = 0;
+    await assert.rejects(
+        () =>
+            waitForChallenge(
+                {
+                    getMode: () => 'extension',
+                    getState: () => ({ title: 'Ordinary', url: 'https://example.com/' }),
+                    getChallengeState: async () => null,
+                    inspectChallenge: async () => {
+                        if (++inspections === 3) {
+                            throw failure;
+                        }
+                        return { turnstilePresent: true, clickPoint: { x: 10, y: 10 }, clickTargetKind: 'widget' };
+                    },
+                    clickTurnstile: async (_snapshot, timeout, _signal, refresh) => {
+                        ++clicks;
+                        await refresh(timeout);
+                    },
+                    evaluate: async () => assert.fail('A permanent denial must stop click revalidation'),
+                },
+                {
+                    action: 'open',
+                    actionStatus: 'completed',
+                    timeout: 1_000,
+                    now: () => clock,
+                    sleep: async (ms) => {
+                        clock += ms;
+                    },
+                }
+            ),
+        (error) => {
+            assert.equal(error.message, failure.message);
+            assert.equal(error.context.actionExecuted, true);
+            assert.equal(error.context.actionStatus, 'completed');
+            assert.equal(error.context.failureStage, 'challenge_inspection');
+            assert.equal(error.context.retryable, false);
+            assert.equal(error.cause, failure);
+            return true;
+        }
+    );
+    assert.equal(inspections, 3);
+    assert.equal(clicks, 1);
+});
+
+test('err-non-scriptable-tab-01 registered evaluate reports restricted-page denial before user script', async () => {
+    const unified = getUnifiedSession();
+    let inspections = 0;
+    let userScripts = 0;
+    const overrides = {
+        getMode: () => 'extension',
+        getState: () => ({ title: 'Extensions', url: 'chrome://extensions/' }),
+        getLiveState: async () => ({ title: 'Extensions', url: 'chrome://extensions/' }),
+        getCurrentTargetId: () => '101',
+        getTargetRestoration: () => undefined,
+        getPageSnapshot: async (targetId) => ({ targetId, url: 'chrome://extensions/', revision: 'restricted-r1' }),
+        listTargets: async () => [{ targetId: '101' }],
+        listTopology: async () => ({ activeTargetId: '101' }),
+        withTabLock: async (action) => action(),
+        withUserAction: async (_kind, action) => action(),
+        withTabId: async (_id, action) => action(),
+        withPageCondition: async (_args, action) => action(),
+        withFrame: async (_frame, action) => action(),
+        getChallengeState: async () => null,
+        inspectChallenge: async () => {
+            ++inspections;
+            throw new Error('Cannot access a chrome:// URL');
+        },
+        evaluate: async (script) => {
+            if (script === '1+1') {
+                ++userScripts;
+            }
+            throw new Error('Cannot access a chrome:// URL');
+        },
+    };
+    const original = new Map(Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(unified, key)]));
+    Object.assign(unified, overrides);
+    try {
+        let handler;
+        registerEvaluateTool({
+            registerTool(_name, _options, callback) {
+                handler = callback;
+            },
+        });
+        const response = await handler({ script: '1+1', targetId: '101', timeout: 100 });
+        const body = JSON.parse(response.content[0].text);
+        assert.equal(response.isError, true);
+        assert.match(body.error.message, /Cannot access a chrome:\/\/ URL/);
+        assert.equal(body.error.code, 'UNKNOWN_ERROR');
+        assert.equal(body.actionExecuted, false);
+        assert.equal(body.actionStatus, 'not_started');
+        assert.equal(body.failureStage, 'challenge_inspection');
+        assert.equal(body.retryable, false);
+        assert.equal(inspections, 1);
+        assert.equal(userScripts, 0);
+    } finally {
+        for (const [key, descriptor] of original) {
+            if (descriptor) {
+                Object.defineProperty(unified, key, descriptor);
+            } else {
+                delete unified[key];
+            }
+        }
+    }
+});
+
+test('C31F9 Challenge preparation retains terminal errors and stops later reads', async (t) => {
+    const failures = [
+        setErrorSource(new TimeoutError('Owned preparation budget expired'), 'budget'),
+        setErrorSource(
+            new StructuredToolError('EXECUTION_RESULT_UNKNOWN', 'Owned RPC timeout', 'Read state', {
+                actionExecuted: 'unknown',
+                actionStatus: 'unknown',
+                retryable: false,
+            }),
+            'budget'
+        ),
+        setErrorSource(new Error('Owned request cancelled'), 'cancelled'),
+        new CDPError('Owned native result unknown', { actionExecuted: 'unknown', actionStatus: 'unknown' }),
+    ];
+    for (const backend of ['extension', 'cdp']) {
+        const stages =
+            backend === 'extension' ? ['title', 'isolated', 'stealth', 'precise'] : ['title', 'stealth', 'precise'];
+        for (const stage of stages) {
+            for (const failure of failures) {
+                await t.test(`${backend}/${stage}/${failure.message}`, async () => {
+                    const attempts = [];
+                    const source = getErrorSource(failure);
+                    const inspect = async (current) => {
+                        attempts.push(current);
+                        throw current === stage ? failure : new Error('Transient inspection context');
+                    };
+                    await assert.rejects(
+                        () =>
+                            waitForChallenge(
+                                {
+                                    getMode: () => backend,
+                                    getState: () => ({ title: 'Owned ordinary page', url: 'https://example.com/' }),
+                                    getLiveState: async () => {
+                                        if (stage === 'title') {
+                                            return inspect('title');
+                                        }
+                                        return { title: 'Owned ordinary page' };
+                                    },
+                                    getChallengeState: async () => null,
+                                    inspectChallenge: () => inspect('isolated'),
+                                    evaluate: (_code, mode) => inspect(mode),
+                                },
+                                {
+                                    action: 'evaluate',
+                                    actionStatus: 'not_started',
+                                    timeout: 1_000,
+                                    sleep: async () => assert.fail('A terminal preparation error must stop polling'),
+                                }
+                            ),
+                        (error) => error === failure
+                    );
+                    assert.deepEqual(
+                        attempts,
+                        stage === 'title' ? ['title'] : stages.slice(1, stages.indexOf(stage) + 1)
+                    );
+                    assert.equal(getErrorSource(failure), source);
+                });
+            }
+        }
+    }
+});
+
+test('C31F9 cached title recovery remains available for non-terminal reads', async () => {
+    let inspections = 0;
+    const result = await waitForChallenge(
+        {
+            getMode: () => 'extension',
+            getState: () => ({ title: 'Owned cached page', url: 'https://example.com/' }),
+            getLiveState: async () => {
+                throw new Error('Temporary title read failure');
+            },
+            getChallengeState: async () => null,
+            inspectChallenge: async () => {
+                ++inspections;
+                return { title: 'Owned ready page', inspected: true };
+            },
+            evaluate: async () => assert.fail('The isolated inspection succeeded'),
+        },
+        { action: 'evaluate', actionStatus: 'not_started', timeout: 1_000 }
+    );
+    assert.equal(result.resolved, true);
+    assert.equal(result.challengeKind, 'none');
+    assert.equal(inspections, 1);
+});
+
+test('CH-08 Challenge inspection retains transient-context and page-exception recovery', async () => {
+    for (const failure of [
+        new Error('Execution context was destroyed'),
+        null,
+        undefined,
+        setErrorSource(new Error('Cannot access a chrome:// URL'), 'page'),
+        new ReferenceError("Cannot access 'value' before initialization"),
+    ]) {
+        let clock = 0;
+        const attempts = [];
+        const inspect = async (mode) => {
+            attempts.push(mode);
+            if (clock === 0) {
+                throw failure;
+            }
+            return { title: 'Ready', inspected: true };
+        };
+        const result = await waitForChallenge(
+            {
+                getMode: () => 'extension',
+                getState: () => ({ title: 'Ordinary', url: 'https://example.com/' }),
+                getChallengeState: async () => null,
+                inspectChallenge: () => inspect('isolated'),
+                evaluate: (_code, mode) => inspect(mode),
+            },
+            {
+                action: 'open',
+                timeout: 1_000,
+                now: () => clock,
+                sleep: async (ms) => {
+                    clock += ms;
+                },
+            }
+        );
+        assert.equal(result.resolved, true);
+        assert.equal(result.waitedMs, 500);
+        assert.equal(result.challengeKind, 'none');
+        assert.deepEqual(attempts, ['isolated', 'stealth', 'precise', 'isolated']);
+    }
+});
+
+test('CH-08 Challenge native inspection timeout preserves its original budget error', async () => {
+    const failure = new TimeoutError('Native inspection timeout: Cannot access a chrome:// URL', {
+        actionExecuted: 'unknown',
+        actionStatus: 'unknown',
+    });
+    let clock = 0;
+    let inspections = 0;
+    await assert.rejects(
+        () =>
+            waitForChallenge(
+                {
+                    getMode: () => 'extension',
+                    getState: () => ({ title: 'Ordinary', url: 'https://example.com/' }),
+                    getChallengeState: async () => null,
+                    inspectChallenge: async (_options, timeout) => {
+                        ++inspections;
+                        assert.ok(timeout > 0 && timeout <= 500);
+                        throw failure;
+                    },
+                    evaluate: async () =>
+                        assert.fail('A native inspection timeout must retain the current poll budget'),
+                },
+                {
+                    action: 'open',
+                    actionStatus: 'completed',
+                    timeout: 500,
+                    now: () => clock,
+                    sleep: async (ms) => {
+                        clock += ms;
+                    },
+                }
+            ),
+        (error) => {
+            assert.equal(error, failure);
+            assert.equal(error.code, 'TIMEOUT');
+            assert.equal(getErrorSource(error), 'budget');
+            assert.deepEqual(error.context, { actionExecuted: 'unknown', actionStatus: 'unknown' });
+            return true;
+        }
+    );
+    assert.equal(clock, 0);
+    assert.equal(inspections, 1);
+});
+
 test('CH-08 Challenge timeout and access denied fail without exporting cookie values', async () => {
     // noinspection JSUnusedGlobalSymbols — structural test double
     const timeoutHost = {
@@ -2262,13 +3033,13 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
         actionsSource,
         pageScriptsSource,
     ] = await Promise.all([
-        readFile(new URL('../src/core/session.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/log-manager.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/log-event-handler.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/extension/bridge.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/content-handler.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/actions.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/page-scripts.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../src/core/session.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/log-manager.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/log-event-handler.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/extension/bridge.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/content-handler.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/actions.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/page-scripts.ts', import.meta.url), { encoding: 'utf8' }),
     ]);
     assert.match(sessionSource, /private challengeRequired = false/);
     assert.match(sessionSource, /this\.challengeRequired = challenge/);
@@ -2305,14 +3076,16 @@ test('CH-08 Challenge state survives network log clearing until a normal documen
         pageScriptsSource,
         /export \{ inspectChallengePage } from '\.\.\/\.\.\/\.\.\/src\/core\/challenge-page\.js'/
     );
-    const inspectorSource = await readFile(new URL('../src/core/challenge-page.ts', import.meta.url), 'utf8');
+    const inspectorSource = await readFile(new URL('../src/core/challenge-page.ts', import.meta.url), {
+        encoding: 'utf8',
+    });
     assert.match(inspectorSource, /export function inspectChallengePage/);
     const [unifiedSessionSource, browseSource, inputSource, evaluateSource, challengeToolSource] = await Promise.all([
-        readFile(new URL('../src/core/unified-session.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/tools/browse.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/tools/input.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/tools/evaluate.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/tools/challenge.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../src/core/unified-session.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/tools/browse.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/tools/input.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/tools/evaluate.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/tools/challenge.ts', import.meta.url), { encoding: 'utf8' }),
     ]);
     const challengeSource = challengeToolSource + '\n' + inspectorSource;
     assert.match(browseSource, /resolveChallenge/);
@@ -2696,6 +3469,88 @@ test('C32 OS mouse revalidation failure, cancellation and deadline exhaustion di
     }
 });
 
+test('C32 Linux native calibration separates pointer events and stops during the shared wait', async (t) => {
+    for (const outcome of ['normal', 'cancelled', 'timeout']) {
+        await t.test(outcome, async () => {
+            const originalNow = Date.now;
+            let now = 1000;
+            const deadline = 3000;
+            const abort = new AbortController();
+            const calls = [];
+            const samples = [];
+            let pendingMove;
+            let relativeMoves = 0;
+            let pointerX = 280;
+            const renderPointer = () => {
+                if (pendingMove) {
+                    samples.push(pendingMove);
+                    pendingMove = undefined;
+                }
+            };
+            Date.now = () => now;
+            try {
+                const operation = osLeftClick(280, 326, {
+                    platform: 'linux',
+                    deadline,
+                    signal: abort.signal,
+                    path: [{ x: 280, y: 326 }],
+                    sleep: async (ms) => {
+                        now += ms;
+                        renderPointer();
+                        if (relativeMoves === 1) {
+                            if (outcome === 'cancelled') {
+                                abort.abort(new Error('cancelled during native calibration wait'));
+                            } else if (outcome === 'timeout') {
+                                now = deadline + 1;
+                            }
+                        }
+                    },
+                    execFile: async (_file, args) => {
+                        calls.push([...args]);
+                        if (args[0] === 'mousemove_relative') {
+                            ++relativeMoves;
+                            pointerX += Number(args[2]);
+                            pendingMove = { at: now, x: pointerX, y: 326 };
+                        }
+                        return { stdout: `X=${pointerX}\nY=326\n`, stderr: '' };
+                    },
+                    refreshPoint: async (probe) => {
+                        const request = await probe();
+                        renderPointer();
+                        assert.equal(samples.length, 2, 'each relative move must reach a separate renderer turn');
+                        assert.deepEqual(
+                            samples.map(({ x }) => x),
+                            [279, 280]
+                        );
+                        assert.ok(samples[0].at >= request.since);
+                        assert.ok(samples[1].at - samples[0].at >= 40);
+                        assert.deepEqual(request.position, { x: 280, y: 326 });
+                        return request.position;
+                    },
+                });
+                if (outcome === 'normal') {
+                    await operation;
+                    assert.equal(relativeMoves, 2);
+                    assert.equal(calls.filter(([command]) => command === 'mousedown').length, 1);
+                    assert.equal(calls.filter(([command]) => command === 'mouseup').length, 1);
+                    assert.equal(pointerX, 280);
+                } else {
+                    await assert.rejects(operation, (error) =>
+                        outcome === 'timeout'
+                            ? error.code === 'TIMEOUT'
+                            : /cancelled during native calibration wait/.test(error.message)
+                    );
+                    assert.equal(relativeMoves, 1);
+                    assert.equal(calls.filter(([command]) => /^(?:mousedown|mouseup)$/.test(command)).length, 0);
+                    assert.equal(calls.at(-1)[0], 'mousemove_relative');
+                }
+            } finally {
+                Date.now = originalNow;
+            }
+        });
+    }
+});
+
 test('C32 macOS fallback refreshes coordinates before its single System Events click', async () => {
     const calls = [];
     let refreshes = 0;
@@ -2782,10 +3637,10 @@ test('C-P6 OS mouse stops before a later process or fallback after deadline exha
 
 test('CH-08 cookie clearing requires a URL or domain at every boundary', async () => {
     const [toolSource, sessionSource, cookieHandlerSource, schemaSource] = await Promise.all([
-        readFile(new URL('../src/tools/cookies.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../src/core/session.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/background/cookie-handler.ts', import.meta.url), 'utf8'),
-        readFile(new URL('../extension/src/types/schemas.ts', import.meta.url), 'utf8'),
+        readFile(new URL('../src/tools/cookies.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../src/core/session.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/background/cookie-handler.ts', import.meta.url), { encoding: 'utf8' }),
+        readFile(new URL('../extension/src/types/schemas.ts', import.meta.url), { encoding: 'utf8' }),
     ]);
     for (const source of [toolSource, sessionSource, cookieHandlerSource, schemaSource]) {
         assert.match(source, /url (?:或|or) domain/);

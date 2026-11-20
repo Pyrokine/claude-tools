@@ -32,7 +32,7 @@ function registered(register) {
             callback = handler;
         },
     });
-    return async (args, signal) => {
+    return async (args, signal = undefined) => {
         const response = await callback(schema.parse(args), { signal });
         return { response, body: JSON.parse(response.content[0].text) };
     };

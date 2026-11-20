@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { access, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { setImmediate as tick } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -92,6 +92,7 @@ async function fixture(run) {
     bridge.httpServer.clientSocket = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             const scope = unified.tabLockContext.getStore();
@@ -195,15 +196,32 @@ async function fixture(run) {
 
 for (const [args, action] of management) {
     test(
-        `C31F3-02 actual SDK queued ${args.action} cancellation dispatches no late mutation`,
+        args.action === 'updateGroup'
+            ? 'C31F3-02 SDK updateGroup is independent of page reads and pre-cancelled display sends nothing'
+            : `C31F3-02 actual SDK queued ${args.action} cancellation dispatches no late mutation`,
         { timeout: 10000 },
         async () => {
-            await fixture(async ({ state, start, release, responses }) => {
+            await fixture(async ({ state, start, release, responses, direct }) => {
                 state.hold = 'get_text';
                 const first = await start('extract', { type: 'text', timeout: 5000 });
                 await until(() => state.held);
                 const controller = new AbortController();
                 const second = await start('manage', args, controller.signal);
+                if (args.action === 'updateGroup') {
+                    assert.equal((await second.response).isError, undefined);
+                    const commands = state.wire.filter((entry) => entry.action === action);
+                    assert.equal(commands.length, 1);
+                    assert.equal(commands[0].signal, second.record.signal);
+                    assert.equal(state.held?.action, 'get_text');
+                    controller.abort('stop group display before another dispatch');
+                    assert.equal((await direct.get('manage')(args, controller.signal)).isError, true);
+                    assert.equal(state.wire.filter((entry) => entry.action === action).length, 1);
+                    release();
+                    await first.response;
+                    assert.equal(state.wire.filter((entry) => entry.action === action).length, 1);
+                    assert.equal(responses.filter((entry) => entry.id === second.record.id).length, 1);
+                    return;
+                }
                 const rejected = assert.rejects(second.response);
                 await tick();
                 assert.equal(state.wire.filter((entry) => entry.action === action).length, 0);
@@ -309,10 +327,13 @@ test('C31F3-03 normal SDK HTML and image-directory exports preserve actual outpu
     await fixture(async ({ start, output, directory }) => {
         const html = await start('extract', { type: 'html', output: output('normal.html') });
         assert.equal((await html.response).isError, undefined);
-        assert.equal(await readFile(join(directory, 'normal.html'), 'utf8'), '<main>synthetic html</main>');
+        assert.equal(
+            await readFile(join(directory, 'normal.html'), { encoding: 'utf8' }),
+            '<main>synthetic html</main>'
+        );
         const images = await start('extract', { type: 'html', images: 'data', output: output('images') });
         assert.equal((await images.response).isError, undefined);
-        const index = JSON.parse(await readFile(join(directory, 'images/index.json'), 'utf8'));
+        const index = JSON.parse(await readFile(join(directory, 'images/index.json'), { encoding: 'utf8' }));
         assert.equal(index.images.length, 3);
         assert.equal((await readdir(join(directory, 'images/images'))).length, 3);
     });
@@ -347,21 +368,27 @@ test(
 );
 
 for (const stopAt of [1, 2, 3, 4, 5]) {
-    test(`C31F3-03 private output guard ${stopAt} stops before final publication and cleans temporary files`, async () => {
-        const directory = await mkdtemp(join(process.cwd(), '.c31f3-file-'));
-        let checks = 0;
-        try {
-            await assert.rejects(
-                writePrivateFile(join(directory, 'output.html'), 'synthetic', 'utf8', () => {
-                    if (++checks === stopAt) {
-                        throw new Error('synthetic cancellation');
-                    }
-                }),
-                /synthetic cancellation/
-            );
-            assert.deepEqual(await readdir(directory), []);
-        } finally {
-            await rm(directory, { recursive: true, force: true });
+    test(
+        'C31F3-03 private output guard ' +
+            `${stopAt}` +
+            ' stops before final publication and cleans ' +
+            'temporary files',
+        async () => {
+            const directory = await mkdtemp(join(process.cwd(), '.c31f3-file-'));
+            let checks = 0;
+            try {
+                await assert.rejects(
+                    writePrivateFile(join(directory, 'output.html'), 'synthetic', 'utf8', () => {
+                        if (++checks === stopAt) {
+                            throw new Error('synthetic cancellation');
+                        }
+                    }),
+                    /synthetic cancellation/
+                );
+                assert.deepEqual(await readdir(directory), []);
+            } finally {
+                await rm(directory, { recursive: true, force: true });
+            }
         }
-    });
+    );
 }

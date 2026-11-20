@@ -1,5 +1,5 @@
-import { formatResponse, resolveScopedOutputPath, writePrivateFile } from '../core/index.js'
 import type { BytePayload } from '../core/browser-events.js'
+import { formatResponse, resolveScopedOutputPath, writePrivateFile } from '../core/index.js'
 
 export async function browserEventResponse(
     result: Record<string, unknown>,

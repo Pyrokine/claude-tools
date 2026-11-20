@@ -98,9 +98,13 @@ function isTransientContextError(error: unknown): boolean {
         return false
     }
     const message = error instanceof Error ? error.message : String(error)
-    return /FRAME_STALE_CONTEXT|execution context.*(?:destroyed|not found|invalid)|cannot find context|cannot find object|could not find object|object.*(?:not found|invalid)/i.test(
-        message
-    )
+    return new RegExp(
+        'FRAME_STALE_CONTEXT|execution ' +
+            'context.*(?:destroyed|not found|invalid)|cannot ' +
+            'find context|cannot find object|could not find ' +
+            'object|object.*(?:not found|invalid)',
+        'i'
+    ).test(message)
 }
 
 function isUnavailableError(error: unknown): boolean {
@@ -135,7 +139,10 @@ function isUnavailableError(error: unknown): boolean {
     return (
         isTransientContextError(error) ||
         new RegExp(
-            'FRAME_(?:STALE_CONTEXT|EVALUATION_FAILED|EVALUATION_TIMEOUT)|no frame with given id|execution context|cannot find context with specified id|debugger.*(?:detach|not attached)|' +
+            'FRAME_(?:STALE_CONTEXT|EVALUATION_FAILED|EVALUATIO' +
+                'N_TIMEOUT)|no frame with given id|execution ' +
+                'context|cannot find context with specified ' +
+                'id|debugger.*(?:detach|not attached)|' +
                 'extension.*(?:disconnect|未连接)|not connected|cannot resolve cdp|' +
                 'failed to attach|restricted|cannot access',
             'i'
@@ -164,7 +171,9 @@ async function checkPostCondition(
     }
     const read = async <T>(code: string, args?: unknown[]): Promise<T> => {
         try {
-            return await unifiedSession.evaluate<T>(code, mode, nextTimeout(), args, { staleContextRetry: 'readOnly' })
+            return await unifiedSession.evaluate<T>(code, mode, nextTimeout(), args, {
+                staleContextRetry: unifiedSession.getMode() === 'cdp' ? 'never' : 'readOnly',
+            })
         } catch (error) {
             if (isTransientContextError(error)) {
                 throw new PostConditionReadError(error instanceof Error ? error.message : String(error), {
@@ -177,36 +186,52 @@ async function checkPostCondition(
 
     if (condition.text !== undefined) {
         const result = await read<{ matched: boolean; actual: string }>(
-            `(expected, exact) => {
-                const body = document.body
-                if (!body) return { matched: false, actual: '' }
-                const visible = (element) => {
-                    if (typeof element.checkVisibility === 'function') {
-                        return element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
-                    }
-                    const style = getComputedStyle(element)
-                    return element.getClientRects().length > 0 && style.display !== 'none' &&
-                        style.visibility !== 'hidden' && style.visibility !== 'collapse' && style.opacity !== '0'
-                }
-                const values = Array.from(body.querySelectorAll('input, textarea, select'))
-                    .filter(visible)
-                    .map((element) =>
-                        element instanceof HTMLSelectElement
-                            ? Array.from(element.selectedOptions)
-                                .map((option) => option.value || option.textContent || '')
-                                .join(' ')
-                            : element instanceof HTMLInputElement && element.type === 'password'
-                              ? ''
-                              : element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
-                                ? element.value || ''
-                                : '')
-                const sources = [visible(body) ? body.innerText || '' : '', ...values]
-                const text = sources.join('\\n')
-                const matchedSource = exact ? sources.find((value) => value === expected) : undefined
-                const index = exact ? (matchedSource === undefined ? -1 : text.indexOf(matchedSource)) : text.indexOf(expected)
-                const start = Math.max(0, index - 120)
-                return { matched: index >= 0, actual: text.slice(start, start + 500) }
-            }`,
+            '(expected, exact) => {\n                const ' +
+                'body = document.body\n                if ' +
+                "(!body) return { matched: false, actual: '' }\n" +
+                '                const visible = (element) => ' +
+                '{\n                    if (typeof ' +
+                "element.checkVisibility === 'function') {\n    " +
+                '                    return ' +
+                'element.checkVisibility({ checkOpacity: true, ' +
+                'checkVisibilityCSS: true })\n                  ' +
+                '  }\n                    const style = ' +
+                'getComputedStyle(element)\n                    ' +
+                'return element.getClientRects().length > 0 && ' +
+                "style.display !== 'none' &&\n                  " +
+                "      style.visibility !== 'hidden' && " +
+                "style.visibility !== 'collapse' && " +
+                "style.opacity !== '0'\n                }\n      " +
+                '          const values = ' +
+                "Array.from(body.querySelectorAll('input, " +
+                "textarea, select'))\n                    " +
+                '.filter(visible)\n                    ' +
+                '.map((element) =>\n                        ' +
+                'element instanceof HTMLSelectElement\n         ' +
+                '                   ? Array.from(element.select' +
+                'edOptions)\n                                ' +
+                '.map((option) => option.value || ' +
+                "option.textContent || '')\n                    " +
+                "            .join(' ')\n                       " +
+                '     : element instanceof HTMLInputElement && ' +
+                "element.type === 'password'\n                  " +
+                "            ? ''\n                             " +
+                ' : element instanceof HTMLInputElement || ' +
+                'element instanceof HTMLTextAreaElement\n       ' +
+                '                         ? element.value || ' +
+                "''\n                                : '')\n     " +
+                '           const sources = [visible(body) ? ' +
+                "body.innerText || '' : '', ...values]\n        " +
+                "        const text = sources.join('\\n')\n      " +
+                '          const matchedSource = exact ? ' +
+                'sources.find((value) => value === expected) : ' +
+                'undefined\n                const index = exact ' +
+                '? (matchedSource === undefined ? -1 : ' +
+                'text.indexOf(matchedSource)) : ' +
+                'text.indexOf(expected)\n                const ' +
+                'start = Math.max(0, index - 120)\n             ' +
+                '   return { matched: index >= 0, actual: ' +
+                'text.slice(start, start + 500) }\n            }',
             [condition.text, condition.exact === true]
         )
         checks.push({ name: 'text', matched: result.matched, actual: result.actual })

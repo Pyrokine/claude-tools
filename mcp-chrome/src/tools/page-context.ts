@@ -1,8 +1,8 @@
+import type { UserActionKind } from '../core/browser-driver.js'
 import { formatErrorResponse, getErrorPageContext, getErrorSource, setErrorPageContext } from '../core/errors.js'
 import type { getUnifiedSession } from '../core/index.js'
-import type { UserActionKind } from '../core/browser-driver.js'
-import { sanitizeUrlRecord } from './network-sanitizer.js'
 import { isControlledTempOutput, remainingNavigationTimeout, TEMP_OUTPUT_RETENTION } from '../core/utils.js'
+import { sanitizeUrlRecord } from './network-sanitizer.js'
 
 type Session = ReturnType<typeof getUnifiedSession>
 type Snapshot = Awaited<ReturnType<Session['getPageSnapshot']>>
@@ -38,6 +38,7 @@ export async function withPageResponse<T extends ToolResponse>(
                     before = targetIdBefore ? await session.getPageSnapshot(targetIdBefore, remaining()) : null
                 } catch (error) {
                     beforeReadFailed = true
+                    // noinspection ExceptionCaughtLocallyJS -- 外层保留读取阶段，随后统一生成页面上下文
                     throw error
                 }
                 signal?.throwIfAborted()

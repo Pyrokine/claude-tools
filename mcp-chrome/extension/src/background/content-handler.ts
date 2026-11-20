@@ -34,10 +34,8 @@ import {
     isRestrictedUrl,
 } from './action-utils'
 import { DebuggerBlockedError, DebuggerManager } from './debugger-manager'
-import { assertScreenshotBase64Budget, assertScreenshotBudget } from './screenshot-budget'
-import { readGrantDocumentId } from './read-grants'
-import { getExistingTab } from './page-revision'
 import { remainingNavigationTimeout } from './navigation-handler'
+import { getExistingTab } from './page-revision'
 import {
     type ActionabilityResult,
     checkActionability,
@@ -52,14 +50,16 @@ import {
     generateAccessibilityTree,
     getComputedStyleFromElement,
     inspectChallengePage,
-    observeNativePointer,
     installActionabilityHelpers,
+    observeNativePointer,
     performActionableClick,
     performClick,
     performDragAndDrop,
     performScroll,
     performType,
 } from './page-scripts'
+import { readGrantDocumentId } from './read-grants'
+import { assertScreenshotBase64Budget, assertScreenshotBudget } from './screenshot-budget'
 
 // 注入函数类型：chrome.scripting 在运行时通过 JSON 序列化传参，类型层用 unknown 兜底
 type InjectableFunc<R> = (...args: never[]) => R | Promise<R>
@@ -128,6 +128,7 @@ export class ContentHandler {
             p.frameId
         )
         const result = await this.injectScript<ReadPageResult>(
+            context,
             tabId,
             p.frameId,
             generateAccessibilityTree,
@@ -246,7 +247,7 @@ export class ContentHandler {
         const p = ClickSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'click')
         assertActionActive(context)
-        return this.injectScript<{ success: boolean }>(tabId, p.frameId, performClick, [
+        return this.injectScript<{ success: boolean }>(context, tabId, p.frameId, performClick, [
             p.refId,
             {
                 altKey: Boolean((p.modifiers ?? 0) & 1),
@@ -274,9 +275,10 @@ export class ContentHandler {
             }
 
             assertActionActive(context)
-            await this.injectScript<void>(tabId, p.frameId, installActionabilityHelpers, [])
+            await this.injectScript<void>(context, tabId, p.frameId, installActionabilityHelpers, [])
             assertActionActive(context)
             lastResult = await this.injectScript<Partial<ActionabilityResult> & { success: boolean; error?: string }>(
+                context,
                 tabId,
                 p.frameId,
                 performActionableClick,
@@ -324,8 +326,8 @@ export class ContentHandler {
     async checkActionabilityAction(params: unknown, context: ActionContext): Promise<ActionabilityResult> {
         const p = CheckActionabilitySchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'check_actionability')
-        await this.injectScript<void>(tabId, p.frameId, installActionabilityHelpers, [])
-        return this.injectScript<ActionabilityResult>(tabId, p.frameId, checkActionability, [p.refId])
+        await this.injectScript<void>(context, tabId, p.frameId, installActionabilityHelpers, [])
+        return this.injectScript<ActionabilityResult>(context, tabId, p.frameId, checkActionability, [p.refId])
     }
 
     async dispatchInputAction(params: unknown, context: ActionContext): Promise<{ success: boolean; error?: string }> {
@@ -333,6 +335,7 @@ export class ContentHandler {
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'dispatch_input')
         assertActionActive(context)
         return this.injectScript<{ success: boolean; error?: string }>(
+            context,
             tabId,
             p.frameId,
             dispatchInputToElement,
@@ -350,6 +353,7 @@ export class ContentHandler {
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'drag_and_drop')
         assertActionActive(context)
         return this.injectScript<{ success: boolean; error?: string; code?: string }>(
+            context,
             tabId,
             p.frameId,
             performDragAndDrop,
@@ -366,6 +370,7 @@ export class ContentHandler {
             p.frameId
         )
         const value = await this.injectScript<string | null>(
+            context,
             tabId,
             p.frameId,
             getComputedStyleFromElement,
@@ -387,7 +392,7 @@ export class ContentHandler {
         const p = TypeSchema.parse(params)
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'type')
         assertActionActive(context)
-        return this.injectScript<{ success: boolean }>(tabId, p.frameId, performType, [
+        return this.injectScript<{ success: boolean }>(context, tabId, p.frameId, performType, [
             p.refId,
             p.text,
             p.clear ?? false,
@@ -402,6 +407,7 @@ export class ContentHandler {
         const tabId = await this.getManagedScriptableTabId(p.tabId, context, 'scroll')
         assertActionActive(context)
         return this.injectScript<{ success: boolean; scrollX: number; scrollY: number }>(
+            context,
             tabId,
             p.frameId,
             performScroll,
@@ -433,7 +439,7 @@ export class ContentHandler {
             errorSource?: 'page' | 'context' | 'output'
             errorCode?: 'CSP_BLOCKED' | 'NON_SERIALIZABLE_EVALUATE_RESULT'
             actionExecuted?: false
-        }>(tabId, p.frameId, executeCode, [
+        }>(context, tabId, p.frameId, executeCode, () => [
             p.code,
             ...(context.deadline !== undefined
                 ? [Math.max(0, context.deadline - Date.now())]
@@ -499,7 +505,7 @@ export class ContentHandler {
             if (!sample || !sampled.documentId) {
                 throw new Error('未收到本次原生移动的可信指针事件')
             }
-            if (sample.previousAt === undefined || sample.previousAt < probe.since! || !sample.sameTarget) {
+            if (sample.previousAt === undefined || sample.previousAt < probe.since!) {
                 throw new Error('原生指针校准未保持在同一控件内')
             }
             const offset =
@@ -513,6 +519,9 @@ export class ContentHandler {
                 throw new Error('原生指针事件的文档已变化')
             }
             assertActionActive(context)
+            if (!sample.sameTarget) {
+                return { documentId: root.documentId, stable: false }
+            }
             return {
                 documentId: root.documentId,
                 at: sample.at,
@@ -622,6 +631,7 @@ export class ContentHandler {
         }
 
         const data = await this.injectScript<ElementInfo[] | { error: string }>(
+            context,
             tabId,
             frameId,
             findElements,
@@ -639,8 +649,8 @@ export class ContentHandler {
         )
         let elements = data as ElementInfo[]
 
-        // iframe 坐标修正：将 iframe 内相对坐标转为页面绝对坐标
-        if (frameId !== 0 && elements.length > 0) {
+        // frame 查询保留文档内矩形；既有 viewport 查询才计算根视口偏移
+        if (frameId !== 0 && elements.length > 0 && p.coordinateSpace !== 'frame') {
             const offset = await getFrameOffset(tabId, frameId, context)
             if (offset) {
                 elements = elements.map((el) => ({
@@ -668,6 +678,7 @@ export class ContentHandler {
             p.frameId
         )
         const data = await this.injectScript<{ text: string }>(
+            context,
             tabId,
             p.frameId,
             extractText,
@@ -688,6 +699,7 @@ export class ContentHandler {
             p.frameId
         )
         const data = await this.injectScript<{ html: string }>(
+            context,
             tabId,
             p.frameId,
             extractHtml,
@@ -735,6 +747,7 @@ export class ContentHandler {
                 naturalHeight: number
             }>
         }>(
+            context,
             tabId,
             p.frameId,
             extractHtmlWithImages,
@@ -762,6 +775,7 @@ export class ContentHandler {
             p.frameId
         )
         const data = await this.injectScript<{ value: string | null }>(
+            context,
             tabId,
             p.frameId,
             extractAttribute,
@@ -782,6 +796,7 @@ export class ContentHandler {
             p.frameId
         )
         const data = await this.injectScript<Record<string, unknown>>(
+            context,
             tabId,
             p.frameId,
             extractMetadata,
@@ -868,10 +883,11 @@ export class ContentHandler {
      * 处理 injection 层错误（如 selector 非法、frame 不可注入）
      */
     private async injectScript<R>(
+        actionContext: ActionContext,
         tabId: number,
         frameId: number | undefined,
         func: InjectableFunc<R>,
-        args: unknown[],
+        args: unknown[] | (() => unknown[]),
         documentId?: string,
         requireResult: boolean | 'action' = false
     ): Promise<R> {
@@ -887,11 +903,12 @@ export class ContentHandler {
         if (!setup[0] || setupError) {
             throw wrapInjectionError(setupError?.message ?? 'DOM helper installation returned no result', context)
         }
+        assertActionActive(actionContext)
         const results = await chrome.scripting
             .executeScript({
                 target,
                 func: func as (...a: unknown[]) => R,
-                args: args as never[],
+                args: (typeof args === 'function' ? args() : args) as never[],
                 world: documentId ? 'ISOLATED' : 'MAIN',
             })
             .catch((error: unknown) => {

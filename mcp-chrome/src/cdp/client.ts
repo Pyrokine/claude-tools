@@ -5,12 +5,12 @@
  * 参考 Puppeteer 的实现原理，但更轻量
  */
 
-import { EventEmitter } from 'events'
 import { AsyncLocalStorage } from 'async_hooks'
+import { EventEmitter } from 'events'
 import WebSocket from 'ws'
+import type { BrowserRequestContext, UserActionKind } from '../core/browser-driver.js'
 import { CDPError, ConnectionRefusedError, getErrorSource, TimeoutError } from '../core/errors.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
-import type { BrowserRequestContext, UserActionKind } from '../core/browser-driver.js'
 import { remainingNavigationTimeout, withNavigationBudget } from '../core/utils.js'
 
 /**
@@ -59,6 +59,10 @@ export class CDPClient extends EventEmitter {
 
     get isConnected(): boolean {
         return this.ws !== null && this.ws.readyState === WebSocket.OPEN
+    }
+
+    get endpoint(): string | null {
+        return this.ws?.url ?? null
     }
 
     /**
@@ -170,7 +174,11 @@ export class CDPClient extends EventEmitter {
             (method === 'Input.dispatchTouchEvent' && (type === 'touchEnd' || type === 'touchCancel')) ||
             (method === 'Emulation.setTouchEmulationEnabled' && (params as { enabled?: boolean })?.enabled === false)
         const requestScope = this.nativeEventContext.getStore() ? undefined : this.requestContext?.()
-        const userAction = requestScope?.userAction
+        const userAction = cleanup ? undefined : requestScope?.userAction
+        const inputAction =
+            userAction?.kind === 'input' && (method.startsWith('Input.dispatch') || method === 'Input.insertText')
+                ? userAction
+                : undefined
         const scope = resourceCleanup ? undefined : requestScope
         if (scope?.signal?.aborted) {
             throw new CDPError(`CDP request cancelled before dispatch: ${method}`, {
@@ -280,6 +288,9 @@ export class CDPClient extends EventEmitter {
                             )
                     } else {
                         this.callbacks.delete(id)
+                        if (inputAction) {
+                            inputAction.acknowledged = true
+                        }
                         resolve(result as T)
                     }
                 },
@@ -296,12 +307,7 @@ export class CDPClient extends EventEmitter {
 
             try {
                 this.ws!.send(JSON.stringify(message))
-                if (
-                    userAction &&
-                    (userAction.kind === dispatchedAction ||
-                        (userAction.kind === 'input' &&
-                            (method.startsWith('Input.dispatch') || method === 'Input.insertText')))
-                ) {
+                if (userAction && (userAction.kind === dispatchedAction || inputAction)) {
                     userAction.dispatched = true
                 }
                 scope?.signal?.addEventListener('abort', onAbort, { once: true })
@@ -441,9 +447,11 @@ export class CDPClient extends EventEmitter {
                 }
                 if (message.error) {
                     const contextLost =
-                        message.error.code === -32000 &&
+                        (message.error.code === -32000 || message.error.code === -32001) &&
                         new RegExp(
-                            '^(?:Cannot find (?:context with specified id|default execution context|object with given id)|' +
+                            '^(?:Cannot find (?:context with specified ' +
+                                'id|default execution context|object with given ' +
+                                'id)|' +
                                 'Could not find object with given id|Execution context was destroyed|' +
                                 'No frame with given id found|Inspected target navigated or closed|' +
                                 String.raw`Session with given id not found)\.?$`

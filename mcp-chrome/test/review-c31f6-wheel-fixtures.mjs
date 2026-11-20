@@ -1,5 +1,309 @@
 /* global document, window, getComputedStyle, scrollX, scrollY, performance */
-export function cases({ boundaryObservations = false } = {}) {
+import { wheelCases } from './review-c31f2-wheel-fixtures.mjs'
+
+export function cases({ boundaryObservations = false, remaining = false } = {}) {
+    if (remaining) {
+        const layouts = wheelCases().filter((options) =>
+            ['viewport', 'hidden', 'containment', 'box', 'positioning', 'display', 'containing-block'].includes(
+                options.group
+            )
+        )
+        for (const axis of ['x', 'y']) {
+            for (const delta of [-200, 200]) {
+                for (const overflow of ['auto', 'scroll']) {
+                    for (const policy of ['auto', 'contain', 'none']) {
+                        layouts.push({
+                            group: 'hidden',
+                            layout: 'normal',
+                            axis,
+                            position: 'middle',
+                            delta,
+                            overflow,
+                            policyX: policy,
+                            policyY: policy,
+                        })
+                    }
+                }
+                for (const display of ['inline', 'contents', 'block']) {
+                    for (const overflow of ['auto', 'hidden']) {
+                        for (const policy of ['auto', 'contain', 'none']) {
+                            for (const position of ['origin', 'far']) {
+                                layouts.push({
+                                    group: 'box',
+                                    layout: 'normal',
+                                    axis,
+                                    position,
+                                    delta,
+                                    display,
+                                    overflow,
+                                    policy,
+                                })
+                            }
+                        }
+                    }
+                }
+                for (const display of [
+                    'flow-root list-item',
+                    'inline flow-root list-item',
+                    '-webkit-box',
+                    '-webkit-inline-box',
+                    'flow-root',
+                    'inline',
+                    'block',
+                ]) {
+                    for (const policy of ['auto', 'contain', 'none']) {
+                        layouts.push({
+                            group: 'display',
+                            review: 'C31F5-01',
+                            layout: 'normal',
+                            axis,
+                            position: 'origin',
+                            delta,
+                            display,
+                            overflow: policy === 'auto' ? 'auto' : 'hidden',
+                            policy,
+                            empty: true,
+                        })
+                    }
+                }
+            }
+        }
+        for (const overflow of ['hidden', 'clip', 'visible', 'auto', 'scroll']) {
+            for (const delta of [-200, 200]) {
+                for (const blockedAxis of ['x', 'y']) {
+                    for (const policy of ['contain', 'none']) {
+                        layouts.push({
+                            group: 'mixed-hidden',
+                            layout: 'normal',
+                            axis: 'both',
+                            position: delta > 0 ? 'far' : 'origin',
+                            delta,
+                            overflow,
+                            policyX: blockedAxis === 'x' ? policy : 'auto',
+                            policyY: blockedAxis === 'y' ? policy : 'auto',
+                        })
+                    }
+                }
+                layouts.push({
+                    group: 'mixed-hidden',
+                    layout: 'normal',
+                    axis: 'both',
+                    position: 'middle',
+                    delta,
+                    overflow,
+                })
+            }
+        }
+        const layoutCount = layouts.length
+        layouts.push(...wheelCases().filter((options) => ['range', 'css-control'].includes(options.group)))
+        for (const delta of [-200, 200]) {
+            layouts.push({
+                group: 'css-control',
+                layout: 'normal',
+                axis: 'x',
+                position: 'middle',
+                delta,
+                target: 'css',
+            })
+        }
+        for (const shadow of [false, true]) {
+            for (const cancelAt of ['none', 'target', 'ancestor', 'document']) {
+                layouts.push({
+                    group: 'propagation',
+                    layout: 'normal',
+                    axis: 'y',
+                    position: 'middle',
+                    delta: 120,
+                    shadow,
+                    cancelAt,
+                })
+            }
+        }
+        layouts.push(
+            ...wheelCases().filter(
+                (options) =>
+                    options.group === 'overscroll' &&
+                    options.position !== 'middle' &&
+                    ['contain', 'none'].includes(options[options.axis === 'x' ? 'policyX' : 'policyY'])
+            )
+        )
+        const matrix = layouts.flatMap((options, index) =>
+            ['precise', 'stealth'].flatMap((mode) =>
+                [false, true].map((frame) => ({
+                    ...options,
+                    id: `remaining-${options.review ?? options.group}-${index}-${mode}-${frame ? 'frame' : 'main'}`,
+                    layoutMatrix: true,
+                    mode,
+                    frame,
+                }))
+            )
+        )
+        const basicMatrix = matrix.splice(layoutCount * 4)
+        const controls = cases().filter(
+            (options) =>
+                options.kind === 'slot' ||
+                options.kind === 'body' ||
+                options.kind === 'svg' ||
+                options.kind === 'foreignObject-child' ||
+                options.id.startsWith('c31f7-foreign-self-') ||
+                options.id.startsWith('property-') ||
+                options.id.startsWith('preserve-used-flat-') ||
+                [
+                    'hint-offset-path',
+                    'hint-offset-position',
+                    'fraction-quarter',
+                    'fraction-negative',
+                    'fraction-half',
+                    'integer',
+                    'fraction-reverse',
+                ].includes(options.id) ||
+                options.id.startsWith('fraction-reset-')
+        )
+        for (const positioning of ['fixed', 'absolute']) {
+            for (const property of [null, 'transform', 'contain']) {
+                for (const axis of ['x', 'y']) {
+                    for (const delta of [-120, 120]) {
+                        controls.push({
+                            id: `foreign-cb-${positioning}-${property ?? 'default'}-${axis}-${delta}`,
+                            kind: 'foreignObject-cb',
+                            positioning,
+                            property,
+                            value: property === 'transform' ? 'translate(0px)' : 'layout',
+                            axis,
+                            delta,
+                        })
+                    }
+                }
+            }
+        }
+        for (const value of ['hidden', 'visible']) {
+            controls.push({
+                id: `backface-three-dimensional-${value}`,
+                kind: 'cb',
+                property: 'backface-visibility',
+                value,
+                extra: 'transform:rotateY(0deg)',
+            })
+        }
+        for (const reset of ['container', 'document']) {
+            controls.push({
+                id: `fraction-reset-${reset}`,
+                reset,
+                deltas: Array(8).fill(0.25),
+                interval: 50,
+                waitMs: 50,
+            })
+        }
+        for (const listenerMode of ['passive', 'stopPropagation']) {
+            controls.push({
+                id: `listener-${listenerMode}`,
+                listenerMode,
+                state: listenerMode === 'passive' ? 'prevent' : undefined,
+            })
+        }
+        for (const policy of ['auto', 'contain', 'none']) {
+            controls.push({ id: `zero-range-${policy}`, zeroRange: true, policy, boundaryProbe: true })
+        }
+        for (const quirks of [false, true]) {
+            for (const body of ['block', 'contents']) {
+                for (const rootContain of ['layout', 'paint', 'strict']) {
+                    controls.push({
+                        id: `body-root-containment-${quirks}-${body}-${rootContain}`,
+                        kind: 'body',
+                        quirks,
+                        body,
+                        overflow: 'auto',
+                        rootOverflow: 'auto',
+                        rootContain,
+                    })
+                }
+            }
+        }
+        for (const axis of ['x', 'y']) {
+            for (const delta of [-120, 120]) {
+                controls.push({
+                    id: `viewport-zoom-${axis}-${delta}`,
+                    kind: 'body',
+                    body: 'block',
+                    overflow: 'auto',
+                    bodyZoom: '2',
+                    axis,
+                    delta,
+                })
+            }
+        }
+        for (const options of cases().filter((item) => item.kind === 'slot' && !item.frame)) {
+            controls.push({ ...options, id: `${options.id}-x`, axis: 'x', delta: -120 })
+        }
+        for (const reset of ['container', 'document']) {
+            controls.push({
+                id: `fraction-continuity-reset-${reset}`,
+                reset,
+                replaceChild: true,
+                selfScroll: 50,
+                deltas: Array(8).fill(0.25),
+                waitMs: 50,
+                interval: 50,
+            })
+        }
+        for (const snap of ['mandatory', 'proximity']) {
+            controls.push({
+                id: `fraction-tail-snap-${snap}`,
+                snap,
+                acceptedSnap: true,
+                stableSnap: true,
+                deltas: [40, ...Array(8).fill(0.25)],
+            })
+        }
+        for (const policy of ['auto', 'contain', 'none']) {
+            controls.push({
+                id: `fraction-tail-clamp-${policy}`,
+                policy,
+                start: 'end',
+                deltas: [40, ...Array(8).fill(0.25)],
+            })
+        }
+        for (const [unit, properties] of [
+            ['zoom', { zoom: '2' }],
+            ['scale', { scale: true }],
+            ['nested-zoom', { zoom: '2', parentZoom: '2' }],
+            ['frame-zoom', { frame: true, frameZoom: 2 }],
+        ]) {
+            for (const axis of ['x', 'y']) {
+                for (const delta of [-120, 120]) {
+                    for (const policy of ['auto', 'contain', 'none']) {
+                        controls.push({
+                            id: `units-${unit}-${axis}-${delta}-${policy}-boundary`,
+                            ...properties,
+                            axis,
+                            delta,
+                            policy,
+                            start: delta > 0 ? 'end' : 'origin',
+                        })
+                    }
+                    if (unit !== 'zoom' && !(axis === 'y' && delta === 120)) {
+                        controls.push({ id: `units-${unit}-${axis}-${delta}-inside`, ...properties, axis, delta })
+                    }
+                }
+            }
+        }
+        for (const options of controls) {
+            for (const mode of options.kind === 'slot' || options.kind?.startsWith('foreignObject')
+                ? ['precise', 'stealth']
+                : ['precise']) {
+                matrix.push({
+                    ...options,
+                    id: `remaining-wheel-${options.id}-${mode}-${options.frame || options.quirks ? 'frame' : 'main'}`,
+                    remainingWheel: true,
+                    observeCSS: true,
+                    mode,
+                    ...(options.deltas ? { waitMs: 50, interval: 50 } : {}),
+                })
+            }
+        }
+        matrix.push(...basicMatrix)
+        return matrix
+    }
     const result = [
         { id: 'math-block', kind: 'math', display: 'block math' },
         { id: 'math-inline', kind: 'math', display: 'inline math', axis: 'x', delta: -120 },
@@ -474,7 +778,13 @@ export async function configure(options) {
         const ns = math ? 'http://www.w3.org/1998/Math/MathML' : 'http://www.w3.org/2000/svg'
         container = make(
             math ? 'math' : 'svg',
-            `display:${options.display ?? 'block'};width:1800px;height:1800px;overflow:${options.overflow ?? 'auto'};overscroll-behavior:${options.policy ?? 'auto'}`,
+            'display:' +
+                `${options.display ?? 'block'}` +
+                ';width:1800px;height:1800px;overflow:' +
+                `${options.overflow ?? 'auto'}` +
+                ';overscroll-behavior:' +
+                `${options.policy ?? 'auto'}` +
+                '',
             outer,
             ns
         )
@@ -494,6 +804,9 @@ export async function configure(options) {
         const foreign = make('foreignObject', '', svg, 'http://www.w3.org/2000/svg')
         foreign.setAttribute('width', '1800')
         foreign.setAttribute('height', '1800')
+        if (options.property) {
+            foreign.style.setProperty(options.property, options.value)
+        }
         if (options.kind === 'foreignObject-child') {
             container = make(
                 'div',
@@ -508,7 +821,7 @@ export async function configure(options) {
             inner = make(
                 'span',
                 options.kind === 'foreignObject-cb'
-                    ? 'position:fixed;left:480px;top:480px;width:60px;height:70px'
+                    ? `position:${options.positioning ?? 'fixed'};left:480px;top:480px;width:60px;height:70px`
                     : 'display:inline-block;width:2200px;height:2200px',
                 foreign
             )
@@ -556,7 +869,12 @@ export async function configure(options) {
     } else if (options.kind === 'cb') {
         spacer.remove()
         outer.style.position = 'static'
-        container.style.cssText = `display:${options.display ?? 'block'};width:1800px;height:1800px;overflow:visible;${options.extra ?? ''}`
+        container.style.cssText =
+            'display:' +
+            `${options.display ?? 'block'}` +
+            ';width:1800px;height:1800px;overflow:visible;' +
+            `${options.extra ?? ''}` +
+            ''
         container.style.setProperty(options.property, options.value)
         make('span', 'display:inline-block;width:1800px;height:1800px;pointer-events:none', container)
         inner.style.cssText = 'position:fixed;left:480px;top:480px;width:60px;height:70px'
@@ -589,7 +907,19 @@ export async function configure(options) {
         document.body.style.display = options.body
         document.body.style.overflow = options.overflow
         document.documentElement.style.overflow = options.rootOverflow ?? ''
-        window.scrollTo({ left: 400, top: 400, behavior: 'instant' })
+        document.documentElement.style.contain = options.rootContain ?? ''
+        if (options.rootContain) {
+            document.documentElement.style.width = '100vw'
+            document.documentElement.style.height = '100vh'
+        }
+        document.body.style.zoom = options.bodyZoom ?? ''
+        if (options.rootContain && options.quirks) {
+            container.style.left = '60px'
+            container.style.top = '60px'
+            window.scrollTo({ left: 0, top: 0, behavior: 'instant' })
+        } else {
+            window.scrollTo({ left: 400, top: 400, behavior: 'instant' })
+        }
     } else {
         container.style.overscrollBehavior = options.policy ?? 'auto'
         if (options.height !== undefined) {
@@ -628,11 +958,18 @@ export async function configure(options) {
                 make('span', 'display:block;height:100px;scroll-snap-align:start;pointer-events:none', inner)
             }
         }
+        if (options.zeroRange) {
+            inner.style.width = `${container.clientWidth}px`
+            inner.style.height = `${container.clientHeight}px`
+        }
         container.scrollTo({
             left: options.rtl || options.reverse === 'row-reverse' ? -400 : 400,
             top: options.reverse === 'column-reverse' ? -400 : 400,
             behavior: 'instant',
         })
+        if (options.start === 'origin') {
+            container.scrollTo({ left: 0, top: 0, behavior: 'instant' })
+        }
         if (options.start === 'end') {
             container.scrollTo({
                 left: options.axis === 'x' ? (options.rtl || options.reverse === 'row-reverse' ? -1e7 : 1e7) : 0,
@@ -665,6 +1002,7 @@ export async function configure(options) {
     const measure = () => {
         const Timeline = window.ScrollTimeline
         const timeline = Timeline ? new Timeline({ source: container, axis: options.axis === 'x' ? 'x' : 'y' }) : null
+        // noinspection JSUnresolvedReference -- ScrollTimeline 的有效时间是百分比 CSSUnitValue
         const time = () => timeline?.currentTime?.value ?? null
         const immediate = time()
         const rect = container.getBoundingClientRect()
@@ -684,6 +1022,13 @@ export async function configure(options) {
     document.addEventListener(
         'wheel',
         (event) => {
+            if (options.reset === 'container' && window.__c31f6.container !== container) {
+                container = window.__c31f6.container
+                inner = window.__c31f6.inner
+            }
+            if (options.listenerMode === 'stopPropagation') {
+                event.stopPropagation()
+            }
             if (options.boundaryProbe) {
                 probes.push({ phase: 'wheel', ...measure() })
                 window.queueMicrotask(() => probes.push({ phase: 'microtask', ...measure() }))
@@ -737,7 +1082,7 @@ export async function configure(options) {
                 event.preventDefault()
             }
         },
-        { passive: false, signal: controller.signal }
+        { passive: options.listenerMode === 'passive', signal: controller.signal }
     )
     for (const type of ['input', 'change']) {
         document.addEventListener(
@@ -787,6 +1132,62 @@ export async function configure(options) {
         selection: [container.selectionStart, container.selectionEnd],
         bodyRects: document.body.getClientRects().length,
         bodyClient: [document.body.clientWidth, document.body.clientHeight],
+        ...(options.observeCSS
+            ? {
+                  dimensions: Object.fromEntries(
+                      [
+                          ['container', container],
+                          ['outer', outer],
+                          ['root', document.documentElement],
+                          ['body', document.body],
+                      ].map(([name, node]) => [
+                          name,
+                          {
+                              client: [node.clientWidth, node.clientHeight],
+                              scroll: [node.scrollWidth, node.scrollHeight],
+                              position: [node.scrollLeft, node.scrollTop],
+                              rects: node.getClientRects().length,
+                          },
+                      ])
+                  ),
+                  computedStyles: Object.fromEntries(
+                      [
+                          ['container', container],
+                          ['inner', inner],
+                          ['outer', outer],
+                          ['root', document.documentElement],
+                          ['body', document.body],
+                      ].map(([name, node]) => {
+                          const style = getComputedStyle(node)
+                          return [
+                              name,
+                              Object.fromEntries(
+                                  [
+                                      'display',
+                                      'position',
+                                      'contain',
+                                      'contentVisibility',
+                                      'containerType',
+                                      'transform',
+                                      'translate',
+                                      'rotate',
+                                      'scale',
+                                      'perspective',
+                                      'willChange',
+                                      'transformStyle',
+                                      'opacity',
+                                      'overflowX',
+                                      'overflowY',
+                                      'offsetPath',
+                                      'offsetPosition',
+                                      'backfaceVisibility',
+                                  ].map((property) => [property, style[property]])
+                              ),
+                          ]
+                      })
+                  ),
+              }
+            : {}),
     }
 }
 

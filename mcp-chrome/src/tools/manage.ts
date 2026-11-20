@@ -16,8 +16,16 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import {
-    devices,
+    authCommandSchema,
+    captureCommandSchema,
+    dialogCommandSchema,
+    downloadCommandSchema,
+    routeCommandSchema,
+} from '../core/browser-event-schema.js'
+import type { BrowserEventAction, EventCommand } from '../core/browser-events.js'
+import {
     DEFAULT_TIMEOUT,
+    devices,
     formatErrorResponse,
     formatResponse,
     getSession,
@@ -25,18 +33,10 @@ import {
     isNativeExecutionResultUnknown,
 } from '../core/index.js'
 import type { CacheType } from '../core/types.js'
+import { browserEventResponse } from './browser-event-output.js'
 import { sanitizePageUrls } from './network-sanitizer.js'
 import { withPageResponse } from './page-context.js'
 import { pageConditionSchema } from './schema.js'
-import {
-    dialogCommandSchema,
-    captureCommandSchema,
-    routeCommandSchema,
-    authCommandSchema,
-    downloadCommandSchema,
-} from '../core/browser-event-schema.js'
-import { browserEventResponse } from './browser-event-output.js'
-import type { BrowserEventAction, EventCommand } from '../core/browser-events.js'
 
 function invalidArgument(
     message: string,
@@ -203,15 +203,22 @@ const manageSchema = z
             ),
         width: z.number().optional().describe('视口宽度（viewport）'),
         height: z.number().optional().describe('视口高度（viewport）'),
-        userAgent: z.string().optional().describe('User-Agent 字符串（userAgent）'),
+        userAgent: z.string().optional().describe('User-Agent 字符串（userAgent），空字符串清除页面覆盖'),
         device: z.string().optional().describe('设备名称（emulate），如 iPhone 13, iPad Pro'),
-        taskHint: z.string().max(120).nullable().optional().describe('newPage/pageMetadata：任务名称，null 清除'),
+        taskHint: z
+            .string()
+            .max(120)
+            .nullable()
+            .optional()
+            .describe(
+                'newPage/pageMetadata：页面的任务名称，写具体对象＋动作/目的，如“车道查询修复”；保留完整含义，用于检索与复用页面，与原生组名独立，null 清除'
+            ),
         note: z
             .string()
             .max(1000)
             .nullable()
             .optional()
-            .describe('newPage/pageMetadata：页面用途与保留要求，null 清除'),
+            .describe('newPage/pageMetadata：页面具体用途、保留要求及 HIL/仿真、任务号、版本、进度等细节，null 清除'),
     })
     .strict()
     .superRefine((args, context) => {
@@ -462,6 +469,9 @@ async function handleManage(args: ManageArgs, signal?: AbortSignal): Promise<Man
                     ? unifiedSession.withTabId(args.targetId, () => unifiedSession.withPageCondition(args, handler))
                     : unifiedSession.withPageCondition(args, handler)
                 : handler()
+        if (args.action === 'updateGroup') {
+            return await unifiedSession.withMetadataContext(run, deadline, signal)
+        }
         if (
             pageActions.includes(args.action) ||
             ['newPage', 'newWindow', 'pageMetadata', 'clearCache'].includes(args.action)
@@ -813,7 +823,7 @@ async function handleViewport({ unifiedSession, mode }: ManageContext, args: Man
 
 async function handleUserAgent({ unifiedSession, mode }: ManageContext, args: ManageArgs): Promise<ManageResponse> {
     return unifiedSession.withTabId(args.targetId, async () => {
-        if (!args.userAgent) {
+        if (args.userAgent === undefined) {
             return invalidArgument('设置 User-Agent 需要 userAgent 参数')
         }
         if (mode === 'extension') {
@@ -948,7 +958,9 @@ export function registerManageTool(server: McpServer): void {
         {
             description: [
                 '页面、窗口与原生分组管理。先 browse list，再后台 attach 复用；确无合适页才 newPage，',
-                '设置 taskHint/note 说明任务和临时、产物或可复用用途。newPage 始终新建，默认复用现有普通窗口。',
+                '设置 taskHint/note 说明任务和临时、产物或可复用用途。同一任务跨页面、站点和阶段沿用同名，不同任务按目的区分。',
+                'newPage 始终新建，默认复用现有普通窗口；同一连接跨步骤复用可信工作组，其他活动连接独立，重启后通过原工作页恢复。',
+                '为工作组自主拟定简短用途名，如 MCP·发版，用已有 updateGroup 设置；内部子任务沿用原组，新组初始展开；执行冻结工具组中的工作时自动展开，不激活标签，空闲时可折叠自有组；taskHint/note 只更新页面记录，用户标题、颜色、新建时的折叠设置和混合用户组保持。',
                 '任务完成通过已有 closePage/releasePage 处理明确页面集合；默认只关闭本任务 created 临时页，',
                 '保留 adopted/unknown、产物、可复用页及混合用户组。原生分组仅 Extension；显式授权关闭保持原合同。',
                 '支持缓存、视口、UA、设备模拟；dialog、networkCapture、route、httpAuth、download 准备浏览器事件观察，',

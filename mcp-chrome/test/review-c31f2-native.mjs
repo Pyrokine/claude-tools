@@ -47,15 +47,23 @@ await build({
         },
     },
 })
-const http = createServer((request, response) => {
-    response.setHeader('Content-Type', 'text/html')
-    response.end(
-        request.url === '/child'
-            ? '<!doctype html><title>Wheel child</title><body></body>'
-            : '<!doctype html><title>Isolated wheel check</title><iframe id="owned" src="/child" style="position:absolute;top:350px;left:0;width:440px;height:230px"></iframe>'
-    )
-})
-await new Promise((resolve) => http.listen(0, '127.0.0.1', resolve))
+const http = createServer(
+    (
+        /** @type {import('node:http').IncomingMessage} */ request,
+        /** @type {import('node:http').ServerResponse} */ response
+    ) => {
+        response.setHeader('Content-Type', 'text/html')
+        response.end(
+            request.url === '/child'
+                ? '<!doctype html><title>Wheel child</title><body></body>'
+                : '<!doctype html><title>Isolated wheel check</title>' +
+                      '<iframe id="owned" src="/child" ' +
+                      'style="position:absolute;top:350px;left:0;' +
+                      'width:440px;height:230px"></iframe>'
+        )
+    }
+)
+await new Promise((resolve) => http.listen(0, '127.0.0.1', () => resolve(undefined)))
 const base = `http://127.0.0.1:${http.address().port}`
 const chrome = spawn(
     chromePath,
@@ -133,7 +141,12 @@ const result = {
     nativeReferences: 0,
     work,
     boundary:
-        'registered public input/UnifiedSession/ExtensionBridge, production Extension handlers and real installed isolated Extension/Chrome APIs; command transport forwarded through pipe evaluator; native wheel dispatched to the same real browser on a rebuilt fixture',
+        'registered public input/UnifiedSession/ExtensionBr' +
+        'idge, production Extension handlers and real ' +
+        'installed isolated Extension/Chrome APIs; command ' +
+        'transport forwarded through pipe evaluator; ' +
+        'native wheel dispatched to the same real browser ' +
+        'on a rebuilt fixture',
 }
 try {
     result.browser = await send('Browser.getVersion')
@@ -181,7 +194,12 @@ try {
             return evaluate('c31f2.tabs()')
         }
         const value = await evaluate(
-            `c31f2.command(${JSON.stringify(action)},${JSON.stringify(params)}).then(result=>({result}),error=>({error:error.message}))`
+            'c31f2.command(' +
+                `${JSON.stringify(action)}` +
+                ',' +
+                `${JSON.stringify(params)}` +
+                ').then(result=>({result}),error=>' +
+                '({error:error.message}))'
         )
         if (value.error) {
             throw new Error(value.error)
@@ -196,6 +214,7 @@ try {
     bridge.httpServer.clientSocket = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text)
             if (message.type === 'cancel') {
@@ -297,7 +316,8 @@ try {
                         'Runtime.evaluate',
                         {
                             expression:
-                                "document.documentElement.style.overflow='hidden'; window.scrollTo({left:0,top:0,behavior:'instant'})",
+                                "document.documentElement.style.overflow='hidden'; " +
+                                "window.scrollTo({left:0,top:0,behavior:'instant'})",
                         },
                         pageSession
                     )

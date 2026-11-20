@@ -10,9 +10,9 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 test('C31F11 navigation settlement distinguishes request expiry from shorter waits', async () => {
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-c31f11-navigation-'));
     const load = (p) => import(pathToFileURL(path.join(root, p)));
-    const { Client } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js');
-    const { McpServer } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js');
-    const { InMemoryTransport } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/inMemory.js');
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+    const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
     const { getUnifiedSession, getSession } = await load('dist/core/index.js');
     const { CDPClient } = await load('dist/cdp/client.js');
     const { getErrorSource } = await load('dist/core/errors.js');
@@ -21,7 +21,23 @@ test('C31F11 navigation settlement distinguishes request expiry from shorter wai
         root,
         status: 'RUNNING',
         boundary:
-            'Actual SDK Client/McpServer, registered browse, UnifiedSession, SessionManager navigation waiters, CDPClient send and handleMessage. Controlled connected CDP protocol peer immediately acknowledges Page.navigate/Page.reload but emits no completion lifecycle event. Original production navigation timeout callback is scheduled by the native Node timer and executes unchanged. Date.now is pinned at the recorded enclosing request deadline minus one, or at the deadline control, only when that genuine callback runs through handler completion. No fabricated timeout Error, no replacement classifier, no Chrome/DOM or browser navigation. The tested contract is the previously accepted callback-immediate budget settlement rule, not a claim of naturally observed Chrome timing.',
+            'Actual SDK Client/McpServer, registered browse, ' +
+            'UnifiedSession, SessionManager navigation waiters,' +
+            ' CDPClient send and handleMessage. Controlled ' +
+            'connected CDP protocol peer immediately ' +
+            'acknowledges Page.navigate/Page.reload but emits ' +
+            'no completion lifecycle event. Original ' +
+            'production navigation timeout callback is ' +
+            'scheduled by the native Node timer and executes ' +
+            'unchanged. Date.now is pinned at the recorded ' +
+            'enclosing request deadline minus one, or at the ' +
+            'deadline control, only when that genuine callback ' +
+            'runs through handler completion. No fabricated ' +
+            'timeout Error, no replacement classifier, no ' +
+            'Chrome/DOM or browser navigation. The tested ' +
+            'contract is the previously accepted ' +
+            'callback-immediate budget settlement rule, not a ' +
+            'claim of naturally observed Chrome timing.',
         checks: [],
         requests: [],
         observations: [],
@@ -127,6 +143,7 @@ test('C31F11 navigation settlement distinguishes request expiry from shorter wai
     clientCdp.ws = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             result.requests.push({
@@ -161,6 +178,8 @@ test('C31F11 navigation settlement distinguishes request expiry from shorter wai
                             data = {};
                             break;
                         default:
+                            // 固定协议替身将未知命令转换为 CDP 错误响应
+                            // noinspection ExceptionCaughtLocallyJS
                             throw new Error('Unexpected controlled CDP method ' + message.method);
                     }
                     clientCdp.handleMessage(Buffer.from(JSON.stringify({ id: message.id, result: data })));
@@ -406,7 +425,10 @@ test('C31F12 history command refusal cancels only its local waiter and preserves
         peerErrors: [],
         cleanup: [],
         boundary:
-            'Direct production SessionManager -> CDPClient send/handleMessage, controlled protocol receipts, native Node timers and request AbortSignal; no SDK, browser, DOM or real socket',
+            'Direct production SessionManager -> CDPClient ' +
+            'send/handleMessage, controlled protocol receipts, ' +
+            'native Node timers and request AbortSignal; no ' +
+            'SDK, browser, DOM or real socket',
     };
     const setTimer = globalThis.setTimeout,
         clearTimer = globalThis.clearTimeout;
@@ -458,6 +480,7 @@ test('C31F12 history command refusal cancels only its local waiter and preserves
             cdp.ws = {
                 readyState: 1,
                 close() {},
+                /** @param {string} text */
                 send(text) {
                     const q = JSON.parse(text);
                     row.requests.push(q);

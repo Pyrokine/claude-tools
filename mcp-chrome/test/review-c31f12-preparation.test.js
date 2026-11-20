@@ -19,7 +19,13 @@ test('C31F13 SDK keeps auxiliary output facts separate from undispatched input',
         checks: [],
         cleanup: [],
         boundary:
-            'Actual SDK Client/McpServer -> registered input -> production UnifiedSession/Bridge/ExtensionHttpServer sendCommand and handleMessage. Controlled socket peer supplies snapshots, frame resolution and raw evaluate replies; find results and challenge observations are controlled. No native Chrome, DOM, sockets or discovery claimed.',
+            'Actual SDK Client/McpServer -> registered input ->' +
+            ' production UnifiedSession/Bridge/ExtensionHttpSer' +
+            'ver sendCommand and handleMessage. Controlled ' +
+            'socket peer supplies snapshots, frame resolution ' +
+            'and raw evaluate replies; find results and ' +
+            'challenge observations are controlled. No native ' +
+            'Chrome, DOM, sockets or discovery claimed.',
     };
     const unified = getUnifiedSession();
     const bridge = new ExtensionBridge({ requestContext: () => unified.tabLockContext.getStore() });

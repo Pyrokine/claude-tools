@@ -20,10 +20,10 @@ import {
     TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
+import { browserEventResponse } from './browser-event-output.js'
 import { sanitizeUrlRecord, sanitizeUrlRecords } from './network-sanitizer.js'
 import { withPageContext } from './page-context.js'
 import { pageTargetIdSchema, resolvePageTargetId } from './schema.js'
-import { browserEventResponse } from './browser-event-output.js'
 
 /**
  * logs 参数 schema

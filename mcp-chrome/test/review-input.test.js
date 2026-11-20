@@ -4,10 +4,13 @@ import vm from 'node:vm';
 import { EventEmitter, getEventListeners } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { ExtensionHttpServer } from '../dist/extension/http-server.js';
+import { CDPClient } from '../dist/cdp/client.js';
 import { getSession, getUnifiedSession } from '../dist/core/index.js';
 import {
     CDPError,
     formatErrorResponse,
+    getErrorPageContext,
+    getErrorSource,
     setErrorSource,
     StructuredToolError,
     TimeoutError,
@@ -79,6 +82,737 @@ async function withInput(overrides, action) {
     }
 }
 
+test('CDP background element clicks keep actionability and report synthetic dispatch', async (t) => {
+    for (const scenario of [
+        { name: 'hidden', synthetic: true },
+        { name: 'hidden-frame', synthetic: true, frame: 'iframe#owned' },
+        { name: 'visible', hidden: false },
+        { name: 'coordinate', target: { x: 33, y: 44 } },
+        { name: 'right', button: 'right' },
+        { name: 'double', clickCount: 2 },
+        { name: 'modified', modifiers: 2 },
+        { name: 'humanized', humanize: true },
+        { name: 'force', force: true, synthetic: true },
+        { name: 'covered', failure: 'actionability' },
+        { name: 'expired', failure: 'budget' },
+        { name: 'page-error', failure: 'script' },
+    ]) {
+        await t.test(scenario.name, async () => {
+            const calls = { checks: 0, native: [], synthetic: [], visibility: 0, focuses: 0 };
+            const element = {
+                isConnected: true,
+                getBoundingClientRect: () => ({ x: 23, y: 34, width: 20, height: 20 }),
+                focus: () => ++calls.focuses,
+                dispatchEvent: (event) => {
+                    calls.synthetic.push({ type: event.type, detail: event.detail, trusted: event.isTrusted });
+                    return true;
+                },
+            };
+            const simulator = { getCurrentPosition: () => ({ x: 0, y: 0 }), setCurrentPosition: () => {} };
+            const restore = override(getSession(), {
+                evaluate: async (script) => {
+                    assert.equal(script, 'document.hidden');
+                    ++calls.visibility;
+                    return scenario.hidden !== false;
+                },
+                createLocator: () => ({
+                    find: async () => 41,
+                    getClickablePoint: async () => ({ x: 33, y: 44 }),
+                    evaluateOn: async (script) => {
+                        if (scenario.failure === 'script') {
+                            throw new Error('owned page-click failed');
+                        }
+                        vm.runInNewContext(`(${script}).call(element)`, {
+                            element,
+                            window: {},
+                            MouseEvent: class {
+                                constructor(type, options) {
+                                    Object.assign(this, { type, ...options, isTrusted: false });
+                                }
+                            },
+                        });
+                    },
+                }),
+                createAutoWait: () => ({
+                    waitForClickable: async () => {
+                        ++calls.checks;
+                        if (scenario.failure === 'actionability') {
+                            throw new StructuredToolError(
+                                'ACTIONABILITY_FAILED',
+                                'owned target covered',
+                                'Read target',
+                                {
+                                    actionExecuted: false,
+                                }
+                            );
+                        }
+                        if (scenario.failure === 'budget') {
+                            throw new TimeoutError('input timeout during target checks');
+                        }
+                    },
+                }),
+                getBehaviorSimulator: () => simulator,
+                getModifiers: () => scenario.modifiers ?? 0,
+                mouseMove: async () => calls.native.push('move'),
+                mouseDown: async () => calls.native.push('down'),
+                mouseUp: async () => calls.native.push('up'),
+            });
+            try {
+                await withInput(
+                    {
+                        getMode: () => 'cdp',
+                        getDriver: async () => getSession(),
+                        evaluate: async () => ({ title: 'Input fixture', inspected: true }),
+                    },
+                    async (handler) => {
+                        const response = await handler({
+                            targetId: '801',
+                            frame: scenario.frame,
+                            timeout: 5000,
+                            humanize: scenario.humanize ?? false,
+                            events: [
+                                {
+                                    type: 'click',
+                                    target: scenario.target ?? { css: '#owned' },
+                                    button: scenario.button ?? 'left',
+                                    clickCount: scenario.clickCount ?? 1,
+                                    ...(scenario.force ? { force: true, forceReason: 'Owned covered target' } : {}),
+                                },
+                            ],
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        if (scenario.failure) {
+                            assert.equal(response.isError, true);
+                            assert.equal(body.eventsExecuted, 0);
+                            assert.equal(calls.synthetic.length, 0);
+                            assert.equal(calls.native.length, 0);
+                            assert.match(
+                                body.error.message,
+                                /owned target covered|input timeout|owned page-click failed/
+                            );
+                            return;
+                        }
+                        assert.notEqual(response.isError, true, response.content[0].text);
+                        assert.equal(body.success, true);
+                        assert.equal(body.eventsExecuted, 1);
+                        assert.equal(body.actionStatus, 'completed');
+                        if (scenario.synthetic) {
+                            assert.deepEqual(
+                                calls.synthetic.map((event) => event.type),
+                                ['mousedown', 'mouseup', 'click']
+                            );
+                            assert.ok(calls.synthetic.every((event) => event.detail === 1 && event.trusted === false));
+                            assert.equal(calls.focuses, 1);
+                            assert.equal(calls.native.length, 0);
+                            assert.equal(calls.checks, scenario.force ? 0 : 1);
+                            if (!scenario.force) {
+                                assert.ok(body.warnings.some((warning) => warning.includes('isTrusted=false')));
+                            }
+                        } else {
+                            assert.equal(calls.synthetic.length, 0);
+                            assert.ok(calls.native.includes('move'));
+                            assert.equal(
+                                calls.native.filter((type) => type === 'down').length,
+                                scenario.clickCount ?? 1
+                            );
+                            assert.equal(body.warnings, undefined);
+                        }
+                        if (
+                            scenario.force ||
+                            scenario.target ||
+                            scenario.button ||
+                            scenario.clickCount ||
+                            scenario.modifiers ||
+                            scenario.humanize
+                        ) {
+                            assert.equal(calls.visibility, 0);
+                        }
+                    }
+                );
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('C31F9 input diagnostics budget errors preserve preparation state and stop input', async (t) => {
+    for (const phase of ['enableConsole', 'enableNetwork', 'getConsoleLogs', 'getNetworkRequests']) {
+        for (const code of ['TIMEOUT', 'EXECUTION_RESULT_UNKNOWN']) {
+            await t.test(`${phase} ${code}`, async () => {
+                const context = {
+                    actionExecuted: 'unknown',
+                    actionStatus: 'unknown',
+                    failureStage: 'rpc',
+                    retryable: false,
+                };
+                const failure = setErrorSource(
+                    code === 'TIMEOUT'
+                        ? new TimeoutError('navigation timeout: request budget exhausted', context)
+                        : new StructuredToolError(
+                              code,
+                              'Owned diagnostics request timeout',
+                              'Read the owned page',
+                              context
+                          ),
+                    'budget'
+                );
+                let dispatches = 0;
+                let evaluations = 0;
+                const evaluate = async () => {
+                    ++evaluations;
+                    assert.fail('postcondition after diagnostic budget failure');
+                };
+                await withInput(
+                    {
+                        enableConsole: async () => {
+                            if (phase === 'enableConsole') {
+                                throw failure;
+                            }
+                        },
+                        enableNetwork: async () => {
+                            if (phase === 'enableNetwork') {
+                                throw failure;
+                            }
+                        },
+                        getConsoleLogs: async () => {
+                            if (phase === 'getConsoleLogs') {
+                                throw failure;
+                            }
+                            return [];
+                        },
+                        getNetworkRequests: async () => {
+                            if (phase === 'getNetworkRequests') {
+                                throw failure;
+                            }
+                            return [];
+                        },
+                        keyDown: async () => {
+                            ++dispatches;
+                        },
+                        keyUp: async () => {
+                            ++dispatches;
+                        },
+                        evaluate,
+                    },
+                    async (handler, session) => {
+                        assert.equal(session.evaluate, evaluate);
+                        const response = await handler({
+                            targetId: '801',
+                            expectedRevision: 'r1',
+                            timeout: 1000,
+                            diagnostics: true,
+                            postCondition: { script: 'true', timeout: 10 },
+                            events: [
+                                { type: 'keydown', key: 'x' },
+                                { type: 'keyup', key: 'x' },
+                            ],
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.isError, true);
+                        assert.equal(body.error.code, code);
+                        assert.equal(body.error.context.actionExecuted, 'unknown');
+                        assert.equal(body.actionExecuted, false);
+                        assert.equal(body.actionStatus, 'not_started');
+                        assert.equal(body.failureStage, 'context');
+                        assert.equal(body.eventsExecuted, 0);
+                        assert.equal(body.remainingEventsNotExecuted, 2);
+                        assert.equal(body.retryable, false);
+                        assert.equal(body.verificationRequested, true);
+                        assert.equal(body.verificationStatus, 'unavailable');
+                        assert.equal(body.diagnosticsStatus, 'unavailable');
+                        assert.equal(dispatches, 0);
+                        assert.equal(getErrorSource(failure), 'budget');
+                        const followup = JSON.parse(
+                            (await handler({ targetId: '801', events: [{ type: 'wait', ms: 0 }] })).content[0].text
+                        );
+                        assert.equal(followup.success, true);
+                        assert.equal(followup.eventsExecuted, 1);
+                        assert.equal(followup.actionStatus, 'completed');
+                    }
+                );
+                assert.equal(evaluations, 0);
+            });
+        }
+    }
+});
+
+test('C31F9 title preparation errors stop input before any event', async (t) => {
+    for (const source of ['budget', 'cancelled']) {
+        await t.test(source, async () => {
+            const failure = setErrorSource(
+                new TimeoutError('Owned title preparation stopped', {
+                    actionExecuted: 'unknown',
+                    actionStatus: 'unknown',
+                    retryable: false,
+                }),
+                source
+            );
+            let inspections = 0;
+            let dispatches = 0;
+            await withInput(
+                {
+                    getLiveState: async () => {
+                        throw failure;
+                    },
+                    inspectChallenge: async () => {
+                        ++inspections;
+                        return { title: 'Owned ready page', inspected: true };
+                    },
+                    keyDown: async () => {
+                        ++dispatches;
+                    },
+                    keyUp: async () => {
+                        ++dispatches;
+                    },
+                },
+                async (handler) => {
+                    const response = await handler({
+                        targetId: '801',
+                        timeout: 1_000,
+                        events: [
+                            { type: 'keydown', key: 'x' },
+                            { type: 'keyup', key: 'x' },
+                        ],
+                    });
+                    const body = JSON.parse(response.content[0].text);
+                    assert.equal(response.isError, true);
+                    assert.equal(body.error.code, failure.code);
+                    assert.equal(body.error.message, failure.message);
+                    assert.equal(body.error.context.actionExecuted, 'unknown');
+                    assert.equal(body.actionExecuted, false);
+                    assert.equal(body.actionStatus, 'not_started');
+                    assert.equal(body.failureStage, 'context');
+                    assert.equal(body.eventsExecuted, 0);
+                    assert.equal(body.remainingEventsNotExecuted, 2);
+                    assert.equal(body.retryable, false);
+                }
+            );
+            assert.equal(inspections, 0);
+            assert.equal(dispatches, 0);
+            assert.equal(getErrorSource(failure), source);
+        });
+    }
+});
+
+test('C31F9 completed input keeps its action state when later inspection fails', async () => {
+    const failure = new TimeoutError('Owned completed-input inspection timeout', {
+        actionExecuted: 'unknown',
+        actionStatus: 'unknown',
+        retryable: false,
+    });
+    let inspections = 0;
+    let dispatches = 0;
+    await withInput(
+        {
+            inspectChallenge: async () => {
+                if (++inspections > 1) {
+                    throw failure;
+                }
+                return { title: 'Owned ready page', inspected: true };
+            },
+            keyDown: async () => {
+                ++dispatches;
+            },
+            keyUp: async () => {
+                ++dispatches;
+            },
+        },
+        async (handler) => {
+            const response = await handler({
+                targetId: '801',
+                timeout: 1_000,
+                events: [
+                    { type: 'keydown', key: 'x' },
+                    { type: 'keyup', key: 'x' },
+                ],
+            });
+            const body = JSON.parse(response.content[0].text);
+            assert.equal(response.isError, true);
+            assert.equal(body.error.code, failure.code);
+            assert.equal(body.error.message, failure.message);
+            assert.equal(body.error.context.actionStatus, 'unknown');
+            assert.equal(body.actionExecuted, true);
+            assert.equal(body.actionStatus, 'completed');
+            assert.equal(body.eventsExecuted, 2);
+            assert.equal(body.remainingEventsNotExecuted, 0);
+            assert.equal(body.retryable, false);
+        }
+    );
+    assert.equal(dispatches, 2);
+    assert.equal(inspections, 2);
+    assert.equal(getErrorSource(failure), 'budget');
+});
+
+test('C31F9 tagged request errors use actual user-action dispatch state', async (t) => {
+    for (const source of ['budget', 'cancelled']) {
+        for (const dispatched of [false, true]) {
+            await t.test(`${source}/dispatched=${dispatched}`, async () => {
+                const failure = setErrorSource(new TimeoutError('Owned request stopped'), source);
+                await withInput({}, async (_handler, session) => {
+                    await assert.rejects(
+                        () =>
+                            session.withUserAction('input', async () => {
+                                // noinspection JSAccessibilityCheck -- 白盒用例读取本次请求的派发状态
+                                session.tabLockContext.getStore().userAction.dispatched = dispatched;
+                                throw failure;
+                            }),
+                        (error) => error === failure
+                    );
+                });
+                assert.equal(getErrorPageContext(failure).contextPhase, dispatched ? 'action' : 'preparation');
+                assert.equal(getErrorSource(failure), source);
+            });
+        }
+    }
+});
+
+test('C31F9 budgeted frame commands retain classified transport error identity', async () => {
+    const bridge = new ExtensionBridge();
+    bridge.setCurrentTargetId('801');
+    const failure = setErrorSource(
+        new StructuredToolError(
+            'EXECUTION_RESULT_UNKNOWN',
+            'Request timeout for action: resolve_frame (250ms)',
+            'Read the owned page',
+            { actionExecuted: 'unknown', actionStatus: 'unknown', failureStage: 'rpc', retryable: false }
+        ),
+        'budget'
+    );
+    const restore = override(bridge.httpServer, {
+        sendCommand: async (action) => {
+            assert.equal(action, 'resolve_frame');
+            throw failure;
+        },
+    });
+    try {
+        await assert.rejects(bridge.resolveFrame('#owned-child', 250), (error) => {
+            assert.equal(error, failure);
+            assert.equal(error.code, 'EXECUTION_RESULT_UNKNOWN');
+            assert.equal(getErrorSource(error), 'budget');
+            assert.equal(error.context.actionExecuted, 'unknown');
+            assert.equal(error.context.failureStage, 'rpc');
+            return true;
+        });
+    } finally {
+        restore();
+    }
+});
+
+test('input preserves acknowledged movement when a later dispatch is not started', async (t) => {
+    const failure = new TimeoutError('Request timeout before dispatch', {
+        actionExecuted: false,
+        actionStatus: 'not_started',
+        retryable: false,
+    });
+    for (const transport of ['extension', 'cdp']) {
+        for (const completedMove of [false, true]) {
+            await t.test(`${transport} completedMove=${completedMove}`, async () => {
+                let moves = 0;
+                let sendMove;
+                await withInput(
+                    {
+                        getInputMode: () => 'stealth',
+                        mouseMove: async () => {
+                            ++moves;
+                            if (completedMove && moves === 1) {
+                                await sendMove();
+                                return;
+                            }
+                            throw failure;
+                        },
+                        mouseClick: async () => assert.fail('a timed out movement must not dispatch a click'),
+                    },
+                    async (handler, session) => {
+                        const requestContext = () => session.tabLockContext.getStore();
+                        const server = new ExtensionHttpServer({ requestContext });
+                        const cdp = new CDPClient(requestContext);
+                        server.isConnected = () => true;
+                        server.clientSocket = { readyState: 1 };
+                        server.sendMessage = (_socket, message) => {
+                            globalThis.queueMicrotask(() => {
+                                // noinspection JSAccessibilityCheck
+                                server.handleMessage(
+                                    JSON.stringify({ id: message.id, success: true, data: { success: true } })
+                                );
+                            });
+                        };
+                        cdp.ws = {
+                            readyState: 1,
+                            send: (serialized) => {
+                                const message = JSON.parse(serialized);
+                                globalThis.queueMicrotask(() =>
+                                    cdp.handleMessage(JSON.stringify({ id: message.id, result: {} }))
+                                );
+                            },
+                        };
+                        sendMove = () =>
+                            transport === 'extension'
+                                ? server.sendCommand('stealth_mouse', { type: 'mousemove' }, 1000)
+                                : cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved' }, undefined, 1000);
+                        const response = await handler({
+                            humanize: true,
+                            timeout: 1000,
+                            events: [
+                                { type: 'mousemove', target: { x: 80, y: 40 }, steps: 3 },
+                                { type: 'click', target: { x: 80, y: 40 } },
+                            ],
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.isError, true);
+                        assert.equal(body.eventsExecuted, 0);
+                        assert.equal(body.actionExecuted, completedMove);
+                        assert.equal(body.actionStatus, completedMove ? 'unknown' : 'not_started');
+                        assert.equal(body.retryable, false);
+                        assert.equal(moves, completedMove ? 2 : 1);
+                        assert.equal(server.messageHandlers.size, 0);
+                        assert.equal(cdp.callbacks.size, 0);
+                    }
+                );
+            });
+        }
+    }
+});
+
+test('input acknowledgement follows the current request and nested input scope', async () => {
+    const session = getUnifiedSession();
+    session.acknowledgeInputAction();
+    assert.equal(session.tabLockContext.getStore(), undefined);
+    await session.withTabLock(async () => {
+        const scope = session.tabLockContext.getStore();
+        session.acknowledgeInputAction();
+        assert.equal(scope.userAction, undefined);
+        await session.withUserAction('evaluate', async () => {
+            const evaluating = scope.userAction;
+            session.acknowledgeInputAction();
+            assert.equal(evaluating.acknowledged, false);
+            await session.withUserAction('input', async () => {
+                session.acknowledgeInputAction();
+                assert.equal(scope.userAction.acknowledged, true);
+            });
+            assert.equal(scope.userAction, evaluating);
+            assert.equal(evaluating.acknowledged, false);
+        });
+        await session.withUserAction('input', async () => {
+            const parent = scope.userAction;
+            assert.equal(parent.acknowledged, false);
+            await session.withUserAction('input', async () => {
+                assert.equal(scope.userAction.acknowledged, false);
+                session.acknowledgeInputAction();
+            });
+            assert.equal(scope.userAction, parent);
+            assert.equal(parent.acknowledged, true);
+            const failure = new Error('owned nested input failure');
+            await assert.rejects(
+                () =>
+                    session.withUserAction('input', async () => {
+                        assert.equal(scope.userAction.acknowledged, false);
+                        session.acknowledgeInputAction();
+                        throw failure;
+                    }),
+                (error) => error === failure
+            );
+            assert.equal(scope.userAction, parent);
+            assert.equal(parent.acknowledged, true);
+        });
+        assert.equal(scope.userAction, undefined);
+        await session.withUserAction('input', async () => {
+            assert.equal(scope.userAction.acknowledged, false);
+        });
+    });
+    assert.equal(session.tabLockContext.getStore(), undefined);
+    await session.withUserAction('input', async () => {
+        assert.equal(session.tabLockContext.getStore().userAction.acknowledged, false);
+    });
+});
+
+test('input consumer acknowledgement preserves confirmed effects without acknowledging preparation scripts', async (t) => {
+    for (const transport of ['extension', 'cdp']) {
+        for (const result of [
+            { type: 'input' },
+            { type: 'range' },
+            { handled: false },
+            { type: 'notfound' },
+            { type: 'unsupported' },
+        ]) {
+            await t.test(`${transport} ${JSON.stringify(result)}`, async () => {
+                const selected = result.type === 'input' || result.type === 'range';
+                const failure = new TimeoutError('Request timeout before dispatch', {
+                    actionExecuted: false,
+                    actionStatus: 'not_started',
+                    retryable: false,
+                });
+                let sendScript;
+                await withInput(
+                    {
+                        keyDown: async () => {
+                            const returned = await sendScript();
+                            if (returned.type === 'input' || returned.type === 'range') {
+                                getUnifiedSession().acknowledgeInputAction();
+                            }
+                            throw failure;
+                        },
+                    },
+                    async (handler, session) => {
+                        const requestContext = () => session.tabLockContext.getStore();
+                        const server = new ExtensionHttpServer({ requestContext });
+                        const cdp = new CDPClient(requestContext);
+                        server.isConnected = () => true;
+                        server.clientSocket = { readyState: 1 };
+                        server.sendMessage = (_socket, message) =>
+                            globalThis.queueMicrotask(() => {
+                                // noinspection JSAccessibilityCheck
+                                server.handleMessage(JSON.stringify({ id: message.id, success: true, data: result }));
+                            });
+                        cdp.ws = {
+                            readyState: 1,
+                            send: (serialized) => {
+                                const message = JSON.parse(serialized);
+                                globalThis.queueMicrotask(() =>
+                                    cdp.handleMessage(JSON.stringify({ id: message.id, result }))
+                                );
+                            },
+                        };
+                        sendScript = () =>
+                            transport === 'extension'
+                                ? server.sendCommand(
+                                      'debugger_send',
+                                      { method: 'Runtime.callFunctionOn' },
+                                      1000,
+                                      'input'
+                                  )
+                                : cdp.send('Runtime.callFunctionOn', {}, undefined, 1000, false, 'input');
+                        const response = await handler({ timeout: 1000, events: [{ type: 'keydown', key: 'a' }] });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.isError, true);
+                        assert.equal(body.eventsExecuted, 0);
+                        assert.equal(body.actionExecuted, selected);
+                        assert.equal(body.actionStatus, selected ? 'unknown' : 'not_started');
+                        assert.equal(body.retryable, false);
+                        assert.equal(server.messageHandlers.size, 0);
+                        assert.equal(cdp.callbacks.size, 0);
+                    }
+                );
+            });
+        }
+    }
+});
+
+test('input CDP typing cleanup does not acknowledge a rejected action or hide its failure', async (t) => {
+    for (const scenario of [
+        { name: 'first character rejected', text: 'A', rejectDown: 1, acknowledged: false },
+        { name: 'first Enter rejected', text: '\n', rejectDown: 1, acknowledged: false },
+        { name: 'previous character acknowledged', text: 'AB', rejectDown: 2, acknowledged: true },
+        { name: 'Enter acknowledged before char rejection', text: '\n', rejectChar: true, acknowledged: true },
+        { name: 'primary and cleanup rejected', text: 'A', rejectDown: 1, rejectRelease: true, acknowledged: false },
+        { name: 'acknowledged input and cleanup rejected', text: 'A', rejectRelease: true, acknowledged: true },
+        { name: 'explicit user keyup', keyup: true, acknowledged: true },
+    ]) {
+        await t.test(scenario.name, async () => {
+            const native = getSession();
+            await withInput(
+                {
+                    getMode: () => 'cdp',
+                    isExtensionConnected: () => false,
+                    getDriver: async () => native,
+                    pressedKeys: new Set(),
+                    modifiers: 0,
+                },
+                async (handler, session) => {
+                    const cdp = new CDPClient(() => session.tabLockContext.getStore());
+                    const sent = [];
+                    const send = cdp.send.bind(cdp);
+                    cdp.send = (...args) => {
+                        sent.push({ type: args[1]?.type, cleanup: args[4] === true });
+                        return send(...args);
+                    };
+                    let downCount = 0;
+                    cdp.ws = {
+                        readyState: 1,
+                        send: (serialized) => {
+                            const message = JSON.parse(serialized);
+                            const type = message.params.type;
+                            assert.equal(message.sessionId, 'owned-frame-session');
+                            if (type === 'keyDown') {
+                                ++downCount;
+                            }
+                            if (type === 'char') {
+                                assert.equal(message.params.text, '\r');
+                            }
+                            const rejected =
+                                (type === 'keyDown' && downCount === scenario.rejectDown) ||
+                                (type === 'char' && scenario.rejectChar) ||
+                                (type === 'keyUp' && scenario.rejectRelease);
+                            globalThis.queueMicrotask(() => {
+                                cdp.handleMessage(
+                                    JSON.stringify(
+                                        rejected
+                                            ? {
+                                                  id: message.id,
+                                                  error: {
+                                                      code: type === 'keyUp' ? -32000 : -32602,
+                                                      message: `${type} rejected`,
+                                                  },
+                                              }
+                                            : { id: message.id, result: {} }
+                                    )
+                                );
+                                if (!rejected && type === 'keyUp' && scenario.keyup) {
+                                    assert.equal(session.tabLockContext.getStore().userAction.acknowledged, true);
+                                }
+                            });
+                        },
+                    };
+                    const restore = override(native, {
+                        cdp,
+                        currentTargetId: '801',
+                        sessionId: 'owned-native-session',
+                        selectedFrame: 7,
+                        frameScopes: new Map([[7, { targetId: '801', sessionId: 'owned-frame-session' }]]),
+                        revisions: new Map(),
+                        modifiers: 0,
+                        evaluate: async () => true,
+                        ensureEventController: () => ({ assertNativeReady() {}, race: (operation) => operation }),
+                    });
+                    try {
+                        const response = await handler({
+                            timeout: 1000,
+                            events: scenario.keyup
+                                ? [{ type: 'keyup', key: 'a' }]
+                                : [
+                                      { type: 'type', text: scenario.text },
+                                      { type: 'type', text: 'not-dispatched' },
+                                  ],
+                        });
+                        const body = JSON.parse(response.content[0].text);
+                        assert.equal(response.isError, scenario.keyup ? undefined : true);
+                        assert.equal(body.eventsExecuted, scenario.keyup ? 1 : 0);
+                        assert.equal(body.actionExecuted, scenario.acknowledged);
+                        assert.equal(
+                            body.actionStatus,
+                            scenario.keyup ? 'completed' : scenario.acknowledged ? 'unknown' : 'not_started'
+                        );
+                        assert.equal(body.retryable, false);
+                        if (!scenario.keyup) {
+                            assert.equal(
+                                body.error.context.nativeCode,
+                                scenario.rejectDown || scenario.rejectChar ? -32602 : -32000
+                            );
+                            assert.ok(sent.some((command) => command.type === 'keyUp' && command.cleanup));
+                            assert.ok(sent.every((command) => command.cleanup === (command.type === 'keyUp')));
+                        } else {
+                            assert.deepEqual(sent, [{ type: 'keyUp', cleanup: false }]);
+                        }
+                        assert.equal(cdp.callbacks.size, 0);
+                    } finally {
+                        restore();
+                    }
+                }
+            );
+        });
+    }
+});
+
 test('C31F6 late native release keeps the restored target and rejects a mismatched original frame', async () => {
     const session = getSession();
     const sent = [];
@@ -147,6 +881,7 @@ test('C31F6 Extension dialog execution facts survive the production transport pa
             },
         ],
     ]);
+    // noinspection JSAccessibilityCheck
     server.handleMessage(JSON.stringify({ id: 'owned-dialog', success: false, error: JSON.stringify(detail) }));
     assert.ok(failure instanceof StructuredToolError);
     assert.deepEqual(JSON.parse(formatErrorResponse(failure).content[0].text), detail);
@@ -380,6 +1115,7 @@ test('G090 text, selector and URL reads recover native context/object loss witho
             let calls = 0;
             const budgets = [];
             const host = {
+                getMode: () => 'extension',
                 evaluate: async (_code, _mode, timeout, _args, options) => {
                     ++calls;
                     budgets.push(timeout);
@@ -436,6 +1172,7 @@ test('G090 persistent context loss reports unavailable within the original deadl
     const budgets = [];
     const result = await waitForPostCondition(
         {
+            getMode: () => 'extension',
             evaluate: async (_code, _mode, timeout) => {
                 ++calls;
                 budgets.push(timeout);
@@ -454,6 +1191,7 @@ test('G090 persistent context loss reports unavailable within the original deadl
     assert.match(result.error, /context was destroyed|timeout|budget exhausted/);
     const exhausted = await waitForPostCondition(
         {
+            getMode: () => 'extension',
             evaluate: async () => {
                 throw new Error('unexpected dispatch');
             },
@@ -470,6 +1208,7 @@ test('G090 a stalled read stops at the original verification budget without a se
     let reads = 0;
     const result = await waitForPostCondition(
         {
+            getMode: () => 'extension',
             evaluate: () => {
                 ++reads;
                 return new Promise(() => {});
@@ -522,6 +1261,7 @@ for (const elapsed of [69, 70]) {
             context.mock.method(Date, 'now', () => now);
             const message = 'navigation timeout: request budget exhausted';
             const host = {
+                getMode: () => 'extension',
                 async evaluate(code, _mode, _timeout, args) {
                     now = startedAt + elapsed;
                     if (source === 'budget') {
@@ -595,7 +1335,10 @@ function textHost(renderedText, controls = [], bodyVisible = true) {
         HTMLTextAreaElement: Textarea,
         HTMLSelectElement: Select,
     });
-    return { evaluate: async (code, _mode, _timeout, args) => vm.runInContext(`(${code})`, realm)(...args) };
+    return {
+        getMode: () => 'extension',
+        evaluate: async (code, _mode, _timeout, args) => vm.runInContext(`(${code})`, realm)(...args),
+    };
 }
 
 test('G124 text checks use rendered text and visible non-password control values', async (context) => {
@@ -661,49 +1404,52 @@ test('C30-06 shared hit membership follows DOM parents, slots and nested Shadow 
     assert.equal(contains(leaf, host), false);
 });
 
-test('C30-08 coordinate wheel bypasses find and native mouse movement in either input mode and selected frame', async () => {
-    for (const mode of ['precise', 'stealth']) {
-        for (const frame of [undefined, 'iframe#owned']) {
-            let selected;
-            const wheels = [];
-            await withInput(
-                {
-                    getInputMode: () => mode,
-                    getFrameOffset: () => (frame ? { x: 120, y: 60 } : null),
-                    withFrame: async (value, fn) => {
-                        selected = value;
-                        return fn();
+test(
+    'C30-08 coordinate wheel bypasses find and native ' + 'mouse movement in either input mode and selected ' + 'frame',
+    async () => {
+        for (const mode of ['precise', 'stealth']) {
+            for (const frame of [undefined, 'iframe#owned']) {
+                let selected;
+                const wheels = [];
+                await withInput(
+                    {
+                        getInputMode: () => mode,
+                        getFrameOffset: () => (frame ? { x: 120, y: 60 } : null),
+                        withFrame: async (value, fn) => {
+                            selected = value;
+                            return fn();
+                        },
+                        find: async () => {
+                            throw new Error('coordinate wheel must not find');
+                        },
+                        mouseMove: async () => {
+                            throw new Error('wheel must not dispatch native mouse movement');
+                        },
+                        mouseWheel: async (...args) => {
+                            wheels.push(args);
+                        },
                     },
-                    find: async () => {
-                        throw new Error('coordinate wheel must not find');
-                    },
-                    mouseMove: async () => {
-                        throw new Error('wheel must not dispatch native mouse movement');
-                    },
-                    mouseWheel: async (...args) => {
-                        wheels.push(args);
-                    },
-                },
-                async (handler) => {
-                    const response = await handler({
-                        targetId: '801',
-                        expectedUrl: 'https://example.com/input',
-                        frame,
-                        timeout: 1000,
-                        events: [{ type: 'wheel', target: { x: 80, y: 40 }, deltaX: 15, deltaY: -35 }],
-                    });
-                    const payload = JSON.parse(response.content[0].text);
-                    assert.equal(payload.actionStatus, 'completed', response.content[0].text);
-                    assert.equal(selected, frame);
-                    assert.equal(wheels.length, 1);
-                    assert.deepEqual(wheels[0].slice(0, 2), [15, -35]);
-                    assert.ok(wheels[0][2] > 0 && wheels[0][2] <= 1000);
-                    assert.deepEqual(wheels[0][3], { x: 80, y: 40 });
-                }
-            );
+                    async (handler) => {
+                        const response = await handler({
+                            targetId: '801',
+                            expectedUrl: 'https://example.com/input',
+                            frame,
+                            timeout: 1000,
+                            events: [{ type: 'wheel', target: { x: 80, y: 40 }, deltaX: 15, deltaY: -35 }],
+                        });
+                        const payload = JSON.parse(response.content[0].text);
+                        assert.equal(payload.actionStatus, 'completed', response.content[0].text);
+                        assert.equal(selected, frame);
+                        assert.equal(wheels.length, 1);
+                        assert.deepEqual(wheels[0].slice(0, 2), [15, -35]);
+                        assert.ok(wheels[0][2] > 0 && wheels[0][2] <= 1000);
+                        assert.deepEqual(wheels[0][3], { x: 80, y: 40 });
+                    }
+                );
+            }
         }
     }
-});
+);
 
 test('C30-08 element and no-target wheel preserve ref scrolling and current-position semantics', async () => {
     const calls = [];

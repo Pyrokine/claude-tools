@@ -318,13 +318,29 @@ export async function configureWheelFixture(options) {
             owner.style.display = options.display
         }
     } else if (box) {
-        container.style.cssText = `display:${options.display};width:${options.empty ? 2200 : 1800}px;height:${options.empty ? 2200 : 1800}px;overflow:${options.overflow};overscroll-behavior:${options.policy};scroll-behavior:auto`
+        container.style.cssText =
+            'display:' +
+            `${options.display}` +
+            ';width:' +
+            `${options.empty ? 2200 : 1800}` +
+            'px;height:' +
+            `${options.empty ? 2200 : 1800}` +
+            'px;overflow:' +
+            `${options.overflow}` +
+            ';overscroll-behavior:' +
+            `${options.policy}` +
+            ';scroll-behavior:auto'
         inner.style.cssText = 'display:inline-block;width:2200px;height:2200px'
         spacer.style.display = 'none'
     } else if (options.group === 'positioning') {
         const kind = options.positioning
         const escape = kind.endsWith('escape') || kind === 'fixed-self'
-        outer.style.cssText = `position:${escape ? 'static' : 'relative'};left:400px;top:400px;margin:12px;width:320px;height:160px;overflow:auto;scroll-behavior:auto`
+        outer.style.cssText =
+            'position:' +
+            `${escape ? 'static' : 'relative'}` +
+            ';left:400px;top:400px;margin:12px;width:320px;' +
+            'height:160px;overflow:auto;' +
+            'scroll-behavior:auto'
         container.style.cssText = 'width:1800px;height:1800px;overflow:visible'
         spacer.style.display = 'none'
         if (kind === 'fixed-transform') {
@@ -358,16 +374,27 @@ export async function configureWheelFixture(options) {
     }
     if (containingBlock) {
         outer.style.cssText = 'position:static;margin:12px;width:320px;height:160px;overflow:auto;scroll-behavior:auto'
-        container.style.cssText = `display:${options.display};position:static;width:1800px;height:1800px;overflow:visible`
+        container.style.cssText =
+            'display:' + `${options.display}` + ';position:static;width:1800px;height:1800px;' + 'overflow:visible'
         container.style.setProperty(options.property, options.value)
         spacer.style.cssText = 'display:inline-block;width:1800px;height:1800px;pointer-events:none'
-        inner.style.cssText = `position:${options.positioning};left:${options.establishes ? 480 : 350}px;top:${options.establishes ? 480 : 50}px;width:60px;height:80px`
+        inner.style.cssText =
+            'position:' +
+            `${options.positioning}` +
+            ';left:' +
+            `${options.establishes ? 480 : 350}` +
+            'px;top:' +
+            `${options.establishes ? 480 : 50}` +
+            'px;width:60px;height:80px'
         const contents = options.shadow ? container.attachShadow({ mode: 'open' }) : container
         contents.append(spacer, inner)
         outer.append(container)
     } else {
         container.append(inner)
         outer.append(spacer, container)
+    }
+    if (options.group === 'propagation' && options.shadow) {
+        container.attachShadow({ mode: 'open' }).append(inner)
     }
     document.body.append(outer)
     await new Promise((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(resolve)))
@@ -425,7 +452,46 @@ export async function configureWheelFixture(options) {
             }),
         { passive: false, signal: controller.signal }
     )
-    window.__mcpWheelFixture = { outer, container, inner, controller, events, range }
+    const propagation = options.group === 'propagation' ? [] : undefined
+    if (propagation) {
+        const targets = [
+            ['inner', inner],
+            ...(options.shadow
+                ? [
+                      ['root', container.shadowRoot],
+                      ['host', container],
+                  ]
+                : [['ancestor', container]]),
+            ['document', document],
+        ]
+        const cancelName = {
+            target: 'inner',
+            ancestor: options.shadow ? 'host' : 'ancestor',
+            document: 'document',
+        }[options.cancelAt]
+        for (const [name, target] of targets) {
+            target.addEventListener(
+                'wheel',
+                (event) => {
+                    if (name === cancelName) {
+                        event.preventDefault()
+                    }
+                    propagation.push({
+                        listener: name,
+                        target: event.composedPath()[0]?.id,
+                        retargeted: event.target.id,
+                        composed: event.composed,
+                        bubbles: event.bubbles,
+                        cancelable: event.cancelable,
+                        defaultPrevented: event.defaultPrevented,
+                        trusted: event.isTrusted,
+                    })
+                },
+                { passive: false, signal: controller.signal }
+            )
+        }
+    }
+    window.__mcpWheelFixture = { outer, container, inner, controller, events, range, propagation }
     const positioned = options.group === 'positioning' || containingBlock
     const rect = (box ? outer : positioned ? inner : container).getBoundingClientRect()
     const point = {
@@ -495,5 +561,6 @@ export function readWheelFixture() {
         root: { x: document.documentElement.scrollLeft, y: document.documentElement.scrollTop },
         body: { x: document.body.scrollLeft, y: document.body.scrollTop },
         events: [...state.events],
+        ...(state.propagation ? { propagation: [...state.propagation] } : {}),
     }
 }

@@ -233,12 +233,14 @@ async function trackReads(run) {
     const originalStat = fsPromises.stat;
     const originalStream = fs.createReadStream;
     const restoreStream = patch(fs, {
+        /** @param {Parameters<typeof fs.createReadStream>} args */
         createReadStream: (...args) => {
             reads++;
             return originalStream(...args);
         },
     });
     const restoreStat = patch(fsPromises, {
+        /** @param {Parameters<typeof fsPromises.stat>} args */
         stat: (...args) => {
             stats++;
             return originalStat(...args);
@@ -258,7 +260,7 @@ test('ordinary CDP commands retain their results without negotiating permessage-
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0, perMessageDeflate: true });
     await new Promise((resolve) => server.once('listening', resolve));
     let extensions;
-    server.on('connection', (socket) => {
+    server.on('connection', (/** @type {import('ws').WebSocket} */ socket) => {
         extensions = socket.extensions;
         socket.on('message', (raw) => {
             const message = JSON.parse(raw.toString());
@@ -453,6 +455,7 @@ test('stat and actual sequential read both enforce the strict 50 MiB total limit
     });
     const original = fsPromises.stat;
     const restore = patch(fsPromises, {
+        /** @param {Parameters<typeof fsPromises.stat>} args */
         stat: async (...args) => {
             const actual = await original(...args);
             return { size: 1, mtimeMs: actual.mtimeMs, isFile: () => true };
@@ -471,6 +474,7 @@ test('cancellation during sequential reading stops before page assignment', asyn
     const controller = new AbortController();
     const original = fs.createReadStream;
     const restore = patch(fs, {
+        /** @param {Parameters<typeof fs.createReadStream>} args */
         createReadStream: (...args) => {
             const stream = original(...args);
             stream.once('data', () => controller.abort(new Error('test cancellation')));
@@ -520,6 +524,7 @@ for (const stop of ['timeout', 'cancel']) {
             },
         });
         const restoreStream = patch(fs, {
+            /** @param {Parameters<typeof fs.createReadStream>} args */
             createReadStream: (...args) => {
                 reads++;
                 return originalStream(...args);

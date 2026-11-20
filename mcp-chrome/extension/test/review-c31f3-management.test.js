@@ -114,6 +114,7 @@ async function fixture(run) {
         const native = new TabHandler({});
         const actions = Object.assign(Object.create(ActionHandler.prototype), {
             actionLocks: new Map(),
+            browserEventHandler: { waitForOwner: async () => {} },
             tabHandler: native,
             actions: new Map([
                 ['window_close', native.windowClose.bind(native)],
@@ -311,19 +312,22 @@ for (const operation of ['adopt', 'metadata', 'grant', 'revoke', 'refresh']) {
     }
 }
 
-test('C31F4-01 managed state still publishes in memory after cancellation during a dispatched storage set', async () => {
-    await fixture(async ({ state, native, context, controller, tabs, storage }) => {
-        tabs.push({ ...tabs[0], id: 103 });
-        state.hold = 'storage-set';
-        const pending = native.tabsAdopt({ tabId: 103 }, context);
-        await state.readHeld.promise;
-        controller.abort('storage has already committed');
-        state.release.resolve();
-        await pending;
-        assert.equal(isManagedTab({ id: 103 }), true);
-        assert.deepEqual(
-            getManagedTabRecord(103),
-            storage.mcp_managed_tabs_v1.tabs.find((tab) => tab.tabId === 103)
-        );
-    });
-});
+test(
+    'C31F4-01 managed state still publishes in memory ' + 'after cancellation during a dispatched storage set',
+    async () => {
+        await fixture(async ({ state, native, context, controller, tabs, storage }) => {
+            tabs.push({ ...tabs[0], id: 103 });
+            state.hold = 'storage-set';
+            const pending = native.tabsAdopt({ tabId: 103 }, context);
+            await state.readHeld.promise;
+            controller.abort('storage has already committed');
+            state.release.resolve();
+            await pending;
+            assert.equal(isManagedTab({ id: 103 }), true);
+            assert.deepEqual(
+                getManagedTabRecord(103),
+                storage.mcp_managed_tabs_v1.tabs.find((tab) => tab.tabId === 103)
+            );
+        });
+    }
+);

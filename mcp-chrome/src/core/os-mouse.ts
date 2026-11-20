@@ -6,8 +6,8 @@
  * Windows: PowerShell SetCursorPos 沿路径移动后 mouse_event
  */
 import { execFile as execFileCallback } from 'node:child_process'
-import { promisify } from 'node:util'
 import { setTimeout as delay } from 'node:timers/promises'
+import { promisify } from 'node:util'
 import { generateBezierPath, getMouseMoveDelay } from '../anti-detection/behavior.js'
 import { sanitizeErrorMessage } from './error-sanitizer.js'
 import { OsMouseError, TimeoutError } from './errors.js'
@@ -601,6 +601,8 @@ export async function osLeftClick(x: number, y: number, deps: OsLeftClickDeps = 
             const since = Date.now()
             const step = position.x > 0 ? -1 : 1
             await execFile('xdotool', ['mousemove_relative', '--', String(step), '0'], { timeout: EXEC_TIMEOUT_MS })
+            // 留出事件分发时间，避免 Chrome 将往返移动合并为一条可信事件
+            await sleep(40)
             await execFile('xdotool', ['mousemove_relative', '--', String(-step), '0'], { timeout: EXEC_TIMEOUT_MS })
             return { position, since }
         }
@@ -631,7 +633,7 @@ export async function osLeftClick(x: number, y: number, deps: OsLeftClickDeps = 
                       await execFile(file, down, { timeout: EXEC_TIMEOUT_MS })
                       await sleep(50)
                   } finally {
-                      // A dispatched press may have reached the OS even when its subprocess was cancelled.
+                      // A dispatched press may have reached the OS even when its subprocess was canceled.
                       await withNavigationBudget(
                           () => (deps.execFile ?? execFileDefault)(file, up, { timeout: EXEC_TIMEOUT_MS }),
                           Date.now() + EXEC_TIMEOUT_MS

@@ -11,8 +11,9 @@ import { promisify } from 'node:util';
 let execScenario;
 const nativeExecFile = childProcess.execFile;
 const nativeExec = promisify(nativeExecFile);
+/** @param {Parameters<typeof nativeExecFile>} args */
 function controlledExecFile(...args) {
-    return nativeExecFile(...args);
+    return Reflect.apply(nativeExecFile, undefined, args);
 }
 controlledExecFile[promisify.custom] = (file, args, options) => {
     assert.ok(execScenario, `Unexpected system command: ${file}`);
@@ -56,7 +57,7 @@ function publicTool(register) {
             callback = handler;
         },
     });
-    return async (args, signal) => {
+    return async (args, signal = undefined) => {
         const response = await callback(schema.parse(args), { signal });
         return { response, body: JSON.parse(response.content[0].text) };
     };
@@ -64,7 +65,7 @@ function publicTool(register) {
 async function markerExists(path) {
     for (let attempt = 0; attempt < 600; ++attempt) {
         try {
-            return await readFile(path, 'utf8');
+            return await readFile(path, { encoding: 'utf8' });
         } catch (error) {
             if (error.code !== 'ENOENT') {
                 throw error;
@@ -298,7 +299,7 @@ for (const outcome of ['success', 'failure', 'timeout', 'normal']) {
                 assert.deepEqual(queuedEffects(requests), ['navigate', 'navigate', 'input_mouse']);
                 if (outcome !== 'timeout') {
                     assert.equal(releaseFinished, true);
-                    assert.equal(await readFile(ended, 'utf8'), 'ended');
+                    assert.equal(await readFile(ended, { encoding: 'utf8' }), 'ended');
                 }
                 const reused = await browse({ action: 'open', targetId: '101', url: tab.url, timeout: 2000 });
                 assert.equal(reused.body.success, true);
@@ -348,7 +349,7 @@ for (const stage of ['query', 'movement']) {
                     await delay(30);
                     assert.equal(native.length, count);
                     assert.equal(
-                        native.some(({ args }) => /^(mousedown|mouseup|click)$/.test(args[0])),
+                        native.some(({ args }) => /^(?:mousedown|mouseup|click)$/.test(args[0])),
                         false
                     );
                     assert.deepEqual(queuedEffects(requests), ['navigate', 'navigate', 'input_mouse']);

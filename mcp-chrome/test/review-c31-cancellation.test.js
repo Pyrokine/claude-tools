@@ -13,8 +13,9 @@ import { promisify } from 'node:util';
 // Install before module initialization so the real OS path uses a controlled execFile.
 let execScenario;
 const nativeExecFile = childProcess.execFile;
+/** @param {Parameters<typeof nativeExecFile>} args */
 function controlledExecFile(...args) {
-    return nativeExecFile(...args);
+    return Reflect.apply(nativeExecFile, undefined, args);
 }
 controlledExecFile[promisify.custom] = (file, args, options) => {
     assert.ok(execScenario, `Unexpected system command: ${file}`);
@@ -93,7 +94,7 @@ const endpoint = 'ws://127.0.0.1:9333/devtools/browser/c31';
 const json = (value) =>
     new globalThis.Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
 
-async function extensionFixture(run) {
+async function extensionFixture(run, pointerRead = () => ({ x: 0, y: 80 })) {
     const unified = getUnifiedSession();
     const bridge = new ExtensionBridge({ requestContext: () => unified.tabLockContext.getStore() });
     bridge.setCurrentTargetId('101');
@@ -125,7 +126,9 @@ async function extensionFixture(run) {
                         ? { documentId: 'owned-pointer-document' }
                         : message.params.pointerProbe?.operation === 'stop'
                           ? { stopped: true }
-                          : { x: 0, y: 80 },
+                          : message.params.pointerProbe?.operation === 'read'
+                            ? pointerRead(message)
+                            : { x: 0, y: 80 },
             }[message.action];
             assert.notEqual(data, undefined, `Unexpected Extension action: ${message.action}`);
             bridge.httpServer.handleMessage(JSON.stringify({ id: message.id, success: true, data }));
@@ -206,6 +209,245 @@ test(
                 false
             );
         });
+    }
+);
+
+test(
+    'native calibration revalidates page, controls and active window before its single press',
+    { skip: process.platform !== 'linux' ? 'X11 command fixture' : false },
+    async (t) => {
+        for (const change of ['none', 'point', 'title', 'stage', 'focus', 'active', 'permission']) {
+            await t.test(change, async () => {
+                await extensionFixture(async ({ unified, bridge, requests }) => {
+                    let calibrated = false;
+                    let pointer = { x: 12, y: 114 };
+                    const commands = [];
+                    const getViewportMetrics = bridge.getViewportMetrics.bind(bridge);
+                    const restoreBridge = patch(bridge, {
+                        async getViewportMetrics(frame, probe, timeout) {
+                            const result = await getViewportMetrics(frame, probe, timeout);
+                            if (probe?.operation === 'read') {
+                                calibrated = true;
+                            }
+                            return result;
+                        },
+                    });
+                    const restoreUnified = patch(unified, {
+                        currentFrameOffset: null,
+                        async listTopology() {
+                            return {
+                                windows: [
+                                    {
+                                        id: 1,
+                                        focused: !(calibrated && change === 'focus'),
+                                        tabs: [
+                                            {
+                                                ...tab,
+                                                active: !(calibrated && change === 'active'),
+                                                managed: !(calibrated && change === 'permission'),
+                                            },
+                                        ],
+                                    },
+                                ],
+                            };
+                        },
+                    });
+                    const snapshot = { ...point, url: tab.url, clickTargetKind: 'widget' };
+                    execScenario = async (_file, args) => {
+                        commands.push([...args]);
+                        if (args[0] === 'getactivewindow') {
+                            return { stdout: '42', stderr: '' };
+                        }
+                        if (args[0] === 'getwindowname') {
+                            return {
+                                stdout:
+                                    calibrated && change === 'title'
+                                        ? 'Other page - Google Chrome'
+                                        : 'Owned page - Google Chrome',
+                                stderr: '',
+                            };
+                        }
+                        if (args[0] === 'getwindowgeometry') {
+                            return { stdout: 'X=0\nY=0\nWIDTH=800\nHEIGHT=680\n', stderr: '' };
+                        }
+                        if (args[0] === '-id') {
+                            return { stdout: '_GTK_FRAME_EXTENTS:  not found.\n', stderr: '' };
+                        }
+                        if (args[0] === 'mousemove') {
+                            pointer = { x: Number(args[1]), y: Number(args[2]) };
+                        }
+                        if (args[0] === 'mousemove_relative') {
+                            pointer.x += Number(args[2]);
+                        }
+                        return { stdout: `X=${pointer.x}\nY=${pointer.y}\n`, stderr: '' };
+                    };
+                    const operation = unified.clickTurnstile(snapshot, 4000, undefined, async () => ({
+                        ...snapshot,
+                        ...(calibrated && change === 'stage' ? { clickTargetKind: 'verify' } : {}),
+                        ...(calibrated && change === 'point' ? { clickPoint: { x: 32, y: 54 } } : {}),
+                    }));
+                    try {
+                        if (change === 'none' || change === 'point') {
+                            await operation;
+                            assert.equal(commands.filter(([command]) => command === 'mousedown').length, 1);
+                            assert.equal(commands.filter(([command]) => command === 'mouseup').length, 1);
+                            assert.deepEqual(pointer, change === 'point' ? { x: 32, y: 134 } : { x: 12, y: 114 });
+                        } else {
+                            await assert.rejects(operation, (error) => error.code === 'TURNSTILE_OS_CLICK_UNAVAILABLE');
+                            assert.equal(commands.filter(([command]) => command === 'mousedown').length, 0);
+                        }
+                        assert.equal(calibrated, true);
+                        assert.equal(
+                            requests.filter(
+                                ({ action, params }) =>
+                                    action === 'viewport_metrics' && params.pointerProbe?.operation === 'stop'
+                            ).length,
+                            1
+                        );
+                        assert.equal(bridge.httpServer.messageHandlers.size, 0);
+                    } finally {
+                        await operation.catch(() => {});
+                        restoreUnified();
+                        restoreBridge();
+                    }
+                });
+            });
+        }
+    }
+);
+
+test(
+    'native calibration resamples moving targets within its original deadline before one press',
+    { skip: process.platform !== 'linux' ? 'X11 command fixture' : false },
+    async (t) => {
+        for (const state of ['settled', 'legacy', 'cancelled', 'timeout', 'focus', 'stage', 'unbounded']) {
+            await t.test(state, async () => {
+                const originalNow = Date.now;
+                let now = originalNow();
+                if (state === 'timeout') {
+                    Date.now = () => now;
+                }
+                const abort = new AbortController();
+                const commands = [];
+                let pointer = { x: 12, y: 114 };
+                let reads = 0;
+                let refreshes = 0;
+                try {
+                    await extensionFixture(
+                        async ({ unified, bridge, requests }) => {
+                            const listTopology = unified.listTopology.bind(unified);
+                            const restore = patch(unified, {
+                                currentFrameOffset: null,
+                                async listTopology(timeout) {
+                                    const topology = await listTopology(timeout);
+                                    return state === 'focus' && reads > 0
+                                        ? {
+                                              ...topology,
+                                              windows: topology.windows.map((window) => ({
+                                                  ...window,
+                                                  focused: false,
+                                              })),
+                                          }
+                                        : topology;
+                                },
+                            });
+                            execScenario = async (_file, args) => {
+                                commands.push([...args]);
+                                if (args[0] === 'getactivewindow') {
+                                    return { stdout: '42', stderr: '' };
+                                }
+                                if (args[0] === 'getwindowname') {
+                                    return { stdout: 'Owned page - Google Chrome', stderr: '' };
+                                }
+                                if (args[0] === 'getwindowgeometry') {
+                                    return { stdout: 'X=0\nY=0\nWIDTH=800\nHEIGHT=680\n', stderr: '' };
+                                }
+                                if (args[0] === '-id') {
+                                    return { stdout: '_GTK_FRAME_EXTENTS:  not found.\n', stderr: '' };
+                                }
+                                if (args[0] === 'mousemove') {
+                                    pointer = { x: Number(args[1]), y: Number(args[2]) };
+                                }
+                                if (args[0] === 'mousemove_relative') {
+                                    pointer.x += Number(args[2]);
+                                }
+                                return { stdout: `X=${pointer.x}\nY=${pointer.y}\n`, stderr: '' };
+                            };
+                            const snapshot = { ...point, url: tab.url, clickTargetKind: 'widget' };
+                            try {
+                                const operation = unified.clickTurnstile(
+                                    snapshot,
+                                    state === 'unbounded' ? undefined : 4000,
+                                    abort.signal,
+                                    async () => {
+                                        ++refreshes;
+                                        if (reads > 0 && state === 'cancelled') {
+                                            abort.abort(new Error('owned animation cancelled'));
+                                        }
+                                        if (reads > 0 && state === 'timeout') {
+                                            now += 10_000;
+                                        }
+                                        return {
+                                            ...snapshot,
+                                            ...(reads > 0 && state === 'stage' ? { clickTargetKind: 'verify' } : {}),
+                                        };
+                                    }
+                                );
+                                if (state === 'settled' || state === 'legacy') {
+                                    await operation;
+                                    assert.equal(reads, state === 'settled' ? 3 : 1);
+                                    assert.deepEqual(pointer, { x: 12, y: state === 'settled' ? 58 : 114 });
+                                    assert.equal(commands.filter(([command]) => command === 'mousedown').length, 1);
+                                    assert.equal(commands.filter(([command]) => command === 'mouseup').length, 1);
+                                } else {
+                                    await assert.rejects(operation, (error) =>
+                                        state === 'timeout'
+                                            ? error.code === 'TIMEOUT'
+                                            : state === 'cancelled'
+                                              ? /owned animation cancelled/.test(error.message)
+                                              : error.code === 'TURNSTILE_OS_CLICK_UNAVAILABLE'
+                                    );
+                                    assert.equal(reads, 1);
+                                    assert.equal(
+                                        commands.filter(([command]) => /^(?:mousedown|mouseup)$/.test(command)).length,
+                                        0
+                                    );
+                                }
+                                assert.ok(refreshes >= (state === 'legacy' || state === 'unbounded' ? 1 : 2));
+                                const probes = requests.filter(
+                                    ({ action, params }) =>
+                                        action === 'viewport_metrics' && params.pointerProbe?.operation === 'read'
+                                );
+                                assert.equal(new Set(probes.map(({ params }) => params.pointerProbe.id)).size, 1);
+                                if (state !== 'unbounded') {
+                                    assert.ok(
+                                        probes.every(({ params }) => params.timeout > 0 && params.timeout <= 4000)
+                                    );
+                                }
+                                assert.equal(
+                                    requests.filter(
+                                        ({ action, params }) =>
+                                            action === 'viewport_metrics' && params.pointerProbe?.operation === 'stop'
+                                    ).length,
+                                    1
+                                );
+                                assert.equal(bridge.httpServer.messageHandlers.size, 0);
+                            } finally {
+                                restore();
+                            }
+                        },
+                        () => {
+                            ++reads;
+                            return state !== 'legacy' && reads === 1
+                                ? { documentId: 'owned-pointer-document', stable: false }
+                                : { x: 0, y: state === 'legacy' ? 80 : 24 };
+                        }
+                    );
+                } finally {
+                    Date.now = originalNow;
+                }
+            });
+        }
     }
 );
 
@@ -453,47 +695,50 @@ async function launchFixture(run, { realLauncher = false, realConnect = false } 
 }
 
 for (const stage of ['first HTTP', 'second HTTP', 'port reuse targets']) {
-    test(`C31-02B public launch cancellation during ${stage} never starts a browser after a late response`, async () => {
-        await launchFixture(async ({ effects, urls, setFetch }) => {
-            const entered = deferred();
-            const held = deferred();
-            let index = 0;
-            setFetch(async (url, options) => {
-                assert.ok(options.signal);
-                if (++index === (stage === 'first HTTP' ? 1 : 2)) {
-                    entered.resolve();
-                    return held.promise;
+    test(
+        'C31-02B public launch cancellation during ' + `${stage}` + ' never starts a browser after a late response',
+        async () => {
+            await launchFixture(async ({ effects, urls, setFetch }) => {
+                const entered = deferred();
+                const held = deferred();
+                let index = 0;
+                setFetch(async (url, options) => {
+                    assert.ok(options.signal);
+                    if (++index === (stage === 'first HTTP' ? 1 : 2)) {
+                        entered.resolve();
+                        return held.promise;
+                    }
+                    return json({ webSocketDebuggerUrl: endpoint });
+                });
+                const abort = new AbortController();
+                const operation = browse()(
+                    {
+                        action: 'launch',
+                        port: 9333,
+                        ...(stage === 'port reuse targets' ? {} : { headless: true }),
+                        timeout: 1000,
+                    },
+                    abort.signal
+                );
+                await entered.promise;
+                abort.abort(new Error(`cancelled ${stage}`));
+                const { response } = await operation;
+                assert.equal(response.isError, true);
+                held.resolve(json(targets));
+                await tick();
+                await tick();
+                assert.equal(effects.includes('spawn'), false);
+                assert.equal(effects.includes('newPage'), false);
+                assert.equal(effects.includes('attach'), false);
+                assert.equal(urls.length, stage === 'first HTTP' ? 1 : 2);
+                if (stage !== 'port reuse targets') {
+                    assert.deepEqual(effects, []);
+                } else {
+                    assert.deepEqual(effects, ['reset', 'handshake', 'disconnect']);
                 }
-                return json({ webSocketDebuggerUrl: endpoint });
             });
-            const abort = new AbortController();
-            const operation = browse()(
-                {
-                    action: 'launch',
-                    port: 9333,
-                    ...(stage === 'port reuse targets' ? {} : { headless: true }),
-                    timeout: 1000,
-                },
-                abort.signal
-            );
-            await entered.promise;
-            abort.abort(new Error(`cancelled ${stage}`));
-            const { response } = await operation;
-            assert.equal(response.isError, true);
-            held.resolve(json(targets));
-            await tick();
-            await tick();
-            assert.equal(effects.includes('spawn'), false);
-            assert.equal(effects.includes('newPage'), false);
-            assert.equal(effects.includes('attach'), false);
-            assert.equal(urls.length, stage === 'first HTTP' ? 1 : 2);
-            if (stage !== 'port reuse targets') {
-                assert.deepEqual(effects, []);
-            } else {
-                assert.deepEqual(effects, ['reset', 'handshake', 'disconnect']);
-            }
-        });
-    });
+        }
+    );
 }
 
 test('C31-02B cancelled pre-dispatch and queued launch requests perform zero HTTP/profile/spawn work', async () => {
@@ -578,7 +823,16 @@ async function markerFixture(run) {
     const writeMarker = async (endpointLine = '') => {
         await writeFile(
             executable,
-            `#!${process.execPath}\nimport('node:fs').then(({appendFileSync}) => { appendFileSync(${JSON.stringify(marker)}, String(process.pid)+'\\n'); ${endpointLine ? `process.stderr.write(${JSON.stringify(`DevTools listening on ${endpointLine}\n`)});` : ''} setInterval(() => {}, 1000); });\n`
+            '#!' +
+                `${process.execPath}` +
+                "\nimport('node:fs').then(({appendFileSync}) => " +
+                '{ appendFileSync(' +
+                `${JSON.stringify(marker)}` +
+                ", String(process.pid)+'\\n'); " +
+                (endpointLine
+                    ? 'process.stderr.write(' + `${JSON.stringify(`DevTools listening on ${endpointLine}\n`)}` + ');'
+                    : '') +
+                ' setInterval(() => {}, 1000); });\n'
         );
         await chmod(executable, 0o700);
     };
@@ -639,7 +893,7 @@ test(
                 assert.equal(launcher.process, null);
                 assert.equal(child.listenerCount('error'), 0);
                 assert.equal(child.stderr.listenerCount('data'), 0);
-                assert.equal((await readFile(marker, 'utf8')).trim().split('\n').length, 1);
+                assert.equal((await readFile(marker, { encoding: 'utf8' })).trim().split('\n').length, 1);
             } finally {
                 launcher.close();
             }
@@ -679,7 +933,7 @@ test(
                         assert.equal(session.launcher, null);
                         assert.equal(session.cdp, null);
                         assert.equal(effects.includes('attach'), false);
-                        assert.equal((await readFile(marker, 'utf8')).trim().split('\n').length, 1);
+                        assert.equal((await readFile(marker, { encoding: 'utf8' })).trim().split('\n').length, 1);
                     },
                     { realLauncher: true, realConnect: true }
                 );
@@ -802,9 +1056,10 @@ test(
                 abort.abort(new Error('old completed request cancelled'));
                 await tick();
                 assert.equal(child.killed, false);
-                assert.equal((await readFile(marker, 'utf8')).trim().split('\n').length, 1);
+                assert.equal((await readFile(marker, { encoding: 'utf8' })).trim().split('\n').length, 1);
             } finally {
                 const child = launcher.process;
+                // noinspection ES6MissingAwait -- 关闭前订阅 exit，关闭后等待同一 Promise
                 const exited = child ? once(child, 'exit') : Promise.resolve();
                 launcher.close();
                 await exited;

@@ -1,18 +1,25 @@
+import { browserEventCommandSchema } from '../../../src/core/browser-event-schema'
 import {
-    BrowserEventController,
     type BrowserEventAction,
+    BrowserEventController,
     type EventCommand,
     eventRefTarget,
 } from '../../../src/core/browser-events'
-import { browserEventCommandSchema } from '../../../src/core/browser-event-schema'
-import { assertActionActive, assertManagedTab, assertReadableTab, type ActionContext } from './action-utils'
 import { ExpectedOperationError } from '../types/expected-errors'
+import { type ActionContext, assertActionActive, assertManagedTab, assertReadableTab } from './action-utils'
 import type { DebuggerManager } from './debugger-manager'
 
 export class BrowserEventHandler {
-    private controllers = new Map<string, BrowserEventController>()
-    private fetchOwners = new Map<number, string>()
-    constructor(private debuggerManager: DebuggerManager) {
+    private readonly controllers = new Map<string, BrowserEventController>()
+    private readonly fetchOwners = new Map<number, string>()
+    private readonly ownerReleases = new Map<string, Promise<void>>()
+    private readonly ownerReleaseFailures = new Set<string>()
+    constructor(
+        private readonly debuggerManager: Pick<
+            DebuggerManager,
+            'addEventConsumer' | 'ensureAttached' | 'beforeDetach' | 'onCleanup'
+        >
+    ) {
         debuggerManager.addEventConsumer((tabId, method, params, sessionId) => {
             for (const controller of this.controllers.values()) {
                 if (controller.identity.targetId !== String(tabId)) {
@@ -35,6 +42,9 @@ export class BrowserEventHandler {
         if (!owner) {
             throw new ExpectedOperationError('Browser events require a server instance identity', false)
         }
+        if (this.ownerReleases.has(owner) || this.ownerReleaseFailures.has(owner)) {
+            throw new ExpectedOperationError('Browser event owner cleanup must complete before reuse', false)
+        }
         const key = this.key(tabId, owner)
         let controller = this.controllers.get(key)
         if (!controller) {
@@ -55,6 +65,7 @@ export class BrowserEventHandler {
     }
 
     async execute(raw: unknown, context: ActionContext): Promise<unknown> {
+        await this.waitForOwner(context)
         const p = raw as { tabId?: number; action?: BrowserEventAction; command?: EventCommand; deadline?: number }
         const parsed = browserEventCommandSchema.parse({ action: p.action, command: p.command })
         let tabId = p.tabId
@@ -86,7 +97,9 @@ export class BrowserEventHandler {
         }
         context.signal?.addEventListener('abort', abort, { once: true })
         try {
-            const result = await controller.command(parsed.action, parsed.command as EventCommand, context.signal)
+            const result = await controller.command(parsed.action, parsed.command as EventCommand, context.signal, () =>
+                assertActionActive(context)
+            )
             if (!result.fetchEnabled && this.fetchOwners.get(tabId!) === context.serverInstanceId) {
                 this.fetchOwners.delete(tabId!)
             }
@@ -107,8 +120,9 @@ export class BrowserEventHandler {
         params: Record<string, unknown> | undefined,
         context: ActionContext
     ): Promise<unknown> {
+        await this.waitForOwner(context)
         this.claimFetch(tabId, context, 'raw')
-        const result = await this.controller(tabId, context).rawFetch(method, params)
+        const result = await this.controller(tabId, context).rawFetch(method, params, () => assertActionActive(context))
         if (method === 'Fetch.disable') {
             this.fetchOwners.delete(tabId)
         }
@@ -159,23 +173,67 @@ export class BrowserEventHandler {
                             error
                         )
                     )
-                this.controllers.delete(key)
-            }
-        }
-        this.fetchOwners.delete(tabId)
-    }
-
-    async releaseOwner(owner: string): Promise<void> {
-        for (const [key, controller] of this.controllers) {
-            if (controller.identity.owner === owner) {
-                await controller.dispose('server disconnected')
-                this.controllers.delete(key)
-                const tabId = Number(controller.identity.targetId)
-                if (this.fetchOwners.get(tabId) === owner) {
-                    this.fetchOwners.delete(tabId)
+                if (this.controllers.get(key) === controller) {
+                    this.controllers.delete(key)
+                }
+                const owner = controller.identity.owner
+                if (![...this.controllers.values()].some((current) => current.identity.owner === owner)) {
+                    this.ownerReleaseFailures.delete(owner)
                 }
             }
         }
+        if (![...this.controllers.values()].some((controller) => controller.identity.targetId === String(tabId))) {
+            this.fetchOwners.delete(tabId)
+        }
+    }
+
+    async waitForOwner(context: ActionContext): Promise<void> {
+        assertActionActive(context)
+        const owner = context.serverInstanceId
+        if (owner && this.ownerReleaseFailures.has(owner) && !this.ownerReleases.has(owner)) {
+            await this.releaseOwner(owner)
+        }
+        const pending = owner && this.ownerReleases.get(owner)
+        if (pending) {
+            await pending
+        }
+        assertActionActive(context)
+    }
+
+    releaseOwner(owner: string): Promise<void> {
+        const previous = this.ownerReleases.get(owner) ?? Promise.resolve()
+        const disposeControllers = async () => {
+            for (const [key, controller] of [...this.controllers]) {
+                if (controller.identity.owner === owner) {
+                    await controller.dispose('server disconnected')
+                    if (this.controllers.get(key) !== controller) {
+                        continue
+                    }
+                    this.controllers.delete(key)
+                    const tabId = Number(controller.identity.targetId)
+                    if (this.fetchOwners.get(tabId) === owner) {
+                        this.fetchOwners.delete(tabId)
+                    }
+                }
+            }
+        }
+        const cleanup = previous.then(disposeControllers, disposeControllers)
+        this.ownerReleases.set(owner, cleanup)
+        void cleanup.then(
+            () => {
+                if (this.ownerReleases.get(owner) === cleanup) {
+                    this.ownerReleases.delete(owner)
+                    this.ownerReleaseFailures.delete(owner)
+                }
+            },
+            () => {
+                if (this.ownerReleases.get(owner) === cleanup) {
+                    this.ownerReleases.delete(owner)
+                    this.ownerReleaseFailures.add(owner)
+                }
+            }
+        )
+        return cleanup
     }
 
     private key(tabId: number, owner: string): string {

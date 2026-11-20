@@ -8,11 +8,20 @@ import './review-c31-wheel.test.js';
 import './review-c31-cookies.test.js';
 import './review-c31f2-cookies.test.js';
 import './review-c31f3-management.test.js';
+// Vite raw imports expose source strings.
+// noinspection JSUnresolvedReference
 import tabStateSource from '../src/background/tab-state.ts?raw';
+// Vite raw imports expose source strings for isolated Worker reloads.
+// noinspection JSUnresolvedReference
+import tabHandlerSource from '../src/background/tab-handler.ts?raw';
+// Vite raw imports expose source strings.
+// noinspection JSUnresolvedReference
 import backgroundSource from '../src/background/index.ts?raw';
 
 import { ActionHandler } from '../src/background/actions.ts';
+import { BrowserEventHandler } from '../src/background/browser-event-handler.ts';
 import {
+    assertActionActive,
     assertManagedTab,
     assertReadableTab,
     assertScriptable,
@@ -20,20 +29,27 @@ import {
     getTargetTabId,
     probeCdpFrameOwner,
     recordDomFrameProbe,
+    tabToInfo,
 } from '../src/background/action-utils.ts';
 import { ContentHandler } from '../src/background/content-handler.ts';
 import { CookieHandler } from '../src/background/cookie-handler.ts';
 import { DebuggerBlockedError, DebuggerManager } from '../src/background/debugger-manager.ts';
 import { DebuggerHandler } from '../src/background/debugger-handler.ts';
 import { FrameResolver } from '../src/background/frame-resolver.ts';
-import { ExpectedOperationError } from '../src/types/expected-errors.ts';
+import { ExpectedOperationError, isExpectedOperationError, wrapDebuggerError } from '../src/types/expected-errors.ts';
 import { HttpClient } from '../src/background/http-client.ts';
 import { InputEventHandler } from '../src/background/input-event-handler.ts';
 import { StealthHandler } from '../src/background/stealth-handler.ts';
 import { LogEventHandler } from '../src/background/log-event-handler.ts';
 import { LogManager } from '../src/background/log-manager.ts';
 import { NavigationHandler } from '../src/background/navigation-handler.ts';
-import { advancePageRevision, forgetPageRevision, pageSnapshot } from '../src/background/page-revision.ts';
+import {
+    advancePageRevision,
+    forgetPageRevision,
+    getExistingTab,
+    pageRevision,
+    pageSnapshot,
+} from '../src/background/page-revision.ts';
 import {
     hasReadGrant,
     readGrantDocumentId,
@@ -68,7 +84,16 @@ import {
     setMcpWindowId,
     unmarkManagedTab,
 } from '../src/background/tab-state.ts';
-import { EvaluateSchema, FindSchema, InputTypeSchema, NavigateSchema } from '../src/types/schemas.ts';
+import {
+    EvaluateSchema,
+    FindSchema,
+    InputTypeSchema,
+    NavigateSchema,
+    TabGroupUpdateSchema,
+    TabsCreateSchema,
+    TabsMetadataSchema,
+    ViewportMetricsSchema,
+} from '../src/types/schemas.ts';
 
 /**
  * @param {Partial<import('../src/background/action-utils.ts').ActionContext>} [overrides]
@@ -117,6 +142,30 @@ async function isolatedManagedTabs(chrome, warnings = []) {
     );
 }
 
+async function isolatedTabHandler(chrome, warnings = []) {
+    const state = await isolatedManagedTabs(chrome, warnings);
+    await state.restoreManagedTabs();
+    const snapshot = vm.runInNewContext(`(${tabToInfo.toString()})`, { ...state, pageRevision });
+    const { TabHandler: Handler } = await isolatedBackgroundSource(
+        tabHandlerSource,
+        {
+            chrome,
+            URL: globalThis.URL,
+            ...state,
+            ExpectedOperationError,
+            TabGroupUpdateSchema,
+            TabsCreateSchema,
+            TabsMetadataSchema,
+            assertActionActive,
+            getExistingTab,
+            tabToInfo: snapshot,
+            console: { ...globalThis.console, warn: (...args) => warnings.push(args) },
+        },
+        ['TabHandler']
+    );
+    return { state, handler: new Handler({}) };
+}
+
 test('Static-analysis schema updates retain finite deadlines and coordinates', () => {
     for (const { schema, base } of [
         { schema: NavigateSchema, base: { url: 'https://example.com/owned' } },
@@ -127,6 +176,36 @@ test('Static-analysis schema updates retain finite deadlines and coordinates', (
             assert.equal(schema.safeParse({ ...base, deadline: value }).success, false);
         }
     }
+    for (const value of [NaN, Infinity, -Infinity]) {
+        assert.equal(
+            ViewportMetricsSchema.safeParse({ pointerProbe: { operation: 'start', id: 'owned', since: value } })
+                .success,
+            false
+        );
+        for (const axis of ['x', 'y']) {
+            assert.equal(
+                ViewportMetricsSchema.safeParse({
+                    pointerProbe: {
+                        operation: 'start',
+                        id: 'owned',
+                        position: { x: 0, y: 0, [axis]: value },
+                    },
+                }).success,
+                false
+            );
+        }
+    }
+    assert.equal(
+        ViewportMetricsSchema.safeParse({
+            pointerProbe: {
+                operation: 'start',
+                id: 'owned',
+                since: 0,
+                position: { x: -1, y: 0 },
+            },
+        }).success,
+        true
+    );
     assert.equal(FindSchema.safeParse({ point: { x: -1, y: 0 } }).success, true);
     for (const value of [NaN, Infinity, -Infinity]) {
         assert.equal(FindSchema.safeParse({ point: { x: value, y: 0 } }).success, false);
@@ -209,6 +288,8 @@ test('F1 unavailable native identity preserves actual create and adopt contracts
         console: { ...globalThis.console, warn: (...args) => warnings.push(args) },
     });
     try {
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         assert.equal((await handler.tabsAdopt({ tabId: 5001 })).managedAfter, true);
         const created = await handler.tabsCreate({ windowId: 20 }, createActionContext());
@@ -312,7 +393,7 @@ test('F1 migration cleanup failure is visible and local revocation remains autho
     ]);
 });
 
-async function isolatedBackground(fixture) {
+async function isolatedBackground(fixture, runAction) {
     const errors = [];
     const warnings = [];
     const clients = [];
@@ -337,6 +418,7 @@ async function isolatedBackground(fixture) {
     const state = await isolatedManagedTabs(fixture.chrome, warnings);
     await isolatedBackgroundSource(backgroundSource, {
         chrome: fixture.chrome,
+        Error,
         console: {
             ...globalThis.console,
             error: (...args) => errors.push(args),
@@ -366,6 +448,7 @@ async function isolatedBackground(fixture) {
             }
 
             disconnect() {
+                // noinspection JSUnresolvedReference -- disconnects is declared on the injected HttpClient fixture.
                 ++this.disconnects;
             }
 
@@ -400,6 +483,9 @@ async function isolatedBackground(fixture) {
         ActionHandler: class {
             async execute(...args) {
                 executions.push(args);
+                if (runAction) {
+                    return runAction(...args);
+                }
                 return { managed: state.isManagedTab({ id: 5001 }) };
             }
 
@@ -409,7 +495,7 @@ async function isolatedBackground(fixture) {
 
             cleanupTab() {}
         },
-        isExpectedOperationError: () => false,
+        isExpectedOperationError,
         advancePageRevision() {},
         forgetPageRevision() {},
         getExistingTab: async (id) => fixture.tabs.get(id),
@@ -487,6 +573,8 @@ test('F5 failed initialization blocks actions and the next keepalive retries res
     assert.equal(background.executions.length, 0);
     assert.equal(background.client.responses.at(-1)[1], false);
     assert.match((await background.message({ type: 'GET_STATUS', tabId: 5001 })).error, /initialization refused/);
+    assert.match((await background.message({ type: 'CONNECT' })).error, /initialization refused/);
+    assert.equal(background.client.connections, 0);
     fixture.chrome.storage.local.get = get;
     fixture.chrome.alarms.onAlarm.emit({ name: 'mcp-keepalive' });
     await waitUntil(() => background.client.connections === 1);
@@ -499,7 +587,7 @@ test('F5 failed initialization blocks actions and the next keepalive retries res
 });
 
 test('MH-CH-02 pause restoration retries in the same worker and preserves explicit choices', async (t) => {
-    for (const recovery of ['status', 'keepalive']) {
+    for (const recovery of ['connect', 'status', 'keepalive']) {
         await t.test(recovery, async () => {
             const fixture = createTabManagementFixture();
             const get = fixture.chrome.storage.session.get;
@@ -513,12 +601,16 @@ test('MH-CH-02 pause restoration retries in the same worker and preserves explic
             const background = await isolatedBackground(fixture);
             await waitUntil(() => background.errors.length > 0);
             assert.equal(background.client.connections, 0);
-            if (recovery === 'status') {
-                assert.equal((await background.message({ type: 'GET_STATUS' })).paused, false);
+            if (recovery === 'connect') {
+                await background.message({ type: 'CONNECT' });
+            } else {
+                if (recovery === 'status') {
+                    assert.equal((await background.message({ type: 'GET_STATUS' })).paused, false);
+                }
+                fixture.chrome.alarms.onAlarm.emit({ name: 'mcp-keepalive' });
             }
-            fixture.chrome.alarms.onAlarm.emit({ name: 'mcp-keepalive' });
             await waitUntil(() => background.client.connections === 1);
-            assert.equal(reads, 2);
+            assert.equal(reads, recovery === 'connect' ? 1 : 2);
             assert.equal((await background.message({ type: 'DISCONNECT' })).success, true);
             assert.equal(background.client.disconnects, 1);
             assert.equal(fixture.chrome.storage.sessionValues.mcp_connection_paused, true);
@@ -766,6 +858,9 @@ test('ER-03 debugger failures retain native context without replay or parameter 
             });
             try {
                 await markManagedTab(tab.id);
+                // This case supplies only the DebuggerManager methods its path consumes. This case supplies only the
+                // LogManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler = new DebuggerHandler({ ensureAttached: async () => {} }, {});
                 await assert.rejects(
                     () =>
@@ -819,6 +914,8 @@ test('ER-04 iframe result serialization failures retain identity and never repla
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const resolver = new FrameResolver({
             ensureAttached: async () => {},
             getExecutionContexts: () => [{ frameId: 'owned-cdp-frame', id: 3, isDefault: true }],
@@ -868,6 +965,7 @@ test('ER-05 discovery summaries follow complete port sets, resets and active gen
                 checked.push(port);
                 return { healthy: ports.includes(port) };
             };
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             assert.deepEqual(await client.discoverServers(client.generation), ports);
             assert.deepEqual(
                 checked,
@@ -881,20 +979,27 @@ test('ER-05 discovery summaries follow complete port sets, resets and active gen
         assert.match(output[3], /19222/);
         client.disconnect();
         client.shouldReconnect = true;
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
         assert.equal(output.length, 5);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         const oldGeneration = client.generation;
         const pending = createDeferred();
         client.checkPort = async (port) => (port === 19222 ? pending.promise : { healthy: false });
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         const stale = client.discoverServers(oldGeneration);
         client.disconnect();
         client.shouldReconnect = true;
         client.checkPort = async (port) => ({ healthy: port === 19223 });
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         const activeSummary = client.lastDiscoverySummary;
         pending.resolve({ healthy: false, failureKind: 'protocol', reason: 'stale failure' });
         assert.deepEqual(await stale, []);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.lastDiscoverySummary, activeSummary);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.lastServerFailureSummary, '');
         assert.equal(
             output.some((text) => text.includes('stale failure')),
@@ -911,6 +1016,11 @@ test('ER-08 both parent probe paths use the new protocol and clean pending ident
     const childListeners = new Set();
     const packets = [];
     let dropReplies = false;
+    let frameScale = 1;
+    let motionPath = 'none';
+    let motionRotate = 'auto';
+    let motionOnAncestor = false;
+    const frameAncestor = { getRootNode: () => ({}) };
     let awaitFailure = false;
     let scriptAwaitFailure = false;
     const pageTimer = () => assert.fail('frame probes must use the Extension timer');
@@ -952,6 +1062,8 @@ test('ER-08 both parent probe paths use the new protocol and clean pending ident
     };
     const frame = {
         id: 'owned',
+        parentElement: frameAncestor,
+        getRootNode: () => ({}),
         nodeType: 1,
         tagName: 'IFRAME',
         childNodes: [],
@@ -976,6 +1088,18 @@ test('ER-08 both parent probe paths use the new protocol and clean pending ident
     });
     const parentContext = vm.createContext({
         window: parent,
+        getComputedStyle: (node) => ({
+            transform: 'none',
+            scale: String(frameScale),
+            zoom: '1',
+            offsetPath: (node === frameAncestor) === motionOnAncestor ? motionPath : 'none',
+            offsetRotate: motionRotate,
+        }),
+        DOMMatrix: class {
+            constructor() {
+                Object.assign(this, { is2D: true, a: 1, b: 0, c: 0, d: 1 });
+            }
+        },
         document: { title: 'owned', childNodes: [frame], querySelector: () => frame, querySelectorAll: () => [frame] },
         CSS: { escape: (value) => value },
         location: { href: tab.url },
@@ -1039,7 +1163,11 @@ test('ER-08 both parent probe paths use the new protocol and clean pending ident
                     assert.equal(method, 'Runtime.callFunctionOn');
                     parentContext.probeArgs = (params.arguments ?? []).map(({ value }) => value);
                     const value = vm.runInContext(
-                        `(${params.functionDeclaration}).apply(${params.objectId === 'owned-owner' ? 'owner' : 'probePromise'}, probeArgs)`,
+                        '(' +
+                            `${params.functionDeclaration}` +
+                            ').apply(' +
+                            `${params.objectId === 'owned-owner' ? 'owner' : 'probePromise'}` +
+                            ', probeArgs)',
                         parentContext
                     );
                     if (params.returnByValue === false) {
@@ -1069,6 +1197,24 @@ test('ER-08 both parent probe paths use the new protocol and clean pending ident
         assert.equal(released, 2);
         assert.equal(parentContext.probePromise, undefined);
         assert.equal(parentContext.__mcpDomFrameProbes, undefined);
+        assert.equal(snapshot.frames[0].translationOnly, true);
+        frameScale = 2;
+        assert.equal((await getDomFrameSnapshot(tab.id, 0)).frames[0].translationOnly, false);
+        frameScale = 1;
+        for (const onAncestor of [false, true]) {
+            motionOnAncestor = onAncestor;
+            motionPath = 'path("M 0 0 L 200 100")';
+            for (const rotate of ['auto', 'auto 0deg', '0deg auto', 'reverse', '30deg', '0deg', '0rad']) {
+                await t.test(`motion path ${onAncestor ? 'ancestor' : 'frame'} ${rotate}`, async () => {
+                    motionRotate = rotate;
+                    const translated = (await getDomFrameSnapshot(tab.id, 0)).frames[0].translationOnly;
+                    assert.equal(translated, rotate === '0deg' || rotate === '0rad');
+                    assert.equal(parentListeners.size, 0);
+                    assert.equal(parentContext.__mcpDomFrameProbes, undefined);
+                });
+            }
+        }
+        motionPath = 'none';
         dropReplies = true;
         for (const path of ['dom', 'owner']) {
             for (const outcome of ['timeout', 'cancel', 'deadline', 'await-error']) {
@@ -1080,6 +1226,7 @@ test('ER-08 both parent probe paths use the new protocol and clean pending ident
                     });
                     awaitFailure = outcome === 'await-error' && path === 'owner';
                     scriptAwaitFailure = outcome === 'await-error' && path === 'dom';
+                    // noinspection ES6MissingAwait -- 先启动请求，再触发取消并等待同一 Promise
                     const operation =
                         path === 'dom'
                             ? getDomFrameSnapshot(tab.id, 0, undefined, undefined, undefined, context)
@@ -1215,10 +1362,13 @@ test('ER-08a listener installation respects request limits and preserves unavail
                     }),
                 ]);
                 assert.notEqual(result, 'pending');
+                assert.ok(result && typeof result === 'object');
                 if (outcome === 'timeout' && path === 'dom') {
+                    assert.ok('value' in result);
                     assert.equal(parentProbes, 1);
                     assert.match(result.value.unavailableFrames[0].error, /listener installation timed out/);
                 } else {
+                    assert.ok('error' in result);
                     assert.equal(parentProbes, 0);
                     assert.match(
                         result.error.message,
@@ -1276,6 +1426,7 @@ test('ER-09 late navigation snapshots and read grants share the native missing-t
     };
     try {
         await markManagedTab(tab.id);
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         await assert.rejects(() => new NavigationHandler({}).reload({ tabId: tab.id }, createActionContext()), missing);
         assert.equal(reloads, 1);
         await assert.rejects(() => readGrantDocumentId('owned-closed-grant', tab.id), missing);
@@ -1288,6 +1439,307 @@ test('ER-09 late navigation snapshots and read grants share the native missing-t
     }
 });
 
+test('Fetch configuration keeps each queued Extension request cancellation and deadline', async (t) => {
+    for (const boundary of ['cancelled', 'deadline']) {
+        for (const operation of ['raw-enable', 'raw-disable', 'route', 'httpAuth', 'download']) {
+            await t.test(`${boundary}/${operation}`, async (st) => {
+                let clock = Date.now();
+                st.mock.method(Date, 'now', () => clock);
+                const tab = { id: 9931, url: 'https://example.com/fetch-scope' };
+                const blocked = createDeferred();
+                const calls = [];
+                let consume;
+                const restore = installGlobals({
+                    chrome: {
+                        storage: createStorage(),
+                        tabs: { get: async () => tab, query: async () => [] },
+                        debugger: {
+                            sendCommand: async (_target, method, params) => {
+                                calls.push({ method, params });
+                                return calls.length === 1 ? blocked.promise : {};
+                            },
+                        },
+                    },
+                });
+                const events = new BrowserEventHandler({
+                    addEventConsumer: (callback) => {
+                        consume = callback;
+                    },
+                    ensureAttached: async () => {},
+                });
+                const fresh = createActionContext();
+                const abort = new AbortController();
+                const context = createActionContext({ signal: abort.signal, deadline: clock + 10000 });
+                let first;
+                let queued;
+                try {
+                    await markManagedTab(tab.id);
+                    first = events.rawFetch(
+                        tab.id,
+                        'Fetch.enable',
+                        {
+                            patterns: [{ urlPattern: 'https://example.com/prior' }],
+                            handleAuthRequests: true,
+                        },
+                        fresh
+                    );
+                    await waitUntil(() => calls.length === 1);
+                    if (operation.startsWith('raw-')) {
+                        queued = events.rawFetch(
+                            tab.id,
+                            operation === 'raw-enable' ? 'Fetch.enable' : 'Fetch.disable',
+                            {
+                                patterns: [{ urlPattern: 'https://example.com/rejected' }],
+                            },
+                            context
+                        );
+                    } else {
+                        const command =
+                            operation === 'route'
+                                ? { op: 'add', urlPattern: 'https://example.com/rejected' }
+                                : operation === 'httpAuth'
+                                  ? {
+                                        op: 'set',
+                                        scope: { source: 'Server', origin: 'https://example.com' },
+                                        username: 'synthetic',
+                                        password: 'synthetic',
+                                    }
+                                  : { op: 'watch' };
+                        queued = events.execute({ tabId: tab.id, action: operation, command }, context);
+                    }
+                    const rejected = assert.rejects(queued, (error) => {
+                        assert.ok(error instanceof ExpectedOperationError);
+                        assert.equal(error.actionExecuted, false);
+                        const payload = JSON.parse(error.message).error;
+                        assert.equal(payload.code, boundary === 'cancelled' ? 'REQUEST_CANCELLED' : 'TIMEOUT');
+                        assert.equal(payload.context.actionStatus, 'not_started');
+                        return true;
+                    });
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    assert.equal(calls.length, 1);
+                    if (boundary === 'cancelled') {
+                        abort.abort();
+                    } else {
+                        clock += 10001;
+                    }
+                    blocked.resolve({ nativeResult: 'prior' });
+                    assert.deepEqual(await first, { nativeResult: 'prior' });
+                    await rejected;
+                    assert.equal(calls.length, 1);
+                    const state = await events.execute(
+                        { tabId: tab.id, action: 'read', command: { type: 'network' } },
+                        fresh
+                    );
+                    assert.equal(state.routes, 1);
+                    assert.equal(state.fetchEnabled, true);
+                    assert.equal(state.authConfigured, false);
+                    assert.equal(state.downloadWatching, false);
+                    consume(tab.id, 'Fetch.requestPaused', {
+                        requestId: 'prior',
+                        request: { url: 'https://example.com/prior' },
+                    });
+                    const paused = await events.execute(
+                        { tabId: tab.id, action: 'read', command: { type: 'network', view: 'paused' } },
+                        fresh
+                    );
+                    assert.equal(paused.logs[0].state, 'pending');
+                    await events.rawFetch(tab.id, 'Fetch.continueRequest', { requestId: 'prior' }, fresh);
+                } finally {
+                    blocked.resolve({});
+                    await first?.catch(() => {});
+                    await queued?.catch(() => {});
+                    await events.cleanupTab(tab.id);
+                    await unmarkManagedTab(tab.id);
+                    restore();
+                }
+            });
+        }
+    }
+});
+
+test('Extension Fetch preserves native unknown errors and later event observation after request cancellation', async () => {
+    const tab = { id: 9932, url: 'https://example.com/fetch-unknown' };
+    const native = createDeferred();
+    const calls = [];
+    let consume;
+    const restore = installGlobals({
+        chrome: {
+            storage: createStorage(),
+            tabs: { get: async () => tab, query: async () => [] },
+            debugger: {
+                sendCommand: async (_target, method, params) => {
+                    calls.push({ method, params });
+                    return calls.length === 1 ? native.promise : {};
+                },
+            },
+        },
+    });
+    const events = new BrowserEventHandler({
+        addEventConsumer: (callback) => {
+            consume = callback;
+        },
+        ensureAttached: async () => {},
+    });
+    const abort = new AbortController();
+    const context = createActionContext({ signal: abort.signal });
+    const failure = Error('owned native acknowledgement lost');
+    let pending;
+    try {
+        await markManagedTab(tab.id);
+        pending = events.rawFetch(
+            tab.id,
+            'Fetch.enable',
+            { patterns: [{ urlPattern: 'https://example.com/owned' }] },
+            context
+        );
+        const rejected = assert.rejects(pending, (error) => error === failure);
+        await waitUntil(() => calls.length === 1);
+        abort.abort();
+        native.reject(failure);
+        await rejected;
+        const fresh = createActionContext();
+        const state = await events.execute({ tabId: tab.id, action: 'read', command: { type: 'network' } }, fresh);
+        assert.equal(state.routes, 1);
+        assert.equal(state.fetchEnabled, true);
+        consume(tab.id, 'Fetch.requestPaused', {
+            requestId: 'unmatched',
+            request: { url: 'https://example.com/unmatched' },
+        });
+        await waitUntil(() => calls.some((call) => call.method === 'Fetch.continueRequest'));
+        const authAbort = new AbortController();
+        await events.execute(
+            {
+                tabId: tab.id,
+                action: 'httpAuth',
+                command: {
+                    op: 'set',
+                    scope: { source: 'Server', origin: 'https://example.com' },
+                    username: 'synthetic',
+                    password: 'synthetic',
+                },
+            },
+            createActionContext({ signal: authAbort.signal })
+        );
+        authAbort.abort();
+        consume(tab.id, 'Fetch.authRequired', {
+            requestId: 'auth-after-request',
+            request: { url: 'https://example.com/auth' },
+            authChallenge: { source: 'Server', origin: 'https://example.com', realm: 'owned' },
+        });
+        await waitUntil(() => calls.some((call) => call.method === 'Fetch.continueWithAuth'));
+        assert.equal(
+            calls.find((call) => call.method === 'Fetch.continueWithAuth').params.authChallengeResponse.response,
+            'ProvideCredentials'
+        );
+    } finally {
+        native.resolve({});
+        await pending?.catch(() => {});
+        await events.cleanupTab(tab.id);
+        await unmarkManagedTab(tab.id);
+        restore();
+    }
+});
+
+const EXPECTED_ACTION_REFUSALS = [
+    ['console_enable', 'Cannot access a chrome:// URL'],
+    ['browser_events', 'Dialog is no longer pending'],
+    ['browser_events', 'Browser event ref kind does not match the requested view'],
+    ['browser_events', 'Browser event ref expired, evicted, or belongs to another owner/page/session'],
+    [
+        'cookies_set',
+        'partitionKey has a first party value for hasCrossSiteAncestor when the url and the topLevelSite are not first party.',
+    ],
+    ['challenge_inspect', 'Frame with ID 0 was removed'],
+];
+
+test('ER-10 expected refusal classification requires the matching action and complete message', () => {
+    for (const [action, message] of EXPECTED_ACTION_REFUSALS) {
+        const failure = Object.freeze(new Error(message));
+        assert.equal(isExpectedOperationError(failure, action), true, action);
+        for (const otherAction of [
+            undefined,
+            'evaluate',
+            'evaluate_in_frame',
+            'debugger_send',
+            'cookies_get',
+            ...EXPECTED_ACTION_REFUSALS.map(([candidate]) => candidate).filter((candidate) => candidate !== action),
+        ]) {
+            assert.equal(isExpectedOperationError(failure, otherAction), false, `${action}/${otherAction}`);
+        }
+        for (const otherMessage of [`prefix: ${message}`, `${message} suffix`]) {
+            assert.equal(isExpectedOperationError(new Error(otherMessage), action), false, otherMessage);
+        }
+        assert.equal(isExpectedOperationError(message, action), false);
+        assert.equal(isExpectedOperationError({ message }, action), false);
+        assert.equal(failure.message, message);
+        assert.equal(failure.constructor, Error);
+    }
+    assert.equal(isExpectedOperationError(new Error('Frame with ID 23 was removed.'), 'challenge_inspect'), true);
+    assert.equal(isExpectedOperationError(new Error('Frame with ID unknown was removed'), 'challenge_inspect'), false);
+    assert.equal(isExpectedOperationError(new Error('unexpected internal error'), 'browser_events'), false);
+    const expected = new ExpectedOperationError('owned expected refusal', false);
+    assert.equal(isExpectedOperationError(expected), true);
+    assert.equal(isExpectedOperationError(expected, 'evaluate'), true);
+    assert.equal(expected.actionExecuted, false);
+});
+
+test('ER-11 background logs consume the action and preserve failed replies and error identity', async (t) => {
+    const native = new Error('Execution was terminated');
+    const terminated = wrapDebuggerError(native, { tabId: 5001, method: 'Runtime.evaluate', phase: 'command' });
+    assert.equal(terminated.cause, native);
+    assert.equal(JSON.parse(terminated.message).error.context.reason, 'command_failed');
+    const structured = {
+        error: {
+            code: 'OWNED_REJECTION',
+            message: 'Dialog is no longer pending',
+            context: { actionStatus: 'not_executed', actionExecuted: false, retryable: false },
+        },
+    };
+    const serialized = new ExpectedOperationError(JSON.stringify(structured), false);
+    const withPayload = Object.assign(new Error(structured.error.message), { toJSON: () => structured });
+    const cases = [
+        ...EXPECTED_ACTION_REFUSALS.map(([action, message]) => [action, new Error(message), true]),
+        ...EXPECTED_ACTION_REFUSALS.map(([, message]) => ['evaluate', new Error(message), false]),
+        ['evaluate', new ExpectedOperationError('owned expected refusal', false), true],
+        ['evaluate', serialized, true],
+        ['browser_events', withPayload, true, JSON.stringify(structured)],
+        ['browser_events', new Error('unexpected internal error'), false],
+        ['console_enable', new Error('Cannot access a chrome:// URL: unexpected suffix'), false],
+        ['console_enable', terminated, false],
+        ['debugger_send', terminated, false],
+    ];
+    for (const [action, failure, expected, payload = failure.message] of cases) {
+        await t.test(`${action}/${failure.message}`, async () => {
+            const before = Object.getOwnPropertyDescriptors(failure);
+            Object.freeze(failure);
+            const frozen = Object.getOwnPropertyDescriptors(failure);
+            const background = await isolatedBackground(createTabManagementFixture(), async () => {
+                throw failure;
+            });
+            const params = { owned: 'unchanged' };
+            await background.client.message({ id: 'owned-failure', action, params }, 19222);
+            assert.equal(background.executions.length, 1);
+            assert.equal(background.executions[0][0], action);
+            assert.equal(background.executions[0][1], params);
+            assert.deepEqual(background.client.responses, [['owned-failure', false, null, payload, 19222]]);
+            if (expected) {
+                assert.deepEqual(background.warnings, [[`[MCP] ${action}: ${failure.message}`]]);
+                assert.deepEqual(background.errors, []);
+            } else {
+                assert.deepEqual(background.warnings, []);
+                assert.equal(background.errors.length, 1);
+                assert.equal(background.errors[0][0], `[MCP] Error executing ${action}:`);
+                assert.equal(background.errors[0][1], failure);
+            }
+            assert.deepEqual(Object.getOwnPropertyDescriptors(failure), frozen);
+            assert.equal(failure.message, before.message.value);
+        });
+    }
+    assert.equal(serialized.actionExecuted, false);
+    assert.deepEqual(JSON.parse(serialized.message), structured);
+    assert.deepEqual(withPayload.toJSON(), structured);
+});
+
 test('CR-01 explicit window display changes do not inherit page permissions', async (t) => {
     for (const managedIds of [[], [5001], [5001, 5002]]) {
         await t.test(`managed-${managedIds.length}`, async () => {
@@ -1297,6 +1749,8 @@ test('CR-01 explicit window display changes do not inherit page permissions', as
                 for (const id of managedIds) {
                     await markManagedTab(id);
                 }
+                // This case supplies only the NavigationHandler methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler = new TabHandler({});
                 const focused = await handler.windowFocus({ windowId: 10 }, createActionContext());
                 assert.equal(focused.after.focused, true);
@@ -1345,6 +1799,8 @@ test('CR-02 default creation ignores stale caches and reports native enumeration
                         throw new Error('window query refused');
                     };
                 }
+                // This case supplies only the NavigationHandler methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const operation = () => new TabHandler({}).tabsCreate({}, { mcpWindowId: 10, mcpTabGroupId: null });
                 if (scenario === 'lookup-error') {
                     await assert.rejects(operation, /window query refused/);
@@ -1413,7 +1869,9 @@ test('CR-03 mixed group display updates preserve individual page authority', asy
         assert.equal(unmanaged.after[0].title, 'Unmanaged display');
         assert.ok(unmanaged.tabsAfter.every((tab) => !tab.managed));
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         for (const id of fixture.tabs.keys()) {
@@ -1430,7 +1888,11 @@ test('CR-04 group display and selected-member operations tolerate unrelated sibl
             const restore = installGlobals({ chrome: fixture.chrome });
             const gate = createDeferred();
             const entered = createDeferred();
+            const displayGate = createDeferred();
+            let displayStarted = false;
             let handler;
+            let blocking;
+            let changing;
             try {
                 for (const id of [5001, 5002]) {
                     await markManagedTab(id);
@@ -1439,29 +1901,58 @@ test('CR-04 group display and selected-member operations tolerate unrelated sibl
                 if (action !== 'tabgroup_add') {
                     Object.assign(fixture.tabs.get(5001), { groupId: 77, windowId: 20 });
                 }
+                if (action === 'tabgroup_update') {
+                    const update = fixture.chrome.tabGroups.update;
+                    fixture.chrome.tabGroups.update = async (id, properties) => {
+                        displayStarted = true;
+                        await displayGate.promise;
+                        return update(id, properties);
+                    };
+                }
                 handler = new ActionHandler();
                 handler.actions.set('navigate', async () => {
                     entered.resolve();
                     await gate.promise;
                 });
-                const blocking = handler.execute('navigate', { tabId: 5001 }, createActionContext());
+                blocking = handler.execute('navigate', { tabId: 5001 }, createActionContext());
                 await entered.promise;
                 const params =
                     action === 'tabgroup_update'
                         ? { groupId: 77, title: 'Changed display' }
                         : { tabIds: [5001], ...(action === 'tabgroup_add' ? { groupId: 77 } : {}) };
-                const changing = handler.execute(action, params, createActionContext());
+                changing = handler.execute(action, params, createActionContext());
                 changing.catch(() => {});
-                await waitUntil(() => handler.actionLocks.has(5003));
+                await waitUntil(() => (action === 'tabgroup_update' ? displayStarted : handler.actionLocks.has(5003)));
                 fixture.tabs.get(5003).groupId = -1;
+                displayGate.resolve();
+                if (action === 'tabgroup_update') {
+                    const result = await changing;
+                    assert.equal(
+                        result.tabsBefore.some((tab) => tab.id === 5003),
+                        true
+                    );
+                    assert.equal(
+                        result.tabsAfter.some((tab) => tab.id === 5003),
+                        false
+                    );
+                    assert.equal(fixture.groups.get(77).title, 'Changed display');
+                    assert.equal(handler.actionLocks.has(5001), true);
+                    assert.equal(handler.actionLocks.has(5003), false);
+                }
                 gate.resolve();
                 await blocking;
                 assert.equal((await changing).success, true);
                 assert.equal(isManagedTab({ id: 5003 }), false);
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 assert.equal(handler.actionLocks.size, 0);
             } finally {
                 gate.resolve();
+                displayGate.resolve();
+                await Promise.allSettled([blocking, changing].filter(Boolean));
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 if (handler?.logManager.sweepTimer) {
+                    // White-box lifecycle state; production members remain private.
+                    // noinspection JSUnresolvedReference
                     globalThis.clearInterval(handler.logManager.sweepTimer);
                 }
                 for (const id of fixture.tabs.keys()) {
@@ -1484,6 +1975,9 @@ test('CR-05 debugger accepts controlled blank pages without weakening restricted
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
         await markManagedTab(5001);
+        // This case supplies only the DebuggerManager methods its path consumes. This case supplies only the LogManager
+        // methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new DebuggerHandler(
             {
                 ensureAttached: async () => {
@@ -1583,6 +2077,8 @@ test('CR-06 a failed sibling probe does not block a uniquely verified selected f
                     snapshot.unavailableFrames[0].error,
                     failure === 'missing-document' ? /documentId/ : /disappeared/
                 );
+                // This case supplies only the DebuggerManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 await assert.rejects(
                     () => new FrameResolver({}).resolveFrame({ tabId: tab.id, frame: '#bad' }, createActionContext()),
                     /FRAME_IDENTITY_UNAVAILABLE/
@@ -1710,10 +2206,14 @@ test('CE-N02 group operations serialize release in both orders and recheck membe
                     await Promise.all([blocking, failure]);
                     assert.equal(moved, 0);
                 }
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 assert.equal(handler.actionLocks.size, 0);
             } finally {
                 gate.resolve();
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 if (handler?.logManager.sweepTimer) {
+                    // White-box lifecycle state; production members remain private.
+                    // noinspection JSUnresolvedReference
                     globalThis.clearInterval(handler.logManager.sweepTimer);
                 }
                 for (const id of fixture.tabs.keys()) {
@@ -1749,9 +2249,11 @@ test(
             await markManagedTab(5001);
             handler = new ActionHandler();
             const commands = [];
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             handler.debuggerManager.ensureAttached = async () => {
                 commands.push('attach');
             };
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             handler.debuggerManager.isAttached = () => true;
             fixture.chrome.debugger.sendCommand = async ({ tabId }, method) => {
                 commands.push(method);
@@ -1828,7 +2330,9 @@ test(
                 /观测已中断/
             );
         } finally {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             if (handler?.logManager.sweepTimer) {
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 globalThis.clearInterval(handler.logManager.sweepTimer);
             }
             await unmarkManagedTab(5001);
@@ -1874,6 +2378,8 @@ test('CS-N04 Extension key deadlines survive schemas, preparation and final ackn
                             }
                         },
                     };
+                    // This case supplies only the DebuggerManager methods its path consumes.
+                    // noinspection JSCheckFunctionSignatures
                     const handler = mode === 'precise' ? new InputEventHandler(manager) : new StealthHandler();
                     if (mode === 'stealth' && scenario === 'expired-preparation') {
                         now = 1101;
@@ -2069,6 +2575,8 @@ test('C22 attach conflicts recover only a proven debugger session owned by this 
                 },
             });
             try {
+                // This case supplies only the LogManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const manager = new DebuggerManager({});
                 const results = await Promise.allSettled([manager.ensureAttached(1), manager.ensureAttached(1)]);
                 assert.equal(attaches, 1);
@@ -2112,9 +2620,12 @@ async function withKeyboardFocusFixture(run) {
     const handler = new ActionHandler();
     try {
         await markManagedTab(5001);
+        // White-box lifecycle state; production members remain private.
+        // noinspection JSUnresolvedReference
         await run({
             ...fixture,
             handler,
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             manager: handler.debuggerManager,
             commands,
             recover: () => {
@@ -2123,6 +2634,7 @@ async function withKeyboardFocusFixture(run) {
         });
     } finally {
         handler.cleanupTab(5001);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         globalThis.clearInterval(handler.logManager.sweepTimer);
         await unmarkManagedTab(5001);
         restore();
@@ -2531,6 +3043,7 @@ test('C22 cleanup invalidates an ownership probe without removing a replacement 
         },
     });
     try {
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         const manager = new DebuggerManager({});
         const first = manager.ensureAttached(1);
         await waitUntil(() => probes === 1);
@@ -2568,6 +3081,7 @@ test('C22 non-conflict attach errors retain the original error without probing',
         },
     });
     try {
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         const manager = new DebuggerManager({});
         await assert.rejects(
             () => manager.ensureAttached(1),
@@ -2595,6 +3109,7 @@ test('C31F6 debugger context lifecycle isolates equal context IDs across child s
         },
     });
     try {
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         const manager = new DebuggerManager({ handleEvent() {}, handleDebuggerDetach() {} });
         manager.setupListeners();
         await manager.ensureAttached(1);
@@ -2632,6 +3147,87 @@ test('C31F6 debugger context lifecycle isolates equal context IDs across child s
         );
         manager.cleanupTab(1);
         assert.deepEqual(manager.getExecutionContexts(1), []);
+    } finally {
+        restore();
+    }
+});
+
+test('C31F6 parent debugger detach removes descendant sessions and contexts before the next frame probe', async () => {
+    const onEvent = chromeEvent();
+    const onDetach = chromeEvent();
+    const detached = new Set();
+    const commands = [];
+    const restore = installGlobals({
+        chrome: {
+            debugger: {
+                onEvent,
+                onDetach,
+                attach: async () => {},
+                async sendCommand(target, method) {
+                    commands.push({ ...target, method });
+                    if (method === 'Target.setAutoAttach' && detached.has(target.sessionId)) {
+                        throw new Error('Session with given id not found.');
+                    }
+                    return {};
+                },
+            },
+        },
+    });
+    try {
+        // noinspection JSCheckFunctionSignatures -- 仅提供本路径使用的 LogManager 方法
+        const manager = new DebuggerManager({ handleEvent() {}, handleDebuggerDetach() {} });
+        manager.setupListeners();
+        await manager.ensureAttached(1);
+        await manager.ensureAttached(2);
+        const attach = (tabId, sessionId, targetId, parent) => {
+            const source = { tabId, ...(parent ? { sessionId: parent } : {}) };
+            onEvent.emit(source, 'Target.attachedToTarget', {
+                sessionId,
+                targetInfo: { targetId, type: 'iframe' },
+            });
+            onEvent.emit({ tabId, sessionId }, 'Runtime.executionContextCreated', {
+                context: { id: 1, auxData: { frameId: targetId, isDefault: true } },
+            });
+        };
+        const sessions = async (tabId) =>
+            (await manager.getFrameSessions(tabId)).map((target) => target.sessionId ?? 'root').sort();
+        onEvent.emit({ tabId: 1 }, 'Runtime.executionContextCreated', {
+            context: { id: 1, auxData: { frameId: 'root', isDefault: true } },
+        });
+        attach(1, 'parent', 'frame-parent');
+        attach(1, 'child', 'frame-child', 'parent');
+        attach(1, 'grandchild', 'frame-grandchild', 'child');
+        attach(1, 'sibling', 'frame-sibling');
+        attach(2, 'other-parent', 'other-frame-parent');
+        attach(2, 'other-child', 'other-frame-child', 'other-parent');
+        assert.deepEqual(await sessions(1), ['child', 'grandchild', 'parent', 'root', 'sibling']);
+        assert.deepEqual(await sessions(2), ['other-child', 'other-parent', 'root']);
+        onEvent.emit({ tabId: 1 }, 'Target.detachedFromTarget', { sessionId: 'parent' });
+        for (const sessionId of ['parent', 'child', 'grandchild']) {
+            detached.add(sessionId);
+        }
+        const first = commands.length;
+        assert.deepEqual(await sessions(1), ['root', 'sibling']);
+        assert(commands.slice(first).every((command) => !detached.has(command.sessionId)));
+        assert.deepEqual(
+            manager.getExecutionContexts(1).map((context) => context.frameId),
+            ['root', 'frame-sibling']
+        );
+        assert.deepEqual(await sessions(2), ['other-child', 'other-parent', 'root']);
+        assert.equal(manager.getExecutionContexts(2).length, 2);
+        attach(1, 'replacement-parent', 'frame-parent');
+        attach(1, 'replacement-child', 'frame-child', 'replacement-parent');
+        onEvent.emit({ tabId: 1 }, 'Target.detachedFromTarget', { sessionId: 'parent' });
+        assert.deepEqual(await sessions(1), ['replacement-child', 'replacement-parent', 'root', 'sibling']);
+        assert.deepEqual(
+            manager.getExecutionContexts(1).map((context) => context.frameId),
+            ['root', 'frame-sibling', 'frame-parent', 'frame-child']
+        );
+        manager.cleanupTab(1);
+        await manager.ensureAttached(1);
+        assert.deepEqual(await sessions(1), ['root']);
+        assert.deepEqual(manager.getExecutionContexts(1), []);
+        assert.deepEqual(await sessions(2), ['other-child', 'other-parent', 'root']);
     } finally {
         restore();
     }
@@ -2731,6 +3327,7 @@ test('C-P6 expired queued navigation does not reach its handler', async (t) => {
                 const previous = handler.execute('evaluate', { tabId: 5001 }, createActionContext());
                 await entered.promise;
                 const queued = handler.execute(action, { tabId: 5001, deadline: now + 100 }, createActionContext());
+                // noinspection JSUnusedAssignment -- 释放队列后，生产代码通过 ClockDate.now 读取新时间
                 now += 200;
                 blocker.resolve();
                 await previous;
@@ -2745,10 +3342,14 @@ test('C-P6 expired queued navigation does not reach its handler', async (t) => {
                     }
                 );
                 assert.equal(dispatched, 0);
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 assert.equal(handler.actionLocks.size, 0);
             } finally {
                 blocker.resolve();
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 if (handler?.logManager.sweepTimer) {
+                    // White-box lifecycle state; production members remain private.
+                    // noinspection JSUnresolvedReference
                     globalThis.clearInterval(handler.logManager.sweepTimer);
                 }
                 await unmarkManagedTab(5001);
@@ -2812,6 +3413,8 @@ test('C10 mouse deadlines survive schemas and asynchronous preparation', async (
                 try {
                     await markManagedTab(5001);
                     now = 1000;
+                    // This case supplies only the DebuggerManager methods its path consumes.
+                    // noinspection JSCheckFunctionSignatures
                     const handler =
                         route === 'precise'
                             ? new InputEventHandler({
@@ -2840,6 +3443,8 @@ test('C10 mouse deadlines survive schemas and asynchronous preparation', async (
                     }
                     assert.equal(scriptCalls, route === 'stealth' && stage !== 'page' ? 1 : 0);
                     if (route === 'precise') {
+                        // White-box lifecycle state; production members remain private.
+                        // noinspection JSUnresolvedReference
                         assert.equal(handler.buttonsState.size, 0);
                     }
                 } finally {
@@ -2897,6 +3502,9 @@ test('C-P6 Challenge native dispatch checks the budget after page validation', a
                     originResponsePendingTextMarkers: [],
                 };
                 const manager = { isAttached: () => true, cleanupTab() {} };
+                // This case supplies only the DebuggerManager methods its path consumes. This case supplies only the
+                // LogManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler =
                     action === 'stealth_click'
                         ? new StealthHandler()
@@ -2930,6 +3538,7 @@ test('C-P6 history signal and load waits share one navigation budget', async () 
     }
     const restore = installGlobals({ chrome: fixture.chrome, Date: ClockDate });
     const waits = [];
+    // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
     const handler = new NavigationHandler({});
     handler.navigateHistory = async () => {
         now += 40;
@@ -2958,6 +3567,7 @@ test('C-P6 history signal and load waits share one navigation budget', async () 
 test('C-P6 expired navigation is rejected before native URL update', async () => {
     const fixture = createTabManagementFixture();
     const restore = installGlobals({ chrome: fixture.chrome });
+    // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
     const handler = new NavigationHandler({});
     try {
         await markManagedTab(5001);
@@ -3006,6 +3616,7 @@ test('MH-CH-01 partial precise input invalidates revisions and rejects stale sub
             try {
                 await markManagedTab(5001);
                 handler = new ActionHandler();
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 handler.debuggerManager.ensureAttached = async () => {};
                 const before = await pageSnapshot(5001);
                 if (stage === 'before') {
@@ -3057,7 +3668,10 @@ test('MH-CH-01 partial precise input invalidates revisions and rejects stale sub
                     assert.equal(calls.length, count);
                 }
             } finally {
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 if (handler?.logManager.sweepTimer) {
+                    // White-box lifecycle state; production members remain private.
+                    // noinspection JSUnresolvedReference
                     globalThis.clearInterval(handler.logManager.sweepTimer);
                 }
                 await unmarkManagedTab(5001);
@@ -3105,6 +3719,8 @@ test('C10 precise typing stops at the execution deadline', async (t) => {
             });
             try {
                 await markManagedTab(101);
+                // This case supplies only the DebuggerManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler = new InputEventHandler({ ensureAttached: async () => {} });
                 await assert.rejects(
                     () =>
@@ -3143,6 +3759,8 @@ test('C10 precise typing keeps CRLF normalization within a sufficient budget', a
     });
     try {
         await markManagedTab(101);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new InputEventHandler({ ensureAttached: async () => {} });
         const result = await handler.inputType(
             { tabId: 101, text: 'a\r\nb\rc', deadline: Date.now() + 1000 },
@@ -3179,6 +3797,8 @@ test('C10 precise typing releases Enter after a keydown acknowledgement failure'
     });
     try {
         await markManagedTab(101);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new InputEventHandler({ ensureAttached: async () => {} });
         await assert.rejects(
             () =>
@@ -3252,6 +3872,8 @@ test('R-02 precise typing releases Enter after cancellation or deadline without 
                 if (stage === 'before') {
                     controller.abort(new Error('fixture cancellation'));
                 }
+                // This case supplies only the DebuggerManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler = new InputEventHandler({ ensureAttached: async () => {} });
                 await assert.rejects(
                     () => handler.inputType({ tabId: 101, text: '\nafter', deadline: 1100 }, context),
@@ -3592,7 +4214,9 @@ test('C3 Extension rejects stale page conditions before any handler side effect'
         );
         assert.equal(actions, 1);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         await unmarkManagedTab(tab.id);
@@ -3659,6 +4283,7 @@ test('C4 read grants scope ordinary reads by server instance, page and URL', asy
     const context = { serverInstanceId: 'server-a', mcpWindowId: null, mcpTabGroupId: null };
     try {
         handler = new ActionHandler();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         const content = new ContentHandler(handler.debuggerManager);
         await assert.rejects(() => content.getHtml({ tabId: tab.id }, context), /只读权限/);
         await assert.rejects(
@@ -3703,7 +4328,9 @@ test('C4 read grants scope ordinary reads by server instance, page and URL', asy
         assert.equal(await hasReadGrant('server-a', tab.id), false);
         assert.equal(await hasReadGrant('server-b', tab.id), true);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         forgetPageRevision(tab.id);
@@ -3763,7 +4390,9 @@ test('C4 explicit adoption grants full managed access and release revokes it wit
             await assert.rejects(() => handler.execute(action, { tabId: tab.id }, context), ExpectedOperationError);
         }
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         await unmarkManagedTab(tab.id);
@@ -3856,8 +4485,13 @@ test('C4 release waits for in-flight reads and detaches the debugger before revo
     try {
         await markManagedTab(tab.id);
         handler = new ActionHandler();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await handler.debuggerManager.ensureAttached(tab.id);
-        handler.logManager.setConsole(tab.id, [{ text: 'managed log' }]);
+        // White-box lifecycle state; production members remain private.
+        // noinspection JSUnresolvedReference
+        handler.logManager.setConsole(tab.id, [
+            { source: 'console-api', level: 'log', text: 'managed log', timestamp: 0 },
+        ]);
         handler.actions.set('get_text', async () => {
             reading = true;
             return read.promise;
@@ -3873,12 +4507,16 @@ test('C4 release waits for in-flight reads and detaches the debugger before revo
         await release;
         assert.equal(detachCalls, 1);
         assert.equal(isManagedTab(tab), false);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(handler.debuggerManager.isAttached(tab.id), false);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.deepEqual(handler.logManager.getConsole(tab.id), []);
         await assert.rejects(() => handler.execute('evaluate', { tabId: tab.id, code: '1' }, {}), /非托管/);
     } finally {
         read.resolve({ text: '' });
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         await unmarkManagedTab(tab.id);
@@ -3916,10 +4554,12 @@ test(
         try {
             await markManagedTab(tab.id);
             handler = new ActionHandler();
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             await handler.debuggerManager.ensureAttached(tab.id);
             const released = await handler.execute('tabs_release', { tabId: tab.id }, createActionContext());
             assert.equal(released.managedAfter, false);
             assert.equal(isManagedTab(tab), false);
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             assert.equal(handler.debuggerManager.isAttached(tab.id), false);
             assert.equal(released.warnings.length, 2);
             assert.match(released.warnings[0], /detach refused/);
@@ -3930,7 +4570,9 @@ test(
             assert.equal(injections, 1);
             assert.equal(tab.groupId, 77);
         } finally {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             if (handler?.logManager.sweepTimer) {
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 globalThis.clearInterval(handler.logManager.sweepTimer);
             }
             await unmarkManagedTab(tab.id);
@@ -3969,6 +4611,7 @@ test('C4 tab IDs from an earlier browser session do not restore managed authorit
 test('C7 frame resolution classifies selectors and returns bounded filtered identity metadata', async () => {
     const tab = { id: 1987, url: 'https://example.com/owned' };
     let selectionStatus = 'not-found';
+    let translationOnly = true;
     let identityUrl = 'https://user:password@example.com/frame?authorization=fixture-secret#fragment';
     const restore = installGlobals({
         chrome: {
@@ -3987,7 +4630,13 @@ test('C7 frame resolution classifies selectors and returns bounded filtered iden
                                 selectedIndex: selectionStatus === 'found' ? 0 : null,
                                 selectionStatus,
                                 frames: [
-                                    { index: 0, acknowledged: true, url: identityUrl, contentOffset: { x: 10, y: 20 } },
+                                    {
+                                        index: 0,
+                                        acknowledged: true,
+                                        url: identityUrl,
+                                        translationOnly,
+                                        contentOffset: { x: 10, y: 20 },
+                                    },
                                 ],
                             },
                         },
@@ -4010,6 +4659,8 @@ test('C7 frame resolution classifies selectors and returns bounded filtered iden
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const resolver = new FrameResolver({});
         for (const [status, code] of [
             ['not-found', 'FRAME_NOT_FOUND'],
@@ -4053,6 +4704,12 @@ test('C7 frame resolution classifies selectors and returns bounded filtered iden
                 },
             ],
         });
+        translationOnly = false;
+        assert.equal(
+            (await resolver.resolveFrame({ tabId: tab.id, frame: '#owned' }, createActionContext())).offset,
+            null
+        );
+        translationOnly = true;
         globalThis.chrome.debugger = {
             sendCommand: async (_, method) => {
                 if (method === 'Page.getFrameTree') {
@@ -4070,6 +4727,8 @@ test('C7 frame resolution classifies selectors and returns bounded filtered iden
             },
         };
         installOwnerProbeFixture(globalThis.chrome, tab, 3, () => 'document-3');
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const precise = new FrameResolver({
             ensureAttached: async () => {},
             getFrameSessions: async () => [{ tabId: tab.id }],
@@ -4087,6 +4746,7 @@ test('C7 frame resolution classifies selectors and returns bounded filtered iden
             identityUrl + '&unmatched',
             identityUrl.replace('fixture-secret', 'other-fixture'),
         ]) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             await assert.rejects(
                 () => precise.resolveCdpFrame(tab.id, { frameId: 3, parentFrameId: 0, url: unmatchedUrl }),
                 (error) => {
@@ -4238,6 +4898,8 @@ test('CE-N01 precise iframe selection proves the live owner after same-count DOM
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const resolver = new FrameResolver({
             ensureAttached: async () => {},
             getFrameSessions: async () => [{ tabId: tab.id }],
@@ -4313,6 +4975,377 @@ test('CE-N01 precise iframe selection proves the live owner after same-count DOM
     }
 });
 
+test('C31F14 iframe preparation preserves native failures and validates the prepared identity before execution', async () => {
+    const tab = { id: 1992, url: 'https://example.com/owned' };
+    let documentId = 'owned-document';
+    let contextId = 3;
+    let executions = 0;
+    let resolutions = 0;
+    let failure;
+    const restore = installGlobals({
+        chrome: {
+            storage: createStorage(),
+            tabs: { get: async () => tab },
+            webNavigation: {
+                getAllFrames: async () => [{ frameId: 3, parentFrameId: 0, documentId, url: 'about:srcdoc' }],
+            },
+            debugger: {
+                async sendCommand(_target, method) {
+                    assert.equal(method, 'Runtime.evaluate');
+                    ++executions;
+                    return { result: { value: 42 } };
+                },
+            },
+        },
+    });
+    try {
+        await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
+        const resolver = new FrameResolver({
+            ensureAttached: async () => {},
+            getExecutionContexts: () => [{ frameId: 'cdp-3', id: contextId, isDefault: true }],
+        });
+        installOwnerProbeFixture(globalThis.chrome, tab, 3, () => documentId);
+        resolver.resolveCdpFrame = async () => {
+            ++resolutions;
+            if (failure) {
+                throw failure;
+            }
+            return { cdpFrameId: 'cdp-3' };
+        };
+        const { preparedContext } = await resolver.prepareFrameEvaluation(
+            { tabId: tab.id, frameId: 3, timeout: 500 },
+            createActionContext()
+        );
+        assert.equal(executions, 0);
+        assert.equal(resolutions, 1);
+        assert.equal(preparedContext.documentId, documentId);
+        const execute = (prepared = preparedContext) =>
+            resolver.evaluateInFrame(
+                { tabId: tab.id, frameId: 3, expression: 'ownedEffect()', preparedContext: prepared },
+                createActionContext()
+            );
+        assert.equal((await execute()).result.value, 42);
+        assert.equal(executions, 1);
+        assert.equal(resolutions, 1);
+        for (const change of [
+            { tabId: 1993 },
+            { frameId: 8 },
+            { documentId: 'other-document' },
+            { parentFrameId: 7 },
+            { parentDocumentId: 'other-parent' },
+            { url: 'https://example.com/other' },
+            { executionContextId: 8 },
+            { querySessionId: 'other-session' },
+            { cdpFrameId: 'other-frame' },
+        ]) {
+            await assert.rejects(
+                () => execute({ ...preparedContext, ...change }),
+                (error) => {
+                    assert.equal(error.actionExecuted, false);
+                    const context = JSON.parse(error.message).error.context;
+                    assert.equal(context.actionExecuted, false);
+                    assert.equal(context.actionStatus, 'not_started');
+                    return true;
+                }
+            );
+        }
+        assert.equal(executions, 1);
+        contextId = 4;
+        await assert.rejects(execute, /FRAME_CONTEXT_UNAVAILABLE/);
+        contextId = 3;
+        documentId = 'replacement-document';
+        await assert.rejects(execute, /FRAME_IDENTITY_CHANGED/);
+        documentId = 'owned-document';
+        failure = new Error(JSON.stringify({ code: -32602, message: 'Invalid parameters', data: 'returnByValue' }));
+        await assert.rejects(
+            () => resolver.prepareFrameEvaluation({ tabId: tab.id, frameId: 3 }, createActionContext()),
+            (error) => {
+                assert.equal(error.actionExecuted, false);
+                const detail = JSON.parse(error.message).error;
+                assert.equal(detail.context.nativeCode, -32602);
+                assert.match(detail.context.nativeError, /returnByValue/);
+                assert.equal(detail.context.actionStatus, 'not_started');
+                return true;
+            }
+        );
+        assert.equal(executions, 1);
+    } finally {
+        await unmarkManagedTab(tab.id);
+        restore();
+    }
+});
+
+test('C31F14 execution facts preserve revision across preparation failures and readOnly cancellation', async (t) => {
+    for (const scenario of [
+        'frame-deleted',
+        'attach-rejected',
+        'script-timeout',
+        'retry-frame-deleted',
+        'retry-cancel',
+    ]) {
+        await t.test(scenario, async () => {
+            const fixture = createTabManagementFixture();
+            const tab = fixture.tabs.get(5001);
+            const controller = new AbortController();
+            let framePresent = true;
+            let attachRejected = false;
+            let executions = 0;
+            fixture.chrome.webNavigation.getAllFrames = async () => [
+                { frameId: 0, parentFrameId: -1, documentId: 'owned-parent', url: tab.url },
+                ...(framePresent
+                    ? [
+                          {
+                              frameId: 3,
+                              parentFrameId: 0,
+                              parentDocumentId: 'owned-parent',
+                              documentId: 'owned-child',
+                              url: 'about:srcdoc',
+                          },
+                      ]
+                    : []),
+            ];
+            fixture.chrome.debugger.sendCommand = async (_target, method) => {
+                if (method === 'Runtime.enable') {
+                    return {};
+                }
+                assert.equal(method, 'Runtime.evaluate');
+                ++executions;
+                if (scenario === 'retry-frame-deleted') {
+                    framePresent = false;
+                } else if (scenario === 'retry-cancel') {
+                    controller.abort();
+                }
+                throw new Error('Execution context was destroyed.');
+            };
+            installOwnerProbeFixture(fixture.chrome, tab, 3, () => 'owned-child');
+            const restore = installGlobals({ chrome: fixture.chrome });
+            let handler;
+            try {
+                await markManagedTab(tab.id);
+                handler = new ActionHandler();
+                Object.assign(handler.debuggerManager, {
+                    ensureAttached: async () => {
+                        if (attachRejected) {
+                            throw new Error('Cannot attach to this tab');
+                        }
+                    },
+                    getExecutionContexts: () => [{ frameId: 'cdp-3', id: 3, isDefault: true }],
+                    invalidateExecutionContext: () => {},
+                });
+                handler.frameResolver.resolveCdpFrame = async () => ({ cdpFrameId: 'cdp-3' });
+                const { preparedContext } = await handler.execute(
+                    'prepare_frame_evaluation',
+                    { tabId: tab.id, frameId: 3 },
+                    createActionContext()
+                );
+                const revision = pageRevision(tab.id);
+                framePresent = scenario !== 'frame-deleted';
+                attachRejected = scenario === 'attach-rejected';
+                await assert.rejects(
+                    () =>
+                        handler.execute(
+                            'evaluate_in_frame',
+                            {
+                                tabId: tab.id,
+                                frameId: 3,
+                                preparedContext,
+                                expression: 'ownedEffect()',
+                                timeout: scenario === 'script-timeout' ? 0 : 1000,
+                                staleContextRetry: scenario.startsWith('retry-') ? 'readOnly' : 'never',
+                            },
+                            createActionContext({ signal: controller.signal })
+                        ),
+                    (error) => {
+                        const dispatched = scenario.startsWith('retry-');
+                        assert.equal(error.actionExecuted, dispatched ? undefined : false);
+                        const detail = JSON.parse(error.message).error;
+                        assert.equal(detail.context.actionExecuted, dispatched ? 'unknown' : false);
+                        assert.equal(detail.context.actionStatus, dispatched ? 'unknown' : 'not_started');
+                        if (scenario === 'frame-deleted') {
+                            assert.equal(detail.code, 'FRAME_NOT_FOUND');
+                        }
+                        return true;
+                    }
+                );
+                assert.equal(executions, scenario.startsWith('retry-') ? 1 : 0);
+                assert.equal(pageRevision(tab.id) === revision, !scenario.startsWith('retry-'));
+            } finally {
+                if (handler) {
+                    globalThis.clearInterval(handler.logManager.sweepTimer);
+                }
+                await unmarkManagedTab(tab.id);
+                forgetPageRevision(tab.id);
+                restore();
+            }
+        });
+    }
+});
+
+test('C31F14 native owner cancellation releases the tab lock before the native response and cleans late objects', async (t) => {
+    for (const method of ['DOM.getFrameOwner', 'DOM.resolveNode', 'Runtime.callFunctionOn']) {
+        for (const outcome of ['cancel', 'deadline']) {
+            await t.test(`${method} ${outcome}`, { timeout: 3000 }, async () => {
+                const fixture = createTabManagementFixture();
+                const tab = fixture.tabs.get(5001);
+                const entered = createDeferred();
+                const pending = createDeferred();
+                const controller = new AbortController();
+                const calls = [];
+                const objects = new Set();
+                const acknowledgements = new Map();
+                let sequence = 0;
+                let blocked = false;
+                let lateReply;
+                let latePacket;
+                let executions = 0;
+                fixture.chrome.webNavigation.getAllFrames = async () => [
+                    { frameId: 0, parentFrameId: -1, documentId: 'owned-parent', url: tab.url },
+                    {
+                        frameId: 3,
+                        parentFrameId: 0,
+                        parentDocumentId: 'owned-parent',
+                        documentId: 'owned-child',
+                        url: 'about:srcdoc',
+                    },
+                ];
+                fixture.chrome.scripting.executeScript = async ({ func }) => {
+                    assert.equal(func.name, 'installFrameProbeListener');
+                    return [];
+                };
+                fixture.chrome.debugger.sendCommand = async (_target, command, params) => {
+                    calls.push({ method: command, params });
+                    let reply;
+                    if (command === 'Page.getFrameTree') {
+                        reply = { frameTree: { frame: { id: 'root' }, childFrames: [{ frame: { id: 'cdp-3' } }] } };
+                    } else if (command === 'DOM.getFrameOwner') {
+                        reply = { backendNodeId: 3 };
+                    } else if (command === 'DOM.resolveNode') {
+                        const objectId = `owner-${++sequence}`;
+                        objects.add(objectId);
+                        reply = { object: { objectId } };
+                    } else if (command === 'Runtime.callFunctionOn' && params.arguments) {
+                        const objectId = `probe-${++sequence}`;
+                        objects.add(objectId);
+                        const packet = { token: params.arguments[0].value, index: 0 };
+                        acknowledgements.set(
+                            objectId,
+                            recordDomFrameProbe(packet, { tab, frameId: 3, documentId: 'owned-child' }).accepted
+                        );
+                        reply = { result: { objectId } };
+                        if (!blocked && command === method) {
+                            latePacket = packet;
+                        }
+                    } else if (command === 'Runtime.awaitPromise') {
+                        reply = { result: { value: acknowledgements.get(params.promiseObjectId) } };
+                    } else if (command === 'Runtime.releaseObject') {
+                        objects.delete(params.objectId);
+                        acknowledgements.delete(params.objectId);
+                        reply = {};
+                    } else if (command === 'Runtime.callFunctionOn') {
+                        reply = {};
+                    } else {
+                        assert.equal(command, 'Runtime.evaluate');
+                        ++executions;
+                        reply = { result: { value: 42 } };
+                    }
+                    if (!blocked && command === method) {
+                        blocked = true;
+                        lateReply = reply;
+                        entered.resolve();
+                        return pending.promise;
+                    }
+                    return reply;
+                };
+                const restore = installGlobals({ chrome: fixture.chrome });
+                let handler;
+                let operation;
+                let successor;
+                let observation;
+                try {
+                    await markManagedTab(tab.id);
+                    handler = new ActionHandler();
+                    Object.assign(handler.debuggerManager, {
+                        ensureAttached: async () => {},
+                        getFrameSessions: async () => [{ tabId: tab.id }],
+                        getExecutionContexts: () => [{ frameId: 'cdp-3', id: 3, isDefault: true }],
+                    });
+                    const revision = pageRevision(tab.id);
+                    operation = handler
+                        .execute(
+                            'prepare_frame_evaluation',
+                            {
+                                tabId: tab.id,
+                                frameId: 3,
+                                ...(outcome === 'deadline' ? { deadline: Date.now() + 40 } : {}),
+                            },
+                            createActionContext({ signal: controller.signal })
+                        )
+                        .then(
+                            (value) => ({ value }),
+                            (error) => ({ error })
+                        );
+                    await entered.promise;
+                    if (outcome === 'cancel') {
+                        controller.abort();
+                    }
+                    successor = handler.execute(
+                        'prepare_frame_evaluation',
+                        { tabId: tab.id, frameId: 3 },
+                        createActionContext()
+                    );
+                    const result = await Promise.race([
+                        Promise.all([operation, successor]),
+                        new Promise((resolve) => {
+                            observation = setTimeout(() => resolve('pending'), 1000);
+                        }),
+                    ]);
+                    assert.notEqual(result, 'pending');
+                    assert.equal(result[0].error.actionExecuted, false);
+                    const detail = JSON.parse(result[0].error.message).error;
+                    assert.equal(detail.code, outcome === 'cancel' ? 'REQUEST_CANCELLED' : 'TIMEOUT');
+                    assert.equal(detail.context.actionStatus, 'not_started');
+                    assert.equal(result[1].preparedContext.frameId, 3);
+                    assert.equal(executions, 0);
+                    assert.equal(pageRevision(tab.id), revision);
+                    assert.equal(handler.actionLocks.size, 0);
+                    if (latePacket) {
+                        assert.equal(
+                            recordDomFrameProbe(latePacket, { tab, frameId: 3, documentId: 'owned-child' }).accepted,
+                            false
+                        );
+                    }
+                    const lateStart = calls.length;
+                    pending.resolve(lateReply);
+                    await waitUntil(() => objects.size === 0);
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    assert.ok(
+                        calls
+                            .slice(lateStart)
+                            .every(
+                                (call) =>
+                                    call.method === 'Runtime.releaseObject' ||
+                                    (call.method === 'Runtime.callFunctionOn' && !call.params.arguments)
+                            )
+                    );
+                    assert.equal(handler.actionLocks.size, 0);
+                } finally {
+                    clearTimeout(observation);
+                    pending.resolve(lateReply);
+                    await Promise.allSettled([operation, successor].filter(Boolean));
+                    if (handler) {
+                        globalThis.clearInterval(handler.logManager.sweepTimer);
+                    }
+                    await unmarkManagedTab(tab.id);
+                    forgetPageRevision(tab.id);
+                    restore();
+                }
+            });
+        }
+    }
+});
+
 test('C7 readOnly stale recovery waits for document resolution without adding script replays', async (t) => {
     for (const scenario of ['readOnly', 'never', 'permission', 'timeout', 'page-exception']) {
         await t.test(scenario, async () => {
@@ -4347,6 +5380,8 @@ test('C7 readOnly stale recovery waits for document resolution without adding sc
             });
             try {
                 await markManagedTab(tab.id);
+                // This case supplies only the DebuggerManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const resolver = new FrameResolver({
                     ensureAttached: async () => {},
                     getExecutionContexts: () => [
@@ -4630,6 +5665,8 @@ test(
         });
         try {
             await markManagedTab(tab.id);
+            // This case supplies only the DebuggerManager methods its path consumes.
+            // noinspection JSCheckFunctionSignatures
             const handler = new ContentHandler({
                 ensureAttached: () => assert.fail('ordinary reads must not attach debugger'),
             });
@@ -4706,6 +5743,7 @@ test(
                 null
             );
             result = [{ result: undefined }];
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             assert.equal(await handler.injectScript(tab.id, 3, () => undefined, []), undefined);
         } finally {
             await unmarkManagedTab(tab.id);
@@ -4733,6 +5771,8 @@ test('C4 created-page injection arguments survive Chrome JSON serialization', as
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const content = new ContentHandler({});
         for (const [method, params, expectedArgs, expectedResult] of [
             ['readPage', {}, ['all', 15, null, null, null], { pageContent: 'fixture' }],
@@ -4813,8 +5853,12 @@ test('C20 accessibility state never reads hidden/password/file values and retain
                     if (name === 'type') {
                         return this.type;
                     }
+                    if (name === 'aria-disabled') {
+                        return this.ariaDisabled ?? null;
+                    }
                     return name === nameSource ? 'Owned input name' : null;
                 },
+                matches: (selector) => selector === ':disabled' && input.fieldsetDisabled && !input.firstLegend,
                 get value() {
                     ++valueReads;
                     if (sensitive) {
@@ -4883,6 +5927,24 @@ test('C20 accessibility state never reads hidden/password/file values and retain
                     assert.equal(JSON.stringify(targeted).includes(value), includesValue, scenario);
                 }
                 assert.equal(valueReads > 0, includesValue, scenario);
+                for (const tagName of ['INPUT', 'TEXTAREA', 'SELECT']) {
+                    input.tagName = tagName;
+                    input.options = [];
+                    for (const [fieldsetDisabled, firstLegend, disabled, ariaDisabled, expected] of [
+                        [true, false, false, null, true],
+                        [true, true, false, null, false],
+                        [false, false, false, null, false],
+                        [false, false, true, null, true],
+                        [false, false, false, 'true', true],
+                    ]) {
+                        Object.assign(input, { fieldsetDisabled, firstLegend, disabled, ariaDisabled });
+                        assert.equal(
+                            generateAccessibilityTree('all', 15, null, null).interactiveElements[0].disabled,
+                            expected,
+                            `${scenario}/${tagName}/${fieldsetDisabled}/${firstLegend}/${disabled}/${ariaDisabled}`
+                        );
+                    }
+                }
             } finally {
                 restore();
             }
@@ -5140,6 +6202,8 @@ test('C-R8 read grants revoke closed documents without querying or activating pa
     try {
         await setReadGrant('read-revoke-server', tabId, true);
         assert.equal(await hasReadGrant('read-revoke-server', tabId), true);
+        // Native groupId is deliberately extra and must not grant managed access.
+        // noinspection JSCheckFunctionSignatures
         assert.equal(isManagedTab({ id: tabId, groupId: -1 }), false);
         const reads = calls.length;
         closed = true;
@@ -5188,6 +6252,8 @@ test('C-R8 native creation rejections are not retried and do not delete unrelate
             };
             const restore = installGlobals({ chrome: fixture.chrome });
             try {
+                // This case supplies only the NavigationHandler methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler = new TabHandler({});
                 await assert.rejects(
                     () => handler[operation](operation === 'tabsCreate' ? { windowId: 10 } : { focused: false }, {}),
@@ -5300,10 +6366,21 @@ test('C31F12 executeCode keeps result inspection errors in output and Promise ad
     try {
         for (const statement of [
             'return new Proxy({}, {getPrototypeOf(){throw new Error("owned prototype read")}})',
-            'const value=new Node();Object.defineProperty(value,"nodeName",{get(){throw new Error("owned nodeName read")}});return value',
-            'const value=new Node();Object.defineProperty(value,"parentElement",{get(){throw new Error("owned parentElement read")}});return value',
-            'const value=new NodeList();Object.defineProperty(value,"constructor",{get(){throw new Error("owned NodeList constructor read")}});return value',
-            'const value=new HTMLCollection();Object.defineProperty(value,"constructor",{get(){throw new Error("owned HTMLCollection constructor read")}});return value',
+            'const value=new Node();Object.defineProperty(v' +
+                'alue,"nodeName",{get(){throw new Error("owned ' +
+                'nodeName read")}});return value',
+            'const value=new Node();Object.defineProperty(v' +
+                'alue,"parentElement",{get(){throw new ' +
+                'Error("owned parentElement read")}});return ' +
+                'value',
+            'const value=new NodeList();' +
+                'Object.defineProperty(value,"constructor",' +
+                '{get(){throw new Error("owned NodeList ' +
+                'constructor read")}});return value',
+            'const value=new HTMLCollection();' +
+                'Object.defineProperty(value,"constructor",' +
+                '{get(){throw new Error("owned HTMLCollection ' +
+                'constructor read")}});return value',
         ]) {
             globalThis.__c31f12OutputActions = 0;
             const result = await executeCode(`(function(){globalThis.__c31f12OutputActions++;${statement}})()`);
@@ -5346,7 +6423,11 @@ test('C31F13 executeCode retains original output diagnostics when summary JSON i
             HTMLCollection: class {},
         });
         const result = await isolated(
-            `(function(){let calls=0;JSON.stringify=()=>{if(++calls===1)throw new Error("OWNED_FIRST_OUTPUT_FAILURE");return ${JSON.stringify(value)}};return 42})()`
+            '(function(){let calls=0;JSON.stringify=()=>' +
+                '{if(++calls===1)throw new ' +
+                'Error("OWNED_FIRST_OUTPUT_FAILURE");return ' +
+                `${JSON.stringify(value)}` +
+                '};return 42})()'
         );
         assert.equal(result.success, false);
         assert.equal(result.errorSource, 'output');
@@ -5386,6 +6467,8 @@ test('C02 Extension evaluate waits for Promise results before serialization', as
 
 test('C23 closed-port scans and reconnects stay debug while identified failures warn once', async () => {
     const output = [];
+    const requests = [];
+    let health = 'closed';
     const restore = installGlobals({
         console: {
             ...globalThis.console,
@@ -5393,39 +6476,82 @@ test('C23 closed-port scans and reconnects stay debug while identified failures 
             log: (text) => output.push({ level: 'log', text }),
             warn: (text) => output.push({ level: 'warn', text }),
         },
+        chrome: { storage: createStorage({ mcp_pairing_token: 'owned-synthetic-token' }) },
+        fetch: async (url) => {
+            const parsed = new globalThis.URL(url);
+            requests.push(Number(parsed.port));
+            return {
+                ok: health !== 'closed' && parsed.port === '19222',
+                json: async () => ({
+                    status: 'ok',
+                    port: 19222,
+                    instanceId: 'a'.repeat(32),
+                    authRequired: true,
+                    auth:
+                        health === 'authentication'
+                            ? {
+                                  protocol: 2,
+                                  clientNonce: parsed.searchParams.get('clientNonce'),
+                                  serverNonce: 'b'.repeat(32),
+                                  serverProof: 'invalid-proof',
+                              }
+                            : {},
+                }),
+            };
+        },
         setTimeout: () => 123,
     });
     try {
         const client = new HttpClient();
         client.shouldReconnect = true;
-        client.checkPort = async () => ({ healthy: false });
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         client.scheduleReconnect();
         assert.equal(output.length, 2);
         assert.ok(output.every((row) => row.level === 'debug'));
-        client.checkPort = async (port) =>
-            port === 19222
-                ? { healthy: false, failureKind: 'authentication', reason: 'server proof mismatch' }
-                : { healthy: false };
+        health = 'authentication';
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
         assert.equal(output.filter((row) => row.level === 'warn').length, 1);
         assert.match(
             output.find((row) => row.level === 'warn').text,
             /19222 \(authentication: server proof mismatch\)/
         );
-        client.checkPort = async (port) =>
-            port === 19222
-                ? { healthy: false, failureKind: 'protocol', reason: 'authentication challenge incomplete' }
-                : { healthy: false };
+        health = 'protocol';
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await client.discoverServers(client.generation);
         assert.equal(output.filter((row) => row.level === 'warn').length, 2);
         assert.match(
             output.filter((row) => row.level === 'warn')[1].text,
-            /19222 \(protocol: authentication challenge incomplete\)/
+            /19222 \(protocol: authentication protocol v2 required or endpoint mismatch\)/
         );
+        health = 'closed';
+        // noinspection JSUnresolvedReference -- White-box discovery lifecycle; production members remain private.
+        await client.discoverServers(client.generation);
+        health = 'protocol';
+        // noinspection JSUnresolvedReference -- White-box discovery lifecycle; production members remain private.
+        await client.discoverServers(client.generation);
+        assert.equal(output.filter((row) => row.level === 'warn').length, 3);
+        client.disconnect();
+        client.shouldReconnect = true;
+        // noinspection JSUnresolvedReference -- White-box discovery lifecycle; production members remain private.
+        await client.discoverServers(client.generation);
+        assert.equal(output.filter((row) => row.level === 'warn').length, 4);
+        assert.equal(requests.length, 9 * 78);
+        for (let offset = 0; offset < requests.length; offset += 78) {
+            assert.deepEqual(
+                requests.slice(offset, offset + 78).sort((left, right) => left - right),
+                Array.from({ length: 78 }, (_, index) => index + 19222)
+            );
+        }
+        client.disconnect();
     } finally {
         restore();
     }
@@ -5446,8 +6572,10 @@ test('C05 policy changes invalidate pending health checks', async () => {
     try {
         const client = new HttpClient();
         const connecting = client.connect();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await waitUntil(() => client.pendingHealthChecks.size === 78);
         await client.setAllowInsecureNoToken(false);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.pendingHealthChecks.size, 0);
         assert.deepEqual(await connecting, { connected: 0, ports: [] });
         assert.equal(client.isConnected(), false);
@@ -5495,8 +6623,10 @@ test('C05 policy changes cancel scheduled reconnects', async () => {
     try {
         const client = new HttpClient();
         await client.connect();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.notEqual(client.reconnectTimer, null);
         await client.setAllowInsecureNoToken(false);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.reconnectTimer, null);
     } finally {
         restore();
@@ -5563,6 +6693,7 @@ test('C05 disconnected servers keep retrying while another server remains connec
             [19223, survivingSocket],
         ]) {
             ws.open();
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             client.connections.set(port, {
                 ws,
                 heartbeatTimer: null,
@@ -5571,22 +6702,32 @@ test('C05 disconnected servers keep retrying while another server remains connec
                 instanceId: String(port),
             });
         }
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         client.removeConnection(19222, oldSocket);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.notEqual(client.reconnectTimer, null);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(timers.get(client.reconnectTimer).delay, 1000);
         assert.deepEqual(owners, ['19222']);
         assert.deepEqual(statuses, [['connected', 1]]);
         let restarted = false;
         client.checkPort = async (port) => ({ healthy: port === 19223 || (restarted && port === 19222) });
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         let timer = timers.get(client.reconnectTimer);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         timers.delete(client.reconnectTimer);
         await timer.callback();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.notEqual(client.reconnectTimer, null);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(timers.get(client.reconnectTimer).delay, 1500);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.connections.get(19223).ws, survivingSocket);
         assert.equal(survivingSocket.readyState, FakeWebSocket.OPEN);
         restarted = true;
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         timer = timers.get(client.reconnectTimer);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         timers.delete(client.reconnectTimer);
         const retry = timer.callback();
         for (let turn = 0; turn < 20 && FakeWebSocket.instances.length < 3; turn++) {
@@ -5597,15 +6738,24 @@ test('C05 disconnected servers keep retrying while another server remains connec
         replacement.open();
         await retry;
         assert.deepEqual(client.getConnectedPorts(), [19222, 19223]);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.reconnectTimer, null);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.reconnectPorts.size, 0);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         client.removeConnection(19222, oldSocket);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.connections.get(19222).ws, replacement);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.reconnectTimer, null);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         client.removeConnection(19222, replacement);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         const cancelled = timers.get(client.reconnectTimer).callback;
         client.disconnect();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.reconnectTimer, null);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal(client.reconnectPorts.size, 0);
         await cancelled();
         assert.equal(FakeWebSocket.instances.length, 3);
@@ -5620,9 +6770,13 @@ test('C05 stale socket close cannot remove a replacement connection on the same 
     const client = new HttpClient();
     const oldSocket = new FakeWebSocket('ws://127.0.0.1:19222/old');
     const replacement = new FakeWebSocket('ws://127.0.0.1:19222/new');
+    // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
     client.connections.set(19222, { ws: replacement, heartbeatTimer: null, ready: true, requests: new Map() });
+    // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
     oldSocket.onclose = () => client.removeConnection(19222, oldSocket);
+    // noinspection JSValidateTypes -- The stale-socket callback is assigned immediately above.
     oldSocket.onclose();
+    // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
     assert.equal(client.connections.get(19222).ws, replacement);
     client.disconnect();
 });
@@ -5631,6 +6785,8 @@ test('C06 missing cached windows reuse a normal window without stale group membe
     const fixture = createTabManagementFixture();
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({ waitForNavigation: async () => {} });
         const result = await handler.tabsCreate(
             { url: 'https://example.com/test' },
@@ -5650,6 +6806,88 @@ test('C06 missing cached windows reuse a normal window without stale group membe
     }
 });
 
+test('TASK mixed windows keep default pages beside their source or cached window and reuse only local groups', async (t) => {
+    for (const scenario of ['source window', 'cached window', 'local group']) {
+        await t.test(scenario, async () => {
+            const fixture = createTabManagementFixture();
+            Object.assign(fixture.tabs.get(5001), { groupId: 79 });
+            Object.assign(fixture.tabs.get(5002), { windowId: 20, groupId: 77 });
+            fixture.groups.set(79, {
+                id: 79,
+                windowId: 10,
+                title: 'Other window',
+                color: 'purple',
+                collapsed: true,
+                shared: false,
+            });
+            if (scenario === 'local group') {
+                fixture.groups.set(78, { ...fixture.groups.get(77), id: 78, title: 'Local work' });
+                fixture.tabs.set(5004, { ...fixture.tabs.get(5003), id: 5004, groupId: 78, index: 2 });
+            }
+            const restore = installGlobals({ chrome: fixture.chrome });
+            try {
+                const { state, handler } = await isolatedTabHandler(fixture.chrome);
+                const context = createActionContext({
+                    serverInstanceId: 'mixed-window-server',
+                    connectedServerInstanceIds: ['mixed-window-server'],
+                });
+                for (const [tabId, groupId, windowId] of [
+                    [5001, 79, 10],
+                    [5002, 77, 20],
+                    [5003, 77, 20],
+                    ...(scenario === 'local group' ? [[5004, 78, 20]] : []),
+                ]) {
+                    await state.markManagedTab(tabId, 'created');
+                    await state.setManagedTabGroup(tabId, groupId, windowId, context.serverInstanceId);
+                }
+                await state.unmarkManagedTab(5002);
+                state.setMcpWindowId(scenario === 'cached window' ? 20 : 10);
+                const previousTabs = globalThis.structuredClone([...fixture.tabs.values()]);
+                const previousGroups = globalThis.structuredClone([...fixture.groups.values()]);
+                const created = await handler.tabsCreate(
+                    {
+                        url: 'https://example.com/new',
+                        taskHint: 'Mixed window',
+                        ...(scenario === 'cached window' ? {} : { sourceTabId: 5003 }),
+                    },
+                    context
+                );
+                assert.equal(created.windowId, 20);
+                assert.equal(created.managed, true);
+                assert.equal(created.active, false);
+                assert.equal(fixture.calls.find((call) => call.method === 'tabs.create').properties.windowId, 20);
+                if (scenario === 'local group') {
+                    assert.equal(created.groupId, 78);
+                } else {
+                    assert.notEqual(created.groupId, 77);
+                    assert.notEqual(created.groupId, 79);
+                    assert.equal(fixture.groups.get(created.groupId).windowId, 20);
+                }
+                assert.equal(state.isManagedTab({ id: 5002 }), false);
+                assert.equal(state.isManagedTab({ id: 5003 }), true);
+                assert.deepEqual(
+                    previousTabs.map((tab) => fixture.tabs.get(tab.id)),
+                    previousTabs
+                );
+                assert.deepEqual(
+                    previousGroups.map((group) => fixture.groups.get(group.id)),
+                    previousGroups
+                );
+                const repeated = await handler.tabsCreate({ sourceTabId: created.id }, context);
+                assert.equal(repeated.windowId, 20);
+                assert.equal(repeated.groupId, created.groupId);
+                assert.equal(state.getMcpWindowId(), 20);
+                assert.equal(
+                    fixture.calls.some((call) => call.method === 'windows.create' || call.method === 'tabs.move'),
+                    false
+                );
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
 function createTabManagementFixture() {
     const defaults = {
         title: 'Fixture',
@@ -5659,9 +6897,10 @@ function createTabManagementFixture() {
         autoDiscardable: true,
         mutedInfo: { muted: false },
         incognito: false,
-        status: 'complete',
+        status: /** @type {chrome.tabs.Tab['status']} */ ('complete'),
         groupId: -1,
     };
+    /** @type {Map<number, Partial<chrome.tabs.Tab>>} */
     const tabs = new Map([
         [5001, { ...defaults, id: 5001, windowId: 10, index: 0, url: 'https://example.com/one' }],
         [5002, { ...defaults, id: 5002, windowId: 10, index: 1, url: 'https://example.com/two' }],
@@ -5735,6 +6974,7 @@ function createTabManagementFixture() {
                 for (const [key, value] of Object.entries(properties)) {
                     if (value !== undefined) {
                         if (key === 'muted') {
+                            assert.ok(typeof value === 'boolean');
                             tab.mutedInfo = { muted: value };
                         } else if (key !== 'active' || value !== false) {
                             tab[key] = value;
@@ -5881,107 +7121,832 @@ function createTabManagementFixture() {
     };
 }
 
-test(
-    'TASK pages share trusted task groups across servers without creating ' + 'windows or claiming user groups',
-    async () => {
-        const fixture = createTabManagementFixture();
-        fixture.groups.get(77).title = 'MCP · Printer comparison';
-        const restore = installGlobals({ chrome: fixture.chrome });
-        const handler = new ActionHandler();
-        const nativeUpdates = [];
-        const nativeGroup = fixture.chrome.tabs.group;
-        fixture.chrome.tabs.group = async (options) => {
-            const result = await nativeGroup(options);
-            nativeUpdates.push(handler.refreshNativeRelations());
-            return result;
-        };
-        try {
-            const [first, second] = await Promise.all(
-                ['server-one', 'server-two'].map((serverInstanceId) =>
-                    handler.execute(
-                        'tabs_create',
-                        { url: 'https://example.com/task', taskHint: 'Printer comparison', note: 'temporary' },
-                        createActionContext({ serverInstanceId })
+test('TASK continuous work reuses its group and independent active servers keep separate groups', async () => {
+    const fixture = createTabManagementFixture();
+    const context = (serverInstanceId = 'server-0') =>
+        createActionContext({ serverInstanceId, connectedServerInstanceIds: ['server-0', 'server-1'] });
+    fixture.groups.get(77).title = 'MCP';
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const handler = new ActionHandler();
+    const nativeUpdates = [];
+    const nativeGroup = fixture.chrome.tabs.group;
+    fixture.chrome.tabs.group = async (options) => {
+        const result = await nativeGroup(options);
+        nativeUpdates.push(handler.refreshNativeRelations());
+        return result;
+    };
+    try {
+        const [first, second] = await Promise.all(
+            ['Printer comparison', 'Camera research'].map(
+                (taskHint, index) =>
+                    /** @type {Promise<import('../src/types/index.ts').TabInfo>} */ (
+                        handler.execute(
+                            'tabs_create',
+                            { url: 'https://example.com/task', taskHint, note: 'temporary' },
+                            context(`server-${index}`)
+                        )
                     )
-                )
-            );
-            await Promise.all(nativeUpdates);
-            const repeated = await handler.execute(
-                'tabs_create',
-                { taskHint: 'Printer comparison' },
-                createActionContext()
-            );
-            assert.equal(repeated.groupId, first.groupId);
-            await handler.execute('tabs_close', { tabId: repeated.id }, createActionContext());
-            assert.equal(first.windowId, 10);
-            assert.equal(first.groupId, second.groupId);
-            assert.notEqual(first.groupId, 77);
-            assert.equal(first.active, false);
-            assert.equal(first.metadata.origin, 'created');
-            assert.equal(first.metadata.note, 'temporary');
-            assert.equal(
-                fixture.calls.some((call) => call.method === 'windows.create'),
-                false
-            );
-            assert.equal(fixture.groups.get(first.groupId).title, 'MCP · Printer comparison');
-            await handler.execute(
-                'tabs_metadata',
-                { tabId: first.id, taskHint: 'Renamed', note: null },
-                createActionContext()
-            );
-            await handler.execute('tabs_metadata', { tabId: second.id, taskHint: 'Renamed' }, createActionContext());
-            assert.equal(fixture.groups.get(first.groupId).title, 'MCP · Renamed');
-            fixture.tabs.get(first.id).groupId = -1;
-            await handler.refreshNativeRelations();
-            const afterMove = await handler.execute('tabs_create', { taskHint: 'Renamed' }, createActionContext());
-            assert.equal(afterMove.groupId, second.groupId, 'remaining trusted members retain the reusable group');
-            await handler.execute('tabs_close', { tabId: afterMove.id }, createActionContext());
+            )
+        );
+        await Promise.all(nativeUpdates);
+        const repeated = await /** @type {Promise<import('../src/types/index.ts').TabInfo>} */ (
+            handler.execute('tabs_create', {}, context())
+        );
+        assert.equal(repeated.groupId, first.groupId);
+        assert.equal(first.windowId, 10);
+        assert.notEqual(first.groupId, second.groupId);
+        assert.notEqual(first.groupId, 77);
+        assert.equal(first.active, false);
+        assert.equal(first.metadata.origin, 'created');
+        assert.equal(first.metadata.note, 'temporary');
+        assert.equal(first.metadata.taskHint, 'Printer comparison');
+        assert.equal(second.metadata.taskHint, 'Camera research');
+        assert.equal(repeated.metadata.taskHint, undefined);
+        assert.equal(
+            fixture.calls.filter((call) => call.method === 'tabs.group' && call.properties.createProperties).length,
+            2
+        );
+        assert.equal(
+            fixture.calls.some((call) => call.method === 'windows.create'),
+            false
+        );
+        assert.equal(fixture.groups.get(first.groupId).title, 'MCP · Printer comp…');
+        assert.equal(fixture.groups.get(first.groupId).collapsed, false);
+        await handler.execute(
+            'tabgroup_update',
+            { groupId: first.groupId, title: 'MCP · Renamed', color: 'purple', collapsed: true },
+            context()
+        );
+        const display = { ...fixture.groups.get(first.groupId) };
+        const updateCount = fixture.calls.filter((call) => call.method === 'tabGroups.update').length;
+        await handler.execute('tabs_metadata', { tabId: first.id, taskHint: 'Renamed', note: null }, context());
+        await handler.execute('tabs_metadata', { tabId: second.id, taskHint: 'Renamed' }, context());
+        assert.deepEqual(fixture.groups.get(first.groupId), display);
+        fixture.tabs.get(first.id).groupId = -1;
+        await handler.refreshNativeRelations();
+        const afterMove = await /** @type {Promise<import('../src/types/index.ts').TabInfo>} */ (
+            handler.execute('tabs_create', { taskHint: 'Another task' }, context())
+        );
+        assert.equal(afterMove.groupId, repeated.groupId, 'remaining work pages retain the reusable group');
+        assert.deepEqual(fixture.groups.get(first.groupId), display);
+        assert.equal(fixture.calls.filter((call) => call.method === 'tabGroups.update').length, updateCount);
+        await handler.execute('tabs_close', { tabId: afterMove.id }, context());
 
-            const listed = await handler.execute('tabs_list', {}, createActionContext());
-            assert.equal(listed.find((tab) => tab.id === first.id).metadata.taskHint, 'Renamed');
-            const reloaded = await isolatedManagedTabs(fixture.chrome);
-            await reloaded.restoreManagedTabs();
-            assert.equal(reloaded.getManagedTabMetadata(first.id).taskHint, 'Renamed');
-            assert.equal(reloaded.getManagedTabMetadata(first.id).note, undefined);
-            fixture.tabs.get(5001).groupId = first.groupId;
-            const third = await handler.execute('tabs_create', { taskHint: 'Renamed' }, createActionContext());
-            assert.notEqual(third.groupId, first.groupId, 'mixed user groups stay untouched');
-            const updated = await handler.execute(
+        const listed = await /** @type {Promise<import('../src/types/index.ts').TabInfo[]>} */ (
+            handler.execute('tabs_list', {}, context())
+        );
+        assert.equal(listed.find((tab) => tab.id === first.id).metadata.taskHint, 'Renamed');
+        const reloaded = await isolatedManagedTabs(fixture.chrome);
+        await reloaded.restoreManagedTabs();
+        assert.equal(reloaded.getManagedTabMetadata(first.id).taskHint, 'Renamed');
+        assert.equal(reloaded.getManagedTabMetadata(first.id).note, undefined);
+        fixture.tabs.get(5001).groupId = first.groupId;
+        const third = await /** @type {Promise<import('../src/types/index.ts').TabInfo>} */ (
+            handler.execute('tabs_create', { taskHint: 'Renamed' }, context())
+        );
+        assert.notEqual(third.groupId, first.groupId, 'mixed user groups stay untouched');
+        assert.deepEqual(fixture.groups.get(first.groupId), display);
+        assert.equal(fixture.tabs.get(5001).groupId, first.groupId);
+        assert.equal(fixture.tabs.get(repeated.id).groupId, first.groupId);
+        assert.equal(fixture.groups.get(77).title, 'MCP');
+        const updated = await /** @type {Promise<import('../src/types/index.ts').PageMetadata>} */ (
+            handler.execute(
                 'tabs_metadata',
                 { tabId: 5001, note: 'user note', origin: 'created', documentId: 'forged', groupId: third.groupId },
-                createActionContext()
-            );
-            assert.equal(updated.origin, 'unknown');
-            assert.equal(isManagedTab({ id: 5001 }), false);
-            const set = fixture.chrome.storage.local.set;
-            fixture.chrome.storage.local.set = async () => {
-                throw new Error('metadata storage refused');
-            };
-            await assert.rejects(
-                () => handler.execute('tabs_metadata', { tabId: first.id, note: 'not saved' }, createActionContext()),
-                /metadata storage refused/
-            );
-            fixture.chrome.storage.local.set = set;
-            assert.equal(
-                (await handler.execute('tabs_metadata', { tabId: first.id }, createActionContext())).note,
-                undefined
-            );
-            await handler.execute('tabs_adopt', { tabId: 5002 }, createActionContext());
-            assert.equal(
-                (await handler.execute('tabs_list', {}, createActionContext())).find((tab) => tab.id === 5002).metadata
-                    .origin,
-                'adopted'
-            );
-            await handler.execute('tabs_close', { tabId: 5002 }, createActionContext());
-        } finally {
-            globalThis.clearInterval(handler.logManager.sweepTimer);
-            for (const id of [5001, 5002, 6000, 6001, 6002, 6003, 6004]) {
-                await unmarkManagedTab(id);
-            }
-            restore();
+                context()
+            )
+        );
+        assert.equal(updated.origin, 'unknown');
+        assert.equal(isManagedTab({ id: 5001 }), false);
+        const set = fixture.chrome.storage.local.set;
+        fixture.chrome.storage.local.set = async () => {
+            throw new Error('metadata storage refused');
+        };
+        await assert.rejects(
+            () =>
+                /** @type {Promise<import('../src/types/index.ts').PageMetadata>} */ (
+                    handler.execute('tabs_metadata', { tabId: first.id, note: 'not saved' }, context())
+                ),
+            /metadata storage refused/
+        );
+        fixture.chrome.storage.local.set = set;
+        assert.equal(
+            (
+                await /** @type {Promise<import('../src/types/index.ts').PageMetadata>} */ (
+                    handler.execute('tabs_metadata', { tabId: first.id }, context())
+                )
+            ).note,
+            undefined
+        );
+        await handler.execute('tabs_adopt', { tabId: 5002 }, context());
+        assert.equal(
+            (
+                await /** @type {Promise<import('../src/types/index.ts').TabInfo[]>} */ (
+                    handler.execute('tabs_list', {}, context())
+                )
+            ).find((tab) => tab.id === 5002).metadata.origin,
+            'adopted'
+        );
+        await handler.execute('tabs_close', { tabId: 5002 }, context());
+    } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
+        globalThis.clearInterval(handler.logManager.sweepTimer);
+        for (const id of fixture.tabs.keys()) {
+            await unmarkManagedTab(id);
         }
+        restore();
     }
-);
+});
+
+test('TASK trusted source pages restore work without rewriting existing group titles', async (t) => {
+    for (const title of [
+        'MCP Chrome',
+        'MCP · Original task',
+        'MCP · New task',
+        'MCP · User title',
+        'MCP · Original task extra',
+        '',
+    ]) {
+        await t.test(title || 'empty custom title', async () => {
+            const fixture = createTabManagementFixture();
+            Object.assign(fixture.groups.get(77), { title, color: 'purple', collapsed: true });
+            fixture.groups.set(78, {
+                ...fixture.groups.get(77),
+                id: 78,
+                title: 'MCP · Other task',
+                color: 'orange',
+            });
+            Object.assign(fixture.tabs.get(5002), { groupId: 78, windowId: 20 });
+            const restore = installGlobals({ chrome: fixture.chrome });
+            try {
+                const previous = await isolatedManagedTabs(fixture.chrome);
+                await previous.restoreManagedTabs();
+                for (const [tabId, groupId, taskHint] of [
+                    [5003, 77, 'Original task'],
+                    [5002, 78, 'Other task'],
+                ]) {
+                    await previous.markManagedTab(tabId, 'created', { taskHint, note: 'reusable' });
+                    await previous.setManagedTabGroup(tabId, groupId, 20);
+                }
+                const oldTabs = globalThis.structuredClone([...fixture.tabs.values()]);
+                const otherGroup = { ...fixture.groups.get(78) };
+                const { state, handler } = await isolatedTabHandler(fixture.chrome);
+                await handler.tabsMetadata({ tabId: 5003, taskHint: 'Original task', note: 'reusable' });
+                assert.equal(fixture.calls.length, 0, 'metadata never changes a legacy group title');
+                const created = await handler.tabsCreate(
+                    { taskHint: 'New task', sourceTabId: 5003 },
+                    createActionContext()
+                );
+                assert.equal(created.groupId, 77);
+                assert.equal(created.windowId, 20);
+                assert.equal(created.managed, true);
+                assert.equal(created.metadata.taskHint, 'New task');
+                const expectedTitle = title;
+                assert.equal(fixture.groups.get(77).title, expectedTitle);
+                assert.equal(fixture.groups.get(77).color, 'purple');
+                assert.equal(fixture.groups.get(77).collapsed, true);
+                const updates = fixture.calls.filter((call) => call.method === 'tabGroups.update');
+                assert.deepEqual(globalThis.structuredClone(updates.map((call) => call.properties)), []);
+                assert.deepEqual(
+                    globalThis.structuredClone(fixture.calls.find((call) => call.method === 'tabs.group').properties),
+                    { tabIds: [created.id], groupId: 77 }
+                );
+                await handler.tabsMetadata({ tabId: 5003, taskHint: null, note: null });
+                const noHint = await handler.tabsCreate(
+                    { sourceTabId: created.id },
+                    createActionContext({
+                        serverInstanceId: 'another-server',
+                        connectedServerInstanceIds: ['another-server'],
+                    })
+                );
+                assert.equal(noHint.groupId, 77);
+                assert.equal(noHint.metadata.taskHint, undefined);
+                assert.equal(state.getManagedTabMetadata(5003).taskHint, undefined);
+                assert.equal(state.getManagedTabMetadata(5003).note, undefined);
+                assert.equal(state.getManagedTabMetadata(5003).origin, 'created');
+                assert.equal(fixture.groups.get(77).title, expectedTitle);
+                assert.deepEqual(fixture.groups.get(78), otherGroup);
+                assert.deepEqual(
+                    oldTabs.map((tab) => fixture.tabs.get(tab.id)),
+                    oldTabs
+                );
+                assert.equal(fixture.calls.filter((call) => call.method === 'tabGroups.update').length, updates.length);
+                assert.equal(
+                    fixture.calls.some((call) => /^(?:tabs\.move|windows\.)/.test(call.method)),
+                    false
+                );
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('TASK work display and ownership survive metadata changes, explicit titles and reloads', async (t) => {
+    for (const scenario of ['custom template', 'explicit title', 'renamed task']) {
+        await t.test(scenario, async () => {
+            const fixture = createTabManagementFixture();
+            const title = scenario === 'custom template' ? 'MCP · Renamed' : 'MCP · Original task';
+            Object.assign(fixture.groups.get(77), { title, color: 'purple', collapsed: true });
+            const restore = installGlobals({ chrome: fixture.chrome });
+            try {
+                const previous = await isolatedManagedTabs(fixture.chrome);
+                await previous.restoreManagedTabs();
+                await previous.markManagedTab(5003, 'created', { taskHint: 'Original task' });
+                await previous.setManagedTabGroup(5003, 77, 20, 'original-server');
+                let loaded = await isolatedTabHandler(fixture.chrome);
+                if (scenario === 'explicit title') {
+                    await loaded.handler.tabGroupUpdate({ groupId: 77, title: 'MCP · Renamed' }, createActionContext());
+                }
+                const display = { ...fixture.groups.get(77) };
+                await loaded.handler.tabsMetadata({ tabId: 5003, taskHint: 'Renamed' });
+                assert.equal(loaded.state.getManagedTabRecord(5003).groupOwnerId, 'original-server');
+                loaded = await isolatedTabHandler(fixture.chrome);
+                for (const taskHint of ['Renamed', 'Original task']) {
+                    const created = await loaded.handler.tabsCreate(
+                        { taskHint, sourceTabId: 5003 },
+                        createActionContext({ connectedServerInstanceIds: ['regression-server'] })
+                    );
+                    assert.equal(created.groupId, 77);
+                    assert.deepEqual(fixture.groups.get(77), display);
+                    assert.equal(loaded.state.getManagedTabRecord(created.id).groupOwnerId, 'regression-server');
+                }
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('TASK actual handler reload reuses automatic groups only with restored managed identity', async (t) => {
+    for (const scenario of ['worker restart', 'new generation', 'replacement document']) {
+        await t.test(scenario, async () => {
+            const fixture = createTabManagementFixture();
+            const restore = installGlobals({ chrome: fixture.chrome });
+            const warnings = [];
+            try {
+                let loaded = await isolatedTabHandler(fixture.chrome, warnings);
+                const first = await loaded.handler.tabsCreate(
+                    { taskHint: 'Original task', note: 'reusable' },
+                    createActionContext()
+                );
+                await fixture.chrome.tabGroups.update(first.groupId, {
+                    title: 'Research pages',
+                    color: 'yellow',
+                    collapsed: true,
+                });
+                const display = { ...fixture.groups.get(first.groupId) };
+                if (scenario !== 'worker restart') {
+                    delete fixture.chrome.storage.sessionValues.mcp_managed_tabs_generation_v1;
+                }
+                if (scenario === 'replacement document') {
+                    fixture.documents.set(first.id, 'replacement-document');
+                }
+                loaded = await isolatedTabHandler(fixture.chrome, warnings);
+                const restored = scenario !== 'replacement document';
+                assert.equal(loaded.state.isManagedTab({ id: first.id }), restored);
+                assert.equal(loaded.state.getManagedTabMetadata(first.id).origin, restored ? 'created' : 'unknown');
+                const second = await loaded.handler.tabsCreate(
+                    { taskHint: 'Different task', sourceTabId: first.id },
+                    createActionContext({
+                        serverInstanceId: scenario === 'worker restart' ? 'regression-server' : 'replacement-server',
+                        connectedServerInstanceIds: [
+                            scenario === 'worker restart' ? 'regression-server' : 'replacement-server',
+                        ],
+                    })
+                );
+                assert.equal(second.groupId === first.groupId, restored);
+                assert.equal(second.managed, true);
+                assert.equal(second.metadata.origin, 'created');
+                assert.equal(second.metadata.taskHint, 'Different task');
+                assert.deepEqual(fixture.groups.get(first.groupId), display);
+                assert.equal(fixture.tabs.get(first.id).groupId, first.groupId);
+                if (restored) {
+                    assert.equal(loaded.state.getManagedTabMetadata(first.id).note, 'reusable');
+                    assert.equal(loaded.state.getManagedTabRecord(second.id).trustedGroupId, first.groupId);
+                } else {
+                    assert.equal(
+                        warnings.some((args) => String(args[0]).includes('identity differs')),
+                        true
+                    );
+                }
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('TASK matching titles never claim user or nonautomatic native groups', async (t) => {
+    for (const [title, origin] of [
+        ['MCP', 'unknown'],
+        ['MCP Chrome', 'adopted'],
+        ['MCP · Original task', 'created'],
+    ]) {
+        await t.test(origin, async () => {
+            const fixture = createTabManagementFixture();
+            fixture.groups.get(77).title = title;
+            const display = { ...fixture.groups.get(77) };
+            const restore = installGlobals({ chrome: fixture.chrome });
+            try {
+                const { state, handler } = await isolatedTabHandler(fixture.chrome);
+                if (origin !== 'unknown') {
+                    await state.markManagedTab(5003, origin, { taskHint: 'Original task' });
+                }
+                const created = await handler.tabsCreate({ taskHint: 'Original task' }, createActionContext());
+                assert.notEqual(created.groupId, 77);
+                assert.deepEqual(fixture.groups.get(77), display);
+                assert.equal(fixture.tabs.get(5003).groupId, 77);
+                assert.equal(state.getManagedTabRecord(5003)?.trustedGroupId, undefined);
+                assert.equal(state.isManagedTab({ id: 5003 }), origin !== 'unknown');
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('TASK released, mixed and relocated automatic groups lose reuse without changing their pages', async (t) => {
+    for (const scenario of ['released', 'adopted member', 'created nonautomatic member', 'moved window', 'regrouped']) {
+        await t.test(scenario, async () => {
+            const fixture = createTabManagementFixture();
+            const restore = installGlobals({ chrome: fixture.chrome });
+            try {
+                const { state, handler } = await isolatedTabHandler(fixture.chrome);
+                const first = await handler.tabsCreate({ taskHint: 'Original task' }, createActionContext());
+                fixture.groups.get(first.groupId).title = 'MCP · Original task';
+                if (scenario === 'released') {
+                    await state.unmarkManagedTab(first.id);
+                } else if (scenario.endsWith('member')) {
+                    await state.markManagedTab(5001, scenario === 'adopted member' ? 'adopted' : 'created');
+                    fixture.tabs.get(5001).groupId = first.groupId;
+                } else if (scenario === 'moved window') {
+                    fixture.tabs.get(first.id).windowId = 20;
+                    fixture.groups.get(first.groupId).windowId = 20;
+                } else {
+                    fixture.tabs.get(first.id).groupId = 77;
+                    fixture.tabs.get(first.id).windowId = 20;
+                    fixture.groups.delete(first.groupId);
+                }
+                const pages = globalThis.structuredClone([...fixture.tabs.values()]);
+                const display = globalThis.structuredClone([...fixture.groups.values()]);
+                const second = await handler.tabsCreate({ taskHint: 'New task' }, createActionContext());
+                assert.notEqual(second.groupId, first.groupId);
+                assert.notEqual(second.groupId, 77);
+                assert.equal(state.getManagedTabRecord(first.id)?.trustedGroupId, undefined);
+                assert.equal(state.isManagedTab({ id: first.id }), scenario !== 'released');
+                assert.deepEqual(
+                    pages.map((tab) => fixture.tabs.get(tab.id)),
+                    pages
+                );
+                assert.deepEqual(
+                    display.map((group) => fixture.groups.get(group.id)),
+                    display
+                );
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('TASK explicit placement bypasses automatic grouping while explicit native groups remain usable', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    try {
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
+        const handler = new TabHandler({});
+        const first = await handler.tabsCreate({ taskHint: 'Original task' }, createActionContext());
+        const nativeCreate = fixture.chrome.tabs.create;
+        for (const options of [
+            { windowId: 20 },
+            { index: 0 },
+            { openerTabId: 5003 },
+            { pinned: true },
+            { groupId: -1 },
+        ]) {
+            if (options.groupId === -1) {
+                fixture.chrome.tabs.create = async (properties) => {
+                    const tab = await nativeCreate(properties);
+                    fixture.tabs.get(tab.id).groupId = first.groupId;
+                    return { ...tab, groupId: first.groupId };
+                };
+            }
+            const start = fixture.calls.length;
+            const created = await handler.tabsCreate({ ...options, taskHint: 'Different task' }, createActionContext());
+            assert.equal(created.groupId, -1);
+            assert.equal(created.managed, true);
+            assert.equal(created.windowId, options.windowId ?? (options.openerTabId === 5003 ? 20 : first.windowId));
+            assert.equal(fixture.calls.length, start + (options.groupId === -1 ? 2 : 1));
+            assert.equal(fixture.calls[start].method, 'tabs.create');
+            for (const key of ['index', 'openerTabId', 'pinned']) {
+                if (options[key] !== undefined) {
+                    assert.equal(created[key], options[key]);
+                }
+            }
+            if (options.groupId === -1) {
+                assert.equal(fixture.calls.at(-1).method, 'tabs.ungroup');
+            }
+        }
+        fixture.chrome.tabs.create = nativeCreate;
+        const explicit = await handler.tabsCreate({ groupId: 77, index: 1 }, createActionContext());
+        assert.equal(explicit.groupId, 77);
+        assert.equal(explicit.windowId, 20);
+        assert.equal(explicit.index, 1);
+        assert.equal(explicit.managed, true);
+        assert.equal(isManagedTab({ id: 5003 }), false);
+        assert.deepEqual(
+            fixture.calls.slice(-2).map((call) => call.method),
+            ['tabs.group', 'tabs.move']
+        );
+        const repeated = await handler.tabsCreate({}, createActionContext());
+        assert.equal(repeated.groupId, first.groupId);
+        assert.equal(fixture.groups.get(77).title, 'Original');
+    } finally {
+        for (const tabId of fixture.tabs.keys()) {
+            await unmarkManagedTab(tabId);
+        }
+        restore();
+    }
+});
+
+test('TASK title failures preserve new pages and existing work titles require no updates', async (t) => {
+    for (const legacy of [false, true]) {
+        await t.test(legacy ? 'legacy title' : 'new title', async () => {
+            const fixture = createTabManagementFixture();
+            const restore = installGlobals({ chrome: fixture.chrome });
+            const warnings = [];
+            try {
+                if (legacy) {
+                    fixture.groups.get(77).title = 'MCP · Original task';
+                    const previous = await isolatedManagedTabs(fixture.chrome);
+                    await previous.restoreManagedTabs();
+                    await previous.markManagedTab(5003, 'created', { taskHint: 'Original task' });
+                    await previous.setManagedTabGroup(5003, 77, 20);
+                }
+                const { state, handler } = await isolatedTabHandler(fixture.chrome, warnings);
+                fixture.chrome.tabGroups.update = async () => {
+                    throw new Error('title update refused');
+                };
+                const first = await handler.tabsCreate(
+                    { taskHint: 'New task', ...(legacy ? { sourceTabId: 5003 } : {}) },
+                    createActionContext()
+                );
+                assert.equal(first.managed, true);
+                assert.equal(state.getManagedTabRecord(first.id).trustedGroupId, first.groupId);
+                assert.equal(
+                    (first.warnings ?? []).some((warning) => warning.includes('title update refused')),
+                    !legacy
+                );
+                assert.equal(
+                    warnings.some((args) => String(args[1]).includes('title update refused')),
+                    !legacy
+                );
+                const display = { ...fixture.groups.get(first.groupId) };
+                const second = await handler.tabsCreate({}, createActionContext());
+                assert.equal(second.groupId, first.groupId);
+                assert.equal(second.managed, true);
+                assert.deepEqual(fixture.groups.get(first.groupId), display);
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('TASK active foreign sources keep independent work groups and closing a default page preserves reuse', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const context = (serverInstanceId) =>
+        createActionContext({ serverInstanceId, connectedServerInstanceIds: ['work-a', 'work-b'] });
+    try {
+        const { state, handler } = await isolatedTabHandler(fixture.chrome);
+        const first = await handler.tabsCreate({ taskHint: '发版验证' }, context('work-a'));
+        const second = await handler.tabsCreate({ taskHint: '发版验证', sourceTabId: first.id }, context('work-b'));
+        assert.notEqual(second.groupId, first.groupId);
+        assert.equal(fixture.groups.get(first.groupId).title, 'MCP · 发版验证');
+        assert.equal(fixture.groups.get(second.groupId).title, 'MCP · 发版验证 2');
+        assert.equal(state.getManagedTabRecord(first.id).groupOwnerId, 'work-a');
+        assert.equal(state.getManagedTabRecord(second.id).groupOwnerId, 'work-b');
+        const continued = await handler.tabsCreate(
+            { taskHint: '查询构建结果', sourceTabId: first.id },
+            context('work-b')
+        );
+        assert.equal(continued.groupId, second.groupId);
+        await fixture.chrome.tabs.remove(second.id);
+        await state.unmarkManagedTab(second.id);
+        const afterClose = await handler.tabsCreate({}, context('work-b'));
+        assert.equal(afterClose.groupId, continued.groupId);
+        assert.equal(fixture.groups.get(first.groupId).title, 'MCP · 发版验证');
+        assert.equal(fixture.groups.get(continued.groupId).title, 'MCP · 发版验证 2');
+    } finally {
+        restore();
+    }
+});
+
+test('TASK ordinary creation gets bounded purpose names and new groups keep their pages runnable', async (t) => {
+    for (const [options, title, collapsed] of [
+        [{}, 'MCP · 浏览', false],
+        [{ url: 'https://example.com/owned' }, 'MCP · example.com', false],
+        [{ taskHint: '地图缓存验证' }, 'MCP · 地图缓存验证', false],
+        [{ taskHint: 'abcdefghijklmnop' }, 'MCP · abcdefghijkl…', false],
+        [{ taskHint: '发版验证', active: true }, 'MCP · 发版验证', false],
+    ]) {
+        await t.test(title + (options.active ? ' active' : ' background'), async () => {
+            const fixture = createTabManagementFixture();
+            const restore = installGlobals({ chrome: fixture.chrome });
+            try {
+                const { handler } = await isolatedTabHandler(fixture.chrome);
+                const created = await handler.tabsCreate(options, createActionContext());
+                const group = fixture.groups.get(created.groupId);
+                assert.equal(group.title, title);
+                assert.equal(group.collapsed, collapsed);
+                assert.equal(group.color, 'cyan');
+                assert.equal(created.active, options.active ?? false);
+                assert.equal(created.metadata.taskHint, options.taskHint);
+                const snapshot = { ...group };
+                fixture.chrome.tabGroups.update = async () => {
+                    throw new Error('existing display must stay unchanged');
+                };
+                const repeated = await handler.tabsCreate({ taskHint: '后续检查' }, createActionContext());
+                assert.equal(repeated.groupId, created.groupId);
+                assert.deepEqual(group, snapshot);
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('TASK frozen work resumes after page conditions and preserves its title, color and foreground', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const handler = new ActionHandler();
+    const context = createActionContext();
+    let executions = 0;
+    const update = fixture.chrome.tabGroups.update;
+    fixture.chrome.tabGroups.update = async (id, properties) => {
+        await update(id, properties);
+        if (properties.collapsed === false) {
+            for (const tab of fixture.tabs.values()) {
+                if (tab.groupId === id) {
+                    tab.frozen = false;
+                }
+            }
+        }
+    };
+    try {
+        const first = await /** @type {Promise<import('../src/types/index.ts').TabInfo>} */ (
+            handler.execute('tabs_create', { taskHint: '冻结恢复' }, context)
+        );
+        Object.assign(fixture.groups.get(first.groupId), { title: 'MCP · 自定义', color: 'purple', collapsed: true });
+        fixture.tabs.get(first.id).frozen = true;
+        // noinspection JSAccessibilityCheck -- 在生产调度入口验证页面处理前的恢复检查
+        handler.actions.set('challenge_inspect', async () => {
+            ++executions;
+            assert.equal(fixture.tabs.get(first.id).frozen, false);
+            return { inspected: true };
+        });
+        const updates = fixture.calls.filter((call) => call.method === 'tabGroups.update').length;
+        await assert.rejects(
+            () =>
+                handler.execute(
+                    'challenge_inspect',
+                    { tabId: first.id, expectedUrl: 'https://example.com/wrong' },
+                    context
+                ),
+            /ACTION_PRECONDITION_FAILED/
+        );
+        assert.equal(executions, 0);
+        assert.equal(fixture.calls.filter((call) => call.method === 'tabGroups.update').length, updates);
+        assert.equal(fixture.groups.get(first.groupId).collapsed, true);
+        const result = /** @type {{inspected: boolean}} */ (
+            await handler.execute('challenge_inspect', { tabId: first.id }, context)
+        );
+        assert.equal(result.inspected, true);
+        assert.equal(executions, 1);
+        assert.equal(fixture.groups.get(first.groupId).collapsed, false);
+        assert.equal(fixture.groups.get(first.groupId).title, 'MCP · 自定义');
+        assert.equal(fixture.groups.get(first.groupId).color, 'purple');
+        assert.equal(fixture.tabs.get(first.id).active, false);
+        assert.equal(
+            fixture.calls.some((call) => call.method === 'windows.update'),
+            false
+        );
+    } finally {
+        await handler.releaseBrowserEventOwner(context.serverInstanceId);
+        // noinspection JSUnresolvedReference -- 测试清理私有生命周期状态，保持生产成员可见性
+        globalThis.clearInterval(handler.logManager.sweepTimer);
+        for (const id of fixture.tabs.keys()) {
+            await unmarkManagedTab(id);
+        }
+        restore();
+    }
+});
+
+test('TASK cancellation during frozen group recovery stops navigation before dispatch', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const handler = new ActionHandler();
+    const context = createActionContext();
+    const entered = createDeferred();
+    const gate = createDeferred();
+    let operation;
+    try {
+        const first = await /** @type {Promise<import('../src/types/index.ts').TabInfo>} */ (
+            handler.execute('tabs_create', { taskHint: '取消恢复' }, context)
+        );
+        fixture.groups.get(first.groupId).collapsed = true;
+        fixture.tabs.get(first.id).frozen = true;
+        const update = fixture.chrome.tabGroups.update;
+        fixture.chrome.tabGroups.update = async (id, properties) => {
+            entered.resolve();
+            await gate.promise;
+            return update(id, properties);
+        };
+        const controller = new AbortController();
+        operation = handler.execute(
+            'navigate',
+            { tabId: first.id, url: 'https://example.com/cancelled' },
+            createActionContext({ signal: controller.signal })
+        );
+        operation.catch(() => {});
+        await entered.promise;
+        controller.abort();
+        gate.resolve();
+        await assert.rejects(operation, /REQUEST_CANCELLED/);
+        assert.equal(fixture.calls.filter((call) => call.method === 'tabs.update').length, 0);
+        assert.equal(fixture.tabs.get(first.id).url, first.url);
+        assert.equal(fixture.tabs.get(first.id).active, false);
+    } finally {
+        gate.resolve();
+        await Promise.allSettled([operation].filter(Boolean));
+        await handler.releaseBrowserEventOwner(context.serverInstanceId);
+        // noinspection JSUnresolvedReference -- 测试清理私有生命周期状态，保持生产成员可见性
+        globalThis.clearInterval(handler.logManager.sweepTimer);
+        for (const id of fixture.tabs.keys()) {
+            await unmarkManagedTab(id);
+        }
+        restore();
+    }
+});
+
+test('TASK concurrent recovery keeps the first active work owner and expands only once', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const gate = createDeferred();
+    const entered = createDeferred();
+    let firstRecovery;
+    let secondRecovery;
+    try {
+        const { state, handler } = await isolatedTabHandler(fixture.chrome);
+        const previous = createActionContext({ serverInstanceId: 'previous-server' });
+        const first = await handler.tabsCreate({ taskHint: '并发恢复' }, previous);
+        const second = await handler.tabsCreate({ sourceTabId: first.id }, previous);
+        fixture.groups.get(first.groupId).collapsed = true;
+        fixture.tabs.get(first.id).frozen = true;
+        fixture.tabs.get(second.id).frozen = true;
+        const active = ['first-server', 'second-server'];
+        const firstContext = createActionContext({
+            serverInstanceId: active[0],
+            connectedServerInstanceIds: active,
+        });
+        const secondContext = createActionContext({
+            serverInstanceId: active[1],
+            connectedServerInstanceIds: active,
+        });
+        const set = fixture.chrome.storage.local.set;
+        fixture.chrome.storage.local.set = async (values) => {
+            if (values.mcp_managed_tabs_v1?.tabs.some((tab) => tab.groupOwnerId === active[0])) {
+                entered.resolve();
+                await gate.promise;
+            }
+            return set(values);
+        };
+        let memberReads = 0;
+        const query = fixture.chrome.tabs.query;
+        fixture.chrome.tabs.query = async (properties) => {
+            if (properties.groupId === first.groupId) {
+                ++memberReads;
+            }
+            return query(properties);
+        };
+        const before = fixture.calls.filter((call) => call.method === 'tabGroups.update').length;
+        firstRecovery = handler.prepareWorkGroup(first.id, firstContext);
+        await entered.promise;
+        secondRecovery = handler.prepareWorkGroup(second.id, secondContext);
+        await waitUntil(() => memberReads === 2);
+        gate.resolve();
+        await Promise.all([firstRecovery, secondRecovery]);
+        for (const tab of [first, second]) {
+            assert.equal(state.getManagedTabRecord(tab.id).groupOwnerId, active[0]);
+        }
+        assert.equal(fixture.calls.filter((call) => call.method === 'tabGroups.update').length - before, 1);
+        const continued = await handler.tabsCreate({ taskHint: '继续工作' }, firstContext);
+        assert.equal(continued.groupId, first.groupId);
+        const independent = await handler.tabsCreate({ taskHint: '独立工作' }, secondContext);
+        assert.notEqual(independent.groupId, first.groupId);
+    } finally {
+        gate.resolve();
+        await Promise.allSettled([firstRecovery, secondRecovery].filter(Boolean));
+        restore();
+    }
+});
+
+test('TASK display updates complete while a page inspection is still pending', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const handler = new ActionHandler();
+    const context = createActionContext();
+    let started;
+    let finish;
+    let inspection;
+    const entered = new Promise((resolve) => {
+        started = () => resolve(undefined);
+    });
+    const held = new Promise((resolve) => {
+        finish = () => resolve({ inspected: true });
+    });
+    try {
+        const first = await /** @type {Promise<import('../src/types/index.ts').TabInfo>} */ (
+            handler.execute('tabs_create', { taskHint: '展开恢复' }, context)
+        );
+        // noinspection JSAccessibilityCheck -- 保持页面操作等待，验证分组显示更新可以独立完成
+        handler.actions.set('challenge_inspect', async () => {
+            started();
+            return held;
+        });
+        inspection = handler.execute('challenge_inspect', { tabId: first.id }, context);
+        await entered;
+        fixture.groups.get(first.groupId).collapsed = true;
+        const controller = new AbortController();
+        const timer = globalThis.setTimeout(() => controller.abort(), 500);
+        try {
+            const result = await handler.execute(
+                'tabgroup_update',
+                { groupId: first.groupId, collapsed: false },
+                createActionContext({ signal: controller.signal })
+            );
+            assert.equal(result.success, true);
+            assert.equal(fixture.groups.get(first.groupId).collapsed, false);
+        } finally {
+            globalThis.clearTimeout(timer);
+        }
+    } finally {
+        finish();
+        await inspection;
+        await handler.releaseBrowserEventOwner(context.serverInstanceId);
+        // noinspection JSUnresolvedReference -- 测试清理私有生命周期状态，保持生产成员可见性
+        globalThis.clearInterval(handler.logManager.sweepTimer);
+        for (const id of fixture.tabs.keys()) {
+            await unmarkManagedTab(id);
+        }
+        restore();
+    }
+});
+
+test('TASK work recovery preserves frozen user, mixed and other active connection groups', async (t) => {
+    for (const scenario of ['user', 'mixed', 'other active connection']) {
+        await t.test(scenario, async () => {
+            const fixture = createTabManagementFixture();
+            const restore = installGlobals({ chrome: fixture.chrome });
+            try {
+                const { state, handler } = await isolatedTabHandler(fixture.chrome);
+                const owner = createActionContext({
+                    serverInstanceId: 'owner',
+                    connectedServerInstanceIds: ['owner', 'other'],
+                });
+                const first =
+                    scenario === 'user'
+                        ? fixture.tabs.get(5003)
+                        : await handler.tabsCreate({ taskHint: '保留原组' }, owner);
+                if (scenario === 'user') {
+                    await state.markManagedTab(first.id, 'adopted');
+                }
+                if (scenario === 'mixed') {
+                    fixture.tabs.get(5001).groupId = first.groupId;
+                }
+                fixture.tabs.get(first.id).frozen = true;
+                fixture.groups.get(first.groupId).collapsed = true;
+                const before = { ...fixture.groups.get(first.groupId) };
+                await handler.prepareWorkGroup(
+                    first.id,
+                    scenario === 'other active connection'
+                        ? createActionContext({
+                              serverInstanceId: 'other',
+                              connectedServerInstanceIds: ['owner', 'other'],
+                          })
+                        : owner
+                );
+                assert.deepEqual(fixture.groups.get(first.groupId), before);
+                assert.equal(fixture.tabs.get(first.id).frozen, true);
+            } finally {
+                restore();
+            }
+        });
+    }
+});
 
 test('TASK v1 migration retains unknown managed access and never establishes group ownership', async () => {
     const fixture = createTabManagementFixture();
@@ -6017,6 +7982,8 @@ test('C1 post-create failures preserve target identity, actual management and fa
                 };
             }
             try {
+                // This case supplies only the NavigationHandler methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler = new TabHandler({
                     waitForNavigation: async () => {
                         throw new Error('navigation refused');
@@ -6143,7 +8110,9 @@ test('C2 action grants and revokes ordinary reads without GUI and without full o
             false
         );
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         await revokeReadGrants(context.serverInstanceId);
@@ -6202,7 +8171,9 @@ test('C13 tab updates consume native flags, preserve false values and reject sta
         await assert.rejects(() => handler.execute('tabs_update', { tabId: 5001 }, {}), /至少一个/);
         await assert.rejects(() => handler.execute('tabs_update', { tabId: 5001, openerTabId: 5003 }, {}), /同一窗口/);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         await unmarkManagedTab(5001);
@@ -6252,7 +8223,9 @@ test('C15 rejected updates preserve revisions while dispatched failures invalida
         assert.equal(fixture.tabs.get(5001).mutedInfo.muted, true);
         assert.notEqual((await pageSnapshot(5001)).revision, before.revision);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         await unmarkManagedTab(5001);
@@ -6266,6 +8239,8 @@ test('C15 creation preflight failures preserve known non-execution without nativ
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
         await markManagedTab(5001);
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         for (const [method, params] of [
             ['tabsCreate', { windowId: 10, groupId: 77 }],
@@ -6303,6 +8278,8 @@ test('C15 new groups retain their member window and require a destination for mi
             await markManagedTab(id);
             fixture.tabs.get(id).windowId = 20;
         }
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         const grouped = await handler.tabGroupCreate({ tabIds: [5001, 5002] }, createActionContext());
         assert.equal(grouped.after[0].windowId, 20);
@@ -6334,6 +8311,8 @@ test('C15 popup creation rejects extra pages before creating or moving a tab', a
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
         await markManagedTab(5001);
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         for (const params of [
             { type: 'popup', url: ['https://example.com/a', 'https://example.com/b'] },
@@ -6365,6 +8344,8 @@ test('C13 page creation preserves explicit placement and rejects conflicting win
     const fixture = createTabManagementFixture();
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         const created = await handler.tabsCreate(
             { url: 'https://example.com/new', windowId: 10, index: 1, pinned: true, openerTabId: 5002, active: false },
@@ -6462,7 +8443,9 @@ test('C13 group CRUD returns real members and properties without changing manage
         const topology = await handler.execute('tabs_topology', {}, createActionContext());
         assert.deepEqual(topology.groups.find((group) => group.id === 77).tabIds, [5003, 5001, 5002]);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (handler?.logManager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(handler.logManager.sweepTimer);
         }
         for (const id of fixture.tabs.keys()) {
@@ -6478,6 +8461,8 @@ test('C13 unmanaged member mutations and invalid native options reject before ef
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
         await markManagedTab(5001);
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         await assert.rejects(
             () => handler.tabGroupCreate({ tabIds: [5001, 5002], color: 'red' }, createActionContext()),
@@ -6503,6 +8488,8 @@ test('C13 window CRUD marks all created tabs and keeps permissions if native clo
     const fixture = createTabManagementFixture();
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         const created = await handler.windowCreate(
             {
@@ -6657,6 +8644,8 @@ test('C28 window updates observe state and stable geometry without replaying nat
             try {
                 await markManagedTab(5001);
                 await markManagedTab(5002);
+                // This case supplies only the NavigationHandler methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 const handler = new TabHandler({});
                 const bounds = { left: 90, top: 70, width: 1040, height: 780 };
                 const params =
@@ -6748,12 +8737,16 @@ test('C10 network fallback reads requests completed after the first performance 
     const manager = new LogManager();
     try {
         await markManagedTab(5001);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new LogEventHandler(manager, { isAttached: () => false });
         assert.deepEqual((await handler.networkGet({ tabId: 5001 }, createActionContext())).requests, [first]);
         assert.deepEqual((await handler.networkGet({ tabId: 5001 }, createActionContext())).requests, [first, second]);
         assert.equal(reads, 2);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (manager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(manager.sweepTimer);
         }
         await unmarkManagedTab(5001);
@@ -6789,6 +8782,8 @@ test('C10 performance network refresh preserves markers and document-local clear
     const manager = new LogManager();
     try {
         await markManagedTab(5001);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new LogEventHandler(manager, { isAttached: () => attached });
         const read = async (clear = false) =>
             (await handler.networkGet({ tabId: 5001, clear }, createActionContext())).requests;
@@ -6834,7 +8829,9 @@ test('C10 performance network refresh preserves markers and document-local clear
         fixture.chrome.scripting.executeScript = async () => [];
         await assert.rejects(() => read(), /did not return request records/);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         if (manager.sweepTimer) {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(manager.sweepTimer);
         }
         await unmarkManagedTab(5001);
@@ -6998,6 +8995,8 @@ test(
                 },
             },
         });
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new LogEventHandler(manager, {
             ensureAttached: async () => {
                 if (blocked) {
@@ -7045,6 +9044,7 @@ test(
             assert.equal((await handler.consoleGet({ tabId: 1 }, context)).messages.length, 0);
         } finally {
             manager.cleanupTab(1);
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(manager.sweepTimer);
             await unmarkManagedTab(1);
             restore();
@@ -7124,6 +9124,8 @@ for (const mode of ['pending', 'read', 'clear', 'restart', 'native']) {
                 }
             },
         };
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         let handler = new LogEventHandler(manager, debuggerManager);
         const context = { mcpWindowId: null, mcpTabGroupId: 10 };
         try {
@@ -7142,6 +9144,8 @@ for (const mode of ['pending', 'read', 'clear', 'restart', 'native']) {
             if (mode === 'restart') {
                 manager = new LogManager();
                 managers.push(manager);
+                // This case supplies only the DebuggerManager methods its path consumes.
+                // noinspection JSCheckFunctionSignatures
                 handler = new LogEventHandler(manager, debuggerManager);
             }
             blocked = false;
@@ -7169,6 +9173,7 @@ for (const mode of ['pending', 'read', 'clear', 'restart', 'native']) {
             assert.deepEqual((await handler.consoleGet({ tabId: 1 }, context)).messages, messages);
         } finally {
             for (const item of managers) {
+                // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
                 globalThis.clearInterval(item.sweepTimer);
             }
             await unmarkManagedTab(1);
@@ -7224,6 +9229,8 @@ for (const [removeFails, actionFails] of [
         });
         try {
             await markManagedTab(1);
+            // This case supplies only the DebuggerManager methods its path consumes.
+            // noinspection JSCheckFunctionSignatures
             const handler = new LogEventHandler(manager, { ensureAttached: async () => {} });
             const expected = actionFails ? actionError : removeFails ? removeError : contextError;
             await assert.rejects(
@@ -7237,6 +9244,7 @@ for (const [removeFails, actionFails] of [
             );
             assert.equal(manager.hasConsoleHandoff(1), false);
         } finally {
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             globalThis.clearInterval(manager.sweepTimer);
             await unmarkManagedTab(1);
             restore();
@@ -7306,6 +9314,7 @@ test('C07 failed Runtime handoff keeps hook ownership through the next ordinary 
             },
         },
     });
+    // noinspection JSCheckFunctionSignatures -- This case supplies only the DebuggerManager methods its path consumes.
     const handler = new LogEventHandler(manager, {
         ensureAttached: async () => {
             if (blocked) {
@@ -7343,6 +9352,7 @@ test('C07 failed Runtime handoff keeps hook ownership through the next ordinary 
             3
         );
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         globalThis.clearInterval(manager.sweepTimer);
         await unmarkManagedTab(1);
         restore();
@@ -7366,6 +9376,7 @@ test('C07 Runtime handoff retains OOPIF events with the same executionContextId'
     });
     try {
         const debuggerManager = new DebuggerManager(manager);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         debuggerManager.attachedTabs.add(1);
         debuggerManager.setupListeners();
         manager.beginConsoleHandoff(1, 'owned-handoff');
@@ -7395,6 +9406,7 @@ test('C07 Runtime handoff retains OOPIF events with the same executionContextId'
         assert.deepEqual(manager.getConsoleContexts(1), []);
         assert.equal(manager.hasConsoleHandoff(1), false);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         globalThis.clearInterval(manager.sweepTimer);
         restore();
     }
@@ -7439,6 +9451,9 @@ test('C07 concurrent console reads cannot overwrite a later fallback drain', asy
     });
     try {
         await markManagedTab(1);
+        // This case supplies only the LogManager methods its path consumes. This case supplies only the DebuggerManager
+        // methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new LogEventHandler(logManager, {});
         const context = { mcpWindowId: null, mcpTabGroupId: 10 };
         const firstRead = handler.consoleGet({ tabId: 1 }, context);
@@ -7474,6 +9489,236 @@ test('C07 concurrent console reads cannot overwrite a later fallback drain', asy
     }
 });
 
+test('C08 navigation wait observes live completion when getFrame has no documentId', async (t) => {
+    for (const wait of ['load', 'domcontentloaded', 'networkidle']) {
+        await t.test(wait, async () => {
+            const tab = { id: 1, status: /** @type {chrome.tabs.Tab['status']} */ ('loading') };
+            const onCommitted = chromeEvent();
+            const onDOMContentLoaded = chromeEvent();
+            const onCompleted = chromeEvent();
+            let tabReads = 0;
+            let readinessReads = 0;
+            let readyState = 'loading';
+            let settled = false;
+            const restore = installGlobals({
+                chrome: {
+                    tabs: {
+                        async get() {
+                            ++tabReads;
+                            return { ...tab };
+                        },
+                    },
+                    webNavigation: {
+                        onCommitted,
+                        onDOMContentLoaded,
+                        onCompleted,
+                        async getFrame() {
+                            return { url: 'https://example.com/loaded' };
+                        },
+                    },
+                    scripting: {
+                        async executeScript({ target, func }) {
+                            assert.deepEqual(target, { tabId: 1, frameIds: [0] });
+                            ++readinessReads;
+                            const result = vm.runInNewContext(`(${func})()`, { document: { readyState } });
+                            return [{ frameId: 0, result }];
+                        },
+                    },
+                },
+            });
+            try {
+                // noinspection JSCheckFunctionSignatures -- This case supplies the LogManager queries used by networkidle.
+                const handler = new NavigationHandler({
+                    getPending: () => undefined,
+                    isPendingUncertain: () => false,
+                    isNetworkObserved: () => true,
+                });
+                const outcome = handler.waitForNavigation(1, wait, 1200).then(
+                    () => {
+                        settled = true;
+                        return { status: 'fulfilled' };
+                    },
+                    (error) => ({ status: 'rejected', error })
+                );
+                await waitUntil(() => tabReads > 0);
+                const readsBefore = tabReads;
+                const mainFrame = { tabId: 1, frameId: 0, documentId: 'native-current-document' };
+                const event = wait === 'domcontentloaded' ? onDOMContentLoaded : onCompleted;
+                event.emit({ ...mainFrame, tabId: 2 });
+                event.emit({ ...mainFrame, frameId: 1 });
+                await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+                assert.equal(tabReads, readsBefore);
+                assert.equal(settled, false);
+
+                readyState = wait === 'domcontentloaded' ? 'interactive' : 'complete';
+                tab.status = wait === 'domcontentloaded' ? 'loading' : 'complete';
+                const completedAt = Date.now();
+                event.emit(mainFrame);
+                const result = await outcome;
+                assert.equal(result.status, 'fulfilled', result.error?.message);
+                assert.equal(settled, true);
+                if (wait === 'networkidle') {
+                    assert.ok(Date.now() - completedAt >= 500);
+                }
+                if (wait === 'domcontentloaded') {
+                    assert.ok(readinessReads > 0);
+                    assert.equal(tab.status, 'loading');
+                } else {
+                    assert.equal(readinessReads, 0);
+                }
+                assert.equal(onCommitted.size, 0);
+                assert.equal(onDOMContentLoaded.size, 0);
+                assert.equal(onCompleted.size, 0);
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('C08 navigation wait preserves known document identity and clears listeners on timeout', async (t) => {
+    for (const scenario of ['known-document', 'missing-document-timeout', 'state-read-error']) {
+        await t.test(scenario, async () => {
+            const onCommitted = chromeEvent();
+            const onDOMContentLoaded = chromeEvent();
+            const onCompleted = chromeEvent();
+            const failure = new Error('owned current tab state unavailable');
+            let tabReads = 0;
+            let complete = false;
+            let settled = false;
+            const restore = installGlobals({
+                chrome: {
+                    tabs: {
+                        async get() {
+                            ++tabReads;
+                            if (scenario === 'state-read-error' && tabReads > 1) {
+                                throw failure;
+                            }
+                            return {
+                                id: 1,
+                                status: /** @type {chrome.tabs.Tab['status']} */ (complete ? 'complete' : 'loading'),
+                            };
+                        },
+                    },
+                    webNavigation: {
+                        onCommitted,
+                        onDOMContentLoaded,
+                        onCompleted,
+                        async getFrame() {
+                            return { documentId: scenario === 'known-document' ? 'current-document' : undefined };
+                        },
+                    },
+                },
+            });
+            try {
+                // noinspection JSCheckFunctionSignatures -- The load wait does not consume LogManager methods.
+                const outcome = new NavigationHandler({}).waitForNavigation(1, 'load', 120).then(
+                    () => {
+                        settled = true;
+                        return { status: 'fulfilled' };
+                    },
+                    (error) => ({ status: 'rejected', error })
+                );
+                await waitUntil(() => tabReads > 0);
+                if (scenario === 'known-document') {
+                    complete = true;
+                    onCompleted.emit({ tabId: 1, frameId: 0, documentId: 'old-document' });
+                    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+                    assert.equal(settled, false);
+                    assert.equal(tabReads, 1);
+                    onCompleted.emit({ tabId: 1, frameId: 0, documentId: 'current-document' });
+                } else if (scenario === 'state-read-error') {
+                    onCompleted.emit({ tabId: 1, frameId: 0, documentId: 'native-current-document' });
+                }
+                const result = await outcome;
+                if (scenario === 'known-document') {
+                    assert.equal(result.status, 'fulfilled');
+                } else {
+                    assert.equal(result.status, 'rejected');
+                    if (scenario === 'state-read-error') {
+                        assert.equal(result.error, failure);
+                    } else {
+                        assert.match(result.error.message, /Navigation timeout/);
+                    }
+                }
+                assert.equal(onCommitted.size, 0);
+                assert.equal(onDOMContentLoaded.size, 0);
+                assert.equal(onCompleted.size, 0);
+            } finally {
+                restore();
+            }
+        });
+    }
+});
+
+test('C08 navigation wait releases missing-identity readiness probes after error or deadline', async (t) => {
+    for (const scenario of ['probe-error', 'late-probe']) {
+        await t.test(scenario, async () => {
+            const probe = createDeferred();
+            const failure = new Error('owned readiness probe refused');
+            const onCommitted = chromeEvent();
+            const onDOMContentLoaded = chromeEvent();
+            const onCompleted = chromeEvent();
+            let probes = 0;
+            let settled = false;
+            const restore = installGlobals({
+                chrome: {
+                    tabs: {
+                        async get() {
+                            return { id: 1, status: /** @type {chrome.tabs.Tab['status']} */ ('loading') };
+                        },
+                    },
+                    webNavigation: {
+                        onCommitted,
+                        onDOMContentLoaded,
+                        onCompleted,
+                        async getFrame() {
+                            return {};
+                        },
+                    },
+                    scripting: {
+                        async executeScript() {
+                            ++probes;
+                            await probe.promise;
+                            if (scenario === 'probe-error') {
+                                throw failure;
+                            }
+                            return [{ frameId: 0, result: 'interactive' }];
+                        },
+                    },
+                },
+            });
+            try {
+                // noinspection JSCheckFunctionSignatures -- The DOM readiness wait does not consume LogManager methods.
+                const outcome = new NavigationHandler({}).waitForNavigation(1, 'domcontentloaded', 80).then(
+                    () => {
+                        settled = true;
+                        return undefined;
+                    },
+                    (error) => error
+                );
+                await waitUntil(() => probes === 1);
+                if (scenario === 'probe-error') {
+                    probe.resolve();
+                    assert.equal(await outcome, failure);
+                } else {
+                    assert.match((await outcome).message, /Navigation timeout/);
+                    probe.resolve();
+                    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+                }
+                assert.equal(settled, false);
+                assert.equal(probes, 1);
+                assert.equal(onCommitted.size, 0);
+                assert.equal(onDOMContentLoaded.size, 0);
+                assert.equal(onCompleted.size, 0);
+            } finally {
+                probe.resolve();
+                restore();
+            }
+        });
+    }
+});
+
 test('C08 networkidle rejects while requests remain pending and honors the quiet window', async () => {
     const pending = new Map([['request-1', {}]]);
     const onCommitted = chromeEvent();
@@ -7483,7 +9728,7 @@ test('C08 networkidle rejects while requests remain pending and honors the quiet
         chrome: {
             tabs: {
                 async get() {
-                    return { status: 'complete' };
+                    return { status: /** @type {chrome.tabs.Tab['status']} */ ('complete') };
                 },
             },
             webNavigation: { onCommitted, onDOMContentLoaded, onCompleted },
@@ -7495,6 +9740,7 @@ test('C08 networkidle rejects while requests remain pending and honors the quiet
             isPendingUncertain: () => false,
             isNetworkObserved: () => true,
         };
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         const handler = new NavigationHandler(logManager);
         await assert.rejects(() => handler.waitForNavigation(1, 'networkidle', 40), /Navigation timeout/);
 
@@ -7524,7 +9770,9 @@ test('C08 long-running requests remain pending after the diagnostic sweep', () =
             wallTime: 10,
         });
         manager.getPending(1).get('long-request')._addedAt = Date.now() - 61_000;
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         manager.sweepPending();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         manager.sweepPending();
         assert.equal(manager.getPending(1).size, 1);
         assert.equal(warnings.length, 1);
@@ -7567,7 +9815,7 @@ test('C08 pending capacity loss makes networkidle uncertain until tab cleanup', 
             chrome: {
                 tabs: {
                     async get() {
-                        return { status: 'complete' };
+                        return { status: /** @type {chrome.tabs.Tab['status']} */ ('complete') };
                     },
                 },
                 webNavigation: {
@@ -7609,7 +9857,7 @@ test('C08 debugger detach keeps network tracking uncertain until a new root docu
             },
             tabs: {
                 async get() {
-                    return { status: 'complete' };
+                    return { status: /** @type {chrome.tabs.Tab['status']} */ ('complete') };
                 },
             },
             webNavigation: {
@@ -7693,6 +9941,9 @@ test('Extension context loss and error-page injection remain explicit failures w
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes. This case supplies only the LogManager
+        // methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const debuggerHandler = new DebuggerHandler({ async ensureAttached() {} }, {});
         await assert.rejects(
             () =>
@@ -7708,6 +9959,8 @@ test('Extension context loss and error-page injection remain explicit failures w
             () => debuggerHandler.debuggerSend({ tabId: tab.id, method: 'Runtime.evaluate' }, createActionContext()),
             (error) => error === debuggerError
         );
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const contentHandler = new ContentHandler({
             async ensureAttached() {
                 assert.fail('failed dimension reads must not attach the debugger');
@@ -7757,35 +10010,47 @@ test('Extension context loss and error-page injection remain explicit failures w
     }
 });
 
-test('Extension history uses fallback only for scriptable no-history pages and cleans failed waits', async () => {
+test('Extension history uses isolated page traversal or script-free native history and cleans failed waits', async () => {
     for (const direction of ['back', 'forward']) {
         for (const scenario of [
-            'native',
+            'page',
             'native-restricted',
+            'native-error-page',
+            'native-missing-frame',
             'restricted',
             'error-page',
             'missing-frame',
-            'fallback',
             'unexpected',
+            'unexpected-restricted',
             'injection-error',
+            'script-error',
         ]) {
-            const native = scenario === 'native' || scenario === 'native-restricted';
+            const native = scenario.startsWith('native-');
+            const scriptable = ['page', 'injection-error', 'script-error'].includes(scenario);
             const tab = {
                 id: 9802,
-                url:
-                    scenario === 'restricted' || scenario === 'native-restricted'
-                        ? 'chrome://settings/'
-                        : 'https://example.com/current',
+                url: ['restricted', 'native-restricted', 'unexpected-restricted'].includes(scenario)
+                    ? 'chrome://settings/'
+                    : 'https://example.com/current',
             };
             const onUpdated = chromeEvent();
             const onCommitted = chromeEvent();
             let injections = 0;
+            let nativeCalls = 0;
             const nativeError = new Error(
-                scenario === 'unexpected' ? 'native navigation defect' : 'Cannot find a next page in history'
+                scenario.startsWith('unexpected') ? 'native navigation defect' : 'Cannot find a next page in history'
             );
+            const scriptError = new Error('isolated history traversal refused');
             const navigate = () => {
                 tab.url = 'https://example.com/previous';
                 onUpdated.emit(tab.id, { url: tab.url });
+            };
+            const nativeNavigate = async () => {
+                ++nativeCalls;
+                if (!native) {
+                    throw nativeError;
+                }
+                navigate();
             };
             const restore = installGlobals({
                 chrome: {
@@ -7795,49 +10060,41 @@ test('Extension history uses fallback only for scriptable no-history pages and c
                             return tab;
                         },
                         onUpdated,
-                        async goBack() {
-                            if (native) {
-                                navigate();
-                            } else {
-                                throw nativeError;
-                            }
-                        },
-                        async goForward() {
-                            if (native) {
-                                navigate();
-                            } else {
-                                throw nativeError;
-                            }
-                        },
+                        goBack: nativeNavigate,
+                        goForward: nativeNavigate,
                     },
                     webNavigation: {
                         onCommitted,
                         async getFrame() {
-                            return scenario === 'missing-frame' ? null : { errorOccurred: scenario === 'error-page' };
+                            return scenario.endsWith('missing-frame') ? null : { errorOccurred: !scriptable };
                         },
                     },
                     scripting: {
-                        async executeScript() {
-                            injections++;
+                        async executeScript({ world }) {
+                            ++injections;
+                            assert.equal(world, 'ISOLATED');
                             if (scenario === 'injection-error') {
                                 throw new Error('Frame with ID 0 is showing error page');
                             }
+                            if (scenario === 'script-error') {
+                                throw scriptError;
+                            }
                             navigate();
+                            return [{ frameId: 0, result: true }];
                         },
                     },
                 },
             });
             try {
                 await markManagedTab(tab.id);
+                // noinspection JSCheckFunctionSignatures -- This history-only path does not consume LogManager methods.
                 const handler = new NavigationHandler({});
-                const signal = handler.waitForNavigationSignal.bind(handler);
-                handler.waitForNavigationSignal = (tabId, beforeUrl) => signal(tabId, beforeUrl, 1);
                 const action = () =>
                     handler[direction === 'back' ? 'goBack' : 'goForward'](
                         { tabId: tab.id, timeout: 1000 },
                         createActionContext()
                     );
-                if (scenario === 'unexpected') {
+                if (scenario.startsWith('unexpected')) {
                     await assert.rejects(action, (error) => error === nativeError);
                 } else if (scenario === 'injection-error') {
                     await assert.rejects(
@@ -7845,15 +10102,14 @@ test('Extension history uses fallback only for scriptable no-history pages and c
                         (error) =>
                             error instanceof ExpectedOperationError && error.message.includes('showing error page')
                     );
+                } else if (scenario === 'script-error') {
+                    await assert.rejects(action, (error) => error === scriptError);
                 } else {
                     const result = await action();
-                    assert.equal(result.navigated, native || scenario === 'fallback', `${direction}/${scenario}`);
+                    assert.equal(result.navigated, native || scenario === 'page', `${direction}/${scenario}`);
                 }
-                assert.equal(
-                    injections,
-                    scenario === 'fallback' || scenario === 'injection-error' ? 1 : 0,
-                    `${direction}/${scenario}`
-                );
+                assert.equal(injections, scriptable ? 1 : 0, `${direction}/${scenario}`);
+                assert.equal(nativeCalls, scriptable ? 0 : 1, `${direction}/${scenario}`);
                 assert.equal(onUpdated.size, 0, `${direction}/${scenario}`);
                 assert.equal(onCommitted.size, 0, `${direction}/${scenario}`);
             } finally {
@@ -7898,7 +10154,11 @@ test('C-R11 empty history returns before the original deadline and preserves val
                         navigation:
                             scenario === 'legacy-fallback'
                                 ? undefined
-                                : { canGoBack: fallback, canGoForward: fallback },
+                                : {
+                                      canGoBack: fallback,
+                                      canGoForward: fallback,
+                                      entries: () => Array.from({ length: history.length }),
+                                  },
                     },
                     history,
                     chrome: {
@@ -7933,6 +10193,8 @@ test('C-R11 empty history returns before the original deadline and preserves val
                 });
                 try {
                     await markManagedTab(tab.id);
+                    // This case supplies only the LogManager methods its path consumes.
+                    // noinspection JSCheckFunctionSignatures
                     const handler = new NavigationHandler({});
                     const result = await handler[direction === 'back' ? 'goBack' : 'goForward'](
                         { tabId: tab.id, timeout: 60 },
@@ -7941,6 +10203,190 @@ test('C-R11 empty history returns before the original deadline and preserves val
                     assert.equal(result.navigated, fallback);
                     assert.equal(historyActions, fallback ? 1 : 0);
                     assert.equal(injections, ['restricted', 'missing-frame', 'error-page'].includes(scenario) ? 0 : 1);
+                    assert.equal(onUpdated.size, 0);
+                    assert.equal(onCommitted.size, 0);
+                } finally {
+                    await unmarkManagedTab(tab.id);
+                    restore();
+                }
+            });
+        }
+    }
+});
+
+test('HISTORYSTEP accessible documents traverse the adjacent entry without native UI skipping', async (t) => {
+    for (const direction of ['back', 'forward']) {
+        for (const scenario of ['fragment', 'document', 'cross-origin-view']) {
+            await t.test(`${direction}/${scenario}`, async () => {
+                const entries =
+                    scenario === 'fragment'
+                        ? ['#base', '#page-a', '#page-b'].map((hash) => `https://example.com/page${hash}`)
+                        : ['zero', 'one', 'two'].map(
+                              (name, index) =>
+                                  `https://${scenario === 'cross-origin-view' ? `example${index}` : 'example'}.com/${name}`
+                          );
+                let index = direction === 'back' ? 2 : 0;
+                const tab = { id: 9927, url: entries[index] };
+                const onUpdated = chromeEvent();
+                const onCommitted = chromeEvent();
+                let nativeCalls = 0;
+                let scriptCalls = 0;
+                const move = (next) => {
+                    index = next;
+                    tab.url = entries[index];
+                    onUpdated.emit(tab.id, { url: tab.url });
+                };
+                const restore = installGlobals({
+                    chrome: {
+                        storage: createStorage(),
+                        tabs: {
+                            async get() {
+                                return { ...tab };
+                            },
+                            onUpdated,
+                            async [direction === 'back' ? 'goBack' : 'goForward']() {
+                                ++nativeCalls;
+                                move(direction === 'back' ? 0 : entries.length - 1);
+                            },
+                        },
+                        webNavigation: {
+                            onCommitted,
+                            async getFrame() {
+                                return { documentId: 'owned-history-document' };
+                            },
+                        },
+                        scripting: {
+                            async executeScript({ target, world, func, args }) {
+                                ++scriptCalls;
+                                assert.equal(target.tabId, tab.id);
+                                assert.equal(world, 'ISOLATED');
+                                const navigation = {
+                                    canGoBack: scenario !== 'cross-origin-view' && index > 0,
+                                    canGoForward: scenario !== 'cross-origin-view' && index < entries.length - 1,
+                                    entries: () => (scenario === 'cross-origin-view' ? [entries[index]] : entries),
+                                };
+                                const history = {
+                                    length: entries.length,
+                                    [direction]() {
+                                        move(index + (direction === 'back' ? -1 : 1));
+                                    },
+                                };
+                                const result = vm.runInNewContext(`(${func})(...args)`, {
+                                    window: { navigation },
+                                    history,
+                                    args,
+                                });
+                                return [{ frameId: 0, result }];
+                            },
+                        },
+                        debugger: {
+                            async attach() {
+                                assert.fail('one-step history must not attach a debugger');
+                            },
+                        },
+                    },
+                });
+                try {
+                    await markManagedTab(tab.id);
+                    // noinspection JSCheckFunctionSignatures -- This history-only path does not consume LogManager methods.
+                    const result = await new NavigationHandler({})[direction === 'back' ? 'goBack' : 'goForward'](
+                        { tabId: tab.id, timeout: 1000 },
+                        createActionContext()
+                    );
+                    assert.equal(index, 1, 'the adjacent entry remains reachable without user activation');
+                    assert.equal(result.url, entries[1]);
+                    assert.equal(result.navigated, true);
+                    assert.equal(scriptCalls, 1);
+                    assert.equal(nativeCalls, 0);
+                    assert.equal(onUpdated.size, 0);
+                    assert.equal(onCommitted.size, 0);
+                } finally {
+                    await unmarkManagedTab(tab.id);
+                    restore();
+                }
+            });
+        }
+    }
+});
+
+test('HISTORYSTEP pending native loads retain browser traversal and ignored scripts stay unknown', async (t) => {
+    for (const direction of ['back', 'forward']) {
+        for (const scenario of ['pending-native-load', 'ignored-script']) {
+            await t.test(`${direction}/${scenario}`, async () => {
+                const tab = {
+                    id: 9928,
+                    url: 'https://example.com/current',
+                    ...(scenario === 'pending-native-load'
+                        ? { pendingUrl: 'https://example.com/pending', status: 'loading' }
+                        : {}),
+                };
+                const onUpdated = chromeEvent();
+                const onCommitted = chromeEvent();
+                let nativeCalls = 0;
+                let scriptCalls = 0;
+                const restore = installGlobals({
+                    chrome: {
+                        storage: createStorage(),
+                        tabs: {
+                            async get() {
+                                return { ...tab };
+                            },
+                            onUpdated,
+                            async [direction === 'back' ? 'goBack' : 'goForward']() {
+                                ++nativeCalls;
+                                tab.url = 'https://example.com/adjacent';
+                                delete tab.pendingUrl;
+                                onUpdated.emit(tab.id, { url: tab.url });
+                            },
+                        },
+                        webNavigation: {
+                            onCommitted,
+                            async getFrame() {
+                                return { documentId: 'old-visible-document' };
+                            },
+                        },
+                        scripting: {
+                            async executeScript() {
+                                ++scriptCalls;
+                                return [{ frameId: 0, result: true }];
+                            },
+                        },
+                    },
+                });
+                try {
+                    await markManagedTab(tab.id);
+                    // noinspection JSCheckFunctionSignatures -- This history-only path does not consume LogManager methods.
+                    const handler = new NavigationHandler({});
+                    // noinspection JSUnresolvedReference -- Bound the signal window while retaining the real observer and deadline.
+                    const signal = handler.waitForNavigationSignal.bind(handler);
+                    // noinspection JSUnresolvedReference -- The test controls only the existing signal timer.
+                    handler.waitForNavigationSignal = (tabId, url, _timeout, context) =>
+                        signal(tabId, url, 10, context);
+                    const operation = () =>
+                        handler[direction === 'back' ? 'goBack' : 'goForward'](
+                            { tabId: tab.id, timeout: 1000 },
+                            createActionContext()
+                        );
+                    if (scenario === 'pending-native-load') {
+                        const body = await operation();
+                        assert.equal(body.navigated, true);
+                        assert.equal(body.url, 'https://example.com/adjacent');
+                        assert.equal(nativeCalls, 1);
+                        assert.equal(scriptCalls, 0);
+                    } else {
+                        await assert.rejects(operation, (error) => {
+                            const detail = JSON.parse(error.message).error;
+                            return (
+                                detail.code === 'TIMEOUT' &&
+                                detail.context.actionExecuted === true &&
+                                detail.context.actionStatus === 'unknown' &&
+                                detail.context.retryable === false
+                            );
+                        });
+                        assert.equal(nativeCalls, 0);
+                        assert.equal(scriptCalls, 1);
+                        assert.equal(tab.url, 'https://example.com/current');
+                    }
                     assert.equal(onUpdated.size, 0);
                     assert.equal(onCommitted.size, 0);
                 } finally {
@@ -7970,10 +10416,12 @@ test('C04 Extension navigation waits for the lifecycle of the newly committed do
         },
     });
     try {
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         const handler = new NavigationHandler({
             getPending: () => undefined,
             isPendingUncertain: () => false,
         });
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await handler.runNavigationAction(7, 'domcontentloaded', Date.now() + 1000, async () => {
             assert.equal(onCommitted.size, 1);
             assert.equal(onDOMContentLoaded.size, 1);
@@ -8011,12 +10459,14 @@ test('C04 Extension same-document navigation rejects stale document and URL even
         },
     });
     try {
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         const handler = new NavigationHandler({
             getPending: () => undefined,
             isPendingUncertain: () => false,
         });
         let actionRan = false;
         let operationSettled = false;
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         const operation = handler.runNavigationAction(
             7,
             'load',
@@ -8082,10 +10532,12 @@ test('C04 Extension navigation still reports an action failure after the lifecyc
         },
     });
     try {
+        // noinspection JSCheckFunctionSignatures -- This case supplies only the LogManager methods its path consumes.
         const handler = new NavigationHandler({
             getPending: () => undefined,
             isPendingUncertain: () => false,
         });
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await assert.rejects(
             () =>
                 handler.runNavigationAction(7, 'load', Date.now() + 1000, async () => {
@@ -8305,6 +10757,7 @@ test('CH-12 fallback console retention remains bounded with monotonic sequences'
         assert.equal(manager.getConsole(41).length, 0);
     } finally {
         manager.cleanupTab(41);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         globalThis.clearInterval(manager.sweepTimer);
     }
 });
@@ -8323,6 +10776,7 @@ test('F038 nested control names survive depth boundaries without hidden text or 
             getRootNode: () => globalThis.document,
             getAttribute: (name) => attributes[name] ?? null,
             hasAttribute: (name) => Object.hasOwn(attributes, name),
+            matches: () => false,
             getBoundingClientRect: () => ({
                 x: 0,
                 y: 0,
@@ -8348,8 +10802,9 @@ test('F038 nested control names survive depth boundaries without hidden text or 
             element('script', [text('script-secret')]),
             password,
         ]);
+        const document = { body: button, querySelector: () => null, elementFromPoint: () => null };
         const restore = installGlobals({
-            document: { body: button, querySelector: () => null, elementFromPoint: () => null },
+            document,
             window: {
                 innerWidth: 800,
                 innerHeight: 600,
@@ -8380,7 +10835,7 @@ test('F038 nested control names survive depth boundaries without hidden text or 
             for (let depth = 0; depth < 6000; ++depth) {
                 branch = element('span', [branch]);
             }
-            globalThis.document.body = element('div', [branch]);
+            document.body = element('div', [branch]);
             const deepState = generateAccessibilityTree('interactive', 1, null, null);
             assert.equal(
                 deepState.interactiveElements.length,
@@ -8390,13 +10845,13 @@ test('F038 nested control names survive depth boundaries without hidden text or 
             assert.equal(deepState.interactiveElements[0].name, label);
             assert.equal(deepState.interactiveElements[1].value, undefined);
             assert.doesNotMatch(deepState.pageContent, /secret/);
-            globalThis.document.body = button;
+            document.body = button;
             button.getAttribute = (name) => (name === 'aria-label' ? 'ARIA name' : null);
             assert.equal(generateAccessibilityTree('all', 0, null, null).interactiveElements[0].name, 'ARIA name');
             button.getAttribute = () => null;
             button.id = 'named';
             button.labels = [element('label', [text('Label name')])];
-            globalThis.document.querySelector = () => button.labels[0];
+            document.querySelector = () => button.labels[0];
             assert.equal(generateAccessibilityTree('all', 0, null, null).interactiveElements[0].name, 'Label name');
         } finally {
             restore();
@@ -8423,6 +10878,8 @@ test('F074 dispatch_input requires an action result while null and void helpers 
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new ContentHandler({});
         for (results of [
             [],
@@ -8461,6 +10918,7 @@ test('F074 dispatch_input requires an action result while null and void helpers 
         }
         for (const result of [null, undefined]) {
             results = [{ result }];
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             assert.equal(await handler.injectScript(tab.id, 0, () => undefined, []), result);
         }
     } finally {
@@ -8475,16 +10933,18 @@ test('CH-13 controlled contenteditable replaces text without invoking a form val
     class Input {
         namespaceURI = 'http://www.w3.org/1999/xhtml';
         localName = 'input';
-        matches() {
-            return false;
-        }
 
         set value(value) {
             ++setterCalls;
+            // noinspection JSUnresolvedReference -- Input is the local native-setter fixture class declared above.
             if (!(this instanceof Input)) {
                 throw new TypeError('Illegal invocation');
             }
             this.stored = value;
+        }
+
+        matches() {
+            return false;
         }
     }
     const editable = {
@@ -8511,6 +10971,7 @@ test('CH-13 controlled contenteditable replaces text without invoking a form val
         const input = new Input();
         input.focus = () => {};
         input.dispatchEvent = (event) => events.push(event.type);
+        // noinspection JSValidateTypes -- DOM ref lookup consumes only this deterministic deref stub.
         globalThis.window.__mcpElementMap.field = { deref: () => input };
         assert.equal(dispatchInputToElement('field', 'native value').success, true);
         assert.equal(input.stored, 'native value');
@@ -8561,6 +11022,7 @@ test('I025 controlled input validates editable targets before focus or input eve
         [Select, 'select'],
     ]) {
         Object.defineProperty(Type.prototype, 'value', {
+            /** @this {Control} */
             set(value) {
                 assert.equal(this.localName, tag, 'Native setter must receive its own interface');
                 ++writes;
@@ -8587,6 +11049,7 @@ test('I025 controlled input validates editable targets before focus or input eve
             [Object.assign(new Input(), { namespaceURI: 'http://www.w3.org/2000/svg' }), /input、textarea、select/],
             [Object.assign(new Control(), { localName: 'input', type: 'file' }), /upload/],
         ]) {
+            // noinspection JSValidateTypes -- DOM ref lookup consumes only this deterministic deref stub.
             globalThis.window.__mcpElementMap.owned = { deref: () => element };
             const result = dispatchInputToElement('owned', 'private value');
             assert.equal(result.success, false);
@@ -8597,6 +11060,7 @@ test('I025 controlled input validates editable targets before focus or input eve
             assert.deepEqual(events, []);
         }
         for (const element of [new Input(), new Textarea(), new Select()]) {
+            // noinspection JSValidateTypes -- DOM ref lookup consumes only this deterministic deref stub.
             globalThis.window.__mcpElementMap.owned = { deref: () => element };
             assert.equal(dispatchInputToElement('owned', 'accepted value').success, true);
             assert.equal(element.stored, 'accepted value');
@@ -8612,6 +11076,7 @@ test('I025 controlled input validates editable targets before focus or input eve
                 Object.assign(new Control(), { localName: new Type().localName }),
             ]) {
                 const before = { writes, focuses, events: events.length };
+                // noinspection JSValidateTypes -- DOM ref lookup consumes only this deterministic deref stub.
                 globalThis.window.__mcpElementMap.owned = { deref: () => element };
                 assert.equal(dispatchInputToElement('owned', 'updated').success, true);
                 assert.equal(element.stored, 'updated');
@@ -8623,6 +11088,7 @@ test('I025 controlled input validates editable targets before focus or input eve
         const beforeMissingSetter = { writes, focuses, events: events.length };
         const field = new Input();
         globalThis.HTMLInputElement = class {};
+        // noinspection JSValidateTypes -- DOM ref lookup consumes only this deterministic deref stub.
         globalThis.window.__mcpElementMap.owned = { deref: () => field };
         const missingSetter = dispatchInputToElement('owned', 'updated');
         assert.equal(missingSetter.success, false);
@@ -8677,10 +11143,14 @@ test('CH-22 window screenshot rejects A to B to A and always releases activation
         },
     });
     try {
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new ContentHandler({});
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         assert.equal((await handler.screenshotFallback(tab.id, {})).degraded, true);
         assert.equal(onActivated.size, 0);
         race = true;
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         await assert.rejects(handler.screenshotFallback(tab.id, {}), /SCREENSHOT_TARGET_CHANGED/);
         assert.equal(onActivated.size, 0);
     } finally {
@@ -8695,8 +11165,10 @@ test('CH-03 and CH-04 cancelled queued action and expired async attach never dis
     try {
         await markManagedTab(5001);
         const gate = createDeferred();
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         const first = handler.withActionLocks([5001], () => gate.promise);
         let executions = 0;
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         handler.actions.set('evaluate', async () => {
             ++executions;
             return {};
@@ -8709,6 +11181,9 @@ test('CH-03 and CH-04 cancelled queued action and expired async attach never dis
         await first;
         assert.equal(executions, 0);
         const attaching = createDeferred();
+        // This case supplies only the DebuggerManager methods its path consumes. This case supplies only the LogManager
+        // methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const debuggerHandler = new DebuggerHandler({ ensureAttached: () => attaching.promise }, {});
         const signal = new globalThis.AbortController();
         const operation = debuggerHandler.debuggerSend(
@@ -8719,6 +11194,7 @@ test('CH-03 and CH-04 cancelled queued action and expired async attach never dis
         attaching.resolve();
         await assert.rejects(operation, /REQUEST_CANCELLED/);
     } finally {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         globalThis.clearInterval(handler.logManager.sweepTimer);
         await unmarkManagedTab(5001);
         restore();
@@ -8763,6 +11239,8 @@ test('CH-23 precise touch uses one document and local coordinates through start 
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new InputEventHandler({});
         const event = (type, points = []) =>
             handler.inputTouch(
@@ -8778,6 +11256,8 @@ test('CH-23 precise touch uses one document and local coordinates through start 
             injected.map((event) => event.type),
             ['touchstart', 'touchmove', 'touchend', 'touchstart', 'touchcancel']
         );
+        // The injected touch helper creates this transient page field.
+        // noinspection JSUnresolvedReference
         assert.equal(globalThis.window.__mcpLastTouchState, undefined);
         documentId = 'replacement';
         await assert.rejects(event('touchStart', [{ x: 20, y: 30 }]), /document changed/);
@@ -8864,6 +11344,7 @@ test('CH-16 strict client authenticates every payload and rejects raw injection,
             const ws = FakeWebSocket.instances.at(-1);
             ws.open();
             assert.equal(client.isConnected(), false);
+            // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
             const auth = client.verifiedAuth.get(port);
             const frame = async (seq, message, reflect = false) => {
                 const payload = JSON.stringify(message);
@@ -8925,6 +11406,7 @@ test('CH-16 cancellation and late replies remain owned by the original socket', 
         sendChain: Promise.resolve(),
     });
     const source = connection(old);
+    // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
     client.connections.set(19222, source);
     let reply;
     let signal;
@@ -8935,10 +11417,13 @@ test('CH-16 cancellation and late replies remain owned by the original socket', 
         await done.promise;
     });
     try {
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         client.handleMessage(JSON.stringify({ id: 'owned', action: 'evaluate', params: {} }), 19222, source);
         await waitUntil(() => reply !== undefined);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         client.handleMessage(JSON.stringify({ type: 'cancel', id: 'owned' }), 19222, source);
         assert.equal(signal.aborted, true);
+        // noinspection JSUnresolvedReference -- White-box lifecycle state; production members remain private.
         client.connections.set(19222, connection(replacement));
         reply(true, 'old result');
         done.resolve();
@@ -8998,6 +11483,8 @@ test('CH-21 unique URL remapping still verifies the native owner before script d
     });
     try {
         await markManagedTab(tab.id);
+        // This case supplies only the DebuggerManager methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const resolver = new FrameResolver({
             ensureAttached: async () => {},
             getFrameSessions: async () => [{ tabId: tab.id }],
@@ -9015,18 +11502,20 @@ test('CH-21 unique URL remapping still verifies the native owner before script d
     }
 });
 
-test('TASK native task groups outrank other owned windows and no normal window never creates one', async () => {
+test('TASK trusted automatic groups outrank other owned windows across tasks and never create a window', async () => {
     const fixture = createTabManagementFixture();
     const getAll = fixture.chrome.windows.getAll;
     const restore = installGlobals({ chrome: fixture.chrome });
     try {
         fixture.chrome.windows.getAll = async () => (await getAll()).reverse();
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
         const handler = new TabHandler({});
         const first = await handler.tabsCreate({ taskHint: 'Existing task' }, createActionContext());
         assert.equal(first.windowId, 20);
         await handler.tabsCreate({ windowId: 10, taskHint: 'Other task' }, createActionContext());
         fixture.chrome.windows.getAll = getAll;
-        const second = await handler.tabsCreate({ taskHint: 'Existing task' }, createActionContext());
+        const second = await handler.tabsCreate({ taskHint: 'Different task' }, createActionContext());
         assert.equal(second.windowId, first.windowId);
         assert.equal(second.groupId, first.groupId);
         fixture.chrome.windows.getAll = async () => [];
@@ -9037,6 +11526,500 @@ test('TASK native task groups outrank other owned windows and no normal window n
         for (const id of [6000, 6001, 6002]) {
             await unmarkManagedTab(id);
         }
+        restore();
+    }
+});
+
+test('CE-CAND01 new-page networkidle prepares observation before loading its URL', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const create = fixture.chrome.tabs.create;
+    const created = [];
+    fixture.chrome.tabs.create = async (props) => {
+        created.push(props);
+        return create(props);
+    };
+    const navigations = [];
+    try {
+        // This case supplies only the NavigationHandler methods its path consumes.
+        // noinspection JSCheckFunctionSignatures
+        const handler = new TabHandler({
+            navigate: async (params) => {
+                navigations.push(params);
+            },
+        });
+        await handler.tabsCreate(
+            {
+                url: 'https://example.com/owned-idle',
+                waitUntil: 'networkidle',
+                taskHint: 'Stable task',
+                note: 'first purpose',
+            },
+            createActionContext()
+        );
+        assert.equal(created[0].url, 'about:blank');
+        assert.equal(navigations.length, 1);
+        assert.equal(navigations[0].url, 'https://example.com/owned-idle');
+        assert.equal(navigations[0].waitUntil, 'networkidle');
+        const second = await handler.tabsCreate(
+            { taskHint: 'Stable task', note: 'second purpose' },
+            createActionContext()
+        );
+        assert.equal(second.groupId, (await fixture.chrome.tabs.get(6000)).groupId);
+    } finally {
+        for (const id of [6000, 6001]) {
+            await unmarkManagedTab(id);
+        }
+        restore();
+    }
+});
+
+async function navigationCancellationFixture(t) {
+    const controller = new AbortController();
+    const context = createActionContext({ signal: controller.signal, deadline: Date.now() + 1200 });
+    const tab = { id: 9926, url: 'https://example.com/current', status: 'loading', groupId: -1, windowId: 10 };
+    const events = Object.fromEntries(
+        [
+            'onCommitted',
+            'onDOMContentLoaded',
+            'onCompleted',
+            'onHistoryStateUpdated',
+            'onReferenceFragmentUpdated',
+            'onUpdated',
+        ].map((name) => [name, chromeEvent()])
+    );
+    const reads = new Map();
+    const writes = [];
+    const timers = new Set();
+    const abortListeners = new Set();
+    const gates = [];
+    const operations = [];
+    const state = { documentId: 'initial-document', nativeError: null, pending: new Map(), complete: true };
+    const nativeSetTimeout = globalThis.setTimeout;
+    const nativeClearTimeout = globalThis.clearTimeout;
+    const addAbort = controller.signal.addEventListener.bind(controller.signal);
+    const removeAbort = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.addEventListener = (name, listener, options) => {
+        if (name === 'abort') {
+            abortListeners.add(listener);
+        }
+        addAbort(name, listener, options);
+    };
+    controller.signal.removeEventListener = (name, listener, options) => {
+        if (name === 'abort') {
+            abortListeners.delete(listener);
+        }
+        removeAbort(name, listener, options);
+    };
+    const read = async (kind) => {
+        const count = (reads.get(kind) ?? 0) + 1;
+        reads.set(kind, count);
+        const gate = gates.find((item) => item.kind === kind && item.count === count);
+        if (gate) {
+            gate.entered = true;
+            await gate.promise;
+        }
+    };
+    const complete = () => {
+        const details = { tabId: tab.id, frameId: 0, documentId: 'current-document' };
+        events.onCommitted.emit(details);
+        events.onDOMContentLoaded.emit(details);
+        events.onCompleted.emit(details);
+    };
+    const write = async (kind) => {
+        writes.push(kind);
+        if (kind.startsWith('script-')) {
+            await read('script-ack');
+        }
+        await read('ack');
+        if (state.nativeError) {
+            throw state.nativeError;
+        }
+        if (state.complete) {
+            state.documentId = 'current-document';
+            tab.url = 'https://example.com/next';
+            events.onUpdated.emit(tab.id, { url: tab.url });
+            complete();
+        }
+    };
+    const chrome = {
+        storage: createStorage(),
+        tabs: {
+            async get() {
+                await read('tab');
+                return { ...tab };
+            },
+            update: () => write('navigate'),
+            reload: () => write('reload'),
+            goBack: () => write('back'),
+            goForward: () => write('forward'),
+            onUpdated: events.onUpdated,
+            onRemoved: chromeEvent(),
+        },
+        webNavigation: {
+            ...events,
+            async getFrame() {
+                await read('frame');
+                return state.documentId === null ? {} : { documentId: state.documentId };
+            },
+        },
+        scripting: {
+            async executeScript({ args }) {
+                if (args?.[0] === 'back' || args?.[0] === 'forward') {
+                    await write(`script-${args[0]}`);
+                    return [{ frameId: 0, result: true }];
+                }
+                await read('readiness');
+                return [{ frameId: 0, result: 'interactive' }];
+            },
+        },
+        debugger: { onDetach: chromeEvent(), onEvent: chromeEvent() },
+    };
+    const restore = installGlobals({
+        chrome,
+        setTimeout(callback, timeout, ...args) {
+            const timer = nativeSetTimeout(() => {
+                timers.delete(timer);
+                callback(...args);
+            }, timeout);
+            timers.add(timer);
+            return timer;
+        },
+        clearTimeout(timer) {
+            timers.delete(timer);
+            nativeClearTimeout(timer);
+        },
+        setInterval: () => 0,
+    });
+    await markManagedTab(tab.id);
+    reads.clear();
+    // noinspection JSCheckFunctionSignatures -- This model supplies the network queries consumed by NavigationHandler.
+    const handler = new NavigationHandler(
+        {
+            getPending: () => {
+                reads.set('idle', (reads.get('idle') ?? 0) + 1);
+                return state.pending;
+            },
+            isPendingUncertain: () => false,
+            isNetworkObserved: () => true,
+        },
+        () => read('network')
+    );
+    const observe = (operation) => {
+        const outcome = operation.then(
+            (value) => ({ value }),
+            (error) => ({ error })
+        );
+        operations.push(outcome);
+        return outcome;
+    };
+    const pause = (kind, count = 1) => {
+        const gate = { kind, count, entered: false, ...createDeferred() };
+        gates.push(gate);
+        return gate;
+    };
+    const assertReleased = (baseline = {}) => {
+        for (const [name, event] of Object.entries(events)) {
+            assert.equal(event.size, baseline[name] ?? 0, name);
+        }
+        assert.equal(timers.size, 0, 'request timers released');
+        assert.equal(abortListeners.size, 0, 'request abort listeners released');
+    };
+    t.after(async () => {
+        controller.abort();
+        for (const gate of gates) {
+            gate.resolve();
+        }
+        state.pending.clear();
+        complete();
+        await Promise.all(operations);
+        await unmarkManagedTab(tab.id);
+        restore();
+    });
+    return { controller, context, tab, handler, events, reads, writes, state, chrome, pause, observe, assertReleased };
+}
+
+async function navigationOutcomeSoon(outcome) {
+    let timer;
+    try {
+        return await Promise.race([
+            outcome,
+            new Promise((resolve) => {
+                timer = setTimeout(() => resolve({ pending: true }), 150);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function assertNavigationCancelled(result, dispatched) {
+    assert.ok(result.error instanceof ExpectedOperationError, 'cancellation settles before a held native ACK');
+    const error = JSON.parse(result.error.message).error;
+    assert.equal(error.code, 'REQUEST_CANCELLED');
+    assert.equal(error.context.actionExecuted, dispatched ? 'unknown' : false);
+    assert.equal(error.context.actionStatus, dispatched ? 'unknown' : 'not_started');
+    assert.equal(error.context.retryable, false);
+    assert.equal(result.error.actionExecuted, dispatched ? undefined : false);
+}
+
+test('NAVCANCEL pre-dispatch tab, permission, frame and network reads stop all navigation writes', async (t) => {
+    const cases = [
+        ['navigate', 'tab', 1],
+        ['navigate', 'tab', 2],
+        ['navigate', 'frame', 1, 'load'],
+        ['reload', 'tab', 1],
+        ['reload', 'tab', 2],
+        ['goBack', 'tab', 1],
+        ['goBack', 'tab', 2],
+        ['goBack', 'tab', 3],
+        ['goForward', 'tab', 1],
+        ['goForward', 'tab', 2],
+        ['goForward', 'tab', 3],
+        ...['navigate', 'reload', 'goBack', 'goForward'].map((method) => [method, 'network', 1, 'networkidle']),
+    ];
+    for (const [method, kind, count, wait] of cases) {
+        await t.test(`${method}/${kind}/${count}`, async (subtest) => {
+            const fixture = await navigationCancellationFixture(subtest);
+            const gate = fixture.pause(kind, count);
+            const params = {
+                tabId: fixture.tab.id,
+                url: 'https://example.com/next',
+                waitUntil: wait,
+                deadline: fixture.context.deadline,
+            };
+            const outcome = fixture.observe(fixture.handler[method](params, fixture.context));
+            await waitUntil(() => gate.entered);
+            fixture.controller.abort(new Error('owned navigation cancellation'));
+            assertNavigationCancelled(await navigationOutcomeSoon(outcome), false);
+            fixture.assertReleased();
+            gate.resolve();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.deepEqual(fixture.writes, []);
+            fixture.assertReleased();
+        });
+    }
+});
+
+test('NAVCANCEL a released permission read cannot dispatch a cancelled navigation', async (t) => {
+    const fixture = await navigationCancellationFixture(t);
+    const gate = fixture.pause('tab', 2);
+    const outcome = fixture.observe(
+        fixture.handler.navigate({ tabId: fixture.tab.id, url: 'https://example.com/next' }, fixture.context)
+    );
+    await waitUntil(() => gate.entered);
+    fixture.controller.abort();
+    gate.resolve();
+    const result = await navigationOutcomeSoon(outcome);
+    assert.deepEqual(fixture.writes, [], 'cancellation prevents the native URL update after the permission ACK');
+    assertNavigationCancelled(result, false);
+    fixture.assertReleased();
+});
+
+test('NAVCANCEL original deadlines bound held preparation and native ACKs with their dispatch state', async (t) => {
+    for (const [kind, count, wait] of [
+        ['tab', 2],
+        ['frame', 1, 'load'],
+        ['network', 1, 'networkidle'],
+        ['ack', 1],
+    ]) {
+        await t.test(kind, async (subtest) => {
+            const fixture = await navigationCancellationFixture(subtest);
+            const gate = fixture.pause(kind, count);
+            fixture.context.deadline = Date.now() + 80;
+            const outcome = fixture.observe(
+                fixture.handler.navigate(
+                    {
+                        tabId: fixture.tab.id,
+                        url: 'https://example.com/next',
+                        waitUntil: wait,
+                        deadline: Date.now() + 1000,
+                    },
+                    fixture.context
+                )
+            );
+            await waitUntil(() => gate.entered);
+            const result = await navigationOutcomeSoon(outcome);
+            assert.ok(result.error instanceof ExpectedOperationError);
+            const error = JSON.parse(result.error.message).error;
+            assert.equal(error.code, 'TIMEOUT');
+            assert.equal(error.context.actionExecuted, kind === 'ack');
+            assert.equal(error.context.actionStatus, kind === 'ack' ? 'unknown' : 'failed');
+            assert.equal(error.context.retryable, false);
+            fixture.assertReleased();
+            gate.resolve();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.deepEqual(fixture.writes, kind === 'ack' ? ['navigate'] : []);
+            fixture.assertReleased();
+        });
+    }
+});
+
+test('NAVCANCEL cancellation after lifecycle registration prevents the queued native dispatch', async (t) => {
+    const fixture = await navigationCancellationFixture(t);
+    const event = fixture.events.onReferenceFragmentUpdated;
+    const addListener = event.addListener;
+    event.addListener = (listener) => {
+        addListener(listener);
+        fixture.controller.abort();
+    };
+    const outcome = fixture.observe(
+        fixture.handler.navigate(
+            { tabId: fixture.tab.id, url: 'https://example.com/next', waitUntil: 'load' },
+            fixture.context
+        )
+    );
+    assertNavigationCancelled(await navigationOutcomeSoon(outcome), false);
+    assert.deepEqual(fixture.writes, []);
+    fixture.assertReleased();
+});
+
+test('NAVCANCEL in-flight navigation ACKs cancel promptly without replay or late-result acceptance', async (t) => {
+    for (const method of ['navigate', 'reload', 'goBack', 'goForward']) {
+        for (const wait of method === 'navigate' || method === 'reload' ? [undefined, 'load'] : [undefined]) {
+            await t.test(`${method}/${wait ?? 'ack'}`, async (subtest) => {
+                const fixture = await navigationCancellationFixture(subtest);
+                const gate = fixture.pause('ack');
+                const outcome = fixture.observe(
+                    fixture.handler[method](
+                        { tabId: fixture.tab.id, url: 'https://example.com/next', waitUntil: wait },
+                        fixture.context
+                    )
+                );
+                await waitUntil(() => gate.entered);
+                fixture.controller.abort();
+                assertNavigationCancelled(await navigationOutcomeSoon(outcome), true);
+                fixture.assertReleased();
+                const dispatched = [...fixture.writes];
+                gate.resolve();
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                assert.deepEqual(fixture.writes, dispatched);
+                fixture.assertReleased();
+            });
+        }
+    }
+});
+
+test('NAVCANCEL history preparation, final tab reads and script ACK preserve their dispatch state', async (t) => {
+    for (const method of ['goBack', 'goForward']) {
+        for (const [kind, count] of [
+            ['tab', 5],
+            ['frame', 1],
+            ['script-ack', 1],
+        ]) {
+            await t.test(`${method}/${kind}`, async (subtest) => {
+                const fixture = await navigationCancellationFixture(subtest);
+                const gate = fixture.pause(kind, count);
+                const outcome = fixture.observe(fixture.handler[method]({ tabId: fixture.tab.id }, fixture.context));
+                await waitUntil(() => gate.entered);
+                fixture.controller.abort();
+                assertNavigationCancelled(await navigationOutcomeSoon(outcome), kind !== 'frame');
+                fixture.assertReleased();
+                gate.resolve();
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                assert.deepEqual(
+                    fixture.writes,
+                    kind === 'frame' ? [] : [method === 'goBack' ? 'script-back' : 'script-forward']
+                );
+                fixture.assertReleased();
+            });
+        }
+    }
+});
+
+test('NAVCANCEL explicit waits release network, frame, tab and readiness work on cancellation', async (t) => {
+    for (const kind of ['network', 'frame', 'tab', 'readiness']) {
+        await t.test(kind, async (subtest) => {
+            const fixture = await navigationCancellationFixture(subtest);
+            fixture.state.documentId = null;
+            const gate = fixture.pause(kind);
+            const wait = kind === 'network' ? 'networkidle' : 'domcontentloaded';
+            const outcome = fixture.observe(
+                fixture.handler.waitForNavigation(fixture.tab.id, wait, 1000, fixture.context)
+            );
+            await waitUntil(() => gate.entered);
+            fixture.controller.abort();
+            assertNavigationCancelled(await navigationOutcomeSoon(outcome), false);
+            fixture.assertReleased();
+            const reads = [...fixture.reads];
+            gate.resolve();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.deepEqual([...fixture.reads], reads, 'late read does not start the next native probe');
+            assert.deepEqual(fixture.writes, []);
+            fixture.assertReleased();
+        });
+    }
+});
+
+test('NAVCANCEL networkidle quiet windows clear all timers and retain dispatched action state', async (t) => {
+    for (const method of ['navigate', 'reload', 'goBack', 'goForward', 'waitForNavigation']) {
+        await t.test(method, async (subtest) => {
+            const fixture = await navigationCancellationFixture(subtest);
+            fixture.state.pending.set('owned-pending', {});
+            const operation =
+                method === 'waitForNavigation'
+                    ? fixture.handler.waitForNavigation(fixture.tab.id, 'networkidle', 1000, fixture.context)
+                    : fixture.handler[method](
+                          { tabId: fixture.tab.id, url: 'https://example.com/next', waitUntil: 'networkidle' },
+                          fixture.context
+                      );
+            const outcome = fixture.observe(operation);
+            await waitUntil(() =>
+                method === 'waitForNavigation' ? (fixture.reads.get('tab') ?? 0) > 0 : fixture.writes.length > 0
+            );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const details = { tabId: fixture.tab.id, frameId: 0, documentId: 'current-document' };
+            fixture.events.onCommitted.emit(details);
+            fixture.events.onCompleted.emit(details);
+            fixture.events.onCompleted.emit(details);
+            await waitUntil(() => (fixture.reads.get('idle') ?? 0) > 0);
+            fixture.controller.abort();
+            assertNavigationCancelled(await navigationOutcomeSoon(outcome), method !== 'waitForNavigation');
+            fixture.assertReleased();
+        });
+    }
+});
+
+test('NAVCANCEL ActionHandler releases the same-tab queue before a late navigation ACK', async (t) => {
+    const fixture = await navigationCancellationFixture(t);
+    const gate = fixture.pause('ack');
+    const handler = new ActionHandler();
+    const baseline = Object.fromEntries(Object.entries(fixture.events).map(([name, event]) => [name, event.size]));
+    const outcome = fixture.observe(
+        handler.execute('reload', { tabId: fixture.tab.id, waitUntil: 'load' }, fixture.context)
+    );
+    await waitUntil(() => gate.entered);
+    const following = fixture.observe(
+        handler.execute('page_snapshot', { tabId: fixture.tab.id }, createActionContext())
+    );
+    fixture.controller.abort();
+    assertNavigationCancelled(await navigationOutcomeSoon(outcome), true);
+    const result = await navigationOutcomeSoon(following);
+    assert.equal(result.value?.targetId, String(fixture.tab.id));
+    // noinspection JSUnresolvedReference -- White-box queue inspection keeps production fields private.
+    assert.equal(handler.actionLocks.size, 0);
+    fixture.assertReleased(baseline);
+    gate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(fixture.writes, ['reload']);
+    fixture.assertReleased(baseline);
+});
+
+test('NAVCANCEL created-page waits receive the original context and created-action state', async () => {
+    const fixture = createTabManagementFixture();
+    const restore = installGlobals({ chrome: fixture.chrome });
+    const context = createActionContext({ signal: new AbortController().signal, deadline: Date.now() + 1000 });
+    const waits = [];
+    try {
+        // noinspection JSCheckFunctionSignatures -- The creation path consumes only this navigation observer.
+        const handler = new TabHandler({ waitForNavigation: async (...args) => waits.push(args) });
+        const tab = await handler.tabsCreate({ waitUntil: 'load' }, context);
+        assert.equal(waits.length, 1);
+        assert.equal(waits[0][0], tab.id);
+        assert.equal(waits[0][3], context);
+        assert.equal(waits[0][4], true);
+    } finally {
+        await unmarkManagedTab(6000);
         restore();
     }
 });

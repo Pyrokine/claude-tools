@@ -16,6 +16,7 @@ export interface ActionContext {
     mcpTabGroupId: number | null
     mcpWindowId: number | null
     serverInstanceId?: string | null
+    connectedServerInstanceIds?: readonly string[]
     signal?: AbortSignal
     deadline?: number
 }
@@ -38,7 +39,7 @@ export function assertActionActive(
                           : 'Request timeout before dispatch',
                     context: {
                         ...progress,
-                        actionExecuted: progress ? true : false,
+                        actionExecuted: Boolean(progress),
                         actionStatus: progress ? 'partial' : 'not_started',
                         retryable: false,
                     },
@@ -172,6 +173,7 @@ export interface DomFrameSnapshotFrame {
     selector: string | null
     rect: { x: number; y: number; width: number; height: number }
     contentOffset: { x: number; y: number }
+    translationOnly: boolean
     zoom: number
 }
 
@@ -196,6 +198,7 @@ interface DomFrameProbeResult {
 }
 
 declare global {
+    // noinspection ES6ConvertVarToLetConst -- globalThis type augmentation requires var
     var __mcpDomFrameProbes: Map<string, { result: Promise<DomFrameProbeResult>; cancel: () => void }> | undefined
 }
 
@@ -204,7 +207,8 @@ const FRAME_PROBE_TIMEOUT_MS = 500
 async function waitForFrameProbe<T>(
     operation: Promise<T>,
     cancel: () => Promise<unknown>,
-    context?: ActionContext
+    context?: ActionContext,
+    cleanupLateResult?: (result: T) => Promise<unknown>
 ): Promise<T> {
     let rejectCancellation: (error: unknown) => void
     const cancellationFailure = new Promise<never>((_, reject) => {
@@ -215,6 +219,11 @@ async function waitForFrameProbe<T>(
         if (!stopped) {
             stopped = true
             void cancel().catch((error: unknown) => rejectCancellation(error))
+            try {
+                assertActionActive(context)
+            } catch (error) {
+                rejectCancellation(error)
+            }
         }
     }
     const expiresAt = Math.min(Date.now() + FRAME_PROBE_TIMEOUT_MS, context?.deadline ?? Infinity)
@@ -235,9 +244,11 @@ async function waitForFrameProbe<T>(
     if (context?.signal?.aborted) {
         stop()
     }
+    let consumed = false
     try {
         const result = await Promise.race([operation, cancellationFailure])
         assertActionActive(context)
+        consumed = true
         return result
     } catch (error) {
         assertActionActive(context)
@@ -245,6 +256,13 @@ async function waitForFrameProbe<T>(
     } finally {
         clearTimeout(timer)
         context?.signal?.removeEventListener('abort', stop)
+        if (!consumed && cleanupLateResult) {
+            void operation
+                .then(cleanupLateResult, () => {})
+                .catch((error: unknown) => {
+                    console.debug('[MCP] Late frame probe cleanup failed', error)
+                })
+        }
     }
 }
 
@@ -257,8 +275,8 @@ interface PendingDomFrameProbe {
 const pendingDomFrameProbes = new Map<string, PendingDomFrameProbe>()
 
 export function recordDomFrameProbe(
-    message: FrameProbeMessage,
-    sender: chrome.runtime.MessageSender
+    message: Pick<FrameProbeMessage, 'token' | 'index'>,
+    sender: Pick<chrome.runtime.MessageSender, 'frameId' | 'documentId'> & { tab?: Pick<chrome.tabs.Tab, 'id'> }
 ): { accepted: boolean } {
     const pending = pendingDomFrameProbes.get(message.token)
     if (
@@ -301,12 +319,40 @@ export async function probeCdpFrameOwner(
         context
     )
     assertActionActive(context)
-    const owner = (await chrome.debugger.sendCommand(debuggee, 'DOM.getFrameOwner', { frameId: cdpFrameId })) as {
-        backendNodeId: number
+    const releaseObject = async (objectId: string | undefined) => {
+        if (objectId) {
+            await chrome.debugger.sendCommand(debuggee, 'Runtime.releaseObject', { objectId }).catch((error) => {
+                console.debug('[MCP] Frame owner probe cleanup failed', error)
+            })
+        }
     }
-    const resolved = (await chrome.debugger.sendCommand(debuggee, 'DOM.resolveNode', {
-        backendNodeId: owner.backendNodeId,
-    })) as { object: { objectId?: string } }
+    const releaseProbe = async (objectId: string | undefined) => {
+        if (objectId) {
+            await chrome.debugger
+                .sendCommand(debuggee, 'Runtime.callFunctionOn', {
+                    objectId,
+                    functionDeclaration: 'function() { this.cancel(); }',
+                    returnByValue: true,
+                })
+                .catch((error) => {
+                    console.debug('[MCP] Frame owner probe cancellation failed', error)
+                })
+            await releaseObject(objectId)
+        }
+    }
+    const stopNativeWait = () => Promise.reject(new ExpectedOperationError('Frame owner command timed out', false))
+    const owner = (await waitForFrameProbe(
+        chrome.debugger.sendCommand(debuggee, 'DOM.getFrameOwner', { frameId: cdpFrameId }),
+        stopNativeWait,
+        context
+    )) as { backendNodeId: number }
+    assertActionActive(context)
+    const resolved = (await waitForFrameProbe(
+        chrome.debugger.sendCommand(debuggee, 'DOM.resolveNode', { backendNodeId: owner.backendNodeId }),
+        stopNativeWait,
+        context,
+        (value) => releaseObject((value as { object?: { objectId?: string } }).object?.objectId)
+    )) as { object: { objectId?: string } }
     const objectId = resolved.object.objectId
     if (!objectId) {
         return null
@@ -317,9 +363,10 @@ export async function probeCdpFrameOwner(
     let promiseObjectId: string | undefined
     try {
         assertActionActive(context)
-        const probe = (await chrome.debugger.sendCommand(debuggee, 'Runtime.callFunctionOn', {
-            objectId,
-            functionDeclaration: `function(token) {
+        const probe = (await waitForFrameProbe(
+            chrome.debugger.sendCommand(debuggee, 'Runtime.callFunctionOn', {
+                objectId,
+                functionDeclaration: `function(token) {
                 const child = this.contentWindow;
                 if (!this.isConnected || !child) return false;
                 let cancel;
@@ -344,10 +391,14 @@ export async function probeCdpFrameOwner(
                 promise.cancel = cancel;
                 return promise;
             }`,
-            arguments: [{ value: token }],
-            awaitPromise: false,
-            returnByValue: false,
-        })) as { result?: { objectId?: string }; exceptionDetails?: unknown }
+                arguments: [{ value: token }],
+                awaitPromise: false,
+                returnByValue: false,
+            }),
+            stopNativeWait,
+            context,
+            (value) => releaseProbe((value as { result?: { objectId?: string } }).result?.objectId)
+        )) as { result?: { objectId?: string }; exceptionDetails?: unknown }
         promiseObjectId = probe.result?.objectId
         if (probe.exceptionDetails || !promiseObjectId) {
             return null
@@ -369,25 +420,14 @@ export async function probeCdpFrameOwner(
         return !result.exceptionDetails && result.result?.value === true && ids.length === 1 ? ids[0] : null
     } finally {
         pendingDomFrameProbes.delete(token)
-        if (promiseObjectId) {
-            await chrome.debugger
-                .sendCommand(debuggee, 'Runtime.callFunctionOn', {
-                    objectId: promiseObjectId,
-                    functionDeclaration: 'function() { this.cancel(); }',
-                    returnByValue: true,
-                })
-                .catch((error) => {
-                    console.debug('[MCP] Frame owner probe cancellation failed', error)
-                })
+        const cleanup = async () => {
+            await releaseProbe(promiseObjectId)
+            await releaseObject(objectId)
         }
-        for (const id of [promiseObjectId, objectId]) {
-            if (id) {
-                await chrome.debugger
-                    .sendCommand(debuggee, 'Runtime.releaseObject', { objectId: id })
-                    .catch((error) => {
-                        console.debug('[MCP] Frame owner probe cleanup failed', error)
-                    })
-            }
+        if (context?.signal?.aborted || (context?.deadline !== undefined && Date.now() >= context.deadline)) {
+            void cleanup()
+        } else {
+            await cleanup()
         }
     }
 }
@@ -609,6 +649,43 @@ export async function getDomFrameSnapshot(
                                         zoom *= Number.parseFloat(window.getComputedStyle(node).zoom) || 1
                                     }
                                     return zoom
+                                })(),
+                                translationOnly: (() => {
+                                    for (
+                                        let node: Element | null = frame;
+                                        node;
+                                        node =
+                                            node.assignedSlot ??
+                                            node.parentElement ??
+                                            (node.getRootNode() as ShadowRoot).host ??
+                                            null
+                                    ) {
+                                        const style = getComputedStyle(node)
+                                        const matrix = new DOMMatrix(
+                                            style.transform === 'none' ? undefined : style.transform
+                                        )
+                                        if (
+                                            !matrix.is2D ||
+                                            Math.abs(matrix.a - 1) > 1e-12 ||
+                                            Math.abs(matrix.d - 1) > 1e-12 ||
+                                            Math.abs(matrix.b) > 1e-12 ||
+                                            Math.abs(matrix.c) > 1e-12 ||
+                                            (style.rotate &&
+                                                style.rotate !== 'none' &&
+                                                Number.parseFloat(style.rotate) !== 0) ||
+                                            (style.scale &&
+                                                style.scale !== 'none' &&
+                                                style.scale.split(/\s+/).some((value) => Number(value) !== 1)) ||
+                                            (style.offsetPath &&
+                                                style.offsetPath !== 'none' &&
+                                                (Number.parseFloat(style.offsetRotate) !== 0 ||
+                                                    /\b(?:auto|reverse)\b/.test(style.offsetRotate))) ||
+                                            (Number.parseFloat(style.zoom) || 1) !== 1
+                                        ) {
+                                            return false
+                                        }
+                                    }
+                                    return true
                                 })(),
                                 contentOffset: {
                                     x: rect.x + frame.clientLeft,
@@ -861,6 +938,21 @@ export async function getFrameOffset(
     const mappedFrame = snapshot.frames.find((frame) => frame.frameId === frameId)
     if (!mappedFrame) {
         return null
+    }
+    // noinspection PointlessBooleanExpressionJS -- reject explicitly non-translation geometry
+    if (mappedFrame.translationOnly === false) {
+        throw new ExpectedOperationError(
+            JSON.stringify({
+                error: {
+                    code: 'FRAME_GEOMETRY_UNAVAILABLE',
+                    message:
+                        'Frame offset requires translation-only geometry; ' +
+                        'scaled or rotated frames cannot use pointer calibration',
+                    context: { tabId, frameId, actionExecuted: false, actionStatus: 'not_started' },
+                },
+            }),
+            false
+        )
     }
 
     return {

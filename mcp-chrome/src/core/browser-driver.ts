@@ -8,9 +8,9 @@
  * 业务操作统一走 driver.X，状态管理（getDriver/ensureExtensionConnected）保留作为入口
  */
 
-import type { ConsoleLogEntry, NetworkRequestEntry } from './types.js'
 import type { BrowserEventAction, EventCommand } from './browser-events.js'
 import type { SemanticTarget } from './dom-helpers.js'
+import type { ConsoleLogEntry, NetworkRequestEntry } from './types.js'
 
 export type { SemanticTarget } from './dom-helpers.js'
 
@@ -25,6 +25,7 @@ export interface BrowserRequestContext {
     userAction?: {
         kind: UserActionKind
         dispatched: boolean
+        acknowledged?: boolean
         phase: 'preparation' | 'precondition'
     }
 }

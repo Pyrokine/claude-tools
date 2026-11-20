@@ -8,7 +8,9 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
-import { eventRefTarget, type BrowserEventAction, type EventCommand } from './browser-events.js'
+import { setTimeout as delay } from 'node:timers/promises'
+import { Script } from 'node:vm'
+import { ExtensionBridge, type ExtensionConnectionInfo } from '../extension/index.js'
 import type {
     BrowserRequestContext,
     CookieFilter,
@@ -17,9 +19,6 @@ import type {
     SemanticTarget,
     UserActionKind,
 } from './browser-driver.js'
-import { setTimeout as delay } from 'node:timers/promises'
-import { Script } from 'node:vm'
-import { ExtensionBridge, type ExtensionConnectionInfo } from '../extension/index.js'
 import {
     type ActionableClickResult,
     type BrowserTopology,
@@ -42,10 +41,12 @@ import {
     type UpdateGroupOptions,
     type UpdatePageOptions,
 } from './browser-driver.js'
+import { type BrowserEventAction, type EventCommand, eventRefTarget } from './browser-events.js'
+import { inspectChallengePage } from './challenge-page.js'
 import {
-    isNativeExecutionResultUnknown,
-    getErrorSource,
     getErrorPageContext,
+    getErrorSource,
+    isNativeExecutionResultUnknown,
     OsMouseError,
     PagePreconditionError,
     setErrorPageContext,
@@ -57,9 +58,9 @@ import {
 import { isExtensionDisconnected } from './extension-errors.js'
 import {
     asViewportMetrics,
+    type NativePointerProbe,
     osLeftClick,
     resolveTurnstileOsClickPoint,
-    type NativePointerProbe,
     type TurnstileOsClickInput,
     type ViewportMetrics,
 } from './os-mouse.js'
@@ -99,15 +100,21 @@ export interface EvaluationMetadata {
 interface CdpPropertyDescriptor {
     name: string
     value?: CdpResultObject
+    get?: CdpResultObject
+    set?: CdpResultObject
+    symbol?: CdpResultObject
     enumerable?: boolean
     wasThrown?: boolean
 }
 
 interface CdpMaterializeState {
     seen: Set<string>
+    objectIds: Set<string>
     nodes: number
     chars: number
     maxChars: number
+    maxNodes?: number
+    maxDepth?: number
 }
 
 interface UnifiedSessionState {
@@ -294,6 +301,31 @@ class UnifiedSessionManager {
      */
     getFrameOffset(): { x: number; y: number } | null {
         return this.currentFrameOffset
+    }
+
+    async getPageScrollOffset(timeout?: number): Promise<{ x: number; y: number }> {
+        const deadline = Math.min(
+            Date.now() + (timeout ?? DEFAULT_TIMEOUT),
+            this.tabLockContext.getStore()?.deadline ?? Infinity
+        )
+        const driver = await this.getDriver(remainingNavigationTimeout(deadline))
+        const previousFrame = driver.getCurrentFrameId()
+        const extension = driver === this.extensionBridge ? this.extensionBridge : undefined
+        const previousDocument = extension?.getCurrentFrameDocumentId()
+        driver.setCurrentFrameId(0)
+        try {
+            return await this.evaluate<{ x: number; y: number }>(
+                '(() => ({ x: window.scrollX || 0, y: window.scrollY || 0 }))()',
+                undefined,
+                remainingNavigationTimeout(deadline)
+            )
+        } finally {
+            if (extension) {
+                extension.setCurrentFrameId(previousFrame, previousDocument)
+            } else {
+                driver.setCurrentFrameId(previousFrame)
+            }
+        }
     }
 
     consumeLastEvaluationMetadata(): EvaluationMetadata | undefined {
@@ -540,7 +572,7 @@ class UnifiedSessionManager {
         if (!driver.updateGroup) {
             throw new DriverCapabilityError('updateGroup 仅支持 Extension 模式')
         }
-        return this.withTabLock(() => driver.updateGroup!(groupId, options))
+        return driver.updateGroup(groupId, options)
     }
 
     async moveGroup(
@@ -901,8 +933,22 @@ class UnifiedSessionManager {
         return this.extensionReadBridge().getComputedStyle(refId, prop)
     }
 
-    async findAtPoint(x: number, y: number, matchIndex?: number, timeout?: number) {
-        return this.extensionReadBridge().find(undefined, undefined, undefined, timeout, { x, y }, matchIndex)
+    async findAtPoint(
+        x: number,
+        y: number,
+        matchIndex?: number,
+        timeout?: number,
+        coordinateSpace?: 'viewport' | 'frame'
+    ) {
+        return this.extensionReadBridge().find(
+            undefined,
+            undefined,
+            undefined,
+            timeout,
+            { x, y },
+            matchIndex,
+            coordinateSpace
+        )
     }
 
     async getHtmlWithImagesByRef(refId: string) {
@@ -1013,6 +1059,7 @@ class UnifiedSessionManager {
      * @param timeout 端到端预算（毫秒），包含连接等待和请求超时，传给 bridge.find → sendCommand
      * @param semanticOrMatchIndex 语义名称条件，或兼容旧调用的匹配序号
      * @param matchIndex 匹配序号，从 0 开始，指定时只返回该位置
+     * @param coordinateSpace frame 仅查询当前文档内的元素和矩形，viewport 保留既有根视口转换
      */
     async find(
         selector?: string,
@@ -1020,7 +1067,8 @@ class UnifiedSessionManager {
         xpath?: string,
         timeout?: number,
         semanticOrMatchIndex?: SemanticTarget | number,
-        matchIndex?: number
+        matchIndex?: number,
+        coordinateSpace?: 'viewport' | 'frame'
     ): Promise<
         Array<{
             refId: string
@@ -1031,11 +1079,12 @@ class UnifiedSessionManager {
     > {
         const semantic = typeof semanticOrMatchIndex === 'object' ? semanticOrMatchIndex : undefined
         matchIndex = typeof semanticOrMatchIndex === 'number' ? semanticOrMatchIndex : matchIndex
+        const coordinates: [] | ['viewport' | 'frame'] = coordinateSpace === undefined ? [] : [coordinateSpace]
         this.assertRequestActive()
         if (timeout !== undefined) {
             // 轮询上下文：快速失败，端到端预算受控
             if (this.isExtensionConnected()) {
-                return this.extensionBridge!.find(selector, text, xpath, timeout, semantic, matchIndex)
+                return this.extensionBridge!.find(selector, text, xpath, timeout, semantic, matchIndex, ...coordinates)
             }
             this.assertCdpFallbackAllowed()
             return getCdpSession().find(selector, text, xpath, timeout, semantic, matchIndex)
@@ -1046,7 +1095,7 @@ class UnifiedSessionManager {
         return this.withExtensionRetry(
             () =>
                 driver === this.extensionBridge
-                    ? this.extensionBridge.find(selector, text, xpath, undefined, semantic, matchIndex)
+                    ? this.extensionBridge.find(selector, text, xpath, undefined, semantic, matchIndex, ...coordinates)
                     : getCdpSession().find(selector, text, xpath, undefined, semantic, matchIndex),
             () => getCdpSession().find(selector, text, xpath, undefined, semantic, matchIndex)
         )
@@ -1207,6 +1256,7 @@ class UnifiedSessionManager {
             const action: NonNullable<BrowserRequestContext['userAction']> = {
                 kind,
                 dispatched: false,
+                acknowledged: false,
                 phase: 'preparation',
             }
             scope.userAction = action
@@ -1221,20 +1271,31 @@ class UnifiedSessionManager {
                 if (previous?.kind === kind && action.dispatched) {
                     previous.dispatched = true
                 }
+                if (previous?.kind === kind && action.acknowledged) {
+                    previous.acknowledged = true
+                }
                 scope.userAction = previous
             }
         })
     }
 
+    acknowledgeInputAction(): void {
+        const action = this.tabLockContext.getStore()?.userAction
+        if (action?.kind === 'input') {
+            action.acknowledged = true
+        }
+    }
+
     annotateUserActionError(error: unknown): unknown {
         const scope = this.tabLockContext.getStore()
-        if (scope && error instanceof Error && getErrorSource(error) === 'budget') {
+        const source = getErrorSource(error)
+        if (scope && error instanceof Error && source === 'budget') {
             scope.budgetError ??= error
         }
         const action = scope?.userAction
-        const uncertain = getErrorSource(error) !== 'page' && isNativeExecutionResultUnknown(error)
+        const uncertain = source !== 'page' && isNativeExecutionResultUnknown(error)
         const outputFailure =
-            getErrorSource(error) !== 'page' &&
+            source !== 'page' &&
             error instanceof StructuredToolError &&
             error.code === 'NON_SERIALIZABLE_EVALUATE_RESULT' &&
             getErrorPageContext(error)?.contextPhase === 'preparation'
@@ -1242,12 +1303,16 @@ class UnifiedSessionManager {
             action &&
             !action.dispatched &&
             (uncertain ||
+                source === 'budget' ||
+                source === 'cancelled' ||
                 outputFailure ||
+                getErrorPageContext(error)?.diagnosticsPreparation === true ||
                 getErrorPageContext(error)?.keyboardFocusPreparation === true ||
                 getErrorPageContext(error)?.frameResolutionPreparation === true ||
                 action.phase === 'precondition' ||
                 error instanceof PagePreconditionError)
         return setErrorPageContext(error, {
+            inputActionAcknowledged: action?.acknowledged === true,
             contextPhase: preparing
                 ? error instanceof PagePreconditionError
                     ? 'precondition'
@@ -1377,7 +1442,6 @@ class UnifiedSessionManager {
             await cleanup(failed && isNativeExecutionResultUnknown(primaryError))
             const focus = scope.keyboardFocus
             if (focus && driver === this.extensionBridge) {
-                scope.inputCleanup = undefined
                 const releaseKeys =
                     failed ||
                     Boolean(scope.signal?.aborted || scope.budgetError) ||
@@ -1824,6 +1888,19 @@ class UnifiedSessionManager {
         signal?: AbortSignal,
         deadline = Date.now() + timeout
     ): Promise<Record<string, unknown>> {
+        if (!targetId && !command.ref) {
+            return this.withTabLock(
+                () => {
+                    const id = this.getCurrentTargetId()
+                    if (!id) {
+                        throw new DriverCapabilityError('没有操作目标，请先选择页面')
+                    }
+                    return this.browserEvents(action, command, id, timeout, signal, deadline)
+                },
+                deadline,
+                signal
+            )
+        }
         const refTarget = command.ref ? eventRefTarget(command.ref) : undefined
         const mode = refTarget?.backend ?? this.getMode()
         if (targetId && refTarget && targetId !== refTarget.targetId) {
@@ -2248,7 +2325,7 @@ class UnifiedSessionManager {
         await withNavigationBudget(() => this.extensionBridge!.debuggerDetach(undefined, remaining()), deadline, signal)
         const pointerId = process.platform === 'linux' ? randomUUID() : undefined
         let pointerDocumentId: string | undefined
-        const resolvePoint = async (refresh: boolean, probe?: NativePointerProbe) => {
+        const resolvePoint = async (refresh: boolean) => {
             const current =
                 refresh && refreshSnapshot
                     ? await withNavigationBudget(() => refreshSnapshot(remaining()), deadline, signal)
@@ -2299,36 +2376,7 @@ class UnifiedSessionManager {
                 deadline,
                 signal
             )
-            if (!pointerId || !probe) {
-                return estimate
-            }
-            const request = await probe()
-            const origin = (await withNavigationBudget(
-                () =>
-                    this.extensionBridge!.getViewportMetrics(
-                        0,
-                        { operation: 'read', id: pointerId, documentId: pointerDocumentId, ...request },
-                        remaining()
-                    ),
-                deadline,
-                signal
-            )) as { x?: number; y?: number }
-            if (
-                typeof origin.x !== 'number' ||
-                !Number.isFinite(origin.x) ||
-                typeof origin.y !== 'number' ||
-                !Number.isFinite(origin.y)
-            ) {
-                throw new OsMouseError(
-                    'TURNSTILE_OS_CLICK_UNAVAILABLE',
-                    '未取得可信原生指针原点',
-                    '重新检查当前受控页面'
-                )
-            }
-            return {
-                x: Math.round(origin.x + clickPoint.x * viewport.devicePixelRatio),
-                y: Math.round(origin.y + clickPoint.y * viewport.devicePixelRatio),
-            }
+            return { ...estimate, clickPoint, viewport }
         }
         let clickError: { error: unknown } | undefined
         try {
@@ -2341,6 +2389,7 @@ class UnifiedSessionManager {
                 )) as { documentId?: string }
                 pointerDocumentId = started.documentId
                 if (!pointerDocumentId) {
+                    // noinspection ExceptionCaughtLocallyJS -- release the owned pointer observer after failure
                     throw new OsMouseError(
                         'TURNSTILE_OS_CLICK_UNAVAILABLE',
                         '原生指针观察器未取得文档身份',
@@ -2353,7 +2402,46 @@ class UnifiedSessionManager {
             await osLeftClick(screen.x, screen.y, {
                 deadline,
                 signal,
-                refreshPoint: (probe) => resolvePoint(true, probe),
+                refreshPoint: async (probe?: NativePointerProbe) => {
+                    while (true) {
+                        let point = await resolvePoint(true)
+                        if (!pointerId || !probe) {
+                            return point
+                        }
+                        const request = await probe()
+                        const origin = (await withNavigationBudget(
+                            () =>
+                                this.extensionBridge!.getViewportMetrics(
+                                    0,
+                                    { operation: 'read', id: pointerId, documentId: pointerDocumentId, ...request },
+                                    remaining()
+                                ),
+                            deadline,
+                            signal
+                        )) as { x?: number; y?: number; stable?: boolean }
+                        if (origin.stable === false && deadline !== undefined) {
+                            continue
+                        }
+                        if (
+                            origin.stable === false ||
+                            typeof origin.x !== 'number' ||
+                            !Number.isFinite(origin.x) ||
+                            typeof origin.y !== 'number' ||
+                            !Number.isFinite(origin.y)
+                        ) {
+                            throw new OsMouseError(
+                                'TURNSTILE_OS_CLICK_UNAVAILABLE',
+                                '未取得可信原生指针原点',
+                                '重新检查当前受控页面'
+                            )
+                        }
+                        point = await resolvePoint(true)
+                        return {
+                            x: Math.round(origin.x + point.clickPoint.x * point.viewport.devicePixelRatio),
+                            y: Math.round(origin.y + point.clickPoint.y * point.viewport.devicePixelRatio),
+                        }
+                    }
+                },
             })
         } catch (error) {
             clickError = { error }
@@ -2406,6 +2494,14 @@ class UnifiedSessionManager {
         }
         const deadline = timeout === undefined ? undefined : Date.now() + timeout
         const state = await withNavigationBudget(() => this.getLiveState(), deadline)
+        if (/^about:blank(?:[?#]|$)/.test(state?.url ?? '')) {
+            return this.evaluate(
+                inspectChallengePage.toString(),
+                'precise',
+                deadline === undefined ? undefined : remainingNavigationTimeout(deadline),
+                [options]
+            )
+        }
         const title = (state?.title ?? '').trim().toLowerCase().replace(/…/g, '...')
         const challengeTitle = options.titleNeedles.some((needle) => title.includes(needle.toLowerCase()))
         const detach = () =>
@@ -2809,22 +2905,23 @@ class UnifiedSessionManager {
         if (!result?.objectId) {
             return extractCdpValue<T>(result)
         }
+        const state: CdpMaterializeState = {
+            seen: new Set(),
+            objectIds: new Set([result.objectId]),
+            nodes: 0,
+            chars: 0,
+            maxNodes: fileOutput ? 100_000 : UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES,
+            maxDepth: fileOutput ? 64 : UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH,
+            maxChars: fileOutput
+                ? UnifiedSessionManager.CDP_MATERIALIZE_MAX_FILE_CHARS
+                : UnifiedSessionManager.CDP_MATERIALIZE_MAX_CHARS,
+        }
         try {
-            return await this.materializeRemoteObject<T>(
-                result,
-                timeout,
-                {
-                    seen: new Set(),
-                    nodes: 0,
-                    chars: 0,
-                    maxChars: fileOutput
-                        ? UnifiedSessionManager.CDP_MATERIALIZE_MAX_FILE_CHARS
-                        : UnifiedSessionManager.CDP_MATERIALIZE_MAX_CHARS,
-                },
-                0
-            )
+            return await this.materializeRemoteObject<T>(result, timeout, state, 0)
         } finally {
-            this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId: result.objectId }).catch(() => {})
+            for (const objectId of state.objectIds) {
+                this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId }).catch(() => {})
+            }
         }
     }
 
@@ -2839,6 +2936,27 @@ class UnifiedSessionManager {
         }
         if (isKnownNonSerializableRemoteObject(result) || state.seen.has(result.objectId)) {
             throw new NonSerializableEvaluateResultError(result)
+        }
+        if (state.seen.size > 0) {
+            // 同一对象可有多个 CDP 句柄，循环检查按当前祖先对象的实际身份比较
+            const identity = (await this.extensionBridge!.debuggerSend(
+                'Runtime.callFunctionOn',
+                {
+                    objectId: result.objectId,
+                    functionDeclaration:
+                        'function () { for (let index = 0; index < arguments.length; ++index) { if (arguments[index] === this) { return true; } } return false; }',
+                    arguments: [...state.seen].map((objectId) => ({ objectId })),
+                    returnByValue: true,
+                },
+                undefined,
+                timeout
+            )) as {
+                result?: CdpResultObject<boolean>
+                exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+            }
+            if (this.checkCdpResult(identity)) {
+                throw new NonSerializableEvaluateResultError(result)
+            }
         }
 
         this.trackMaterializedNode(result, state, depth)
@@ -2856,7 +2974,22 @@ class UnifiedSessionManager {
                 timeout
             )) as {
                 result?: CdpPropertyDescriptor[]
+                internalProperties?: CdpPropertyDescriptor[]
+                privateProperties?: CdpPropertyDescriptor[]
                 exceptionDetails?: { text: string; exception?: { className?: string; description?: string } }
+            }
+            for (const descriptors of [
+                properties.result,
+                properties.internalProperties,
+                properties.privateProperties,
+            ]) {
+                for (const descriptor of descriptors ?? []) {
+                    for (const value of [descriptor.value, descriptor.get, descriptor.set, descriptor.symbol]) {
+                        if (value?.objectId) {
+                            state.objectIds.add(value.objectId)
+                        }
+                    }
+                }
             }
             if (properties.exceptionDetails) {
                 throw setErrorSource(new Error(formatCdpException(properties.exceptionDetails)), 'page')
@@ -2872,7 +3005,7 @@ class UnifiedSessionManager {
                     typeof length !== 'number' ||
                     !Number.isInteger(length) ||
                     length < 0 ||
-                    length > UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES
+                    length > (state.maxNodes ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES)
                 ) {
                     this.throwMaterializeLimit(state, depth, result)
                 }
@@ -2892,11 +3025,11 @@ class UnifiedSessionManager {
                         continue
                     }
                     const index = Number(descriptor.name)
-                    if (index >= UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES) {
+                    if (index >= (state.maxNodes ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES)) {
                         this.throwMaterializeLimit(state, depth, result)
                     }
                     this.trackMaterializedPropertyName(descriptor.name, state, depth, result)
-                    array[index] = await this.materializePropertyValue(descriptor.value, timeout, state, depth + 1)
+                    array[index] = await this.materializeRemoteObject(descriptor.value, timeout, state, depth + 1)
                 }
                 return array as T
             }
@@ -2908,7 +3041,7 @@ class UnifiedSessionManager {
                 }
                 this.trackMaterializedPropertyName(descriptor.name, state, depth, result)
                 Object.defineProperty(object, descriptor.name, {
-                    value: await this.materializePropertyValue(descriptor.value, timeout, state, depth + 1),
+                    value: await this.materializeRemoteObject(descriptor.value, timeout, state, depth + 1),
                     enumerable: true,
                     configurable: true,
                     writable: true,
@@ -2917,22 +3050,6 @@ class UnifiedSessionManager {
             return object as T
         } finally {
             state.seen.delete(result.objectId)
-        }
-    }
-
-    private async materializePropertyValue(
-        value: CdpResultObject,
-        timeout: number | undefined,
-        state: CdpMaterializeState,
-        depth: number
-    ): Promise<unknown> {
-        if (!value.objectId) {
-            return this.trackMaterializedValue(extractCdpValue(value), state, depth)
-        }
-        try {
-            return await this.materializeRemoteObject(value, timeout, state, depth)
-        } finally {
-            this.extensionBridge!.debuggerSend('Runtime.releaseObject', { objectId: value.objectId }).catch(() => {})
         }
     }
 
@@ -2972,8 +3089,8 @@ class UnifiedSessionManager {
 
     private assertMaterializeBudget(state: CdpMaterializeState, depth: number, result?: CdpResultObject): void {
         if (
-            depth > UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH ||
-            state.nodes > UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES ||
+            depth > (state.maxDepth ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH) ||
+            state.nodes > (state.maxNodes ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES) ||
             state.chars > state.maxChars
         ) {
             this.throwMaterializeLimit(state, depth, result)
@@ -2982,9 +3099,9 @@ class UnifiedSessionManager {
 
     private throwMaterializeLimit(state: CdpMaterializeState, depth: number, result?: CdpResultObject): never {
         const exceeded =
-            depth > UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH
+            depth > (state.maxDepth ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH)
                 ? 'depth'
-                : state.nodes > UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES
+                : state.nodes > (state.maxNodes ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES)
                   ? 'nodes'
                   : 'chars'
         throw new EvaluateResultTooLargeError({
@@ -2992,8 +3109,8 @@ class UnifiedSessionManager {
             depth,
             nodes: state.nodes,
             chars: state.chars,
-            maxDepth: UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH,
-            maxNodes: UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES,
+            maxDepth: state.maxDepth ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_DEPTH,
+            maxNodes: state.maxNodes ?? UnifiedSessionManager.CDP_MATERIALIZE_MAX_NODES,
             maxChars: state.maxChars,
             type: result?.type,
             subtype: result?.subtype,

@@ -61,6 +61,75 @@ test('native pointer observer expires and replaces an old document-local probe',
     assert.equal(w.observe('read', 'second', 2000).active, false);
 });
 
+test('native pointer calibration reports moving targets without an accepted origin', async (t) => {
+    for (const state of ['moving', 'stable', 'stale', 'document', 'cancelled']) {
+        await t.test(state, async () => {
+            const saved = globalThis.chrome;
+            const abort = new AbortController();
+            const sample = {
+                previousAt: state === 'stale' ? 999 : 1000,
+                sameTarget: state === 'stable',
+                at: 1001,
+                screenX: 280,
+                screenY: 326,
+                clientX: 280,
+                clientY: 227,
+                scale: 1,
+            };
+            globalThis.chrome = {
+                scripting: {
+                    executeScript: async () => [
+                        {
+                            frameId: 0,
+                            documentId: 'owned-document',
+                            result: { active: true, sample },
+                        },
+                    ],
+                },
+                webNavigation: {
+                    getFrame: async () => {
+                        if (state === 'cancelled') {
+                            abort.abort(new Error('owned calibration cancelled'));
+                        }
+                        return { documentId: state === 'document' ? 'changed-document' : 'owned-document' };
+                    },
+                },
+            };
+            const handler = new ContentHandler({});
+            handler.getManagedScriptableTabId = async () => 7;
+            const params = {
+                tabId: 7,
+                pointerProbe: {
+                    operation: 'read',
+                    id: 'owned',
+                    documentId: 'owned-document',
+                    since: 1000,
+                    position: { x: 280, y: 326 },
+                },
+            };
+            try {
+                const operation = handler.getViewportMetrics(params, {
+                    mcpTabGroupId: null,
+                    mcpWindowId: null,
+                    signal: abort.signal,
+                });
+                if (state === 'moving') {
+                    assert.deepEqual(await operation, { documentId: 'owned-document', stable: false });
+                } else if (state === 'stable') {
+                    assert.deepEqual(await operation, { documentId: 'owned-document', at: 1001, x: 0, y: 99 });
+                } else {
+                    await assert.rejects(
+                        operation,
+                        state === 'stale' ? /同一控件/ : state === 'document' ? /文档已变化/ : /cancelled/
+                    );
+                }
+            } finally {
+                globalThis.chrome = saved;
+            }
+        });
+    }
+});
+
 test('native pointer action derives the current origin and rejects stale or foreign samples', async () => {
     const saved = globalThis.chrome;
     let sample = {
@@ -84,18 +153,19 @@ test('native pointer action derives the current origin and rejects stale or fore
         tabId: 7,
         pointerProbe: { operation: 'read', id: 'owned', documentId, since: 1000, position: { x: 280, y: 326 } },
     };
+    const context = { mcpTabGroupId: null, mcpWindowId: null };
     try {
-        const origin = await handler.getViewportMetrics(params, {});
+        const origin = await handler.getViewportMetrics(params, context);
         assert.equal(origin.x, 0);
         assert.equal(origin.y, 99);
         sample = { ...sample, at: 999 };
         params.deadline = Date.now() + 20;
-        await assert.rejects(handler.getViewportMetrics(params, {}), /timeout|超时/i);
+        await assert.rejects(handler.getViewportMetrics(params, context), /timeout|超时/i);
         sample = { ...sample, at: 1001, screenX: 281 };
         params.deadline = Date.now() + 20;
-        await assert.rejects(handler.getViewportMetrics(params, {}), /timeout|超时/i);
+        await assert.rejects(handler.getViewportMetrics(params, context), /timeout|超时/i);
         documentId = 'navigated';
-        await assert.rejects(handler.getViewportMetrics(params, {}), /主文档已变化/);
+        await assert.rejects(handler.getViewportMetrics(params, context), /主文档已变化/);
     } finally {
         globalThis.chrome = saved;
     }

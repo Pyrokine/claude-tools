@@ -54,6 +54,7 @@ async function fixture(context, spec, run) {
     bridge.httpServer.clientSocket = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             state.messages.push(message);
@@ -199,7 +200,12 @@ const cases = [
 for (const operation of ['evaluate', 'input']) {
     for (const spec of cases) {
         test(
-            `C31F5-03 actual SDK ${operation}/${spec.name} classifies verification without replaying the completed action`,
+            'C31F5-03 actual SDK ' +
+                `${operation}` +
+                '/' +
+                `${spec.name}` +
+                ' classifies verification without replaying ' +
+                'the completed action',
             { timeout: 5000 },
             async (context) => {
                 await fixture(context, spec, async ({ client, bridge, state }) => {

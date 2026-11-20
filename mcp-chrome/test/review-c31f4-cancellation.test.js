@@ -266,6 +266,7 @@ async function fixture(run, { managed = true, grant = false } = {}) {
     bridge.httpServer.clientSocket = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             state.wire.push(message);
@@ -347,6 +348,7 @@ async function fixture(run, { managed = true, grant = false } = {}) {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     const originals = { open: fs.open, rename: fs.rename };
+    /** @param {Parameters<typeof originals.open>} args */
     fs.open = async (...args) => {
         const handle = await originals.open(...args);
         if (args[1] !== 'wx' || !String(args[0]).includes('.tmp-')) {
@@ -356,6 +358,7 @@ async function fixture(run, { managed = true, grant = false } = {}) {
         state.files.push(filename);
         const write = handle.writeFile.bind(handle);
         const close = handle.close.bind(handle);
+        /** @param {Parameters<typeof write>} params */
         handle.writeFile = async (...params) => {
             const result = await write(...params);
             await wait('file-written', undefined);
@@ -438,32 +441,43 @@ const authority = [
 ];
 for (const [action, fields, read, managed, grant] of authority) {
     if (action !== 'releasePage') {
-        test(`C31F4-01 actual SDK ${action} stops its first storage commit after both ends process cancellation`, async () => {
-            await fixture(
-                async ({ state, start, hold, values, replies }) => {
-                    const before = globalThis.structuredClone(values);
-                    const blocked = hold(read);
-                    const controller = new AbortController();
-                    const request = await start('manage', { action, targetId: '101', ...fields }, controller.signal);
-                    const rejected = assert.rejects(request.response);
-                    await blocked.entered.promise;
-                    assert.equal(state.writes.length, 0);
-                    controller.abort('stop before first storage commit');
-                    await until(
-                        () => request.record.signal.aborted && state.extensions.some((entry) => entry.signal.aborted)
-                    );
-                    blocked.release.resolve();
-                    await Promise.all(state.extensions.map((entry) => entry.done.promise));
-                    await request.record.done.promise;
-                    await rejected;
-                    assert.deepEqual(state.writes, []);
-                    assert.deepEqual(values, before);
-                    assert.equal(replies.filter((entry) => entry.id === request.record.id).length, 0);
-                    ++totals.cancelledResponsesSuppressed;
-                },
-                { managed, grant }
-            );
-        });
+        test(
+            'C31F4-01 actual SDK ' +
+                `${action}` +
+                ' stops its first storage commit after both ' +
+                'ends process cancellation',
+            async () => {
+                await fixture(
+                    async ({ state, start, hold, values, replies }) => {
+                        const before = globalThis.structuredClone(values);
+                        const blocked = hold(read);
+                        const controller = new AbortController();
+                        const request = await start(
+                            'manage',
+                            { action, targetId: '101', ...fields },
+                            controller.signal
+                        );
+                        const rejected = assert.rejects(request.response);
+                        await blocked.entered.promise;
+                        assert.equal(state.writes.length, 0);
+                        controller.abort('stop before first storage commit');
+                        await until(
+                            () =>
+                                request.record.signal.aborted && state.extensions.some((entry) => entry.signal.aborted)
+                        );
+                        blocked.release.resolve();
+                        await Promise.all(state.extensions.map((entry) => entry.done.promise));
+                        await request.record.done.promise;
+                        await rejected;
+                        assert.deepEqual(state.writes, []);
+                        assert.deepEqual(values, before);
+                        assert.equal(replies.filter((entry) => entry.id === request.record.id).length, 0);
+                        ++totals.cancelledResponsesSuppressed;
+                    },
+                    { managed, grant }
+                );
+            }
+        );
     }
     test(`C31F4-01 normal actual SDK ${action} completes one storage update`, async () => {
         await fixture(
@@ -513,41 +527,47 @@ for (const [action, previous, area] of [
 }
 
 for (const action of ['adoptPage', 'releasePage', 'grantReadAccess', 'pageMetadata']) {
-    test(`C31F4-01 actual SDK ${action} keeps persisted and in-memory state consistent after a dispatched set`, async () => {
-        await fixture(
-            async ({ start, hold, state, values }) => {
-                if (action === 'grantReadAccess') {
-                    await extension.revokeReadGrants('c31f4-synthetic-instance');
-                }
-                const blocked = hold(action === 'grantReadAccess' ? 'session-set' : 'local-set');
-                const controller = new AbortController();
-                const request = await start(
-                    'manage',
-                    { action, targetId: '101', ...(action === 'pageMetadata' ? { note: 'committed note' } : {}) },
-                    controller.signal
-                );
-                const rejected = assert.rejects(request.response);
-                await blocked.entered.promise;
-                assert.equal(state.writes.length, 1);
-                controller.abort('stop after storage commit dispatch');
-                await until(() => request.record.signal.aborted && state.extensions[0].signal.aborted);
-                blocked.release.resolve();
-                await state.extensions[0].done.promise;
-                await request.record.done.promise;
-                await rejected;
-                if (action === 'grantReadAccess') {
-                    assert.equal(await extension.hasReadGrant('c31f4-synthetic-instance', 101), true);
-                } else {
-                    const persisted = values.local.mcp_managed_tabs_v1.tabs.find((entry) => entry.tabId === 101);
-                    assert.deepEqual(extension.getManagedTabRecord(101), persisted);
-                    if (action === 'pageMetadata') {
-                        assert.equal(persisted.metadata.note, 'committed note');
+    test(
+        'C31F4-01 actual SDK ' +
+            `${action}` +
+            ' keeps persisted and in-memory state ' +
+            'consistent after a dispatched set',
+        async () => {
+            await fixture(
+                async ({ start, hold, state, values }) => {
+                    if (action === 'grantReadAccess') {
+                        await extension.revokeReadGrants('c31f4-synthetic-instance');
                     }
-                }
-            },
-            { managed: action === 'releasePage' }
-        );
-    });
+                    const blocked = hold(action === 'grantReadAccess' ? 'session-set' : 'local-set');
+                    const controller = new AbortController();
+                    const request = await start(
+                        'manage',
+                        { action, targetId: '101', ...(action === 'pageMetadata' ? { note: 'committed note' } : {}) },
+                        controller.signal
+                    );
+                    const rejected = assert.rejects(request.response);
+                    await blocked.entered.promise;
+                    assert.equal(state.writes.length, 1);
+                    controller.abort('stop after storage commit dispatch');
+                    await until(() => request.record.signal.aborted && state.extensions[0].signal.aborted);
+                    blocked.release.resolve();
+                    await state.extensions[0].done.promise;
+                    await request.record.done.promise;
+                    await rejected;
+                    if (action === 'grantReadAccess') {
+                        assert.equal(await extension.hasReadGrant('c31f4-synthetic-instance', 101), true);
+                    } else {
+                        const persisted = values.local.mcp_managed_tabs_v1.tabs.find((entry) => entry.tabId === 101);
+                        assert.deepEqual(extension.getManagedTabRecord(101), persisted);
+                        if (action === 'pageMetadata') {
+                            assert.equal(persisted.metadata.note, 'committed note');
+                        }
+                    }
+                },
+                { managed: action === 'releasePage' }
+            );
+        }
+    );
 }
 
 for (const action of ['tabs_adopt', 'tabs_metadata', 'tabs_read_access']) {
@@ -607,37 +627,45 @@ for (const [action, fields, phase] of [
     ['closePage', { targetId: '101' }, 'tab-remove'],
     ['closeWindow', { windowId: 7 }, 'window-remove'],
 ]) {
-    test(`C31F4-01 actual SDK ${action} completes required resource bookkeeping after native dispatch cancellation`, async () => {
-        await fixture(async ({ state, start, hold, replies }) => {
-            if (action === 'closeWindow') {
-                await extension.markManagedTab(102);
-            }
-            state.writes.length = 0;
-            const blocked = hold(phase);
-            const controller = new AbortController();
-            const request = await start('manage', { action, ...fields }, controller.signal);
-            const rejected = assert.rejects(request.response);
-            await enterGate(blocked, request.record);
-            controller.abort('stop after native resource change');
-            await until(() => request.record.signal.aborted && state.extensions.some((entry) => entry.signal.aborted));
-            blocked.release.resolve();
-            await Promise.all(state.extensions.map((entry) => entry.done.promise));
-            await request.record.done.promise;
-            await rejected;
-            if (action === 'newPage' || action === 'newWindow') {
-                assert.equal(extension.getManagedTabRecord(103).managed, true);
-                assert.equal(extension.getManagedTabRecord(103).origin, 'created');
-            } else {
-                assert.equal(extension.getManagedTabRecord(101), undefined);
+    test(
+        'C31F4-01 actual SDK ' +
+            `${action}` +
+            ' completes required resource bookkeeping ' +
+            'after native dispatch cancellation',
+        async () => {
+            await fixture(async ({ state, start, hold, replies }) => {
                 if (action === 'closeWindow') {
-                    assert.equal(extension.getManagedTabRecord(102), undefined);
+                    await extension.markManagedTab(102);
                 }
-            }
-            assert.ok(state.writes.length > 0);
-            assert.equal(replies.filter((entry) => entry.id === request.record.id).length, 0);
-            ++totals.cancelledResponsesSuppressed;
-        });
-    });
+                state.writes.length = 0;
+                const blocked = hold(phase);
+                const controller = new AbortController();
+                const request = await start('manage', { action, ...fields }, controller.signal);
+                const rejected = assert.rejects(request.response);
+                await enterGate(blocked, request.record);
+                controller.abort('stop after native resource change');
+                await until(
+                    () => request.record.signal.aborted && state.extensions.some((entry) => entry.signal.aborted)
+                );
+                blocked.release.resolve();
+                await Promise.all(state.extensions.map((entry) => entry.done.promise));
+                await request.record.done.promise;
+                await rejected;
+                if (action === 'newPage' || action === 'newWindow') {
+                    assert.equal(extension.getManagedTabRecord(103).managed, true);
+                    assert.equal(extension.getManagedTabRecord(103).origin, 'created');
+                } else {
+                    assert.equal(extension.getManagedTabRecord(101), undefined);
+                    if (action === 'closeWindow') {
+                        assert.equal(extension.getManagedTabRecord(102), undefined);
+                    }
+                }
+                assert.ok(state.writes.length > 0);
+                assert.equal(replies.filter((entry) => entry.id === request.record.id).length, 0);
+                ++totals.cancelledResponsesSuppressed;
+            });
+        }
+    );
 }
 
 const exports = [
@@ -684,7 +712,7 @@ for (const [index, [name, args]] of exports.entries()) {
                 await rejected;
                 assert.equal(state.renames.length, 0);
                 if (index !== 6) {
-                    assert.equal(await fs.readFile(destination, 'utf8'), 'original synthetic file');
+                    assert.equal(await fs.readFile(destination, { encoding: 'utf8' }), 'original synthetic file');
                 }
                 for (const temporary of state.files) {
                     await assert.rejects(fs.access(temporary), { code: 'ENOENT' });
@@ -709,7 +737,7 @@ for (const [index, [name, args]] of exports.entries()) {
             const response = await request.response;
             assert.notEqual(response.isError, true, response.content[0].text);
             const payload = JSON.parse(response.content[0].text);
-            const contents = await fs.readFile(payload.path ?? join(directory, 'output.json'), 'utf8');
+            const contents = await fs.readFile(payload.path ?? join(directory, 'output.json'), { encoding: 'utf8' });
             assert.ok(contents.includes('synthetic'));
             assert.ok(state.renames.length > 0);
             assert.ok(state.renames.every((entry) => !entry.aborted));
@@ -729,7 +757,7 @@ for (const phase of ['file-renamed', 'manifest-open']) {
             );
             const rejected = assert.rejects(request.response);
             await enterGate(blocked, request.record);
-            assert.match(await fs.readFile(join(directory, 'output.json'), 'utf8'), /synthetic log/);
+            assert.match(await fs.readFile(join(directory, 'output.json'), { encoding: 'utf8' }), /synthetic log/);
             controller.abort('stop later manifest');
             await until(() => request.record.signal.aborted);
             blocked.release.resolve();

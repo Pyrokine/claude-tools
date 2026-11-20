@@ -8,12 +8,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 
-test('C31F10 SDK metadata isolates pending conditions across requests', async () => {
+test('C31F10 SDK metadata isolates pending conditions across requests', { timeout: 20_000 }, async () => {
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-c31f10-sdk-'));
     const load = (relative) => import(pathToFileURL(path.join(root, relative)));
-    const { Client } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js');
-    const { McpServer } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js');
-    const { InMemoryTransport } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/inMemory.js');
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+    const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
     const { getUnifiedSession } = await load('dist/core/index.js');
     const { ExtensionBridge } = await load('dist/extension/bridge.js');
     const { registerEvaluateTool } = await load('dist/tools/evaluate.js');
@@ -23,7 +23,20 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
         status: 'RUNNING',
         root,
         boundary:
-            'Actual SDK Client/McpServer and current registered evaluate/manage, UnifiedSession, Bridge and HttpServer transport parser. Controlled connected Extension protocol peer provides declared tabs/frame/snapshot metadata; it holds a successful preparation or action ACK, then delivers it after a concurrent metadata request. No replacement clock/timer/classifier and no Chrome or DOM. The peer enforces exactly the serialized expectedUrl/revision contract and records a simulated principal effect only when that guard permits execution; source-level dispatch and guard consumption are independent of this simulation.',
+            'Actual SDK Client/McpServer and current ' +
+            'registered evaluate/manage, UnifiedSession, ' +
+            'Bridge and HttpServer transport parser. ' +
+            'Controlled connected Extension protocol peer ' +
+            'provides declared tabs/frame/snapshot metadata; ' +
+            'it holds a successful preparation or action ACK, ' +
+            'then delivers it after a concurrent metadata ' +
+            'request. No replacement clock/timer/classifier ' +
+            'and no Chrome or DOM. The peer enforces exactly ' +
+            'the serialized expectedUrl/revision contract and ' +
+            'records a simulated principal effect only when ' +
+            'that guard permits execution; source-level ' +
+            'dispatch and guard consumption are independent of ' +
+            'this simulation.',
         checks: [],
         requests: [],
         peerErrors: [],
@@ -39,6 +52,14 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
         });
         return { promise, resolve };
     };
+    const waitForEntry = async (entry, request) => {
+        const completed = await Promise.race([entry.promise.then(() => null), request]);
+        assert.equal(completed, null, 'Request completed before controlled peer entry: ' + JSON.stringify(completed));
+    };
+    await assert.rejects(
+        waitForEntry(defer(), Promise.resolve({ isError: true, content: [] })),
+        /Request completed before controlled peer entry/
+    );
     const unified = getUnifiedSession();
     const bridge = new ExtensionBridge({ requestContext: () => unified.tabLockContext.getStore() });
     const rpc = bridge.httpServer;
@@ -105,6 +126,19 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
                     frameContext: { documentId: 'owned-stable-frame', url: 'https://metadata.example.test/frame' },
                 };
                 break;
+            case 'prepare_frame_evaluation':
+                active.preparedContext = {
+                    tabId: p.tabId,
+                    frameId: p.frameId,
+                    documentId: 'owned-stable-frame',
+                    parentFrameId: 0,
+                    parentDocumentId: 'owned-main-document',
+                    url: 'https://metadata.example.test/frame',
+                    cdpFrameId: 'owned-cdp-frame',
+                    executionContextId: 17,
+                };
+                data = { preparedContext: active.preparedContext };
+                break;
             case 'tabs_metadata': {
                 const m = {
                     origin: 'created',
@@ -123,6 +157,8 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
             }
             case 'evaluate_in_frame':
                 assert.ok(isMain(message));
+                assert.ok(active.preparedContext, 'Frame preparation must precede evaluation');
+                assert.deepEqual(p.preparedContext, active.preparedContext);
                 ++active.peerPrincipalEffects;
                 data = {
                     result: { type: 'number', value: 1 },
@@ -151,6 +187,7 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
     rpc.clientSocket = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             result.requests.push({
@@ -248,7 +285,7 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
                 };
                 ++result.sdkCalls;
                 principal = client.callTool(row.evaluateInput);
-                await row.ready.promise;
+                await waitForEntry(row.ready, principal);
                 row.beforeMetadata = {
                     target: bridge.getCurrentTargetId(),
                     frame: bridge.getCurrentFrameId(),
@@ -272,7 +309,7 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
                         row.metadataCompletedBeforeRelease = !row.released;
                         return value;
                     });
-                    await row.manageEntered.promise;
+                    await waitForEntry(row.manageEntered, meta);
                     await Promise.race([meta, new Promise((resolve) => setTimeout(resolve, 30))]);
                 }
                 row.afterConcurrentMetadata = {
@@ -404,9 +441,9 @@ test('C31F10 SDK metadata isolates pending conditions across requests', async ()
 test('C31F10 SDK settled budgets stop later reads and retain bounded key cleanup', async () => {
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-c31f10-sdk-'));
     const load = (relative) => import(pathToFileURL(path.join(root, relative)));
-    const { Client } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js');
-    const { McpServer } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js');
-    const { InMemoryTransport } = await load('node_modules/@modelcontextprotocol/sdk/dist/esm/inMemory.js');
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+    const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
     const { getUnifiedSession } = await load('dist/core/index.js');
     const { ExtensionBridge } = await load('dist/extension/bridge.js');
     const { getErrorSource, getErrorPageContext } = await load('dist/core/errors.js');
@@ -416,7 +453,20 @@ test('C31F10 SDK settled budgets stop later reads and retain bounded key cleanup
         status: 'RUNNING',
         root,
         boundary:
-            'Real SDK Client/McpServer tools/call, current registered handlers, UnifiedSession, ExtensionBridge and HttpServer timers/parser. Controlled in-memory Extension protocol peer; no browser or DOM. Selected valid ACK is held until its genuine production timeout callback runs. The native setTimeout still schedules the original production callback; only Date.now is controlled to recorded command deadline minus one (or deadline control) from that callback until the handler finishes, matching the declared C31F9-13 edge. No timeout Error is manufactured and no error classifier is replaced. Transparent wrappers observe sendCommand and handlers.',
+            'Real SDK Client/McpServer tools/call, current ' +
+            'registered handlers, UnifiedSession, ' +
+            'ExtensionBridge and HttpServer timers/parser. ' +
+            'Controlled in-memory Extension protocol peer; no ' +
+            'browser or DOM. Selected valid ACK is held until ' +
+            'its genuine production timeout callback runs. The ' +
+            'native setTimeout still schedules the original ' +
+            'production callback; only Date.now is controlled ' +
+            'to recorded command deadline minus one (or ' +
+            'deadline control) from that callback until the ' +
+            'handler finishes, matching the declared C31F9-13 ' +
+            'edge. No timeout Error is manufactured and no ' +
+            'error classifier is replaced. Transparent ' +
+            'wrappers observe sendCommand and handlers.',
         checks: [],
         requests: [],
         errors: [],
@@ -582,6 +632,7 @@ test('C31F10 SDK settled budgets stop later reads and retain bounded key cleanup
     rpc.clientSocket = {
         readyState: 1,
         close() {},
+        /** @param {string} text */
         send(text) {
             const message = JSON.parse(text);
             const record = {
@@ -778,7 +829,11 @@ test('C31F10 SDK settled budgets stop later reads and retain bounded key cleanup
                 }
                 if (row.afterLateAck.keys.length) {
                     row.reviewerFixtureReset = {
-                        reason: 'Controlled peer has no real DOM/keyboard; clear retained production bookkeeping only after recording the failing state so later rows start independently.',
+                        reason:
+                            'Controlled peer has no real DOM/keyboard; clear ' +
+                            'retained production bookkeeping only after ' +
+                            'recording the failing state so later rows start ' +
+                            'independently.',
                         keys: [...unified.pressedKeys],
                         modifiers: unified.modifiers,
                     };

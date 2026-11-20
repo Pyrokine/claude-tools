@@ -1,8 +1,8 @@
+import { lookup } from 'mime-types'
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
-import { lookup } from 'mime-types'
 import { StructuredToolError } from './errors.js'
 
 const UPLOAD_BYTE_LIMIT = 50 * 1024 * 1024

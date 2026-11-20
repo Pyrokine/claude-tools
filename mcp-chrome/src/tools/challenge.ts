@@ -1,8 +1,15 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { inspectChallengePage } from '../core/challenge-page.js'
+import {
+    formatErrorResponse,
+    getErrorSource,
+    isNativeExecutionResultUnknown,
+    OsMouseError,
+    StructuredToolError,
+    TimeoutError,
+} from '../core/errors.js'
 import type { ViewportMetrics } from '../core/os-mouse.js'
 import { DEFAULT_TIMEOUT } from '../core/types.js'
-import { OsMouseError, StructuredToolError, TimeoutError } from '../core/errors.js'
 import { remainingNavigationTimeout, withNavigationBudget } from '../core/utils.js'
 
 export const CHALLENGE_POLL_MS = 500
@@ -29,9 +36,7 @@ export const CHALLENGE_SELECTORS = [
     '#cf-please-wait',
     '#challenge-spinner',
     '#trk_jschal_js',
-    '.lds-ring',
     'td.info #js_info',
-    'div.vc div.text-box h2',
 ]
 
 export const TURNSTILE_WIDGET_SELECTORS = ['#turnstile-wrapper', '.cf-turnstile']
@@ -84,6 +89,7 @@ export interface ChallengePageSnapshot {
     screenPoint: ChallengeClickPoint | null
     viewport: ViewportMetrics | null
     inspected: boolean
+    inspectionError?: unknown
 }
 
 export interface ChallengeWaitResult {
@@ -283,12 +289,12 @@ function snapshotInspected(snapshot: { inspected?: boolean }): boolean {
     return snapshot.inspected !== false
 }
 
-function isPending(kind: ChallengeKind, snapshot: ChallengePageSnapshot, headerPending: boolean): boolean {
+function isPending(kind: ChallengeKind, snapshot: ChallengePageSnapshot): boolean {
     if (kind === 'js' || kind === 'turnstile') {
         return true
     }
-    // 主文档 cf-mitigated 只表示曾经进入 Challenge；页面标题和 DOM 恢复后即视为已过
-    return !snapshot.inspected && headerPending
+    // 主文档 cf-mitigated 可在验证后保留，解除等待仍需本次 DOM 检查完成
+    return !snapshotInspected(snapshot)
 }
 
 async function hasClearanceCookie(host: ChallengeHost): Promise<boolean> {
@@ -310,8 +316,11 @@ async function readPageTitle(host: ChallengeHost): Promise<string> {
             if (typeof live?.title === 'string') {
                 return live.title
             }
-        } catch {
-            // 回退到缓存状态
+        } catch (error) {
+            if (isTerminalChallengeError(error)) {
+                throw error
+            }
+            // 暂态读取失败时使用缓存标题
         }
     }
     return host.getState()?.title ?? ''
@@ -395,12 +404,38 @@ function normalizeChallengeSnapshot(
     }
 }
 
+function isTerminalChallengeError(error: unknown): boolean {
+    const source = getErrorSource(error)
+    return source === 'budget' || source === 'cancelled' || (source !== 'page' && isNativeExecutionResultUnknown(error))
+}
+
+function isChallengeAccessError(error: unknown): boolean {
+    if (
+        !(error instanceof Error) ||
+        getErrorSource(error) === 'page' ||
+        error instanceof TimeoutError ||
+        (error instanceof StructuredToolError && error.code === 'TIMEOUT')
+    ) {
+        return false
+    }
+    const { error: detail } = JSON.parse(formatErrorResponse(error).content[0]!.text) as {
+        error: { code: string; message: string }
+    }
+    return (
+        detail.code === 'FRAME_INJECTION_DENIED' ||
+        /Cannot access (?:a \S+ URL|contents of url)|Cannot execute on restricted URL|cannot be scripted/i.test(
+            detail.message
+        )
+    )
+}
+
 export async function readChallengeSnapshot(
     host: ChallengeHost,
     inspectTimeout = CHALLENGE_INSPECT_TIMEOUT_MS
 ): Promise<ChallengePageSnapshot> {
     const fallback = host.getState() ?? {}
     const deadline = Date.now() + inspectTimeout
+    let inspectionError: unknown
     if (host.inspectChallenge && host.getMode() === 'extension') {
         try {
             return normalizeChallengeSnapshot(
@@ -424,8 +459,15 @@ export async function readChallengeSnapshot(
                 fallback
             )
         } catch (error) {
+            if (isTerminalChallengeError(error) || isChallengeAccessError(error)) {
+                throw error
+            }
+            inspectionError = error
             if (error instanceof TimeoutError) {
-                return blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false)
+                return {
+                    ...blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false),
+                    inspectionError,
+                }
             }
             // isolated inspect 失败时，在剩余预算内改用 stealth/precise
         }
@@ -445,13 +487,20 @@ export async function readChallengeSnapshot(
                 fallback
             )
         } catch (error) {
+            if (isTerminalChallengeError(error) || isChallengeAccessError(error)) {
+                throw error
+            }
+            inspectionError = error
             if (error instanceof TimeoutError) {
-                return blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false)
+                return {
+                    ...blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false),
+                    inspectionError,
+                }
             }
             // 保留未完成检查的状态，由等待器继续判定
         }
     }
-    return blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false)
+    return { ...blankChallengeSnapshot(fallback.title ?? '', fallback.url ?? '', false), inspectionError }
 }
 
 export async function waitForChallenge(
@@ -481,19 +530,101 @@ export async function waitForChallenge(
     let finalOriginResponseCheckStarted = false
     let browserEvents: Record<string, unknown> | undefined
     let observersSuspended = false
+    let headerPendingObserved = false
+    let inspectionError: unknown
+    const timeoutError = (cause: unknown = inspectionError): Error => {
+        const waitedMs = Math.max(0, now() - startedAt)
+        if (clickedTurnstile || observedKind !== 'none' || headerPendingObserved) {
+            return new ChallengeTimeoutError(
+                options.action,
+                actionStatus,
+                waitedMs,
+                clickedTurnstile ? 'turnstile' : observedKind === 'none' ? 'js' : observedKind,
+                host.getMode(),
+                clickedTurnstile,
+                browserEvents
+            )
+        }
+        if (cause instanceof Error && isTerminalChallengeError(cause)) {
+            return cause
+        }
+        const nativeContext =
+            cause instanceof StructuredToolError || cause instanceof TimeoutError ? cause.context : undefined
+        const error = new StructuredToolError(
+            'TIMEOUT',
+            '页面状态检查超过请求期限，尚未取得访问验证证据',
+            '独立读取当前页面核验已执行动作的结果',
+            {
+                action: options.action,
+                actionExecuted: actionStatus === 'completed',
+                actionStatus,
+                failureStage: 'challenge_inspection',
+                verificationStatus: 'unavailable',
+                verificationActionExecuted: nativeContext?.actionExecuted ?? 'unknown',
+                verificationActionStatus: nativeContext?.actionStatus ?? 'unknown',
+                challengeState: 'unverified',
+                challengeKind: 'none',
+                waitedMs,
+                ...(browserEvents ? { browserEvents } : {}),
+                retryable: false,
+            }
+        )
+        const toJSON = error.toJSON.bind(error)
+        return Object.assign(error, {
+            cause,
+            toJSON: () => ({
+                ...toJSON(),
+                success: false,
+                ...error.context,
+                mode: host.getMode(),
+                autoRetry: false,
+            }),
+        })
+    }
     const readWithinBudget = async <T>(operation: () => Promise<T>): Promise<T> => {
+        let operationError: unknown
         try {
-            return await withNavigationBudget(operation, deadline(), options.signal)
+            return await withNavigationBudget(
+                async () => {
+                    try {
+                        return await operation()
+                    } catch (error) {
+                        operationError = error
+                        throw error
+                    }
+                },
+                deadline(),
+                options.signal
+            )
         } catch (error) {
+            if (error === operationError && isTerminalChallengeError(error)) {
+                throw error
+            }
             if (error instanceof TimeoutError || (error instanceof StructuredToolError && error.code === 'TIMEOUT')) {
-                throw new ChallengeTimeoutError(
-                    options.action,
-                    actionStatus,
-                    Math.max(0, now() - startedAt),
-                    clickedTurnstile ? 'turnstile' : observedKind,
-                    host.getMode(),
-                    clickedTurnstile,
-                    browserEvents
+                throw timeoutError(error)
+            }
+            if (isChallengeAccessError(error)) {
+                const { error: detail } = JSON.parse(formatErrorResponse(error).content[0]!.text) as {
+                    error: { code: string; message: string; suggestion?: string; context?: Record<string, unknown> }
+                }
+                throw Object.assign(
+                    new StructuredToolError(
+                        detail.code,
+                        detail.message,
+                        detail.suggestion ?? '当前页面拒绝脚本访问，请检查页面类型与访问权限',
+                        {
+                            ...detail.context,
+                            action: options.action,
+                            actionExecuted: actionStatus === 'completed',
+                            actionStatus,
+                            failureStage: 'challenge_inspection',
+                            verificationStatus: 'unavailable',
+                            verificationActionExecuted: detail.context?.actionExecuted ?? false,
+                            verificationActionStatus: detail.context?.actionStatus ?? 'not_started',
+                            retryable: false,
+                        }
+                    ),
+                    { cause: error }
                 )
             }
             throw error
@@ -525,15 +656,7 @@ export async function waitForChallenge(
     while (true) {
         const remainingBeforeInspect = timeout - (now() - startedAt)
         if (remainingBeforeInspect <= 0) {
-            throw new ChallengeTimeoutError(
-                options.action,
-                actionStatus,
-                Math.max(0, now() - startedAt),
-                clickedTurnstile ? 'turnstile' : observedKind,
-                host.getMode(),
-                clickedTurnstile,
-                browserEvents
-            )
+            throw timeoutError()
         }
         if (host.hasBrowserEventObservation?.() && host.browserEvents) {
             const events = await readWithinBudget(() => host.browserEvents!('read', { type: 'dialog', limit: 1000 }))
@@ -557,6 +680,7 @@ export async function waitForChallenge(
         }
         const header = await readWithinBudget(() => host.getChallengeState())
         const headerPending = header?.state === 'pending'
+        headerPendingObserved = headerPending
         const title = await readWithinBudget(() => readPageTitle(host))
         if (DENIED_TITLE_PREFIXES.some((prefix) => title.trim().toLowerCase().startsWith(prefix))) {
             await suspendObservers()
@@ -613,6 +737,7 @@ export async function waitForChallenge(
             )
             lastInspectAt = now()
         }
+        inspectionError = snapshot.inspectionError
         const kind = classifyChallengeSnapshot(snapshot, headerPending)
         if (kind === 'denied') {
             await suspendObservers()
@@ -630,7 +755,7 @@ export async function waitForChallenge(
         if (kind !== 'none' && (kind === 'turnstile' || snapshotInspected(snapshot) || observedKind === 'none')) {
             observedKind = kind
         }
-        if (!isPending(kind, snapshot, headerPending)) {
+        if (!isPending(kind, snapshot)) {
             return {
                 resolved: true,
                 waitedMs: Math.max(0, now() - startedAt),
@@ -669,7 +794,9 @@ export async function waitForChallenge(
                                 Math.max(0, timeout - (now() - startedAt)),
                                 options.signal,
                                 (remaining = CHALLENGE_INSPECT_TIMEOUT_MS) =>
-                                    readChallengeSnapshot(host, Math.min(CHALLENGE_INSPECT_TIMEOUT_MS, remaining))
+                                    readWithinBudget(() =>
+                                        readChallengeSnapshot(host, Math.min(CHALLENGE_INSPECT_TIMEOUT_MS, remaining))
+                                    )
                             )
                         // iframe 路径自行处理取消与有界释放，完成后才结束 tab 锁
                         if (clickSnapshot.clickSource === 'iframe') {
@@ -714,15 +841,7 @@ export async function waitForChallenge(
 
         const elapsed = now() - startedAt
         if (elapsed >= timeout) {
-            throw new ChallengeTimeoutError(
-                options.action,
-                actionStatus,
-                Math.max(elapsed, timeout),
-                clickedTurnstile ? 'turnstile' : observedKind === 'none' ? kind : observedKind,
-                host.getMode(),
-                clickedTurnstile,
-                browserEvents
-            )
+            throw timeoutError()
         }
         await readWithinBudget(() => sleep(Math.min(CHALLENGE_POLL_MS, timeout - elapsed)))
     }

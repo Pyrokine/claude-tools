@@ -1,10 +1,10 @@
-import { InputEventHandler } from '../extension/src/background/input-event-handler'
-import { ContentHandler } from '../extension/src/background/content-handler'
-import { FrameResolver } from '../extension/src/background/frame-resolver'
-import { StealthHandler } from '../extension/src/background/stealth-handler'
-import { DebuggerManager } from '../extension/src/background/debugger-manager'
-import { markManagedTab } from '../extension/src/background/tab-state'
 import { recordDomFrameProbe } from '../extension/src/background/action-utils'
+import { ContentHandler } from '../extension/src/background/content-handler'
+import { DebuggerManager } from '../extension/src/background/debugger-manager'
+import { FrameResolver } from '../extension/src/background/frame-resolver'
+import { InputEventHandler } from '../extension/src/background/input-event-handler'
+import { StealthHandler } from '../extension/src/background/stealth-handler'
+import { markManagedTab } from '../extension/src/background/tab-state'
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'MCP_FRAME_PROBE') {
@@ -54,6 +54,15 @@ debuggerApi.sendCommand = (target, method, params) => {
     counts: () => ({ ...counts }),
     command: (action: string, params: unknown) => {
         counts[action] = (counts[action] ?? 0) + 1
+        if (action === 'resolve_frame') {
+            return frameResolver.resolveFrame(params, context)
+        }
+        if (action === 'find') {
+            return content.find(params, context)
+        }
+        if (action === 'scroll') {
+            return content.scroll(params, context)
+        }
         if (action === 'evaluate_in_frame') {
             return frameResolver.evaluateInFrame(params, context)
         }

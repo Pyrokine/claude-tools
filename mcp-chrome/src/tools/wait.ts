@@ -15,13 +15,13 @@ import {
     formatErrorResponse,
     getSession,
     getUnifiedSession,
-    TimeoutError,
     StructuredToolError,
+    TimeoutError,
 } from '../core/index.js'
 import { DEFAULT_TIMEOUT, type ElementState, type Target } from '../core/types.js'
 import { remainingNavigationTimeout } from '../core/utils.js'
-import { sanitizeUrlRecord } from './network-sanitizer.js'
 import { withDiagnosticsResponse } from './diagnostics.js'
+import { sanitizeUrlRecord } from './network-sanitizer.js'
 import { withPageContext } from './page-context.js'
 import {
     frameZodSchema,
@@ -546,7 +546,7 @@ async function waitForElementExtension(
 
         try {
             const remaining = timeout - elapsed
-            const elements = await unifiedSession.find(selector, text, xpath, remaining, semantic)
+            const elements = await unifiedSession.find(selector, text, xpath, remaining, semantic, undefined, 'frame')
             matchCount = elements.length < 50 ? elements.length : null
             candidates = elements
             const selected =
@@ -559,7 +559,8 @@ async function waitForElementExtension(
                               xpath,
                               Math.max(1, timeout - (Date.now() - startTime)),
                               semantic,
-                              nth
+                              nth,
+                              'frame'
                           )
                       )[0]
             const found = selected !== undefined

@@ -288,7 +288,11 @@ export function generateAccessibilityTree(
     }
 
     function isDisabled(element: Element): boolean {
-        return Boolean((element as HTMLButtonElement).disabled) || element.getAttribute('aria-disabled') === 'true'
+        return (
+            element.matches(':disabled') ||
+            Boolean((element as HTMLButtonElement).disabled) ||
+            element.getAttribute('aria-disabled') === 'true'
+        )
     }
 
     function isCovered(element: Element): boolean {
@@ -734,6 +738,7 @@ export function extractHtml(
     if (refId) {
         const win = window as Window & { __mcpElementMap?: Record<string, WeakRef<Element>> }
         const element = win.__mcpElementMap?.[refId]?.deref()
+        // noinspection InnerHTMLJS -- 读取已授权目标的原 HTML，供 extract 返回
         return { html: element?.isConnected ? (outer ? element.outerHTML : element.innerHTML) : '' }
     }
     if (selector) {

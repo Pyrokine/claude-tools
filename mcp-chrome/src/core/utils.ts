@@ -147,7 +147,10 @@ const execFileAsync = promisify(execFile)
 /**
  * 转义 XPath 字符串字面量（处理包含引号的值）
  *
- * 例如：`"It's a \"test\"" => concat('It', "'", 's a "test"')`
+ * @example
+ * ```ts
+ * escapeXPathString(`It's a "test"`) // concat('It', "'", 's a "test"')
+ * ```
  */
 export function escapeXPathString(str: string): string {
     if (!str.includes("'")) {

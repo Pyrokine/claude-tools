@@ -17,6 +17,21 @@ test.describe('owned browser event protocols', () => {
             },
         };
     }
+    const chromeEvent = () => {
+        const listeners = new Set();
+        return {
+            addListener: (listener) => listeners.add(listener),
+            removeListener: (listener) => listeners.delete(listener),
+            emit: (...args) => {
+                for (const listener of listeners) {
+                    listener(...args);
+                }
+            },
+            get size() {
+                return listeners.size;
+            },
+        };
+    };
     const callbacks = [];
     const calls = [];
     const page = { id: 51201, url: 'https://example.com/owned', title: 'Owned', windowId: 51, groupId: -1, index: 0 };
@@ -24,6 +39,7 @@ test.describe('owned browser event protocols', () => {
     const body = Buffer.from([0, 255, 128, 1]);
     const chromeFixture = {
         storage: { local: storage(), session: storage() },
+        scripting: { executeScript: async () => [{ result: [] }] },
         tabs: {
             get: async (id) => {
                 if (id !== page.id) {
@@ -33,10 +49,17 @@ test.describe('owned browser event protocols', () => {
             },
             query: async () => [page],
         },
-        webNavigation: { getFrame: async () => ({ documentId: 'owned-document', frameId: 0, url: page.url }) },
+        webNavigation: {
+            getFrame: async () => ({ documentId: 'owned-document', frameId: 0, url: page.url }),
+            onCommitted: chromeEvent(),
+            onDOMContentLoaded: chromeEvent(),
+            onCompleted: chromeEvent(),
+            onHistoryStateUpdated: chromeEvent(),
+            onReferenceFragmentUpdated: chromeEvent(),
+        },
         debugger: {
             onEvent: { addListener: (listener) => callbacks.push(listener) },
-            onDetach: { addListener: () => {} },
+            onDetach: chromeEvent(),
             attach: async () => {},
             detach: async () => {},
             sendCommand: async (source, method, params) => {
@@ -101,7 +124,7 @@ test.describe('owned browser event protocols', () => {
         }
     });
 
-    test('inactive tabs reject native mouse movement and press before dispatch while release remains available', async () => {
+    test('inactive tabs reject native movement and press before dispatch while release remains available', async () => {
         const before = calls.length;
         page.active = false;
         try {
@@ -178,6 +201,91 @@ test.describe('owned browser event protocols', () => {
         assert.ok(
             calls.some((call) => call.method === 'Page.handleJavaScriptDialog' && call.params.promptText === 'answer')
         );
+    });
+
+    test('HOST-NAV-01 native navigation settles after debugger detach, owner release and tab cleanup', async (t) => {
+        for (const ending of ['detach', 'owner-release', 'tab-close']) {
+            await t.test(ending, async () => {
+                const owner = `owner-navigation-${ending}`;
+                const before = { ...page };
+                const previousUpdate = chromeFixture.tabs.update;
+                const failure = new Error('original native tab update refused');
+                let finishNative;
+                let entered;
+                const started = new Promise((resolve) => {
+                    entered = resolve;
+                });
+                const nativeAck = new Promise((resolve) => {
+                    finishNative = resolve;
+                });
+                let dispatches = 0;
+                let settled = false;
+                let operation;
+                chromeFixture.tabs.update = async (_tabId, options) => {
+                    ++dispatches;
+                    if (ending === 'detach') {
+                        chromeFixture.debugger.onDetach.emit({ tabId: page.id }, 'target_closed');
+                    } else if (ending === 'owner-release') {
+                        void handler.releaseBrowserEventOwner(owner);
+                    } else {
+                        handler.cleanupTab(page.id);
+                    }
+                    entered();
+                    await nativeAck;
+                    if (ending === 'tab-close') {
+                        throw failure;
+                    }
+                    page.url = options.url;
+                    page.title = 'Extensions';
+                    chromeFixture.webNavigation.onCommitted.emit({
+                        tabId: page.id,
+                        frameId: 0,
+                        documentId: 'restricted-document',
+                    });
+                    chromeFixture.webNavigation.onCompleted.emit({
+                        tabId: page.id,
+                        frameId: 0,
+                        documentId: 'restricted-document',
+                    });
+                    return { ...page };
+                };
+                try {
+                    await handler.execute('debugger_attach', { tabId: page.id }, context(owner));
+                    operation = handler.execute(
+                        'navigate',
+                        { tabId: page.id, url: 'chrome://extensions/', waitUntil: 'load', timeout: 1_000 },
+                        context(owner)
+                    );
+                    void operation.then(
+                        () => {
+                            settled = true;
+                        },
+                        () => {
+                            settled = true;
+                        }
+                    );
+                    await started;
+                    await flush();
+                    assert.equal(settled, false, 'Observer cleanup must preserve the unfinished native navigation');
+                    finishNative();
+                    if (ending === 'tab-close') {
+                        await assert.rejects(operation, (error) => error === failure);
+                    } else {
+                        assert.equal((await operation).url, 'chrome://extensions/');
+                    }
+                    assert.equal(dispatches, 1);
+                    assert.equal(chromeFixture.webNavigation.onCompleted.size, 0);
+                    assert.equal(chromeFixture.webNavigation.onCommitted.size, 0);
+                } finally {
+                    finishNative();
+                    await operation?.catch(() => {});
+                    await flush();
+                    chromeFixture.tabs.update = previousUpdate;
+                    Object.assign(page, before);
+                    await handler.releaseBrowserEventOwner(owner);
+                }
+            });
+        }
     });
 
     test('Extension Fetch ownership excludes other servers and preserves exact source session', async () => {
@@ -290,5 +398,166 @@ test.describe('owned browser event protocols', () => {
                 cleanup.findIndex((call) => call.method === 'Fetch.disable')
         );
         await assert.rejects(action('owner-a', 'route', { op: 'continue', ref }), /another owner/);
+    });
+    test('CE-NEW01 cancellation during helper preparation prevents user script dispatch', async () => {
+        const content = handler.contentHandler;
+        const originalResolve = content.getManagedScriptableTabId;
+        const originalScripting = chromeFixture.scripting;
+        let finishSetup;
+        let entered;
+        const started = new Promise((resolve) => {
+            entered = resolve;
+        });
+        let calls = 0;
+        chromeFixture.scripting = {
+            executeScript: async () => {
+                ++calls;
+                entered();
+                return new Promise((resolve) => {
+                    finishSetup = () => resolve([{ result: true }]);
+                });
+            },
+        };
+        content.getManagedScriptableTabId = async () => page.id;
+        const controller = new AbortController();
+        try {
+            const result = content.evaluate(
+                { tabId: page.id, code: 'globalThis.owned = true' },
+                { ...context('owner-a'), signal: controller.signal, deadline: Date.now() + 1000 }
+            );
+            await started;
+            controller.abort();
+            finishSetup();
+            await assert.rejects(result, /REQUEST_CANCELLED/);
+            assert.equal(calls, 1);
+        } finally {
+            content.getManagedScriptableTabId = originalResolve;
+            chromeFixture.scripting = originalScripting;
+        }
+    });
+
+    test('CE-NEW02 same-owner reconnection waits for old Fetch disposal', async () => {
+        const events = new BrowserEventHandler({ addEventConsumer: () => {}, ensureAttached: async () => {} });
+        const execute = () =>
+            events.execute(
+                { tabId: page.id, action: 'route', command: { op: 'add', urlPattern: '*' } },
+                context('owner-reconnect')
+            );
+        await execute();
+        const old = events.controller(page.id, context('owner-reconnect'));
+        const original = chromeFixture.debugger.sendCommand;
+        let finishDisable;
+        chromeFixture.debugger.sendCommand = async (...args) => {
+            if (args[1] === 'Fetch.disable') {
+                return new Promise((resolve) => {
+                    finishDisable = resolve;
+                });
+            }
+            return original(...args);
+        };
+        try {
+            const cleanup = events.releaseOwner('owner-reconnect');
+            await flush();
+            assert.equal(typeof finishDisable, 'function');
+            let installed = false;
+            const reconnect = execute().then(() => {
+                installed = true;
+            });
+            await flush();
+            assert.equal(installed, false);
+            finishDisable({});
+            await Promise.all([cleanup, reconnect]);
+            assert.notEqual(events.controller(page.id, context('owner-reconnect')), old);
+        } finally {
+            chromeFixture.debugger.sendCommand = original;
+            await events.releaseOwner('owner-reconnect');
+        }
+    });
+
+    test('M16-C01 failed owner disposal can retry before same-owner actions resume', async () => {
+        const events = new BrowserEventHandler({ addEventConsumer: () => {}, ensureAttached: async () => {} });
+        const owner = 'owner-retry';
+        const execute = () =>
+            events.execute(
+                { tabId: page.id, action: 'route', command: { op: 'add', urlPattern: '*' } },
+                context(owner)
+            );
+        await execute();
+        const old = events.controller(page.id, context(owner));
+        const original = chromeFixture.debugger.sendCommand;
+        let disables = 0;
+        chromeFixture.debugger.sendCommand = async (...args) => {
+            if (args[1] === 'Fetch.disable' && ++disables <= 2) {
+                throw new Error('owned transient disable failure');
+            }
+            return original(...args);
+        };
+        try {
+            await assert.rejects(events.releaseOwner(owner), /owned transient disable failure/);
+            await assert.rejects(execute(), /owned transient disable failure/);
+            assert.equal(disables, 2);
+            await execute();
+            assert.equal(disables, 3);
+            assert.notEqual(events.controller(page.id, context(owner)), old);
+        } finally {
+            chromeFixture.debugger.sendCommand = original;
+            await events.releaseOwner(owner);
+        }
+    });
+
+    test('M16-C01 detached tab cleanup releases a previously failed owner barrier', async () => {
+        const events = new BrowserEventHandler({ addEventConsumer: () => {}, ensureAttached: async () => {} });
+        const owner = 'owner-detach-retry';
+        await events.execute(
+            { tabId: page.id, action: 'route', command: { op: 'add', urlPattern: '*' } },
+            context(owner)
+        );
+        const original = chromeFixture.debugger.sendCommand;
+        chromeFixture.debugger.sendCommand = async (...args) => {
+            if (args[1] === 'Fetch.disable') {
+                throw new Error('owned detach disable failure');
+            }
+            return original(...args);
+        };
+        try {
+            await assert.rejects(events.releaseOwner(owner), /owned detach disable failure/);
+        } finally {
+            chromeFixture.debugger.sendCommand = original;
+        }
+        await events.cleanupTab(page.id);
+        await events.waitForOwner(context(owner));
+        await events.execute(
+            { tabId: page.id, action: 'route', command: { op: 'add', urlPattern: '*' } },
+            context(owner)
+        );
+        await events.releaseOwner(owner);
+    });
+
+    test('E01 window creation and page release share global and member locks', async () => {
+        const original = handler.actions.get('window_create');
+        let finishCreate;
+        handler.actions.set('window_create', async () => {
+            await new Promise((resolve) => {
+                finishCreate = resolve;
+            });
+            await markManagedTab(page.id, 'adopted');
+            return { success: true };
+        });
+        try {
+            const creation = handler.execute('window_create', { tabId: page.id }, context('owner-a'));
+            await flush();
+            let released = false;
+            const release = handler.execute('tabs_release', { tabId: page.id }, context('owner-b')).then(() => {
+                released = true;
+            });
+            await flush();
+            assert.equal(released, false);
+            finishCreate();
+            await Promise.all([creation, release]);
+            await assert.rejects(action('owner-a', 'route', { op: 'add', urlPattern: '*' }), /受控|managed/);
+        } finally {
+            handler.actions.set('window_create', original);
+            await markManagedTab(page.id);
+        }
     });
 });

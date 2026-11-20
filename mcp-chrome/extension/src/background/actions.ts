@@ -4,18 +4,20 @@
  * 处理来自 MCP Server 的所有操作请求
  */
 
-import { ExpectedOperationError } from '../types/expected-errors'
 import type { TabInfo } from '../types'
-import { assertActionActive, assertManagedTab, getTargetTabId, type ActionContext } from './action-utils'
+import { ExpectedOperationError } from '../types/expected-errors'
+import { TabsReadAccessSchema } from '../types/schemas'
+import { type ActionContext, assertActionActive, assertManagedTab, getTargetTabId } from './action-utils'
+import { BrowserEventHandler } from './browser-event-handler'
 import { ContentHandler } from './content-handler'
 import { CookieHandler } from './cookie-handler'
 import { DebuggerHandler } from './debugger-handler'
 import { DebuggerManager } from './debugger-manager'
-import { BrowserEventHandler } from './browser-event-handler'
 import { FrameResolver } from './frame-resolver'
 import { InputEventHandler } from './input-event-handler'
 import { LogEventHandler } from './log-event-handler'
 import { LogManager } from './log-manager'
+import { NavigationHandler, remainingNavigationTimeout } from './navigation-handler'
 import {
     advancePageRevision,
     assertPageCondition,
@@ -24,12 +26,10 @@ import {
     pageRevision,
     pageSnapshot,
 } from './page-revision'
-import { NavigationHandler, remainingNavigationTimeout } from './navigation-handler'
+import { hasReadGrant, setReadGrant } from './read-grants'
 import { StealthHandler } from './stealth-handler'
 import { TabHandler } from './tab-handler'
-import { hasReadGrant, setReadGrant } from './read-grants'
 import { getManagedTabMetadata, isManagedTab, refreshManagedTabRelations } from './tab-state'
-import { TabsReadAccessSchema } from '../types/schemas'
 
 type ActionFunction = (params: unknown, context: ActionContext) => Promise<unknown>
 
@@ -82,6 +82,7 @@ const MANAGED_PAGE_ONLY = new Set([
     'screenshot',
     'evaluate',
     'evaluate_in_frame',
+    'prepare_frame_evaluation',
     'challenge_inspect',
     'viewport_metrics',
     'debugger_attach',
@@ -131,23 +132,34 @@ const PAGE_READS = new Set([
 export class ActionHandler {
     private actions: Map<string, ActionFunction> = new Map()
     private actionLocks = new Map<number, Promise<void>>()
-    private logManager = new LogManager()
-    private debuggerManager = new DebuggerManager(this.logManager)
-    private browserEventHandler = new BrowserEventHandler(this.debuggerManager)
-    private navigationHandler = new NavigationHandler(this.logManager, (tabId) =>
-        this.logEventHandler.enableNetworkObservation(tabId)
-    )
-
-    private frameResolver = new FrameResolver(this.debuggerManager)
-    private tabHandler = new TabHandler(this.navigationHandler)
-    private contentHandler = new ContentHandler(this.debuggerManager)
-    private cookieHandler = new CookieHandler()
-    private debuggerHandler = new DebuggerHandler(this.debuggerManager, this.logManager)
-    private inputEventHandler = new InputEventHandler(this.debuggerManager)
-    private logEventHandler = new LogEventHandler(this.logManager, this.debuggerManager)
-    private stealthHandler = new StealthHandler()
+    private readonly logManager: LogManager
+    private readonly debuggerManager: DebuggerManager
+    private readonly browserEventHandler: BrowserEventHandler
+    private readonly navigationHandler: NavigationHandler
+    private readonly frameResolver: FrameResolver
+    private readonly tabHandler: TabHandler
+    private readonly contentHandler: ContentHandler
+    private readonly cookieHandler: CookieHandler
+    private readonly debuggerHandler: DebuggerHandler
+    private readonly inputEventHandler: InputEventHandler
+    private readonly logEventHandler: LogEventHandler
+    private readonly stealthHandler: StealthHandler
 
     constructor() {
+        this.logManager = new LogManager()
+        this.debuggerManager = new DebuggerManager(this.logManager)
+        this.browserEventHandler = new BrowserEventHandler(this.debuggerManager)
+        this.frameResolver = new FrameResolver(this.debuggerManager)
+        this.contentHandler = new ContentHandler(this.debuggerManager)
+        this.cookieHandler = new CookieHandler()
+        this.debuggerHandler = new DebuggerHandler(this.debuggerManager, this.logManager)
+        this.inputEventHandler = new InputEventHandler(this.debuggerManager)
+        this.logEventHandler = new LogEventHandler(this.logManager, this.debuggerManager)
+        this.navigationHandler = new NavigationHandler(this.logManager, (tabId) =>
+            this.logEventHandler.enableNetworkObservation(tabId)
+        )
+        this.tabHandler = new TabHandler(this.navigationHandler)
+        this.stealthHandler = new StealthHandler()
         this.debuggerHandler.browserEvents = this.browserEventHandler
         this.registerActions()
         this.debuggerManager.setupListeners()
@@ -160,6 +172,7 @@ export class ActionHandler {
         }
         context = { ...context, deadline: deadline as number | undefined }
         assertActionActive(context)
+        await this.browserEventHandler.waitForOwner(context)
         const handler = this.actions.get(action)
         if (action === 'browser_events_raw') {
             const p = params as { tabId?: number; method?: string; params?: Record<string, unknown> }
@@ -200,8 +213,17 @@ export class ActionHandler {
                 JSON.stringify({ error: { code: 'UNKNOWN_ACTION', message: `Unknown action: ${action}` } })
             )
         }
-        if (action === 'tabs_create') {
-            return this.withActionLocks([-1], () => handler(params, context), context)
+        if (action === 'tabs_create' || action === 'window_create') {
+            const tabId = (params as { tabId?: number } | null)?.tabId
+            return this.withActionLocks(
+                [-1, ...(action === 'window_create' && Number.isSafeInteger(tabId) ? [tabId!] : [])],
+                () => handler(params, context),
+                context
+            )
+        }
+        if (action === 'tabgroup_update') {
+            // 展示属性不改变页面归属，展开必须能唤醒正在等待页面任务的分组
+            return handler(params, context)
         }
         if (action.startsWith('tabgroup_')) {
             const snapshot = await this.tabHandler.getGroupLockSnapshot(action, params, context)
@@ -212,11 +234,9 @@ export class ActionHandler {
                     const current = await this.tabHandler.getGroupLockSnapshot(action, params, context)
                     const request = params as { tabId?: number; tabIds?: number[] }
                     const targets = (tabs: chrome.tabs.Tab[]) =>
-                        action === 'tabgroup_update'
-                            ? []
-                            : action === 'tabgroup_move'
-                              ? tabs
-                              : tabs.filter((tab) => (request.tabIds ?? [request.tabId]).includes(tab.id))
+                        action === 'tabgroup_move'
+                            ? tabs
+                            : tabs.filter((tab) => (request.tabIds ?? [request.tabId]).includes(tab.id))
                     const identity = (tabs: chrome.tabs.Tab[]) =>
                         targets(tabs).map((tab) => [tab.id, tab.groupId, tab.windowId])
                     if (JSON.stringify(identity(snapshot)) !== JSON.stringify(identity(current))) {
@@ -259,9 +279,9 @@ export class ActionHandler {
                         }
                     }
                     await assertPageCondition(tabId, request?.expectedUrl, request?.expectedRevision)
-                    if (MANAGED_PAGE_ONLY.has(action)) {
-                        await assertManagedTab(tabId, context, action)
-                    }
+                    const managedTab = MANAGED_PAGE_ONLY.has(action)
+                        ? await assertManagedTab(tabId, context, action)
+                        : undefined
                     if (request?.deadline !== undefined) {
                         remainingNavigationTimeout(request.deadline)
                     }
@@ -298,6 +318,22 @@ export class ActionHandler {
                             )
                         }
                     }
+                    if (
+                        !action.startsWith('tabs_') &&
+                        (mutating ||
+                            PAGE_READS.has(action) ||
+                            [
+                                'challenge_inspect',
+                                'viewport_metrics',
+                                'check_actionability',
+                                'screenshot',
+                                'keyboard_focus',
+                                'prepare_frame_evaluation',
+                            ].includes(action))
+                    ) {
+                        await this.tabHandler.prepareWorkGroup(tabId, context, managedTab)
+                    }
+                    assertActionActive(context)
                     let result: unknown
                     let actionExecuted = true
                     try {
@@ -576,6 +612,7 @@ export class ActionHandler {
         // iframe 穿透
         this.actions.set('resolve_frame', this.frameResolver.resolveFrame.bind(this.frameResolver))
         this.actions.set('get_all_frames', this.frameResolver.getAllFrames.bind(this.frameResolver))
+        this.actions.set('prepare_frame_evaluation', this.frameResolver.prepareFrameEvaluation.bind(this.frameResolver))
         this.actions.set('evaluate_in_frame', this.frameResolver.evaluateInFrame.bind(this.frameResolver))
     }
 }

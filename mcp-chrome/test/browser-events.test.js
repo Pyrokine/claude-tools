@@ -5,11 +5,19 @@ import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 const root = process.env.MCP_EVENT_DIST ?? path.resolve(import.meta.dirname, '../dist');
+// noinspection ES6TopLevelAwaitExpression -- Node ESM 等待所选候选模块加载后注册测试
 const { BrowserEventController } = await import(pathToFileURL(path.join(root, 'core/browser-events.js')));
+// noinspection ES6TopLevelAwaitExpression -- 与 MCP_EVENT_DIST 指定的同一候选保持一致
 const { browserEventCommandSchema } = await import(pathToFileURL(path.join(root, 'core/browser-event-schema.js')));
+// noinspection ES6TopLevelAwaitExpression -- 与 MCP_EVENT_DIST 指定的同一候选保持一致
 const { CDPClient } = await import(pathToFileURL(path.join(root, 'cdp/client.js')));
+// noinspection ES6TopLevelAwaitExpression -- 与 MCP_EVENT_DIST 指定的同一候选保持一致
 const { CDPError, getErrorSource, setErrorSource } = await import(pathToFileURL(path.join(root, 'core/errors.js')));
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+/**
+ * @param {(method: string, params?: object, sessionId?: string) => Promise<object>} [send]
+ * @param {object} [identity]
+ */
 function fixture(send = async () => ({}), identity = {}) {
     const calls = [];
     const controller = new BrowserEventController(
@@ -217,6 +225,120 @@ for (const state of ['expired', 'cancelled', 'active']) {
     });
 }
 
+test('HOST-NAV-01 observer disposal retains in-flight native success and failure', async (t) => {
+    for (const reason of ['debugger detached or page released', 'page closed', 'server disconnected']) {
+        for (const outcome of ['completed', 'failed']) {
+            await t.test(`${reason}: ${outcome}`, async () => {
+                const { controller } = fixture();
+                let finish;
+                let fail;
+                const failure = new Error('original native operation failed');
+                const native = new Promise((resolve, reject) => {
+                    finish = resolve;
+                    fail = reject;
+                });
+                const operation = controller.race(native);
+                let settled = false;
+                void operation.then(
+                    () => {
+                        settled = true;
+                    },
+                    () => {
+                        settled = true;
+                    }
+                );
+                try {
+                    await controller.dispose(reason);
+                    await flush();
+                    assert.equal(settled, false, 'Observer teardown must wait for the native operation outcome');
+                    if (outcome === 'completed') {
+                        finish({ native: 'completed' });
+                        assert.deepEqual(await operation, { native: 'completed' });
+                    } else {
+                        fail(failure);
+                        await assert.rejects(operation, (error) => error === failure);
+                    }
+                    assert.equal(controller.dialogWaiters.size, 0);
+                    await assert.rejects(read(controller, 'dialog'), /closed/);
+                } finally {
+                    finish({ native: 'cleanup' });
+                    await operation.catch(() => {});
+                }
+            });
+        }
+    }
+});
+
+test('HOST-NAV-01 disposed observers retain native deadlines, cancellation and transport errors', async (t) => {
+    for (const ending of ['budget', 'cancelled', 'transport']) {
+        await t.test(ending, async () => {
+            const abort = new AbortController();
+            const scope = { deadline: Date.now() + 80, signal: abort.signal };
+            const client = new CDPClient(() => scope);
+            let dispatches = 0;
+            client.ws = {
+                readyState: 1,
+                send() {
+                    ++dispatches;
+                },
+                close() {},
+            };
+            const { controller } = fixture();
+            const operation = controller.race(
+                client.send('Page.navigate', { url: 'chrome://extensions/' }, 'session', 80)
+            );
+            const rejected = assert.rejects(operation, (error) => {
+                assert.ok(error instanceof CDPError);
+                assert.equal(getErrorSource(error), ending);
+                assert.equal(error.context.actionExecuted, 'unknown');
+                assert.equal(error.context.actionStatus, 'unknown');
+                assert.equal(error.context.retryable, false);
+                return true;
+            });
+            try {
+                await controller.dispose('debugger detached or page released');
+                if (ending === 'cancelled') {
+                    abort.abort();
+                }
+                if (ending === 'transport') {
+                    client.close();
+                }
+                await rejected;
+                assert.equal(dispatches, 1);
+                assert.equal(client.callbacks.size, 0);
+            } finally {
+                client.close();
+            }
+        });
+    }
+});
+
+test('HOST-NAV-01 observer disposal preserves native refusal before dispatch', async () => {
+    const abort = new AbortController();
+    abort.abort();
+    const client = new CDPClient(() => ({ signal: abort.signal }));
+    let dispatches = 0;
+    client.ws = {
+        readyState: 1,
+        send() {
+            ++dispatches;
+        },
+        close() {},
+    };
+    const { controller } = fixture();
+    const operation = controller.race(client.send('Page.navigate', { url: 'chrome://extensions/' }, 'session', 80));
+    const rejected = assert.rejects(operation, (error) => {
+        assert.equal(getErrorSource(error), 'cancelled');
+        assert.equal(error.context.actionExecuted, false);
+        assert.equal(error.context.actionStatus, 'not_started');
+        return true;
+    });
+    await controller.dispose('debugger detached or page released');
+    await rejected;
+    assert.equal(dispatches, 0);
+    client.close();
+});
+
 test('dialog observations interrupt blocked native operations and remain independently handleable', async () => {
     const { controller, calls } = fixture();
     const pending = controller.race(new Promise(() => {}));
@@ -323,17 +445,26 @@ test('raw handshake headers redact credentials, folded values and request URL fi
             requestId: 'headers',
             response: {
                 requestHeadersText:
-                    'GET ws://user:pass@example.com/ws?token=query-secret HTTP/1.1\r\nCookie: cookie-secret\r\nAuthorization: auth-secret\r\n folded-secret\r\nProxy-Authorization: proxy-secret\r\nX-Trace: kept\r\n',
+                    'GET ws://user:pass@example.com/ws?token=query-secret HTTP/1.1\r\n' +
+                    'Cookie: cookie-secret\r\nAuthorization: auth-secret\r\n folded-secret\r\n' +
+                    'Proxy-Authorization: proxy-secret\r\nX-Trace: kept\r\n',
                 headers: {
                     Location:
+                        // noinspection HttpUrlsUsage -- 合成 HTTP Location 验证凭证脱敏，保留原协议
                         'http://location-user:location-password@example.com/owned?token=location-token&plain=kept',
                     'Content-Location': '/relative?password=relative-password&plain=kept',
                     Referer: 'https://referer-user:referer-password@example.com/source',
                     'X-Trace': 'kept',
                 },
                 headerList: [{ name: 'Location', value: 'https://list-user:list-password@example.com/' }],
+                // noinspection HttpUrlsUsage -- 合成原始 HTTP header 验证凭证脱敏，保留原协议
                 headersText:
-                    'HTTP/1.1 101 Switching Protocols\r\nSet-Cookie: response-secret\r\nLocation: http://location-user:location-password@example.com/owned?token=location-token&plain=kept\r\nContent-Location: /relative?password=relative-password&plain=kept\r\nReferer: https://referer-user:referer-password@example.com/source\r\nX-Trace: kept\r\n',
+                    'HTTP/1.1 101 Switching Protocols\r\nSet-Cookie: response-secret\r\n' +
+                    // noinspection HttpUrlsUsage -- 合成原始 HTTP header 验证凭证脱敏
+                    'Location: http://location-user:location-password@example.com/owned?' +
+                    'token=location-token&plain=kept\r\n' +
+                    'Content-Location: /relative?password=relative-password&plain=kept\r\n' +
+                    'Referer: https://referer-user:referer-password@example.com/source\r\nX-Trace: kept\r\n',
             },
         },
         'session'
@@ -386,6 +517,556 @@ test('managed auth remains observed with route, download and raw Fetch configura
     assert.ok(!config().patterns.some((p) => p.urlPattern === '*'));
     assert.ok(config().patterns.some((p) => p.urlPattern === 'https://example.com/mock'));
     await controller.dispose('test completed');
+});
+
+test('raw Fetch configuration refusals preserve the last effective configuration', async (t) => {
+    for (const method of ['Fetch.enable', 'Fetch.disable']) {
+        for (const previous of ['disabled', 'raw', 'managed']) {
+            for (const backend of ['cdp', 'extension']) {
+                await t.test(`${method}/${previous}/${backend}`, async (st) => {
+                    let reject = false;
+                    const failure =
+                        backend === 'cdp'
+                            ? new CDPError(`${method}: Invalid parameters`, {
+                                  method,
+                                  nativeCode: -32602,
+                                  actionExecuted: false,
+                                  actionStatus: 'not_started',
+                              })
+                            : Error(JSON.stringify({ code: -32602, message: 'Invalid parameters' }));
+                    const { controller, calls } = fixture(
+                        async (name) => {
+                            if (reject && name === method) {
+                                throw failure;
+                            }
+                            return { nativeResult: name };
+                        },
+                        { backend }
+                    );
+                    st.after(() => controller.dispose('test finished'));
+                    let rawRule;
+                    if (previous !== 'disabled') {
+                        await controller.rawFetch('Fetch.enable', {
+                            patterns: [{ urlPattern: 'https://example.com/raw-before' }],
+                            handleAuthRequests: true,
+                        });
+                        paused(controller, 'before', { request: { url: 'https://example.com/raw-before' } });
+                        rawRule = (await read(controller, 'network', 'paused')).logs[0].ruleRef;
+                        await controller.rawFetch('Fetch.continueRequest', { requestId: 'before' });
+                    }
+                    if (previous === 'managed') {
+                        await controller.command('route', { op: 'add', urlPattern: 'https://example.com/managed' });
+                        await controller.command('download', { op: 'watch', urlPattern: 'https://example.com/file' });
+                        await controller.command('httpAuth', {
+                            op: 'set',
+                            scope: { source: 'Server', origin: 'https://example.com' },
+                            username: 'synthetic',
+                            password: 'synthetic',
+                        });
+                    }
+                    const before = await read(controller, 'network');
+                    reject = true;
+                    await assert.rejects(
+                        controller.rawFetch(method, { patterns: [], handleAuthRequests: true }),
+                        (error) => error === failure
+                    );
+                    reject = false;
+                    const after = await read(controller, 'network');
+                    for (const field of ['fetchEnabled', 'routes', 'authConfigured', 'downloadWatching']) {
+                        assert.equal(after[field], before[field], field);
+                    }
+                    if (previous !== 'disabled') {
+                        paused(controller, 'after', { request: { url: 'https://example.com/raw-before' } });
+                        const entry = (await read(controller, 'network', 'paused')).logs.find(
+                            (p) => p.requestId === 'after'
+                        );
+                        assert.equal(entry?.ruleRef, rawRule);
+                        await controller.rawFetch('Fetch.continueRequest', { requestId: 'after' });
+                    }
+                    const recovery = await controller.command('httpAuth', { op: 'clear' });
+                    assert.equal(recovery.fetchEnabled, previous !== 'disabled');
+                    assert.equal(recovery.authConfigured, false);
+                    if (previous === 'disabled') {
+                        assert.equal(
+                            calls.filter((call) => call[0] === 'Fetch.enable').length,
+                            method === 'Fetch.enable' ? 1 : 0
+                        );
+                    } else {
+                        const config = calls.filter((call) => call[0] === 'Fetch.enable').at(-1)[1];
+                        assert.equal(config.handleAuthRequests, true);
+                        assert.ok(config.patterns.some((p) => p.urlPattern === 'https://example.com/raw-before'));
+                        if (previous === 'managed') {
+                            assert.ok(config.patterns.some((p) => p.urlPattern === 'https://example.com/managed'));
+                            assert.ok(config.patterns.some((p) => p.urlPattern === 'https://example.com/file'));
+                        }
+                    }
+                });
+            }
+        }
+    }
+});
+
+test('raw Fetch local route-limit rejection preserves existing raw routes', async (t) => {
+    const { controller, calls } = fixture();
+    t.after(() => controller.dispose('test finished'));
+    const patterns = Array.from({ length: 100 }, (_, index) => ({ urlPattern: `https://example.com/raw-${index}` }));
+    await controller.rawFetch('Fetch.enable', { patterns, handleAuthRequests: true });
+    await assert.rejects(controller.rawFetch('Fetch.enable', { patterns: [...patterns, {}] }), /Route limit/);
+    assert.equal(calls.length, 1);
+    assert.equal((await read(controller, 'network')).routes, 100);
+    await controller.command('httpAuth', { op: 'clear' });
+    assert.deepEqual(
+        calls.at(-1)[1].patterns.map((p) => p.urlPattern),
+        patterns.map((p) => p.urlPattern)
+    );
+    assert.equal(calls.at(-1)[1].handleAuthRequests, true);
+});
+
+test('raw Fetch configuration retains dispatched unknown outcomes and original errors', async (t) => {
+    for (const source of ['protocol', 'budget', 'cancelled', 'transport', 'page']) {
+        for (const method of ['Fetch.enable', 'Fetch.disable']) {
+            await t.test(`${source}/${method}`, async (st) => {
+                const failure =
+                    source === 'page'
+                        ? setErrorSource(Error(JSON.stringify({ code: -32602, message: 'Invalid parameters' })), 'page')
+                        : new CDPError('original native outcome unknown', {
+                              method,
+                              errorSource: source,
+                              actionExecuted: 'unknown',
+                              actionStatus: 'unknown',
+                          });
+                let reject = false;
+                const { controller } = fixture(async (name) => {
+                    if (reject && name === method) {
+                        throw failure;
+                    }
+                    return {};
+                });
+                st.after(() => controller.dispose('test finished'));
+                if (method === 'Fetch.disable') {
+                    await controller.rawFetch('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+                }
+                reject = true;
+                await assert.rejects(
+                    controller.rawFetch(method, {
+                        patterns: [{ urlPattern: 'https://example.com/unknown' }],
+                        handleAuthRequests: true,
+                    }),
+                    (error) => error === failure
+                );
+                reject = false;
+                const state = await read(controller, 'network');
+                assert.equal(state.fetchEnabled, method === 'Fetch.enable');
+                assert.equal(state.routes, method === 'Fetch.enable' ? 1 : 0);
+                assert.equal(getErrorSource(failure), source);
+            });
+        }
+    }
+});
+
+test('raw Fetch consumers observe native pauses and auth before enable acknowledgement', async (t) => {
+    for (const outcome of ['success', 'unknown']) {
+        await t.test(outcome, async (st) => {
+            let finish;
+            let fail;
+            const native = new Promise((resolve, reject) => {
+                finish = resolve;
+                fail = reject;
+            });
+            const { controller, calls } = fixture((method) =>
+                method === 'Fetch.enable' ? native : Promise.resolve({})
+            );
+            st.after(() => controller.dispose('test finished'));
+            const operation = controller.rawFetch('Fetch.enable', { handleAuthRequests: true });
+            const failure = new CDPError('enable acknowledgement lost', {
+                actionExecuted: 'unknown',
+                actionStatus: 'unknown',
+            });
+            const result = outcome === 'unknown' ? assert.rejects(operation, (error) => error === failure) : operation;
+            await flush();
+            paused(controller, 'early-pause');
+            controller.handle(
+                'Fetch.authRequired',
+                {
+                    requestId: 'early-auth',
+                    request: { url: 'https://example.com/auth' },
+                    authChallenge: { source: 'Server', origin: 'https://example.com', realm: 'owned' },
+                },
+                'session'
+            );
+            assert.equal((await read(controller, 'network', 'paused')).logs[0].state, 'pending');
+            assert.equal((await read(controller, 'network', 'auth')).logs[0].state, 'pending');
+            assert.equal(calls.length, 1);
+            if (outcome === 'success') {
+                finish({ nativeResult: 'enabled' });
+                assert.deepEqual(await result, { nativeResult: 'enabled' });
+            } else {
+                fail(failure);
+                await result;
+            }
+            assert.equal((await read(controller, 'network')).routes, 1);
+            assert.equal((await controller.suspend('test finished')).suspended, true);
+            assert.equal(calls.filter((call) => call[0] === 'Fetch.failRequest').length, 1);
+            assert.equal(calls.filter((call) => call[0] === 'Fetch.continueWithAuth').length, 1);
+        });
+    }
+});
+
+test('raw Fetch replacement keeps prior consumers until the native acknowledgement', async (t) => {
+    for (const outcome of ['success', 'refused', 'unknown']) {
+        await t.test(outcome, async (st) => {
+            let finish;
+            let fail;
+            let replacement = false;
+            const native = new Promise((resolve, reject) => {
+                finish = resolve;
+                fail = reject;
+            });
+            const { controller, calls } = fixture((method) =>
+                method === 'Fetch.enable' && replacement ? native : Promise.resolve({})
+            );
+            st.after(() => controller.dispose('test finished'));
+            await controller.rawFetch('Fetch.enable', {
+                patterns: [{ urlPattern: 'https://example.com/old' }],
+                handleAuthRequests: true,
+            });
+            replacement = true;
+            const pending = controller.rawFetch('Fetch.enable', {
+                patterns: [{ urlPattern: 'https://example.com/new' }],
+            });
+            const failure = new CDPError('Fetch.enable: original native failure', {
+                nativeCode: outcome === 'refused' ? -32602 : -32000,
+                actionExecuted: outcome === 'refused' ? false : 'unknown',
+                actionStatus: outcome === 'refused' ? 'not_started' : 'unknown',
+            });
+            const result = outcome === 'success' ? pending : assert.rejects(pending, (error) => error === failure);
+            await flush();
+            for (const name of ['old', 'new']) {
+                paused(controller, name, { request: { url: `https://example.com/${name}` } });
+            }
+            controller.handle(
+                'Fetch.authRequired',
+                {
+                    requestId: 'old-auth',
+                    request: { url: 'https://example.com/auth' },
+                    authChallenge: { source: 'Server', origin: 'https://example.com', realm: 'owned' },
+                },
+                'session'
+            );
+            await flush();
+            assert.equal(
+                (await read(controller, 'network', 'paused')).logs.filter((p) => p.state === 'pending').length,
+                2
+            );
+            assert.equal((await read(controller, 'network', 'auth')).logs[0].state, 'pending');
+            assert.deepEqual(calls[1][1], {
+                patterns: [{ urlPattern: 'https://example.com/new', requestStage: 'Request' }],
+                handleAuthRequests: false,
+            });
+            if (outcome === 'success') {
+                finish({});
+            } else {
+                fail(failure);
+            }
+            await result;
+            assert.equal((await read(controller, 'network')).routes, 1);
+            for (const name of ['old', 'new']) {
+                await controller.rawFetch('Fetch.continueRequest', { requestId: name });
+            }
+            await controller.rawFetch('Fetch.continueWithAuth', {
+                requestId: 'old-auth',
+                authChallengeResponse: { response: 'CancelAuth' },
+            });
+            replacement = false;
+            await controller.command('httpAuth', { op: 'clear' });
+            const restored = calls.filter((call) => call[0] === 'Fetch.enable').at(-1)[1];
+            assert.equal(
+                restored.patterns[0].urlPattern,
+                `https://example.com/${outcome === 'refused' ? 'old' : 'new'}`
+            );
+            assert.equal(restored.handleAuthRequests, outcome === 'refused');
+        });
+    }
+});
+
+test('raw and managed Fetch configurations serialize in their own request scopes', async (t) => {
+    const storage = new AsyncLocalStorage();
+    const scopes = [];
+    let rejectFirst;
+    const failure = new CDPError('Fetch.enable: Invalid parameters', {
+        method: 'Fetch.enable',
+        nativeCode: -32602,
+        actionExecuted: false,
+    });
+    const { controller, calls } = fixture(async (method) => {
+        if (method === 'Fetch.enable') {
+            scopes.push(storage.getStore());
+            if (scopes.length === 1) {
+                return new Promise((_resolve, reject) => {
+                    rejectFirst = reject;
+                });
+            }
+        }
+        return { nativeResult: storage.getStore() };
+    });
+    t.after(() => controller.dispose('test finished'));
+    const first = storage.run('first', () =>
+        controller.rawFetch('Fetch.enable', {
+            patterns: [{ urlPattern: 'https://example.com/rejected' }],
+            handleAuthRequests: true,
+        })
+    );
+    const rejected = assert.rejects(first, (error) => error === failure);
+    await flush();
+    const managed = storage.run('managed', () =>
+        controller.command('route', { op: 'add', urlPattern: 'https://example.com/managed' })
+    );
+    const auth = storage.run('auth', () =>
+        controller.command('httpAuth', {
+            op: 'set',
+            scope: { source: 'Server', origin: 'https://example.com' },
+            username: 'synthetic',
+            password: 'synthetic',
+        })
+    );
+    const download = storage.run('download', () =>
+        controller.command('download', { op: 'watch', urlPattern: 'https://example.com/file' })
+    );
+    const second = storage.run('second', () =>
+        controller.rawFetch('Fetch.enable', { patterns: [{ urlPattern: 'https://example.com/accepted' }] })
+    );
+    await flush();
+    assert.equal(calls.filter((call) => call[0] === 'Fetch.enable').length, 1);
+    rejectFirst(failure);
+    await rejected;
+    assert.equal((await managed).routes, 1);
+    assert.deepEqual(await second, { nativeResult: 'second' });
+    assert.equal((await auth).authConfigured, true);
+    assert.equal((await download).downloadWatching, true);
+    assert.deepEqual(scopes, ['first', 'managed', 'auth', 'download', 'second']);
+    const config = calls.filter((call) => call[0] === 'Fetch.enable').at(-1)[1];
+    assert.deepEqual(config.patterns, [
+        { urlPattern: 'https://example.com/managed', requestStage: 'Request' },
+        { urlPattern: 'https://example.com/accepted', requestStage: 'Request' },
+        { urlPattern: 'https://example.com/file', requestStage: 'Response' },
+        { urlPattern: '*', requestStage: 'Request' },
+    ]);
+    assert.equal(config.handleAuthRequests, true);
+    assert.equal((await read(controller, 'network')).routes, 2);
+});
+
+test('Fetch suspension and disposal finish after in-flight configuration without restoring stopped state', async (t) => {
+    for (const operation of ['suspend', 'dispose']) {
+        for (const outcome of ['success', 'refused', 'unknown']) {
+            await t.test(`${operation}/${outcome}`, async () => {
+                let finish;
+                let fail;
+                const native = new Promise((resolve, reject) => {
+                    finish = resolve;
+                    fail = reject;
+                });
+                const failure = new CDPError('Fetch.enable: original native failure', {
+                    method: 'Fetch.enable',
+                    nativeCode: outcome === 'refused' ? -32602 : -32000,
+                    actionExecuted: outcome === 'refused' ? false : 'unknown',
+                    actionStatus: outcome === 'refused' ? 'not_started' : 'unknown',
+                });
+                const { controller, calls } = fixture((method) =>
+                    method === 'Fetch.enable' ? native : Promise.resolve({})
+                );
+                const pending = controller.rawFetch('Fetch.enable', { handleAuthRequests: true });
+                const result = outcome === 'success' ? pending : assert.rejects(pending, (error) => error === failure);
+                await flush();
+                const stop = controller[operation]('test lifecycle');
+                let stopped = false;
+                void stop.then(() => {
+                    stopped = true;
+                });
+                await flush();
+                assert.equal(stopped, false);
+                assert.equal(
+                    calls.some((call) => call[0] === 'Fetch.disable'),
+                    false
+                );
+                if (outcome === 'success') {
+                    finish({});
+                } else {
+                    fail(failure);
+                }
+                await result;
+                const state = await stop;
+                assert.equal(state.suspended, true);
+                assert.equal(state.fetchEnabled, false);
+                assert.equal(state.routes, 0);
+                assert.equal(calls.filter((call) => call[0] === 'Fetch.disable').length, outcome === 'refused' ? 0 : 1);
+                if (operation === 'dispose') {
+                    await assert.rejects(controller.rawFetch('Fetch.enable'), /closed/);
+                } else {
+                    const restart = await controller.command('httpAuth', { op: 'clear' });
+                    assert.equal(restart.fetchEnabled, false);
+                    await controller.dispose('test finished');
+                }
+            });
+        }
+    }
+});
+
+test('raw Fetch distinguishes cancellation and transport failure before and after native dispatch', async (t) => {
+    for (const source of ['budget', 'cancelled', 'transport']) {
+        for (const dispatched of [false, true]) {
+            await t.test(`${source}/${dispatched ? 'after' : 'before'}`, async (st) => {
+                const abort = new AbortController();
+                const scope = {
+                    signal: abort.signal,
+                    ...(source === 'budget' ? { deadline: Date.now() + (dispatched ? 50 : -1) } : {}),
+                };
+                if (source === 'cancelled' && !dispatched) {
+                    abort.abort();
+                }
+                const client = new CDPClient(() => scope);
+                let dispatches = 0;
+                client.ws = {
+                    readyState: source === 'transport' && !dispatched ? 3 : 1,
+                    send() {
+                        ++dispatches;
+                    },
+                    close() {},
+                };
+                const { controller } = fixture((method, params, sessionId) =>
+                    method === 'Fetch.disable' ? Promise.resolve({}) : client.send(method, params, sessionId)
+                );
+                st.after(async () => {
+                    await controller.dispose('test finished');
+                    client.close();
+                });
+                const pending = controller.rawFetch('Fetch.enable', { handleAuthRequests: true });
+                const rejected = assert.rejects(pending, (error) => {
+                    assert.ok(error instanceof CDPError || getErrorSource(error) === 'budget');
+                    assert.equal(getErrorSource(error), source);
+                    assert.equal(error.context.actionExecuted, dispatched ? 'unknown' : false);
+                    assert.equal(error.context.actionStatus, dispatched ? 'unknown' : 'not_started');
+                    return true;
+                });
+                await flush();
+                if (dispatched && source === 'cancelled') {
+                    abort.abort();
+                }
+                if (dispatched && source === 'transport') {
+                    client.close();
+                }
+                await rejected;
+                assert.equal(dispatches, dispatched ? 1 : 0);
+                const state = await read(controller, 'network');
+                assert.equal(state.fetchEnabled, dispatched);
+                assert.equal(state.routes, dispatched ? 1 : 0);
+            });
+        }
+    }
+});
+
+test('queued managed Fetch configuration observes cancellation before changing state', async (t) => {
+    let finish;
+    const native = new Promise((resolve) => {
+        finish = resolve;
+    });
+    const { controller, calls } = fixture((method) => (method === 'Fetch.enable' ? native : Promise.resolve({})));
+    t.after(async () => {
+        finish({});
+        await controller.dispose('test finished');
+    });
+    const pending = controller.rawFetch('Fetch.enable');
+    await flush();
+    const abort = new AbortController();
+    const reason = Error('owned queued request cancelled');
+    const rejected = [
+        ['route', { op: 'add', urlPattern: '*' }],
+        [
+            'httpAuth',
+            {
+                op: 'set',
+                scope: { source: 'Server', origin: 'https://example.com' },
+                username: 'synthetic',
+                password: 'synthetic',
+            },
+        ],
+        ['download', { op: 'watch' }],
+    ].map(([action, command]) =>
+        assert.rejects(controller.command(action, command, abort.signal), (error) => error === reason)
+    );
+    abort.abort(reason);
+    finish({});
+    await pending;
+    await Promise.all(rejected);
+    const state = await read(controller, 'network');
+    assert.equal(state.routes, 1);
+    assert.equal(state.authConfigured, false);
+    assert.equal(state.downloadWatching, false);
+    assert.equal(calls.length, 1);
+});
+
+test('Fetch disposal rejects queued configuration and retains idempotent cleanup', async () => {
+    let finish;
+    const native = new Promise((resolve) => {
+        finish = resolve;
+    });
+    const { controller, calls } = fixture((method) => (method === 'Fetch.enable' ? native : Promise.resolve({})));
+    const pending = controller.rawFetch('Fetch.enable');
+    await flush();
+    const disposal = controller.dispose('test lifecycle');
+    const rejected = [
+        () => controller.command('route', { op: 'add', urlPattern: '*' }),
+        () =>
+            controller.command('httpAuth', {
+                op: 'set',
+                scope: { source: 'Server', origin: 'https://example.com' },
+                username: 'synthetic',
+                password: 'synthetic',
+            }),
+        () => controller.command('download', { op: 'watch' }),
+        () => controller.rawFetch('Fetch.enable'),
+    ].map((operation) => assert.rejects(operation(), /closed/));
+    finish({});
+    await pending;
+    assert.equal((await disposal).suspended, true);
+    await Promise.all(rejected);
+    assert.deepEqual(
+        calls.map((call) => call[0]),
+        ['Fetch.enable', 'Fetch.disable']
+    );
+    assert.equal((await controller.suspend('already disposed')).suspended, true);
+    assert.equal((await controller.dispose('already disposed')).suspended, true);
+});
+
+test('raw Fetch restores configuration when its request scope refuses the final dispatch', async (t) => {
+    for (const method of ['Fetch.enable', 'Fetch.disable']) {
+        await t.test(method, async (st) => {
+            const { controller, calls } = fixture();
+            st.after(() => controller.dispose('test finished'));
+            await controller.rawFetch('Fetch.enable', {
+                patterns: [{ urlPattern: 'https://example.com/prior' }],
+                handleAuthRequests: true,
+            });
+            let checks = 0;
+            const failure = Object.assign(Error('owned request expired before native dispatch'), {
+                actionExecuted: false,
+            });
+            await assert.rejects(
+                controller.rawFetch(method, { patterns: [] }, () => {
+                    if (++checks === 3) {
+                        throw failure;
+                    }
+                }),
+                (error) => error === failure
+            );
+            assert.equal(calls.length, 1);
+            const state = await read(controller, 'network');
+            assert.equal(state.routes, 1);
+            assert.equal(state.fetchEnabled, true);
+            await controller.command('httpAuth', { op: 'clear' });
+            assert.equal(calls.at(-1)[1].patterns[0].urlPattern, 'https://example.com/prior');
+            assert.equal(calls.at(-1)[1].handleAuthRequests, true);
+        });
+    }
 });
 
 test('native body reads preserve binary encoding and do not refetch URLs', async () => {
@@ -495,6 +1176,479 @@ test('raw Fetch uses the same owner and retains native command responses', async
     await controller.suspend('stop');
 });
 
+test('stream URL filters follow the recorded parent request without changing stream entries', async (t) => {
+    for (const backend of ['cdp', 'extension']) {
+        for (const method of [
+            'Network.eventSourceMessageReceived',
+            'Network.webSocketWillSendHandshakeRequest',
+            'Network.webSocketFrameSent',
+            'Network.webSocketFrameReceived',
+        ]) {
+            await t.test(`${backend} ${method}`, async (context) => {
+                const { controller, calls } = fixture(undefined, { backend });
+                context.after(() => controller.dispose('test finished'));
+                await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+                const sse = method === 'Network.eventSourceMessageReceived';
+                const endpoint = sse ? 'sse' : 'ws';
+                begin(controller, 'owned-stream', {
+                    request: {
+                        url: `${sse ? 'https' : 'wss'}://stream-user:stream-password@example.com/${endpoint}`,
+                        method: 'GET',
+                        headers: { Authorization: 'stream-auth-secret' },
+                    },
+                });
+                const parent = (await read(controller, 'network', 'details')).logs[0];
+                controller.handle(
+                    method,
+                    {
+                        requestId: 'owned-stream',
+                        ...(sse
+                            ? { data: 'mcp_test_event', eventName: 'message', eventId: '' }
+                            : { response: { opcode: 1, payloadData: 'mcp_test_event' } }),
+                    },
+                    'session'
+                );
+                const all = await read(controller, 'network', 'stream');
+                assert.equal(all.count, 1);
+                assert.equal(all.logs[0].requestRef, parent.ref);
+                const beforeReads = calls.length;
+                const options = { type: 'network', view: 'stream', urlPattern: `*/${endpoint}` };
+                const filtered = await controller.command('read', options);
+                assert.equal(filtered.count, 1);
+                assert.equal(filtered.totalBuffered, 1);
+                assert.deepEqual(filtered.logs, all.logs);
+                begin(controller, 'owned-stream', {
+                    request: { url: 'https://example.com/redirected', method: 'GET' },
+                    redirectResponse: { status: 302 },
+                });
+                assert.deepEqual((await controller.command('read', options)).logs, all.logs);
+                assert.equal((await controller.command('read', { ...options, urlPattern: '*/redirected' })).count, 0);
+                assert.deepEqual((await read(controller, 'network', 'stream')).logs, all.logs);
+                assert.equal((await controller.command('read', { ...options, ref: all.logs[0].ref })).count, 1);
+                assert.equal((await controller.command('read', { ...options, urlPattern: '*/other' })).count, 0);
+                const serialized = JSON.stringify(filtered);
+                for (const secret of ['stream-user', 'stream-password', 'stream-auth-secret']) {
+                    assert.equal(serialized.includes(secret), false);
+                }
+                assert.equal((await controller.command('read', { ...options, clear: true })).count, 1);
+                assert.equal((await read(controller, 'network', 'stream')).count, 0);
+                assert.equal((await read(controller, 'network', 'details', parent.ref)).count, 1);
+                await assert.rejects(read(controller, 'network', 'stream', all.logs[0].ref), /expired, evicted/);
+                assert.equal(calls.length, beforeReads);
+            });
+        }
+    }
+});
+
+test('stream URL filters preserve request session and hop ownership after parent invalidation', async (t) => {
+    for (const backend of ['cdp', 'extension']) {
+        for (const invalidation of ['clear', 'expiry']) {
+            await t.test(`${backend} ${invalidation}`, async (context) => {
+                const { controller } = fixture(undefined, { backend });
+                context.after(() => controller.dispose('test finished'));
+                await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+                for (const sessionId of ['frame-a', 'frame-b']) {
+                    controller.handle(
+                        'Network.requestWillBeSent',
+                        {
+                            requestId: 'same-request-id',
+                            request: { url: `https://example.com/${sessionId}/sse`, method: 'GET' },
+                        },
+                        sessionId
+                    );
+                    controller.handle(
+                        'Network.eventSourceMessageReceived',
+                        {
+                            requestId: 'same-request-id',
+                            data: sessionId,
+                        },
+                        sessionId
+                    );
+                }
+                const parents = (await read(controller, 'network', 'details')).logs;
+                const parentA = parents.find((entry) => entry.sessionId === 'frame-a');
+                const streams = (await read(controller, 'network', 'stream')).logs;
+                const oldStreamA = streams.find((entry) => entry.sessionId === 'frame-a');
+                if (invalidation === 'clear') {
+                    await read(controller, 'network', 'details', parentA.ref, true);
+                } else {
+                    controller.entries.get(parentA.ref).timestamp = Date.now() - 300001;
+                }
+                assert.deepEqual((await read(controller, 'network', 'stream')).logs, streams);
+                await assert.rejects(read(controller, 'network', 'details', parentA.ref), /expired, evicted/);
+                controller.handle(
+                    'Network.requestWillBeSent',
+                    {
+                        requestId: 'same-request-id',
+                        request: { url: 'https://example.com/reused/sse', method: 'GET' },
+                    },
+                    'frame-a'
+                );
+                controller.handle(
+                    'Network.eventSourceMessageReceived',
+                    {
+                        requestId: 'same-request-id',
+                        data: 'reused',
+                    },
+                    'frame-a'
+                );
+                const all = await read(controller, 'network', 'stream');
+                assert.equal(all.count, 3);
+                const options = { type: 'network', view: 'stream' };
+                assert.equal((await controller.command('read', { ...options, urlPattern: '*frame-a/sse' })).count, 0);
+                const sibling = await controller.command('read', { ...options, urlPattern: '*frame-b/sse' });
+                assert.equal(sibling.count, 1);
+                assert.equal(sibling.logs[0].sessionId, 'frame-b');
+                const reused = await controller.command('read', { ...options, urlPattern: '*reused/sse' });
+                assert.equal(reused.count, 1);
+                assert.equal(reused.logs[0].data, 'reused');
+                assert.notEqual(reused.logs[0].requestRef, oldStreamA.requestRef);
+                assert.equal((await controller.command('read', { ...options, urlPattern: '*' })).count, 2);
+                assert.equal((await read(controller, 'network', 'stream', oldStreamA.ref)).count, 1);
+                assert.equal(
+                    (
+                        await controller.command('read', {
+                            ...options,
+                            ref: oldStreamA.ref,
+                            urlPattern: '*reused/sse',
+                        })
+                    ).count,
+                    0
+                );
+            });
+        }
+    }
+});
+
+test('stream URL filters leave unobserved parent URLs unmatched and retain direct WebSocket URLs', async (t) => {
+    for (const backend of ['cdp', 'extension']) {
+        await t.test(backend, async (context) => {
+            const { controller } = fixture(undefined, { backend });
+            context.after(() => controller.dispose('test finished'));
+            await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+            controller.handle(
+                'Network.eventSourceMessageReceived',
+                { requestId: 'missing-sse', data: 'unknown' },
+                'session'
+            );
+            controller.handle(
+                'Network.webSocketFrameReceived',
+                {
+                    requestId: 'missing-ws',
+                    response: { opcode: 1, payloadData: 'unknown' },
+                },
+                'session'
+            );
+            controller.handle(
+                'Network.webSocketCreated',
+                { requestId: 'direct-ws', url: 'wss://example.com/ws' },
+                'session'
+            );
+            const all = await read(controller, 'network', 'stream');
+            assert.equal(all.count, 3);
+            const selected = await controller.command('read', { type: 'network', view: 'stream', urlPattern: '*' });
+            assert.equal(selected.count, 1);
+            assert.equal(selected.logs[0].nativeMethod, 'Network.webSocketCreated');
+            assert.equal(
+                (await controller.command('read', { type: 'network', view: 'stream', urlPattern: '*/ws' })).count,
+                1
+            );
+            assert.deepEqual((await read(controller, 'network', 'stream')).logs, all.logs);
+        });
+    }
+});
+
+test('WebSocket stream URL filters pin observed socket URLs across sessions and ID reuse', async (t) => {
+    for (const backend of ['cdp', 'extension']) {
+        for (const withParent of [false, true]) {
+            await t.test(`${backend} HTTP parent=${withParent}`, async (context) => {
+                const { controller, calls } = fixture(undefined, { backend });
+                context.after(() => controller.dispose('test finished'));
+                await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+                if (withParent) {
+                    begin(controller, 'socket', { request: { url: 'wss://example.com/first', method: 'GET' } });
+                }
+                const parent = (await read(controller, 'network', 'details')).logs[0];
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/first' },
+                    'session'
+                );
+                controller.handle(
+                    'Network.webSocketFrameSent',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'first' } },
+                    'session'
+                );
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/sibling' },
+                    'sibling'
+                );
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'sibling' } },
+                    'sibling'
+                );
+                begin(controller, 'socket', { request: { url: 'https://example.com/later-request', method: 'GET' } });
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'still-first' } },
+                    'session'
+                );
+                controller.handle('Network.webSocketClosed', { requestId: 'socket' }, 'session');
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/reused' },
+                    'session'
+                );
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'reused' } },
+                    'session'
+                );
+                const all = await read(controller, 'network', 'stream');
+                const beforeReads = calls.length;
+                const options = { type: 'network', view: 'stream' };
+                const first = await controller.command('read', { ...options, urlPattern: '*/first' });
+                assert.equal(first.count, 4);
+                assert.ok(first.logs.every((entry) => entry.sessionId === 'session'));
+                assert.ok(first.logs.every((entry) => entry.requestRef === parent?.ref));
+                assert.equal((await controller.command('read', { ...options, urlPattern: '*/sibling' })).count, 2);
+                const reused = await controller.command('read', { ...options, urlPattern: '*/reused' });
+                assert.equal(reused.count, 2);
+                assert.ok(reused.logs.every((entry) => entry.requestRef === undefined));
+                assert.equal(
+                    (await controller.command('read', { ...options, urlPattern: '*/later-request' })).count,
+                    0
+                );
+                const oldFrame = first.logs.find((entry) => entry.nativeMethod === 'Network.webSocketFrameSent');
+                assert.equal(
+                    (await controller.command('read', { ...options, ref: oldFrame.ref, urlPattern: '*/reused' })).count,
+                    0
+                );
+                assert.deepEqual((await read(controller, 'network', 'stream')).logs, all.logs);
+                assert.equal(calls.length, beforeReads);
+            });
+        }
+    }
+});
+
+test('same-session child frame navigation preserves unrelated WebSocket stream URLs', async (t) => {
+    for (const backend of ['cdp', 'extension']) {
+        await t.test(backend, async (context) => {
+            const { controller } = fixture(undefined, { backend });
+            context.after(() => controller.dispose('test finished'));
+            await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+            const owners = [
+                ['main-a', 'session'],
+                ['main-b', 'session'],
+                ['child', 'child'],
+                ['sibling', 'sibling'],
+            ];
+            for (const [requestId, sessionId] of owners) {
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId, url: `wss://example.com/${requestId}` },
+                    sessionId
+                );
+            }
+            for (const [index, navigation] of [
+                {
+                    sessionId: 'session',
+                    frame: { id: 'same-process-child', parentId: 'main' },
+                    retained: ['main-a', 'main-b', 'child', 'sibling'],
+                },
+                {
+                    sessionId: 'child',
+                    frame: { id: 'oopif-root', parentId: 'main' },
+                    retained: ['main-a', 'main-b', 'sibling'],
+                },
+                { sessionId: 'session', frame: { id: 'main' }, retained: [] },
+            ].entries()) {
+                controller.handle('Page.frameNavigated', { frame: navigation.frame }, navigation.sessionId);
+                for (const [requestId, sessionId] of owners) {
+                    controller.handle(
+                        'Network.webSocketFrameReceived',
+                        {
+                            requestId,
+                            response: { opcode: 1, payloadData: `${index}:${requestId}` },
+                        },
+                        sessionId
+                    );
+                }
+                const all = await read(controller, 'network', 'stream');
+                for (const [requestId] of owners) {
+                    const entry = all.logs.find((item) => item.response?.payloadData === `${index}:${requestId}`);
+                    assert.ok(entry);
+                    const filtered = await controller.command('read', {
+                        type: 'network',
+                        view: 'stream',
+                        ref: entry.ref,
+                        urlPattern: `*/${requestId}`,
+                    });
+                    assert.equal(
+                        filtered.count,
+                        navigation.retained.includes(requestId) ? 1 : 0,
+                        `${backend} navigation=${index} socket=${requestId}`
+                    );
+                }
+            }
+        });
+    }
+});
+
+test('WebSocket stream URL associations end on close, navigation and capture boundaries', async (t) => {
+    for (const backend of ['cdp', 'extension']) {
+        for (const boundary of ['close', 'navigation', 'child-navigation', 'stop', 'replace-capture', 'suspend']) {
+            await t.test(`${backend} ${boundary}`, async (context) => {
+                const { controller } = fixture(undefined, { backend });
+                context.after(() => controller.dispose('test finished'));
+                await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+                const sessionId = boundary === 'child-navigation' ? 'child' : 'session';
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/old' },
+                    sessionId
+                );
+                controller.handle(
+                    'Network.webSocketFrameSent',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'old' } },
+                    sessionId
+                );
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/sibling' },
+                    'sibling'
+                );
+                const oldFrame = (await read(controller, 'network', 'stream')).logs.find(
+                    (entry) => entry.nativeMethod === 'Network.webSocketFrameSent'
+                );
+                if (boundary === 'close') {
+                    controller.handle('Network.webSocketClosed', { requestId: 'socket' }, sessionId);
+                } else if (boundary === 'navigation' || boundary === 'child-navigation') {
+                    const frame =
+                        boundary === 'child-navigation' ? { id: 'navigated', parentId: 'main' } : { id: 'navigated' };
+                    controller.handle('Page.frameNavigated', { frame }, sessionId);
+                } else if (boundary === 'suspend') {
+                    await controller.suspend('test stream boundary');
+                } else if (boundary === 'replace-capture') {
+                    await controller.command('networkCapture', { op: 'start', include: ['body'] });
+                } else {
+                    await controller.command('networkCapture', { op: 'stop' });
+                }
+                if (['stop', 'replace-capture', 'suspend'].includes(boundary)) {
+                    controller.handle(
+                        'Network.webSocketCreated',
+                        { requestId: 'socket', url: 'wss://example.com/not-captured' },
+                        sessionId
+                    );
+                    await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+                }
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'after-boundary' } },
+                    sessionId
+                );
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'sibling-after' } },
+                    'sibling'
+                );
+                const after = (await read(controller, 'network', 'stream')).logs;
+                const unbound = after.find((entry) => entry.response?.payloadData === 'after-boundary');
+                const sibling = after.find((entry) => entry.response?.payloadData === 'sibling-after');
+                const options = { type: 'network', view: 'stream' };
+                assert.equal(
+                    (await controller.command('read', { ...options, ref: unbound.ref, urlPattern: '*' })).count,
+                    0
+                );
+                assert.equal(
+                    (await controller.command('read', { ...options, ref: sibling.ref, urlPattern: '*/sibling' })).count,
+                    boundary === 'close' || boundary === 'child-navigation' ? 1 : 0
+                );
+                assert.equal(
+                    (await controller.command('read', { ...options, ref: oldFrame.ref, urlPattern: '*/old' })).count,
+                    1
+                );
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/new' },
+                    sessionId
+                );
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'new' } },
+                    sessionId
+                );
+                const fresh = await controller.command('read', { ...options, urlPattern: '*/new' });
+                assert.equal(fresh.count, 2);
+                assert.equal(
+                    (await controller.command('read', { ...options, ref: unbound.ref, urlPattern: '*/new' })).count,
+                    0
+                );
+            });
+        }
+    }
+});
+
+test('WebSocket stream URL filters keep invalid socket refs separate from later HTTP requests', async (t) => {
+    for (const backend of ['cdp', 'extension']) {
+        for (const invalidation of ['clear', 'expiry']) {
+            await t.test(`${backend} ${invalidation}`, async (context) => {
+                const { controller } = fixture(undefined, { backend });
+                context.after(() => controller.dispose('test finished'));
+                await controller.command('networkCapture', { op: 'start', include: ['stream'] });
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/old' },
+                    'session'
+                );
+                controller.handle(
+                    'Network.webSocketFrameSent',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'old' } },
+                    'session'
+                );
+                const original = (await read(controller, 'network', 'stream')).logs;
+                const created = original.find((entry) => entry.nativeMethod === 'Network.webSocketCreated');
+                const oldFrame = original.find((entry) => entry.nativeMethod === 'Network.webSocketFrameSent');
+                if (invalidation === 'clear') {
+                    await read(controller, 'network', 'stream', created.ref, true);
+                } else {
+                    controller.entries.get(created.ref).timestamp = Date.now() - 300001;
+                }
+                await read(controller, 'network', 'stream');
+                await assert.rejects(read(controller, 'network', 'stream', created.ref), /expired, evicted/);
+                begin(controller, 'socket', { request: { url: 'https://example.com/later-request', method: 'GET' } });
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'without-source' } },
+                    'session'
+                );
+                const options = { type: 'network', view: 'stream' };
+                const unknown = await controller.command('read', options);
+                assert.equal(unknown.count, 2);
+                assert.ok(unknown.logs.every((entry) => entry.requestRef === undefined));
+                assert.equal((await controller.command('read', { ...options, urlPattern: '*' })).count, 0);
+                controller.handle(
+                    'Network.webSocketCreated',
+                    { requestId: 'socket', url: 'wss://example.com/reused' },
+                    'session'
+                );
+                controller.handle(
+                    'Network.webSocketFrameReceived',
+                    { requestId: 'socket', response: { opcode: 1, payloadData: 'reused' } },
+                    'session'
+                );
+                assert.equal((await controller.command('read', { ...options, urlPattern: '*/reused' })).count, 2);
+                assert.equal(
+                    (await controller.command('read', { ...options, ref: oldFrame.ref, urlPattern: '*/reused' })).count,
+                    0
+                );
+            });
+        }
+    }
+});
+
 test('stream messages preserve direction and order and expose truncation', async () => {
     const { controller } = fixture();
     await controller.command('networkCapture', { op: 'start', include: ['stream'] });
@@ -573,6 +1727,78 @@ test('cancel during original body read waits for the read then aborts, without c
     assert.ok(calls.some((c) => c[0] === 'Fetch.failRequest'));
     assert.ok(!calls.some((c) => c[0] === 'Fetch.continueResponse'));
 });
+
+test('M16-C04 cancelled attachment bytes cannot become a later same-URL download', async (t) => {
+    let finishBody;
+    const url = 'https://example.com/api';
+    const { controller, calls } = fixture(async (method) =>
+        method === 'Fetch.getResponseBody'
+            ? new Promise((resolve) => {
+                  finishBody = resolve;
+              })
+            : {}
+    );
+    t.after(() => controller.dispose('owned test finished'));
+    await controller.command('download', { op: 'watch', urlPattern: url });
+    paused(controller, 'old-download', {
+        responseStatusCode: 200,
+        responseHeaders: [{ name: 'Content-Disposition', value: 'attachment' }],
+    });
+    await flush();
+    const stop = controller.command('download', { op: 'stop' });
+    finishBody({ body: 'OLD cancelled file', base64Encoded: false });
+    await stop;
+    assert.ok(calls.some(([method, params]) => method === 'Fetch.failRequest' && params.requestId === 'old-download'));
+    await controller.command('download', { op: 'watch', urlPattern: url });
+    await controller.command('route', { op: 'add', stage: 'Response', urlPattern: url });
+    paused(controller, 'new-download', {
+        responseStatusCode: 200,
+        responseHeaders: [{ name: 'Content-Disposition', value: 'attachment' }],
+    });
+    await flush();
+    const pause = (await read(controller, 'network', 'paused')).logs[0];
+    await controller.command('route', { op: 'continue', ref: pause.ref });
+    controller.handle('Page.downloadWillBegin', { guid: 'new-file-guid', frameId: 'frame', url }, 'session');
+    controller.handle('Page.downloadProgress', { guid: 'new-file-guid', state: 'completed' }, 'session');
+    const download = (await read(controller, 'download')).logs[0];
+    assert.equal(download.artifact, 'unavailable');
+    await assert.rejects(
+        controller.command('download', { op: 'save', ref: download.ref }),
+        /unavailable|expired|evicted/i
+    );
+});
+
+for (const invalidation of ['watch', 'navigation', 'frame-navigation']) {
+    test(`M16-C04 unbound response identity expires on ${invalidation}`, async (t) => {
+        const { controller } = fixture(async (method) =>
+            method === 'Fetch.getResponseBody' ? { body: 'owned old bytes', base64Encoded: false } : {}
+        );
+        t.after(() => controller.dispose('owned test finished'));
+        await controller.command('download', { op: 'watch' });
+        paused(controller, 'old-download', {
+            responseStatusCode: 200,
+            responseHeaders: [{ name: 'Content-Disposition', value: 'attachment' }],
+        });
+        await flush();
+        if (invalidation === 'watch') {
+            await controller.command('download', { op: 'watch' });
+        } else {
+            controller.handle(
+                'Page.frameNavigated',
+                { frame: { id: 'frame', ...(invalidation === 'frame-navigation' ? { parentId: 'root' } : {}) } },
+                'session'
+            );
+            await flush();
+        }
+        controller.handle(
+            'Page.downloadWillBegin',
+            { guid: 'later-guid', frameId: 'frame', url: 'https://example.com/api' },
+            'session'
+        );
+        const download = (await read(controller, 'download')).logs[0];
+        assert.equal(download.artifact, 'unavailable');
+    });
+}
 
 test('event caches expose eviction and clear never resumes active controls', async () => {
     const { controller, calls } = fixture();
@@ -724,7 +1950,7 @@ test('large metadata and active pause admission remain bounded with explicit los
     await controller.suspend('stop');
 });
 
-test('expired native interception identities release every pause path without blocking later Fetch configuration', async (t) => {
+test('expired native interception identities release every pause path and allow later Fetch setup', async (t) => {
     const operations = {
         navigation: 'Fetch.failRequest',
         'frame-navigation': 'Fetch.failRequest',
@@ -849,7 +2075,7 @@ test('expired native interception identities release every pause path without bl
     }
 });
 
-test('native interception expiry keeps validation refusals, lost acknowledgements and page errors distinct', async (t) => {
+test('native expiry distinguishes validation refusals, lost acknowledgements and page errors', async (t) => {
     const cases = [
         ['parameters', Error(JSON.stringify({ code: -32602, message: 'Invalid parameters' })), 'pending'],
         ['wrong-code', Error(JSON.stringify({ code: -32000, message: 'Invalid InterceptionId.' })), 'unknown'],

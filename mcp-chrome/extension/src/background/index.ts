@@ -17,12 +17,12 @@ import { hasReadGrant, revokeReadGrants, revokeTabReadGrants, setReadGrant } fro
 import {
     getMcpTabGroupId,
     getMcpWindowId,
+    isManagedTab,
     restoreManagedTabs,
     setMcpTabGroupId,
     setMcpWindowId,
     unmarkManagedTab,
     updateManagedTabDocument,
-    isManagedTab,
 } from './tab-state'
 
 // ==================== 全局状态 ====================
@@ -87,6 +87,9 @@ httpClient.onMessage(async (message, port, signal, reply) => {
             mcpTabGroupId: getMcpTabGroupId(),
             mcpWindowId: getMcpWindowId(),
             serverInstanceId: httpClient.getServerInstanceId(port),
+            connectedServerInstanceIds: httpClient
+                .getConnectedServers()
+                .flatMap(({ instanceId }) => (instanceId ? [instanceId] : [])),
             signal,
         })
         reply(true, result)
@@ -94,7 +97,7 @@ httpClient.onMessage(async (message, port, signal, reply) => {
         const rawMsg = error instanceof Error ? error.message : 'Unknown error'
         const msg = structuredErrorPayload(error) ?? sanitizeErrorMessage(rawMsg)
         // 预期的操作错误用 warn，不污染 Extension 错误面板
-        if (isExpectedOperationError(error)) {
+        if (isExpectedOperationError(error, action)) {
             console.warn(`[MCP] ${action}: ${rawMsg}`)
         } else {
             console.error(`[MCP] Error executing ${action}:`, error)

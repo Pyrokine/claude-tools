@@ -7,8 +7,8 @@ import { registerManageTool } from '../dist/tools/manage.js';
 import { registerLogsTool } from '../dist/tools/logs.js';
 import {
     CHALLENGE_INSPECT_SCRIPT,
-    ChallengeTimeoutError,
     challengeResultFields,
+    ChallengeTimeoutError,
     classifyChallengeSnapshot,
     waitForChallenge,
 } from '../dist/tools/challenge.js';
@@ -39,7 +39,7 @@ function challengeFixture({
         parentElement: outside ? root : widgets[index],
         form: forms[index] ?? null,
     }));
-    const snapshot = vm.runInNewContext(CHALLENGE_INSPECT_SCRIPT, {
+    return vm.runInNewContext(CHALLENGE_INSPECT_SCRIPT, {
         document: {
             title: 'Checkout',
             body: { innerText: 'Checkout' },
@@ -72,7 +72,6 @@ function challengeFixture({
         },
         location: { href: 'https://example.com/checkout' },
     });
-    return snapshot;
 }
 
 test('CF completed response suppresses only its own visible widget and returns no response value', () => {

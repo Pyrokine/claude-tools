@@ -1,8 +1,8 @@
-import { InputEventHandler } from '../extension/src/background/input-event-handler'
+import { recordDomFrameProbe } from '../extension/src/background/action-utils'
 import { ContentHandler } from '../extension/src/background/content-handler'
 import { FrameResolver } from '../extension/src/background/frame-resolver'
+import { InputEventHandler } from '../extension/src/background/input-event-handler'
 import { markManagedTab } from '../extension/src/background/tab-state'
-import { recordDomFrameProbe } from '../extension/src/background/action-utils'
 import { configureWheelFixture, readWheelFixture } from './review-c31f2-wheel-fixtures.mjs'
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

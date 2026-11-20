@@ -24,7 +24,7 @@ function registeredTool(register) {
             schema = options.inputSchema;
         },
     });
-    return (args, extra) => handler(schema.parse(args), extra);
+    return (args, extra = undefined) => handler(schema.parse(args), extra);
 }
 function result(response) {
     assert.equal(response.isError, undefined, JSON.stringify(response));
@@ -48,19 +48,24 @@ async function fixture(t) {
     const responseBody = Buffer.concat([Buffer.from([0, 255, 128]), Buffer.from(requestBody)]);
     let socket;
     let onDialog;
-    const http = createServer((request, response) => {
-        response.setHeader('Content-Type', 'application/json');
-        response.end(
-            JSON.stringify(
-                request.url === '/json/version'
-                    ? { webSocketDebuggerUrl: `ws://127.0.0.1:${http.address().port}` }
-                    : [page]
-            )
-        );
-    });
+    const http = createServer(
+        (
+            /** @type {import('node:http').IncomingMessage} */ request,
+            /** @type {import('node:http').ServerResponse} */ response
+        ) => {
+            response.setHeader('Content-Type', 'application/json');
+            response.end(
+                JSON.stringify(
+                    request.url === '/json/version'
+                        ? { webSocketDebuggerUrl: `ws://127.0.0.1:${http.address().port}` }
+                        : [page]
+                )
+            );
+        }
+    );
     const server = new WebSocketServer({ server: http });
     const reply = (message, value = {}) => socket.send(JSON.stringify({ id: message.id, result: value }));
-    server.on('connection', (connection) => {
+    server.on('connection', (/** @type {import('ws').WebSocket} */ connection) => {
         socket = connection;
         connection.on('message', (raw) => {
             const message = JSON.parse(raw.toString());
@@ -93,7 +98,7 @@ async function fixture(t) {
             }
         });
     });
-    await new Promise((resolve) => http.listen(0, '127.0.0.1', resolve));
+    await new Promise((resolve) => http.listen(0, '127.0.0.1', () => resolve(undefined)));
     t.after(async () => {
         await session.close();
         for (const client of server.clients) {
@@ -231,7 +236,7 @@ test(
                 })
             );
             f.files.push(output.output);
-            const written = await readFile(output.output, 'utf8');
+            const written = await readFile(output.output, { encoding: 'utf8' });
             assertCookieMetadata(JSON.parse(written).logs[0], withCookie);
             for (const text of [JSON.stringify(inline), written, JSON.stringify(output)]) {
                 assert.doesNotMatch(text, /synthetic-(?:blocked|exempted|header|associated)(?:-object)?-secret/);

@@ -1,7 +1,6 @@
 /* global document, window, getComputedStyle, scrollX, scrollY, DOMMatrix, DOMPoint */
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { once } from 'node:events'
 import fs from 'node:fs'
 import { createServer } from 'node:http'
 import os from 'node:os'
@@ -10,11 +9,30 @@ import { finished } from 'node:stream/promises'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { cases, configure, read } from './review-c31f6-wheel-fixtures.mjs'
+import { configureWheelFixture, readWheelFixture } from './review-c31f2-wheel-fixtures.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const chromePath = process.argv[2]
 if (!chromePath) {
-    throw new Error('Usage: node test/review-c31f2-native.mjs CHROME_PATH [OUTPUT_JSON]')
+    throw new Error('Usage: node test/review-c31f6-wheel-native.mjs CHROME_PATH [OUTPUT_JSON]')
+}
+const phaseControl = process.env.C31F7_WHEEL_PHASE_CONTROL === '1'
+const wheelCases = cases({
+    boundaryObservations: process.env.C31F7_BOUNDARY_OBSERVATIONS === '1',
+    remaining: process.env.C31F6_REMAINING === '1',
+}).filter((options) => !process.env.C31F6_CASE_FILTER || new RegExp(process.env.C31F6_CASE_FILTER).test(options.id))
+if (
+    phaseControl &&
+    (process.env.C31F6_WHEEL_ONLY !== '1' ||
+        process.env.C31F6_GEOMETRY_DIAGNOSTIC ||
+        wheelCases.length === 0 ||
+        wheelCases.some((options) => !options.eventBoundary))
+) {
+    throw new Error(
+        'C31F7_WHEEL_PHASE_CONTROL=1 requires C31F6_WHEEL_ONLY=1, no C31F6_GEOMETRY_DIAGNOSTIC, ' +
+            'and a nonempty C31F6_CASE_FILTER selection containing only eventBoundary cases; ' +
+            'use C31F7_BOUNDARY_OBSERVATIONS=1 and C31F6_CASE_FILTER=^c31f7-boundary-listener- in a separate process'
+    )
 }
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-c31f2-wheel-'))
 const output = process.argv[3] ? path.resolve(process.argv[3]) : path.join(work, 'results.json')
@@ -42,7 +60,7 @@ await build({
                       const relative = path.relative(root, id)
                       const before = path.join(process.env.C31F6_BEFORE, relative)
                       if (!relative.startsWith('test/') && fs.existsSync(before) && fs.statSync(before).isFile()) {
-                          return fs.readFileSync(before, 'utf8')
+                          return fs.readFileSync(before, { encoding: 'utf8' })
                       }
                   },
               },
@@ -60,16 +78,38 @@ await build({
         },
     },
 })
-const http = createServer((request, response) => {
-    response.setHeader('Content-Type', 'text/html')
-    response.end(
-        request.url.startsWith('/child')
-            ? (request.url.includes('quirks') ? '' : '<!doctype html>') + '<title>Wheel child</title><body></body>'
-            : '<!doctype html><title>Isolated wheel check</title><iframe id="owned" src="/child" style="position:absolute;top:350px;left:0;width:440px;height:230px"></iframe>'
-    )
-})
-await new Promise((resolve) => http.listen(0, '127.0.0.1', resolve))
+const http = createServer(
+    /**
+     * @param {import('node:http').IncomingMessage} request
+     * @param {import('node:http').ServerResponse} response
+     */
+    (request, response) => {
+        response.setHeader('Content-Type', 'text/html')
+        response.end(
+            request.url.startsWith('/child')
+                ? (request.url.includes('quirks') ? '' : '<!doctype html>') + '<title>Wheel child</title><body></body>'
+                : '<!doctype html><title>Isolated wheel ' +
+                      'check</title><iframe id="owned" src="/child" ' +
+                      'style="position:absolute;top:350px;left:0;' +
+                      'width:440px;height:230px"></iframe>'
+        )
+    }
+)
+await new Promise((resolve) => http.listen(0, '127.0.0.1', () => resolve(undefined)))
 const base = `http://127.0.0.1:${http.address().port}`
+let sequence = 0
+let nativeProtocolDispatches = 0
+let buffer = ''
+let transportError
+const pending = new Map()
+const rejectPending = (error) => {
+    transportError ??= error
+    for (const call of pending.values()) {
+        clearTimeout(call.timer)
+        call.reject(transportError)
+    }
+    pending.clear()
+}
 const chrome = spawn(
     chromePath,
     [
@@ -90,12 +130,23 @@ const chrome = spawn(
     ],
     { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] }
 )
+let chromeClosed = false
+const closed = new Promise((resolve) => {
+    chrome.once('close', () => {
+        chromeClosed = true
+        resolve()
+    })
+})
+chrome.once('error', rejectPending)
+chrome.once('exit', (code, signal) => {
+    rejectPending(new Error(`Native Chrome exited: code=${code}, signal=${signal}`))
+})
 const stderr = fs.createWriteStream(path.join(work, 'chrome.log'), { mode: 0o600 })
+chrome.stderr.on('error', rejectPending)
+stderr.on('error', rejectPending)
 chrome.stderr.pipe(stderr)
-let sequence = 0
-let nativeProtocolDispatches = 0
-let buffer = ''
-const pending = new Map()
+chrome.stdio[3].on('error', rejectPending)
+chrome.stdio[4].on('error', rejectPending)
 chrome.stdio[4].on('data', (data) => {
     buffer += data.toString()
     let end
@@ -119,6 +170,9 @@ chrome.stdio[4].on('data', (data) => {
     }
 })
 function send(method, params = {}, sessionId) {
+    if (transportError) {
+        return Promise.reject(transportError)
+    }
     if (method.startsWith('Input.dispatch')) {
         ++nativeProtocolDispatches
     }
@@ -129,7 +183,18 @@ function send(method, params = {}, sessionId) {
             reject(new Error(`Native CDP timeout: ${method}`))
         }, 15000)
         pending.set(id, { resolve, reject, timer })
-        chrome.stdio[3].write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + '\0')
+        try {
+            chrome.stdio[3].write(
+                JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + '\0',
+                (error) => {
+                    if (error) {
+                        rejectPending(error)
+                    }
+                }
+            )
+        } catch (error) {
+            rejectPending(error)
+        }
     })
 }
 async function poll(read, predicate) {
@@ -143,6 +208,7 @@ async function poll(read, predicate) {
     }
     throw new Error('Native fixture condition did not arrive')
 }
+let restorePublicWheel
 const result = {
     status: 'running',
     checks: [],
@@ -153,7 +219,10 @@ const result = {
     sdkCalls: 0,
     work,
     boundary:
-        'installed isolated Extension, production schemas/handlers and real Chrome scripting/CDP APIs; direct handler entry, no SDK or Bridge',
+        'installed isolated Extension, production ' +
+        'schemas/handlers and real Chrome ' +
+        'scripting/CDP APIs; direct handler entry, no ' +
+        'SDK or Bridge',
 }
 try {
     result.browser = await send('Browser.getVersion')
@@ -190,7 +259,7 @@ try {
     const wheelScript = (expression) =>
         evaluate(`c31f6.script(${tab.id},${wheelFrameId},${JSON.stringify(expression)})`)
     const setup = async (options) => {
-        const controlRenderPhase = options.eventBoundary && process.env.C31F7_WHEEL_PHASE_CONTROL === '1'
+        const controlRenderPhase = options.eventBoundary && phaseControl
         if (controlRenderPhase) {
             await send('Emulation.setVirtualTimePolicy', { policy: 'advance' }, pageSession)
         }
@@ -203,11 +272,174 @@ try {
     const readState = () => wheelScript(`(${read.toString()})()`)
     const command = (params) =>
         evaluate(`c31f6.command('input_mouse',${JSON.stringify({ tabId: tab.id, frameId: wheelFrameId, ...params })})`)
+    let publicWheel
+    let refreshPublicWheel
+    if (process.env.C31F6_REMAINING === '1') {
+        const { getUnifiedSession } = await import(pathToFileURL(path.join(root, 'dist/core/index.js')))
+        const { ExtensionBridge } = await import(pathToFileURL(path.join(root, 'dist/extension/bridge.js')))
+        const { registerInputTool } = await import(pathToFileURL(path.join(root, 'dist/tools/input.js')))
+        const unified = getUnifiedSession()
+        const bridge = new ExtensionBridge({ requestContext: () => unified.tabLockContext.getStore() })
+        const top = (await evaluate(`c31f6.frames(${tab.id})`)).find((frame) => frame.frameId === 0)
+        bridge.currentTabId = tab.id
+        bridge.currentFrameDocumentId = top.documentId
+        bridge.httpServer.helloReceived = true
+        bridge.httpServer.clientSocket = {
+            readyState: 1,
+            close() {},
+            send(text) {
+                const message = JSON.parse(text)
+                if (message.type === 'cancel') {
+                    return
+                }
+                const call =
+                    message.action === 'tabs_list'
+                        ? evaluate('c31f6.tabs()')
+                        : evaluate(`c31f6.command(${JSON.stringify(message.action)},${JSON.stringify(message.params)})`)
+                void call.then(
+                    (data) => bridge.httpServer.handleMessage(JSON.stringify({ id: message.id, success: true, data })),
+                    (error) =>
+                        bridge.httpServer.handleMessage(
+                            JSON.stringify({ id: message.id, success: false, error: error.message })
+                        )
+                )
+            },
+        }
+        const overrides = {
+            extensionBridge: bridge,
+            inputMode: 'precise',
+            currentFrameOffset: null,
+            activeMode: 'extension',
+            cdpExplicitlySelected: false,
+            getPageSnapshot: async () => ({ targetId: String(tab.id), url: tab.url, revision: 'native-wheel' }),
+            listTargets: async () => [{ targetId: String(tab.id) }],
+            listTopology: async () => ({ activeTargetId: String(tab.id) }),
+            hasBrowserEventObservation: () => false,
+            getChallengeState: async () => null,
+            getState: () => ({ title: 'Native wheel test', url: tab.url }),
+            getLiveState: async () => ({ title: 'Native wheel test', url: tab.url }),
+            inspectChallenge: async () => ({
+                inspected: true,
+                title: 'Native wheel test',
+                url: tab.url,
+                selectorHits: [],
+                deniedHits: [],
+                textHits: [],
+                originResponsePending: false,
+                turnstilePresent: false,
+                clickPoint: null,
+                clickTargetKind: null,
+            }),
+        }
+        const previous = new Map(
+            Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(unified, key)])
+        )
+        Object.assign(unified, overrides)
+        restorePublicWheel = async () => {
+            for (const [key, descriptor] of previous) {
+                if (descriptor) {
+                    Object.defineProperty(unified, key, descriptor)
+                } else {
+                    Reflect.deleteProperty(unified, key)
+                }
+            }
+            await bridge.stop()
+        }
+        let input
+        let schema
+        registerInputTool({
+            registerTool(_name, config, handler) {
+                schema = config.inputSchema
+                input = handler
+            },
+        })
+        refreshPublicWheel = async () => {
+            const current = (await evaluate(`c31f6.frames(${tab.id})`)).find((frame) => frame.frameId === 0)
+            top.documentId = current.documentId
+            tab.url = current.url
+            bridge.currentFrameDocumentId = current.documentId
+            return current
+        }
+        publicWheel = async (options, point, delta = options.delta ?? 120) => {
+            const axis = options.axis ?? 'y'
+            unified.setInputMode(options.mode)
+            const response = await input(
+                schema.parse({
+                    targetId: String(tab.id),
+                    ...(wheelFrameId ? { frame: 'iframe#owned' } : {}),
+                    timeout: 5000,
+                    events: [
+                        {
+                            type: 'wheel',
+                            target: point,
+                            deltaX: axis === 'y' ? 0 : delta,
+                            deltaY: axis === 'x' ? 0 : delta,
+                        },
+                        ...(options.waitMs ? [{ type: 'wait', ms: options.waitMs }] : []),
+                    ],
+                })
+            )
+            const payload = JSON.parse(response.content[0].text)
+            assert.notEqual(response.isError, true, JSON.stringify(payload))
+            assert.equal(payload.mode, 'extension')
+            assert.equal(payload.actionStatus, 'completed')
+            assert.equal(payload.eventsExecuted, options.waitMs ? 2 : 1)
+            assert.equal(payload.retryable, false)
+            assert.equal(bridge.getCurrentFrameId(), 0)
+            assert.equal(bridge.getCurrentFrameDocumentId(), top.documentId)
+            return payload
+        }
+        result.publicInputs = 0
+        result.publicWheelBoundary =
+            'registered public input/UnifiedSession/ExtensionBridge; transport and page metadata adapted to the owned native carrier; real installed Extension handlers; no SDK Client/McpServer'
+    }
+    const prepareWheelFrame = async (options) => {
+        wheelFrameId = 0
+        if (options.frame || options.quirks) {
+            const source = base + '/child?' + (options.quirks ? 'quirks-' : '') + encodeURIComponent(options.id)
+            await script(
+                '(() => {document.documentElement.style.cssText="";document.body.style.cssText="margin:0";document.body.innerHTML=' +
+                    JSON.stringify(
+                        `<iframe ${options.layoutMatrix || options.remainingWheel ? 'id="owned" ' : ''}src="${source}" style="position:absolute;left:0;top:0;width:500px;height:400px;border:0;zoom:${options.frameZoom ?? 1}"></iframe>`
+                    ) +
+                    ';window.scrollTo(0,0);return true})()'
+            )
+            const frames = await poll(
+                () => evaluate(`c31f6.frames(${tab.id})`),
+                (frames) => frames.some((frame) => frame.url === source)
+            )
+            wheelFrameId = frames.find((frame) => frame.url === source).frameId
+        }
+    }
+    const navigateWheelDocument = async (options) => {
+        const before = (await evaluate(`c31f6.frames(${tab.id})`)).find((frame) => frame.frameId === 0)
+        const url = `${base}/?mcp_test_wheel_document=${sequence}`
+        await send('Page.navigate', { url }, pageSession)
+        await poll(
+            async () => (await evaluate('c31f6.tabs()')).find((entry) => entry.id === tab.id),
+            (entry) => entry?.url === url && entry.status === 'complete'
+        )
+        const after = await poll(
+            async () => (await evaluate(`c31f6.frames(${tab.id})`)).find((frame) => frame.frameId === 0),
+            (frame) => frame?.url === url && frame.documentId !== before.documentId
+        )
+        await refreshPublicWheel()
+        await prepareWheelFrame(options)
+        return { before: before.documentId, after: after.documentId }
+    }
     const resetFraction = async (options, step) => {
         if (!options.reset || step !== 2) {
             return
         }
+        if (options.reset === 'document') {
+            const beforeEvents = (await readState()).events
+            const identity = await navigateWheelDocument(options)
+            await setup(options)
+            return { kind: 'document', ...identity, beforeEvents }
+        }
         const expressions = {
+            container:
+                'const position=[s.container.scrollLeft,s.container.scrollTop];const next=s.container.cloneNode(true);s.container.replaceWith(next);s.container=next;s.inner=next.querySelector("#inner");next.scrollTo({left:position[0],top:position[1],behavior:"instant"})',
             position: 's.container.scrollTop=500',
             target: 's.inner.replaceWith(s.inner.cloneNode(true));s.inner=s.container.querySelector("#inner")',
             zoom: 's.container.style.zoom="2";s.container.style.left="210px";s.container.style.top="210px"',
@@ -240,31 +472,151 @@ try {
         }
         throw new Error('Snap endpoint did not produce eight stable samples after 800ms')
     }
-    for (const options of cases({
-        boundaryObservations: process.env.C31F7_BOUNDARY_OBSERVATIONS === '1',
-    }).filter(
-        (options) => !process.env.C31F6_CASE_FILTER || new RegExp(process.env.C31F6_CASE_FILTER).test(options.id)
-    )) {
+    for (const options of wheelCases) {
         const check = {
             kind: 'wheel',
             id: options.id,
             options,
-            ...(options.eventBoundary && process.env.C31F7_WHEEL_PHASE_CONTROL === '1'
-                ? { renderPhaseControl: 'virtual-time-paused-during-input' }
-                : {}),
+            ...(phaseControl ? { renderPhaseControl: 'virtual-time-paused-during-input' } : {}),
         }
         try {
-            wheelFrameId = 0
-            if (options.frame || options.quirks) {
-                const source = base + '/child?' + (options.quirks ? 'quirks-' : '') + encodeURIComponent(options.id)
-                await script(
-                    `(() => {document.documentElement.style.cssText='';document.body.style.cssText='margin:0';document.body.innerHTML=${JSON.stringify(`<iframe src="${source}" style="position:absolute;left:0;top:0;width:500px;height:400px;border:0;zoom:${options.frameZoom ?? 1}"></iframe>`)};window.scrollTo(0,0);return true})()`
+            await prepareWheelFrame(options)
+            if (options.layoutMatrix) {
+                if (wheelFrameId === 0) {
+                    await script('(() => {document.querySelector("#owned")?.remove();return true})()')
+                }
+                const rebuild = async () => {
+                    const configuration = {
+                        ...options,
+                        group: options.group === 'mixed-hidden' ? 'hidden' : options.group,
+                    }
+                    const layout = await wheelScript(
+                        `(${configureWheelFixture.toString()})(${JSON.stringify(configuration)})`
+                    )
+                    assert.equal(layout.hit, 'inner', JSON.stringify(layout))
+                    return layout
+                }
+                const readLayout = () => wheelScript(`(${readWheelFixture.toString()})()`)
+                const settled = async (expectedEvents = 1) => {
+                    const deadline = Date.now() + 2500
+                    let previous
+                    let stable = 0
+                    while (Date.now() < deadline) {
+                        const value = await readLayout()
+                        const positions = JSON.stringify(
+                            ['target', 'container', 'outer', 'viewport', 'root', 'body'].map((key) => value[key])
+                        )
+                        stable = positions === previous ? stable + 1 : 0
+                        previous = positions
+                        if (stable >= 5 && value.events.length === expectedEvents) {
+                            return value
+                        }
+                        await delay(20)
+                    }
+                    throw new Error('Remaining wheel state did not settle')
+                }
+                check.mode = options.mode
+                check.frameId = wheelFrameId
+                check.layout = await rebuild()
+                check.initial = await readLayout()
+                if (options.group === 'propagation') {
+                    check.documentBefore = (await evaluate(`c31f6.frames(${tab.id})`)).find(
+                        (frame) => frame.frameId === wheelFrameId
+                    ).documentId
+                }
+                ++result.publicInputs
+                check.response = await publicWheel(
+                    options,
+                    options.target === 'css' ? { css: '#scroller' } : check.layout.point
                 )
-                const frames = await poll(
-                    () => evaluate(`c31f6.frames(${tab.id})`),
-                    (frames) => frames.some((frame) => frame.url === source)
-                )
-                wheelFrameId = frames.find((frame) => frame.url === source).frameId
+                check.tool = await settled(options.target === 'css' ? 0 : 1)
+                if (options.target === 'css') {
+                    assert.deepEqual(check.tool.events, [])
+                } else {
+                    assert.equal(check.tool.events[0].trusted, false)
+                    assert.equal(check.tool.events[0].composed, true)
+                }
+                if (options.group === 'propagation') {
+                    check.documentAfter = (await evaluate(`c31f6.frames(${tab.id})`)).find(
+                        (frame) => frame.frameId === wheelFrameId
+                    ).documentId
+                    assert.equal(typeof check.documentBefore, 'string')
+                    assert.equal(check.documentAfter, check.documentBefore)
+                }
+                check.references = {}
+                for (const referenceAxis of options.axis === 'both' ? ['x', 'y'] : ['both']) {
+                    if (options.axis === 'both') {
+                        check.referenceDocuments ??= {}
+                        check.referenceDocuments[referenceAxis] = await navigateWheelDocument(options)
+                    }
+                    const reference = await rebuild()
+                    ++result.nativeReferences
+                    ++result.nativeWheelReferences
+                    await send(
+                        'Input.dispatchMouseEvent',
+                        {
+                            type: 'mouseWheel',
+                            ...reference.point,
+                            deltaX: options.axis === 'y' || referenceAxis === 'y' ? 0 : options.delta,
+                            deltaY: options.axis === 'x' || referenceAxis === 'x' ? 0 : options.delta,
+                        },
+                        pageSession
+                    )
+                    const native = await settled()
+                    check.references[referenceAxis] = native
+                    if (referenceAxis === 'both') {
+                        check.native = native
+                    }
+                    assert.equal(native.events[0].trusted, true)
+                    assert.equal(native.events[0].target, 'inner')
+                    for (const key of ['target', 'container', 'outer', 'viewport', 'root', 'body']) {
+                        for (const axis of referenceAxis === 'both' ? ['x', 'y'] : [referenceAxis]) {
+                            assert.ok(
+                                Math.abs(check.tool[key][axis] - native[key][axis]) < 0.02,
+                                `${key}/${axis}: ${check.tool[key][axis]} != ${native[key][axis]}`
+                            )
+                        }
+                    }
+                }
+                if (options.group === 'propagation') {
+                    const listeners = options.shadow
+                        ? ['inner', 'root', 'host', 'document']
+                        : ['inner', 'ancestor', 'document']
+                    const cancelIndex = {
+                        none: listeners.length,
+                        target: 0,
+                        ancestor: options.shadow ? 2 : 1,
+                        document: listeners.length - 1,
+                    }[options.cancelAt]
+                    for (const [state, trusted] of [
+                        [check.tool, false],
+                        [check.native, true],
+                    ]) {
+                        assert.deepEqual(
+                            state.propagation.map((event) => event.listener),
+                            listeners
+                        )
+                        for (const [index, event] of state.propagation.entries()) {
+                            assert.equal(event.target, 'inner')
+                            assert.equal(event.retargeted, options.shadow && index >= 2 ? 'scroller' : 'inner')
+                            assert.equal(event.composed, true)
+                            assert.equal(event.bubbles, true)
+                            assert.equal(event.cancelable, true)
+                            assert.equal(event.trusted, trusted)
+                            assert.equal(event.defaultPrevented, index >= cancelIndex)
+                        }
+                        if (options.cancelAt !== 'none') {
+                            for (const key of ['target', 'container', 'outer', 'viewport', 'root', 'body']) {
+                                for (const axis of ['x', 'y']) {
+                                    assert.ok(Math.abs(state[key][axis] - check.initial[key][axis]) < 0.02)
+                                }
+                            }
+                        }
+                    }
+                }
+                check.status = 'PASS'
+                result.checks.push(check)
+                continue
             }
             check.layout = await setup(options)
             assert.ok(
@@ -289,60 +641,116 @@ try {
                     await evaluate('c31f6.freshHandler()')
                 }
                 ++result.handlerCalls
-                await command({
-                    type: 'mouseWheel',
-                    ...check.layout.point,
-                    deltaX: options.axis === 'x' ? delta : 0,
-                    deltaY: options.axis === 'x' ? 0 : delta,
-                })
-                await delay(options.interval ?? 30)
-                check.toolSteps.push(await readState())
-                await resetFraction(options, check.toolSteps.length - 1)
-            }
-            check.tool = await settle(options, (check.toolStableSamples = []))
-            const reference = await setup(options)
-            check.nativeSteps = []
-            for (const delta of deltas) {
-                ++result.nativeReferences
-                ++result.nativeWheelReferences
-                await send(
-                    'Input.dispatchMouseEvent',
-                    {
+                if (options.remainingWheel) {
+                    ++result.publicInputs
+                    check.responses ??= []
+                    check.responses.push(await publicWheel(options, check.layout.point, delta))
+                } else {
+                    await command({
                         type: 'mouseWheel',
-                        x: reference.point.x * (options.frameZoom ?? 1),
-                        y: reference.point.y * (options.frameZoom ?? 1),
+                        ...check.layout.point,
                         deltaX: options.axis === 'x' ? delta : 0,
                         deltaY: options.axis === 'x' ? 0 : delta,
-                    },
-                    pageSession
-                )
-                await delay(options.interval ?? 30)
-                check.nativeSteps.push(await readState())
-                await resetFraction(options, check.nativeSteps.length - 1)
+                    })
+                }
+                await delay(options.waitMs ? 0 : (options.interval ?? 30))
+                check.toolSteps.push(await readState())
+                const reset = await resetFraction(options, check.toolSteps.length - 1)
+                if (reset) {
+                    check.resets ??= []
+                    check.resets.push({ source: 'tool', ...reset })
+                }
             }
-            check.native = await settle(options, (check.nativeStableSamples = []))
+            check.tool = await settle(options, (check.toolStableSamples = []))
+            for (const label of phaseControl ? ['native', 'nativeRepeat'] : ['native']) {
+                const reference = await setup(options)
+                const steps = (check[`${label}Steps`] = [])
+                for (const delta of deltas) {
+                    ++result.nativeReferences
+                    ++result.nativeWheelReferences
+                    await send(
+                        'Input.dispatchMouseEvent',
+                        {
+                            type: 'mouseWheel',
+                            x: reference.point.x * (options.frameZoom ?? 1),
+                            y: reference.point.y * (options.frameZoom ?? 1),
+                            deltaX: options.axis === 'x' ? delta : 0,
+                            deltaY: options.axis === 'x' ? 0 : delta,
+                        },
+                        pageSession
+                    )
+                    await delay(options.interval ?? 30)
+                    steps.push(await readState())
+                    const reset = await resetFraction(options, steps.length - 1)
+                    if (reset) {
+                        check.resets ??= []
+                        check.resets.push({ source: label, ...reset })
+                    }
+                }
+                check[label] = await settle(options, (check[`${label}StableSamples`] = []))
+            }
+            if (phaseControl) {
+                const differences = []
+                for (const key of ['container', 'outer', 'middle', 'replacement', 'viewport']) {
+                    for (let axis = 0; axis < 2; axis++) {
+                        const first = check.native[key][axis]
+                        const repeat = check.nativeRepeat[key][axis]
+                        if (Math.abs(first - repeat) >= 0.02) {
+                            differences.push({ key, axis, first, repeat })
+                        }
+                    }
+                }
+                check.nativeControl = { status: differences.length ? 'FAIL' : 'PASS', differences }
+            }
+            for (const reset of check.resets ?? []) {
+                if (reset.kind === 'document') {
+                    const state = reset.source === 'tool' ? check.tool : check[reset.source]
+                    state.documentEvents = [
+                        { documentId: reset.before, events: reset.beforeEvents },
+                        { documentId: reset.after, events: [...state.events] },
+                    ]
+                    state.events = [...reset.beforeEvents, ...state.events]
+                }
+            }
             let expected = check.native
             if (options.acceptedSnap) {
                 await setup(options)
                 for (const delta of deltas) {
-                    await wheelScript(`(() => {
-                        const s=window.__c31f6, delta=${delta};
-                        s.programmaticStart ??= [s.outer.scrollLeft,s.outer.scrollTop];
-                        s.programmaticBoundary ??= [0,0];
-                        const axis=${options.axis === 'x' ? 0 : 1}, position=axis===0?s.container.scrollLeft:s.container.scrollTop;
-                        const maximum=axis===0?s.container.scrollWidth-s.container.clientWidth:s.container.scrollHeight-s.container.clientHeight;
-                        if ((delta<0 && position===0)||(delta>0 && position===maximum)) s.programmaticBoundary[axis]+=delta;
-                        s.container.scrollBy({left:axis===0?delta:0,top:axis===1?delta:0,behavior:'instant'});
-                        s.outer.scrollTo({left:s.programmaticStart[0]+s.programmaticBoundary[0],top:s.programmaticStart[1]+s.programmaticBoundary[1],behavior:'instant'});
-                        return true;
-                    })()`)
+                    await wheelScript(
+                        '(() => {\n                        const ' +
+                            's=window.__c31f6, delta=' +
+                            `${delta}` +
+                            ';\n                        s.programmaticStart ' +
+                            '??= [s.outer.scrollLeft,s.outer.scrollTop];\n  ' +
+                            '                      s.programmaticBoundary ' +
+                            '??= [0,0];\n                        const axis=' +
+                            `${options.axis === 'x' ? 0 : 1}` +
+                            ', position=axis===0?s.container.scrollLeft:s.c' +
+                            'ontainer.scrollTop;\n                        ' +
+                            'const maximum=axis===0?s.container.scrollWidth' +
+                            '-s.container.clientWidth:s.container.scrollHei' +
+                            'ght-s.container.clientHeight;\n                ' +
+                            '        if ((delta<0 && position===0)||(delta>' +
+                            '0 && position===maximum)) ' +
+                            's.programmaticBoundary[axis]+=delta;\n         ' +
+                            '               s.container.scrollBy({left:axis' +
+                            '===0?delta:0,top:axis===1?delta:0,' +
+                            "behavior:'instant'});\n                        " +
+                            's.outer.scrollTo({left:s.programmaticStart[0]+' +
+                            's.programmaticBoundary[0],' +
+                            'top:s.programmaticStart[1]+s.programmaticBound' +
+                            "ary[1],behavior:'instant'});\n                 " +
+                            '       return true;\n                    })()'
+                    )
                     await delay(options.interval ?? 30)
                 }
                 check.programmatic = await settle(options, (check.programmaticStableSamples = []))
                 check.programmaticBoundaryIntent = await wheelScript('window.__c31f6.programmaticBoundary')
                 check.acceptedContract = options.requireNativeEquality
                     ? 'Programmatic scrollBy endpoint and native-equivalence control'
-                    : 'Programmatic scrollBy snap endpoint; native differences are recorded, not native-equivalence passes'
+                    : 'Programmatic scrollBy snap endpoint; native ' +
+                      'differences are recorded, not ' +
+                      'native-equivalence passes'
                 expected = check.programmatic
                 check.nativeDifferences = ['container', 'outer', 'middle', 'replacement', 'viewport'].filter((key) =>
                     check.tool[key].some((value, axis) => Math.abs(value - check.native[key][axis]) >= 0.02)
@@ -380,8 +788,17 @@ try {
             }
             assert.equal(check.tool.events.length, deltas.length)
             assert.equal(check.native.events.length, deltas.length)
+            if (phaseControl) {
+                assert.equal(check.nativeRepeat.events.length, deltas.length)
+                assert.equal(
+                    check.nativeControl.status,
+                    'PASS',
+                    'Native repeat: ' + JSON.stringify(check.nativeControl)
+                )
+            }
             if (process.env.WHEEL_BUSINESS_FAILURE === options.id) {
                 check.controlledBusinessFailure = true
+                // noinspection ExceptionCaughtLocallyJS — 将受控失败收集为测试结果
                 throw new Error('Controlled business failure: ' + options.id)
             }
             check.status = 'PASS'
@@ -390,6 +807,9 @@ try {
             check.error = error.message
         }
         result.checks.push(check)
+        if (process.env.C31F6_REMAINING === '1' && check.status === 'FAIL') {
+            break
+        }
     }
     const frameScript = (frameId, code) => evaluate(`c31f6.script(${tab.id},${frameId},${JSON.stringify(code)})`)
     const record = async (kind, id, run) => {
@@ -409,7 +829,11 @@ try {
             document.documentElement.style.cssText = ''
             document.body.style.cssText = 'margin:0;min-height:2400px'
             document.body.innerHTML =
-                '<input type="checkbox" id="pad" style="position:absolute;left:80px;top:60px;width:120px;height:100px"><button id="disabled" disabled style="position:absolute;left:260px;top:60px">disabled</button>'
+                '<input type="checkbox" id="pad" ' +
+                'style="position:absolute;left:80px;top:60px;' +
+                'width:120px;height:100px"><button ' +
+                'id="disabled" disabled style="position:absolut' +
+                'e;left:260px;top:60px">disabled</button>'
             window.scrollTo(0, 0)
             window.__mcpElementMap = {
                 pad: new WeakRef(document.getElementById('pad')),
@@ -470,7 +894,11 @@ try {
                         await script('window.__c31f6Events=[]')
                         ++result.handlerCalls
                         await evaluate(
-                            `c31f6.command(${JSON.stringify(action)},${JSON.stringify({ tabId: tab.id, frameId: 0, ...params, modifiers: mask })})`
+                            'c31f6.command(' +
+                                `${JSON.stringify(action)}` +
+                                ',' +
+                                `${JSON.stringify({ tabId: tab.id, frameId: 0, ...params, modifiers: mask })}` +
+                                ')'
                         )
                         const events = await script('window.__c31f6Events')
                         assert.ok(events.length > 0)
@@ -590,7 +1018,30 @@ try {
             await record('geometry', options.id, async () => {
                 const source = (options.remote ? base.replace('127.0.0.1', 'localhost') : base) + '/child?' + options.id
                 await script(
-                    `(() => {document.documentElement.style.cssText='';document.body.style.cssText='margin:0;min-height:2400px';document.body.innerHTML=${JSON.stringify(`<iframe id="geometry" src="${source}" style="position:absolute;left:100px;top:${options.scroll ? 1200 : 100}px;width:${options.zero ? 0 : 400}px;height:${options.zero ? 0 : 300}px;border:${options.border ?? (options.nested ? 11 : 0)}px solid;zoom:${options.zoom ?? 1};transform-origin:${options.origin ?? '0 0'};transform:${options.transform ?? (options.nested ? 'matrix(1.2,.2,-.1,1.1,0,0)' : 'none')}"></iframe>`)};window.scrollTo(0,0);return true})()`
+                    '(() => {document.documentElement.style.cssText' +
+                        "='';document.body.style.cssText='margin:0;" +
+                        "min-height:2400px';document.body.innerHTML=" +
+                        ('' +
+                            JSON.stringify(
+                                '<iframe id="geometry" src="' +
+                                    `${source}` +
+                                    '" style="position:absolute;left:100px;top:' +
+                                    `${options.scroll ? 1200 : 100}` +
+                                    'px;width:' +
+                                    `${options.zero ? 0 : 400}` +
+                                    'px;height:' +
+                                    `${options.zero ? 0 : 300}` +
+                                    'px;border:' +
+                                    `${options.border ?? (options.nested ? 11 : 0)}` +
+                                    'px solid;zoom:' +
+                                    `${options.zoom ?? 1}` +
+                                    ';transform-origin:' +
+                                    `${options.origin ?? '0 0'}` +
+                                    ';transform:' +
+                                    `${options.transform ?? (options.nested ? 'matrix(1.2,.2,-.1,1.1,0,0)' : 'none')}` +
+                                    '"></iframe>'
+                            )) +
+                        ';window.scrollTo(0,0);return true})()'
                 )
                 const frames = await poll(
                     () => evaluate(`c31f6.frames(${tab.id})`),
@@ -605,7 +1056,25 @@ try {
                         options.id
                     await frameScript(
                         first.frameId,
-                        `(() => {document.body.style.cssText='margin:0';document.body.innerHTML=${JSON.stringify(`<iframe id="geometry" src="${nestedSource}" style="position:absolute;left:${options.innerSimple ? 20 : 40}px;top:${options.innerSimple ? 20 : 50}px;width:240px;height:200px;border:${options.innerSimple ? 0 : 7}px solid;zoom:${options.innerZoom ?? 1};transform-origin:0 0;transform:${options.innerSimple ? 'scale(.8)' : 'matrix(.8,.1,.2,.9,0,0)'}"></iframe>`)};return true})()`
+                        "(() => {document.body.style.cssText='margin:0'" +
+                            ';document.body.innerHTML=' +
+                            ('' +
+                                JSON.stringify(
+                                    '<iframe id="geometry" src="' +
+                                        `${nestedSource}` +
+                                        '" style="position:absolute;left:' +
+                                        `${options.innerSimple ? 20 : 40}` +
+                                        'px;top:' +
+                                        `${options.innerSimple ? 20 : 50}` +
+                                        'px;width:240px;height:200px;border:' +
+                                        `${options.innerSimple ? 0 : 7}` +
+                                        'px solid;zoom:' +
+                                        `${options.innerZoom ?? 1}` +
+                                        ';transform-origin:0 0;transform:' +
+                                        `${options.innerSimple ? 'scale(.8)' : 'matrix(.8,.1,.2,.9,0,0)'}` +
+                                        '"></iframe>'
+                                )) +
+                            ';return true})()'
                     )
                     selected = (
                         await poll(
@@ -618,7 +1087,14 @@ try {
                 if (options.shadow) {
                     await frameScript(
                         selected.frameId,
-                        '(() => { const pad=document.getElementById("pad"),host=document.createElement("div");host.style.cssText="position:absolute;left:0;top:0;width:300px;height:200px";document.body.append(host);host.attachShadow({mode:"open"}).append(pad);window.__mcpElementMap.pad=new WeakRef(pad);return true })()'
+                        '(() => { const pad=document.getElementById("pa' +
+                            'd"),host=document.createElement("div");' +
+                            'host.style.cssText="position:absolute;left:0;' +
+                            'top:0;width:300px;height:200px";' +
+                            'document.body.append(host);' +
+                            'host.attachShadow({mode:"open"}).append(pad);' +
+                            'window.__mcpElementMap.pad=new WeakRef(pad);' +
+                            'return true })()'
                     )
                 }
                 if (options.scroll) {
@@ -627,7 +1103,15 @@ try {
                     )
                 }
                 const query = await evaluate(
-                    `c31f6.command('evaluate_in_frame',${JSON.stringify({ tabId: tab.id, frameId: selected.frameId, expression: '({url:location.href,marked:globalThis.__c31f6Events!==undefined})', timeout: 5000 })})`
+                    "c31f6.command('evaluate_in_frame'," +
+                        ('' +
+                            JSON.stringify({
+                                tabId: tab.id,
+                                frameId: selected.frameId,
+                                expression: '({url:location.href,marked:globalThis.__c31f6Events!==undefined})',
+                                timeout: 5000,
+                            })) +
+                        ')'
                 )
                 assert.equal(query.result?.value?.url, selected.url)
                 assert.equal(query.result?.value?.marked, true)
@@ -705,10 +1189,30 @@ try {
                 assert.equal(legacy.at(-1)?.target, 'pad')
                 await frameScript(selected.frameId, 'window.__c31f6Events=[]')
                 await evaluate(
-                    `c31f6.inputTouch(${JSON.stringify({ tabId: tab.id, frameId: selected.frameId, documentId: selected.documentId, modifiers: 10, type: 'touchStart', touchPoints: [{ x: 140, y: 110 }] })})`
+                    'c31f6.inputTouch(' +
+                        ('' +
+                            JSON.stringify({
+                                tabId: tab.id,
+                                frameId: selected.frameId,
+                                documentId: selected.documentId,
+                                modifiers: 10,
+                                type: 'touchStart',
+                                touchPoints: [{ x: 140, y: 110 }],
+                            })) +
+                        ')'
                 )
                 await evaluate(
-                    `c31f6.inputTouch(${JSON.stringify({ tabId: tab.id, frameId: selected.frameId, documentId: selected.documentId, modifiers: 10, type: 'touchEnd', touchPoints: [] })})`
+                    'c31f6.inputTouch(' +
+                        ('' +
+                            JSON.stringify({
+                                tabId: tab.id,
+                                frameId: selected.frameId,
+                                documentId: selected.documentId,
+                                modifiers: 10,
+                                type: 'touchEnd',
+                                touchPoints: [],
+                            })) +
+                        ')'
                 )
                 const touch = await frameScript(selected.frameId, 'window.__c31f6Events')
                 assert.equal(touch[0]?.target, 'pad')
@@ -727,7 +1231,18 @@ try {
                             await record('frame-modifiers', `${options.id}-${action}-${mask}`, async () => {
                                 await frameScript(selected.frameId, 'window.__c31f6Events=[]')
                                 await evaluate(
-                                    `c31f6.command(${JSON.stringify(action)},${JSON.stringify({ tabId: tab.id, frameId: selected.frameId, documentId: selected.documentId, ...event, modifiers: mask })})`
+                                    'c31f6.command(' +
+                                        `${JSON.stringify(action)}` +
+                                        ',' +
+                                        ('' +
+                                            JSON.stringify({
+                                                tabId: tab.id,
+                                                frameId: selected.frameId,
+                                                documentId: selected.documentId,
+                                                ...event,
+                                                modifiers: mask,
+                                            })) +
+                                        ')'
                                 )
                                 const events = await frameScript(selected.frameId, 'window.__c31f6Events')
                                 assert.ok(events.length > 0)
@@ -769,14 +1284,30 @@ try {
         result.geometryDiagnostics = []
         const debug = (method, params = {}, sessionId) =>
             evaluate(
-                `c31f6.debug(${tab.id},${JSON.stringify(method)},${JSON.stringify(params)},${JSON.stringify(sessionId)})`
+                'c31f6.debug(' +
+                    `${tab.id}` +
+                    ',' +
+                    `${JSON.stringify(method)}` +
+                    ',' +
+                    `${JSON.stringify(params)}` +
+                    ',' +
+                    `${JSON.stringify(sessionId)}` +
+                    ')'
             )
         const frameScript = (frameId, code) => evaluate(`c31f6.script(${tab.id},${frameId},${JSON.stringify(code)})`)
         for (const remote of [false, true]) {
             const observation = { remote }
             const source = remote ? base.replace('127.0.0.1', 'localhost') : base
             await script(
-                `(() => { document.body.style.cssText='margin:0';document.body.innerHTML='<iframe id="geometry" src="${source}/child" style="position:absolute;left:100px;top:100px;width:300px;height:250px;border:11px solid;transform-origin:0 0;transform:matrix(1.2,.2,-.1,1.1,0,0)"></iframe>';return true })()`
+                "(() => { document.body.style.cssText='margin:0" +
+                    "';document.body.innerHTML='<iframe " +
+                    'id="geometry" src="' +
+                    `${source}` +
+                    '/child" style="position:absolute;left:100px;' +
+                    'top:100px;width:300px;height:250px;' +
+                    'border:11px solid;transform-origin:0 0;' +
+                    'transform:matrix(1.2,.2,-.1,1.1,0,0)">' +
+                    "</iframe>';return true })()"
             )
             const frames = await poll(
                 () => evaluate(`c31f6.frames(${tab.id})`),
@@ -786,7 +1317,15 @@ try {
             observation.child = child
             await frameScript(
                 child.frameId,
-                `(() => { document.body.style.cssText='margin:0';document.body.innerHTML='<iframe id="nested" src="${base}/child" style="position:absolute;left:40px;top:50px;width:140px;height:120px;border:7px solid;transform-origin:0 0;transform:matrix(.8,.1,.2,.9,0,0)"></iframe>';return true })()`
+                "(() => { document.body.style.cssText='margin:0" +
+                    "';document.body.innerHTML='<iframe " +
+                    'id="nested" src="' +
+                    `${base}` +
+                    '/child" style="position:absolute;left:40px;' +
+                    'top:50px;width:140px;height:120px;border:7px ' +
+                    'solid;transform-origin:0 0;' +
+                    'transform:matrix(.8,.1,.2,.9,0,0)"></iframe>\';' +
+                    'return true })()'
             )
             await poll(
                 () => evaluate(`c31f6.frames(${tab.id})`),
@@ -837,7 +1376,7 @@ try {
     result.status = result.checks.some((c) => c.status === 'FAIL') ? 'FAIL' : 'PASS'
 } catch (error) {
     result.status = 'FAIL'
-    result.error = { message: error.message, stack: error.stack }
+    result.error = { message: error.message, stack: error.stack, ...(error.code ? { code: error.code } : {}) }
 } finally {
     const errors = []
     result.cleanupAttempts = []
@@ -846,20 +1385,24 @@ try {
         try {
             await close()
             if (process.env.WHEEL_CLEANUP_FAILURE === name) {
+                // noinspection ExceptionCaughtLocallyJS — 将受控清理失败收集为测试结果
                 throw new Error('Controlled cleanup failure: ' + name)
             }
         } catch (error) {
             errors.push({ resource: name, error: String(error) })
         }
     }
+    if (restorePublicWheel) {
+        await cleanup('public-wheel', restorePublicWheel)
+    }
     await cleanup('chrome', async () => {
-        if (chrome.exitCode === null && chrome.signalCode === null) {
-            const exited = once(chrome, 'exit')
+        if (!chromeClosed) {
             chrome.kill('SIGTERM')
-            await Promise.race([exited, delay(3000)])
-            if (chrome.exitCode === null && chrome.signalCode === null) {
+            await Promise.race([closed, delay(3000)])
+            // noinspection PointlessBooleanExpressionJS — 等待期间进程可以退出
+            if (!chromeClosed) {
                 chrome.kill('SIGKILL')
-                await exited
+                await closed
             }
         }
     })
@@ -872,14 +1415,8 @@ try {
         stderr.end()
         await closed
     })
-    await cleanup('pipe', () => {
-        for (const call of pending.values()) {
-            clearTimeout(call.timer)
-            call.reject(new Error('Native test cleanup'))
-        }
-        pending.clear()
-    })
-    await cleanup('profile', () => fs.rmSync(path.join(work, 'profile'), { recursive: true }))
+    await cleanup('pipe', () => rejectPending(new Error('Native test cleanup')))
+    await cleanup('profile', () => fs.rmSync(path.join(work, 'profile'), { recursive: true, force: true }))
     if (errors.length) {
         result.cleanupErrors = errors
         result.businessStatus = result.status
@@ -887,6 +1424,7 @@ try {
     }
     result.resources = {
         chromeExited: chrome.exitCode !== null || chrome.signalCode !== null,
+        chromeClosed,
         pipePending: pending.size,
         httpListening: http.listening,
         logClosed: stderr.closed,

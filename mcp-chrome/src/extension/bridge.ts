@@ -5,6 +5,13 @@
  * 使用 HTTP + WebSocket 实现
  */
 
+import type {
+    BrowserRequestContext,
+    CookieScope,
+    FrameSelection,
+    SemanticTarget,
+    UserActionKind,
+} from '../core/browser-driver.js'
 import {
     type ActionableClickResult,
     type BrowserTabGroupInfo,
@@ -30,6 +37,7 @@ import {
     type UpdateGroupOptions,
     type UpdatePageOptions,
 } from '../core/browser-driver.js'
+import { type BrowserEventAction, type EventCommand, eventRefTarget } from '../core/browser-events.js'
 import {
     creationError,
     setErrorPageContext,
@@ -39,14 +47,6 @@ import {
 } from '../core/errors.js'
 import { type ConsoleLogEntry, DEFAULT_TIMEOUT, type NetworkRequestEntry } from '../core/types.js'
 import { remainingNavigationTimeout } from '../core/utils.js'
-import { eventRefTarget, type BrowserEventAction, type EventCommand } from '../core/browser-events.js'
-import type {
-    BrowserRequestContext,
-    FrameSelection,
-    SemanticTarget,
-    CookieScope,
-    UserActionKind,
-} from '../core/browser-driver.js'
 import { type ExtensionConnectionInfo, ExtensionHttpServer } from './http-server.js'
 
 /** RPC 传输余量（毫秒）：给网络往返和 Extension 处理留出的额外时间 */
@@ -75,6 +75,7 @@ const CONDITIONAL_ACTIONS = new Set([
     'scroll',
     'evaluate',
     'evaluate_in_frame',
+    'prepare_frame_evaluation',
     'debugger_send',
     'keyboard_focus',
     'input_key',
@@ -150,10 +151,12 @@ export class ExtensionBridge implements IBrowserDriver {
             if (tabId === undefined || String(tabId) !== condition.targetId) {
                 throw new DriverCapabilityError('条件动作的目标与请求目标不一致，未执行动作')
             }
-            if (context) {
-                context.pendingPageCondition = null
-            } else {
-                this.pendingPageCondition = null
+            if (action !== 'prepare_frame_evaluation') {
+                if (context) {
+                    context.pendingPageCondition = null
+                } else {
+                    this.pendingPageCondition = null
+                }
             }
             return {
                 ...(condition.expectedUrl !== undefined ? { expectedUrl: condition.expectedUrl } : {}),
@@ -276,6 +279,7 @@ export class ExtensionBridge implements IBrowserDriver {
                     url,
                     active: false,
                     ...options,
+                    sourceTabId: this.currentTabId ?? undefined,
                     waitUntil: 'load',
                     timeout,
                 },
@@ -896,6 +900,7 @@ export class ExtensionBridge implements IBrowserDriver {
                         typeof value.context !== 'object' ||
                         Array.isArray(value.context)
                     ) {
+                        // noinspection ExceptionCaughtLocallyJS -- preserve the output-error parsing stage
                         throw new TypeError('浏览器返回的 evaluate 输出错误详情格式无效')
                     }
                     detail = {
@@ -925,6 +930,7 @@ export class ExtensionBridge implements IBrowserDriver {
         }
         try {
             if (typeof result.result !== 'string') {
+                // noinspection ExceptionCaughtLocallyJS -- preserve the output-error parsing stage
                 throw new TypeError('浏览器返回的 evaluate 结果不是 JSON 字符串')
             }
             return JSON.parse(result.result)
@@ -944,7 +950,8 @@ export class ExtensionBridge implements IBrowserDriver {
         xpath?: string,
         timeout?: number,
         semanticOrPointOrMatchIndex?: SemanticTarget | { x: number; y: number } | number,
-        matchIndex?: number
+        matchIndex?: number,
+        coordinateSpace?: 'viewport' | 'frame'
     ): Promise<
         Array<{
             refId: string
@@ -973,6 +980,7 @@ export class ExtensionBridge implements IBrowserDriver {
                 point,
                 semantic,
                 matchIndex,
+                coordinateSpace,
             },
             timeout
         )) as Array<{
@@ -1651,26 +1659,65 @@ export class ExtensionBridge implements IBrowserDriver {
         staleContextRetry?: StaleContextRetryPolicy
         frameContext?: Record<string, unknown>
     }> {
-        return (await this.httpServer.sendCommand(
-            'evaluate_in_frame',
-            {
-                tabId: this.requireCurrentTabId(),
-                frameId,
-                expression,
-                returnByValue: true,
-                awaitPromise: true,
-                timeout,
-                staleContextRetry,
-            },
-            timeout,
-            userAction
-        )) as {
-            result?: { value?: unknown }
-            exceptionDetails?: { text: string }
-            retryAttempted?: boolean
-            retryReason?: string
-            staleContextRetry?: StaleContextRetryPolicy
-            frameContext?: Record<string, unknown>
+        const deadline = timeout === undefined ? undefined : Date.now() + timeout
+        const remaining = () => (deadline === undefined ? undefined : remainingNavigationTimeout(deadline))
+        let preparedContext: Record<string, unknown> | undefined
+        try {
+            const prepared = (await this.httpServer.sendCommand(
+                'prepare_frame_evaluation',
+                { tabId: this.requireCurrentTabId(), frameId, timeout: remaining() },
+                remaining()
+            )) as { preparedContext?: Record<string, unknown> } | null
+            if (
+                !prepared?.preparedContext ||
+                typeof prepared.preparedContext !== 'object' ||
+                Array.isArray(prepared.preparedContext)
+            ) {
+                throw new StructuredToolError(
+                    'ACTION_RESULT_INVALID',
+                    'iframe 执行准备未返回有效上下文，未发送脚本',
+                    '请读取 frame 列表和当前连接状态',
+                    { actionExecuted: false, actionStatus: 'not_started', retryable: false }
+                )
+            }
+            preparedContext = prepared.preparedContext
+        } catch (error) {
+            if (error instanceof Error && error.message === 'Unknown action: prepare_frame_evaluation') {
+                console.warn('[MCP] 当前连接使用单阶段 iframe 兼容路径，准备期间取消的执行结果将标记为 unknown')
+            } else {
+                throw setErrorPageContext(error, { contextPhase: 'preparation', frameResolutionPreparation: true })
+            }
+        }
+        try {
+            this.options.requestContext?.()?.signal?.throwIfAborted()
+            return (await this.httpServer.sendCommand(
+                'evaluate_in_frame',
+                {
+                    tabId: this.requireCurrentTabId(),
+                    frameId,
+                    expression,
+                    returnByValue: true,
+                    awaitPromise: true,
+                    timeout: remaining(),
+                    staleContextRetry,
+                    ...(preparedContext ? { preparedContext } : {}),
+                },
+                remaining(),
+                userAction
+            )) as {
+                result?: { value?: unknown }
+                exceptionDetails?: { text: string }
+                retryAttempted?: boolean
+                retryReason?: string
+                staleContextRetry?: StaleContextRetryPolicy
+                frameContext?: Record<string, unknown>
+            }
+        } catch (error) {
+            const action = this.options.requestContext?.()?.userAction
+            if (action && !action.dispatched) {
+                throw setErrorPageContext(error, { contextPhase: 'preparation', frameResolutionPreparation: true })
+            }
+            throw error
         }
     }
 
@@ -1725,7 +1772,11 @@ export class ExtensionBridge implements IBrowserDriver {
             remainingNavigationTimeout(deadline)
             return result
         } catch (error) {
-            if (error instanceof Error && error.message.startsWith(`Request timeout for action: ${action} (`)) {
+            if (
+                error instanceof Error &&
+                !(error instanceof StructuredToolError) &&
+                error.message.startsWith(`Request timeout for action: ${action} (`)
+            ) {
                 throw new StructuredToolError('TIMEOUT', error.message, '请回读实际页面，勿自动重放操作', {
                     actionExecuted: 'unknown',
                     actionStatus: 'unknown',

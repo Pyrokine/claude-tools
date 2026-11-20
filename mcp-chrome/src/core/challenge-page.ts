@@ -123,9 +123,14 @@ export function inspectChallengePage(options: {
     const cloudflareFramePresent = Array.from(document.querySelectorAll('iframe')).some((el) => isCloudflareFrame(el))
     const normalizedTitle = title.trim().toLowerCase().replace(/…/g, '...')
     const titlePending = options.titleNeedles.some((needle) => normalizedTitle.includes(String(needle).toLowerCase()))
-    const textHits = options.textMarkers.filter((marker) =>
-        visibleBodyText.toLowerCase().includes(String(marker).toLowerCase())
-    )
+    const normalizedBody = visibleBodyText.trim().toLowerCase()
+    const textHits = options.textMarkers.filter((marker) => {
+        const normalizedMarker = String(marker).toLowerCase()
+        return (
+            normalizedBody.includes(normalizedMarker) &&
+            (titlePending || selectorHits.length > 0 || normalizedBody.startsWith(normalizedMarker))
+        )
+    })
     const originResponsePending = options.originResponsePendingTextMarkers.some((marker) =>
         visibleBodyText.toLowerCase().includes(String(marker).toLowerCase())
     )

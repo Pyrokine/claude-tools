@@ -10,18 +10,18 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import type { CookieFilter, CookieScope } from '../core/browser-driver.js'
 import {
     CWD_PATH_PREFIX,
     formatErrorResponse,
     formatResponse,
     getUnifiedSession,
     resolveScopedOutputPath,
-    TMP_PATH_PREFIX,
     StructuredToolError,
+    TMP_PATH_PREFIX,
     writePrivateFile,
 } from '../core/index.js'
 import { TEMP_OUTPUT_RETENTION } from '../core/utils.js'
-import type { CookieFilter, CookieScope } from '../core/browser-driver.js'
 
 /**
  * cookies 参数 schema
@@ -78,6 +78,7 @@ async function handleCookies(args: z.infer<typeof cookiesSchema>): Promise<{
                 if (
                     ![args.name, args.domain, args.url].some((value) => value !== undefined && value.trim().length > 0)
                 ) {
+                    // noinspection ExceptionCaughtLocallyJS -- 参数错误经同一出口保留公开错误结构
                     throw new StructuredToolError(
                         'INVALID_ARGUMENT',
                         'cookies action=get 必须带非空 name、domain 或 url 过滤参数',

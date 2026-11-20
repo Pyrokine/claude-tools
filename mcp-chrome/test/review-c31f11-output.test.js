@@ -20,7 +20,9 @@ test('C31F11 SDK retains empty page exceptions and completed stealth output fail
     const { getErrorSource } = await imp('dist/core/errors.js');
     const { ExtensionBridge } = await imp('dist/extension/bridge.js');
     const { registerEvaluateTool } = await imp('dist/tools/evaluate.js');
-    const pageScriptsSource = fs.readFileSync(path.join(root, 'extension/src/background/page-scripts.ts'), 'utf8');
+    const pageScriptsSource = fs.readFileSync(path.join(root, 'extension/src/background/page-scripts.ts'), {
+        encoding: 'utf8',
+    });
     const executeStart = pageScriptsSource.indexOf('export async function executeCode(');
     const executeEnd = pageScriptsSource.indexOf('// 提取文本', executeStart);
     assert.ok(executeStart >= 0 && executeEnd > executeStart, 'production executeCode source boundaries');
@@ -36,15 +38,32 @@ test('C31F11 SDK retains empty page exceptions and completed stealth output fail
         sdkCalls: 0,
         registeredCalls: 0,
         carrier:
-            'Actual SDK Client/McpServer -> registered evaluate -> UnifiedSession -> ExtensionBridge -> production ExtensionHttpServer.sendCommand/handleMessage. Only its socket endpoint is controlled. Evaluate packets run current production executeCode in Node VM. Precise packets execute supplied JS in VM and return controlled CDP result/exceptionDetails. Frame resolver/snapshots/metadata are controlled. No native Chrome, DOM, extension injection, CSP HTTP header enforcement, real sockets, pairing/discovery or browser frame routing is claimed.',
+            'Actual SDK Client/McpServer -> registered ' +
+            'evaluate -> UnifiedSession -> ExtensionBridge -> ' +
+            'production ExtensionHttpServer.sendCommand/handleM' +
+            'essage. Only its socket endpoint is controlled. ' +
+            'Evaluate packets run current production ' +
+            'executeCode in Node VM. Precise packets execute ' +
+            'supplied JS in VM and return controlled CDP ' +
+            'result/exceptionDetails. Frame ' +
+            'resolver/snapshots/metadata are controlled. No ' +
+            'native Chrome, DOM, extension injection, CSP HTTP ' +
+            'header enforcement, real sockets, ' +
+            'pairing/discovery or browser frame routing is ' +
+            'claimed.',
         policyCarrier:
-            'VM codeGeneration.strings=false is real V8 policy, not a thrown test Error. It verifies trusted compile/source logic only; it is not browser CSP.',
+            'VM codeGeneration.strings=false is real V8 policy,' +
+            ' not a thrown test Error. It verifies trusted ' +
+            'compile/source logic only; it is not browser CSP.',
         checks: [],
         cleanup: [],
         sources: {},
         injectedFunction: {
             source: 'extension/src/background/page-scripts.ts#executeCode',
-            loader: 'verbatim standalone production injected function, project TypeScript transpileModule ES2022; no semantic rewriting',
+            loader:
+                'verbatim standalone production injected function, ' +
+                'project TypeScript transpileModule ES2022; no ' +
+                'semantic rewriting',
         },
     };
     const restores = [];
@@ -128,6 +147,19 @@ test('C31F11 SDK retains empty page exceptions and completed stealth output fail
         if (action === 'resolve_frame') {
             return { frameId: 7, offset: { x: 11, y: 17 }, frameContext: { documentId: 'controlled-child-document' } };
         }
+        if (action === 'prepare_frame_evaluation') {
+            current.preparedContext = {
+                tabId: params.tabId,
+                frameId: params.frameId,
+                documentId: 'controlled-child-document',
+                parentFrameId: 0,
+                parentDocumentId: 'controlled-main-document',
+                url: page.url + '/frame',
+                cdpFrameId: 'controlled-cdp-frame',
+                executionContextId: 17,
+            };
+            return { preparedContext: current.preparedContext };
+        }
         if (action === 'evaluate') {
             const invoke = vm.runInContext(`(${executeCode.toString()})`, current.context);
             const value = await invoke(params.code, params.timeout);
@@ -144,6 +176,8 @@ test('C31F11 SDK retains empty page exceptions and completed stealth output fail
             return value;
         }
         if (action === 'evaluate_in_frame') {
+            assert.ok(current.preparedContext, 'Frame preparation must precede evaluation');
+            assert.deepEqual(params.preparedContext, current.preparedContext);
             const value = await executePrecise(params);
             current.rawExecution = value;
             return value;
@@ -295,7 +329,12 @@ test('C31F11 SDK retains empty page exceptions and completed stealth output fail
                     kind: 'return',
                     output,
                     originalMessage: 'OWNED_FIRST_OUTPUT_FAILURE',
-                    statement: `let calls=0;JSON.stringify=()=>{if(++calls===1)throw new Error("OWNED_FIRST_OUTPUT_FAILURE");return ${JSON.stringify(value)}};return 42`,
+                    statement:
+                        'let calls=0;JSON.stringify=()=>' +
+                        '{if(++calls===1)throw new ' +
+                        'Error("OWNED_FIRST_OUTPUT_FAILURE");return ' +
+                        `${JSON.stringify(value)}` +
+                        '};return 42',
                 });
             }
             for (const [kind, statement, expected] of [
@@ -393,7 +432,9 @@ test('C31F11 SDK retains empty page exceptions and completed stealth output fail
                 statement = 'return {toJSON(){throw new Error("owned serialization failure")}}';
             } else if (spec.output === 'get-prototype') {
                 statement =
-                    'return new Proxy({owned:true,value:42},{getPrototypeOf(){throw new Error("owned prototype read")}})';
+                    'return new Proxy({owned:true,value:42},' +
+                    '{getPrototypeOf(){throw new Error("owned ' +
+                    'prototype read")}})';
             } else if (spec.output === 'summary-json') {
                 statement = 'JSON.stringify=()=>{throw new Error("owned JSON serializer unavailable")};return 42';
             } else if (spec.kind === 'revoked-proxy') {
@@ -470,7 +511,20 @@ test('C31F11 SDK retains empty page exceptions and completed stealth output fail
                 }
             }
             report.checks.push({
-                name: `${spec.group}/${spec.mode}/${spec.framed ? 'frame' : 'main'}/${spec.args ? 'args' : 'expression'}/${spec.kind}/${spec.output ?? ''}`,
+                name:
+                    '' +
+                    `${spec.group}` +
+                    '/' +
+                    `${spec.mode}` +
+                    '/' +
+                    `${spec.framed ? 'frame' : 'main'}` +
+                    '/' +
+                    `${spec.args ? 'args' : 'expression'}` +
+                    '/' +
+                    `${spec.kind}` +
+                    '/' +
+                    `${spec.output ?? ''}` +
+                    '',
                 spec,
                 input,
                 rawExecution: current.rawExecution,

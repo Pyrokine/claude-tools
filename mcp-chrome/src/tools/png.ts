@@ -1,4 +1,5 @@
 import { deflateSync, inflateSync } from 'zlib'
+import { StructuredToolError } from '../core/errors.js'
 
 export const MAX_COMPARE_PNG_BYTES = 25 * 1024 * 1024
 export const MAX_COMPARE_PIXELS = 12_000_000
@@ -18,16 +19,32 @@ export function assertScreenshotBudget(width: number, height: number, scale = 1)
         scaledWidth * scaledHeight > MAX_COMPARE_PIXELS ||
         scaledWidth * scaledHeight * 4 > MAX_SCREENSHOT_ESTIMATED_BYTES
     ) {
-        throw new Error(
+        throw new StructuredToolError(
+            'SCREENSHOT_BUDGET_EXCEEDED',
             `screenshot 尺寸 ${scaledWidth}x${scaledHeight} 超出预算（单边 ${MAX_SCREENSHOT_DIMENSION}、` +
-                `像素 ${MAX_COMPARE_PIXELS}、预计 RGBA ${MAX_SCREENSHOT_ESTIMATED_BYTES} 字节），请用 clip 或 scale 缩小截图`
+                `像素 ${MAX_COMPARE_PIXELS}、预计 RGBA ${MAX_SCREENSHOT_ESTIMATED_BYTES} 字节），请用 clip 或 scale 缩小截图`,
+            '使用 clip 或降低 scale 后重新截图',
+            {
+                width: scaledWidth,
+                height: scaledHeight,
+                maxDimension: MAX_SCREENSHOT_DIMENSION,
+                maxPixels: MAX_COMPARE_PIXELS,
+                maxEstimatedBytes: MAX_SCREENSHOT_ESTIMATED_BYTES,
+                actionExecuted: false,
+                actionStatus: 'not_started',
+            }
         )
     }
 }
 
 export function assertScreenshotBase64Budget(data: string): void {
     if (Math.floor((data.length * 3) / 4) > MAX_COMPARE_PNG_BYTES) {
-        throw new Error(`screenshot 数据超过 ${MAX_COMPARE_PNG_BYTES} 字节，请用 clip 或 scale 缩小截图`)
+        throw new StructuredToolError(
+            'SCREENSHOT_BUDGET_EXCEEDED',
+            `screenshot 数据超过 ${MAX_COMPARE_PNG_BYTES} 字节，请用 clip 或 scale 缩小截图`,
+            '使用 clip 或降低 scale 后重新截图',
+            { maxEncodedBytes: MAX_COMPARE_PNG_BYTES, failureStage: 'output' }
+        )
     }
 }
 
