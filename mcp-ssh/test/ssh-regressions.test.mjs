@@ -3497,6 +3497,12 @@ async function r29SftpFixture(t, faultStage = undefined, rejectRequest = false, 
         password: 'synthetic',
         alias,
     })
+    if (process.platform === 'win32') {
+        // noinspection JSAccessibilityCheck — 持久化权限检查完成后再验证 SFTP 故障期限
+        await sessionManager.persistQueue
+        const persisted = JSON.parse(fs.readFileSync(sessionManager.persistPath, 'utf8'))
+        assert.ok(persisted.some((entry) => entry.alias === alias && entry.port === server.address().port))
+    }
     const callbacks = new Map()
     registerFileTools({
         registerTool(name, _schema, callback) {
@@ -3758,6 +3764,7 @@ await import(${JSON.stringify(moduleUrl('index.js'))})
         t.diagnostic(
             JSON.stringify({
                 layer: 'stdio-MCP',
+                server: client.getServerVersion(),
                 isolation: JSON.parse(bootstrapProof),
                 toolsListed: tools.tools.length,
                 connected: connected.body,

@@ -1940,7 +1940,12 @@ export class SessionManager {
 
             try {
                 verificationDeadline = Date.now() + readyTimeout
-                const algorithms = this.knownHosts.getHostKeyAlgorithms(config.host, config.port ?? 22)
+                const algorithms = this.knownHosts.getHostKeyAlgorithms(
+                    config.host,
+                    config.port ?? 22,
+                    verificationSignal,
+                    verificationDeadline
+                )
                 if (algorithms.length > 0) {
                     // ssh2 的 prepend 跳过已有项，先 remove 才能调整默认顺序
                     connectConfig.algorithms = {

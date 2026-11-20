@@ -6,8 +6,8 @@ import * as path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import ssh2, { type ServerHostKeyAlgorithm } from 'ssh2'
 import { validateKnownHostsPath } from './security.js'
-import type { ConnectionFailureDetails } from './types.js'
-import { checkWindowsAcl, checkWindowsKnownHostsIntegrity } from './windows-acl.js'
+import { DEFAULT_EXEC_TIMEOUT_MS, type ConnectionFailureDetails } from './types.js'
+import { checkWindowsAcl, checkWindowsKnownHostsIntegrity, getWindowsPowerShellEnv } from './windows-acl.js'
 
 export interface HostKeyTrust {
     status: 'known' | 'added'
@@ -24,24 +24,36 @@ export class HostKeyError extends Error {
     }
 }
 
-function assertIntegrity(filePath: string): void {
-    if (process.platform === 'win32') {
-        checkWindowsKnownHostsIntegrity(filePath)
-        return
+function assertVerificationActive(signal?: AbortSignal, deadline?: number): void {
+    signal?.throwIfAborted()
+    if (deadline !== undefined && Date.now() >= deadline) {
+        throw new HostKeyError('known_hosts verification deadline exhausted')
     }
-    let current = filePath
-    for (;;) {
-        const stats = fs.statSync(current)
-        const trustedOwner = stats.uid === 0 || stats.uid === process.getuid?.()
-        const stickyDirectory = stats.isDirectory() && (stats.mode & 0o1000) !== 0
-        if (!trustedOwner || ((stats.mode & 0o022) !== 0 && !stickyDirectory)) {
-            throw new HostKeyError(`known_hosts has an untrusted owner or writer: ${current}`)
-        }
-        const parent = path.dirname(current)
-        if (parent === current) {
+}
+
+function assertIntegrity(filePath: string, signal?: AbortSignal, deadline?: number): void {
+    assertVerificationActive(signal, deadline)
+    try {
+        if (process.platform === 'win32') {
+            checkWindowsKnownHostsIntegrity(filePath, deadline)
             return
         }
-        current = parent
+        let current = filePath
+        for (;;) {
+            const stats = fs.statSync(current)
+            const trustedOwner = stats.uid === 0 || stats.uid === process.getuid?.()
+            const stickyDirectory = stats.isDirectory() && (stats.mode & 0o1000) !== 0
+            if (!trustedOwner || ((stats.mode & 0o022) !== 0 && !stickyDirectory)) {
+                throw new HostKeyError(`known_hosts has an untrusted owner or writer: ${current}`)
+            }
+            const parent = path.dirname(current)
+            if (parent === current) {
+                return
+            }
+            current = parent
+        }
+    } finally {
+        assertVerificationActive(signal, deadline)
     }
 }
 
@@ -104,6 +116,7 @@ function localProcessDomain(deadline: number): string | undefined {
                 : ['-n', 'kern.bootsessionuuid'],
             {
                 timeout: Math.max(1, Math.min(5000, deadline - Date.now())),
+                ...(windows ? { env: getWindowsPowerShellEnv() } : {}),
                 encoding: 'utf8',
                 windowsHide: true,
                 maxBuffer: 16_384,
@@ -162,9 +175,12 @@ async function removeLockOwner(directory: string, owner: string): Promise<void> 
 async function inspectLock(
     directory: string,
     domain: string | undefined,
-    preparation = false
+    preparation = false,
+    signal?: AbortSignal,
+    deadline?: number
 ): Promise<string | undefined> {
     try {
+        assertVerificationActive(signal, deadline)
         const stats = await fs.promises.lstat(directory)
         if (stats.isFile()) {
             return 'legacy lock file has no verifiable owner; it was retained'
@@ -172,8 +188,9 @@ async function inspectLock(
         if (!stats.isDirectory()) {
             return 'lock owner identity could not be verified; it was retained'
         }
-        assertIntegrity(directory)
+        assertIntegrity(directory, signal, deadline)
         const entries = await fs.promises.readdir(directory)
+        assertVerificationActive(signal, deadline)
         if (entries.length === 0 && !preparation) {
             await removeEmptyLock(directory)
             return
@@ -184,13 +201,15 @@ async function inspectLock(
         }
         const ownerPath = path.join(directory, entries[0])
         const ownerStats = await fs.promises.lstat(ownerPath)
+        assertVerificationActive(signal, deadline)
         if (!ownerStats.isFile() || ownerStats.size > 4096) {
             return 'lock owner identity could not be verified; it was retained'
         }
-        assertIntegrity(ownerPath)
+        assertIntegrity(ownerPath, signal, deadline)
         let owner: { version?: number; pid?: number; domain?: string }
         try {
             owner = JSON.parse(await fs.promises.readFile(ownerPath, 'utf8'))
+            assertVerificationActive(signal, deadline)
         } catch (error) {
             if (error instanceof SyntaxError) {
                 return 'lock owner identity could not be verified; it was retained'
@@ -213,6 +232,7 @@ async function inspectLock(
             process.kill(owner.pid, 0)
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+                assertVerificationActive(signal, deadline)
                 await removeLockOwner(directory, entries[0])
                 return
             }
@@ -224,6 +244,7 @@ async function inspectLock(
         }
         return 'lock is held by a live process'
     } catch (error) {
+        assertVerificationActive(signal, deadline)
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
             return
         }
@@ -293,9 +314,14 @@ export class KnownHosts {
             : ['/etc/ssh/ssh_known_hosts', '/etc/ssh/ssh_known_hosts2']
     ) {}
 
-    getHostKeyAlgorithms(host: string, port: number): ServerHostKeyAlgorithm[] {
+    getHostKeyAlgorithms(
+        host: string,
+        port: number,
+        signal?: AbortSignal,
+        deadline?: number
+    ): ServerHostKeyAlgorithm[] {
         const types = new Set<string>()
-        for (const { type, revoked } of this.matchingKeys(knownHostName(host, port))) {
+        for (const { type, revoked } of this.matchingKeys(knownHostName(host, port), signal, deadline)) {
             if (!revoked) {
                 types.add(type)
             }
@@ -317,7 +343,7 @@ export class KnownHosts {
         port: number,
         rawKey: Buffer,
         signal?: AbortSignal,
-        deadline = Date.now() + 5000
+        deadline = Date.now() + DEFAULT_EXEC_TIMEOUT_MS
     ): Promise<HostKeyTrust> {
         const name = knownHostName(host, port)
         const parsed = ssh2.utils.parseKey(rawKey)
@@ -325,23 +351,21 @@ export class KnownHosts {
             throw new HostKeyError('Unsupported or damaged server host key')
         }
         const fingerprint = `SHA256:${createHash('sha256').update(rawKey).digest('base64').replace(/=+$/, '')}`
-        const check = (): void => {
-            signal?.throwIfAborted()
-            if (Date.now() >= deadline) {
-                throw new HostKeyError('known_hosts verification deadline exhausted')
-            }
-        }
+        const check = (): void => assertVerificationActive(signal, deadline)
         check()
-        if (this.lookup(name, rawKey)) {
+        const known = this.lookup(name, rawKey, signal, deadline)
+        check()
+        if (known) {
             return { status: 'known', fingerprint }
         }
         const real = validateKnownHostsPath(this.userFile)
         const parent = path.dirname(real)
+        check()
         fs.mkdirSync(parent, { recursive: true, mode: 0o700 })
-        assertIntegrity(parent)
+        assertIntegrity(parent, signal, deadline)
         const lockPath = `${real}.mcp-lock`
-        const lockDeadline = Math.min(deadline, Date.now() + 5000)
-        const domain = localProcessDomain(lockDeadline)
+        const domain = localProcessDomain(deadline)
+        check()
         const identity = `${process.pid}-${randomBytes(16).toString('hex')}`
         const preparation = `${lockPath}.prepare-${identity}`
         const owner = `owner-${identity}.json`
@@ -356,15 +380,20 @@ export class KnownHosts {
             for (const entry of await fs.promises.readdir(parent)) {
                 if (entry.startsWith(prefix) && /^\d+-[\da-f]{32}$/.test(entry.slice(prefix.length))) {
                     check()
-                    await inspectLock(path.join(parent, entry), domain, true)
+                    await inspectLock(path.join(parent, entry), domain, true, signal, deadline)
                 }
             }
             check()
             await fs.promises.mkdir(preparation, { mode: 0o700 })
             prepared = true
-            if (process.platform === 'win32' && checkWindowsAcl(preparation, true) !== 'key_path_usable') {
-                // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
-                throw new HostKeyError('known_hosts lock preparation permissions could not be verified')
+            check()
+            if (process.platform === 'win32') {
+                const acl = checkWindowsAcl(preparation, true, deadline)
+                check()
+                if (acl !== 'key_path_usable') {
+                    // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
+                    throw new HostKeyError('known_hosts lock preparation permissions could not be verified')
+                }
             }
             await fs.promises.writeFile(
                 path.join(preparation, owner),
@@ -374,18 +403,28 @@ export class KnownHosts {
                     mode: 0o600,
                 }
             )
-            assertIntegrity(path.join(preparation, owner))
+            assertIntegrity(path.join(preparation, owner), signal, deadline)
+            check()
+            const lockDeadline = Math.min(deadline, Date.now() + 5000)
             let waitingReason = 'another writer'
-            while (!owned) {
+            const checkLockBudget = (): void => {
                 signal?.throwIfAborted()
                 if (Date.now() >= lockDeadline) {
-                    // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                     throw new HostKeyError(`known_hosts is locked: ${waitingReason}`)
                 }
-                let waiting = await inspectLock(lockPath, domain)
+            }
+            while (!owned) {
+                checkLockBudget()
+                let waiting: string | undefined
+                try {
+                    waiting = await inspectLock(lockPath, domain, false, signal, lockDeadline)
+                } catch (error) {
+                    checkLockBudget()
+                    throw error
+                }
                 waitingReason = waiting ?? waitingReason
+                checkLockBudget()
                 if (!waiting) {
-                    check()
                     try {
                         // Await publication even if canceled, so ownership is recorded before cleanup.
                         await fs.promises.rename(preparation, lockPath)
@@ -402,6 +441,7 @@ export class KnownHosts {
                                 throw cause
                             }
                         })
+                        checkLockBudget()
                         if (target?.isDirectory()) {
                             await removeEmptyLock(lockPath)
                         } else if ((code === 'EPERM' || code === 'EACCES') && !target?.isFile()) {
@@ -412,28 +452,27 @@ export class KnownHosts {
                     }
                 }
                 if (!owned) {
-                    if (Date.now() >= lockDeadline) {
-                        // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
-                        throw new HostKeyError(`known_hosts is locked: ${waiting}`)
-                    }
+                    checkLockBudget()
                     await delay(Math.min(25, lockDeadline - Date.now()), undefined, { signal })
                 }
             }
             check()
-            if (this.lookup(name, rawKey)) {
+            if (this.lookup(name, rawKey, signal, deadline)) {
                 result = { status: 'known', fingerprint }
             } else {
-                const original = this.read(this.userFile, false)
+                const original = this.read(this.userFile, false, signal, deadline)
                 const existed = fs.existsSync(real)
                 const before = existed ? fs.statSync(real) : undefined
+                check()
                 file = await fs.promises.open(
                     real,
                     existed ? fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0) : 'ax',
                     0o600
                 )
                 check()
-                assertIntegrity(real)
+                assertIntegrity(real, signal, deadline)
                 const opened = await file.stat()
+                check()
                 if (before && (opened.ino !== before.ino || opened.dev !== before.dev || opened.size !== before.size)) {
                     // noinspection ExceptionCaughtLocallyJS — 保留锁归属及清理失败信息
                     throw new HostKeyError('known_hosts changed while opening it')
@@ -511,21 +550,28 @@ export class KnownHosts {
         return result!
     }
 
-    private read(filePath: string, system: boolean): string {
-        const real = validateKnownHostsPath(filePath, system)
-        if (!fs.existsSync(real)) {
-            return ''
+    private read(filePath: string, system: boolean, signal?: AbortSignal, deadline?: number): string {
+        assertVerificationActive(signal, deadline)
+        try {
+            const real = validateKnownHostsPath(filePath, system)
+            if (!fs.existsSync(real)) {
+                return ''
+            }
+            assertIntegrity(real, signal, deadline)
+            const stats = fs.statSync(real)
+            if (!stats.isFile() || stats.size > 8 * 1024 * 1024) {
+                throw new HostKeyError('known_hosts must be a regular file no larger than 8 MiB')
+            }
+            return fs.readFileSync(real, 'utf8')
+        } finally {
+            assertVerificationActive(signal, deadline)
         }
-        assertIntegrity(real)
-        const stats = fs.statSync(real)
-        if (!stats.isFile() || stats.size > 8 * 1024 * 1024) {
-            throw new HostKeyError('known_hosts must be a regular file no larger than 8 MiB')
-        }
-        return fs.readFileSync(real, 'utf8')
     }
 
     private *matchingKeys(
-        hostname: string
+        hostname: string,
+        signal?: AbortSignal,
+        deadline?: number
     ): Generator<{ key: Buffer; type: string; revoked: boolean; file: string; line: number }> {
         const files = [
             [this.userFile, false],
@@ -533,8 +579,9 @@ export class KnownHosts {
             ...this.systemFiles.map((name) => [name, true]),
         ] as [string, boolean][]
         for (const [filePath, system] of files) {
-            const lines = this.read(filePath, system).split(/\r?\n/)
+            const lines = this.read(filePath, system, signal, deadline).split(/\r?\n/)
             for (let index = 0; index < lines.length; ++index) {
+                assertVerificationActive(signal, deadline)
                 const line = lines[index].trim()
                 if (!line || line.startsWith('#')) {
                     continue
@@ -568,14 +615,14 @@ export class KnownHosts {
         }
     }
 
-    private lookup(hostname: string, rawKey: Buffer): boolean {
+    private lookup(hostname: string, rawKey: Buffer, signal?: AbortSignal, deadline?: number): boolean {
         let accepted = false
         const hostKey: NonNullable<ConnectionFailureDetails['hostKey']> = {
             keyType: (ssh2.utils.parseKey(rawKey) as ssh2.ParsedKey).type,
             fingerprint: `SHA256:${createHash('sha256').update(rawKey).digest('base64').replace(/=+$/, '')}`,
             knownKeys: [],
         }
-        for (const { key, type, revoked, file, line } of this.matchingKeys(hostname)) {
+        for (const { key, type, revoked, file, line } of this.matchingKeys(hostname, signal, deadline)) {
             hostKey.knownKeys.push({
                 keyType: type,
                 fingerprint: `SHA256:${createHash('sha256').update(key).digest('base64').replace(/=+$/, '')}`,

@@ -35,7 +35,7 @@ import {
 import { escapeShellArg, expandTilde } from './tools/utils.js'
 import { ExternalTransferCapability, FileInfo, TransferProgress } from './types.js'
 import { ensureUtf8Boundary, isUtf8ContinuationByte } from './utf8.js'
-import { checkWindowsAcl, windowsAclScript } from './windows-acl.js'
+import { checkWindowsAcl, getWindowsPowerShellEnv, windowsAclScript } from './windows-acl.js'
 
 // 文件类型 mode 常量
 const S_IFMT = 0o170000 // 文件类型位掩码
@@ -2190,6 +2190,7 @@ function verifyWindowsDownloadNames(localPath: string, remoteNames: string[], ti
         const script = encodedPowershell(windowsCaseSemanticsScript(parent)).split(' ').at(-1)!
         const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', script], {
             input: Buffer.from(JSON.stringify(names)).toString('base64'),
+            env: getWindowsPowerShellEnv(),
             encoding: 'utf8',
             windowsHide: true,
             timeout: Math.min(timeout ?? 10_000, 10_000),

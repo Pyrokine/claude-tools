@@ -10,7 +10,7 @@ SSH MCP Server for AI assistants (Claude, Cursor, Windsurf, etc.)
 
 ![Linux](https://img.shields.io/badge/Linux-tested-success)
 ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
-![Windows](https://img.shields.io/badge/Windows-untested-yellow)
+[![Windows](https://img.shields.io/badge/Windows-native%20regressions-success)](TESTING.md)
 
 ## Migrating to 3.0
 
@@ -36,7 +36,9 @@ the returned prefix, including whether its last line ends with a newline.
 
 Windows connections require `remotePlatform="windows"`; local Windows does not change the remote default. Set
 `commandShell` and `remotePathStyle` for the host, and an explicit `rsyncProfile` when using rsync with Windows. The
-Windows behavior and examples below remain available.
+Windows behavior and examples below remain available. Local permission, boot-identity, and filename checks ignore
+inherited `PSModulePath`, allowing MCP to start under PowerShell 7 while using Windows PowerShell 5.1. Remote commands
+and user scripts retain their configured environment.
 
 ## Host key trust
 
@@ -66,8 +68,9 @@ the shared bastion and unrelated aliases. Explicit connect or reconnect verifies
 retains automatic reconnect. Hashed hostnames, host/port pairs, IPv6, multiple names, wildcard patterns, and negated
 patterns are supported. Matching CA or host-certificate entries require the OpenSSH backend. Concurrent first-use
 writes
-use an exclusive owner-directory lock with a bounded, cancellable wait. A complete owner record is published before
-writing trust. A confirmed exited owner is recovered automatically within the same verified local process domain:
+use an exclusive owner-directory lock with a bounded, cancellable wait. Preparation and permission checks share the
+connection deadline; the five-second lock-contention budget starts after preparation and stays within that deadline.
+A complete owner record is published before writing trust. A confirmed exited owner is recovered automatically within the same verified local process domain:
 Linux uses the `/proc` boot ID and PID namespace, macOS uses `kern.bootsessionuuid`, and Windows queries the kernel's
 `SystemBootEnvironmentInformation.BootIdentifier` through the built-in PowerShell. Live or reused PIDs, denied
 liveness

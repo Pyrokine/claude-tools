@@ -15,7 +15,7 @@ import { HostKeyError, KnownHosts } from '../dist/known-hosts.js'
 import { validateKnownHostsPath } from '../dist/security.js'
 import { SessionManager, sessionManager } from '../dist/session-manager.js'
 import { registerConnectionTools } from '../dist/tools/connection.js'
-import { checkWindowsAcl } from '../dist/windows-acl.js'
+import { checkWindowsAcl, checkWindowsKnownHostsIntegrity, getWindowsPowerShellEnv } from '../dist/windows-acl.js'
 
 // Fixed synthetic OpenSSH keys keep ssh2's random key generator out of protocol regressions.
 const key = {
@@ -134,6 +134,171 @@ function systemAliasFixture(t) {
     syncBuiltinESMExports()
     return { directory, home, system, file: path.join(home, '.ssh', 'known_hosts'), checked }
 }
+
+test('SSH-01 preparation uses the request budget while lock contention retains its own budget', async (t) => {
+    for (const scenario of ['explicit budget', 'default budget', 'expired request', 'cancelled preparation']) {
+        await t.test(scenario, async (t) => {
+            const { directory, file, trust } = fixture(t)
+            const abort = new AbortController()
+            const cancellation = new Error('owned preparation cancellation')
+            let clock = Date.now()
+            const deadline = clock + (scenario === 'expired request' ? 5000 : 30_000)
+            let inspections = 0
+            const mkdir = fs.promises.mkdir
+            const lstat = fs.promises.lstat
+            t.mock.method(Date, 'now', () => clock)
+            t.mock.method(fs.promises, 'mkdir', async (name, options) => {
+                const result = await mkdir(name, options)
+                if (path.basename(String(name)).startsWith('known_hosts.mcp-lock.prepare-')) {
+                    clock += 6000
+                    if (scenario === 'cancelled preparation') {
+                        abort.abort(cancellation)
+                    }
+                }
+                return result
+            })
+            t.mock.method(fs.promises, 'lstat', (name, options) => {
+                if (String(name) === `${file}.mcp-lock`) {
+                    ++inspections
+                }
+                return lstat(name, options)
+            })
+            const operation =
+                scenario === 'default budget'
+                    ? trust.verify('budget.example.com', 22, raw, abort.signal)
+                    : trust.verify('budget.example.com', 22, raw, abort.signal, deadline)
+            if (scenario === 'expired request') {
+                await assert.rejects(operation, /known_hosts verification deadline exhausted/)
+                assert.equal(inspections, 0)
+                assert.equal(fs.existsSync(file), false)
+            } else if (scenario === 'cancelled preparation') {
+                await assert.rejects(operation, (error) => error === cancellation)
+                assert.equal(inspections, 0)
+                assert.equal(fs.existsSync(file), false)
+            } else {
+                assert.equal((await operation).status, 'added')
+                assert.ok(inspections > 0)
+                assert.equal(fs.readFileSync(file, 'utf8'), line('budget.example.com'))
+            }
+            assert.deepEqual(
+                fs.readdirSync(directory).filter((name) => name.startsWith('known_hosts.mcp-lock')),
+                []
+            )
+        })
+    }
+})
+
+test('SSH-01 existing trust and algorithm reads retain the caller deadline after synchronous metadata', async (t) => {
+    for (const scenario of ['existing trust', 'algorithm preference']) {
+        await t.test(scenario, async (t) => {
+            const { file, trust } = fixture(t)
+            fs.writeFileSync(file, line('known-budget.example.com'), { mode: 0o600 })
+            if (process.platform === 'win32') {
+                assert.equal(checkWindowsAcl(file, true), 'key_path_usable')
+            }
+            let clock = Date.now()
+            const deadline = clock + 5000
+            const readFileSync = fs.readFileSync
+            t.mock.method(Date, 'now', () => clock)
+            t.mock.method(fs, 'readFileSync', (name, options) => {
+                const result = readFileSync(name, options)
+                if (String(name) === file) {
+                    clock = deadline + 1
+                }
+                return result
+            })
+            syncBuiltinESMExports()
+            t.after(() => {
+                t.mock.restoreAll()
+                syncBuiltinESMExports()
+            })
+            if (scenario === 'existing trust') {
+                await assert.rejects(
+                    trust.verify('known-budget.example.com', 22, raw, undefined, deadline),
+                    /known_hosts verification deadline exhausted/
+                )
+            } else {
+                assert.throws(
+                    () => trust.getHostKeyAlgorithms('known-budget.example.com', 22, undefined, deadline),
+                    /known_hosts verification deadline exhausted/
+                )
+            }
+        })
+    }
+})
+
+test(
+    'SSH-01 Windows metadata queries share caller deadlines and isolate native modules',
+    { skip: process.platform !== 'linux' ? 'Controlled Windows subprocess fixture' : false },
+    async (t) => {
+        const { file, trust } = fixture(t)
+        const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+        const originalModulePath = Object.getOwnPropertyDescriptor(process.env, 'PSModulePath')
+        const originalMarker = Object.getOwnPropertyDescriptor(process.env, 'MCP_SSH_ENV_TEST')
+        let clock = Date.now()
+        const deadline = clock + 30_000
+        const calls = []
+        t.mock.method(Date, 'now', () => clock)
+        t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
+            assert.equal(command, 'powershell.exe')
+            assert.ok(options.timeout > 0 && options.timeout <= deadline - clock)
+            assert.equal(
+                Object.keys(options.env).some((name) => name.toLowerCase() === 'psmodulepath'),
+                false
+            )
+            assert.equal(options.env.MCP_SSH_ENV_TEST, 'owned-preserved-value')
+            const script = Buffer.from(args.at(-1), 'base64').toString('utf16le')
+            calls.push({ script, timeout: options.timeout })
+            clock += 5
+            return {
+                status: 0,
+                stdout: script.includes('NtQuerySystemInformation')
+                    ? '12345678-1234-4321-abcd-123456789abc'
+                    : script.includes("Write('verified')")
+                      ? 'verified'
+                      : 'usable',
+            }
+        })
+        syncBuiltinESMExports()
+        Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' })
+        process.env.PSModulePath = 'owned-module-path'
+        process.env.MCP_SSH_ENV_TEST = 'owned-preserved-value'
+        try {
+            assert.equal(
+                (await trust.verify('windows-budget.example.com', 22, raw, undefined, deadline)).status,
+                'added'
+            )
+            assert.ok(calls.some(({ script }) => script.includes('NtQuerySystemInformation')))
+            assert.ok(calls.some(({ script }) => script.includes("Write('verified')")))
+            assert.ok(calls.some(({ script }) => script.includes("WriteLine('usable')")))
+            clock = deadline - 13
+            assert.equal(checkWindowsAcl(file, false, deadline), 'key_path_usable')
+            assert.equal(calls.at(-1).timeout, 13)
+            checkWindowsKnownHostsIntegrity(file, deadline)
+            assert.equal(calls.at(-1).timeout, 8)
+            clock = deadline
+            const count = calls.length
+            assert.equal(checkWindowsAcl(file, false, deadline), 'key_acl_unverified')
+            assert.throws(() => checkWindowsKnownHostsIntegrity(file, deadline), /verification deadline exhausted/)
+            assert.equal(calls.length, count)
+            assert.equal(process.env.PSModulePath, 'owned-module-path')
+        } finally {
+            Object.defineProperty(process, 'platform', originalPlatform)
+            for (const [name, descriptor] of [
+                ['PSModulePath', originalModulePath],
+                ['MCP_SSH_ENV_TEST', originalMarker],
+            ]) {
+                if (descriptor) {
+                    Object.defineProperty(process.env, name, descriptor)
+                } else {
+                    Reflect.deleteProperty(process.env, name)
+                }
+            }
+            t.mock.restoreAll()
+            syncBuiltinESMExports()
+        }
+    }
+)
 
 for (const missingDirectory of [false, true]) {
     test(
@@ -645,7 +810,7 @@ test('SSH-01: public registered ssh_connect callback reports persisted trust fro
         alias: 'public-fixture',
     })
     const result = JSON.parse(response.content[0].text)
-    assert.equal(result.success, true)
+    assert.equal(result.success, true, JSON.stringify(result))
     assert.equal(result.hostKey.status, 'added')
     assert.match(result.hostKey.fingerprint, /^SHA256:/)
     assert.equal(result.hostKeys[0].port, remote.port)
@@ -755,25 +920,31 @@ const { KnownHosts } = await import(process.argv[1]);
 try {
     const trust = new KnownHosts(process.argv[2], []);
     await trust.verify('process-race.example.com', 22, Buffer.from(process.argv[3], 'base64'));
-} catch { process.exitCode = 1; }
+} catch (error) { console.error(error); process.exitCode = 1; }
 `
     const run = (blob) =>
         new Promise((resolve, reject) => {
             const child = spawn(
                 process.execPath,
                 ['--input-type=module', '-e', program, moduleUrl, file, blob.toString('base64')],
-                { stdio: 'ignore' }
+                { stdio: ['ignore', 'ignore', 'pipe'] }
             )
+            let stderr = ''
+            child.stderr.setEncoding('utf8')
+            child.stderr.on('data', (chunk) => {
+                stderr += chunk
+            })
             t.after(() => {
                 if (child.exitCode === null && child.signalCode === null) {
                     child.kill()
                 }
             })
             child.once('error', reject)
-            child.once('exit', (code) => resolve(code))
+            child.once('close', (code) => resolve({ code, stderr }))
         })
     const results = await Promise.all([run(raw), run(other)])
-    assert.deepEqual(results.sort(), [0, 1])
+    assert.deepEqual(results.map(({ code }) => code).sort(), [0, 1], JSON.stringify(results))
+    assert.match(results.find(({ code }) => code === 1).stderr, /HostKeyError:/)
     assert.equal(fs.readFileSync(file).toString('utf8').trim().split('\n').length, 1)
     assert.equal(fs.existsSync(`${file}.mcp-lock`), false)
 })
@@ -1174,19 +1345,21 @@ test('QL-SSH-01: legacy empty lock files are retained with a bounded explanatory
     const lock = `${file}.mcp-lock`
     fs.writeFileSync(lock, '', { mode: 0o600 })
     let now = Date.now()
+    const deadline = now + 30_000
+    let inspections = 0
     t.mock.method(Date, 'now', () => now)
     const lstat = filePromises.lstat.bind(filePromises)
     t.mock.method(filePromises, 'lstat', async (...args) => {
         const stat = await lstat(...args)
         if (args[0] === lock) {
-            now += 100
+            ++inspections
+            now = deadline
         }
         return stat
     })
-    await assert.rejects(
-        trust.verify('legacy.example.com', 22, raw, undefined, Date.now() + 100),
-        /locked.*legacy.*retained/
-    )
+    await assert.rejects(trust.verify('legacy.example.com', 22, raw, undefined, deadline), /locked.*legacy.*retained/)
+    assert.equal(inspections, 1)
+    assert.equal(now, deadline)
     assert.equal(fs.readFileSync(lock).toString('utf8'), '')
     assert.equal(fs.existsSync(file), false)
     assert.deepEqual(fs.readdirSync(directory), [path.basename(lock)])
@@ -1292,7 +1465,7 @@ function accessState(file) {
     const result = spawnSync(
         'powershell.exe',
         ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-        { encoding: 'utf8', timeout: 10000 }
+        { encoding: 'utf8', timeout: 10000, env: getWindowsPowerShellEnv() }
     )
     assert.ifError(result.error)
     assert.equal(result.status, 0, result.stderr)
@@ -1470,7 +1643,7 @@ test(
             const result = spawnSync(
                 'powershell.exe',
                 ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-                { encoding: 'utf8', timeout: 10000 }
+                { encoding: 'utf8', timeout: 10000, env: getWindowsPowerShellEnv() }
             )
             assert.ifError(result.error)
             assert.equal(result.status, 0, result.stderr)

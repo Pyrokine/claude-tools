@@ -10,7 +10,7 @@
 
 ![Linux](https://img.shields.io/badge/Linux-tested-success)
 ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
-![Windows](https://img.shields.io/badge/Windows-untested-yellow)
+[![Windows](https://img.shields.io/badge/Windows-native%20regressions-success)](TESTING.md)
 
 ## 迁移到 3.0
 
@@ -30,6 +30,7 @@ PTY 的 `bufferSize` 参数与列表结果中的 `bufferSize`，以及 read/list
 
 连接 Windows 主机须设置 `remotePlatform="windows"`，本机为 Windows 不会改变远端默认值；按主机设置 `commandShell` 和
 `remotePathStyle`，使用 Windows rsync 时显式设置 `rsyncProfile`；下文 Windows 功能和示例继续适用
+本机权限、启动身份与文件名检查忽略继承的 `PSModulePath`，从 PowerShell 7 启动 MCP 时仍可使用 Windows PowerShell 5.1，远端命令和用户脚本沿用各自配置的环境
 
 ## 主机密钥信任
 
@@ -48,7 +49,9 @@ SHA2 签名
 目标失败保留共享跳板和无关 alias；显式 connect/reconnect 重新验证信任，普通网络断线仍自动重连
 支持哈希主机名、host/port、IPv6、多名称、通配和否定模式，匹配
 CA 或主机证书记录时使用 OpenSSH
-后端；首次信任写入使用持有者目录排他锁，等待有期限且可取消，完整持有者记录发布后才开始写入信任；在同一可核实的本地进程域内，自动恢复已核实退出的持有者
+后端；首次信任写入使用持有者目录排他锁，等待有期限且可取消
+准备与权限检查共用连接总期限，五秒锁竞争预算从准备完成后开始，并受该总期限约束
+完整持有者记录发布后才开始写入信任；在同一可核实的本地进程域内，自动恢复已核实退出的持有者
 Linux 使用 `/proc` 启动标识与 PID 命名空间，macOS 使用 `kern.bootsessionuuid`，Windows 通过系统自带 PowerShell 查询内核的
 `SystemBootEnvironmentInformation.BootIdentifier`
 存活或已复用的 PID、存活探测被拒绝、启动标识或进程域无法取得或不匹配时，保留锁并等待至期限或取消

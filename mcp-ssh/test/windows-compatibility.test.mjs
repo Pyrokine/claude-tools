@@ -41,7 +41,12 @@ import { registerExecTools, windowsScriptContent } from '../dist/tools/exec.js'
 import { registerFileTools } from '../dist/tools/file.js'
 import { registerPtyTools } from '../dist/tools/pty.js'
 import { expandTilde } from '../dist/tools/utils.js'
-import { checkWindowsAcl, windowsAclScript, windowsTemporaryPathScript } from '../dist/windows-acl.js'
+import {
+    checkWindowsAcl,
+    getWindowsPowerShellEnv,
+    windowsAclScript,
+    windowsTemporaryPathScript,
+} from '../dist/windows-acl.js'
 
 const fixtureHostKey = ssh2.utils.parseKey(ssh2.utils.generateKeyPairSync('ed25519').public).getPublicSSH()
 const fixtureTrustFile = path.join(os.homedir(), '.ssh', `known_hosts-fixture-${process.pid}`)
@@ -448,7 +453,7 @@ test('S11: Windows key ACL status requires effective read access', (t) => {
         '[void]$acl.AddAccessRule($rule)\n' +
         'Set-Acl -LiteralPath $p -AclObject $acl'
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', denyRead], {
-        env: { ...process.env, MCP_SSH_TEST_PRIVATE_KEY: key },
+        env: { ...getWindowsPowerShellEnv(), MCP_SSH_TEST_PRIVATE_KEY: key },
         encoding: 'utf8',
         timeout: 5000,
     })
@@ -1164,7 +1169,7 @@ test('S4: Windows rejects a shared temporary directory before writing script con
     assert.equal(grant.status, 0, grant.stderr)
     const encoded = encodedPowershell(windowsTemporaryPathScript('script.ps1')).split(' ').at(-1)
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
-        env: { ...process.env, TEMP: shared, TMP: shared },
+        env: { ...getWindowsPowerShellEnv(), TEMP: shared, TMP: shared },
         encoding: 'utf8',
         timeout: 5000,
     })
@@ -1618,6 +1623,7 @@ test(
         }
         const query = encodedPowershell(windowsCaseSemanticsScript(directory, names)).split(' ').at(-1)
         const nativeQuery = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', query], {
+            env: getWindowsPowerShellEnv(),
             encoding: 'utf8',
             timeout: 10000,
         })

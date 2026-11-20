@@ -3,6 +3,10 @@ import { encodedPowershell, quotePowershell } from './remote-platform.js'
 
 export type AclStatus = 'key_path_usable' | 'key_acl_insecure' | 'key_acl_unverified'
 
+export function getWindowsPowerShellEnv(): NodeJS.ProcessEnv {
+    return Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'psmodulepath'))
+}
+
 export function windowsAclScript(filePath: string, apply: boolean): string {
     const target = quotePowershell(filePath)
     return (
@@ -128,9 +132,13 @@ export function windowsTemporaryPathScript(name: string): string {
     )
 }
 
-export function checkWindowsKnownHostsIntegrity(filePath: string): void {
+export function checkWindowsKnownHostsIntegrity(filePath: string, deadline?: number): void {
     if (process.platform !== 'win32') {
         throw new Error('Windows ACL verification requires a native Windows process')
+    }
+    const timeout = deadline === undefined ? 10_000 : Math.min(10_000, deadline - Date.now())
+    if (timeout <= 0) {
+        throw new Error('known_hosts verification deadline exhausted')
     }
     const script =
         "$ErrorActionPreference = 'Stop'\n" +
@@ -177,7 +185,8 @@ export function checkWindowsKnownHostsIntegrity(filePath: string): void {
         "[Console]::Write('verified')"
     const encoded = encodedPowershell(script).split(' ').at(-1)!
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
-        timeout: 10_000,
+        timeout,
+        env: getWindowsPowerShellEnv(),
         encoding: 'utf8',
         windowsHide: true,
         maxBuffer: 16_384,
@@ -187,14 +196,19 @@ export function checkWindowsKnownHostsIntegrity(filePath: string): void {
     }
 }
 
-export function checkWindowsAcl(filePath: string, apply: boolean = false): AclStatus {
+export function checkWindowsAcl(filePath: string, apply: boolean = false, deadline?: number): AclStatus {
     if (process.platform !== 'win32') {
         throw new Error('Windows ACL verification requires a native Windows process')
+    }
+    const timeout = deadline === undefined ? 10_000 : Math.min(10_000, deadline - Date.now())
+    if (timeout <= 0) {
+        return 'key_acl_unverified'
     }
     const command = encodedPowershell(windowsAclScript(filePath, apply))
     const encoded = command.split(' ').at(-1)!
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
-        timeout: 10_000,
+        timeout,
+        env: getWindowsPowerShellEnv(),
         encoding: 'utf8',
         windowsHide: true,
         maxBuffer: 16_384,
