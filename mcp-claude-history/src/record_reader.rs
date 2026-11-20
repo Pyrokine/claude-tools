@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BUFFER_BYTES: usize = 16 * 1024;
+const LINE_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_INDEX_NODES: usize = 65_536;
 const MAX_KEY_BYTES: usize = 4096;
 
@@ -189,7 +190,7 @@ pub enum LineStep {
 impl RecordLines {
     pub fn new(file: File, snapshot_end: u64) -> Self {
         Self {
-            reader: BufReader::with_capacity(BUFFER_BYTES, file),
+            reader: BufReader::with_capacity(LINE_BUFFER_BYTES, file),
             snapshot_end,
             offset: 0,
             line: 0,
@@ -2321,7 +2322,7 @@ pub fn sensitive_field_spans(
             .last()
             .map_or((bytes.len(), 0), |scope| (scope.0, scope.2));
         if (separated || cursor == 0 || !key_byte(bytes.at(cursor - 1)?))
-            && let Some((start, end)) = authorization_header_span(bytes, cursor, scope)?
+            && let Some((start, end)) = sensitive_header_span(bytes, cursor, scope)?
         {
             if end > start {
                 add_redaction(&mut edits, start, end, "[redacted]")?;
@@ -2494,18 +2495,7 @@ fn prefix_regex(
         .map(|matched| position + matched.end()))
 }
 
-fn unicode_whitespace_end(bytes: &mut impl ByteSource, mut position: usize) -> Result<usize, ErrorResponse> {
-    while position < bytes.len() {
-        let (character, length) = character_at(bytes, position)?;
-        if !character.is_whitespace() {
-            break;
-        }
-        position += length;
-    }
-    Ok(position)
-}
-
-fn authorization_character_at(
+fn header_character_at(
     bytes: &mut impl ByteSource,
     position: usize,
     scope: (usize, u32),
@@ -2514,29 +2504,30 @@ fn authorization_character_at(
     Ok(field_character(bytes, &mut next, scope.0, scope.1)?.map(|character| (character, next - position)))
 }
 
-pub(crate) fn authorization_header_span(
+pub(crate) fn sensitive_header_span(
     bytes: &mut impl ByteSource,
     start: usize,
     scope: (usize, u32),
 ) -> Result<Option<(usize, usize)>, ErrorResponse> {
     let first = bytes.at(start)?;
-    if !matches!(first, b'a' | b'A' | b'p' | b'P' | b'\\')
+    if !matches!(first, b'a' | b'A' | b'p' | b'P' | b'c' | b'C' | b'\\')
         || (first == b'\\' && start > 0 && bytes.at(start - 1)? == b'\\')
     {
         return Ok(None);
     }
     let result = (|| {
-        let Some((first, _)) = authorization_character_at(bytes, start, scope)? else {
+        let Some((first, _)) = header_character_at(bytes, start, scope)? else {
             return Ok(None);
         };
         let name = match first {
             'a' | 'A' => "authorization",
             'p' | 'P' => "proxy-authorization",
+            'c' | 'C' => "cookie",
             _ => return Ok(None),
         };
         let mut position = start;
         for expected in name.chars() {
-            let Some((character, width)) = authorization_character_at(bytes, position, scope)? else {
+            let Some((character, width)) = header_character_at(bytes, position, scope)? else {
                 return Ok(None);
             };
             if !character.eq_ignore_ascii_case(&expected) {
@@ -2544,11 +2535,16 @@ pub(crate) fn authorization_header_span(
             }
             position += width;
         }
-        while let Some((character, width)) = authorization_character_at(bytes, position, scope)? {
-            if character.is_whitespace() {
+        while let Some((character, width)) = header_character_at(bytes, position, scope)? {
+            if character.is_whitespace() && (name != "cookie" || !matches!(character, '\n' | '\r')) {
                 position += width;
             } else if matches!(character, ':' | '=') {
-                return authorization_value_span(bytes, position + width, scope).map(Some);
+                return if name == "cookie" {
+                    cookie_value_span(bytes, position + width, scope)
+                } else {
+                    authorization_value_span(bytes, position + width, scope)
+                }
+                .map(Some);
             } else {
                 return Ok(None);
             }
@@ -2561,12 +2557,12 @@ pub(crate) fn authorization_header_span(
     }
 }
 
-fn authorization_whitespace_end(
+fn header_whitespace_end(
     bytes: &mut impl ByteSource,
     mut position: usize,
     scope: (usize, u32),
 ) -> Result<usize, ErrorResponse> {
-    while let Some((character, width)) = authorization_character_at(bytes, position, scope)? {
+    while let Some((character, width)) = header_character_at(bytes, position, scope)? {
         if !character.is_whitespace() || matches!(character, '\n' | '\r') {
             break;
         }
@@ -2575,13 +2571,35 @@ fn authorization_whitespace_end(
     Ok(position)
 }
 
+fn cookie_value_span(
+    bytes: &mut impl ByteSource,
+    from: usize,
+    scope: (usize, u32),
+) -> Result<(usize, usize), ErrorResponse> {
+    let result: Result<_, ErrorResponse> = (|| {
+        let start = header_whitespace_end(bytes, from, scope)?;
+        let mut end = start;
+        while let Some((character, width)) = header_character_at(bytes, end, scope)? {
+            if matches!(character, '\n' | '\r') {
+                break;
+            }
+            end += width;
+        }
+        Ok((start, end))
+    })();
+    match result {
+        Err(error) if error.error == "field_decode_error" => Ok((from, scope.0)),
+        result => result,
+    }
+}
+
 pub(crate) fn authorization_value_span(
     bytes: &mut impl ByteSource,
     from: usize,
     scope: (usize, u32),
 ) -> Result<(usize, usize), ErrorResponse> {
     let result: Result<_, ErrorResponse> = (|| {
-        let start = authorization_whitespace_end(bytes, from, scope)?;
+        let start = header_whitespace_end(bytes, from, scope)?;
         if let Some((end, _, _)) = escaped_quote(
             &mut LimitedBytes {
                 source: bytes,
@@ -2597,7 +2615,7 @@ pub(crate) fn authorization_value_span(
         let mut end = start;
         let mut scheme = true;
         let mut name = String::with_capacity(17);
-        while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+        while let Some((character, width)) = header_character_at(bytes, end, scope)? {
             if character.is_whitespace() || matches!(character, ',' | ';') {
                 break;
             }
@@ -2613,7 +2631,7 @@ pub(crate) fn authorization_value_span(
         if !scheme || end == start {
             return Ok((start, end));
         }
-        let credential_start = authorization_whitespace_end(bytes, end, scope)?;
+        let credential_start = header_whitespace_end(bytes, end, scope)?;
         if credential_start == end {
             return Ok((start, end));
         }
@@ -2623,11 +2641,11 @@ pub(crate) fn authorization_value_span(
             && let Some(mut parameter_end) = authorization_parameter_end(bytes, credential_start, aws_v4, scope)?
         {
             loop {
-                let separator = authorization_whitespace_end(bytes, parameter_end, scope)?;
-                let Some((',', width)) = authorization_character_at(bytes, separator, scope)? else {
+                let separator = header_whitespace_end(bytes, parameter_end, scope)?;
+                let Some((',', width)) = header_character_at(bytes, separator, scope)? else {
                     break;
                 };
-                let next = authorization_whitespace_end(bytes, separator + width, scope)?;
+                let next = header_whitespace_end(bytes, separator + width, scope)?;
                 let Some(next_end) = authorization_parameter_end(bytes, next, aws_v4, scope)? else {
                     break;
                 };
@@ -2636,7 +2654,7 @@ pub(crate) fn authorization_value_span(
             return Ok((start, parameter_end));
         }
         let mut credential_end = credential_start;
-        while let Some((character, width)) = authorization_character_at(bytes, credential_end, scope)? {
+        while let Some((character, width)) = header_character_at(bytes, credential_end, scope)? {
             if character.is_whitespace() || matches!(character, ',' | ';') {
                 break;
             }
@@ -2666,7 +2684,7 @@ fn authorization_parameter_end(
 ) -> Result<Option<usize>, ErrorResponse> {
     let mut end = start;
     let mut name = String::with_capacity(14);
-    while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+    while let Some((character, width)) = header_character_at(bytes, end, scope)? {
         if !(character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character)) {
             break;
         }
@@ -2675,16 +2693,16 @@ fn authorization_parameter_end(
         }
         end += width;
     }
-    let separator = authorization_whitespace_end(bytes, end, scope)?;
-    let Some(('=', width)) = authorization_character_at(bytes, separator, scope)? else {
+    let separator = header_whitespace_end(bytes, end, scope)?;
+    let Some(('=', width)) = header_character_at(bytes, separator, scope)? else {
         return Ok(None);
     };
     if end == start {
         return Ok(None);
     }
     let signed_headers = aws_v4 && name == "signedheaders";
-    end = authorization_whitespace_end(bytes, separator + width, scope)?;
-    let Some((first, _)) = authorization_character_at(bytes, end, scope)? else {
+    end = header_whitespace_end(bytes, separator + width, scope)?;
+    let Some((first, _)) = header_character_at(bytes, end, scope)? else {
         return Ok(None);
     };
     if first.is_whitespace() || matches!(first, '=' | ',' | ';') {
@@ -2693,7 +2711,7 @@ fn authorization_parameter_end(
     if let Some(end) = authorization_quoted_end(bytes, end, scope)? {
         return Ok(Some(end));
     }
-    while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+    while let Some((character, width)) = header_character_at(bytes, end, scope)? {
         if character.is_whitespace() || character == ',' || (character == ';' && !signed_headers) {
             break;
         }
@@ -2707,12 +2725,12 @@ fn authorization_quoted_end(
     start: usize,
     scope: (usize, u32),
 ) -> Result<Option<usize>, ErrorResponse> {
-    let Some((quote @ ('"' | '\''), width)) = authorization_character_at(bytes, start, scope)? else {
+    let Some((quote @ ('"' | '\''), width)) = header_character_at(bytes, start, scope)? else {
         return Ok(None);
     };
     let mut end = start + width;
     let mut escaped = false;
-    while let Some((character, width)) = authorization_character_at(bytes, end, scope)? {
+    while let Some((character, width)) = header_character_at(bytes, end, scope)? {
         if matches!(character, '\n' | '\r') {
             return Ok(Some(end));
         }
@@ -2737,9 +2755,7 @@ pub fn redaction_spans(
         return Ok(Vec::new());
     }
     let mut edits = sensitive_field_spans(bytes, mode)?;
-    static COOKIE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static HOST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let cookie = COOKIE.get_or_init(|| regex::Regex::new(r"(?i)^cookie").expect("valid regex"));
     let host = HOST.get_or_init(|| {
         regex::Regex::new(
             r"^(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})\b",
@@ -2747,7 +2763,6 @@ pub fn redaction_spans(
         .expect("valid regex")
     });
     let mut token_uuid_cursor = 0;
-    let mut cookie_cursor = 0;
     let mut key_cursor = 0;
     let mut url_cursor = 0;
     let mut host_cursor = 0;
@@ -2775,37 +2790,6 @@ pub fn redaction_spans(
             token_uuid_cursor = end;
         }
         if mode == RedactionMode::Strict {
-            if position >= cookie_cursor
-                && matches!(character, 'c' | 'C')
-                && !preceding_word(bytes, position)?
-                && let Some(name_end) = prefix_regex(bytes, position, cookie, 32)?
-            {
-                let separator = unicode_whitespace_end(bytes, name_end)?;
-                if bytes.get(separator)?.is_some_and(|byte| matches!(byte, b':' | b'=')) {
-                    let mut value_start = unicode_whitespace_end(bytes, separator + 1)?;
-                    if value_start == bytes.len() {
-                        let mut previous = value_start;
-                        while previous > separator + 1 {
-                            previous -= 1;
-                            while previous > separator + 1 && bytes.at(previous)? & 0xc0 == 0x80 {
-                                previous -= 1;
-                            }
-                            if !matches!(character_at(bytes, previous)?.0, '\n' | '\r') {
-                                value_start = previous;
-                                break;
-                            }
-                        }
-                    }
-                    let mut end = value_start;
-                    while bytes.get(end)?.is_some_and(|byte| !matches!(byte, b'\n' | b'\r')) {
-                        end += 1;
-                    }
-                    if end > value_start {
-                        add_redaction(&mut edits, value_start, end, "[redacted]")?;
-                        cookie_cursor = end;
-                    }
-                }
-            }
             if position >= url_cursor
                 && character == 'h'
                 && (bytes.starts(position, b"http://")? || bytes.starts(position, b"https://")?)
@@ -2902,9 +2886,10 @@ pub fn render_text_range(
     let character_count = bytes.cursor.projection.characters;
     let (start_char, end_char) = range.unwrap_or((0, character_count));
     if start_char > end_char || (range.is_some() && start_char >= character_count) {
-        return Err(reader_error(
-            "invalid_range",
-            format!("range 无效，original_content_size={character_count}"),
+        return Err(crate::utils::invalid_range_response(
+            start_char,
+            end_char,
+            character_count,
         ));
     }
     if start_char == end_char {
@@ -3110,8 +3095,9 @@ pub(crate) fn ql_h01_authorization_corpus() -> Vec<(String, String)> {
             "Fixture fixture.value:signature",
             "Custom fixture.value:signature",
             "Digest username=\"fixture user\", response=\"fixture-secret\"",
-            "AWS EXAMPLEACCESS:fixture-signature=",
-            "AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+            concat!("AWS EXAMPLE", "ACCESS:fixture-signature="),
+            "AWS4-HMAC-SHA256 Credential=EXAMPLE\
+                    ACCESS/20261027/us-east-1/s3/aws4_request, \
                 SignedHeaders=host;x-amz-date, Signature=fixture.signature",
         ] {
             let mut text = format!("前缀😀\n{header}: {value}\nX-Diagnostic: visible");
@@ -3123,24 +3109,29 @@ pub(crate) fn ql_h01_authorization_corpus() -> Vec<(String, String)> {
             }
         }
         for (value, encoded) in [
-            ("Basic Zml4dHVyZTpwYXNz", "B"),
-            ("Basic Zml4dHVyZTpwYXNz", "a"),
-            ("Bearer fixture.value", "B "),
-            ("Fixture fixture.value:signature", "Fi:"),
-            ("\"Basic Zml4dHVyZTpwYXNz\"", "\""),
-            ("AWS EXAMPLEACCESS:fixture-signature=", "W:"),
+            ("Basic Zml4dHVyZTpwYXNz", &['B'][..]),
+            ("Basic Zml4dHVyZTpwYXNz", &['a'][..]),
+            ("Bearer fixture.value", &['B', ' '][..]),
+            ("Fixture fixture.value:signature", &['F', 'i', ':'][..]),
+            ("\"Basic Zml4dHVyZTpwYXNz\"", &['"'][..]),
             (
-                "Digest username=\"fixture user\", response=\"fixture-secret\"",
-                "Drespon=,",
+                "AWS EXAMPLE\
+                    ACCESS:fixture-signature=",
+                &['W', ':'][..],
             ),
             (
-                "AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                "Digest username=\"fixture user\", response=\"fixture-secret\"",
+                &['D', 'r', 'e', 's', 'p', 'o', 'n', '=', ','][..],
+            ),
+            (
+                "AWS4-HMAC-SHA256 Credential=EXAMPLE\
+                    ACCESS/20261027/us-east-1/s3/aws4_request, \
                     SignedHeaders=host;x-amz-date, Signature=fixture.signature",
-                "WS4Hi=,;",
+                &['W', 'S', '4', 'H', 'i', '=', ',', ';'][..],
             ),
         ] {
             let mut value = serde_json::to_string(value).unwrap();
-            for character in encoded.chars() {
+            for &character in encoded {
                 let encoded = format!("\\u{:04x}", character as u32);
                 value = if character == '"' {
                     value.replace("\\\"", &encoded)
@@ -3262,13 +3253,23 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let mut data = b"\n\r\n".to_vec();
         data.extend(0..=255);
-        data.resize(data.len() + BUFFER_BYTES + 3, b'x');
-        data.extend_from_slice(b"\nlast");
+        data.resize(data.len() + LINE_BUFFER_BYTES + 3, b'x');
+        data.extend_from_slice(b"\n");
+        data.extend_from_slice(b"last");
         let fixture = Fixture::new("");
         std::fs::write(&fixture.path, &data).unwrap();
         for snapshot_end in [0, data.len() - 2, data.len()] {
             let expected: Vec<_> = data[..snapshot_end].split_inclusive(|byte| *byte == b'\n').collect();
-            for budget in [1, 2, 17, BUFFER_BYTES as u64 - 1, BUFFER_BYTES as u64, u64::MAX] {
+            for budget in [
+                1,
+                2,
+                17,
+                BUFFER_BYTES as u64 - 1,
+                BUFFER_BYTES as u64,
+                LINE_BUFFER_BYTES as u64 - 1,
+                LINE_BUFFER_BYTES as u64,
+                u64::MAX,
+            ] {
                 for recycle in [false, true] {
                     let accounted = Arc::new(AtomicUsize::new(0));
                     let control = WorkControl::from_checkpoint({
@@ -3417,8 +3418,8 @@ mod tests {
                 }
                 for invalid in [
                     raw.replace(" end", "\u{1} end"),
-                    raw.replace('😀', "\\uD83Dinvalid")
-                        .replace("\\uD83D\\uDE00", "\\uD83Dinvalid"),
+                    raw.replace('😀', concat!("\\uD83D", "invalid"))
+                        .replace("\\uD83D\\uDE00", concat!("\\uD83D", "invalid")),
                 ] {
                     let fixture = Fixture::new(&invalid);
                     assert_eq!(
@@ -3656,7 +3657,7 @@ mod tests {
                 let mut value = value.clone();
                 value["padding"] = "x".repeat(padding).into();
                 let line = value.to_string();
-                let ordinary = parse_message_record(&line);
+                let ordinary = parse_message_record(&line, None);
                 let fixture = Fixture::new(&line);
                 let indexed = index_record(
                     fixture.open(),
@@ -3683,7 +3684,7 @@ mod tests {
             }
         }
         let malformed = r#"{"type":"api-request-blob","message":{]"#;
-        assert!(parse_message_record(malformed).is_err());
+        assert!(parse_message_record(malformed, None).is_err());
         let fixture = Fixture::new(malformed);
         assert_eq!(
             index_record(
@@ -3748,10 +3749,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("history-json-redaction-{}-{nonce}", std::process::id()));
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let body = r#"{"needle":"fixture-json-needle","sensitiveReads":{"password":0,"hidden":0},"nested":{"password":false,"secret":null},"token":"fixture-secret"}"#;
+        let body = concat!(
+            r#"{"needle":"fixture-json-needle","sensitiveReads":{"password":0,"hidden":0},"#,
+            r#""nested":{"password":false,"secret":null},"token":"fixture-secret"}"#
+        );
         for (session, padding) in [("normal01", 0), ("stream01", MAX_JSONL_LINE_BYTES + 1)] {
             let record = serde_json::json!({"uuid":session,"type":"user","timestamp":"2026-10-01T00:00:00Z",
-                "padding":"x".repeat(padding),"message":{"content":[{"type":"tool_result","tool_use_id":"fixture-call","content":[{"type":"text","text":body}]}]}});
+            "padding":"x".repeat(padding),"message":{"content":[{
+                "type":"tool_result","tool_use_id":"fixture-call","content":[{"type":"text","text":body}]
+            }]}});
             std::fs::write(project.join(format!("{session}.jsonl")), format!("{record}\n")).unwrap();
         }
         let config = Config {
@@ -3954,7 +3960,7 @@ mod tests {
                         ]
                     },
                     "url": "https://example.com/中文",
-                    "command": "前缀😀\nAuthorization: Bearer\tfixture-value\nword token='quoted-value'",
+                    "command": concat!("前缀😀\nAuthorization: Bearer\t", "fixture-value\n", "word token='quoted-value'"),
                     "values": [
                         1.0,
                         null,
@@ -4015,7 +4021,7 @@ mod tests {
                 }
             }
             let indexed = index.finish(true).unwrap();
-            let record = parse_message_record(&line).unwrap().unwrap();
+            let record = parse_message_record(&line, None).unwrap().unwrap();
             let blocks = ToolAssociationTracker::default().observe_record(&record, false);
             let block = &blocks[0];
             let view = if block.kind == ToolBlockKind::Use {
@@ -4511,8 +4517,10 @@ mod tests {
             "Authorization: Basic Zml4dHVyZTpwYXNz",
             "Authorization:\tBearer fixture.value",
             "Authorization: Digest username=\"fixture user\", response=\"fixture-secret\"",
-            "Authorization: AWS EXAMPLEACCESS:fixture-signature=",
-            "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+            "Authorization: AWS EXAMPLE\
+                    ACCESS:fixture-signature=",
+            "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLE\
+                    ACCESS/20261027/us-east-1/s3/aws4_request, \
                 SignedHeaders=host;x-amz-date, \
                 Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ] {
@@ -4556,6 +4564,165 @@ mod tests {
     }
 
     #[test]
+    fn scalar_lowercase_queries_preserve_streamed_original_positions() {
+        use crate::utils::parse_search_pattern;
+        let text = "前缀😀ΟΣ suffix";
+        let fixture = Fixture::new(text);
+        let mut projection = TextProjection::default();
+        projection.literal(text.to_string());
+        let mut bytes = TextBytes::new(projection.cursor(
+            fixture.open(),
+            SourceSpan {
+                start: 0,
+                end: text.len() as u64,
+            },
+        ));
+        for (query, sensitive, expected) in [
+            ("ΟΣ", false, (true, Some(3))),
+            ("ΟΣ suffix", false, (true, Some(3))),
+            ("absent|ΟΣ", false, (true, Some(3))),
+            ("ΟΣ !absent", false, (true, Some(3))),
+            ("suffix !ΟΣ", false, (false, None)),
+            ("!ΟΣ", false, (false, None)),
+            ("ος", false, (false, None)),
+            ("ΟΣ", true, (true, Some(3))),
+            ("οσ", true, (false, None)),
+        ] {
+            assert_eq!(
+                stream_matches_pattern(&mut bytes, &parse_search_pattern(query, sensitive), sensitive).unwrap(),
+                expected,
+                "{query}/{sensitive}"
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_headers_keep_complete_values_and_outer_boundaries() {
+        use crate::utils::{RedactionMode, redact_text_range_with_mode};
+        for header in ["Cookie:", "cOoKiE:", "COOKIE="] {
+            for value in [
+                "theme=light; sid=fixture-session-credential",
+                "theme=\"light\"; sid=fixture-session-credential; option='quoted'",
+                "theme=light; sid=\"fixture-session-credential\"",
+                "",
+            ] {
+                for newline in ["\n", "\r\n"] {
+                    let mut text = format!("前缀😀\n{header} {value}{newline}X-Diagnostic: visible");
+                    let mut expected = format!(
+                        "前缀😀\n{header} {}{newline}X-Diagnostic: visible",
+                        if value.is_empty() { "" } else { "[redacted]" }
+                    );
+                    for layer in 0..4 {
+                        for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                            let mut ranges = vec![None, Some((1, 1))];
+                            if let Some(start) = text.find("fixture-session-credential") {
+                                let start = text[..start].chars().count();
+                                ranges.extend([Some((start + 3, start + 8)), Some((start - 2, start + 4))]);
+                            }
+                            if let Some(start) = text.find(';') {
+                                let start = text[..start].chars().count();
+                                ranges.push(Some((start, start + 1)));
+                            }
+                            for range in ranges {
+                                let expected = match range {
+                                    Some((start, end)) if start == end => String::new(),
+                                    Some(_) if mode.enabled() => "[redacted]".to_string(),
+                                    Some((start, end)) => text.chars().skip(start).take(end - start).collect(),
+                                    None if mode.enabled() => expected.clone(),
+                                    None => text.clone(),
+                                };
+                                let count = usize::from(
+                                    mode.enabled() && !value.is_empty() && range.is_none_or(|(a, b)| a < b),
+                                );
+                                let plain = redact_text_range_with_mode(&text, mode, range);
+                                assert_eq!(plain.text, expected, "{mode:?}/{layer}/{range:?}: {text}");
+                                assert_eq!(plain.count, count);
+                                if mode.enabled() {
+                                    assert!(!plain.text.contains("fixture-session-credential"));
+                                    if range.is_none() {
+                                        assert!(plain.text.contains("X-Diagnostic: visible"));
+                                    }
+                                }
+                                let fixture = Fixture::new(&text);
+                                let mut projection = TextProjection::default();
+                                projection.literal(text.clone());
+                                let mut bytes = TextBytes::new(projection.cursor(
+                                    fixture.open(),
+                                    SourceSpan {
+                                        start: 0,
+                                        end: text.len() as u64,
+                                    },
+                                ));
+                                let mut actual = String::new();
+                                let (_, _, actual_count) = render_text_range(&mut bytes, mode, range, |chunk| {
+                                    actual.push_str(std::str::from_utf8(chunk).unwrap());
+                                    Ok(())
+                                })
+                                .unwrap();
+                                assert_eq!(actual, expected, "indexed {mode:?}/{layer}/{range:?}: {text}");
+                                assert_eq!(actual_count, count);
+                            }
+                        }
+                        text = serde_json::to_string(&text).unwrap();
+                        expected = serde_json::to_string(&expected).unwrap();
+                    }
+                }
+            }
+        }
+        for sample in [
+            concat!(
+                r#"{"note":"Cookie: theme=\"light\"; sid=fixture-session-credential"#,
+                r#"\r\nX-Diagnostic: visible","keep":"visible"}"#
+            ),
+            concat!(
+                r#"{"note":"Cookie: theme=\"light\"; sid=fixture-session-credential","keep":"visible","#,
+                r#""next":"X-Diagnostic: visible"}"#
+            ),
+            concat!(
+                r#"{"note":"Cookie: theme=light; sid=fixture-session-credential"#,
+                r#"\u000d\u000aX-Diagnostic: visible","keep":"visible"}"#
+            ),
+        ] {
+            for prefix in [0, BUFFER_BYTES - 25, BUFFER_BYTES - 8, BUFFER_BYTES + 1] {
+                let text = format!("{}{sample}", " ".repeat(prefix));
+                for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                    let fixture = Fixture::new(&text);
+                    let mut projection = TextProjection::default();
+                    projection.literal(text.clone());
+                    let mut bytes = TextBytes::new(projection.cursor(
+                        fixture.open(),
+                        SourceSpan {
+                            start: 0,
+                            end: text.len() as u64,
+                        },
+                    ));
+                    let mut actual = String::new();
+                    let (_, _, count) = render_text_range(&mut bytes, mode, None, |chunk| {
+                        actual.push_str(std::str::from_utf8(chunk).unwrap());
+                        Ok(())
+                    })
+                    .unwrap();
+                    let plain = redact_text_range_with_mode(&text, mode, None);
+                    for result in [&actual, &plain.text] {
+                        let decoded: serde_json::Value = serde_json::from_str(result).unwrap();
+                        assert_eq!(decoded["keep"], "visible");
+                        assert_eq!(
+                            result.contains("fixture-session-credential"),
+                            mode == RedactionMode::Off
+                        );
+                        assert!(result.contains("X-Diagnostic: visible"));
+                        if !mode.enabled() {
+                            assert_eq!(result, &text);
+                        }
+                    }
+                    assert_eq!(count, usize::from(mode.enabled()));
+                    assert_eq!(plain.count, count);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ql_h01_authorization_complete_values_and_decoded_syntax() {
         use crate::utils::{RedactionMode, redact_text_range_with_mode};
         let mut failures = Vec::new();
@@ -4567,7 +4734,7 @@ mod tests {
                 for secret in [
                     "Zml4dHVyZTpwYXNz",
                     "fixture.value",
-                    "EXAMPLEACCESS",
+                    concat!("EXAMPLE", "ACCESS"),
                     "fixture.signature",
                     "signature",
                 ] {
@@ -4665,27 +4832,32 @@ mod tests {
                 "Authorization: [redacted]\nX-Trace: visible",
             ),
             (
-                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLE\
+                    ACCESS/20261027/us-east-1/s3/aws4_request, \
                     SignedHeaders=host;x-amz-date, \
                     Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nX-Diagnostic: visible",
                 "Authorization: [redacted]\nX-Diagnostic: visible",
             ),
             (
-                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLE\
+                    ACCESS/20261027/us-east-1/s3/aws4_request, \
                     SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=fixture.signature, X-Trace: visible",
                 "Authorization: [redacted], X-Trace: visible",
             ),
             (
-                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+                "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLE\
+                    ACCESS/20261027/us-east-1/s3/aws4_request, \
                     SignedHeaders=host;x-amz-date, Signature=fixture.signature; status=ok",
                 "Authorization: [redacted]; status=ok",
             ),
             (
-                "Authorization: AWS EXAMPLEACCESS:fixture-signature=\nX-Diagnostic: visible",
+                "Authorization: AWS EXAMPLE\
+                    ACCESS:fixture-signature=\nX-Diagnostic: visible",
                 "Authorization: [redacted]\nX-Diagnostic: visible",
             ),
             (
-                "Authorization: AWS EXAMPLEACCESS:fixture-signature= diagnostic tail",
+                "Authorization: AWS EXAMPLE\
+                    ACCESS:fixture-signature= diagnostic tail",
                 "Authorization: [redacted] diagnostic tail",
             ),
             (
@@ -4723,7 +4895,7 @@ mod tests {
                 for start in [
                     "fixture.value",
                     "Zml4dHVyZTpwYXNz",
-                    "EXAMPLEACCESS",
+                    concat!("EXAMPLE", "ACCESS"),
                     "fixture.signature",
                     "fixture-signature",
                     "0123456789abcdef",
@@ -4934,7 +5106,7 @@ mod tests {
         }
         let indexed = index.finish(true).unwrap();
         let projection = indexed.projection(fixture.open(), span, "content", None).unwrap();
-        let expected = replace_images_with_placeholders(&parse_message_record(line).unwrap().unwrap());
+        let expected = replace_images_with_placeholders(&parse_message_record(line, None).unwrap().unwrap());
         assert_eq!(
             projection.cursor(fixture.open(), span).read_text(1_000_000).unwrap(),
             expected

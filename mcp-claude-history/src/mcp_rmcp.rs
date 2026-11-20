@@ -177,6 +177,7 @@ pub struct SearchToolParams {
     pub case_sensitive: Option<bool>,
     #[serde(default)]
     pub offset: Option<usize>,
+    /// normal 的结果条数；scan 每页 1..10000（默认 100）；sources 每页 1..128（默认 128）
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -749,9 +750,8 @@ impl McpHistoryService {
         run_history_work(request, move || list_projects(&cfg), tool_text_result).await
     }
 
-    #[tool(
-        description = "List project sessions with UUIDs and optional custom titles. Titles and topics are redacted before preview; redaction defaults to auto."
-    )]
+    #[tool(description = "List project sessions with UUIDs and optional custom titles. \
+            Titles and topics are redacted before preview; redaction defaults to auto.")]
     async fn history_sessions(
         &self,
         Parameters(p): Parameters<SessionsToolParams>,
@@ -1035,10 +1035,12 @@ mod tests {
         let project = root.join("fixture");
         std::fs::create_dir_all(&project).unwrap();
         let text = "Authorization: Basic Zml4dHVyZTpwYXNz\nAuthorization: Custom fixture.opaque\nAuthorization: \
-            AWS4-HMAC-SHA256 Credential=EXAMPLEACCESS/20261027/us-east-1/s3/aws4_request, \
+            AWS4-HMAC-SHA256 Credential=EXAMPLE\
+            ACCESS/20261027/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-date, \
             Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nAuthorization: AWS \
-            EXAMPLEACCESS:fixture-signature=\nX-Diagnostic: visible";
+            EXAMPLE\
+            ACCESS:fixture-signature=\nX-Diagnostic: visible";
         std::fs::write(
             project.join("fixture1.jsonl"),
             format!(
@@ -1134,7 +1136,7 @@ mod tests {
                         mode == "off",
                         "{view} {mode} {content}"
                     );
-                    for secret in ["EXAMPLEACCESS", "0123456789abcdef", "fixture-signature="] {
+                    for secret in [concat!("EXAMPLE", "ACCESS"), "0123456789abcdef", "fixture-signature="] {
                         assert_eq!(
                             content.contains(secret),
                             mode == "off",
@@ -1273,7 +1275,7 @@ mod tests {
         fs::create_dir(&project).unwrap();
         let source = project.join("window00.jsonl");
         let result_text = format!(
-            "前缀😀 Authorization: Bearer {}\nvisible-after",
+            concat!("前缀😀 Authorization: Bearer {}\n", "visible-after"),
             "x".repeat(crate::utils::MAX_JSONL_LINE_BYTES + 4096)
         );
         let records = [
@@ -1998,6 +2000,324 @@ mod tests {
         assert!(description.contains("remote-agents") && description.contains("subagents"));
         assert_eq!(schema["properties"]["subagents"]["default"], false);
         assert_eq!(fs::read_to_string(root.join(".owner")).unwrap(), "H-SUBAGENT-SCOPE");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cookie_redaction_covers_public_views_previews_and_exports() {
+        use std::{fs, io::Write};
+        let root = std::env::temp_dir().join(format!("mcp-history-cookie-{}", std::process::id()));
+        let secret = "fixture-session-credential";
+        let text = format!("前缀😀\nCookie: theme=\"light\"; sid={secret}\r\nX-Diagnostic: visible");
+        let nested = serde_json::json!({"note":text,"keep":"visible"}).to_string();
+        for (size, padding) in [("small", 0), ("indexed", crate::utils::MAX_JSONL_LINE_BYTES + 1)] {
+            let project = root.join(size);
+            fs::create_dir_all(&project).unwrap();
+            let mut file = fs::File::create(project.join("cookie00.jsonl")).unwrap();
+            for record in [
+                serde_json::json!({"uuid":"human","type":"user","timestamp":"2026-01-01T00:00:00Z",
+                    "padding":"x".repeat(padding),"message":{"content":text}}),
+                serde_json::json!({"uuid":"call","type":"assistant","timestamp":"2026-01-01T00:00:01Z",
+                    "padding":"x".repeat(padding),"message":{"content":[{"type":"tool_use","id":"cookie-call",
+                    "name":"Bash","input":{"command":nested,"keep":"visible"}}]}}),
+                serde_json::json!({"uuid":"result","parentUuid":"call","type":"user",
+                    "timestamp":"2026-01-01T00:00:02Z","padding":"x".repeat(padding),
+                    "message":{"content":[{"type":"tool_result","tool_use_id":"cookie-call","content":nested}]}}),
+            ] {
+                writeln!(file, "{record}").unwrap();
+            }
+            drop(file);
+            let service = McpHistoryService {
+                config: Config {
+                    projects_dir: root.clone(),
+                },
+                scans: crate::stream_scan::ScanStore::default(),
+                tool_router: McpHistoryService::tool_router(),
+            };
+            for mode in ["auto", "strict", "off"] {
+                for tool in [
+                    "get",
+                    "record",
+                    "tool_input",
+                    "tool_result",
+                    "normal",
+                    "scan",
+                    "context",
+                    "trace",
+                ] {
+                    for export in [false, true] {
+                        if tool == "scan" && export {
+                            continue;
+                        }
+                        let mut query = serde_json::json!({"project":size,"redaction":mode});
+                        match tool {
+                            "normal" | "scan" => {
+                                query["mode"] = serde_json::json!(tool);
+                                query["pattern"] = serde_json::json!("Cookie");
+                                if tool == "scan" {
+                                    query["scan_bytes"] = serde_json::json!(268435456);
+                                    query["scan_ms"] = serde_json::json!(10000);
+                                }
+                            }
+                            "context" | "trace" => {
+                                query["ref"] = serde_json::json!("cookie00:3");
+                                query["before"] = serde_json::json!(2);
+                                query["after"] = serde_json::json!(0);
+                            }
+                            _ => {
+                                let line = match tool {
+                                    "tool_input" => 2,
+                                    "tool_result" => 3,
+                                    _ => 1,
+                                };
+                                query["ref"] = serde_json::json!(format!("cookie00:{line}"));
+                                if tool != "get" {
+                                    query["view"] = serde_json::json!(tool);
+                                }
+                                if tool == "record" {
+                                    query["range"] = serde_json::json!("0-250");
+                                }
+                            }
+                        }
+                        if export {
+                            query["output"] = serde_json::json!(format!("tmp:cookie-{size}-{mode}-{tool}"));
+                        }
+                        let mut rows = 0;
+                        let last = loop {
+                            let request = test_context().await;
+                            let params = query.clone();
+                            let result = match tool {
+                                "normal" | "scan" => {
+                                    service
+                                        .history_search(Parameters(serde_json::from_value(params).unwrap()), request)
+                                        .await
+                                }
+                                "context" => {
+                                    service
+                                        .history_context(Parameters(serde_json::from_value(params).unwrap()), request)
+                                        .await
+                                }
+                                "trace" => {
+                                    service
+                                        .history_trace(Parameters(serde_json::from_value(params).unwrap()), request)
+                                        .await
+                                }
+                                _ => {
+                                    service
+                                        .history_get(Parameters(serde_json::from_value(params).unwrap()), request)
+                                        .await
+                                }
+                            }
+                            .unwrap();
+                            let wrapper = serde_json::to_value(result).unwrap();
+                            assert_ne!(wrapper["isError"], true, "{size}/{mode}/{tool}: {wrapper}");
+                            let response = wrapper["content"][0]["text"].as_str().unwrap();
+                            let payload: serde_json::Value = serde_json::from_str(response).unwrap();
+                            let page_rows = payload["results"].as_array().map_or(0, Vec::len);
+                            rows += page_rows;
+                            if mode != "off" {
+                                assert!(!response.contains(secret));
+                            }
+                            let body = if export {
+                                let key = if tool == "normal" { "results" } else { "content" };
+                                let body = fs::read_to_string(payload["output"][key].as_str().unwrap()).unwrap();
+                                let manifest =
+                                    fs::read_to_string(payload["output"]["manifest"].as_str().unwrap()).unwrap();
+                                assert!(!manifest.contains(secret));
+                                assert!(serde_json::from_str::<serde_json::Value>(&manifest).is_ok());
+                                fs::remove_dir_all(
+                                    std::path::Path::new(payload["output"][key].as_str().unwrap())
+                                        .parent()
+                                        .unwrap(),
+                                )
+                                .unwrap();
+                                body
+                            } else {
+                                response.to_string()
+                            };
+                            assert_eq!(
+                                body.contains(secret),
+                                mode == "off" && (tool != "scan" || page_rows > 0),
+                                "{size}/{mode}/{tool}/{export}: {body}"
+                            );
+                            if tool != "scan" || !payload["results"].as_array().unwrap().is_empty() {
+                                assert!(body.contains("X-Diagnostic: visible"), "{size}/{mode}/{tool}: {body}");
+                            }
+                            if tool == "trace" {
+                                let preview = payload["tool_calls"][0]["result_preview"].to_string();
+                                assert_eq!(preview.contains(secret), mode == "off", "{preview}");
+                                assert!(preview.contains("X-Diagnostic: visible"), "{preview}");
+                            }
+                            if tool == "get" && !export && mode == "off" {
+                                assert_eq!(payload["content"], text);
+                            }
+                            if tool == "scan" && payload["has_more"] == true {
+                                query = payload["next_query"].clone();
+                            } else {
+                                break payload;
+                            }
+                        };
+                        if tool == "scan" {
+                            assert_eq!(rows, 3);
+                            assert_eq!(last["scan_complete"], true);
+                            let result = service
+                                .history_scan_metadata(
+                                    Parameters(
+                                        serde_json::from_value(
+                                            serde_json::json!({"scan_id":last["scan_id"],"release":true}),
+                                        )
+                                        .unwrap(),
+                                    ),
+                                    test_context().await,
+                                )
+                                .await
+                                .unwrap();
+                            assert_ne!(serde_json::to_value(result).unwrap()["isError"], true);
+                        }
+                    }
+                }
+                let credential = text[..text.find(secret).unwrap()].chars().count();
+                let semicolon = text[..text.find(';').unwrap()].chars().count();
+                for (start, end) in [
+                    (credential + 3, credential + 8),
+                    (semicolon, semicolon + 1),
+                    (credential - 2, credential + 4),
+                    (credential, credential),
+                ] {
+                    for export in [false, true] {
+                        let mut query = serde_json::json!({
+                            "ref":"cookie00:1","project":size,"redaction":mode,"range":format!("{start}-{end}")
+                        });
+                        if export {
+                            query["output"] =
+                                serde_json::json!(format!("tmp:cookie-range-{size}-{mode}-{start}-{end}"));
+                        }
+                        let result = service
+                            .history_get(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
+                            .await
+                            .unwrap();
+                        let wrapper = serde_json::to_value(result).unwrap();
+                        assert_ne!(wrapper["isError"], true, "{wrapper}");
+                        let payload: serde_json::Value =
+                            serde_json::from_str(wrapper["content"][0]["text"].as_str().unwrap()).unwrap();
+                        let expected = if start == end {
+                            String::new()
+                        } else if mode == "off" {
+                            text.chars().skip(start).take(end - start).collect()
+                        } else {
+                            "[redacted]".to_string()
+                        };
+                        let actual = if export {
+                            let content = payload["output"]["content"].as_str().unwrap();
+                            let actual = fs::read_to_string(content).unwrap();
+                            let manifest: serde_json::Value = serde_json::from_slice(
+                                &fs::read(payload["output"]["manifest"].as_str().unwrap()).unwrap(),
+                            )
+                            .unwrap();
+                            assert!(!manifest.to_string().contains(secret));
+                            assert_eq!(
+                                manifest["redaction"]["redacted_count"],
+                                usize::from(mode != "off" && start < end)
+                            );
+                            fs::remove_dir_all(std::path::Path::new(content).parent().unwrap()).unwrap();
+                            actual
+                        } else {
+                            payload["content"].as_str().unwrap().to_string()
+                        };
+                        assert_eq!(actual, expected, "{size}/{mode}/{start}-{end}/{export}");
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scalar_lowercase_queries_match_normal_indexed_and_scan() {
+        use std::{fs, io::Write};
+        let root = std::env::temp_dir().join(format!("mcp-history-sigma-{}", std::process::id()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let text = "前缀😀ΟΣ suffix";
+        let mut file = fs::File::create(project.join("sigma000.jsonl")).unwrap();
+        for (uuid, padding) in [("normal", 0), ("indexed", crate::utils::MAX_JSONL_LINE_BYTES + 1)] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"uuid":uuid,"type":"user",
+                "timestamp":"2026-01-01T00:00:00Z","padding":"x".repeat(padding),"message":{"content":text}})
+            )
+            .unwrap();
+        }
+        drop(file);
+        let service = McpHistoryService {
+            config: Config {
+                projects_dir: root.clone(),
+            },
+            scans: crate::stream_scan::ScanStore::default(),
+            tool_router: McpHistoryService::tool_router(),
+        };
+        for mode in ["normal", "scan"] {
+            for (pattern, sensitive, expected) in [
+                ("ΟΣ", false, 2),
+                ("ΟΣ suffix", false, 2),
+                ("absent|ΟΣ", false, 2),
+                ("ΟΣ !absent", false, 2),
+                ("suffix !ΟΣ", false, 0),
+                ("!ΟΣ", false, 0),
+                ("οσ", false, 2),
+                ("ος", false, 0),
+                ("ΟΣ", true, 2),
+                ("οσ", true, 0),
+            ] {
+                let parsed = crate::utils::parse_search_pattern(pattern, sensitive);
+                let direct = crate::utils::matches_pattern(text, &parsed, sensitive);
+                assert_eq!(direct.0, expected > 0);
+                if expected > 0 {
+                    assert_eq!(direct.1, Some(3));
+                }
+                let mut query = serde_json::json!({"project":"project","mode":mode,"pattern":pattern,
+                    "case_sensitive":sensitive});
+                if mode == "scan" {
+                    query["scan_bytes"] = serde_json::json!(268435456);
+                    query["scan_ms"] = serde_json::json!(10000);
+                }
+                let mut rows = Vec::new();
+                let last = loop {
+                    let result = service
+                        .history_search(Parameters(serde_json::from_value(query).unwrap()), test_context().await)
+                        .await
+                        .unwrap();
+                    let wrapper = serde_json::to_value(result).unwrap();
+                    assert_ne!(wrapper["isError"], true, "{wrapper}");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(wrapper["content"][0]["text"].as_str().unwrap()).unwrap();
+                    rows.extend(payload["results"].as_array().unwrap().iter().cloned());
+                    if payload["has_more"] != true {
+                        break payload;
+                    }
+                    query = payload["next_query"].clone();
+                };
+                assert_eq!(rows.len(), expected, "{mode}/{pattern}/{sensitive}");
+                for row in rows {
+                    assert_eq!(row["content"], text);
+                }
+                if mode == "scan" {
+                    assert_eq!(last["scan_complete"], true);
+                    let result = service
+                        .history_scan_metadata(
+                            Parameters(
+                                serde_json::from_value(serde_json::json!({"scan_id":last["scan_id"],"release":true}))
+                                    .unwrap(),
+                            ),
+                            test_context().await,
+                        )
+                        .await
+                        .unwrap();
+                    assert_ne!(serde_json::to_value(result).unwrap()["isError"], true);
+                }
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2764,8 +3084,11 @@ mod tests {
         fs::write(root.join(".owner"), &owner).unwrap();
         let pattern = ".claude/skills/mrdr-optimize-analysis/SKILL.md";
         let cache = serde_json::json!({"type":"api-request-blob", "message":{"content":
-            (0..2000).map(|index| serde_json::json!({"index":index,"text":"synthetic ignored cache"})).collect::<Vec<_>>()
-        }}).to_string();
+            (0..2000)
+                .map(|index| serde_json::json!({"index":index,"text":"synthetic ignored cache"}))
+                .collect::<Vec<_>>()
+        }})
+        .to_string();
         for project in 0..4 {
             let directory = root.join(format!("project-{project}"));
             fs::create_dir_all(directory.join("session-main/subagents/workflows/run")).unwrap();

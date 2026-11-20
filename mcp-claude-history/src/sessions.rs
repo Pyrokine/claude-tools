@@ -145,7 +145,7 @@ fn get_session_stats(path: &std::path::Path, redaction_mode: RedactionMode) -> R
         };
         line_count += 1;
 
-        if let Ok(Some(record)) = parse_message_record(&line) {
+        if let Ok(Some(record)) = parse_message_record(&line, None) {
             if start_time.is_empty() {
                 start_time = record.timestamp.clone();
             }

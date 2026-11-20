@@ -4,7 +4,7 @@ English | [中文](README_zh.md)
 
 A conversation history search tool for Claude Code
 
-Module version: 2.2.0
+Module version: 2.2.1
 
 Session lists show custom titles alongside UUIDs. Large-history searches preserve exact match counts, filtering and
 pagination.
@@ -132,9 +132,12 @@ case-insensitive. If several projects resolve to that path, the call returns `pr
 | `project`   | string | current | Project ID                                    |
 | `redaction` | string | auto    | `auto`, `strict`, or `off` for session topics |
 
-Each session keeps its UUID in `id` and its first user topic in `topic`. Optional `title` is the last nonblank `custom-title` name from the session, so a name such as `HDMap_3` can be mapped to that UUID. Sessions without a custom name omit `title`.
+Each session keeps its UUID in `id` and its first user topic in `topic`. Optional `title` is the last nonblank
+`custom-title` name from the session, so a name such as `HDMap_3` can be mapped to that UUID. Sessions without a custom
+name omit `title`.
 
-Titles and topics are redacted before their 100-character preview is created. The response includes aggregate `redaction` metadata, plus `title_redacted_count` or `topic_redacted_count` when that field had replacements.
+Titles and topics are redacted before their 100-character preview is created. The response includes aggregate
+`redaction` metadata, plus `title_redacted_count` or `topic_redacted_count` when that field had replacements.
 
 ### history_search
 
@@ -180,7 +183,8 @@ Titles and topics are redacted before their 100-character preview is created. Th
 | `max_total`               | number   | 40000                  | Compact response bytes, 512 to 10,000,000         |
 
 Without `project` or `all`, search uses the current project. `sessions` filters that selected project scope; use
-`all=true` to find sessions across projects, or set `project` explicitly. `all=true` and `project` are mutually exclusive.
+`all=true` to find sessions across projects, or set `project` explicitly. `all=true` and `project` are mutually
+exclusive.
 
 `subagents=false` (the default) searches only main JSONL files. `true` includes direct agent files under
 `<session>/subagents/`, `<session>/remote-agents/`, and the known nested layout
@@ -211,6 +215,10 @@ one regular expression. When `since` or `until` is set, an unparseable record ti
 `stats.skipped_invalid_timestamps` and `incomplete_reasons`. Dates are interpreted in UTC: `since=YYYY-MM-DD` starts at
 00:00 UTC, `until=YYYY-MM-DD` includes the whole UTC date, and `today` uses the current UTC date. RFC3339 values include
 their explicit timezone offset and compare as UTC instants. `since` cannot be later than `until`.
+
+With `regex=false` and `case_sensitive=false`, search lowercases each Unicode scalar in both the query and message.
+`ΟΣ` matches `ΟΣ` and `οσ`; `ος` remains distinct. Match positions use original Unicode character offsets, including
+characters whose lowercase form expands.
 
 Search matches `pattern` against the complete extracted message, including tool input beyond the response preview limit.
 Each result returns the bounded message preview in `content`; use its `ref` with `history_get` for ranges or export.
@@ -258,7 +266,15 @@ tool strings retain trailing diagnostic text, the next header and later JSON fie
 same boundaries; ranges
 overlapping a credential return one redaction marker.
 
-Complete JSON message bodies remain valid JSON after redaction, including JSON embedded in tool-result text. Sensitive numbers, booleans, nulls and strings become JSON string markers; nonsensitive values keep their original types. Ranges still use the original character offsets, and `off` preserves the original text.
+`auto` and `strict` redact the complete value after `Cookie:` or `Cookie=`, including every cookie pair and its quotes.
+Semicolons and quotes inside a pair do not end the header. Scanning stops at actual or JSON-decoded CR/LF or the
+enclosing
+string boundary. Empty headers leave the next line untouched. Inline content, structured previews, ranges, and exports
+use these same boundaries.
+
+Complete JSON message bodies remain valid JSON after redaction, including JSON embedded in tool-result text. Sensitive
+numbers, booleans, nulls and strings become JSON string markers; nonsensitive values keep their original types. Ranges
+still use the original character offsets, and `off` preserves the original text.
 
 Auto and strict also redact complete npm access tokens: lowercase `npm_` followed by exactly 36 ASCII alphanumeric
 characters, with Unicode word boundaries on both sides. This includes standalone values and separately quoted command
@@ -325,7 +341,8 @@ bundle and removes the unpublished staging directory.
 On Windows, export paths may be owned by the current user, SYSTEM, or Administrators. The owner remains unchanged; the
 protected DACL grants only the current user FullControl Allow, with no inherited entries. Other owners are rejected
 before changing the DACL, and the error includes the owner SID. Permissions are set and verified through native Windows
-APIs, without starting PowerShell for each file. Directory rules apply to child files and directories. Returned canonical
+APIs, without starting PowerShell for each file. Directory rules apply to child files and directories. Returned
+canonical
 Windows drive paths can be passed back as `output`, including `\\?\C:\...` paths.
 
 Exported search rows use the same filtering, timestamp ordering, and de-duplication as inline results, subject to a
@@ -354,9 +371,13 @@ included. The response reports `serialized_bytes`, `max_total_bytes`, `limits_ap
 Normal search retains timestamp ordering, UUID de-duplication, regex, and slice. Collection stops at 50,000 matches or
 32 MiB of cached results and reports the gap. Each request has a 120-second execution deadline. `limit` bounds returned
 rows; matching still examines the selected sources. Use scan for incremental progress through the full source set.
-Rust regex does not support look-around or backreferences. Normal search and scan validate complete JSON while leaving ignored cache payloads and
+Rust regex does not support look-around or backreferences. Normal search and scan validate complete JSON while leaving
+ignored cache payloads and
 unknown envelope fields unmaterialized. Filename patterns still match message content, with unchanged date, type,
 association, and redaction rules; they do not select source paths. Use `source` for an exact physical file.
+Repeated top-level keys keep the last value. `user` and `assistant` records require `message`; an explicit `null` is valid.
+Time and line filters still validate excluded normal-search records and preserve their tool associations; full-text
+matching uses records inside the selected ranges.
 
 Metadata reduced by `max_total` is listed in `stats.metadata_dimensions`, keyed by fields such as
 `coverage.searched_files` and `summary.by_tool`. Each affected dimension reports `total`, `returned`, and `omitted`; a
@@ -434,13 +455,23 @@ conversation messages still produce diagnostics.
 
 Frozen source names are stored in a private catalog, capped at 128 MiB per scan, instead of duplicating long paths in
 metadata memory. Coverage pages restore every project, session, and source unchanged. The 32 MiB diagnostic metadata
-quota remains active. Catalogs are removed when the scan is released, expires, is canceled, or the process exits normally.
+quota remains active. Catalogs are removed when the scan is released, expires, is canceled, or the process exits
+normally.
+
+Normal search reports omitted coverage entries in `stats.metadata_dimensions`. Metadata omissions leave
+`stats.total_matches_exact` and each returned result's exact `source` available. Use an identified `source` for a
+follow-up limited to that physical file; `max_total` continues to cover the complete response, including metadata.
+
+Normal and scan validate `sessions` within the selected projects and subagent scope. Missing sessions return
+`session_not_found`; ambiguous sessions return `session_ambiguous` with up to two exact source candidates and
+`sources_truncated=true` when more exist. Use `source` to choose one file or `sources` to select several explicitly.
 
 Cursors belong to the running MCP instance. Repeating the most recently successful request with the same budgets replays
 its response. Changed replay budgets, frozen filters, stale cursors, and another instance return explicit errors. A
 record that cannot fit is retained, and `response_too_large.available.next_query` points to the unconsumed page. The
 instance retains at most four scans; idle scans expire after 20 minutes and metadata is limited to 32 MiB per scan.
-Release state when finished. Cancellation stops reads and CPU work; a canceled scan releases its cursor state. A
+Release state when finished. Cancellation stops reads and CPU work and releases the scan's cursor state. The MCP
+transport discards a canceled request's response, including a page formed before cancellation was received. A
 `scan_metadata_quota` error reports `metadata_bytes_used`, `requested_bytes`, `max_metadata_bytes`, `remaining_bytes`,
 `files_enumerated`, and `scan_phase`. The byte values describe quota accounting, not process RSS. Reduce the query by
 project or session, read the failed scan's metadata, and release its state; the 32 MiB limit remains in force.
@@ -532,7 +563,8 @@ The anchor message (specified by `ref`) is always included. `before`/`after` cou
 Local context and trace queries support sessions with more than 100,000 messages. Limits apply to the selected span: all
 valid messages in that span, including those hidden by display filters, count toward the 2,000-message and 32 MiB
 limits. Exceeding either returns `session_window_limit` or `session_window_memory_limit`, respectively. When matching
-messages are separated by many hidden records, even a small `before`/`after` count can exceed the span limit. Use a nearby
+messages are separated by many hidden records, even a small `before`/`after` count can exceed the span limit. Use a
+nearby
 `until_ref` to bound the span, or `history_search` to retrieve matching messages. Diagnostics cover the scanned prefix
 only; an unread suffix is not checked. Valid `.jsonl` session metadata records are ignored
 without warnings; malformed JSON and incomplete message records produce warnings. User or assistant records with UUID,

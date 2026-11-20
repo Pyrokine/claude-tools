@@ -446,7 +446,7 @@ pub(crate) fn prepare_search_inputs(config: &Config, params: &SearchParams) -> R
     files.sort();
     files.dedup();
     if params.sources.is_empty() {
-        ensure_session_filters_unambiguous(&files, &params.sessions)?;
+        ensure_session_filters_unambiguous(files.iter().cloned().map(Ok), &params.sessions)?;
     }
     let regex = build_search_regex(params)?;
     let search_pattern = if !params.use_regex && !params.pattern.is_empty() {
@@ -1206,21 +1206,27 @@ fn build_response_warning(
 }
 
 pub(crate) fn ensure_session_filters_unambiguous(
-    files: &[(String, String, PathBuf)],
+    files: impl IntoIterator<Item = Result<crate::session_files::SessionFile, ErrorResponse>>,
     sessions: &[String],
 ) -> Result<(), ErrorResponse> {
     if sessions.is_empty() {
         return Ok(());
     }
-
-    for filter in sessions {
-        let mut matches = BTreeSet::new();
-        for (project, session, source) in files {
-            crate::record_reader::check_work()?;
-            if session_matches_ref(session, filter) {
-                matches.insert((project, session, source));
+    let mut candidates = vec![(BTreeSet::new(), false); sessions.len()];
+    for file in files {
+        crate::record_reader::check_work()?;
+        let file = file?;
+        for (filter, (matches, truncated)) in sessions.iter().zip(&mut candidates) {
+            if session_matches_ref(&file.1, filter) {
+                matches.insert(file.clone());
+                if matches.len() > 2 {
+                    matches.pop_last();
+                    *truncated = true;
+                }
             }
         }
+    }
+    for (filter, (matches, truncated)) in sessions.iter().zip(candidates) {
         if matches.is_empty() {
             return Err(ErrorResponse {
                 error: "session_not_found".to_string(),
@@ -1235,6 +1241,7 @@ pub(crate) fn ensure_session_filters_unambiguous(
                     "session 过滤条件不唯一: {filter}；请原样传入 available.sources 中的 source 精确选择物理来源"
                 ),
                 available: Some(serde_json::json!({
+                    "sources_truncated": truncated,
                     "candidates": matches.iter().map(|(project,
                     session,
                     _)| format!("{project}:{session}")).collect::<Vec<_>>(),
@@ -2313,6 +2320,14 @@ pub(crate) fn build_search_result(
         return Ok(None);
     }
 
+    if has_tool_filter(ctx.params)
+        && select_tool_block(tool_blocks, ctx.params).is_none()
+        && tool_blocks
+            .iter()
+            .all(|block| block.metadata_incomplete_reason.is_none())
+    {
+        return Ok(None);
+    }
     let (raw_content, images) = extract_and_replace_images(record);
     crate::record_reader::check_work()?;
     let (matches, match_pos) = if ctx.params.pattern.is_empty() {
@@ -2474,6 +2489,12 @@ pub(crate) fn build_indexed_search_result(
             return Ok(None);
         }
         _ => return Ok(None),
+    }
+    if has_tool_filter(params)
+        && select_tool_block(&blocks, params).is_none()
+        && blocks.iter().all(|block| block.metadata_incomplete_reason.is_none())
+    {
+        return Ok(None);
     }
     let projection = indexed.projection(open()?, span, "content", None)?;
     let images = projection.images.clone();
@@ -2737,8 +2758,16 @@ fn visit_search_file(
         let parsed = (|| {
             if let Some(raw) = &located.small {
                 let raw = std::str::from_utf8(raw).map_err(|_| reader_error("invalid_utf8", "JSONL UTF-8 无效"))?;
-                let Some(record) =
-                    parse_message_record(raw).map_err(|_| reader_error("parse_error", "JSONL 格式或消息字段无效"))?
+                let time_match = std::cell::Cell::new(None);
+                let retain_message = |timestamp: &str| {
+                    let matched = time_in_range(timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref());
+                    time_match.set(Some(matched));
+                    in_range && matched == TimeRangeMatch::Matches
+                };
+                let message_filter = (ctx.params.since.is_some() || ctx.params.until.is_some() || !in_range)
+                    .then_some(&retain_message as &dyn Fn(&str) -> bool);
+                let Some(record) = parse_message_record(raw, message_filter)
+                    .map_err(|_| reader_error("parse_error", "JSONL 格式或消息字段无效"))?
                 else {
                     return Ok(None);
                 };
@@ -2749,7 +2778,9 @@ fn visit_search_file(
                 if !in_range {
                     return Ok(None);
                 }
-                let time_match = time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref());
+                let time_match = time_match.get().unwrap_or_else(|| {
+                    time_in_range(&record.timestamp, ctx.params.since.as_ref(), ctx.params.until.as_ref())
+                });
                 if time_match == TimeRangeMatch::UnparseableTimestamp {
                     stats.invalid_timestamps += 1;
                     return Ok(None);
@@ -3043,6 +3074,139 @@ mod tests {
         .unwrap();
         assert_eq!(response.stats.total_matches, 1);
         assert!(response.stats.total_matches_exact);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexed_tool_filter_rejects_long_body_before_projection() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let root = env::temp_dir().join(format!("history-tool-projection-{}", process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("fixture.jsonl");
+        let row = serde_json::json!({
+            "uuid":"projection", "type":"assistant", "timestamp":"2026-01-01T00:00:00Z",
+            "message":{"content":[{"type":"tool_use","id":"call","name":"mcp__fixture__other",
+                "input":{"note":"x".repeat(2 * 1024 * 1024)}}]}
+        })
+        .to_string();
+        fs::write(&source, &row).unwrap();
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let measured = bytes.clone();
+        let control = crate::record_reader::WorkControl::from_checkpoint(move |count| {
+            measured.fetch_add(count, Ordering::Relaxed);
+            Ok(())
+        });
+        for (tool, since, expect) in [
+            ("mcp__fixture__wanted", None, false),
+            ("mcp__fixture__other", Some("2026-01-02T00:00:00Z"), false),
+            ("mcp__fixture__other", None, true),
+        ] {
+            bytes.store(0, Ordering::Relaxed);
+            let params = SearchParams {
+                tools: vec![tool.into()],
+                pattern: "x".into(),
+                structured: Some("preview".into()),
+                redaction: RedactionMode::Off,
+                since: since.map(|value| parse_time(value).unwrap()),
+                ..SearchParams::default()
+            };
+            let result = control
+                .run(|| {
+                    build_indexed_search_result(
+                        &RecordBuildContext {
+                            project_id: "fixture",
+                            session_id: "fixture",
+                            source: &source,
+                            prefix: "fixture",
+                            params: &params,
+                            regex: None,
+                            pattern: Some(&parse_search_pattern(&params.pattern, false)),
+                        },
+                        SourceSpan {
+                            start: 0,
+                            end: row.len() as u64,
+                        },
+                        1,
+                        || File::open(&source).map_err(|error| reader_error("io_error", error.to_string())),
+                        &mut ToolAssociationTracker::default(),
+                        &mut Vec::new(),
+                        &mut 0,
+                    )
+                })
+                .unwrap();
+            assert_eq!(result.is_some(), expect);
+            let processed = bytes.load(Ordering::Relaxed);
+            eprintln!(
+                "projection fixture tool={tool} since={since:?} source_bytes={} processing_bytes={processed}",
+                row.len()
+            );
+            if !expect {
+                assert!(
+                    processed < row.len() * 2,
+                    "unmatched tool/time repeated body projection: {processed}"
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normal_metadata_budget_keeps_exact_match_count_and_source_pointers() {
+        let root = env::temp_dir().join(format!("history-normal-metadata-{}", process::id()));
+        fs::create_dir_all(root.join("project")).unwrap();
+        for index in 0..500 {
+            fs::write(
+                root.join("project")
+                    .join(format!("{index:04}-{}.jsonl", "path".repeat(25))),
+                "",
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.join("project/matches.jsonl"),
+            concat!(
+                "{\"uuid\":\"one\",\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",",
+                "\"message\":{\"content\":\"document-id\"}}\n",
+                "{\"uuid\":\"two\",\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:01Z\",",
+                "\"message\":{\"content\":\"document-id\"}}\n"
+            ),
+        )
+        .unwrap();
+        let response = search(
+            &Config {
+                projects_dir: root.clone(),
+            },
+            SearchParams {
+                projects: vec!["project".into()],
+                pattern: "document-id".into(),
+                max_total: 30000,
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.stats.files_scanned, 501);
+        assert_eq!(response.stats.total_matches, 2);
+        assert!(response.stats.total_matches_exact);
+        assert_eq!(response.results.len(), 2);
+        assert!(!response.has_more);
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|value| value.source.as_ref().unwrap().ends_with("matches.jsonl"))
+        );
+        let dimension = &response.stats.metadata_dimensions["coverage.searched_files"];
+        assert_eq!(dimension.total, 501);
+        assert!(dimension.omitted > 0);
+        assert_eq!(dimension.returned + dimension.omitted, dimension.total);
+        assert!(response.serialized_bytes <= 30000);
+        eprintln!(
+            "normal metadata fixture total={} returned={} omitted={} matches={}",
+            dimension.total, dimension.returned, dimension.omitted, response.stats.total_matches
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3407,13 +3571,23 @@ mod tests {
             regex: None,
             pattern: Some(&pattern),
         };
-        for kind in ["text", "tool_use", "cache"] {
+        for kind in [
+            "text",
+            "tool_use",
+            "cache",
+            "cache_nested_uuid",
+            "text_excluded",
+            "tool_use_excluded",
+        ] {
             let padding = "synthetic nonmatching text ".repeat(4096);
             let record = match kind {
-                "text" => json!({"uuid":"text","type":"assistant","timestamp":"2026-10-01T00:00:00Z",
+                "text" | "text_excluded" => json!({"uuid":"text","type":"assistant","timestamp":"2026-10-01T00:00:00Z",
                     "message":{"content":[{"type":"text","text":padding}]}}),
-                "tool_use" => json!({"uuid":"call","type":"assistant","timestamp":"2026-10-01T00:00:00Z",
-                    "message":{"content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":padding}}]}}),
+                "tool_use" | "tool_use_excluded" => {
+                    json!({"uuid":"call","type":"assistant","timestamp":"2026-10-01T00:00:00Z",
+                    "message":{"content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":padding}}]}})
+                }
+                "cache_nested_uuid" => json!({"type":"api-request-blob","message":{"content":padding,"uuid":"nested"}}),
                 _ => json!({"type":"api-request-blob","message":{"content":padding}}),
             };
             let raw = record.to_string();
@@ -3421,9 +3595,12 @@ mod tests {
             let mut parse = std::time::Duration::ZERO;
             let mut association = std::time::Duration::ZERO;
             let mut matching = std::time::Duration::ZERO;
+            let excluded = kind.ends_with("_excluded");
+            let retain_message = |_: &str| false;
+            let message_filter = excluded.then_some(&retain_message as &dyn Fn(&str) -> bool);
             for _ in 0..count {
                 let start = Instant::now();
-                let record = parse_message_record(&raw).unwrap();
+                let record = parse_message_record(&raw, message_filter).unwrap();
                 parse += start.elapsed();
                 let Some(record) = record else { continue };
                 let mut tracker = ToolAssociationTracker::default();
@@ -3437,7 +3614,11 @@ mod tests {
                         1,
                         &record,
                         &blocks,
-                        time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref()),
+                        if excluded {
+                            TimeRangeMatch::OutsideRange
+                        } else {
+                            time_in_range(&record.timestamp, params.since.as_ref(), params.until.as_ref())
+                        },
                         &mut Vec::new(),
                     )
                     .unwrap()
@@ -3517,7 +3698,7 @@ mod tests {
             let parse = Instant::now();
             let records: Vec<_> = raw
                 .lines()
-                .map(|line| parse_message_record(line).unwrap().unwrap())
+                .map(|line| parse_message_record(line, None).unwrap().unwrap())
                 .collect();
             let parse_ms = parse.elapsed().as_secs_f64() * 1000.0;
             let redaction = Instant::now();
@@ -4170,11 +4351,11 @@ mod tests {
     #[test]
     fn line_range_observes_tool_use_before_filtering_result_rows() {
         assert!(
-            parse_message_record(r#"{"type":"custom-title","customTitle":"fixture"}"#)
+            parse_message_record(r#"{"type":"custom-title","customTitle":"fixture"}"#, None)
                 .unwrap()
                 .is_none()
         );
-        assert!(parse_message_record(r#"{"type":"assistant","message":{}}"#).is_err());
+        assert!(parse_message_record(r#"{"type":"assistant","message":{}}"#, None).is_err());
 
         let tmp = env::temp_dir().join(format!("mcp-search-metadata-test-{}", process::id()));
         fs::create_dir_all(&tmp).unwrap();
@@ -4315,6 +4496,86 @@ mod tests {
         );
         assert!(serde_json::to_vec(&output).unwrap().len() <= output.max_total_bytes);
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn excluded_raw_values_preserve_tool_attribution_and_parse_errors() {
+        let root = env::temp_dir().join(format!("mcp-search-raw-value-{}", process::id()));
+        fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        let root = root.canonicalize().unwrap();
+        let path = root.join("raw-value.jsonl");
+        let block = serde_json::json!({"type":"tool_use", "id":"call", "name":"mcp__fixture__echo", "input":{}});
+        let message = serde_json::json!({"content":[block]});
+        let mut messages = vec![
+            message.to_string(),
+            serde_json::json!({"$serde_json::private::RawValue":message.to_string()}).to_string(),
+            serde_json::json!({"content":{"$serde_json::private::RawValue":message["content"].to_string()}})
+                .to_string(),
+            serde_json::json!({"content":[{"$serde_json::private::RawValue":block.to_string()}]}).to_string(),
+            format!(r#"{{"content":[{block}],"$serde_json::private::RawValue":"{{"}}"#),
+        ];
+        messages.push(messages[1].replace('$', &format!("{}u0024", char::from(92))));
+        for field in ["type", "id", "name", "input"] {
+            let mut nested = message.clone();
+            nested["content"][0][field] =
+                serde_json::json!({"$serde_json::private::RawValue":block[field].to_string()});
+            messages.push(nested.to_string());
+        }
+        for message in messages {
+            let call = format!(
+                r#"{{"uuid":"call","type":"assistant","timestamp":"2026-09-01T00:00:00Z","message":{message}}}"#
+            );
+            let result = serde_json::json!({"uuid":"result", "type":"user", "timestamp":"2026-10-01T00:00:00Z",
+                "message":{"content":[{"type":"tool_result", "tool_use_id":"call", "content":"needle"}]}});
+            for invalid in [false, true] {
+                let raw_call = if invalid {
+                    r#"{"uuid":"call","type":"assistant","timestamp":"2026-09-01T00:00:00Z","message":{"$serde_json::private::RawValue":"{"}}"#
+                } else {
+                    &call
+                };
+                fs::write(&path, format!("{raw_call}\n{result}\n")).unwrap();
+                for filter in ["time", "lines"] {
+                    let params = SearchParams {
+                        pattern: "needle".to_string(),
+                        tools: if invalid { Vec::new() } else { vec!["echo".to_string()] },
+                        since: (filter == "time").then(|| parse_time("2026-10-01T00:00:00Z").unwrap()),
+                        lines: if filter == "lines" {
+                            vec![Range {
+                                start: Some(2),
+                                end: Some(2),
+                                exclude: false,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    };
+                    let found = search_file(
+                        "fixture",
+                        "raw-value",
+                        &path,
+                        &params,
+                        None,
+                        None,
+                        FileSearchLimits {
+                            max_matches: 10,
+                            max_bytes: MAX_SEARCH_RESULTS_BYTES,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(found.read_errors, 0, "{filter}/{invalid}/{message}");
+                    assert_eq!(found.results.len(), 1, "{filter}/{invalid}/{message}");
+                    assert_eq!(found.parse_errors, usize::from(invalid && filter == "time"));
+                    assert_eq!(found.metadata_parse_errors, usize::from(invalid && filter == "lines"));
+                    if !invalid {
+                        assert_eq!(found.results[0].server.as_deref(), Some("fixture"));
+                        assert_eq!(found.results[0].tool.as_deref(), Some("echo"));
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

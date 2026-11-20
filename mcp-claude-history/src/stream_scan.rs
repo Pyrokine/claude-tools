@@ -1261,6 +1261,19 @@ fn scan_files(
     } else {
         let projects = search::get_project_dirs(config, &params)?;
         crate::session_files::visit_session_files(&projects, &params.sessions, params.subagents, &mut append)?;
+        let count = snapshots.len();
+        search::ensure_session_filters_unambiguous(
+            (0..count).map(|index| {
+                shared
+                    .lock()
+                    .map_err(|_| reader_error("scan_state_error", "扫描统计不可用"))?
+                    .sources
+                    .as_mut()
+                    .expect("scan source catalog")
+                    .source(index)
+            }),
+            &params.sessions,
+        )?;
     }
     {
         let mut metadata = shared
@@ -1321,7 +1334,7 @@ fn scan_files(
                     let parsed = std::str::from_utf8(line)
                         .map_err(|_| reader_error("invalid_utf8", "JSONL UTF-8 无效"))
                         .and_then(|line| {
-                            parse_message_record(line).map_err(|_| reader_error("parse_error", "JSONL 格式无效"))
+                            parse_message_record(line, None).map_err(|_| reader_error("parse_error", "JSONL 格式无效"))
                         });
                     match parsed {
                         Ok(Some(record)) => {
@@ -2083,6 +2096,210 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn session_filters_match_normal_errors_without_collecting_scan_paths() {
+        let fixture = Fixture::new([human("main")]);
+        let direct = fixture
+            .source
+            .parent()
+            .unwrap()
+            .join("parent/subagents/agent-shared.jsonl");
+        let nested = fixture
+            .source
+            .parent()
+            .unwrap()
+            .join("parent/subagents/workflows/run/agent-shared.jsonl");
+        for source in [&direct, &nested] {
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            fs::write(source, format!("{}\n", human("child"))).unwrap();
+        }
+        for (filters, expected) in [
+            (vec!["missing".to_string()], "session_not_found"),
+            (vec!["agent-shared".to_string()], "session_ambiguous"),
+            (
+                vec!["scan-session".to_string(), "missing".to_string()],
+                "session_not_found",
+            ),
+        ] {
+            let store = ScanStore::default();
+            let mut request = fixture.request();
+            request.params.sessions = filters;
+            request.params.subagents = true;
+            let normal = search::search(&fixture.config, request.params.clone()).err().unwrap();
+            let scan = store.search(&fixture.config, request, Arc::new(|| false)).unwrap_err();
+            assert_eq!(normal.error, expected);
+            assert_eq!(scan.error, expected);
+            if expected == "session_ambiguous" {
+                assert_eq!(
+                    normal.available.as_ref().unwrap()["sources"],
+                    scan.available.as_ref().unwrap()["sources"]
+                );
+            }
+            store
+                .release(scan.available.as_ref().unwrap()["scan_id"].as_str().unwrap())
+                .unwrap();
+        }
+        let store = ScanStore::default();
+        let mut request = fixture.request();
+        request.params.sessions = vec!["agent-shared".into()];
+        request.params.subagents = true;
+        request.params.sources = vec![
+            direct.to_string_lossy().into_owned(),
+            nested.to_string_lossy().into_owned(),
+        ];
+        let page: Value =
+            serde_json::from_str(&store.search(&fixture.config, request, Arc::new(|| false)).unwrap()).unwrap();
+        assert_eq!(page["results"].as_array().unwrap().len(), 2);
+        store.release(page["scan_id"].as_str().unwrap()).unwrap();
+        let candidates = (0..10_000).map(|index| {
+            Ok((
+                "project".into(),
+                "session".into(),
+                PathBuf::from(format!("/{index:05}.jsonl")),
+            ))
+        });
+        let error = search::ensure_session_filters_unambiguous(candidates, &["session".into()]).unwrap_err();
+        assert_eq!(
+            error.available.as_ref().unwrap()["sources"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(error.available.unwrap()["sources_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn native_rmcp_late_cancellation_drops_response_and_releases_scan() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+        use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        struct ProtocolScan {
+            store: ScanStore,
+            config: Config,
+            metadata: Arc<Mutex<ScanMetadata>>,
+            committed: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        }
+        impl ServerHandler for ProtocolScan {
+            async fn call_tool(
+                &self,
+                request: CallToolRequestParams,
+                context: RequestContext<RoleServer>,
+            ) -> Result<CallToolResult, rmcp::ErrorData> {
+                let store = self.store.clone();
+                let config = self.config.clone();
+                let metadata = self.metadata.clone();
+                let committed = self.committed.clone();
+                let cursor = request.arguments.unwrap()["cursor"].as_str().unwrap().to_string();
+                let result = tokio::task::spawn_blocking(move || {
+                    let token = context.ct.clone();
+                    let signal = Arc::new(move || {
+                        if metadata.lock().unwrap().counters.returned_count > 1
+                            && let Some(notify) = committed.lock().unwrap().take()
+                        {
+                            notify.send(()).unwrap();
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !token.is_cancelled() && Instant::now() < deadline {
+                                thread::yield_now();
+                            }
+                            assert!(token.is_cancelled(), "native cancellation was not delivered");
+                        }
+                        token.is_cancelled()
+                    });
+                    store.search(
+                        &config,
+                        ScanRequest {
+                            params: SearchParams {
+                                limit: Some(1),
+                                max_total: 1_000_000,
+                                ..SearchParams::default()
+                            },
+                            cursor: Some(cursor),
+                            scan_bytes: Some(1024 * 1024),
+                            scan_ms: Some(1000),
+                            explicit_filters: json!({}),
+                        },
+                        signal,
+                    )
+                })
+                .await
+                .unwrap();
+                Ok(match result {
+                    Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+                    Err(error) => {
+                        CallToolResult::error(vec![ContentBlock::text(serde_json::to_string(&error).unwrap())])
+                    }
+                })
+            }
+        }
+        let fixture = Fixture::new([human("first"), human("second"), human("third")]);
+        let store = ScanStore::default();
+        let mut request = fixture.request();
+        request.params.limit = Some(1);
+        let first: Value =
+            serde_json::from_str(&store.search(&fixture.config, request, Arc::new(|| false)).unwrap()).unwrap();
+        let metadata = store
+            .entries
+            .lock()
+            .unwrap()
+            .get(first["scan_id"].as_str().unwrap())
+            .unwrap()
+            .driver
+            .lock()
+            .unwrap()
+            .metadata
+            .clone();
+        let (notify, committed) = tokio::sync::oneshot::channel();
+        let service = ProtocolScan {
+            store: store.clone(),
+            config: fixture.config.clone(),
+            metadata: metadata.clone(),
+            committed: Arc::new(Mutex::new(Some(notify))),
+        };
+        let (client, server) = tokio::io::duplex(65536);
+        let serving = tokio::spawn(async move { service.serve(server).await });
+        let mut client = tokio::io::BufReader::new(client);
+        client.get_mut().write_all(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",",
+            "\"capabilities\":{},\"clientInfo\":{\"name\":\"scan-fixture\",\"version\":\"1\"}}}\n"
+        ).as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_line(&mut response).await.unwrap();
+        client
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let running = serving.await.unwrap().unwrap();
+        let call = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+            "name":"history_search", "arguments":{"cursor": first["next_query"]["cursor"]}
+        }});
+        client
+            .get_mut()
+            .write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), committed)
+            .await.expect("scan did not reach the committed-page checkpoint").unwrap();
+        client.get_mut().write_all(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",",
+            "\"params\":{\"requestId\":2,\"reason\":\"fixture late cancellation\"}}\n"
+        ).as_bytes()).await.unwrap();
+        response.clear();
+        let mut server_exit = std::pin::pin!(running.waiting());
+        tokio::select! {
+            message = client.read_line(&mut response) => panic!("cancelled request delivered {message:?}: {response}"),
+            exit = &mut server_exit => panic!("server exited before cancellation observation: {exit:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        while store.entries.lock().unwrap().contains_key(first["scan_id"].as_str().unwrap()) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(metadata.lock().unwrap().counters.returned_count, 2);
+        let error = store.search(&fixture.config, next_request(&first), Arc::new(|| false)).unwrap_err();
+        assert_eq!(error.error, "cursor_unavailable");
+        drop(client);
+        server_exit.await.unwrap();
+        }).await.expect("native scan protocol scenario exceeded its total deadline");
+    }
+
     fn human(content: impl Into<String>) -> Value {
         json!({
             "type": "user",
@@ -3208,7 +3425,7 @@ mod tests {
                 panic!("脱敏结构应可完整内联恢复")
             };
             assert!(!content.contains("private.example.test"));
-            assert!(!content.contains("xxxxxxxx"));
+            assert!(!content.contains(&"x".repeat(8)));
             assert!(serde_json::from_str::<Value>(&content).is_ok());
             assert_eq!(preview["original_bytes"], content.len());
             assert_eq!(preview["preview"], content.chars().take(20).collect::<String>());
@@ -3343,7 +3560,7 @@ mod tests {
                         "name": "mcp__fixture__full",
                         "input": {
                             "password": "x".repeat(MAX_JSONL_LINE_BYTES + 1024),
-                            "command": "前缀😀 Authorization: Bearer\tfixture-value",
+                            "command": concat!("前缀😀 Authorization: Bearer\t", "fixture-value"),
                             "array": [
                                 1,
                                 null,

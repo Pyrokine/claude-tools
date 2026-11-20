@@ -4,7 +4,7 @@
 
 Claude Code 对话历史搜索工具
 
-模块版本：2.2.0
+模块版本：2.2.1
 
 会话列表同时显示自定义名称与 UUID，大规模历史检索保留精确匹配数、筛选条件和分页
 
@@ -209,6 +209,9 @@ normal 和 scan 都支持 `source`，CLI 使用 `--source`，原样使用 search
 说明；日期按 UTC 解释：`since=YYYY-MM-DD` 从当日 UTC 00:00 开始，`until=YYYY-MM-DD` 包含该 UTC 日期全天；`today`
 为当前 UTC 日期；RFC3339 显式时区偏移按 UTC 瞬间比较；`since` 不能晚于 `until`
 
+`regex=false` 且 `case_sensitive=false` 时，搜索词和消息逐 Unicode scalar 转为小写
+`ΟΣ` 匹配 `ΟΣ` 和 `οσ`，与 `ος` 保持区别；命中位置使用原始 Unicode 字符坐标，小写展开也保留原字符位置
+
 搜索会在完整提取的消息上匹配 `pattern`，包括超出响应预览上限的 tool input
 
 每项结果在 `content` 中返回有界正文预览，使用其 `ref` 调用 `history_get` 读取范围或导出
@@ -250,7 +253,12 @@ scheme 中含冒号的完整凭证及 SignedHeaders 中的分号
 普通文本与 JSON 编码的工具字符串均保留后续诊断、下一条 header 和后续 JSON 字段，普通与 indexed 记录使用相同边界，range
 与凭证相交时返回一个脱敏标记
 
-完整 JSON 正文脱敏后仍可按 JSON 解析，包含 tool-result text 中嵌入的 JSON；敏感数字、布尔值、null 和字符串均替换为 JSON 字符串标记，非敏感值保持原类型，range 继续使用原文字符坐标，`off` 保留原文
+`auto` 和 `strict` 对 `Cookie:` 与 `Cookie=` 遮蔽完整 header 值，分号和 cookie-pair 内部引号保留在同一值范围
+扫描在实际或 JSON 解码后的 CR/LF、外层字符串边界停止，空 header 保留下一行
+正文、结构化预览、range 与导出使用相同边界
+
+完整 JSON 正文脱敏后仍可按 JSON 解析，包含 tool-result text 中嵌入的 JSON；敏感数字、布尔值、null 和字符串均替换为 JSON 字符串标记，非敏感值保持原类型，range 继续使用原文字符坐标，
+`off` 保留原文
 
 auto 和 strict 也会遮蔽完整的 npm access token：小写 `npm_`
 后接恰好 36 个 ASCII 字母或数字，前后使用完整 Unicode 单词边界；正文、结构化 tool 字段、record
@@ -302,7 +310,8 @@ MiB 绝对 output 路径须解析到当前工作目录或受控临时会话内�
 发布前同步已存在的正文与 manifest，保留文件内容并要求文件已经存在，Windows 文件同步使用可写句柄，同步失败时返回错误，清理未发布的暂存目录并保留原
 bundle
 
-Windows 导出路径接受当前用户、SYSTEM 或 Administrators 作为 owner，owner 保持原值；DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，其他 owner 在修改 DACL 前被拒绝，错误中包含 owner SID
+Windows 导出路径接受当前用户、SYSTEM 或 Administrators 作为 owner，owner 保持原值；DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，其他 owner 在修改 DACL
+前被拒绝，错误中包含 owner SID
 权限通过 Windows 原生 API 设置并回读验证，每个文件均无需启动 PowerShell，目录规则由子文件和子目录继承
 返回的 Windows canonical 盘符路径可再次作为 `output`，包含 `\\?\C:\...` 路径
 
@@ -330,6 +339,8 @@ normal 保留时间排序、UUID 去重、regex 和 slice，收集到 50,000 个
 每次请求的执行期限为 120 秒，`limit` 限制返回条数，匹配仍检查选定来源；逐批遍历全部来源使用 scan
 Rust regex 不支持 look-around 和 backreference
 normal 与 scan 完整验证 JSON，跳过缓存正文和未知外层字段的内存构造；文件名 pattern 仍匹配消息正文，时间、类型、工具归因和脱敏规则保持，精确选择物理文件使用 `source`
+重复的同名外层字段沿用最后值；`user` 和 `assistant` 记录必须带 `message`，显式 `null` 有效
+normal 的时间或行范围筛选仍完整校验范围外记录，保留工具关联，全文匹配只处理范围内记录
 
 被 `max_total` 缩减的 metadata 在 `stats.metadata_dimensions` 中按字段列出，例如 `coverage.searched_files` 和
 `summary.by_tool` 每个受影响维度返回 `total`、`returned`、`omitted`，被删为空数组不表示真实零分布 `response_too_large`
@@ -395,13 +406,21 @@ KiB 解码后 UTF-8 索引限制
 普通搜索与索引扫描跳过内部元数据，包括没有消息 UUID 的 `api-request-blob` 缓存记录，这些记录仍可通过
 `history_get(view="record")` 读取，损坏 JSON、非法 UTF-8 和缺少必填字段的对话消息继续报告诊断
 
-冻结来源名称保存在私有目录中，每次扫描最多 128 MiB，长路径不再重复占用 metadata 内存；coverage 分页完整还原 project、session 和 source，32 MiB 诊断 metadata 配额保持有效，扫描释放、过期、取消或进程正常退出时清理目录
+冻结来源名称保存在私有目录中，每次扫描最多 128 MiB，长路径不再重复占用 metadata 内存；coverage 分页完整还原 project、session 和 source，32 MiB 诊断 metadata 配额保持有效，
+扫描释放、过期、取消或进程正常退出时清理目录
+
+normal 在 `stats.metadata_dimensions` 中说明 coverage 条目的省略情况，`stats.total_matches_exact` 继续说明命中计数的精确性，每条返回结果保留自己的精确
+`source`，已定位来源后传入 `source` 可将后续查询限定到该物理文件，`max_total` 仍覆盖包含 metadata 的完整响应
+
+normal 与 scan 在所选项目和 subagents 范围内校验 `sessions`，不存在时返回 `session_not_found`；来源有歧义时返回 `session_ambiguous` 和至多两个精确候选，
+更多候选时标记 `sources_truncated=true`，使用 `source` 选择一份，或通过 `sources` 显式选择多份
 
 cursor 绑定当前 MCP 实例，按相同预算重试最近成功请求时原样重放改变重放预算、冻结筛选，使用旧 cursor
 或其他实例都会返回明确错误单条记录无法容纳时保留该记录，
 `response_too_large.available.next_query`
 指向尚未消费的当前页每个实例最多保留四个扫描，空闲 20 分钟过期，每次扫描的 metadata 上限为 32
-MiB，消费结束后释放状态取消会停止读取和 CPU 工作，取消扫描会释放对应 cursor 状态 `scan_metadata_quota` 返回
+MiB，消费结束后释放状态；取消会停止读取和 CPU 工作，并释放对应 cursor 状态；MCP 传输层丢弃已取消请求的响应，包括取消前已形成的结果页
+`scan_metadata_quota` 返回
 `metadata_bytes_used`、`requested_bytes`、`max_metadata_bytes`、`remaining_bytes`、`files_enumerated` 和 `scan_phase`
 字节数为配额记账值，不是进程 RSS；按项目或会话缩小查询范围，读取失败扫描的 metadata 后释放状态，32 MiB 上限保持有效
 

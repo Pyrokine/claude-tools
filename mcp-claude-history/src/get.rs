@@ -98,7 +98,7 @@ pub fn get(config: &Config, params: GetParams) -> Result<GetResponse, ErrorRespo
         message: format!("解析消息失败: {e}"),
         available: None,
     })?;
-    let record = parse_message_record(line)
+    let record = parse_message_record(line, None)
         .map_err(|e| ErrorResponse {
             error: "parse_error".to_string(),
             message: format!("解析消息失败: {e}"),
@@ -366,35 +366,6 @@ fn tail_chars(content: &str, max_len: usize) -> String {
         return content.to_string();
     }
     content.chars().skip(char_count - max_len).collect()
-}
-
-fn valid_range_example(original_content_size: usize) -> Option<String> {
-    if original_content_size == 0 {
-        return None;
-    }
-    Some(format!("0-{}", original_content_size.min(100_000)))
-}
-
-fn valid_range_label(original_content_size: usize) -> String {
-    valid_range_example(original_content_size).unwrap_or_else(|| "empty content has no valid range".to_string())
-}
-
-fn invalid_range_response(start: usize, end: usize, original_content_size: usize) -> ErrorResponse {
-    ErrorResponse {
-        error: "invalid_range".to_string(),
-        message: format!(
-            "range {}-{} 无效，original_content_size={}，valid_range 示例 {}",
-            start,
-            end,
-            original_content_size,
-            valid_range_label(original_content_size)
-        ),
-        available: Some(serde_json::json!({
-            "original_content_size": original_content_size,
-            "valid_range": valid_range_example(original_content_size),
-            "parsed_range": { "start": start, "end": end }
-        })),
-    }
 }
 
 /// 查找 session 文件
@@ -2567,6 +2538,145 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.error, "image_export_failed");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn range_errors_match_between_ordinary_and_indexed_records() {
+        for text in ["前缀😀 password=fixture_secret 后缀", ""] {
+            let length = text.chars().count();
+            let ranges = [(length, length), (length + 1, length + 2), (999_999, 1_000_000)];
+            let mut ordinary_errors = Vec::new();
+            for indexed in [false, true] {
+                let (root, config, reference) = fixture(serde_json::json!({
+                    "uuid": "range-diagnostics", "type": "user", "timestamp": "2026-10-09T00:00:00Z",
+                    "message": { "content": text },
+                    "padding": if indexed { "x".repeat(MAX_JSONL_LINE_BYTES + 128) } else { String::new() }
+                }));
+                let params = || GetParams {
+                    r#ref: reference.clone(),
+                    range: None,
+                    output: None,
+                    project: Some("project".to_string()),
+                    source: None,
+                    redaction: RedactionMode::Auto,
+                    overwrite: false,
+                    view: None,
+                    block: None,
+                };
+                let output_root = resolve_output_dir(&format!("tmp:range-diagnostics-{}", export_nonce())).unwrap();
+                fs::create_dir_all(&output_root).unwrap();
+                let entries = || {
+                    fs::read_dir(&output_root)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                let original_entries = entries();
+                for (index, range) in ranges.into_iter().enumerate() {
+                    let error = get(
+                        &config,
+                        GetParams {
+                            range: Some(range),
+                            ..params()
+                        },
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.error, "invalid_range");
+                    assert_eq!(
+                        error.available,
+                        Some(serde_json::json!({
+                            "original_content_size": length,
+                            "valid_range": if length == 0 { None } else { Some(format!("0-{length}")) },
+                            "parsed_range": { "start": range.0, "end": range.1 }
+                        }))
+                    );
+                    let serialized = serde_json::to_value(&error).unwrap();
+                    if indexed {
+                        assert_eq!(serialized, ordinary_errors[index]);
+                    } else {
+                        ordinary_errors.push(serialized);
+                    }
+                    let export_error = get(
+                        &config,
+                        GetParams {
+                            range: Some(range),
+                            output: Some(output_root.join("invalid-export").display().to_string()),
+                            ..params()
+                        },
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        serde_json::to_value(export_error).unwrap(),
+                        serde_json::to_value(error).unwrap()
+                    );
+                    assert_eq!(entries(), original_entries);
+                }
+                for mode in [RedactionMode::Auto, RedactionMode::Strict, RedactionMode::Off] {
+                    let result = get(
+                        &config,
+                        GetParams {
+                            redaction: mode,
+                            ..params()
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(success_content(result), redact_text_with_mode(text, mode).text);
+                    if length > 0 {
+                        for at in [0, 3, length - 1] {
+                            let response = get(
+                                &config,
+                                GetParams {
+                                    range: Some((at, at)),
+                                    redaction: mode,
+                                    ..params()
+                                },
+                            )
+                            .unwrap();
+                            assert_eq!(success_content(response), "");
+                        }
+                        let response = get(
+                            &config,
+                            GetParams {
+                                range: Some((0, length + 100)),
+                                redaction: mode,
+                                ..params()
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(success_content(response), redact_text_with_mode(text, mode).text);
+                    }
+                }
+                let GetResponse::Output { output, .. } = get(
+                    &config,
+                    GetParams {
+                        output: Some(output_root.join("bundle").display().to_string()),
+                        ..params()
+                    },
+                )
+                .unwrap() else {
+                    panic!("expected published output");
+                };
+                let content = fs::read(&output.content).unwrap();
+                let manifest = fs::read(&output.manifest).unwrap();
+                let published_entries = entries();
+                let error = get(
+                    &config,
+                    GetParams {
+                        range: Some((length, length)),
+                        output: Some(output.content.parent().unwrap().display().to_string()),
+                        overwrite: true,
+                        ..params()
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.error, "invalid_range");
+                assert_eq!(fs::read(output.content).unwrap(), content);
+                assert_eq!(fs::read(output.manifest).unwrap(), manifest);
+                assert_eq!(entries(), published_entries);
+                fs::remove_dir_all(output_root).unwrap();
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]
