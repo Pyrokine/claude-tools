@@ -312,10 +312,10 @@ config；重连和配置 fingerprint 保留禁用语义；外部 ssh/rsync 不�
 
 ### connect-no-delay-01
 
-**步骤**：执行持久回归，在直连和跳板底层 socket 创建后记录客户端 `setNoDelay` 调用；连接失败后检查 pending 状态，再按
-`sync-parallel-01` 用自有原生 sshd 测量小文件同步，检查大文件校验和重连
+**步骤**：执行持久回归，在直连和跳板底层 socket 创建后记录客户端 `setNoDelay` 调用；受控服务器接受 TCP 后主动关闭连接，使用默认连接期限完成真实信任读取与 Windows 权限准备，再校验握手前断开和 pending 清理
+使用自有 known_hosts 文件覆盖 Windows 真实权限查询，随后按 `sync-parallel-01` 用自有原生 sshd 测量小文件同步，检查大文件校验和重连
 
-**预期**：每个新客户端在调用 `connect` 后启用
+**预期**：受控服务器实际接受两次 TCP 连接，每次请求因握手前连接中断而失败；每个新客户端在调用 `connect` 后启用
 `setNoDelay(true)`，连接失败不残留 pending 状态；跳板与重连使用同一设置，SFTP-only、内容校验和超时语义保持，不使用诊断
 preload 代替当前代码验收
 

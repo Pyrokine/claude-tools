@@ -164,7 +164,18 @@ test('MH-SSH-03 real ssh2 channel closure retains unknown or known exit metadata
 
 test('new direct and jump connections disable Nagle after socket creation', async (t) => {
     const { manager } = createManager(t)
-    const port = await createBlackholeServer(t)
+    let accepted = 0
+    const server = net.createServer((socket) => {
+        ++accepted
+        socket.resume()
+        socket.end()
+    })
+    await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, '127.0.0.1', () => resolve())
+    })
+    t.after(() => new Promise((resolve) => server.close(resolve)))
+    const port = server.address().port
     const calls = []
     const original = ssh2.Client.prototype.setNoDelay
     t.mock.method(ssh2.Client.prototype, 'setNoDelay', function (enabled) {
@@ -180,12 +191,13 @@ test('new direct and jump connections disable Nagle after socket creation', asyn
                 port,
                 username: 'tester',
                 agent: 'none',
-                readyTimeout: 30,
                 jumpHost,
-            })
+            }),
+            /Connection lost before handshake/
         )
     }
 
+    assert.equal(accepted, 2)
     assert.deepEqual(calls, [
         { enabled: true, socketCreated: true },
         { enabled: true, socketCreated: true },
