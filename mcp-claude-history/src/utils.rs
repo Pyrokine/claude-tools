@@ -177,7 +177,7 @@ pub fn set_private_permissions(path: &Path, _mode: u32) -> Result<(), ErrorRespo
         FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
     };
-    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     struct LocalMemory(*mut c_void);
@@ -231,7 +231,8 @@ pub fn set_private_permissions(path: &Path, _mode: u32) -> Result<(), ErrorRespo
         let mut options = OpenOptions::new();
         options
             .read(true)
-            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC)
+            // MAXIMUM_ALLOWED 阻止 SetSecurityInfo 向已有子项传播并改写其 DACL
+            .access_mode(MAXIMUM_ALLOWED | READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let (file, write_error) = match options.open(path) {
             Ok(file) => (file, None),
@@ -329,7 +330,17 @@ pub fn set_private_permissions(path: &Path, _mode: u32) -> Result<(), ErrorRespo
             || unsafe { (*actual_dacl).AceCount } != 1
             || unsafe { EqualSid(owner, actual_owner) } == 0
         {
-            return Err(io::Error::other("private DACL verification failed"));
+            return Err(io::Error::other(format!(
+                "private DACL verification failed (descriptor): directory={}, control={control:#x}, dacl_present={}, ace_count={:?}, owner_unchanged={}",
+                metadata.is_dir(),
+                !actual_dacl.is_null(),
+                if actual_dacl.is_null() {
+                    None
+                } else {
+                    Some(unsafe { (*actual_dacl).AceCount })
+                },
+                unsafe { EqualSid(owner, actual_owner) } != 0
+            )));
         }
         let mut entry = null_mut();
         if unsafe { GetAce(actual_dacl, 0, &mut entry) } == 0 {
@@ -341,7 +352,14 @@ pub fn set_private_permissions(path: &Path, _mode: u32) -> Result<(), ErrorRespo
             || entry.Mask != FILE_ALL_ACCESS
             || unsafe { EqualSid(addr_of!(entry.SidStart).cast_mut().cast(), sid) } == 0
         {
-            return Err(io::Error::other("private DACL verification failed"));
+            return Err(io::Error::other(format!(
+                "private DACL verification failed (ACE): directory={}, type={}, flags={:#x}, expected_flags={flags:#x}, mask={:#x}, expected_mask={FILE_ALL_ACCESS:#x}, sid_matches={}",
+                metadata.is_dir(),
+                entry.Header.AceType,
+                entry.Header.AceFlags,
+                entry.Mask,
+                unsafe { EqualSid(addr_of!(entry.SidStart).cast_mut().cast(), sid) } != 0
+            )));
         }
         Ok(())
     })();
@@ -2774,7 +2792,7 @@ fn code_rhs_span(bytes: &[u8], start: usize) -> (usize, bool) {
 
 fn split_limit_suffix(bytes: &[u8], mut cursor: usize) -> bool {
     // A punctuation delimiter is allowed only in a method's (delimiter, limit)[index] shape.
-    for expected in [b',', b'0', b')', b'['] {
+    for expected in *b",0)[" {
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
@@ -4252,6 +4270,61 @@ mod tests {
         file.write_all(b"fixture").unwrap();
         set_private_permissions(&file_path, 0o600).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_acl_preserves_concurrent_child_protection() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mcp-history-acl-concurrent-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        set_private_permissions(&root, 0o700).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let mut failures = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..8 {
+                let root = &root;
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || {
+                    let mut failures = Vec::new();
+                    barrier.wait();
+                    for iteration in 0..300 {
+                        let child = root.join(format!("child-{worker}-{iteration}"));
+                        if let Err(error) = fs::create_dir(&child) {
+                            failures.push(format!("child creation failed: {error}"));
+                            continue;
+                        }
+                        if let Err(error) = set_private_permissions(root, 0o700) {
+                            failures.push(error.message);
+                        }
+                        if let Err(error) = set_private_permissions(&child, 0o700) {
+                            failures.push(error.message);
+                        }
+                        let file = child.join("private.txt");
+                        if let Err(error) = fs::write(&file, b"synthetic") {
+                            failures.push(format!("file write failed: {error}"));
+                        } else if let Err(error) = set_private_permissions(&file, 0o600) {
+                            failures.push(error.message);
+                        }
+                        if let Err(error) = fs::remove_dir_all(&child) {
+                            failures.push(format!("child cleanup failed: {error}"));
+                        }
+                    }
+                    failures
+                }));
+            }
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        if let Err(error) = fs::remove_dir_all(&root) {
+            failures.push(format!("root cleanup failed: {error}"));
+        }
+        assert!(failures.is_empty(), "concurrent private DACL failures: {failures:#?}");
     }
 
     #[cfg(windows)]

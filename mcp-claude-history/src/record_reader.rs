@@ -2010,7 +2010,7 @@ pub(crate) fn value_end(
 }
 
 fn punctuation_split_suffix(bytes: &mut impl ByteSource, mut cursor: usize) -> Result<bool, ErrorResponse> {
-    for expected in [b',', b'0', b')', b'['] {
+    for expected in *b",0)[" {
         cursor = skip_whitespace(bytes, cursor, false)?;
         if expected == b'0' {
             let start = cursor;

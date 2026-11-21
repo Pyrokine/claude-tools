@@ -1029,6 +1029,11 @@ Windows 临时配额扫描遇到目录消失或 Access Denied 时，按现有上
 通过 Bash 和原生 PowerShell 分别执行 `cargo test --locked utils::tests::windows_private -- --nocapture` 与
 `cargo test --locked get::tests::`，每条命令均须成功
 
+`windows_private_acl_preserves_concurrent_child_protection` 使用独立临时根目录，让多个工作线程同时更新父目录权限并创建、保护和清理各自的子目录与文件
+父目录设置只作用于当前对象，新建子项继续继承目录规则，已有子项保持各自的 DACL 保护位，所有 owner、单条当前用户 ACE、继承标记和 FullControl 校验保持
+验证错误应区分安全描述符与 ACE 阶段，并包含相应的实际权限字段，函数直接返回当前校验结果
+原 `scalar_lowercase_queries_match_normal_indexed_and_scan` 与完整 History 回归继续验证 MCP scan 入口、来源缓存及结果分页
+
 使用独立临时 fixture，对目录和文件分别设置当前用户、SYSTEM、Administrators 和内置 Users 组 owner，读取实际 owner 后调用权限函数
 
 **预期**：当前用户、SYSTEM 和 Administrators

@@ -1,6 +1,6 @@
 [package]
 name = "mcp-claude-history"
-version = "2.2.1"
+version = "2.2.2"
 edition = "2024"
 rust-version = "1.88"
 description = "MCP tool for searching Claude Code conversation history"
@@ -15,18 +15,18 @@ path = "src/main.rs"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["raw_value"] }
 regex = "1.13.0"
-rayon = "1.12.0"
 clap = { version = "4.6.1", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 base64 = "0.22.1"
-glob = "0.3.3"
-libc = "0.2"
 dirs = "6.0.0"
 # rmcp 用于新 MCP 协议层（替换手写 JSON-RPC）
 rmcp = { version = "2.2.0", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"] }
 schemars = "1.2.1"
 anyhow = "1.0.103"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61.2"

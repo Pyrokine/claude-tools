@@ -56,7 +56,7 @@ claude mcp add mcp-claude-history -- mcp-claude-history --mcp
 
 ## 子模块版本
 
-- mcp-claude-history 2.2.1：会话名称、大规模历史精确检索、来源目录分页、全文导出、精确来源恢复与私有导出目录
+- mcp-claude-history 2.2.2：Windows 并发扫描与导出的私有权限、会话名称、大规模历史精确检索、来源目录分页、全文导出与精确来源恢复
 
 - mcp-chrome 3.1.2：iframe 准备与执行共用期限、Windows PowerShell 兼容、本地文件上传、字段值保护、任务页面管理、Cloudflare 完成状态、open Shadow DOM 与嵌套 frame、对话框、原响应与下载收件、请求控制、限定范围的 HTTP 认证及 WebSocket/SSE 观察
 

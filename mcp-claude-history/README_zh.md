@@ -4,7 +4,7 @@
 
 Claude Code 对话历史搜索工具
 
-模块版本：2.2.1
+模块版本：2.2.2
 
 会话列表同时显示自定义名称与 UUID，大规模历史检索保留精确匹配数、筛选条件和分页
 
@@ -312,7 +312,9 @@ bundle
 
 Windows 导出路径接受当前用户、SYSTEM 或 Administrators 作为 owner，owner 保持原值；DACL 禁止继承，仅保留当前用户的一条 FullControl Allow，其他 owner 在修改 DACL
 前被拒绝，错误中包含 owner SID
-权限通过 Windows 原生 API 设置并回读验证，每个文件均无需启动 PowerShell，目录规则由子文件和子目录继承
+权限通过 Windows 原生 API 设置并回读验证，每个文件均无需启动 PowerShell，目录规则由新建子文件和子目录继承
+更新父目录权限时保留已有子项各自的 DACL，使并发扫描与导出分别设置自己的文件权限
+DACL 回读不符时，错误区分安全描述符与 ACE 校验，并包含实际权限字段
 返回的 Windows canonical 盘符路径可再次作为 `output`，包含 `\\?\C:\...` 路径
 
 normal 搜索导出与内联结果使用相同过滤、时间排序和去重，导出最多 20,000 条、16 MiB；v2

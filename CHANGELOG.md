@@ -1,5 +1,45 @@
 # Changelog
 
+## v1.20.2 - 2026-11-21
+
+## Versions
+
+- mcp-claude-history: 2.2.1 → 2.2.2
+- mcp-chrome Server and Extension: 3.1.2
+- mcp-ssh: 3.3.1
+- skill-elenchus: 1.2.0
+
+## What's Changed
+
+### mcp-claude-history
+
+- fix: Preserve existing child DACLs when updating a parent's private permissions so concurrent scans and exports retain each child's protection
+- fix: Include descriptor or ACE permission fields when private DACL verification fails
+- test: Cover concurrent parent, child directory and file permission updates with the existing owner, inheritance and access checks
+- chore: Remove unused glob and rayon dependencies and limit the direct libc dependency to Unix
+- docs: Synchronize bilingual permission behavior and reusable Windows regression guidance
+
+---
+
+## 版本
+
+- mcp-claude-history：2.2.1 → 2.2.2
+- mcp-chrome Server 和 Extension：3.1.2
+- mcp-ssh：3.3.1
+- skill-elenchus：1.2.0
+
+## 更新内容
+
+### mcp-claude-history
+
+- fix: 更新父目录私有权限时保留已有子项各自的 DACL，避免并发扫描与导出改写子项的保护状态
+- fix: 私有 DACL 回读失败时提供安全描述符或 ACE 的实际权限字段
+- test: 覆盖父目录、子目录和文件的并发权限设置，保留原 owner、继承与访问检查
+- chore: 删除未使用的 glob 与 rayon 依赖，将直接 libc 依赖限定为 Unix
+- docs: 同步中英文权限行为说明与可复用 Windows 回归指导
+
+**Full Changelog**: https://github.com/Pyrokine/claude-tools/compare/v1.20.1...v1.20.2
+
 ## v1.20.1 - 2026-11-21
 
 ## Versions

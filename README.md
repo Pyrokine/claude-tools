@@ -56,8 +56,8 @@ Each subdirectory README includes source build instructions and client-specific 
 
 ## Module versions
 
-- mcp-claude-history 2.2.1: Session titles, exact large-history search, paged source catalogs, full-content exports,
-  precise source recovery, and private output bundles
+- mcp-claude-history 2.2.2: Private Windows output during concurrent scans and exports, session titles, exact
+  large-history search, paged source catalogs, full-content exports, and precise source recovery
 
 - mcp-chrome 3.1.2: Shared iframe deadlines and Windows PowerShell compatibility, with local file uploads, hidden-field
   value protection, middle-button events, focus-only editing commands, task page controls, Cloudflare completion checks,
